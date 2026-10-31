@@ -19,6 +19,9 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('shards', HERE / '_ci-shards.py')
 shards = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shards)
+input_spec = importlib.util.spec_from_file_location('connector_inputs', HERE / '_connector-inputs.py')
+connector_inputs = importlib.util.module_from_spec(input_spec)
+input_spec.loader.exec_module(connector_inputs)
 # Named witnesses include cases that configure connector jars without calling the gate.
 SELECTOR = 'PublishedExamplesIT,RealMysqlToMongo*IT,Nest*IT,DataBrowser*IT,Watch*IT,AnObjectIdReadsBackTheSameThroughBothFacesIT,SinkValueRoundTripIT,*TargetPreparationIT'
 GATE_CALL = re.compile(r'\bRealConnectorGate\s*\.\s*require\s*\(')
@@ -150,6 +153,8 @@ def main():
     for name in ['plan', 'run', 'pack', 'verify']:
         cmd = sub.add_parser(name)
         cmd.add_argument('--root', default='.', type=Path)
+        cmd.add_argument('--input-mode', choices=['upstream', 'release'], default='upstream')
+        cmd.add_argument('--inputs', type=Path)
         if name == 'plan':
             cmd.add_argument('--durations')
         else:
@@ -173,12 +178,21 @@ def main():
             extra = ['--durations', args.durations] if args.durations else []
             engine('plan', args, '--inventory', source, '--count', '10', '--output', args.output, *extra)
         plan = shards.read(args.output)
-        plan.update(connector_deferrals=deferrals, requires_atlas_fixtures=requires_atlas)
+        plan.update(connector_deferrals=deferrals, requires_atlas_fixtures=requires_atlas, connector_input_mode=args.input_mode)
         shards.write(args.output, plan)
         for name in deferrals['classes']:
             print('Deferred external Atlas witness: ' + name + ' (' + deferrals['issue'] + ')')
         return
     plan = shards.load_plan(args, args.root)
+    shards.require(plan.get('connector_input_mode', 'upstream') == args.input_mode, 'connector input mode differs from plan')
+    shards.require(args.inputs is not None or args.input_mode == 'upstream', 'Release witnesses require an input identity')
+    input_identity = None
+    if args.inputs is not None:
+        input_identity = connector_inputs.validate_identity(shards.read(args.inputs), args.root / 'deploy/cloud/connectors.lock.json',
+                                                           plan['source_sha'], args.input_mode)
+        if args.command in {'run', 'pack'}:
+            connector_inputs.verify(args.inputs, args.inputs.parent, args.root / 'deploy/cloud/connectors.lock.json',
+                                    plan['source_sha'], args.input_mode)
     shards.require(plan.get('connector_deferrals') == deferrals
                    and plan.get('requires_atlas_fixtures') is requires_atlas,
                    'connector deferral policy differs from plan')
@@ -198,6 +212,8 @@ def main():
         if has_examples:
             shard_ledger(paths[0], selected['tests'])
         engine('pack', args, '--plan', args.plan, '--shard', args.shard, '--output', args.output)
+        if input_identity is not None:
+            shards.write(Path(args.output) / 'connector-inputs.json', input_identity)
         if has_examples:
             path = Path(args.output) / 'witness-ledger.txt'
             shutil.copyfile(paths[0], path)
@@ -209,10 +225,12 @@ def main():
         for selected in plan['shards']:
             directory = args.artifacts / selected['id']
             has_examples = bool(expected_cases(selected['tests']))
-            allowed = {'files', 'manifest.json'} | ({'witness-ledger.txt', 'ledger.json'} if has_examples else set())
+            allowed = {'files', 'manifest.json'} | ({'connector-inputs.json'} if input_identity is not None else set()) | ({'witness-ledger.txt', 'ledger.json'} if has_examples else set())
             shards.require(directory.is_dir() and not directory.is_symlink()
                            and {p.name for p in directory.iterdir()} == allowed,
                            'connector shard evidence differs: ' + selected['id'])
+            if input_identity is not None:
+                shards.require(shards.read(directory / 'connector-inputs.json') == input_identity, 'shard connector input identity differs')
             all_cases.update(strict_reports(directory / 'files', selected))
             if has_examples:
                 ledger = directory / 'witness-ledger.txt'

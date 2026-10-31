@@ -4,12 +4,21 @@ name: Real connectors
 
 on:
   workflow_dispatch:
+    inputs:
+      connector-inputs:
+        description: Connector input policy
+        type: choice
+        options: [upstream, release]
+        default: upstream
   schedule:
     - cron: "30 19 * * *"
 
 concurrency:
-  group: real-connectors-sharded-${{ github.ref }}
+  group: real-connectors-sharded-${{ github.ref }}-${{ inputs.connector-inputs || 'upstream' }}
   cancel-in-progress: true
+
+env:
+  CONNECTOR_INPUT_MODE: ${{ inputs.connector-inputs || 'upstream' }}
 
 jobs:
   connector-plan:
@@ -19,7 +28,7 @@ jobs:
       - name: Plan active connector witnesses and record deferred acceptance
         id: plan
         run: |
-          .github/scripts/connector-witnesses.sh plan --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
+          .github/scripts/connector-witnesses.sh plan --input-mode "$CONNECTOR_INPUT_MODE" --durations .github/connector-test-durations.json --output "$RUNNER_TEMP/connector-shards.json"
           echo "requires_atlas=$(jq -r '.requires_atlas_fixtures' "$RUNNER_TEMP/connector-shards.json")" >> "$GITHUB_OUTPUT"
           jq -r '.connector_deferrals | "## Deferred external Atlas acceptance\n\(.reason)\nFollow-up: \(.issue)\n", (.classes[] | "- " + .)' "$RUNNER_TEMP/connector-shards.json" >> "$GITHUB_STEP_SUMMARY"
       - name: Require controlled Atlas fixture inputs when selected
@@ -45,6 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Connector JDK compatible with its pinned Lombok
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -56,6 +66,7 @@ jobs:
             scripts/build-real-connectors.sh
             .github/maven-settings-connectors.xml
       - name: Pin the connector Maven toolchain
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         env:
           MAVEN_VERSION: "3.9.16"
           MAVEN_SHA512: "831a8591fe20c8243b1dbe7d71e3244f31d1665b0804b2e825e38cbbe5ce0cafb8338851f90780735568773e0a6cd07bbec107cda0b896b008b861075358b6f6"
@@ -72,10 +83,12 @@ jobs:
           echo "MAVEN_HOME=$maven_home" >> "$GITHUB_ENV"
           "$maven_home/bin/mvn" --version
       - name: Seed isolated connector dependencies
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         run: |
           mkdir -p "$HOME/.m2/repository" "$RUNNER_TEMP/connector-m2"
           rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$HOME/.m2/repository/" "$RUNNER_TEMP/connector-m2/"
       - name: Read enterprise connector source
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         uses: actions/checkout@v4
         with:
           repository: tapdata/tapdata-connectors-enterprise
@@ -83,6 +96,7 @@ jobs:
           path: .connector-enterprise-source
           persist-credentials: false
       - name: Resolve current upstream source
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         id: source
         run: |
           git clone --depth 1 https://github.com/tapdata/tapdata-connectors.git "$RUNNER_TEMP/connector-source"
@@ -92,12 +106,14 @@ jobs:
       # These are remote dependencies only. prepare always refreshes their snapshot
       # metadata and checks resolved bytes before a cached connector jar is eligible.
       - name: Restore remote PDK dependencies
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         uses: actions/cache/restore@v4
         id: pdk
         with:
           path: ${{ runner.temp }}/connector-m2/io/tapdata
           key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
       - name: Resolve current snapshot artifacts
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         id: inputs
         run: |
           .github/scripts/connector-cache.sh prepare --modules "$CONNECTOR_MODULES" --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --repo-local "$RUNNER_TEMP/connector-m2" --output "$RUNNER_TEMP/connector-inputs.json"
@@ -105,33 +121,51 @@ jobs:
       # Reuse delays discovering faults outside the resolved source/snapshot inputs.
       # A miss also means possible cache eviction, not necessarily an upstream change.
       - uses: actions/cache/restore@v4
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         id: jars
         with:
           path: ${{ runner.temp }}/connectors
           key: ${{ steps.inputs.outputs.key }}
       - name: Build current connector jars on a miss
-        if: steps.jars.outputs.cache-hit != 'true'
+        if: env.CONNECTOR_INPUT_MODE == 'upstream' && (steps.jars.outputs.cache-hit != 'true')
         env:
           MAVEN_ARGS: -nsu -Dmaven.repo.local=${{ runner.temp }}/connector-m2
         run: |
           scripts/build-real-connectors.sh --modules "$CONNECTOR_MODULES" --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" "$RUNNER_TEMP/connectors"
           .github/scripts/connector-cache.sh seal --checkout "$RUNNER_TEMP/connector-source" --checkout "$RUNNER_TEMP/connector-enterprise-source" --manifest "$RUNNER_TEMP/connector-inputs.json" --repo-local "$RUNNER_TEMP/connector-m2" --jars "$RUNNER_TEMP/connectors"
       - name: Verify exact connector jar evidence
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
         run: .github/scripts/connector-cache.sh verify --manifest "$RUNNER_TEMP/connector-inputs.json" --jars "$RUNNER_TEMP/connectors"
       - uses: actions/cache/save@v4
-        if: steps.jars.outputs.cache-hit != 'true'
+        if: env.CONNECTOR_INPUT_MODE == 'upstream' && (steps.jars.outputs.cache-hit != 'true')
         with:
           path: ${{ runner.temp }}/connectors
           key: ${{ steps.inputs.outputs.key }}
       - name: Cache verified remote PDK dependencies
-        if: steps.pdk.outputs.cache-hit != 'true'
+        if: env.CONNECTOR_INPUT_MODE == 'upstream' && (steps.pdk.outputs.cache-hit != 'true')
         uses: actions/cache/save@v4
         with:
           path: ${{ runner.temp }}/connector-m2/io/tapdata
           key: pdk-inputs-${{ runner.os }}-${{ steps.source.outputs.oss_sha }}-${{ steps.source.outputs.enterprise_sha }}-${{ hashFiles('.github/scripts/connector-cache.sh', 'scripts/build-real-connectors.sh', '.github/maven-settings-connectors.xml') }}
       - name: Retain only third-party Maven dependencies
-        if: always()
+        if: env.CONNECTOR_INPUT_MODE == 'upstream' && (always())
         run: rsync -a --exclude='/io/tapstate/' --exclude='/io/tapdata/' "$RUNNER_TEMP/connector-m2/" "$HOME/.m2/repository/"
+      - name: Prepare verified published connector inputs
+        if: env.CONNECTOR_INPUT_MODE == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B .github/scripts/_connector-inputs.py prepare-release --directory "$RUNNER_TEMP/connectors" --source-sha "$GITHUB_SHA"
+      - name: Record upstream connector inputs
+        if: env.CONNECTOR_INPUT_MODE == 'upstream'
+        run: python3 -B .github/scripts/_connector-inputs.py record --directory "$RUNNER_TEMP/connectors" --mode upstream --source-sha "$GITHUB_SHA"
+      - name: Verify selected input identities
+        run: python3 -B .github/scripts/_connector-inputs.py verify --directory "$RUNNER_TEMP/connectors" --mode "$CONNECTOR_INPUT_MODE" --source-sha "$GITHUB_SHA"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: connector-input-identity
+          path: ${{ runner.temp }}/connectors/connector-inputs.json
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: connector-jars
@@ -179,9 +213,9 @@ jobs:
         # Docker 29 requires a newer API than the pinned testcontainers default.
         env:
           MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors
-        run: .github/scripts/connector-witnesses.sh run --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
+        run: .github/scripts/connector-witnesses.sh run --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Admit reports and the sweep's witness ledger
-        run: .github/scripts/connector-witnesses.sh pack --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"
+        run: .github/scripts/connector-witnesses.sh pack --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"
       - name: Retain only third-party Maven dependencies
         if: always()
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
@@ -204,14 +238,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # Release gates require this exact non-matrix name, including on missing shards.
+  # Each input policy has its own non-matrix verdict, including on missing shards.
   real-connectors:
+    name: ${{ inputs.connector-inputs == 'release' && 'real-connectors-release' || 'real-connectors' }}
     needs: [connector-plan, connector-witnesses]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: connector-input-identity
+          path: ${{ runner.temp }}/connector-input-identity
       - uses: actions/download-artifact@v4
         with:
           name: connector-shard-plan
@@ -222,7 +261,7 @@ jobs:
           merge-multiple: true
           path: ${{ runner.temp }}/connector-results
       - name: Globally admit every witness and its exact ledger
-        run: .github/scripts/connector-witnesses.sh verify --plan "$RUNNER_TEMP/connector-shards.json" --artifacts "$RUNNER_TEMP/connector-results" --restore .
+        run: .github/scripts/connector-witnesses.sh verify --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connector-input-identity/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --artifacts "$RUNNER_TEMP/connector-results" --restore .
       - name: Require successful shard jobs
         env:
           SHARD_RESULT: ${{ needs.connector-witnesses.result }}

@@ -88,9 +88,7 @@ class AtlasPdkSourcePermissionsIT {
     @EnumSource(AtlasRuntime.Mode.class)
     void aSourceWithoutReadPermissionFailsThroughThePdkAndRecovers(AtlasRuntime.Mode mode) throws Exception {
         String suffix = suffix(mode);
-        String metadata = "ts_plan_prm_" + suffix;
         String targetDatabase = "ts_plan_prt_" + suffix;
-        String metadataUri = SharedMongo.replicaSetUrl(metadata);
         String targetUri = SharedMongo.replicaSetUrl(targetDatabase);
         String source = "permission_read_source";
         String target = "permission_read_target";
@@ -99,7 +97,9 @@ class AtlasPdkSourcePermissionsIT {
         try (SourceUser fixture = new SourceUser("ts_plan_prs_" + suffix);
              MongoClient targetClient = MongoClients.create(targetUri);
              AutoCloseable targetCleanup = () -> targetClient.getDatabase(targetDatabase).drop();
-             AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri);
+             PreparedNativeStore prepared = mode == AtlasRuntime.Mode.ON_PREM
+                     ? PreparedNativeStore.create() : PreparedNativeStore.createCloud();
+             AtlasRuntime runtime = new AtlasRuntime(mode, prepared);
              ServerHandle server = runtime.launch(Tiers.IN_PROCESS)) {
             ControlPlane control = runtime.control(server, true);
             runtime.register(control, CONNECTOR);
@@ -136,10 +136,8 @@ class AtlasPdkSourcePermissionsIT {
     void aSourceThatCanSnapshotButCannotWatchFailsThroughThePdkAndRecovers(AtlasRuntime.Mode mode)
             throws Exception {
         String suffix = suffix(mode);
-        String metadata = "ts_plan_pcm_" + suffix;
         String snapshotTargetDatabase = "ts_plan_pst_" + suffix;
         String cdcTargetDatabase = "ts_plan_pct_" + suffix;
-        String metadataUri = SharedMongo.replicaSetUrl(metadata);
         String snapshotTargetUri = SharedMongo.replicaSetUrl(snapshotTargetDatabase);
         String cdcTargetUri = SharedMongo.replicaSetUrl(cdcTargetDatabase);
         String snapshot = "permission_snapshot_pipeline";
@@ -152,7 +150,9 @@ class AtlasPdkSourcePermissionsIT {
                  targetClient.getDatabase(snapshotTargetDatabase).drop();
                  targetClient.getDatabase(cdcTargetDatabase).drop();
              };
-             AtlasRuntime runtime = new AtlasRuntime(mode, metadataUri);
+             PreparedNativeStore prepared = mode == AtlasRuntime.Mode.ON_PREM
+                     ? PreparedNativeStore.create() : PreparedNativeStore.createCloud();
+             AtlasRuntime runtime = new AtlasRuntime(mode, prepared);
              ServerHandle server = runtime.launch(Tiers.IN_PROCESS)) {
             fixture.permissions(true, false);
             try (MongoClient reader = MongoClients.create(fixture.sourceUri())) {
