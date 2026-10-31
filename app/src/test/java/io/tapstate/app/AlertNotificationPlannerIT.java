@@ -30,11 +30,27 @@ class AlertNotificationPlannerIT {
     }
     static void bad(AlertEvaluationHostIT.Fixture f){assertThat(f.evaluator().accept(f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)),1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);}
     static List<AlertStore.Stored<AlertIntent.Record>> intents(AlertEvaluationHostIT.Fixture f){return f.store().dueIntents(T.plus(Duration.ofDays(60)),null,100).rows();}
-    @Test void anEpisodeFreeClearObservationSurvivesUnrelatedConfigurationWrites() {
+    static long settledBaseline(AlertEvaluationHostIT.Fixture f,AlertEvaluationHost.Binding binding,boolean recovered) {
+        long sequence=0;
+        if(recovered){
+            assertThat(f.evaluator().accept(binding,++sequence,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            f.now().set(T.plusMillis(100));
+        }
+        assertThat(f.evaluator().accept(binding,++sequence,new AlertInput.Conditions(f.clock().instant(),AlertSignal.Condition.GOOD,null)))
+                .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        var head=f.store().state(binding.key(),f.reads()).orElseThrow().value();
+        assertThat(head.snapshot().status()).isEqualTo(recovered?AlertSnapshot.Status.RESOLVED:AlertSnapshot.Status.CLEAR);
+        if(recovered)assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+        else assertThat(head.episode()).isNull();
+        return sequence;
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void aSettledObservationSurvivesUnrelatedConfigurationWrites(boolean recovered) {
         AlertEvaluationHostIT.withFixture(f->{
             var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
-            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
-                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            long sequence=settledBaseline(f,binding,recovered);
             // The first observation changes quality; interleave writes only after that baseline is valid.
             assertThat(f.store().state(binding.key(),f.reads()).orElseThrow().value().snapshot().quality())
                     .isEqualTo(AlertSnapshot.Quality.VALID);
@@ -54,22 +70,22 @@ class AlertNotificationPlannerIT {
             }).when(interleaved).commit(org.mockito.ArgumentMatchers.any());
             f.evaluator().withPlanner(new AlertNotificationPlanner(interleaved,f.clock(),"clear-observer",null,ACTIVE));
             f.now().set(T.plusSeconds(1));
-            assertThat(f.evaluator().accept(binding,2,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
+            assertThat(f.evaluator().accept(binding,sequence+1,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
                     .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
             var retained=f.store().state(binding.key(),f.reads()).orElseThrow().value();
-            assertThat(retained.snapshot().status()).isEqualTo(AlertSnapshot.Status.CLEAR);
-            assertThat(retained.snapshot().lastSequence()).isEqualTo(2);
-            assertThat(retained.episode()).isNull();assertThat(edits).hasValue(1);
+            assertThat(retained.snapshot().status()).isEqualTo(recovered?AlertSnapshot.Status.RESOLVED:AlertSnapshot.Status.CLEAR);
+            assertThat(retained.snapshot().lastSequence()).isEqualTo(sequence+1);
+            if(recovered)assertThat(retained.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+            else assertThat(retained.episode()).isNull();assertThat(edits).hasValue(1);
             assertThat(f.store().planning().schedules()).isEmpty();assertThat(intents(f)).isEmpty();
         });
     }
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
-    void anEpisodeFreeClearStillRejectsAnUnavailableStoreType(boolean missing) {
+    @org.junit.jupiter.params.provider.CsvSource({"true,false","false,false","true,true","false,true"})
+    void aSettledObservationStillRejectsAnUnavailableStoreType(boolean missing,boolean recovered) {
         AlertEvaluationHostIT.withFixture(f->{
             var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
-            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
-                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            long sequence=settledBaseline(f,binding,recovered);
             var before=f.store().state(binding.key(),f.reads()).orElseThrow();
             var type=BuiltinAlarmTypes.catalog().types().stream().filter(t->t.id().equals(f.rule().typeId())).findFirst().orElseThrow();
             var newer=new AlarmTypeCatalog.Type(type.id(),type.version()+1,type.kind(),type.resourceKinds(),type.providerId(),
@@ -78,17 +94,18 @@ class AlertNotificationPlannerIT {
             var current=f.configuration().alerts(f.storeHost(),new AlarmTypeCatalog(missing?List.of():List.of(newer)),f.clock());
             f.evaluator().withPlanner(new AlertNotificationPlanner(current,f.clock(),"unsupported-observer",null,ACTIVE));
             f.now().set(T.plusSeconds(1));
-            assertThatThrownBy(()->f.evaluator().accept(binding,2,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
+            assertThatThrownBy(()->f.evaluator().accept(binding,sequence+1,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
                     .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                             error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
             assertThat(f.store().state(binding.key(),f.reads()).orElseThrow()).isEqualTo(before);
         });
     }
-    @Test void anExplicitPlanningVersionStillFencesAnEpisodeFreeClearProposal() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void anExplicitPlanningVersionStillFencesASettledProposal(boolean recovered) {
         AlertEvaluationHostIT.withFixture(f->{
             var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
-            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
-                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            long sequence=settledBaseline(f,binding,recovered);
             var before=f.store().state(binding.key(),f.reads()).orElseThrow();var version=f.store().planning().version();
             var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,
                     f.storeHost().scope(),"intervening-rule"),AlertChannelPolicy.Deployment.ON_PREM,T,"operator");

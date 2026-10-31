@@ -35,10 +35,11 @@ final class AlertNotificationPlanner {
     AlertStore.Outcome accept(AlertStore.Commit state) {
         active.run();
         if(state.kind()==AlertStore.CommitKind.STATE_AND_PLAN && state.state()!=null
-                && state.state().after().snapshot().status()==AlertSnapshot.Status.CLEAR
-                && state.state().after().episode()==null && state.state().transitions().isEmpty()
+                && (state.state().after().snapshot().status()==AlertSnapshot.Status.CLEAR
+                    || state.state().after().snapshot().status()==AlertSnapshot.Status.RESOLVED)
+                && state.state().transitions().isEmpty()
                 && state.intents().isEmpty() && state.schedules().isEmpty()) {
-            // An episode-free clear state derives no notification decisions from a planning snapshot.
+            // A settled state without transitions derives no notification decisions from a planning snapshot.
             return store.commit(state);
         }
         var view=store.planning();var changes=seed(view,state.state()==null?null:state.state().after());

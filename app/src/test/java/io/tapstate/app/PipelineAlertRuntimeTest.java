@@ -45,6 +45,46 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void removedResourceReconciliationReadsOnlyHeadsThatStillNeedRetirement(boolean retired) {
+        var rule=useResourceRule();var resource=new AlarmKey.Resource("source","erp","uuid");
+        var binding=new AlertEvaluationHost.Binding(rule,resource,"producer",1,()->{});
+        assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(T,"a".repeat(64),
+                OperationalEvidence.Capability.STREAM_READ,false))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        if(retired)fixture.host.end(binding.key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{});
+        var retained=rows.get(binding.key());
+        when(fixture.store.evaluationStates(any(),anyInt())).thenReturn(new AlertStore.EvaluationPage(
+                List.of(retained),null,Set.of(resource),Set.of()));
+        clearInvocations(fixture.store);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            if(retired)verify(fixture.store,never()).state(eq(binding.key()),any());
+            else verify(fixture.store,atLeastOnce()).state(eq(binding.key()),any());
+            assertThat(rows.get(binding.key()).value().retiredAt()).isNotNull();
+            assertThat(rows.get(binding.key()).value().episode().value().endReason())
+                    .isEqualTo(AlertSnapshot.EndReason.RESOURCE_REMOVED);
+        }
+    }
+    @Test void anotherObserversRetirementStillEvictsTheOriginalLocalBinding() {
+        useResourceRule();
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"erp",T,false,()->{});drained(runtime);
+            var head=resourceHead("erp");var key=head.snapshot().rule().key();
+            fixture.now.set(T.plusSeconds(31));
+            var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),
+                    AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"peer-owner",()->{});
+            assertThat(peer.end(key,AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{}))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            when(fixture.store.evaluationStates(any(),anyInt())).thenAnswer(call->new AlertStore.EvaluationPage(
+                    List.copyOf(rows.values()),null,Set.of(key.resource()),Set.of()));
+            runtime.tick();drained(runtime);clearInvocations(fixture.store);
+            runtime.tick();drained(runtime);
+            verify(fixture.store,never()).state(eq(key),any());
+            assertThat(rows.get(key).value().retiredAt()).isNotNull();
+            assertThat(rows.get(key).value().owner().ownerId()).isEqualTo("peer-owner");
+        }
+    }
     static Observation observation(String id, Instant at, PipelineState state) {
         return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, at, List.of());
     }
