@@ -62,6 +62,16 @@ final class ValidationMemberResources implements AutoCloseable {
         private Member(State state, Runnable active, boolean compatible) { this.state = state; this.active = active; this.compatible = compatible; }
         Metadata admitMetadata() {return admitMetadata(false);}
         Metadata admitMaintenanceMetadata() {return admitMetadata(true);}
+        Metadata admitRetainedMetadata(){return admitRetainedMetadata(1).getFirst();}
+        List<Metadata> admitRetainedMetadata(int frames){
+            require();var leases=metadata.acquireRetainedBundle(this,frames);
+            try{require();return leases.stream().map(Metadata::new).toList();}
+            catch(RuntimeException|Error failed){leases.forEach(io.tapstate.core.validation.ValidationMetadataBudget.Lease::close);throw failed;}
+        }
+        Metadata admitWorkMetadata(){
+            require();var lease=metadata.acquireWork(this);
+            try{require();return new Metadata(lease);}catch(RuntimeException|Error failed){lease.close();throw failed;}
+        }
         private Metadata admitMetadata(boolean maintenance) {
             require();var lease=maintenance?metadata.acquireMaintenance(this):metadata.acquire(this);
             try { require(); return new Metadata(lease); } catch (RuntimeException | Error failed) { lease.close(); throw failed; }
@@ -71,7 +81,7 @@ final class ValidationMemberResources implements AutoCloseable {
         /** A blocking metadata consumer is a third paid worker; native query and decode retain their own slots. */
         Probe admitProbeWithConsumer(){return admitProbe(true);}
         private Probe admitProbe(boolean consumer){
-            var frame=admitMetadata();Unbound allocation=null;
+            var frame=admitWorkMetadata();Unbound allocation=null;
             try{
                 int workers=consumer?3:2;
                 allocation=reserve(new ValidationLocalBudget.Amount(16L*1024*1024,workers,1,1),0);var probe=new Probe(this,frame,allocation,workers);

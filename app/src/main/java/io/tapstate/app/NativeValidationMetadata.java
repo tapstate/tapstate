@@ -39,7 +39,7 @@ final class NativeValidationMetadata {
         Objects.requireNonNull(selection);Objects.requireNonNull(method);Objects.requireNonNull(projections);
         if(deadline==null||!deadline.isAfter(clock.instant())||deadline.isAfter(clock.instant().plusSeconds(60)))throw invalid("deadline");
         if(!method.supports(ValidationMode.FULL)||method==ValidationMethod.COUNT&&!projections.isEmpty()||projections.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("method");
-        var scope=new Scope(member.admitMetadata(),deadline,method);
+        var scope=new Scope(member.admitWorkMetadata(),deadline,method);
         try{
             scope.require();
             for(var entry:projections.entrySet())if(entry.getKey()==null||entry.getValue()==null)throw invalid("projectionMapping");

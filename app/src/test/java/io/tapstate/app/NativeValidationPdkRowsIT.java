@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
-import io.tapstate.core.validation.ValidationError;
+import io.tapstate.core.validation.*;
+import io.tapstate.spi.store.ValidationTaskStore;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Clock;
@@ -18,6 +19,23 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class NativeValidationPdkRowsIT {
     @Container static final MongoDBContainer MONGO = NativeValidationOwnerReservationsIT.MONGO;
+
+    @Test void anOlderSavedTextKeyCannotBypassNativeOrderingAdmission() {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture()){
+            var previous=f.comparison;var mapping=previous.mappings().getFirst();
+            var field=new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("text"));
+            var legacy=new ValidationTaskSpec(previous.pipelineId(),previous.dependencyHashes(),previous.mappingRevision()+1,previous.comparisonRulesVersion(),
+                    List.of(new ValidationTaskSpec.Mapping(mapping.mappingId(),mapping.outputKind(),mapping.outputId(),mapping.source(),mapping.target(),
+                            new ValidationTaskSpec.Keys("old-text-confirmation",List.of(field),List.of(field)))));
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,legacy,ValidationTaskStore.Settings.defaults(ValidationMethod.UNIQUE_KEY,1000),java.util.UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var request=new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,1,"FULL",java.util.UUID.randomUUID(),java.util.UUID.randomUUID().toString());
+            var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var original=f.owners.take(f.owners.original(request,accepted.owner()));
+            assertThatThrownBy(()->new NativeValidationPdkRows(original,original.declarations,ValidationDirectMappings.declare(original.declarations),Map.of(),Clock.systemUTC()))
+                    .isInstanceOfSatisfying(TapstateException.class,refused->{assertThat(refused.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED);
+                        assertThat(refused.args()).containsEntry("rule","native-text-ordering-unproven");});
+        }
+    }
 
     @Test void exceptionalWorkerExitAndAnIdempotentCloseCannotReleaseTheNativeReadBudget() throws Exception {
         try (var f = new NativeValidationOwnerReservationsIT.Fixture()) {

@@ -29,6 +29,27 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationOwnerReservationsIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
 
+    @Test void concurrentRootProducingReservationsCannotHoldEachOthersQuotaFrames()throws Exception{
+        try(var f=new Fixture();var callers=Executors.newFixedThreadPool(2)){
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var other=new PipelineResource("other",null,List.of(SourceRef.spec("input",false)),null,null,
+                    new ServeBlock.Inline("serving",FromRef.literal("orders"),List.of(new SyncElement("out","views",null,null,null)),null,null),null,null);
+            assertThat(f.configuration.artifacts().create(other)).isEqualTo(ArtifactMutation.CREATED);
+            var hashes=new TreeMap<>(f.comparison.dependencyHashes());hashes.remove("flow");hashes.put("other",CanonicalHash.of(other));
+            var comparison=new ValidationTaskSpec("other",hashes,1,"rules",f.comparison.mappings());
+            var task=new ValidationReportAdmission.Task("cluster","other","task",UUID.randomUUID());
+            assertThat(f.tasks.create(new ValidationTaskStore.Create(task,comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var first=new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var second=new ValidationOwnerRouter.Request("other","task",task.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var barrier=new CyclicBarrier(2);
+            var a=callers.submit(()->{barrier.await();return f.owners.reserve(first);});
+            var b=callers.submit(()->{barrier.await();return f.owners.reserve(second);});
+            var results=List.of(a.get(10,TimeUnit.SECONDS),b.get(10,TimeUnit.SECONDS));
+            assertThat(results).extracting(ValidationOwnerRouter.Result::outcome).containsExactlyInAnyOrder(ValidationOwnerRouter.Outcome.ACCEPTED,ValidationOwnerRouter.Outcome.CAPACITY);
+            assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
+        }
+    }
+
     @Test void preparedOwnerObservationDoesNotPrepareOrWriteEitherStorageDomain() {
         try(var f=new Fixture()){
             f.owners.readOwner("flow");

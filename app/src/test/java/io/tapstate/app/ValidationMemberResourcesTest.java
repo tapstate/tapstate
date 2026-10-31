@@ -113,6 +113,25 @@ class ValidationMemberResourcesTest {
             try(var count=member.admitProbe()){assertThatThrownBy(count::consumerExecutor).isInstanceOf(TapstateException.class).hasMessageContaining("probeConsumer");}
         }finally{release.countDown();}
     }
+    @Test void retainedRunsAndAnUnresolvedProbeStillLeaveAFrameForCancellation()throws Exception{
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});
+            try(var first=member.admitRetainedMetadata();var second=member.admitRetainedMetadata()){
+                var probe=member.admitProbe();var workers=new CompletableFuture<Void>();var rows=new CompletableFuture<Void>();
+                var closed=new CountDownLatch(1);probe.retain(closed::countDown,workers,rows);
+                try{
+                    assertThat(member.snapshot().metadataFrames()).isEqualTo(3);
+                    assertThatThrownBy(member::admitProbe).isInstanceOf(TapstateException.class);
+                    try(var control=member.admitControl()){
+                        control.execute(probe::close);control.released().toCompletableFuture().get(2,TimeUnit.SECONDS);
+                    }
+                    assertThat(closed.await(2,TimeUnit.SECONDS)).isTrue();
+                    assertThat(probe.released().toCompletableFuture()).isNotDone();
+                }finally{workers.complete(null);rows.complete(null);probe.close();probe.released().toCompletableFuture().get(2,TimeUnit.SECONDS);}
+            }
+            assertThat(member.snapshot().metadataFrames()).isZero();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
+        }
+    }
     @Test void aMinimalWorkerReceiptPreservesFatalDiagnosisPriority()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){

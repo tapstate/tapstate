@@ -46,6 +46,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             var keys=declared.mapping().keys();
             for(int component=0;component<keys.source().size();component++){
                 var from=keys.source().get(component);var to=keys.target().get(component);
+                for(var key:List.of(from,to))if(key.domain()==ValidationKey.Kind.TEXT&&!key.logicalTypes().equals(Set.of("object-id")))
+                    throw unsupported("keys",String.join(".",key.path()),"native-text-ordering-unproven");
                 if((from.logicalTypes().contains("object-id")||to.logicalTypes().contains("object-id"))
                         &&(!from.logicalTypes().equals(Set.of("object-id"))||!to.logicalTypes().equals(Set.of("object-id"))
                             ||from.domain()!=ValidationKey.Kind.TEXT||to.domain()!=ValidationKey.Kind.TEXT))

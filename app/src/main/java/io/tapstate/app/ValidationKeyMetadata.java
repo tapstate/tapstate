@@ -29,7 +29,8 @@ final class ValidationKeyMetadata {
                 case STRING -> {
                     domain=ValidationKey.Kind.TEXT;
                     boolean identifier=nativeBson&&field.dataType()!=null&&field.dataType().replace("_","").equalsIgnoreCase("OBJECTID");
-                    logical=identifier?Set.of("object-id"):Set.of("text");
+                    if(!identifier){unavailable.put(name,"native-text-ordering-unproven");continue;}
+                    logical=Set.of("object-id");
                 }
                 case BOOLEAN -> {domain=ValidationKey.Kind.BOOLEAN;logical=Set.of("boolean");}
                 case BINARY -> {unavailable.put(name,"binary-key-subtype-unavailable");continue;}

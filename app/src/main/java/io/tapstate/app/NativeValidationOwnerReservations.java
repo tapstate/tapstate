@@ -132,7 +132,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 local.operations.remove(handoff.key(),handoff.displaced());
             }
             operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
-            operation.preparing = true; operation.metadata = resources.admitMetadata();
+            operation.preparing = true;
+            var metadata=resources.admitRetainedMetadata(retainedFrames(request));operation.metadata=metadata.getFirst();
+            if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
             var task = task(request); var definitions = configuration.validationTasks(this::requireActive);
             var inputs = definitions.inputs(task, request.configurationRevision());
             if (inputs.isEmpty()) return operation.reject();
@@ -140,6 +142,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             var saved = operation.declarations.original().task();
             operation.spec = new ValidationRunSpec(saved.comparison(), ValidationMode.valueOf(request.mode()),
                     request.mode().equals("FULL") ? saved.settings().full().method() : ValidationMethod.FULL_COLUMN);
+            if(needsQuota(operation.spec)!=(operation.quotaMetadata!=null))return operation.reject();
             var selected = saved.mode(operation.spec.mode());
             if (selected.permission() != null && selected.permission().start().sequence() == request.startSequence()) return operation.reject();
             if (selected.nextStartSequence() != request.startSequence()) return operation.reject();
@@ -425,6 +428,16 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }
     }
     private ValidationReportAdmission.Task task(Request request) { return new ValidationReportAdmission.Task(scope.clusterId(), request.pipeline(), request.task(), request.taskGeneration()); }
+    private int retainedFrames(Request request){
+        // This temporary paid read returns only a scalar. The full snapshot is read again under
+        // the complete retained bundle and the original revision before any owner is acquired.
+        try(var frame=resources.admitWorkMetadata()){
+            var saved=configuration.validationTasks(this::requireActive).read(request.pipeline(),request.task()).orElse(null);
+            return saved!=null&&saved.task().generation().equals(request.taskGeneration())&&saved.revision()==request.configurationRevision()
+                    &&(!request.mode().equals("FULL")||saved.settings().full().method()!=ValidationMethod.COUNT)?2:1;
+        }
+    }
+    private static boolean needsQuota(ValidationRunSpec spec){return spec.mode()!=ValidationMode.FULL||spec.method()!=ValidationMethod.COUNT;}
     private ValidationLocalBudget.Amount envelope(ValidationTaskStore.Snapshot saved, ValidationRunSpec spec) {
         int tables = spec.mode() == ValidationMode.FULL ? Math.min(saved.settings().full().maxConcurrentTables(), spec.task().mappings().size()) : 1;
         boolean count = spec.method() == ValidationMethod.COUNT;
@@ -457,10 +470,14 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         volatile Owner owner; volatile ValidationSavedDeclarations declarations; volatile ValidationRunSpec spec;
         volatile StartupGate startup;volatile ValidationLocalBudget.Amount dataEnvelope;
         volatile MongoConfigurationDomain.ValidationAccess access;
-        volatile ValidationMemberResources.Metadata metadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
+        volatile ValidationMemberResources.Metadata metadata,quotaMetadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
         private volatile Runnable stop;
         private volatile ValidationRunState terminal;private boolean terminalAdmitted,terminalWithoutReport;private volatile TerminalReceipt previous;private Set<UUID> blocked=Set.of();
         Reservation(Pipeline pipeline, Request request) { this.pipeline = pipeline; this.request = request; }
+        synchronized ValidationMemberResources.Metadata takeQuotaMetadata(){
+            requireReserved();var frame=quotaMetadata;if(frame==null)throw new IllegalStateException("root quota was not admitted with its original declaration");
+            quotaMetadata=null;return frame;
+        }
         ValidationRunSpec spec() { requireReserved(); return spec; }
         ValidationMemberResources.Run resources() { requireReserved(); return bound; }
         MongoConfigurationDomain.ValidationAccess access() { return access; }
@@ -553,7 +570,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             if (bound != null) { bound.close(); bound.processorsExited(); }
             if (unbound != null) unbound.close(); clearMetadata();
         }
-        private synchronized void clearMetadata() { declarations = null; spec = null;startup=null;dataEnvelope=null; if (metadata != null) { metadata.close(); metadata = null; } }
+        private synchronized void clearMetadata() { declarations = null; spec = null;startup=null;dataEnvelope=null; if (metadata != null) { metadata.close(); metadata = null; } if(quotaMetadata!=null){quotaMetadata.close();quotaMetadata=null;} }
         @Override public void close() {
             Runnable callback;
             synchronized (this) {

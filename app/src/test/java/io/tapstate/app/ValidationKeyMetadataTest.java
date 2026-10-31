@@ -16,14 +16,15 @@ class ValidationKeyMetadataTest {
         assertThat(rules.fields().get("decimal").logicalTypes()).containsExactly("exact-number");
         assertThat(rules.fields().get("approximate").numericPolicy()).isEqualTo(ValidationKeyBinding.NumericPolicy.EXACT_BINARY_FLOAT);
         assertThat(rules.fields().get("approximate").logicalTypes()).contains("float32","float64","exact-number");
-        assertThat(rules.fields().get("text").domain()).isEqualTo(ValidationKey.Kind.TEXT);
+        assertThat(rules.fields()).doesNotContainKey("text");
+        assertThat(rules.unavailable()).containsEntry("text","native-text-ordering-unproven");
         assertThat(rules.fields().get("flag").domain()).isEqualTo(ValidationKey.Kind.BOOLEAN);
     }
     @Test void nativeIdentifiersRequireThePinnedBsonProfileAndDoNotBecomeOrdinaryText(){
         var model=model(new SourceField("native_id","OBJECT_ID",TapstateType.STRING),new SourceField("ordinary","VARCHAR",TapstateType.STRING));
         assertThat(ValidationKeyMetadata.describe(model,true).fields().get("native_id").logicalTypes()).containsExactly("object-id");
-        assertThat(ValidationKeyMetadata.describe(model,true).fields().get("ordinary").logicalTypes()).containsExactly("text");
-        assertThat(ValidationKeyMetadata.describe(model,false).fields().get("native_id").logicalTypes()).containsExactly("text");
+        assertThat(ValidationKeyMetadata.describe(model,true).unavailable()).containsEntry("ordinary","native-text-ordering-unproven");
+        assertThat(ValidationKeyMetadata.describe(model,false).unavailable()).containsEntry("native_id","native-text-ordering-unproven");
     }
     @Test void unknownTemporalBinarySubtypesAndContainersDoNotAcquireGuessedKeyDomains(){
         var model=model(new SourceField("binary","BINARY",TapstateType.BINARY),new SourceField("calendar","TIMESTAMP",TapstateType.DATETIME),

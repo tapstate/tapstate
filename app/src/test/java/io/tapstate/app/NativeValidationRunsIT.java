@@ -251,12 +251,13 @@ class NativeValidationRunsIT {
 
     private static ValidationRoot root(int value){return new ValidationRoot("mapping","out",new ValidationKey(List.of(ValidationKey.Part.number(value))),List.of());}
     private static void await(java.util.function.BooleanSupplier fact)throws InterruptedException{long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);while(!fact.getAsBoolean()&&System.nanoTime()-until<0)Thread.sleep(10);assertThat(fact.getAsBoolean()).isTrue();}
-    @Test void actualNativeRunRegistryWaitsCancelsAndReleasesItsSharedGeneration() throws Exception {
-        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
-            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
-            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);
+    @Test void nativeRunRegistryKeepsOnlyItsRequiredFramesThroughWaitingAndStop() throws Exception {
+        for(var method:List.of(ValidationMethod.COUNT,ValidationMethod.FULL_COLUMN))try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(method,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var request=new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,method);
             var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),spec.mode(),spec.fingerprint(),1,"rules");
-            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
+            var start=new ValidationReportAdmission.Start(f.task,2,1,request.command().toString(),identity);
             var activation=new ValidationRunLifecycle.Activation(){
                 public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD;}
                 public ValidationRunLifecycle.Execution create(){throw new AssertionError("initial waiting cannot create a Job");}
@@ -264,7 +265,7 @@ class NativeValidationRunsIT {
             runs.start(start,activation);
             long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
             while(!runs.read(identity).waiting()&&System.nanoTime()-until<0)Thread.sleep(10);
-            assertThat(runs.read(identity).waiting()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
+            assertThat(runs.read(identity).waiting()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(method==ValidationMethod.COUNT?1:2);
             runs.stop(identity);
             until=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
             while(f.tasks.read("flow","task").orElseThrow().full().permission().phase()!=ValidationTaskStore.Phase.CLOSED&&System.nanoTime()-until<0)Thread.sleep(10);

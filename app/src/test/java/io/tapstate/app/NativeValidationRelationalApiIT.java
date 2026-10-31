@@ -33,7 +33,9 @@ class NativeValidationRelationalApiIT {
     @Test @Timeout(180) void mysqlMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(true);}
     @Test @Timeout(180) void postgresMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(false);}
 
-    private void verify(boolean mysql)throws Exception{
+    @Test @Timeout(180) void mysqlNonBinaryTextKeysAreRefusedDuringPreflight()throws Exception{verify(true,true);}
+    private void verify(boolean mysql)throws Exception{verify(mysql,false);}
+    private void verify(boolean mysql,boolean textOnly)throws Exception{
         int port=mysql?3306:5432;String kind=mysql?"mysql":"postgres";
         try(var sql=new GenericContainer<>(mysql?"mysql:8.0":"postgres:16").withExposedPorts(port).withStartupTimeout(Duration.ofSeconds(75))){
             if(mysql)sql.withEnv("MYSQL_ROOT_PASSWORD",PASSWORD).withEnv("MYSQL_DATABASE",DB).withEnv("MYSQL_USER","validation").withEnv("MYSQL_PASSWORD",PASSWORD)
@@ -42,17 +44,22 @@ class NativeValidationRelationalApiIT {
                     .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\n",2));
             sql.start();String statement="CREATE TABLE orders (id BIGINT PRIMARY KEY, payload VARCHAR(32), amount BIGINT); INSERT INTO orders VALUES (1,'same',9007199254740993),(2,'two',9007199254740993); "
                     +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
+            if(mysql)statement+=" CREATE TABLE text_orders (id VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci PRIMARY KEY); INSERT INTO text_orders VALUES ('a'),('B');";
             var seeded=mysql?sql.execInContainer("mysql","--protocol=TCP","--host=127.0.0.1","--user=validation","--password="+PASSWORD,"--batch",DB,"-e",statement)
                     :sql.execInContainer("psql","-U","validation","-d",DB,"-c",statement);
             assertThat(seeded.getExitCode()).as(seeded.getStderr()).isZero();
             var source=new LinkedHashMap<String,Object>();source.put("host",sql.getHost());source.put("port",sql.getMappedPort(port));source.put("database",DB);
             source.put(mysql?"username":"user","validation");source.put("password",PASSWORD);source.put("timezone","+00:00");source.put("oldVersionTimezone",false);
             if(mysql)source.put("addtionalString","useSSL=false&allowPublicKeyRetrieval=true");else source.put("schema","public");
-            exercise(kind,source);
+            if(textOnly){
+                var ordered=sql.execInContainer("mysql","--protocol=TCP","--host=127.0.0.1","--user=validation","--password="+PASSWORD,"--batch","--skip-column-names",DB,"-e","SELECT id FROM text_orders ORDER BY id");
+                assertThat(ordered.getExitCode()).isZero();assertThat(ordered.getStdout().strip()).isEqualTo("a\nB");
+            }
+            exercise(kind,source,textOnly);
         }
     }
 
-    private void exercise(String kind,Map<String,Object> source)throws Exception{
+    private void exercise(String kind,Map<String,Object> source,boolean textOnly)throws Exception{
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"relational_http","admin",PASSWORD);
         try(var schema=io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
                 new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId(),UUID.randomUUID());
@@ -64,6 +71,7 @@ class NativeValidationRelationalApiIT {
             var target=observer.getDatabase(targetName);
             target.getCollection("checked_orders").insertMany(List.of(new Document("id",1L).append("payload","same").append("amount",9007199254740993L),
                     new Document("id",2L).append("payload","two").append("amount",9007199254740993L)));
+            if(textOnly)target.getCollection("checked_text_orders").insertMany(List.of(new Document("id","a"),new Document("id","B")));
             target.getCollection("checked_items").insertMany(List.of(item(9,90,"item"),item(11,110,"tail")));
             try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
                     "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
@@ -73,13 +81,27 @@ class NativeValidationRelationalApiIT {
                 var sourceConnector=registrar.register(artifact(kind),RegistrationSource.REGISTER).registration().connectorId();
                 var targetConnector=registrar.register(artifact("mongodb"),RegistrationSource.REGISTER).registration().connectorId();
                 var artifacts=child.getBean(ArtifactStore.class);
-                artifacts.create(new SourceResource("input",null,sourceConnector,source,SourceMode.SNAPSHOT,List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null));
+                artifacts.create(new SourceResource("input",null,sourceConnector,source,SourceMode.SNAPSHOT,textOnly?List.of(TableRef.literal("orders"),TableRef.literal("items"),TableRef.literal("text_orders")):List.of(TableRef.literal("orders"),TableRef.literal("items")),null,null));
                 artifacts.create(new SourceResource("target",null,targetConnector,Map.of("uri",MONGO.getReplicaSetUrl(targetName),"database",targetName,"isUri",true),null,null,null,null));
                 artifacts.create(new PipelineResource("flow",null,List.of(SourceRef.spec("input",false)),null,null,
                         new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("input.orders"),FromRef.literal("input.items")),
                                 List.of(new SyncElement("out","target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
                 var tokens=child.getBean(TokenService.class);String write=tokens.create(Scope.WRITE),read=tokens.create(Scope.READ);
                 var http=RestClient.create("http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort());
+                if(textOnly){
+                    artifacts.create(new PipelineResource("text_flow",null,List.of(SourceRef.spec("input",false)),null,null,
+                            new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("input.text_orders")),List.of(new SyncElement("out","target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
+                    for(var method:List.of("COUNT","UNIQUE_KEY","FULL_COLUMN")){
+                        var input=Map.of("pipelineId","text_flow","taskId","full","expectedRevision","0","method",method,
+                                "mappings",List.of(Map.of("mappingId","text","outputId","out","sourceId","input","table","text_orders")),
+                                "confirmations",method.equals("COUNT")?Map.of():Map.of("text",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
+                        if(method.equals("COUNT"))assertThat(post(http,write,"evaluate",input)).containsEntry("method","COUNT");
+                        else assertThatThrownBy(()->post(http,write,"evaluate",input)).isInstanceOfSatisfying(org.springframework.web.client.HttpClientErrorException.class,
+                                refused->{assertThat(refused.getStatusCode().value()).isEqualTo(400);assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-text-ordering-unproven");});
+                    }
+                    assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
+                    return;
+                }
                 var operations=new LinkedHashMap<String,Map<String,Object>>();var inputs=new LinkedHashMap<String,Map<String,Object>>();
                 for(var method:List.of("COUNT","UNIQUE_KEY","FULL_COLUMN")){
                     var task=method.toLowerCase(Locale.ROOT);var input=selection(task,method);inputs.put(method,input);

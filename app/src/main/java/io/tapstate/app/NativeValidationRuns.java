@@ -66,8 +66,8 @@ final class NativeValidationRuns implements AutoCloseable {
     private Shared shared(Actor actor) {
         var key=new Generation(actor.original.identity().owner(),actor.original.countingGeneration());
         synchronized(quotas) {
-            var current=quotas.get(key);if(current!=null)return current;
-            var frame=resources.admitMetadata();
+            var current=quotas.get(key);if(current!=null){actor.reservation.takeQuotaMetadata().close();return current;}
+            var frame=actor.reservation.takeQuotaMetadata();
             try {current=new Shared(key,frame,new ValidationOwnerQuota(key.owner(),key.counting(),8L*1024*1024,actor.reservation.access().control(),actor.reservation::requireOwner));quotas.put(key,current);return current;}
             catch(RuntimeException|Error failed){frame.close();throw failed;}
         }
@@ -198,7 +198,12 @@ final class NativeValidationRuns implements AutoCloseable {
             settleReport();
         }
         private void settleReport(){reportSettled=true;reservation.reportSettled();}
-        @Override public void joined(){reservation.joinedOriginal(original.admission());shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());}
+        @Override public void joined(){
+            reservation.joinedOriginal(original.admission());
+            // Count summaries never publish roots or consume their shared problem quota.
+            if(original.identity().mode()==ValidationMode.FULL&&original.snapshot().method()==ValidationMethod.COUNT)return;
+            shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());
+        }
         @Override public void requireOwner(){reservation.requireOwner();}
         @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw invalid("runs.publicationClosed");}
         @Override public void sealPublication(){sealed.set(true);var queue=candidates;if(queue!=null)queue.close();var value=shared;if(value!=null)value.quota.seal(original.identity());}
