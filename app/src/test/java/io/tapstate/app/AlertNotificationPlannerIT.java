@@ -30,6 +30,78 @@ class AlertNotificationPlannerIT {
     }
     static void bad(AlertEvaluationHostIT.Fixture f){assertThat(f.evaluator().accept(f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)),1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);}
     static List<AlertStore.Stored<AlertIntent.Record>> intents(AlertEvaluationHostIT.Fixture f){return f.store().dueIntents(T.plus(Duration.ofDays(60)),null,100).rows();}
+    @Test void anEpisodeFreeClearObservationSurvivesUnrelatedConfigurationWrites() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            // The first observation changes quality; interleave writes only after that baseline is valid.
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow().value().snapshot().quality())
+                    .isEqualTo(AlertSnapshot.Quality.VALID);
+            var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,
+                    f.storeHost().scope(),"unrelated-rule"),AlertChannelPolicy.Deployment.ON_PREM,T,"operator");
+            var unrelated=new java.util.concurrent.atomic.AtomicReference<>(new AlertConfiguration.Rule(header,"Other rule",
+                    f.rule().typeId(),f.rule().typeVersion(),f.rule().resources(),f.rule().parameters(),null,true,null).enrolled(null));
+            assertThat(f.store().saveDefinition(null,unrelated.get(),access())).isEqualTo(AlertStore.Outcome.STAGED);
+            var edits=new java.util.concurrent.atomic.AtomicInteger();
+            var interleaved=org.mockito.Mockito.mock(AlertStore.class,org.mockito.AdditionalAnswers.delegatesTo(f.store()));
+            org.mockito.Mockito.doAnswer(call->{
+                var before=unrelated.get();int edit=edits.incrementAndGet();f.now().set(T.plusSeconds(1).plusMillis(edit));
+                var after=new AlertConfiguration.Rule(before.header().next(f.clock().instant(),"operator"),"Other rule "+edit,
+                        before.typeId(),before.typeVersion(),before.resources(),before.parameters(),null,true,null).enrolled(before);
+                assertThat(f.store().saveDefinition(before,after,access())).isEqualTo(AlertStore.Outcome.STAGED);
+                unrelated.set(after);return f.store().commit(call.getArgument(0));
+            }).when(interleaved).commit(org.mockito.ArgumentMatchers.any());
+            f.evaluator().withPlanner(new AlertNotificationPlanner(interleaved,f.clock(),"clear-observer",null,ACTIVE));
+            f.now().set(T.plusSeconds(1));
+            assertThat(f.evaluator().accept(binding,2,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            var retained=f.store().state(binding.key(),f.reads()).orElseThrow().value();
+            assertThat(retained.snapshot().status()).isEqualTo(AlertSnapshot.Status.CLEAR);
+            assertThat(retained.snapshot().lastSequence()).isEqualTo(2);
+            assertThat(retained.episode()).isNull();assertThat(edits).hasValue(1);
+            assertThat(f.store().planning().schedules()).isEmpty();assertThat(intents(f)).isEmpty();
+        });
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    void anEpisodeFreeClearStillRejectsAnUnavailableStoreType(boolean missing) {
+        AlertEvaluationHostIT.withFixture(f->{
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            var before=f.store().state(binding.key(),f.reads()).orElseThrow();
+            var type=BuiltinAlarmTypes.catalog().types().stream().filter(t->t.id().equals(f.rule().typeId())).findFirst().orElseThrow();
+            var newer=new AlarmTypeCatalog.Type(type.id(),type.version()+1,type.kind(),type.resourceKinds(),type.providerId(),
+                    type.evaluatorId(),type.parameters(),type.defaultSeverity(),type.enabledByDefault(),type.conditionTextKey(),
+                    type.recoveryTextKey(),type.guidanceTextKey());
+            var current=f.configuration().alerts(f.storeHost(),new AlarmTypeCatalog(missing?List.of():List.of(newer)),f.clock());
+            f.evaluator().withPlanner(new AlertNotificationPlanner(current,f.clock(),"unsupported-observer",null,ACTIVE));
+            f.now().set(T.plusSeconds(1));
+            assertThatThrownBy(()->f.evaluator().accept(binding,2,new AlertInput.Conditions(T.plusSeconds(1),AlertSignal.Condition.GOOD,null)))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error->assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow()).isEqualTo(before);
+        });
+    }
+    @Test void anExplicitPlanningVersionStillFencesAnEpisodeFreeClearProposal() {
+        AlertEvaluationHostIT.withFixture(f->{
+            var binding=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE));
+            assertThat(f.evaluator().accept(binding,1,new AlertInput.Conditions(T,AlertSignal.Condition.GOOD,null)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            var before=f.store().state(binding.key(),f.reads()).orElseThrow();var version=f.store().planning().version();
+            var header=AlertConfiguration.Header.create(AlertConfiguration.Identity.create(AlertConfiguration.Kind.RULE,
+                    f.storeHost().scope(),"intervening-rule"),AlertChannelPolicy.Deployment.ON_PREM,T,"operator");
+            var other=new AlertConfiguration.Rule(header,"Intervening rule",f.rule().typeId(),f.rule().typeVersion(),
+                    f.rule().resources(),f.rule().parameters(),null,true,null).enrolled(null);
+            assertThat(f.store().saveDefinition(null,other,access())).isEqualTo(AlertStore.Outcome.STAGED);
+            var change=new AlertStore.StateChange(before.revision(),before.value(),before.value(),List.of(),null,
+                    new AlertStore.EvaluationProof(f.intent(),ACTIVE),f.rule().header().revision());
+            var proposal=new AlertStore.Commit(AlertStore.CommitKind.STATE_AND_PLAN,change,List.of(),List.of(),version);
+            assertThat(planner(f,"explicit-version").accept(proposal)).isEqualTo(AlertStore.Outcome.CONFLICT);
+            assertThat(f.store().state(binding.key(),f.reads()).orElseThrow()).isEqualTo(before);
+        });
+    }
     @Test void stateAndPendingMembershipCommitTogetherAndRestartCreatesOneIntentPerTarget(){
         AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var p=planner(f,"planner-a");f.evaluator().withPlanner(p);bad(f);
             assertThat(f.store().planning().schedules()).hasSize(2);assertThat(intents(f)).isEmpty();

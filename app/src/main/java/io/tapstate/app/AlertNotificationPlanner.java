@@ -33,7 +33,15 @@ final class AlertNotificationPlanner {
     }
     /** State acceptance registers notification membership in the same commit, without sending or advancing a round. */
     AlertStore.Outcome accept(AlertStore.Commit state) {
-        active.run();var view=store.planning();var changes=seed(view,state.state()==null?null:state.state().after());
+        active.run();
+        if(state.kind()==AlertStore.CommitKind.STATE_AND_PLAN && state.state()!=null
+                && state.state().after().snapshot().status()==AlertSnapshot.Status.CLEAR
+                && state.state().after().episode()==null && state.state().transitions().isEmpty()
+                && state.intents().isEmpty() && state.schedules().isEmpty()) {
+            // An episode-free clear state derives no notification decisions from a planning snapshot.
+            return store.commit(state);
+        }
+        var view=store.planning();var changes=seed(view,state.state()==null?null:state.state().after());
         if(state.state()!=null&&state.state().after().binding()!=null&&view.unavailableRules().containsKey(state.state().after().binding().ruleIdentity().id()))throw unavailableRule();
         if(view.isolatedRecords()&&!changes.schedules().isEmpty())throw isolated();
         return store.commit(new AlertStore.Commit(state.kind(),state.state(),changes.intents(),changes.schedules(),view.version()));

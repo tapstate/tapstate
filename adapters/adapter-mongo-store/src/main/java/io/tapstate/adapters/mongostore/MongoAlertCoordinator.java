@@ -327,6 +327,8 @@ final class MongoAlertCoordinator implements AlertStore {
                     if(v.after().binding()==null)throw stale("state-rule-binding");
                     var member=v.after().binding();
                     var rule=definitions.load(s,Kind.RULE,member.ruleIdentity().id()).orElseThrow(()->stale("rule"));
+                    if(!(rule.definition() instanceof Rule currentRule) || ruleCapability(currentRule).isPresent())
+                        throw unreadable("rule-capability");
                     long expected=v.expectedRuleRevision()==null?member.evaluation().revision():v.expectedRuleRevision();
                     if(rule.definition().header().revision()!=expected)throw stale("rule-authoring-revision");
                     validateMember(s,member,true);
