@@ -65,6 +65,28 @@ class ConfiguredCaptureRunTest {
         assertThatThrownBy(() -> run.port(config.at(new PipelineNode("flow","other")),notes,id -> ARTIFACT,() -> {})).isInstanceOf(TapstateException.class);
         assertThatThrownBy(() -> run.port(config.sharing(new SharedNotes("another-chain",List.of())),notes,id -> ARTIFACT,() -> {})).isInstanceOf(TapstateException.class);
     }
+    @Test void sampledComparisonRequiresTheExactArtifactOriginalSettingsAndLiveScope() {
+        var notes=notes();
+        var config=new CaptureConfig("mongodb",Map.of("database","orders"),List.of("orders"),NODE)
+                .sharing(new SharedNotes("chain",List.of()));
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","1.0",null,null,HASH,false);
+        var run=ConfiguredCaptureRun.prepare(ORIGINAL,config,notes,id -> artifact,() -> {});
+        when(notes.origin(run.primary())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,config.settings()));
+        assertThat(run.modelComparison(config,notes,id -> artifact,() -> {})).isEqualTo(SourceModelComparison.SAMPLED_DOCUMENT);
+        assertThatThrownBy(() -> run.modelComparison(config.at(new PipelineNode("flow","other")),notes,id -> artifact,() -> {}))
+                .isInstanceOf(TapstateException.class);
+        when(notes.origin(run.primary())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,Map.of("database","changed")));
+        assertThatThrownBy(() -> run.modelComparison(config,notes,id -> artifact,() -> {}))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+        when(notes.origin(run.primary())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,config.settings()));
+        var active=new AtomicBoolean(false);
+        assertThatThrownBy(() -> run.modelComparison(config,notes,id -> artifact,() -> require(active)))
+                .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        var wrong=new ConnectorRef(List.of(),artifact.className(),"1.0",null,null,"b".repeat(64),false);
+        var provisioner=mock(ConnectorProvisioner.class);when(provisioner.resolve("mongodb",HASH)).thenReturn(wrong);
+        assertThatThrownBy(() -> run.modelComparison(config,notes,provisioner,() -> {})).isInstanceOf(TapstateException.class);
+    }
+
     private static CaptureConfig config(boolean shared) {
         var config=new CaptureConfig("demo",Map.of("password","secret-sentinel"),List.of("orders"),NODE);
         return shared?config.sharing(new SharedNotes("chain",List.of())):config;

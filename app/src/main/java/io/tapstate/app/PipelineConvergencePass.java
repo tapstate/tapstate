@@ -177,6 +177,17 @@ final class PipelineConvergencePass {
         Runnable fixed=guardOriginal(original);
         fixed.run();views.sinkPreparations(scope(),original,fixed).prepareTargets(captured);fixed.run();
     }
+    io.tapstate.spi.store.SinkPreparationStore sinkPreparations(WorkloadClaimFence original) {
+        var fixed=guardOriginal(original);fixed.run();return views.sinkPreparations(scope(),original,fixed);
+    }
+    void prepareSinkModels(WorkloadClaimFence original,java.util.List<io.tapstate.spi.store.SinkPreparationStore.Prepared> models) {
+        var captured=java.util.List.copyOf(models);var fixed=guardOriginal(original);fixed.run();
+        sinkPreparations(original).prepareModels(captured);fixed.run();
+    }
+    void prepareSinkModels(WorkloadClaimFence original,java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> inputs,
+            java.util.List<io.tapstate.spi.store.SinkPreparationStore.Prepared> models) {
+        var fixed=guardOriginal(original);fixed.run();sinkPreparations(original).prepareTargets(java.util.List.copyOf(inputs),java.util.List.copyOf(models));fixed.run();
+    }
 
     /** Called before any later start step may throw; no other pass or asynchronous DAG retains this object. */
     void advanced(WorkloadClaimFence actual) {

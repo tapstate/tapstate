@@ -14,6 +14,7 @@ import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsModel;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SourceModelComparison;
 import io.tapstate.spi.store.SrsModelKey;
 import io.tapstate.spi.store.SrsModelStore;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -107,7 +108,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     @Override public SrsModel publishInitial(SrsModelKey key, String ring, SourceTable actual, WorkloadClaimFence fence) {
+        return publishObservedInitial(key, ring, actual, fence, SourceModelComparison.DECLARED_STRUCTURE);
+    }
+    @Override public SrsModel publishObservedInitial(SrsModelKey key, String ring, SourceTable actual,
+            WorkloadClaimFence fence, SourceModelComparison comparison) {
         Objects.requireNonNull(key, "key"); Objects.requireNonNull(actual, "actual"); Objects.requireNonNull(fence, "originalCapture");
+        Objects.requireNonNull(comparison, "comparison");
         requireScope(key);
         if (key.modelVersion() != 0) throw new IllegalArgumentException("an initial model has version zero");
         SourceTable captured = new SourceTable(actual.name(), actual.fields(), actual.primaryKey(), actual.indexes());
@@ -115,11 +121,15 @@ public final class MongoSrsModelStore implements SrsModelStore {
             requireBusiness(session);
             Document chain = requireChain(session, key);
             var control = contexts.find(session, key);
+            SourceTable proposed = captured;
             long first;
             if (control != null) {
                 contexts.requireAnchor(session, chain, control);
                 if (control.publishedVersion() != 0) throw unavailable(key);
-                first = loadInSession(session, key).orElseThrow(() -> unavailable(key)).ddlSequence();
+                var retained = loadInSession(session, key).orElseThrow(() -> unavailable(key));
+                first = retained.ddlSequence();
+                if (comparison == SourceModelComparison.SAMPLED_DOCUMENT
+                        && comparison.acceptsObservation(retained.table(), captured)) proposed = retained.table();
             } else {
                 Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
                         new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
@@ -127,7 +137,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 if (largest >= Long.MAX_VALUE - 1) throw unavailable(key);
                 first = largest + 1;
             }
-            return new SrsModel(key, ring, captured, first);
+            return new SrsModel(key, ring, proposed, first);
         });
         // A fixed proposal is revalidated by publication under the original live claim and current
         // context/bounds. A racing append or context change refuses it rather than selecting a newer one.

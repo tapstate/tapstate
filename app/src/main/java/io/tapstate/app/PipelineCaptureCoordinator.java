@@ -15,6 +15,12 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
+    default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
+            SourceModelSnapshot discovered) {
+        return discovered;
+    }
+
     /** A scoped lifecycle captures the original run separately from its current command authority. */
     default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
         throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);

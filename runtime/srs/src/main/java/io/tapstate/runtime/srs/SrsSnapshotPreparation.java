@@ -64,6 +64,12 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
 
     /** Bound by the host to the same connector session's before-row callback, outside plugin exception wrapping. */
     public void prepare(SnapshotPreparation actualRequest,SourcePosition sampledSeam,Map<String,SourceTable> actualTables) {
+        prepare(actualRequest, sampledSeam, actualTables, SourceModelComparison.DECLARED_STRUCTURE);
+    }
+
+    public void prepare(SnapshotPreparation actualRequest,SourcePosition sampledSeam,Map<String,SourceTable> actualTables,
+            SourceModelComparison comparison) {
+        Objects.requireNonNull(comparison, "comparison");
         requireOpen();
         var capturedTables = Map.copyOf(actualTables);
         if (!request.equals(actualRequest) || sampledSeam == null || !new HashSet<>(owed).equals(capturedTables.keySet())) throw unavailable(); var references = new TreeMap<String,SrsModelKey>();
@@ -80,7 +86,9 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
                     || !progress.cursor().snapshotCompletedTables().isEmpty() || progress.writerRun() != null) throw unavailable();
             for (var entry : pin.models().entrySet()) {
                 var model = models.require(entry.getValue());
-                if (!model.ringName().equals(tableRings.get(entry.getKey())) || !model.table().equals(structural(capturedTables.get(entry.getKey())))) throw unavailable();
+                // require resolved the receipt's exact immutable body; this comparison is with a source observation.
+                if (!model.ringName().equals(tableRings.get(entry.getKey()))
+                        || !comparison.acceptsObservation(model.table(), structural(capturedTables.get(entry.getKey())))) throw unavailable();
             }
             var previous = freshReceipt.compareAndExchange(null, receipt);
             if (previous != null && !previous.equals(receipt)) throw unavailable();
@@ -96,7 +104,7 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
             var model = key == null ? candidates.get(table) : models.require(key);
             SourceTable actual = capturedTables.get(table);
             if (model == null || !model.key().table().equals(table) || !model.key().miningChainId().equals(run.miningChainId()) || !model.key().cacheIncarnation().equals(run.scope().cacheIncarnation())
-                    || !model.ringName().equals(tableRings.get(table)) || !model.table().equals(structural(actual))) throw unavailable();
+                    || !model.ringName().equals(tableRings.get(table)) || !comparison.acceptsObservation(model.table(), structural(actual))) throw unavailable();
             references.put(table,model.key());
         }
         if (!references.keySet().containsAll(tableRings.keySet())) throw unavailable();

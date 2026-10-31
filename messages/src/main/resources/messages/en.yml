@@ -619,6 +619,9 @@ io.schema-write-contention:
 io.sink-writer-progress-ambiguous:
   message: "Pipeline '{pipeline}' has retained sink progress from before progress was recorded per writer, but it now has multiple sink writers."
   solution: "Stop the pipeline to clear its retained state. Then run a full resync, or explicitly choose and accept a new incremental starting point knowing earlier changes will not be replayed. The old aggregate may belong only to the fastest sink, so it cannot be used as evidence for every target."
+io.sink-model-capacity:
+  message: "Prepared target '{target}' for pipeline '{pipeline}' requires {bytes} bytes, exceeding its {limit} byte budget."
+  solution: "Reduce the prepared target metadata. Required original models are not discarded to fit the budget."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."

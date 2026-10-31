@@ -75,15 +75,19 @@ public final class SrsCaptureWriter implements AutoCloseable {
 
     /** Called with actual selected metadata from each source session, before that session may read rows. */
     public synchronized void prepare(Map<String, SourceTable> actualTables) {
-        prepareTables(actualTables, true);
+        prepare(actualTables, SourceModelComparison.DECLARED_STRUCTURE);
+    }
+
+    public synchronized void prepare(Map<String, SourceTable> actualTables, SourceModelComparison comparison) {
+        prepareTables(actualTables, true, Objects.requireNonNull(comparison, "comparison"));
     }
 
     /** Publishes only tables this snapshot session actually reads; it grants no CDC preparation receipt. */
     public synchronized void prepareSnapshotTables(Map<String, SourceTable> actualTables) {
-        prepareTables(actualTables, false);
+        prepareTables(actualTables, false, SourceModelComparison.DECLARED_STRUCTURE);
     }
 
-    private void prepareTables(Map<String, SourceTable> actualTables, boolean completeSelection) {
+    private void prepareTables(Map<String, SourceTable> actualTables, boolean completeSelection, SourceModelComparison comparison) {
         requireActive();
         Map<String, SourceTable> actual = new LinkedHashMap<>();
         for (var entry : Map.copyOf(actualTables).entrySet()) {
@@ -93,16 +97,15 @@ public final class SrsCaptureWriter implements AutoCloseable {
         }
         if (actual.isEmpty() || !opened.servingTables().containsAll(actual.keySet())
                 || (completeSelection && !actual.keySet().equals(opened.servingTables()))) throw unproven();
-        // Validate the entire retained baseline before publishing any new model. Current discovery cannot
-        // describe a different schema's unread source history after a restart.
+        // Resolve every original model before comparing observations or publishing a successor epoch.
         String mismatch = null;
         for (var entry : actual.entrySet()) {
             String table = entry.getKey();
             SrsTableCheckpoint prior = opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
             var baseline = opened.pendingFreshFull() == null ? prior == null ? null : prior.model() : opened.pendingFreshFull().models().get(table);
-            if (baseline != null && !models.require(baseline).table().equals(entry.getValue())) mismatch = table;
+            if (baseline != null && !comparison.acceptsObservation(models.require(baseline).table(), entry.getValue())) mismatch = table;
             SrsModel held = published.get(table);
-            if (held != null && !held.table().equals(entry.getValue())) throw unavailable(table);
+            if (held != null && !comparison.acceptsObservation(held.table(), entry.getValue())) throw unavailable(table);
             String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
             var configuration = member.getConfig().findRingbufferConfig(ring);
             if (!configuration.getRingbufferStoreConfig().isEnabled()
@@ -122,8 +125,12 @@ public final class SrsCaptureWriter implements AutoCloseable {
             if (published.containsKey(table)) continue;
             String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
             var key = new SrsModelKey(opened.miningChainId(), table, scope.cacheIncarnation(), opened.epoch(), 0);
-            SrsModel saved = models.publishInitial(key, ring, entry.getValue(), fence);
-            if (!saved.key().equals(key) || !saved.ringName().equals(ring) || !saved.table().equals(entry.getValue())) throw unavailable(table);
+            // Publication, rather than a historical lookup of an unpublished key, owns context creation/reuse.
+            SrsModel saved = comparison == SourceModelComparison.DECLARED_STRUCTURE
+                    ? models.publishInitial(key, ring, entry.getValue(), fence)
+                    : models.publishObservedInitial(key, ring, entry.getValue(), fence, comparison);
+            if (!saved.key().equals(key) || !saved.ringName().equals(ring)
+                    || !comparison.acceptsObservation(saved.table(), entry.getValue())) throw unavailable(table);
             requireActive();
             published.put(table, saved);
             SrsTableCheckpoint prior = opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
