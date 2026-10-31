@@ -60,8 +60,10 @@ final class ValidationMemberResources implements AutoCloseable {
         private final State state; private final Runnable active; private final boolean compatible;
         private volatile boolean retired;
         private Member(State state, Runnable active, boolean compatible) { this.state = state; this.active = active; this.compatible = compatible; }
-        Metadata admitMetadata() {
-            require();var lease=metadata.acquire(this);
+        Metadata admitMetadata() {return admitMetadata(false);}
+        Metadata admitMaintenanceMetadata() {return admitMetadata(true);}
+        private Metadata admitMetadata(boolean maintenance) {
+            require();var lease=maintenance?metadata.acquireMaintenance(this):metadata.acquire(this);
             try { require(); return new Metadata(lease); } catch (RuntimeException | Error failed) { lease.close(); throw failed; }
         }
         /** Independent metadata discovery has no fictitious validation owner, run or cooperative processor. */
@@ -81,6 +83,9 @@ final class ValidationMemberResources implements AutoCloseable {
         /** One pre-owner control body, with no fictitious run or cooperative processor. */
         Control admitControl(){
             var frame=admitMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
+        }
+        Control admitMaintenanceControl(){
+            var frame=admitMaintenanceMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
         }
         /** The request scope, not this worker, retains and eventually returns this exact member's frame. */
         Control admitControl(Metadata frame){frame.requireRetained(this);return control(frame,false);}

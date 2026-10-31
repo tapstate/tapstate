@@ -43,7 +43,7 @@ final class NativeValidationScheduler implements AutoCloseable {
         try{active.run();sendDue();}catch(TapstateException unavailable){return;}
         long now=System.nanoTime();if(now-nextDiscovery<0||!discovering.compareAndSet(false,true))return;nextDiscovery=now+TimeUnit.MILLISECONDS.toNanos(100);
         final ValidationMemberResources.Control work;
-        try{work=resources.admitControl();}
+        try{work=resources.admitMaintenanceControl();}
         catch(TapstateException unavailable){discovering.set(false);return;}
         try{work.execute(()->{try{scan();}catch(TapstateException unavailable){/* Unknown or unprepared storage grants no schedule. */}
             finally{discovering.set(false);}});}

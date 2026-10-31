@@ -11,9 +11,12 @@ public final class ValidationMetadataBudget {
     public static final int FRAMES=4;
     public static final long RESERVED_BYTES=64L*1024*1024;
     private final Semaphore slots=new Semaphore(FRAMES);
-    public Lease acquire(Object owner){
+    public Lease acquire(Object owner){return acquire(owner,false);}
+    /** Retryable discovery and history leave room for a foreground response and native probe. */
+    public Lease acquireMaintenance(Object owner){return acquire(owner,true);}
+    private synchronized Lease acquire(Object owner,boolean maintenance){
         Objects.requireNonNull(owner,"metadata owner");
-        if(!slots.tryAcquire())throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.metadataFrames"),null);
+        if((maintenance&&slots.availablePermits()<3)||!slots.tryAcquire())throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.metadataFrames"),null);
         return new Lease(owner);
     }
     public int inUse(){return FRAMES-slots.availablePermits();}
