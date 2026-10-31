@@ -126,11 +126,21 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private TapstateException initializationDiagnostic(TapstateException failure) {
-        if (quota(failure) || (configurationQuotaExceeded || initializationProgress.quotaExceeded())
+        if (quota(failure) || (configurationQuotaExceeded || originalInitializationQuota())
                 && (failure.code() == ControlError.STORAGE_UNAVAILABLE || failure.code() == IoError.STORE_UNAVAILABLE
                     || failure.code() == IoError.CACHE_AUTH_FENCED || failure.code() == IoError.CACHE_BUSINESS_FENCED))
             return new TapstateException(ControlError.STORAGE_QUOTA_EXCEEDED, Map.of(), null);
         return failure;
+    }
+
+    /** Later CACHE authorities cannot inherit evidence from the original bootstrap operation. */
+    private boolean originalInitializationQuota() {
+        if (!initializationProgress.quotaExceeded()) return false;
+        return runtime.boundForObservation().map(original -> {
+            var authority = original.preparation().authScope();
+            return authority.bindingVersion() == 1 && authority.authGeneration() == 1
+                    && initializationProgress.snapshot(original.binding().setup()).isPresent();
+        }).orElse(true);
     }
 
     Optional<CredentialAuthentication> authenticateCredentials(String presented) {

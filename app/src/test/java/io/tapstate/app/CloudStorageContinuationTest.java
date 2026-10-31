@@ -144,6 +144,32 @@ class CloudStorageContinuationTest {
         }
     }
 
+    @Test void initialQuotaEvidenceCannotClassifyAnOutageAfterFormalAuthenticationRecovery() {
+        try (var f = new Fixture()) {
+            var business = f.business();
+            doThrow(new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null)).when(business).start();
+            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
+            assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            assertThat(f.root.initializationProgress().quotaExceeded()).isTrue();
+            var next = new CachePreparation("authentication-recovery", new CacheAuthScope("cluster", 1,
+                    StorageBinding.Mode.CLOUD, "recovered-cache", 2));
+            var sessions = mock(CloudSessionStore.class);
+            when(f.cache.cloudSessions(next.authScope())).thenReturn(sessions);
+            when(f.cache.cloudSessions(eq(next.authScope()), any(MongoReadBudget.class))).thenReturn(sessions);
+            doThrow(StorageRuntime.unavailable()).when(f.cache).loadAuthScope(eq(PREPARATION.authScope()), any(MongoReadBudget.class));
+            when(f.configuration.authenticationRecoveryRequired(eq(f.cache), any())).thenReturn(true);
+            doAnswer(invocation -> { when(f.bindings.cachePreparation()).thenReturn(Optional.of(next)); return null; })
+                    .when(f.configuration).prepareAuthenticationRecovery(eq(f.cache), any());
+            f.root.managedAuthentication();
+            assertThat(f.root.runtime().current().orElseThrow().preparation().authScope()).isEqualTo(next.authScope());
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(next), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.root.authenticateCredentials("unverified-cookie"))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            verify(f.bindings, times(1)).complete(SETUP);
+        }
+    }
+
     @Test void aSpecificConfigAuthenticationFailureRetiresEarlierQuotaEvidence() {
         try (var f = new Fixture(true)) {
             var loads = new java.util.concurrent.atomic.AtomicInteger();
