@@ -265,6 +265,47 @@ class ScopedSrsSinkAckFactoryTest {
         var guards = ArgumentCaptor.forClass(ExecutionFence.class); verify(f.authorization,atLeastOnce()).require(guards.capture());
         assertThat(guards.getAllValues()).allSatisfy(fence -> assertThat(fence).isEqualTo(new ExecutionFence(SCOPE,FENCE)));
     }
+    @Test void aSnapshotPositionAndItsBoundUseOneStoreCallPerWriter() {
+        var f = new Fixture(); var resolved = factory().resolve(f.member);
+        var position = new ChainPosition(SourceOrder.snapshotRow(7),null);
+        for (int i = 0; i < 4; i++) {
+            var ack = resolved.forWriter("writer-" + i);
+            if (i < 3) ack.advance("source.orders",position,FENCE);
+            ack.bounded("source.orders",position.order(),FENCE);
+        }
+        verify(f.store,times(4)).advanceWriter(eq(RUN.context()),eq(4L),eq("original-run"),eq("orders"),
+                anyString(),eq(new WriterProgress(position.order(),null)),eq(FENCE));
+        // A new writer handle has no receipt from the earlier handle, even when its name is reused.
+        resolved.forWriter("writer-0").bounded("source.orders",position.order(),FENCE);
+        verify(f.store,times(5)).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+    }
+
+    @Test void aRepeatedBoundStillChecksTheClaimAndNewProgressStillReachesTheStore() {
+        var f = new Fixture(); var ack = factory().resolve(f.member).forWriter("writer");
+        var order = SourceOrder.snapshotRow(7);
+        ack.advance("source.orders",new ChainPosition(order,null),FENCE);
+        var foreign = new WorkloadClaimFence(FENCE.key(),new WorkloadOwner("other","boot"),2,5,9);
+        assertThatThrownBy(() -> ack.bounded("source.orders",order,foreign)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        f.active.set(false);
+        assertThatThrownBy(() -> ack.bounded("source.orders",order,FENCE)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        f.active.set(true);
+        var tokened = new ChainPosition(order,"token");
+        ack.advance("source.orders",tokened,FENCE);
+        ack.bounded("source.orders",new SourceOrder(7,1),FENCE);
+        verify(f.store).advanceWriter(RUN.context(),4,"original-run","orders","writer",new WriterProgress(order,tokened),FENCE);
+        verify(f.store).advanceWriter(RUN.context(),4,"original-run","orders","writer",new WriterProgress(new SourceOrder(7,1),null),FENCE);
+        verify(f.store,times(3)).advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any());
+    }
+
+    @Test void aRefusedPositionDoesNotSuppressTheFollowingBound() {
+        var f = new Fixture();
+        when(f.store.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(false,true);
+        var ack = factory().resolve(f.member).forWriter("writer"); var order = SourceOrder.snapshotRow(7);
+        assertThatThrownBy(() -> ack.advance("source.orders",new ChainPosition(order,null),FENCE)).satisfies(ScopedSrsSinkAckFactoryTest::refused);
+        ack.bounded("source.orders",order,FENCE);
+        verify(f.store,times(2)).advanceWriter(RUN.context(),4,"original-run","orders","writer",new WriterProgress(order,null),FENCE);
+    }
+
     @Test void storeRefusalCannotBeConvertedToAnAcknowledgedOrRetriedNewerRun() {
         var f = new Fixture(); when(f.store.advanceWriter(any(),anyLong(),anyString(),anyString(),anyString(),any(),any())).thenReturn(false);
         var ack = factory().resolve(f.member).forWriter("writer");

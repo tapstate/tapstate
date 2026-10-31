@@ -68,8 +68,7 @@ class NestIdleInstanceDoesNotStallFrontierIT {
     private static final String PIPELINE_ID = "idle_instances";
 
     /** Where the product keeps what it would resume from: one record per mining chain, in the store. */
-    private static final String CHAIN_RECORDS = "srs_meta";
-    private static final String OFFSET_FIELD = "sourceReadOffset";
+    private static final String CHAIN_RECORDS = io.tapstate.adapters.mongostore.SystemCollections.SRS_CHAINS.collectionName();
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,
@@ -103,13 +102,13 @@ class NestIdleInstanceDoesNotStallFrontierIT {
 
             String suffix = tier.name().toLowerCase(Locale.ROOT);
             pipelineId = PIPELINE_ID + "_" + suffix;
-            String storeUri = SharedMongo.replicaSetUrl("idle_store_" + suffix);
             String targetUri = SharedMongo.replicaSetUrl("idle_target_" + suffix);
 
-            try (ServerHandle server = tier.launch(storeUri);
+            try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
                     MongoEndpoints mongo = new MongoEndpoints()) {
+                String storeUri = storage.cacheUri();
                 ControlPlane control = new ControlPlane(server.baseUrl());
-                control.bootstrapAndLogin("e2e", "e2e-password");
+                storage.loginAndAwaitBusiness(control);
 
                 control.registerConnector("mysql", ConnectorJars.bytesFor("mysql"));
                 control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
@@ -182,7 +181,8 @@ class NestIdleInstanceDoesNotStallFrontierIT {
     private static List<String> offsets(MongoEndpoints mongo, String storeUri) {
         List<String> offsets = new ArrayList<>();
         for (Document record : mongo.documents(EndpointAddress.uri(storeUri), CHAIN_RECORDS)) {
-            Object offset = record.get(OFFSET_FIELD);
+            Document checkpoint = record.get("checkpoint", Document.class);
+            Object offset = checkpoint == null ? null : checkpoint.get("token");
             if (offset != null) {
                 offsets.add(record.get("_id") + "=" + offset);
             }
