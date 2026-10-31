@@ -35,6 +35,24 @@ class TokenServiceTest {
     private static final Clock CLOCK = Clock.fixed(NOW, ZoneOffset.UTC);
 
     @Test
+    void authenticatedBindingComesFromTheSameReadWhoseSecretWasVerified() {
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var original = new TokenRecord("token", "ADMIN", "hash:valid", false, NOW);
+        var replacement = new TokenRecord("token", "ADMIN", "hash:replacement", false, NOW.plusSeconds(1));
+        TokenStore store = new TokenStore() {
+            @Override public Optional<TokenRecord> find(String id) { return Optional.of(reads.incrementAndGet() == 1 ? original : replacement); }
+            @Override public void save(TokenRecord record) { throw new UnsupportedOperationException(); }
+            @Override public void revoke(String id) { throw new UnsupportedOperationException(); }
+            @Override public List<TokenRecord> list() { return List.of(); }
+        };
+        var authenticated = new TokenService(store, new FakeTokenSecrets(), CLOCK).authenticateBound("cyxt_token.valid").orElseThrow();
+        assertThat(reads).hasValue(1);
+        assertThat(authenticated.identity()).isEqualTo(new VerifiedToken("token", Scope.ADMIN));
+        assertThat(authenticated.configurationBinding()).isEqualTo(original.authenticationBinding()).isNotEqualTo(replacement.authenticationBinding());
+        assertThat(authenticated.toString()).doesNotContain("hash:valid", "hash:replacement", authenticated.configurationBinding());
+    }
+
+    @Test
     void createIssuesAPrefixedTokenAndStoresOnlyTheHashedSecret() {
         FakeTokenStore store = new FakeTokenStore();
         FakeTokenSecrets secrets = new FakeTokenSecrets();

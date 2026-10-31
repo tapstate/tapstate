@@ -8,6 +8,12 @@ public record ViewCatalogItem(
     public record Location(String storeId, String database, String collection) {
     }
 
-    public record Freshness(String state, Long behindSeconds, Long staleSeconds, Integer percent) {
+    /** Event age is measured at target ACK and is independent of observation availability. */
+    public record Freshness(String state, Long behindSeconds, Long staleSeconds, Integer percent,
+            Long eventAgeSeconds, java.time.Instant observedAt, java.time.Instant refreshedAt,
+            Long observationAgeSeconds, String unit, String aggregation, String reason) {
+        public Freshness(String state,Long behindSeconds,Long staleSeconds,Integer percent) {
+            this(state,behindSeconds,staleSeconds,percent,behindSeconds,null,null,staleSeconds,"s","max-input-table-event-age",null);
+        }
     }
 }

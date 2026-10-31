@@ -192,7 +192,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
             if (bounds == null) bounds = log.boundsInSession(session, ring);
             if (at.sequence() > bounds.largestSequence()) throw unproven(chain);
             if (at.sequence() >= 0 && at.sequence() > bounds.trimmedThrough()) {
-                var event = log.loadInSession(session, ring, at.sequence()).orElseThrow(() -> unproven(chain));
+                var event = log.loadInSession(session, ring, at.sequence(), reference).orElseThrow(() -> unproven(chain));
                 if (at.sequence() >= range.firstSequence() && (event.epoch() != key.captureEpoch() || event.schemaVer() != key.modelVersion()
                         || !reference.fence().equals(event.captureFence()))) throw unproven(chain);
             }

@@ -6,6 +6,12 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.spi.store.DataBrowserTableInfo;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import io.tapstate.core.lifecycle.*;
+import io.tapstate.core.dsl.PipelineInputs;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -496,6 +502,252 @@ class PipelineOutputNamesTest {
         });
     }
 
+    @Test
+    void renamedMirrorOutputsKeepOnlyTheirOriginalInputLag() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                serve:
+                  from: [orders, customers]
+                  sync: [{id: sink, source: target, rename: {map: {orders: chosen}, prefix: out_}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        for (var output : description.names().outputs()) {
+            String original = output.table().equals("chosen") ? "orders" : "customers";
+            assertThat(description.inputs().get(output.identity())).containsExactly(new PipelineInputs.Input("src", original));
+        }
+        lag(store, Map.of("orders", 1L, "customers", 900L, "unrelated", 9999L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+        assertThat(rows).hasSize(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("chosen")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("out_customers")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(901);
+    }
+
+    @Test
+    void aMaterializedAssemblyKeepsRootAndLookupInputMeasurements() {
+        for (String transform : List.of("""
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                """, """
+                transforms:
+                  - id: assembled
+                    type: join
+                    from: {o: orders, c: customers}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id
+                """)) {
+            var store = sources();
+            var pipeline = pipeline(store, transform + """
+                    serve:
+                      from: assembled
+                      sync: [{id: sink, source: target, rename: {prefix: shaped_}}]
+                    """);
+            var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+            var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+            var output = description.names().outputs().getFirst();
+            assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
+                    new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
+            lag(store, Map.of("orders", 1L, "customers", 900L, "unrelated", 9999L));
+            var status = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status();
+            assertThat(status.state()).isEqualTo("fresh");assertThat(status.eventAgeSeconds()).isEqualTo(901);
+            lag(store, Map.of("orders", 1L));
+            assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status().reason()).isEqualTo("measurement-unavailable");
+        }
+    }
+
+    @Test
+    void sameNamedTablesInDifferentSourcesRequireTheirOriginalQualifiedMeasurement() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: second
+                connector: mongodb
+                config: {uri: "mongodb://localhost/second"}
+                tables: [orders]
+                """));
+        var pipeline = (PipelineResource) new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, second]
+                serve:
+                  from: [src.orders, second.orders]
+                  sync: [{id: sink, source: target, rename: {map: {src.orders: first_orders, second.orders: second_orders}}}]
+                """);
+        store.artifacts().save(pipeline);
+        lag(store, Map.of("orders", 5L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).hasSize(2).allSatisfy(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+        lag(store, Map.of("src.orders", 1L, "second.orders", 900L));
+        var rows = query.list();
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("first_orders")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(2);
+        assertThat(rows.stream().filter(row -> row.location().collection().equals("second_orders")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(901);
+    }
+
+    @Test
+    void aSingleTableSourceReferenceKeepsItsPhysicalInputThroughAViewAlias() {
+        var store = mixedSourceStore("[orders]");
+        var pipeline = pipeline(store, """
+                view: {id: managed, from: src, primary_key: id}
+                serve: {from: managed, sync: [{id: sink, source: target}]}
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        assertThat(description.names().outputs()).hasSize(2);
+        assertThat(description.inputs().values()).allSatisfy(inputs ->
+                assertThat(inputs).containsExactly(new PipelineInputs.Input("src", "orders")));
+        lag(store, Map.of("orders", 7L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list())
+                .allSatisfy(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+    }
+
+    @Test
+    void collidingPhysicalTargetsKeepEveryContributingInputMeasurement() {
+        var store = sources();
+        var pipeline = pipeline(store, """
+                serve:
+                  from: [orders, customers]
+                  sync: [{id: sink, source: target, rename: {map: {orders: combined, customers: combined}}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        assertThat(description.names().outputs()).singleElement().satisfies(output -> {
+            assertThat(output.identity()).isEqualTo("sink:orders");
+            assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
+                    new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
+        });
+        lag(store, Map.of("orders", 1L, "customers", 900L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(901));
+        lag(store, Map.of("orders", 1L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+    }
+
+    @Test
+    void anUnavailableDisjointBranchDoesNotHideAProvenOutputButPossibleCollisionsDo() {
+        var store = sources();
+        var parser = new DslParser();
+        store.artifacts().save(parser.parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        String definition = """
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                serve:
+                  from: [src.orders, unknown]
+                  sync: [{id: sink, source: target, rename: %s}]
+                """;
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_}")));
+        lag(store, Map.of("src.orders", 7L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.catalog().unresolved()).hasSize(1);
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_, map: {customers: distinct, unknown.customers: out_orders}}")));
+        assertThat(query.list()).singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        store.artifacts().save(parser.parse(definition.formatted("{prefix: out_, map: {unknown.customers: out_orders}}")));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+    }
+
+    @Test
+    void anUnavailableSeparateViewCannotInvalidateAnIndependentSync() {
+        for (String caseRule : List.of("", "case: lower, ")) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/customer.*/"]
+                """));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                view: {id: managed, from: unknown.customers, primary_key: id}
+                serve:
+                  from: src.orders
+                  sync: [{id: sink, source: target, rename: {%sprefix: out_, map: {unknown.customers: out_orders}}}]
+                """.formatted(caseRule)));
+        lag(store, Map.of("src.orders", 7L));
+        assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list()
+                .stream().filter(row -> row.location().collection().equals("out_orders")).toList())
+                .singleElement().satisfies(row -> assertThat(row.status().eventAgeSeconds()).isEqualTo(8));
+        }
+    }
+
+    @Test
+    void anUnresolvedQualifiedJoinCannotHideBehindACollidingKnownTarget() {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unknown
+                connector: mongodb
+                tables: ["/order.*/"]
+                """));
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: p
+                source: [src, unknown]
+                transforms:
+                  - id: assembled
+                    type: join
+                    from: {o: unknown.orders, c: src.orders}
+                    engine: builtin
+                    sql: SELECT o.id FROM o LEFT JOIN c ON o.id = c.id
+                serve:
+                  from: [src.orders, assembled]
+                  sync: [{id: sink, source: target, rename: {map: {src.orders: unknown.orders}}}]
+                """));
+        lag(store, Map.of("src.orders", 7L));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.location().collection()).isEqualTo("unknown.orders");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+        });
+        store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("unknown", "mongodb", 0L,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
+        lag(store, Map.of("src.orders", 7L, "unknown.orders", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.location().collection()).isEqualTo("unknown.orders");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+        });
+    }
+
+    private static final Instant LAG_AT = Instant.parse("2026-10-29T00:00:00Z");
+    private static void lag(InMemoryStorePort store, Map<String, Long> tables) {
+        var points = tables.entrySet().stream().map(entry -> MetricPoint.reading(
+                Map.of(MetricAttributes.PIPELINE_ID, "p", MetricAttributes.TABLE_ID, entry.getKey()), LAG_AT, entry.getValue())).toList();
+        store.observations().save(new Observation("p", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, LAG_AT,
+                List.of(new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points))));
+    }
+
     private static InMemoryStorePort sources() {
         var store = new InMemoryStorePort();
         var parser = new DslParser();
@@ -524,13 +776,15 @@ class PipelineOutputNamesTest {
         return pipeline;
     }
 
-    private static ViewCatalogService catalog(InMemoryStorePort store) {
+    private static ViewCatalogService catalog(InMemoryStorePort store) { return catalog(store, Clock.systemUTC()); }
+
+    private static ViewCatalogService catalog(InMemoryStorePort store, Clock clock) {
         var artifacts = new ArtifactQueryService(store.artifacts());
         var browser = new DataBrowserService(store.artifacts(), store.schemas(), config -> List.of(),
                 (config, collection) -> new DataBrowserTableInfo(7L, 42L, 6L),
                 (config, query) -> { throw new AssertionError("must not read rows"); },
                 (config, request, listener) -> { throw new AssertionError("must not follow rows"); });
         return new ViewCatalogService(artifacts, new PipelineObservationQueryService(artifacts, store.observations()),
-                browser, new StoreBackedPipelineOutputNames(store, false));
+                browser, new StoreBackedPipelineOutputNames(store, false), clock);
     }
 }

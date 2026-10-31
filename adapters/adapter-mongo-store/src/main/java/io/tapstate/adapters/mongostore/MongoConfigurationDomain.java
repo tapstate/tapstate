@@ -44,6 +44,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final MongoConfigurationSecurityStores security;
     private final MongoFirstAdminStore firstAdmin;
     private final MongoConfigurationDraftStore drafts;
+    private final PersistentKey configurationKey;
     private final String clusterId;
     private final int installedSchemaVersion;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
@@ -52,15 +53,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.connection = connection;
         this.clusterId = clusterId;
         MongoDatabase database = connection.database();
-        Document identity = StoreIo.call(() -> durable(SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database))
-                .find(new Document("_id", "cluster")).first());
+        OpeningFacts facts = openingFacts(connection.client(), database);
+        Document identity = facts.identity();
         if (identity == null || !clusterId.equals(identity.get("clusterId"))
                 || !LAYOUT.equals(identity.get("layoutId"))
                 || !(identity.get("bindingVersion") instanceof Long binding) || binding < 0) {
             throw unreadable("cluster", "identity");
         }
-        Document schema = StoreIo.call(() -> durable(SystemCollections.SCHEMA_MIGRATIONS.on(database))
-                .find(new Document("_id", "config")).first());
+        Document schema = facts.schema();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer installed) || installed < 1) {
             throw unreadable("config", "installedVersion");
         }
@@ -69,13 +69,14 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
-        Document version = StoreIo.call(() -> durable(SystemCollections.CONFIGURATION_VERSION.on(database))
-                .find(new Document("_id", ConfigurationVersion.ID)).first());
+        Document version = facts.version();
         if (version == null || !(version.get("revision") instanceof Long revision)
                 || revision < 0 || revision == Long.MAX_VALUE) {
             throw unreadable(ConfigurationVersion.ID, "revision");
         }
-        PersistentKey key = new PersistentKey(database, clusterId);
+        PersistentKey key = new PersistentKey(database, clusterId, facts.key());
+        MongoAlertStorageSchema.verifyAuthorityState(schema, version, clusterId, key.current().activeKeyId());
+        this.configurationKey = key;
         this.artifacts = new MongoConfigurationArtifactStore(connection.client(), database, key);
         this.requiredNotes = new MongoRequiredNoteStore(connection.client(), database, key);
         this.catalog = new MongoConfigurationCatalogStore(connection.client(), database, key);
@@ -94,6 +95,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         this.drafts = new MongoConfigurationDraftStore(connection.client(), database, key, artifacts);
         drafts.verify();
         new MongoRequiredDeadLetterStore(connection.client(), database, clusterId).verify();
+    }
+
+    record OpeningFacts(Document identity, Document schema, Document version, Document key) { }
+
+    static OpeningFacts openingFacts(com.mongodb.client.MongoClient client, MongoDatabase database) {
+        return new MongoReadBudget(java.time.Duration.ofSeconds(5)).transaction(client, session -> new OpeningFacts(
+                SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first(),
+                SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first(),
+                SystemCollections.CONFIGURATION_VERSION.on(database).find(session, new Document("_id", ConfigurationVersion.ID)).first(),
+                SystemCollections.CLUSTER_KEYS.on(database).find(session, new Document("_id", "cluster")).first()));
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -128,12 +139,85 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public String clusterId() { requireOpen(); return clusterId; }
     /** The CONFIG schema fact verified when this domain was opened, not a CACHE readiness signal. */
     public int schemaVersion() { requireOpen(); return installedSchemaVersion; }
+
+    /** Feature schema validation is load-only and does not change the global CONFIG version. */
+    public int alertSchemaVersion() {
+        return alertSchemaVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5)));
+    }
+    int alertSchemaVersion(MongoReadBudget budget) {
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
+    }
+
+    /** Explicit additive preparation; ordinary opens and reads never repair lost alert resources. */
+    public int prepareAlertStorage(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).prepare(operationId, budget);
+    }
+
+    <T> T alertMaintenanceTransaction(MongoReadBudget budget,java.util.function.Function<com.mongodb.client.ClientSession,T> action) {
+        requireOpen();return budget.maintenanceTransaction(connection.client(),session->{requireOpen();T result=action.apply(session);requireOpen();return result;});
+    }
+
+    /** Load-only maintenance status; an unfinished operation is never presented as query capability 3. */
+    public java.util.Optional<io.tapstate.spi.store.AlertQueryPreparation> alertQueryPreparation() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).progress(budget);
+    }
+
+    /** Adapter-private composition only; production management requires the complete authorization coordinator. */
+    MongoAlertConfigurationStore alertDefinitions(io.tapstate.core.alerting.AlarmKey.Scope scope,
+            io.tapstate.core.alerting.AlarmTypeCatalog catalog) {
+        if (!clusterId.equals(scope.clusterId())) { throw unreadable("alert-configuration", "scope"); }
+        if (alertSchemaVersion() != MongoAlertStorageSchema.VERSION) { throw unreadable("alert-configuration", "schema-not-prepared"); }
+        return new MongoAlertConfigurationStore(connection.database(), scope, catalog, this::requireOpen, configurationKey);
+    }
+
+    /** The assembly supplies original trusted host facts; this does not open CACHE or a sender. */
+    public io.tapstate.spi.store.AlertStore alerts(io.tapstate.spi.store.AlertStore.Host host,
+            io.tapstate.core.alerting.AlarmTypeCatalog catalog,java.time.Clock clock) {
+        requireOpen();
+        if(!clusterId.equals(host.scope().clusterId()))throw unreadable("alert-store","scope");
+        if(alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-store","capability");
+        return new MongoAlertCoordinator(this,connection.database(),configurationKey,artifacts,security,bindings,host,catalog,clock);
+    }
+
+    /** Original trusted assembly only; ordinary construction never prepares lifecycle storage. */
+    public io.tapstate.spi.store.AlertNodeLifecycleStore alertNodeLifecycles(io.tapstate.core.alerting.AlarmKey.Scope scope,
+            io.tapstate.spi.store.StorageSetupScope setup,Runnable locallyActive) {
+        requireOpen();
+        if(!clusterId.equals(scope.clusterId()) || alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-node-lifecycle","capability");
+        return new MongoAlertNodeLifecycleStore(this,connection.database(),configurationKey,bindings,scope,setup,locallyActive);
+    }
+
+    <T> T alertTransaction(MongoReadBudget budget, java.util.function.Function<com.mongodb.client.ClientSession, T> action) {
+        requireOpen();
+        return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });
+    }
+
+    /** Load-only progress. Absence does not authorize a normal access path to create identities. */
+    public java.util.Optional<io.tapstate.spi.store.SourceIdentityPreparation> sourceIdentityPreparation() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
+        return new MongoSourceIdentityPreparation(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget), this::requireOpen).load(budget);
+    }
+
+    /** Controlled same-version maintenance only; the installation owner must first stop old writers. */
+    public io.tapstate.spi.store.SourceIdentityPreparation prepareSourceIdentities(String operationId) {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30)); requireOpen();
+        return new MongoSourceIdentityPreparation(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget), this::requireOpen).step(operationId, budget);
+    }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
 
     public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
         requireOpen();
         return new MongoConfigurationAiProviderSettingsStore(connection.client(), connection.database(), clusterId,
-                new PersistentKey(connection.database(), clusterId), this::requireOpen);
+                configurationKey, this::requireOpen);
     }
 
     public ArtifactStore artifacts() {
@@ -474,10 +558,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private final String clusterId;
         private final SourceConfigCipher cipher;
 
-        private PersistentKey(MongoDatabase database, String clusterId) {
+        private PersistentKey(MongoDatabase database, String clusterId, Document original) {
             this.keys = durable(SystemCollections.CLUSTER_KEYS.on(database));
             this.clusterId = clusterId;
-            this.cipher = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
+            this.cipher = decode(original);
         }
 
         @Override
@@ -485,9 +569,23 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             return cipher;
         }
 
+        /** The same-session fence below verifies this original immutable key before any write commits. */
+        @Override public SourceConfigCipher currentForWrite() { return cipher; }
+
         @Override
         public SourceConfigCipher refresh() {
             SourceConfigCipher observed = StoreIo.call(() -> decode(keys.find(new Document("_id", "cluster")).first()));
+            if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
+            return observed;
+        }
+
+        @Override public SourceConfigCipher refresh(MongoReadBudget budget) {
+            SourceConfigCipher observed = StoreIo.call(() -> {
+                SourceConfigCipher value = decode(keys.withTimeout(budget.operationMillis(), java.util.concurrent.TimeUnit.MILLISECONDS)
+                        .find(new Document("_id", "cluster")).first());
+                budget.remainingMillis();
+                return value;
+            });
             if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
             return observed;
         }
@@ -502,7 +600,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             SourceConfigCipher observed = decode(keys.find(scope.session(), new Document("_id", "cluster")).first());
             if (!cipher.activeKeyId().equals(keyId) || !keyId.equals(observed.activeKeyId())) throw invalidKey();
             return keys.updateOne(scope.session(), new Document("_id", "cluster").append("keyId", keyId),
-                    new Document("$inc", new Document("sourceWriteFence", 1L))).getMatchedCount() == 1;
+                    new Document("$inc", new Document("sourceWriteFence", 1L))).getModifiedCount() == 1;
         }
 
         private SourceConfigCipher decode(Document document) {

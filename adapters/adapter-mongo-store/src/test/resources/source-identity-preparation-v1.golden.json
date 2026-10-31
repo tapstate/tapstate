@@ -1,0 +1,10 @@
+{
+  "installedVersion": 1,
+  "phase": "PREPARING",
+  "operationId": "source-upgrade-a",
+  "clusterId": "cluster-a",
+  "layoutId": "three-layer-v1",
+  "keyId": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "lastSourceIncarnation": "9a96a925-3365-4e32-936b-fec2054eb7be",
+  "preparedCount": { "$numberLong": "1" }
+}

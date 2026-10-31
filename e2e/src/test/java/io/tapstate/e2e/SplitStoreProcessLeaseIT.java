@@ -51,6 +51,9 @@ class SplitStoreProcessLeaseIT {
              MongoClient cacheObserver = MongoClients.create(CACHE.getReplicaSetUrl(cacheDb));
              var cluster = start(prepared)) {
             for (String node : NODES) assertThat(cluster.awaitMembers(node, 3)).containsExactlyInAnyOrderElementsOf(NODES);
+            Await.until("all original node boots to be durably observed",()->configObserver.getDatabase(configDb).getCollection("alert_node_lifecycles")
+                    .countDocuments(new Document("phase","EXPECTED"))==3,()->"the original lifecycle facts are incomplete");
+            for(String node:NODES)cluster.member(node).awaitInitialAlertMaintenance();
             var keys = configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>());
             assertThat(keys).hasSize(1);
             assertThat(cluster.member(NODES.getFirst()).artifactIds()).contains("views");
@@ -75,6 +78,8 @@ class SplitStoreProcessLeaseIT {
             Await.until("configuration reads to recover", CONFIGURATION_REFUSAL,
                     () -> cluster.member(NODES.getFirst()).artifactIdsIfConfigurationAvailable(CONFIGURATION_REFUSAL)
                             .filter(ids -> ids.contains("views")).isPresent(), () -> "configuration unavailable");
+            assertThat(configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>()))
+                    .as("lease renewal during the outage performs no CONFIG write").isEqualTo(keys);
             String oldBoot = original.get(NODES.getFirst()).getString("ownerBootId");
             long generation = ((Number) original.get(NODES.getFirst()).get("claimGeneration")).longValue();
             cluster.restart(NODES.getFirst());
@@ -82,7 +87,17 @@ class SplitStoreProcessLeaseIT {
             var replacement = claims(cacheObserver, cacheDb).get(NODES.getFirst());
             assertThat(replacement.getString("ownerBootId")).isNotEqualTo(oldBoot);
             assertThat(((Number) replacement.get("claimGeneration")).longValue()).isGreaterThan(generation);
-            assertThat(configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>())).isEqualTo(keys);
+            String replacementBoot=replacement.getString("ownerBootId");
+            Await.until("the orderly retirement and replacement boot facts",()->{
+                var facts=configObserver.getDatabase(configDb).getCollection("alert_node_lifecycles");
+                return facts.countDocuments(new Document("nodeId",NODES.getFirst()).append("bootId",oldBoot).append("phase","RETIRING"))==1
+                        &&facts.countDocuments(new Document("nodeId",NODES.getFirst()).append("bootId",replacementBoot).append("phase","EXPECTED"))==1;
+            },()->"the original retirement or replacement lifecycle fact is absent");
+            var after=configObserver.getDatabase(configDb).getCollection("cluster_keys").find().into(new ArrayList<>());assertThat(after).hasSize(1);
+            var originalIdentity=new Document(keys.getFirst());originalIdentity.remove("sourceWriteFence");
+            var replacementIdentity=new Document(after.getFirst());replacementIdentity.remove("sourceWriteFence");
+            assertThat(replacementIdentity).isEqualTo(originalIdentity);
+            assertThat(after.getFirst().getLong("sourceWriteFence")).isGreaterThanOrEqualTo(keys.getFirst().getLong("sourceWriteFence")+2);
             assertThat(configObserver.getDatabase(configDb).listCollectionNames().into(new ArrayList<>()))
                     .doesNotContain("workload_claims", "keyring_acks", "source_config_keyring_sessions");
             assertThat(cluster.unattributedConnections()).isZero();

@@ -6,6 +6,8 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.spi.store.StorePort;
 import java.util.List;
+import java.util.Map;
+import io.tapstate.core.model.Resource;
 
 /** Definition-backed output coordinates; querying them neither starts nor validates a write. */
 final class StoreBackedPipelineOutputNames implements PipelineOutputNames {
@@ -24,5 +26,10 @@ final class StoreBackedPipelineOutputNames implements PipelineOutputNames {
     @Override
     public Result resolve(PipelineResource pipeline) {
         return source.outputNameResult(pipeline);
+    }
+
+    @Override
+    public Description describe(PipelineResource pipeline, Map<String, Resource> resources) {
+        return source.outputNameDetails(pipeline, resources);
     }
 }

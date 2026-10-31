@@ -305,7 +305,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             int maxRecords, long maxWaitMillis) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
-        SupplierEx<Processor> supplier = () -> new SinkProcessor(writerFactory.get(), null, null,
+        SupplierEx<Processor> supplier = () -> new SinkProcessor(openWriter(writerFactory,0,0), null, null,
                 DEFAULT_MAX_IN_FLIGHT, maxRecords, FrontierGauge.none(), new JetDeliveryGauge(),
                 System::currentTimeMillis, null, true, null, maxWaitMillis, System::nanoTime);
         return ProcessorMetaSupplier.forceTotalParallelismOne(ProcessorSupplier.of(supplier), vertexName);
@@ -375,13 +375,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             int maxRecords, long maxWaitMillis) {
         Objects.requireNonNull(vertexName, "vertexName");
         Objects.requireNonNull(writerFactory, "writerFactory");
-        ProcessorSupplier supplier = sinkAckFactory == null
-                ? (ProcessorSupplier) count -> openedTogether(count, () -> new SinkProcessor(writerFactory.get(), null,
-                        null, DEFAULT_MAX_IN_FLIGHT, maxRecords, FrontierGauge.none(), new JetDeliveryGauge(),
-                        System::currentTimeMillis, null, false, null, maxWaitMillis, System::nanoTime))
-                : new AckSinkSupplier(writerFactory, sinkAckFactory,
-                        Objects.requireNonNull(frontierFactory, "frontierFactory"), edgesFactory, vertexName, false,
-                        maxRecords, maxWaitMillis);
+        ProcessorSupplier supplier = new AckSinkSupplier(writerFactory,sinkAckFactory,
+                sinkAckFactory==null?()->null:Objects.requireNonNull(frontierFactory,"frontierFactory"),
+                edgesFactory,vertexName,false,maxRecords,maxWaitMillis);
         return PlannedMembersGuard.of(ProcessorMetaSupplier.of(supplier), plannedMembers);
     }
 
@@ -940,6 +936,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         private final int maxRecords;
         private final long maxWaitMillis;
         private transient SinkAck sinkAck;
+        private transient int memberIndex;
 
         AckSinkSupplier(SupplierEx<? extends SinkWriter> writerFactory,
                 SinkAckFactory sinkAckFactory, SupplierEx<SinkFrontier> frontierFactory,
@@ -957,14 +954,16 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
 
         @Override
         public void init(Context context) {
-            sinkAck = sinkAckFactory.resolve(context.hazelcastInstance());
+            memberIndex=context.memberIndex();
+            sinkAck = sinkAckFactory==null?null:sinkAckFactory.resolve(context.hazelcastInstance());
         }
 
         @Override
         public Collection<? extends Processor> get(int count) {
             // A gauge per processor, not one shared: the handles it keeps belong to the sink that took the
             // reading, and a shared one would have each sink's readings land under the other's.
-            return openedTogether(count, () -> new SinkProcessor(writerFactory.get(), sinkAck, frontierFactory.get(),
+            var next=new java.util.concurrent.atomic.AtomicInteger();
+            return openedTogether(count, () -> new SinkProcessor(openWriter(writerFactory,totalOne?0:memberIndex,next.getAndIncrement()), sinkAck, frontierFactory.get(),
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
                     edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));
@@ -978,6 +977,10 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * and a retry would open as many again beside it. None of them has written anything: a processor writes only
      * once the engine runs it.
      */
+    private static SinkWriter openWriter(SupplierEx<? extends SinkWriter> factory,int memberIndex,int localIndex) throws Exception {
+        return factory instanceof IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):factory.get();
+    }
+
     private static List<Processor> openedTogether(int count, SupplierEx<SinkProcessor> processor) {
         List<Processor> processors = new ArrayList<>(count);
         try {

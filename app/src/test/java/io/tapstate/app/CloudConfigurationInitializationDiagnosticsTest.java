@@ -31,6 +31,8 @@ class CloudConfigurationInitializationDiagnosticsTest {
         properties.setClusterId("cluster"); properties.setAtlasUri(settings.uri());
         var cloud = CloudRuntimeSettings.resolve(properties);
         var bridge = mock(CloudSdkBridge.class);
+        var alertScope = new io.tapstate.core.alerting.AlarmKey.Scope("organization", "cluster");
+        when(bridge.alertScope()).thenReturn(java.util.Optional.of(alertScope));
         when(bridge.claimConfiguration(anyString(), anyString())).thenAnswer(call ->
                 new CloudSdkBridge.ConfigurationInitialization("cluster", OPERATION, "CLAIMED", call.getArgument(1), true));
         var first = new TapstateException(IoError.STORE_UNAVAILABLE,
@@ -41,7 +43,8 @@ class CloudConfigurationInitializationDiagnosticsTest {
                 var bootstrap = mockStatic(MongoConfigurationBootstrap.class);
                 var initialization = new CloudConfigurationInitialization(settings, cloud, bridge, BootId.fresh())) {
             domains.when(() -> MongoConfigurationDomain.open(settings, "cluster")).thenThrow(later);
-            bootstrap.when(() -> MongoConfigurationBootstrap.prepare(settings, "cluster", "cloud-cluster", OPERATION, 1)).thenThrow(first);
+            bootstrap.when(() -> MongoConfigurationBootstrap.prepareWithAlerts(settings, "cluster", "cloud-cluster", OPERATION, 1,
+                    alertScope, io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED)).thenThrow(first);
             bootstrap.when(() -> MongoConfigurationBootstrap.resume(settings, "cluster", "cloud-cluster", OPERATION, 1)).thenThrow(later);
 
             assertThat(catchThrowable(initialization::open)).isSameAs(first);
@@ -52,7 +55,8 @@ class CloudConfigurationInitializationDiagnosticsTest {
             assertThat(logs.events.list.get(1).getFormattedMessage()).contains("stage=resume", later.code().code());
             assertSafe(logs);
             verify(bridge, times(1)).claimConfiguration(anyString(), anyString());
-            bootstrap.verify(() -> MongoConfigurationBootstrap.prepare(settings, "cluster", "cloud-cluster", OPERATION, 1), times(1));
+            bootstrap.verify(() -> MongoConfigurationBootstrap.prepareWithAlerts(settings, "cluster", "cloud-cluster", OPERATION, 1,
+                    alertScope, io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED), times(1));
             bootstrap.verify(() -> MongoConfigurationBootstrap.resume(settings, "cluster", "cloud-cluster", OPERATION, 1), times(1));
         }
     }

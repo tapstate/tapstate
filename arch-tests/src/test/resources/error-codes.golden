@@ -37,6 +37,14 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+alert.channel-not-accepted
+alert.channel-result-unknown
+alert.channel-unavailable
+alert.command-conflict
+alert.command-expired
+alert.command-not-yet-valid
+alert.invalid-configuration
+alert.stale-action
 artifact.in-use
 artifact.not-found
 artifact.pipeline-not-stopped
@@ -290,6 +298,8 @@ io.required-dead-letter-fenced
 io.schema-read-contention
 io.schema-write-contention
 io.sink-writer-progress-ambiguous
+io.source-identity-exhausted
+io.source-identity-unavailable
 io.srs-checkpoint-unproven
 io.srs-consumer-unavailable
 io.srs-event-model-unavailable

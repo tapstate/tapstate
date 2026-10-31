@@ -32,6 +32,7 @@ class CloudInitializationQuotaDiagnosticsIT {
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final String CLUSTER = "quota-diagnostic-cluster";
+    private static final String ORGANIZATION = "quota-diagnostic-org";
     private static final String TOKEN = "quota-test-service-token-sentinel";
     private static final String OPERATION = "a83f26ca-d2ce-4b92-9a0c-0ee331e1682f";
     private static final String PREFIX = "/v1/api/clusters/" + CLUSTER + "/configuration-initialization/";
@@ -47,6 +48,17 @@ class CloudInitializationQuotaDiagnosticsIT {
         cloud.createContext("/", exchange -> {
             String path = exchange.getRequestURI().getPath();
             requests.add(exchange.getRequestMethod() + " " + path);
+            if ("GET".equals(exchange.getRequestMethod())
+                    && path.equals("/v1/api/clusters/" + CLUSTER + "/egress-address")
+                    && ("Bearer " + TOKEN).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                byte[] response = JsonWriter.write(Map.of("code", "ok", "data", Map.of(
+                        "organizationId", ORGANIZATION, "clusterId", CLUSTER,
+                        "egressAddressStatus", "DYNAMIC"))).getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.length);
+                try (var output = exchange.getResponseBody()) { output.write(response); }
+                exchange.close(); return;
+            }
             boolean claim = path.equals(PREFIX + "claim"), complete = path.equals(PREFIX + "complete");
             if (!"POST".equals(exchange.getRequestMethod()) || !(claim || complete)
                     || !("Bearer " + TOKEN).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
@@ -89,8 +101,10 @@ class CloudInitializationQuotaDiagnosticsIT {
                         assertThat(failure.headers().firstValue("Set-Cookie")).isEmpty();
                         assertThat(failure.body()).doesNotContain(TOKEN, OPERATION, "unrelated-user-value-sentinel", "513 MB", uri);
                     }
-                    assertThat(requests).containsExactly("POST " + PREFIX + "claim");
-                } else assertThat(requests).containsExactly("POST " + PREFIX + "claim", "POST " + PREFIX + "complete");
+                    assertThat(requests).containsExactly("POST " + PREFIX + "claim",
+                            "GET /v1/api/clusters/" + CLUSTER + "/egress-address");
+                } else assertThat(requests).containsExactly("POST " + PREFIX + "claim",
+                        "GET /v1/api/clusters/" + CLUSTER + "/egress-address", "POST " + PREFIX + "complete");
                 assertThat(mongo.getDatabase(witness).getCollection("witness").find().first()).isEqualTo(retained);
                 assertThat(Files.readString(server.output())).doesNotContain(TOKEN, uri, "unrelated-user-value-sentinel");
             }

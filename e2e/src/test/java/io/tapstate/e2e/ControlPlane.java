@@ -93,6 +93,30 @@ final class ControlPlane {
         this.baseUrl = baseUrl;
     }
 
+    /** Actual View projection, read with this scenario's original authenticated session. */
+    String viewsJson(){
+        var response=send(authedGet("/api/views"));
+        if(response.statusCode()!=200)throw new AssertionError("View read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
+    String metricsJson(String pipeline){
+        var response=send(authedGet("/api/pipelines/"+pipeline+"/metrics"));
+        if(response.statusCode()!=200)throw new AssertionError("Metrics read failed: "+response.statusCode()+" "+response.body());
+        return response.body();
+    }
+    Map<String,Object> alert(String operation,Map<String,?> input) {
+        var response=send(authed("/api/alerts/"+operation,JsonWriter.write(input)));
+        expect(response,200,"alert "+operation);
+        Object parsed=JsonReader.parse(response.body());
+        if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
+        var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
+    }
+    void awaitInitialAlertMaintenance(){
+        Await.until("the initial bounded alert cleanup to finish",Duration.ofSeconds(30),()->{
+            var value=alert("health",Map.of()).get("maintenance");
+            return value instanceof Map<?,?> maintenance&&maintenance.get("lastSuccess")!=null;
+        },()->"initial alert cleanup has not finished");
+    }
     /** Whether the product answers its health probe; the readiness signal a launcher waits on. */
     boolean healthy() {
         HttpRequest request = get("/healthz");
@@ -223,7 +247,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         expect(response, 200, "apply " + contentBySource.keySet());
         return warningsOf(response.body());
     }
@@ -306,7 +330,7 @@ final class ControlPlane {
                 .map(entry -> Map.of("source", entry.getKey(), "content", entry.getValue()))
                 .toList();
         String body = JsonWriter.write(Map.of("drafts", drafts));
-        HttpResponse<String> response = send(authed("/api/artifacts:apply", body));
+        HttpResponse<String> response = send(applyRequest(body));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + contentBySource.keySet());
     }
 
@@ -319,7 +343,7 @@ final class ControlPlane {
 
     /** Applies one document written against the version {@code expectedContentHash} names. */
     void applyExpecting(String source, String content, String expectedContentHash) {
-        expect(send(authed("/api/artifacts:apply", applyBody(List.of(
+        expect(send(applyRequest(applyBody(List.of(
                         new Draft(source, content, expectedContentHash))))),
                 200, "apply " + source + " against version " + expectedContentHash);
     }
@@ -330,8 +354,7 @@ final class ControlPlane {
      * is kept apart from its success: one return value cannot mean both.
      */
     Refusal applyExpectingRefusal(String source, String content, String expectedContentHash) {
-        HttpResponse<String> response = send(authed("/api/artifacts:apply",
-                applyBody(List.of(new Draft(source, content, expectedContentHash)))));
+        HttpResponse<String> response = send(applyRequest(applyBody(List.of(new Draft(source, content, expectedContentHash)))));
         return interpretRefusal(response.statusCode(), response.body(), "applying " + source);
     }
 
@@ -2393,6 +2416,11 @@ final class ControlPlane {
 
     private HttpRequest authed(String path, String body) {
         return authed(path, body, TIMEOUT);
+    }
+
+    /** Artifact configuration writes use the existing shared heavy-operation budget. */
+    private HttpRequest applyRequest(String body) {
+        return authed("/api/artifacts:apply", body, io.tapstate.control.client.HttpControlClient.DEFAULT_HEAVY_TIMEOUT);
     }
 
     /** The same request with a bound of the caller's own, for a body large enough to need one. */

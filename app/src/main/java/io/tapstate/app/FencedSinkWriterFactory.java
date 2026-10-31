@@ -27,7 +27,7 @@ import java.util.concurrent.CompletionStage;
  * is a write, and a superseded run clearing a table after the current run has started writing into it would
  * take the current run's rows with it.
  */
-final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
+final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSinkWriterFactory {
 
     private static final long serialVersionUID = 1L;
 
@@ -50,10 +50,11 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
     }
 
     @Override
-    public SinkWriter getEx() throws Exception {
+    public SinkWriter getEx() throws Exception {return forWriter(0,0);}
+    @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception {
         ExecutionAuthorization authorization = ExecutionAuthorization.local();
         authorization.require(fence);
-        SinkWriter opened = delegate.get();
+        SinkWriter opened = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):delegate.get();
         try {
             authorization.require(fence);
             return guarded(opened, fence, authorization);
@@ -75,12 +76,13 @@ final class FencedSinkWriterFactory implements SupplierEx<SinkWriter> {
 
     /** Writers held to the run, over tables whose preparing is held to it too. */
     private record Preparing(FencedSinkWriterFactory writers, PreparesTargets targets, ExecutionFence fence)
-            implements SupplierEx<SinkWriter>, PreparesTargets {
+            implements io.tapstate.runtime.engine.IndexedSinkWriterFactory, PreparesTargets {
 
         @Override
         public SinkWriter getEx() throws Exception {
             return writers.getEx();
         }
+        @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception{return writers.forWriter(memberIndex,localIndex);}
 
         @Override
         public void prepareTargets(HazelcastInstance coordinator) {

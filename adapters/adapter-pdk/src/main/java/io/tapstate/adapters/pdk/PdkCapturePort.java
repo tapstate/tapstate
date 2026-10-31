@@ -13,6 +13,7 @@ import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.FieldSchema;
 import io.tapstate.spi.capture.SourcePosition;
+import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.SnapshotSession;
 import io.tapstate.spi.capture.SnapshotPreparation;
@@ -163,6 +164,32 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
     private final Set<PendingPreflight> pendingPreflights;
 
+    private SourceOperationObserver operationObserver = SourceOperationObserver.NONE;
+
+    /** Installed only by an original running-source assembly, never by a manual connection test. */
+    public PdkCapturePort withOperationObserver(SourceOperationObserver observer) {
+        this.operationObserver = Objects.requireNonNull(observer); return this;
+    }
+    private final java.util.concurrent.ConcurrentMap<PdkConnector,SourceOperationObserver> driveObservers=new java.util.concurrent.ConcurrentHashMap<>();
+    private PdkConnector observed(PdkConnector connector,String phase) {
+        driveObservers.put(connector,operationObserver.fork(phase));return connector;
+    }
+    private void closeObserver(PdkConnector connector) {
+        var observer=driveObservers.remove(connector);if(observer!=null)observer.close();
+    }
+    private <T> T operation(PdkConnector connector,SourceOperationObserver.Capability capability,PdkConnector.Action<T> action) throws Throwable {
+        return operation(connector,"connection",capability,action);
+    }
+    private <T> T operation(PdkConnector connector,String access,SourceOperationObserver.Capability capability,PdkConnector.Action<T> action) throws Throwable {
+        T result;
+        try {result=action.run();}catch(Throwable failure){reportOperation(connector,access,capability,failure);throw failure;}
+        reportOperation(connector,access,capability,null);return result;
+    }
+    private void reportOperation(PdkConnector connector,String access,SourceOperationObserver.Capability capability,Throwable failure) {
+        try {driveObservers.getOrDefault(connector,SourceOperationObserver.NONE).completed(access,capability,failure);}
+        catch(RuntimeException unavailable){LOG.warn("Source operation collection is degraded");}
+    }
+
     /** Accepts exact metadata from this open connector session before its first source row is read. */
     @FunctionalInterface
     public interface SnapshotPreparer {
@@ -177,15 +204,19 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** The returned port keeps both preparation owners and the same connector and note configuration. */
     public PdkCapturePort withSnapshotPreparation(SnapshotPreparer prepare) {
-        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+        var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, Objects.requireNonNull(prepare, "prepare"), streamPreparer, pendingPreflights);
+        configured.withOperationObserver(operationObserver);
+        return configured;
     }
 
 
     /** The host callback runs outside the connector loader and completes before CDC preflight succeeds. */
     public PdkCapturePort withStreamPreparation(StreamPreparer prepare) {
-        return new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
+        var configured = new PdkCapturePort(provisioner, stateStore, preflightTimeout, Duration.ofNanos(acknowledgeIntervalNanos),
                 nanoClock, releaseTimeout, noteScopes, snapshotPreparer, Objects.requireNonNull(prepare, "prepare"), pendingPreflights);
+        configured.withOperationObserver(operationObserver);
+        return configured;
     }
 
     /** Configured capture notes use the configuration domain, independently of generic operator state. */
@@ -277,7 +308,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private CaptureBatch snapshot(CaptureConfig config, boolean sampleSeam) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = observed(open(config),"snapshot");
         BatchReadFunction batch;
         try {
             // Resolve the read capability before entering the drive: a non-source connector is a caller
@@ -286,15 +317,25 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             batch = requireFunction(connector.functions().getBatchReadFunction());
         } catch (RuntimeException e) {
             connector.stopQuietly();
-            connector.close();
+            connector.close();closeObserver(connector);
             throw e;
         }
         // The batch stops and closes the connector itself when the read fails before its seam is taken, and
         // on close afterwards.
-        return PdkCaptureBatch.start(
-                connector,
-                reading -> read(connector, () -> batchRead(connector, config, batch, reading, sampleSeam)),
-                "tapstate-snapshot-" + connector.connectorId());
+        try {
+            var opened=PdkCaptureBatch.start(connector,
+                    reading->read(connector,()->batchRead(connector,config,batch,reading,sampleSeam)),
+                    "tapstate-snapshot-"+connector.connectorId());
+            if(driveObservers.get(connector)==SourceOperationObserver.NONE){
+                closeObserver(connector);return opened;
+            }
+            return new CaptureBatch() {
+                public Optional<SourcePosition> seam(){return opened.seam();}
+                public boolean hasNext(){return opened.hasNext();}
+                public Envelope next(){return opened.next();}
+                public void close(){try{opened.close();}finally{closeObserver(connector);}}
+            };
+        }catch(RuntimeException | Error failure){closeObserver(connector);throw failure;}
     }
 
     /** One initialized connector serves every table of a chained snapshot round. */
@@ -309,12 +350,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private SnapshotSession openSnapshotSession(CaptureConfig config, SnapshotPreparation preparation) {
-        PdkConnector connector = open(config);
+        PdkConnector connector = observed(open(config),"snapshot");
         try {
             BatchReadFunction batch = requireFunction(connector.functions().getBatchReadFunction());
             return new SharedSnapshotSession(connector, config, batch, preparation);
         } catch (RuntimeException | Error failure) {
-            connector.close();
+            connector.close();closeObserver(connector);
             throw failure;
         }
     }
@@ -389,6 +430,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
         @Override
         public void close() {
+            closeObserver(connector);
             synchronized (this) {
                 if (!closed) {
                     closed = true; var reading = active;
@@ -440,7 +482,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     @Override
     public Subscription cdc(CaptureConfig config, CaptureStart start, CaptureListener listener) {
         OracleLogMinerIdentifiers.validateConfigured(config);
-        PdkConnector connector = open(config);
+        PdkConnector connector = observed(open(config),"stream");
         StreamReadFunction stream;
         Object resumeAt;
         try {
@@ -466,7 +508,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                             connector.connector().getClass().getClassLoader())
                     : null;
         } catch (RuntimeException e) {
-            connector.close();
+            connector.close();closeObserver(connector);
             throw e;
         }
         Long startAt = startAt(start);
@@ -484,7 +526,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 "tapstate-cdc-" + connector.connectorId());
         thread.setDaemon(true);
         thread.start();
-        awaitPreflight(preflight, connector, thread, delivery);
+        try{awaitPreflight(preflight,connector,thread,delivery);}
+        catch(RuntimeException | Error failure){closeObserver(connector);throw failure;}
         return new Subscription() {
             private final CompletableFuture<Void> ended = new CompletableFuture<>();
             @Override
@@ -494,7 +537,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
             @Override
             public void close() {
-                acknowledgements.close();
+                closeObserver(connector);acknowledgements.close();
                 if (delivery.cancel()) {
                     Thread cleanup = new Thread(() -> finishCdc(connector, thread, delivery, ended),
                             "tapstate-cdc-ending-" + connector.connectorId());
@@ -576,8 +619,12 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         pendingPreflights.remove(retained);
     }
 
-    /** Retries only original failed-open cleanup; active subscriptions still own their own shutdown. */
+    /** Releases observation and retries failed-open cleanup; subscriptions own their physical shutdown. */
     @Override public void close() {
+        operationObserver.close();driveObservers.values().forEach(SourceOperationObserver::close);driveObservers.clear();
+        retryFailedOpenCleanup();
+    }
+    private void retryFailedOpenCleanup(){
         for (var retained : List.copyOf(pendingPreflights)) {
             awaitPreflightClose(retained); pendingPreflights.remove(retained);
         }
@@ -948,7 +995,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
     }
 
     private PdkConnector open(CaptureConfig config, PipelineNode node, SharedNotes notes) {
-        close();
+        retryFailedOpenCleanup();
         return PdkConnector.open(config.connectorId(), provisioner.resolve(config.connectorId()), config.settings(),
                 node, stateStore, notes, node == null && notes == null ? null : noteScopes);
     }
@@ -990,10 +1037,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     private PreparedSnapshot prepareSnapshot(PdkConnector connector, CaptureConfig config, boolean sampleSeam)
             throws Throwable {
-        connector.connector().init(connector.context());
+        operation(connector,SourceOperationObserver.Capability.INITIALIZE, () -> { connector.connector().init(connector.context()); return null; });
         // A connector builds its read from the table's own columns, so it is handed the table as
         // discovered - with its fields - not a bare name. Discovery does not re-init: init has run.
-        Map<String, TapTable> discovered = byId(discoverTables(connector, config.streams()));
+        Map<String, TapTable> discovered = byId(operation(connector,SourceOperationObserver.Capability.METADATA_READ, () -> discoverTables(connector, config.streams())));
         discovered.values().forEach(connector::fillFieldTypes);
         connector.context().setTableMap(tableMap(discovered));
         // Position discovery may inspect the selected tables too. Populate their context first, while
@@ -1012,7 +1059,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         LOG.info("Snapshot read started for table {}", stream);
         java.util.concurrent.atomic.LongAdder eventsRead = new java.util.concurrent.atomic.LongAdder();
-        batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
+        operation(connector,stream,SourceOperationObserver.Capability.SNAPSHOT_READ, () -> { batch.batchRead(connector.context(), table, null, BATCH_SIZE, (events, offset) -> {
             if (events.isEmpty()) {
                 return;
             }
@@ -1020,7 +1067,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             List<TapEvent> handed = new ArrayList<>(events);
             reading.rowsRead(() -> decodeSnapshotRows(connector, handed, snapshot.declared()));
             eventsRead.add(handed.size());
-        });
+        }); return null; });
         LOG.info("Snapshot read finished for table {} ({} events read; awaiting target confirmation)",
                 stream, eventsRead.sum());
     }
@@ -1115,8 +1162,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** Initializes a stream connector and places its discovered, typed tables on its context. */
     private Map<String, TapTable> prepareStream(PdkConnector connector, CaptureConfig config) throws Throwable {
-        connector.connector().init(connector.context());
-        List<TapTable> discovered = discoverTables(connector, config.streams());
+        operation(connector,SourceOperationObserver.Capability.INITIALIZE, () -> { connector.connector().init(connector.context()); return null; });
+        List<TapTable> discovered = operation(connector,SourceOperationObserver.Capability.METADATA_READ, () -> discoverTables(connector, config.streams()));
         OracleLogMinerIdentifiers.validateDiscovered(config, discovered);
         Map<String, TapTable> tables = byId(discovered);
         tables.values().forEach(connector::fillFieldTypes);
@@ -1167,6 +1214,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     position(connector, startOffset).ifPresent(started::onStart);
                 }
                 Map<String, PdkRowSchema> declared = declaredTypes(tables);
+                var callbackFailed = new java.util.concurrent.atomic.AtomicBoolean();
                 StreamReadConsumer consumer = StreamReadConsumer.create((events, offset) -> {
                     // Every delivery is the moment to hand the connector what its source may release: this
                     // is the connector's own delivery thread, the one thread any connector can safely be
@@ -1176,12 +1224,26 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     // thread for as long as the recipient needs room, and the release is due regardless --
                     // and outside the delivery a close cancels, so a close wakes the hand-over and never the
                     // source's own call.
-                    acknowledgements.applyIfDue();
-                    delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    events.stream().filter(event->!(event instanceof ControlEvent)).filter(TapBaseEvent.class::isInstance).map(TapBaseEvent.class::cast).map(TapBaseEvent::getTableId)
+                            .filter(Objects::nonNull).distinct().forEach(table->reportOperation(connector,table,SourceOperationObserver.Capability.STREAM_READ,null));
+                    try {
+                        acknowledgements.applyIfDue();
+                        delivery.accept(() -> handOver(connector, declared, listener, events, offset));
+                    } catch (RuntimeException | Error downstreamFailure) {
+                        callbackFailed.set(true);
+                        throw downstreamFailure;
+                    }
                 });
                 Object readerOffset = readerOffset(connector, startOffset, resumeAt != null);
                 if (delivery.closed) return null;
-                stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer);
+                try { stream.streamRead(connector.context(), config.streams(), readerOffset, BATCH_SIZE, consumer); }
+                catch (Throwable failure) {
+                    if (!delivery.closed && !callbackFailed.get()) {
+                        for(String table:config.streams().isEmpty()?tables.keySet():config.streams())
+                            reportOperation(connector,table,SourceOperationObserver.Capability.STREAM_READ,failure);
+                    }
+                    throw failure;
+                }
                 return null;
             });
         } catch (Throwable t) {

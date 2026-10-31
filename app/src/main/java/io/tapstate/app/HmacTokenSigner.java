@@ -76,7 +76,10 @@ public final class HmacTokenSigner implements TokenSigner {
     }
 
     @Override
-    public Optional<VerifiedToken> verify(String token) {
+    public Optional<VerifiedToken> verify(String token) { return verifyDetailed(token).map(TokenSigner.Detailed::identity); }
+
+    @Override
+    public Optional<TokenSigner.Detailed> verifyDetailed(String token) {
         if (token == null) {
             return Optional.empty();
         }
@@ -113,10 +116,16 @@ public final class HmacTokenSigner implements TokenSigner {
             if (clock.instant().getEpochSecond() >= exp) {
                 return Optional.empty();
             }
-            return Optional.of(new VerifiedToken(subject, Scope.valueOf(scopeName)));
+            return Optional.of(new TokenSigner.Detailed(new VerifiedToken(subject, Scope.valueOf(scopeName)),
+                    new io.tapstate.control.core.HumanTokenEvidence(java.time.Instant.ofEpochSecond(exp), verifierBinding())));
         } catch (RuntimeException malformedClaims) {
             return Optional.empty();
         }
+    }
+
+    /** Pure nonsecret verifier lineage, including its actual signed storage authentication domain. */
+    public String verifierBinding() {
+        return java.util.HexFormat.of().formatHex(hmac("alert-human-verifier-v1" + scopeClaims()));
     }
 
     private byte[] hmac(String data) {

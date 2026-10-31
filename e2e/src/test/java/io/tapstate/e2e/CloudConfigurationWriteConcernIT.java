@@ -31,6 +31,7 @@ class CloudConfigurationWriteConcernIT {
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     private static final String CLUSTER = "write-concern-cluster";
+    private static final String ORGANIZATION = "write-concern-org";
     private static final String TOKEN = "write-concern-service-token-sentinel";
     private static final String OPERATION = "36ace56d-6eea-4071-8ed0-bd335ad1c6bd";
 
@@ -45,6 +46,17 @@ class CloudConfigurationWriteConcernIT {
         cloud.createContext("/", exchange -> {
             String path = exchange.getRequestURI().getPath();
             requests.add(exchange.getRequestMethod() + " " + path);
+            if ("GET".equals(exchange.getRequestMethod())
+                    && path.equals("/v1/api/clusters/" + CLUSTER + "/egress-address")
+                    && ("Bearer " + TOKEN).equals(exchange.getRequestHeaders().getFirst("Authorization"))) {
+                byte[] response = JsonWriter.write(Map.of("code", "ok", "data", Map.of(
+                        "organizationId", ORGANIZATION, "clusterId", CLUSTER,
+                        "egressAddressStatus", "DYNAMIC"))).getBytes(StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, response.length);
+                try (var output = exchange.getResponseBody()) { output.write(response); }
+                exchange.close(); return;
+            }
             boolean claim = path.equals(prefix + "claim");
             boolean complete = path.equals(prefix + "complete");
             if (!"POST".equals(exchange.getRequestMethod()) || !(claim || complete)
@@ -76,11 +88,15 @@ class CloudConfigurationWriteConcernIT {
             assertThat(entry.statusCode()).isEqualTo(200);
             assertThat(Document.parse(entry.body()))
                     .containsEntry("mode", "CLOUD").containsEntry("entry", "SETUP_REQUIRED");
-            assertThat(requests).containsExactly("POST " + prefix + "claim", "POST " + prefix + "complete");
+            assertThat(requests).containsExactly("POST " + prefix + "claim",
+                    "GET /v1/api/clusters/" + CLUSTER + "/egress-address", "POST " + prefix + "complete");
             var target = mongo.getDatabase(database);
             assertThat(SystemCollections.STORAGE_SETUP.on(target).find(new Document("_id", "cluster")).first())
                     .containsEntry("phase", "CONFIG_PREPARED").containsEntry("operationId", OPERATION);
             assertThat(SystemCollections.CLUSTER_KEYS.on(target).countDocuments()).isEqualTo(1);
+            var rules = SystemCollections.ALERT_RULES.on(target).find().into(new java.util.ArrayList<>());
+            assertThat(rules).hasSize(5).allSatisfy(row -> assertThat(row.get("_id", Document.class))
+                    .containsEntry("authorityId", ORGANIZATION).containsEntry("clusterId", CLUSTER));
             assertThat(Files.readString(server.output())).doesNotContain(TOKEN, uri, "Cloud configuration initialization failed");
         } finally {
             cloud.stop(0);

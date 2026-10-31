@@ -15,7 +15,14 @@ import java.util.Objects;
 
 /** Credential-free coordinates captured before submission; member callbacks never resolve newer note tokens. */
 record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.Purpose purpose,
-        Note primary,Note global,String artifactHash)implements Serializable {
+        Note primary,Note global,String artifactHash,Source source)implements Serializable {
+    ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.Purpose purpose,Note primary,Note global,String artifactHash){this(original,node,purpose,primary,global,artifactHash,null);}
+    record Source(String id,String incarnation,long revision,String contentHash) implements Serializable {
+        Source(SourceBindingSnapshot value){this(value.identity().sourceId(),value.identity().incarnation(),value.identity().bindingRevision(),value.contentHash());}
+        Source {new SourceBindingIdentity(id,incarnation,revision);if(contentHash==null || !contentHash.matches("[0-9a-f]{64}"))throw new IllegalArgumentException("invalid original target Source");}
+        boolean matches(SourceBindingSnapshot value){return id.equals(value.identity().sourceId()) && incarnation.equals(value.identity().incarnation()) && revision==value.identity().bindingRevision() && contentHash.equals(value.contentHash());}
+    }
+    ConfiguredSinkRun withSource(SourceBindingSnapshot original){return new ConfiguredSinkRun(this.original,node,purpose,primary,global,artifactHash,new Source(original));}
     record Note(long bindingVersion,String namespace,RequiredNoteOwner.Kind kind,String ownerId,
             long stateGeneration,long generation)implements Serializable {
         Note(RequiredNoteScope original){this(original.owner().bindingVersion(),original.owner().namespace(),original.owner().kind(),original.owner().ownerId(),original.owner().stateGeneration(),original.generation());}
@@ -52,6 +59,10 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
 
     Map<String,TargetIdentityPlan> assessTargets(SinkConfig config,Map<String,io.tapstate.spi.sink.TargetTable> targets,
             RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable active) {
+        return assessTargets(config,targets,notes,provisioner,active,io.tapstate.spi.capture.SourceOperationObserver.NONE);
+    }
+    Map<String,TargetIdentityPlan> assessTargets(SinkConfig config,Map<String,io.tapstate.spi.sink.TargetTable> targets,
+            RequiredNoteStore notes,ConnectorProvisioner provisioner,Runnable active,io.tapstate.spi.capture.SourceOperationObserver observer) {
         active.run();if(!node.equals(config.node()))throw unavailable();
         var fixed=Map.of(primary.namespace(),primary.token(),global.namespace(),global.token());
         var scopes=ConnectorNoteScopes.of(notes,namespace -> {
@@ -64,7 +75,7 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         var claim=new WorkloadClaimFence(new WorkloadClaimKey(original.scope().clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,original.pipelineId()),
                 new WorkloadOwner(original.ownerNodeId(),original.ownerBootId()),original.claimGeneration(),original.executionGeneration(),original.topologyRevision());
         return PdkSinkPort.withRequiredNotes(exact,null,null,purpose,scopes,claim)
-                .assessTargets(config,targets);
+                .withOperationObserver(observer).assessTargets(config,targets);
     }
     private static TapstateException unavailable(){return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null);}
 }

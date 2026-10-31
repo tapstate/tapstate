@@ -1,0 +1,553 @@
+package io.tapstate.app;
+
+import io.tapstate.core.alerting.*;
+import io.tapstate.core.lifecycle.*;
+import io.tapstate.spi.store.*;
+import java.time.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.Test;
+import static org.assertj.core.api.Assertions.*;
+import static org.awaitility.Awaitility.await;
+import static org.mockito.Mockito.*;
+import static org.mockito.ArgumentMatchers.*;
+
+class PipelineAlertRuntimeTest {
+    static final Instant T = AlertEvaluationHostTest.T;
+    final AlertEvaluationHostTest fixture = new AlertEvaluationHostTest();
+    final ConcurrentMap<AlarmKey, AlertStore.Stored<AlertStateRecord.Head>> rows = new ConcurrentHashMap<>();
+    final ConcurrentMap<String, PipelineIntentSnapshot> intents = new ConcurrentHashMap<>();
+    final PipelineIntentStore intentStore = mock(PipelineIntentStore.class);
+    PipelineAlertRuntimeTest() {
+        when(intentStore.loadForActuation(anyString())).thenAnswer(c -> Optional.ofNullable(intents.get(c.getArgument(0))));
+        when(fixture.store.state(any(), any())).thenAnswer(c -> Optional.ofNullable(rows.get(c.getArgument(0))));
+        var definition = AlertEvaluationHostTest.definition("pipeline.failed");
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(definition), null));
+        when(fixture.store.evaluationStates(any(),anyInt())).thenAnswer(c->new AlertStore.EvaluationPage(List.copyOf(rows.values()),null));
+        doAnswer(c -> {
+            AlertStore.Commit commit = c.getArgument(0); var change = commit.state();
+            rows.compute(change.after().snapshot().rule().key(), (key, before) -> new AlertStore.Stored<>(before == null ? 1 : before.revision() + 1, change.after()));
+            return AlertStore.Outcome.STAGED;
+        }).when(fixture.store).commit(any());
+    }
+    PipelineConvergencePass pass(String id) {
+        var scope = new PipelineIntentScope("cluster", 1, "cache", id, 1);
+        var intent = new PipelineIntentSnapshot(scope, 1, new DesiredState(id, PipelineState.RUNNING, "revision"));
+        intents.put(id, intent);
+        var claim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, id),
+                new WorkloadOwner("node", "boot"), 1, 1, 1);
+        var pass = mock(PipelineConvergencePass.class);
+        when(pass.scope()).thenReturn(scope); when(pass.claim()).thenReturn(claim); when(pass.intent()).thenReturn(intent);
+        return pass;
+    }
+    PipelineAlertRuntime runtime() {
+        return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
+                (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void removedResourceReconciliationReadsOnlyHeadsThatStillNeedRetirement(boolean retired) {
+        var rule=useResourceRule();var resource=new AlarmKey.Resource("source","erp","uuid");
+        var binding=new AlertEvaluationHost.Binding(rule,resource,"producer",1,()->{});
+        assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(T,"a".repeat(64),
+                OperationalEvidence.Capability.STREAM_READ,false))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        if(retired)fixture.host.end(binding.key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{});
+        var retained=rows.get(binding.key());
+        when(fixture.store.evaluationStates(any(),anyInt())).thenReturn(new AlertStore.EvaluationPage(
+                List.of(retained),null,Set.of(resource),Set.of()));
+        clearInvocations(fixture.store);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            if(retired)verify(fixture.store,never()).state(eq(binding.key()),any());
+            else verify(fixture.store,atLeastOnce()).state(eq(binding.key()),any());
+            assertThat(rows.get(binding.key()).value().retiredAt()).isNotNull();
+            assertThat(rows.get(binding.key()).value().episode().value().endReason())
+                    .isEqualTo(AlertSnapshot.EndReason.RESOURCE_REMOVED);
+        }
+    }
+    @Test void anotherObserversRetirementStillEvictsTheOriginalLocalBinding() {
+        useResourceRule();
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"erp",T,false,()->{});drained(runtime);
+            var head=resourceHead("erp");var key=head.snapshot().rule().key();
+            fixture.now.set(T.plusSeconds(31));
+            var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),
+                    AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"peer-owner",()->{});
+            assertThat(peer.end(key,AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{}))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            when(fixture.store.evaluationStates(any(),anyInt())).thenAnswer(call->new AlertStore.EvaluationPage(
+                    List.copyOf(rows.values()),null,Set.of(key.resource()),Set.of()));
+            runtime.tick();drained(runtime);clearInvocations(fixture.store);
+            runtime.tick();drained(runtime);
+            verify(fixture.store,never()).state(eq(key),any());
+            assertThat(rows.get(key).value().retiredAt()).isNotNull();
+            assertThat(rows.get(key).value().owner().ownerId()).isEqualTo("peer-owner");
+        }
+    }
+    static Observation observation(String id, Instant at, PipelineState state) {
+        return new Observation(id, state, Map.of(), Map.of(), Map.of(), null, at, List.of());
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value=PipelineState.class,names={"RUNNING","FAILED"})
+    void onePublicationBoundsRemoteActuationReadsWhileKeepingTheOriginalCommitProof(PipelineState state) {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");clearInvocations(intentStore);
+            runtime.published(original,observation("orders",T,state),null);drained(runtime);
+            assertThat(rows).hasSize(1);assertThat(runtime.health().degraded()).isFalse();
+            verify(intentStore,atMost(2)).loadForActuation("orders");
+            verify(fixture.store).commit(argThat(c->c.state()!=null && c.state().proof()!=null
+                    && c.state().proof().pipeline().equals(original.intent())));
+        }
+    }
+    @Test void anIgnoredPublicationStillChecksTheOriginalIntentAfterItsWork() {
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");var first=new AtomicBoolean(true);
+            when(intentStore.loadForActuation("orders")).thenAnswer(call->{
+                var value=intents.get("orders");if(first.compareAndSet(true,false))intents.remove("orders");return Optional.ofNullable(value);
+            });
+            runtime.published(original,observation("orders",T.minusMillis(1),PipelineState.RUNNING),null);drained(runtime);
+            assertThat(rows).isEmpty();assertThat(runtime.health().degraded()).isTrue();
+        }
+    }
+    @Test void aDisabledRuleKeepsRemoteGuardsForItsAdministrativeEnd() {
+        var rule=AlertEvaluationHostTest.definition("pipeline.failed");
+        var disabled=new AlertConfiguration.Rule(rule.header(),rule.name(),rule.typeId(),rule.typeVersion(),rule.resources(),
+                rule.parameters(),rule.severityOverride(),false,rule.metric());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);var original=pass("orders");
+            runtime.published(original,observation("orders",T,PipelineState.FAILED),null);drained(runtime);
+            var retained=rows.entrySet().iterator().next();rows.clear();
+            when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled),null));
+            runtime.tick();drained(runtime);
+            // The disabled definition is now visible while this original active head still awaits its END.
+            rows.put(retained.getKey(),retained.getValue());clearInvocations(intentStore,fixture.store);
+            runtime.published(original,observation("orders",T,PipelineState.RUNNING),null);drained(runtime);
+            verify(intentStore,atLeast(3)).loadForActuation("orders");
+            verify(fixture.store).commit(argThat(c->c.kind()==AlertStore.CommitKind.END && c.state().proof()==null));
+            assertThat(rows.get(retained.getKey()).value().snapshot().enabled()).isFalse();
+            assertThat(runtime.health().degraded()).isFalse();
+        }
+    }
+    @Test void aWrappedCodedFailureKeepsItsCodeWithoutExceptionMessagesOrArguments() {
+        var coded = new io.tapstate.core.common.TapstateException(io.tapstate.runtime.engine.EngineError.JOB_FAILED,
+                Map.of("pipeline", "private-argument-sentinel", "cause", "private-cause-argument"),
+                new IllegalStateException("private-driver-message"));
+        var failure = new RuntimeException("private-wrapper-message", coded);
+        var observation = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                PipelineFailures.of("orders", failure), T, List.of());
+        try (var runtime = runtime()) {
+            runtime.tick(); await().atMost(Duration.ofSeconds(3)).until(() -> !runtime.health().degraded());
+            runtime.published(pass("orders"), observation, failure);
+            await().atMost(Duration.ofSeconds(3)).until(() -> !rows.isEmpty());
+            var trace = rows.values().iterator().next().value().episode().diagnostics().history().first().trace();
+            assertThat(trace.text()).contains(coded.code().code())
+                    .doesNotContain("private-argument-sentinel", "private-cause-argument",
+                            "private-driver-message", "private-wrapper-message");
+            assertThat(trace.text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .isLessThanOrEqualTo(AlarmDiagnostics.MAX_TEXT_BYTES);
+        }
+    }
+    @Test void healthyCacheReadBurstsLeaveRoomForFailureAndCapabilitySpecificRecovery() throws Exception {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Cache health","cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null)
+                .validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var first=new AtomicBoolean(true);
+        doAnswer(call->{
+            if(first.compareAndSet(true,false)){
+                entered.countDown();
+                try {assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();return Optional.empty();}
+            }
+            return Optional.ofNullable(rows.get(call.getArgument(0)));
+        }).when(fixture.store).state(any(),any());
+        var claims=mock(WorkloadClaimStore.class);
+        var key=new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"orders");
+        when(claims.read(key)).thenReturn(Optional.empty());
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,
+                BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-storage-health")),intentStore,
+                (scope,claim)->Optional.of(()->{}),()->{},fixture.clock)){
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var signals=new BuiltinResourceSignals(()->runtime,()->null,
+                    new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},fixture.clock);
+            var observed=new ObservedWorkloadClaims(claims,signals::cacheOperation);
+            observed.read(key);assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            try {
+                for(int i=0;i<200;i++)observed.read(key);
+                assertThat(runtime.health().rejected()).isZero();
+                fixture.now.set(T.plusMillis(100));
+                doThrow(new io.tapstate.core.common.TapstateException(IoError.STORE_UNAVAILABLE,Map.of(),null))
+                        .when(claims).read(key);
+                assertThatThrownBy(()->observed.read(key)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                fixture.now.set(T.plusMillis(200));observed.release(null);
+                assertThat(runtime.health().queuedInputs()).isLessThanOrEqualTo(3);
+            } finally {release.countDown();}
+            drained(runtime);assertThat(runtime.health().rejected()).isZero();
+            var afterWrite=rows.values().iterator().next().value();
+            assertThat(afterWrite.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            assertThat(afterWrite.operationalEvidence().failedCapabilities()).isEqualTo(1<<OperationalEvidence.Capability.CACHE_READ.ordinal());
+            fixture.now.set(T.plusMillis(300));doReturn(Optional.empty()).when(claims).read(key);observed.read(key);drained(runtime);
+            var last=rows.values().iterator().next().value();
+            assertThat(last.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(last.episode().value().recoveredAt()).isEqualTo(T.plusMillis(300));
+            assertThat(last.operationalEvidence().failedCapabilities()).isZero();
+        } finally {release.countDown();}
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"healthy,false","resolved,false","exact-gap,false","exact-age,false",
+            "new-failure,true","recovery,true","other-capability,true","expired-evidence,true","gap-exceeded,true",
+            "age-exceeded,true","binding-changed,true","missing-rule,true","raced-failure,true","source-resource,true","cas-conflict,true"})
+    void peerOwnedCacheHeartbeatsDeferOnlyUnchangedFreshHealthyEvidence(String scenario,boolean degraded) {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        boolean source=scenario.equals("source-resource");
+        var rule=new AlertConfiguration.Rule(original.header(),"Operational health",source?"source.connection-failed":"cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of(source?"source":"cluster-storage"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenReturn(Optional.of(rule));
+        var resource=new AlarmKey.Resource(source?"source":"cluster-storage",source?"erp":"cache","cache:1");var digest="a".repeat(64);
+        var binding=new AlertEvaluationHost.Binding(rule,resource,digest,source?1:0,()->{});
+        var initialCapability=scenario.equals("other-capability")?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ;
+        boolean initialSuccess=!Set.of("resolved","recovery","other-capability").contains(scenario);
+        assertThat(fixture.host.accept(binding,0,new AlertInput.Operational(T,digest,initialCapability,initialSuccess)))
+                .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        if(scenario.equals("resolved")) {
+            fixture.now.set(T.plusSeconds(1));
+            assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(fixture.clock.instant(),digest,initialCapability,true)))
+                    .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+        }
+        fixture.now.set(T.plusSeconds(scenario.equals("resolved")?4:3));
+        var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"other-owner",()->{});
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,peer,BuiltinAlarmTypes.catalog(),null,null,
+                Set.of("cluster-storage-health","source-operational-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);assertThat(runtime.health().degraded()).isFalse();
+            if(scenario.equals("expired-evidence")) {
+                fixture.now.set(T.plus(rows.get(binding.key()).value().snapshot().rule().maxAge()).plusSeconds(1));
+                fixture.host.tick(binding);
+            }
+            if(scenario.equals("cas-conflict")) {
+                fixture.now.set(T.plusSeconds(31));doReturn(AlertStore.Outcome.CONFLICT).when(fixture.store).commit(any());
+            }
+            if(scenario.equals("gap-exceeded")||scenario.equals("exact-gap"))fixture.now.set(T.plusSeconds(scenario.equals("exact-gap")?5:6));
+            if(scenario.equals("age-exceeded")||scenario.equals("exact-age"))fixture.now.set(T.plusSeconds(scenario.equals("exact-age")?15:16));
+            var before=new AtomicReference<>(rows.get(binding.key()));
+            if(scenario.equals("missing-rule"))when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenReturn(Optional.empty());
+            if(scenario.equals("raced-failure"))when(fixture.store.definition(eq(AlertConfiguration.Kind.RULE),eq(rule.header().identity().id()),isNull())).thenAnswer(call->{
+                assertThat(fixture.host.accept(binding,1,new AlertInput.Operational(fixture.clock.instant(),digest,OperationalEvidence.Capability.CACHE_READ,false)))
+                        .isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+                before.set(rows.get(binding.key()));return Optional.of(rule);
+            });
+            var incoming=scenario.equals("binding-changed")?"b".repeat(64):digest;
+            var observed=scenario.equals("age-exceeded")||scenario.equals("exact-age")?T.plusSeconds(3):fixture.clock.instant();
+            runtime.resourceInput(resource,rule.typeId(),binding.sourceBindingRevision(),incoming,()->{},new AlertInput.Operational(observed,incoming,
+                    OperationalEvidence.Capability.CACHE_READ,!scenario.equals("new-failure")));
+            drained(runtime);assertThat(runtime.health().degraded()).isEqualTo(degraded);
+            assertThat(rows.get(binding.key())).as("deferred or refused peer input cannot freshen retained evidence or change ownership").isEqualTo(before.get());
+        }
+    }
+    @Test void healthyCacheCoalescingLeavesRoomForTheRealSamplingCadence() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Cache health","cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        var resource=new AlarmKey.Resource("cluster-storage","cache","cache:1");var digest="a".repeat(64);
+        var binding=new AlertEvaluationHost.Binding(rule,resource,digest,0,()->{});
+        fixture.host.accept(binding,0,new AlertInput.Operational(T,digest,OperationalEvidence.Capability.CACHE_READ,true));
+        var accepted=new ArrayList<Instant>();accepted.add(T);
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,
+                Set.of("cluster-storage-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);
+            for(int index=1;index<=8;index++) {
+                fixture.now.set(T.plusMillis(index*1100L));
+                runtime.resourceInput(resource,rule.typeId(),0,digest,()->{},new AlertInput.Operational(fixture.clock.instant(),digest,
+                        OperationalEvidence.Capability.CACHE_READ,true));drained(runtime);
+                var observed=rows.get(binding.key()).value().snapshot().lastObservedAt();
+                if(!observed.equals(accepted.getLast()))accepted.add(observed);
+            }
+            var maxGap=rows.get(binding.key()).value().snapshot().rule().maxGap();
+            assertThat(accepted).hasSizeGreaterThan(1);
+            for(int index=1;index<accepted.size();index++)assertThat(Duration.between(accepted.get(index-1),accepted.get(index)))
+                    .as("coalescing and the one-second sampler cannot themselves manufacture a gap").isLessThanOrEqualTo(maxGap);
+        }
+    }
+    @Test void oneBlockedObjectDoesNotOccupyBothWorkersAndStarveAnotherObject() throws Exception {
+        var entered = new CountDownLatch(1); var release = new CountDownLatch(1);
+        doAnswer(c -> {
+            AlertStore.Commit commit = c.getArgument(0);
+            if (commit.state().after().snapshot().rule().key().resource().id().equals("a")) {
+                entered.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();return AlertStore.Outcome.CONFLICT;}
+            }
+            var head = commit.state().after(); rows.put(head.snapshot().rule().key(), new AlertStore.Stored<>(1, head));
+            return AlertStore.Outcome.STAGED;
+        }).when(fixture.store).commit(any());
+        try (var runtime = runtime()) {
+            runtime.tick(); await().atMost(Duration.ofSeconds(3)).until(() -> !runtime.health().degraded());
+            var a = pass("a"); var b = pass("b");
+            runtime.published(a, observation("a", T, PipelineState.FAILED), null);
+            assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+            fixture.now.set(T.plusSeconds(1));
+            runtime.published(a, observation("a", T.plusSeconds(1), PipelineState.FAILED), null);
+            runtime.published(b, observation("b", T, PipelineState.FAILED), null);
+            try { await().atMost(Duration.ofSeconds(2)).until(() -> rows.keySet().stream().anyMatch(k -> k.resource().id().equals("b"))); }
+            finally { release.countDown(); }
+            await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+        } finally { release.countDown(); }
+    }
+    @Test void freshnessRunsWithoutPublicationsAndStopDoesNotInventRecovery() {
+        var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        try(var runtime=runtime()){
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var pass=pass("orders");runtime.expecting(pass);
+            fixture.now.set(T.plusSeconds(121));runtime.tick();
+            await().atMost(Duration.ofSeconds(3)).until(()->rows.values().stream().anyMatch(v->v.value().snapshot().status()==AlertSnapshot.Status.FIRING));
+            var original=rows.values().iterator().next().value();
+            var stopped=new PipelineIntentSnapshot(pass.scope(),2,new DesiredState("orders",PipelineState.STOPPED,"revision"));
+            intents.put("orders",stopped);var next=mock(PipelineConvergencePass.class);var originalScope=pass.scope();var originalClaim=pass.claim();
+            when(next.scope()).thenReturn(originalScope);when(next.claim()).thenReturn(originalClaim);when(next.intent()).thenReturn(stopped);
+            fixture.now.set(T.plusSeconds(122));runtime.published(next,observation("orders",fixture.now.get(),PipelineState.STOPPED),null);runtime.tick();
+            await().atMost(Duration.ofSeconds(3)).until(()->rows.values().iterator().next().value().snapshot().quality()==AlertSnapshot.Quality.UNKNOWN);
+            var after=rows.values().iterator().next().value();
+            assertThat(after.episode().value()).isEqualTo(original.episode().value());
+            assertThat(after.snapshot().rule().generation()).isEqualTo(original.snapshot().rule().generation());
+            assertThat(after.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        }
+    }
+    @Test void aQueueRefusalCannotBridgeThePreviousPendingWindow() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),original.name(),original.typeId(),1,original.resources(),
+                Map.of("trigger-for",java.math.BigDecimal.valueOf(4)),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        try(var runtime=runtime()){
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var pass=pass("orders");runtime.published(pass,observation("orders",T,PipelineState.FAILED),null);
+            await().atMost(Duration.ofSeconds(3)).until(()->!rows.isEmpty());
+            var tooMany=new ArrayList<MetricFact>();for(int i=0;i<4097;i++)tooMany.add(new MetricFact("test.quantity"+i,MetricType.GAUGE,"1",List.of()));
+            fixture.now.set(T.plusSeconds(2));runtime.published(pass,new Observation("orders",PipelineState.FAILED,
+                    Map.of(),Map.of(),Map.of(),null,fixture.now.get(),tooMany),null);
+            assertThat(runtime.health().rejected()).isPositive();assertThat(runtime.health().degraded()).isTrue();
+            fixture.now.set(T.plusSeconds(4));runtime.published(pass,observation("orders",fixture.now.get(),PipelineState.FAILED),null);
+            await().atMost(Duration.ofSeconds(3)).until(()->T.plusSeconds(4).equals(rows.values().iterator().next().value().snapshot().lastObservedAt()));
+            var state=rows.values().iterator().next().value().snapshot();
+            assertThat(state.status()).isEqualTo(AlertSnapshot.Status.PENDING);assertThat(state.pendingSince()).isEqualTo(T.plusSeconds(4));
+        }
+    }
+    @Test void boundedQueueAndCloseReleasePendingWorkWithoutReopeningTheHost() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        doAnswer(c->{entered.countDown();try{release.await(5,TimeUnit.SECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();return AlertStore.Outcome.CONFLICT;}return AlertStore.Outcome.STAGED;}).when(fixture.store).commit(any());
+        var runtime=runtime();
+        try{
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var pass=pass("orders");runtime.published(pass,observation("orders",T,PipelineState.FAILED),null);
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            for(int i=0;i<80;i++)runtime.published(pass,observation("orders",T,PipelineState.FAILED),null);
+            assertThat(runtime.health().rejected()).isPositive();assertThat(runtime.health().queuedInputs()).isLessThanOrEqualTo(64);
+            assertThat(runtime.health().queuedBytes()).isLessThanOrEqualTo(8*1024*1024);
+            runtime.close();release.countDown();
+            await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+            assertThat(runtime.health().queuedBytes()).isZero();assertThat(runtime.health().closed()).isTrue();
+            int requests=mockingDetails(fixture.store).getInvocations().size();runtime.tick();runtime.published(pass,observation("orders",T,PipelineState.FAILED),null);
+            assertThat(mockingDetails(fixture.store).getInvocations()).hasSize(requests);
+        }finally{release.countDown();runtime.close();}
+    }
+    @Test void exhaustedIndependentTickCommitsAreReportedAsDegradedCollection() {
+        try(var runtime=runtime()){
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            var pass=pass("orders");runtime.published(pass,observation("orders",T,PipelineState.RUNNING),null);
+            await().atMost(Duration.ofSeconds(3)).until(()->!rows.isEmpty());
+            var conflicts=new AtomicInteger();doAnswer(c->{conflicts.incrementAndGet();return AlertStore.Outcome.CONFLICT;}).when(fixture.store).commit(any());
+            fixture.now.set(T.plusSeconds(16));runtime.tick();
+            await().atMost(Duration.ofSeconds(3)).until(()->conflicts.get()>=3);
+            await().atMost(Duration.ofSeconds(1)).untilAsserted(()->assertThat(runtime.health().degraded()).isTrue());
+        }
+    }
+    @Test void theOwnedFreshnessTimerRunsWithoutAnyConvergenceOrManualTick() {
+        var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        try(var runtime=runtime()){
+            var pass=pass("orders");runtime.expecting(pass);fixture.now.set(T.plusSeconds(121));runtime.start();
+            await().atMost(Duration.ofSeconds(4)).until(()->rows.values().stream().anyMatch(r->r.value().snapshot().status()==AlertSnapshot.Status.FIRING));
+            assertThat(runtime.health().closed()).isFalse();
+        }
+    }
+    @Test void closeCancelsQueuedReservationsEvenAfterTheirSlotWasRemoved() throws Exception {
+        var entered=new CountDownLatch(2);var release=new CountDownLatch(1);
+        doAnswer(c->{entered.countDown();try{release.await(5,TimeUnit.SECONDS);}catch(InterruptedException interrupted){Thread.currentThread().interrupt();}return AlertStore.Outcome.CONFLICT;})
+                .when(fixture.store).commit(any());
+        var runtime=runtime();
+        try{
+            runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->!runtime.health().degraded());
+            runtime.published(pass("b"),observation("b",T,PipelineState.FAILED),null);
+            runtime.published(pass("c"),observation("c",T,PipelineState.FAILED),null);
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            runtime.published(pass("a"),observation("a",T,PipelineState.FAILED),null);
+            runtime.retain(Set.of("b","c"));runtime.close();release.countDown();
+            await().atMost(Duration.ofSeconds(2)).until(()->runtime.health().queuedInputs()==0);
+            assertThat(runtime.health().queuedBytes()).isZero();
+        }finally{release.countDown();runtime.close();}
+    }
+    @Test void closingDuringServiceCreationDisposesTheUnpublishedPlanner() throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var planning=mock(AlertPlanningRuntime.class);
+        when(fixture.store.evaluationRules(any(),anyInt())).thenAnswer(call->{entered.countDown();boolean interrupted=false;for(;;)try{release.await();break;}catch(InterruptedException expected){interrupted=true;}if(interrupted)Thread.currentThread().interrupt();return new AlertStore.DefinitionPage(List.of(),null);});
+        var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),planning),intentStore,(scope,claim)->Optional.of(()->{}),()->{},fixture.clock);
+        try{runtime.tick();assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();runtime.close();release.countDown();verify(planning,timeout(3000)).close();verify(planning,never()).start();assertThat(runtime.health().closed()).isTrue();}
+        finally{release.countDown();runtime.close();}
+    }
+
+    private AlertConfiguration.Rule resourceRule() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        return new AlertConfiguration.Rule(original.header(),"Source health","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null)
+                .validated(BuiltinAlarmTypes.catalog());
+    }
+    private AlertConfiguration.Rule useResourceRule() {
+        var rule=resourceRule();
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        return rule;
+    }
+    private void resource(PipelineAlertRuntime runtime,String id,Instant at,boolean success,Runnable guard) {
+        runtime.resourceInput(new AlarmKey.Resource("source",id,"uuid"),"source.connection-failed",1,"producer",guard,
+                new AlertInput.Operational(at,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,success));
+    }
+    private AlertStateRecord.Head resourceHead(String id) {
+        return rows.values().stream().map(AlertStore.Stored::value).filter(h->h.snapshot().rule().key().resource().id().equals(id)).findFirst().orElseThrow();
+    }
+    private void drained(PipelineAlertRuntime runtime) {
+        await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+    }
+    @Test void aNecessaryOperationFailureStillReportsBusyRatherThanClaimingAcceptance() {
+        var rule=useResourceRule();var resource=new AlarmKey.Resource("source","erp","uuid");
+        var binding=new AlertEvaluationHost.Binding(rule,resource,"producer",1,()->{});
+        fixture.host.accept(binding,0,new AlertInput.Operational(T,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,true));
+        var before=rows.get(binding.key());
+        var peer=new AlertEvaluationHost(fixture.store,BuiltinAlarmTypes.catalog(),AlertChannelPolicy.Deployment.ON_PREM,fixture.clock,"other-owner",()->{});
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,peer,BuiltinAlarmTypes.catalog(),null,null,Set.of("source-operational-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);assertThat(runtime.health().degraded()).isFalse();
+            fixture.now.set(T.plusSeconds(1));resource(runtime,"erp",T.plusSeconds(1),false,()->{});drained(runtime);
+            assertThat(runtime.health().degraded()).isTrue();assertThat(runtime.health().parameters()).containsEntry("reason","state-contention");
+            assertThat(rows.get(binding.key())).isEqualTo(before);
+        }
+    }
+    @Test void aSharedSnapshotStillReportsExhaustedRealCompareAndSetConflicts() {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Node health","cluster.node-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-node"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        doReturn(AlertStore.Outcome.CONFLICT).when(fixture.store).commit(any());
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-member-health")),intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            runtime.tick();drained(runtime);
+            runtime.sharedResourceInput(new AlarmKey.Resource("cluster-node","node-a","boot-a"),rule.typeId(),0,"node-producer",()->{},new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null));
+            drained(runtime);assertThat(runtime.health().degraded()).isTrue();assertThat(runtime.health().parameters()).containsEntry("reason","state-contention");
+            assertThat(rows).isEmpty();verify(fixture.store,times(3)).commit(any());
+        }
+    }
+    @Test void resourceFailureAndRecoveryStayOrderedWhileAnotherResourceCanProceed() throws Exception {
+        useResourceRule();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            resource(runtime,"a",T,false,()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException e){Thread.currentThread().interrupt();}});
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();fixture.now.set(T.plusSeconds(1));
+            resource(runtime,"a",T.plusSeconds(1),true,()->{});
+            resource(runtime,"b",T,false,()->{});
+            try {await().atMost(Duration.ofSeconds(2)).until(()->rows.keySet().stream().anyMatch(k->k.resource().id().equals("b")));}
+            finally {release.countDown();}
+            drained(runtime);var head=resourceHead("a");
+            assertThat(head.snapshot().episodeSequence()).isOne();
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RECOVERED);
+        }finally{release.countDown();}
+    }
+    @Test void aRefusedResourceTickCanBeRetriedAfterTheSharedQueueDrains() throws Exception {
+        useResourceRule();var entered=new CountDownLatch(2);var release=new CountDownLatch(1);
+        Runnable block=()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException e){Thread.currentThread().interrupt();}};
+        try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            resource(runtime,"a",T,false,block);resource(runtime,"b",T,false,block);
+            assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            for(int i=0;i<62;i++)resource(runtime,"a",T,false,()->{});
+            assertThat(runtime.health().queuedInputs()).isEqualTo(64);runtime.tick();
+            assertThat(runtime.health().rejected()).isPositive();release.countDown();drained(runtime);
+            fixture.now.set(T.plusSeconds(16));runtime.tick();drained(runtime);
+            assertThat(resourceHead("observed").snapshot().quality()).isEqualTo(AlertSnapshot.Quality.STALE);
+        }finally{release.countDown();}
+    }
+    @Test void repeatedSameCapabilityEvidenceRefreshesAgeWithoutChangingTheFailure() {
+        useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(10));resource(runtime,"observed",fixture.now.get(),false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(16));runtime.tick();drained(runtime);
+            var head=resourceHead("observed");
+            assertThat(head.snapshot().lastObservedAt()).isEqualTo(T.plusSeconds(10));
+            assertThat(head.snapshot().quality()).isEqualTo(AlertSnapshot.Quality.VALID);
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        }
+    }
+    @Test void resourceRuleChangesTakeEffectWithoutAnotherOperationCallback() {
+        var original=useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);resource(runtime,"observed",T,false,()->{});drained(runtime);
+            fixture.now.set(T.plusSeconds(1));
+            var changed=new AlertConfiguration.Rule(original.header().next(fixture.now.get(),"admin"),original.name(),original.typeId(),1,
+                    original.resources(),original.parameters(),AlarmSeverity.CRITICAL,true,null);
+            when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(changed),null));
+            runtime.tick();drained(runtime);runtime.tick();drained(runtime);
+            var head=resourceHead("observed");assertThat(head.snapshot().rule().revision()).isEqualTo(changed.header().revision());
+            assertThat(head.episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.SUPERSEDED);
+            assertThat(head.snapshot().lastObservedAt()).isNull();
+            assertThat(head.snapshot().quality()).isIn(AlertSnapshot.Quality.UNKNOWN,AlertSnapshot.Quality.STALE);
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.CLEAR);
+        }
+    }
+
+    @Test void anEndedOperationCannotBeAcceptedAfterItWasQueued() {
+        useResourceRule();try(var runtime=runtime()) {
+            runtime.tick();drained(runtime);
+            resource(runtime,"ended",T,false,()->{throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);});
+            drained(runtime);assertThat(rows).isEmpty();assertThat(runtime.health().rejected()).isPositive();
+        }
+    }
+
+    @Test void concurrentPipelineAndResourceAdmissionShareOneObjectLimit() throws Exception {
+        var initial=new ArrayList<PipelineConvergencePass>();
+        for(int i=0;i<255;i++)initial.add(pass("existing-"+i));
+        var next=pass("next");var pool=Executors.newFixedThreadPool(2);
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(),null));
+        try {
+            for(int round=0;round<64;round++)try(var runtime=runtime()) {
+                runtime.tick();drained(runtime);initial.forEach(runtime::expecting);
+                var gate=new CyclicBarrier(3);
+                var pipeline=pool.submit(()->{gate.await(3,TimeUnit.SECONDS);runtime.expecting(next);return null;});
+                var resource=pool.submit(()->{gate.await(3,TimeUnit.SECONDS);resource(runtime,"last-resource",T,true,()->{});return null;});
+                gate.await(3,TimeUnit.SECONDS);pipeline.get(3,TimeUnit.SECONDS);resource.get(3,TimeUnit.SECONDS);drained(runtime);
+                assertThat(runtime.health().rejected()).as("mixed admission round %s",round).isOne();
+            }
+        } finally {pool.shutdownNow();}
+    }
+
+    @Test void legacyBindingDegradationSurvivesOtherPagesUntilACompleteCleanScan() {
+        var header=AlertEvaluationHostTest.definition("pipeline.failed").header();
+        var rule=new AlertConfiguration.Rule(header,"Source","source.connection-failed",1,
+                new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null).validated(BuiltinAlarmTypes.catalog());
+        var binding=new AlertEvaluationHost.Binding(rule,new AlarmKey.Resource("source","erp","original"),"producer",1,()->{});
+        fixture.host.accept(binding,1,new AlertInput.Operational(T,"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,false));
+
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        when(fixture.store.evaluationStates(any(),anyInt())).thenAnswer(call->call.getArgument(0)==null
+                ?new AlertStore.EvaluationPage(List.of(rows.get(binding.key())),binding.key(),Set.of(),Set.of(binding.key()))
+                :new AlertStore.EvaluationPage(List.of(),null));
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,BuiltinAlarmTypes.catalog(),null,null,Set.of("source-operational-health")),
+                intentStore,(scope,claim)->Optional.empty(),()->{},fixture.clock)) {
+            for(int page=0;page<4;page++) {
+                if(page==2)fixture.host.end(binding.key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,()->{});
+                runtime.tick();await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
+                assertThat(runtime.health().degraded()).as("page %s",page).isEqualTo(page<3);
+            }
+            assertThat(rows.get(binding.key()).value().retiredAt()).isNotNull();
+            assertThat(rows.get(binding.key()).value().episode().value().endReason()).isEqualTo(AlertSnapshot.EndReason.RESOURCE_REMOVED);
+        }
+    }
+
+}

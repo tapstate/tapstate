@@ -140,4 +140,19 @@ class FactsBecomeMetricDataTest {
     void nothingOfferedIsNothingProduced() {
         assertThat(producer.produce(Resource.empty())).isEmpty();
     }
+    @org.junit.jupiter.api.Test void processFactsAreExportedWithoutCreatingPipelineStateOrBeingForgottenWithPipelines() {
+        var at=java.time.Instant.parse("2026-10-29T00:00:00Z");var producer=new FactsMetricProducer(at);
+        var fact=new io.tapstate.core.lifecycle.MetricFact("tapstate.alerting.pending",io.tapstate.core.lifecycle.MetricType.GAUGE,"1",
+                java.util.List.of(io.tapstate.core.lifecycle.MetricPoint.reading(java.util.Map.of(),at,7)));
+        producer.offerRuntime(at,java.util.List.of(fact));producer.forgetPipelinesOutside(java.util.List.of());
+        org.assertj.core.api.Assertions.assertThat(producer.pipelines()).isEmpty();
+        var exported=producer.produce(io.opentelemetry.sdk.resources.Resource.empty());
+        org.assertj.core.api.Assertions.assertThat(exported).singleElement().satisfies(metric->{
+            org.assertj.core.api.Assertions.assertThat(metric.getName()).isEqualTo("tapstate.alerting.pending");
+            org.assertj.core.api.Assertions.assertThat(metric.getLongGaugeData().getPoints()).singleElement().satisfies(point->{
+                org.assertj.core.api.Assertions.assertThat(point.getValue()).isEqualTo(7);org.assertj.core.api.Assertions.assertThat(point.getAttributes().isEmpty()).isTrue();
+            });
+        });
+    }
+
 }

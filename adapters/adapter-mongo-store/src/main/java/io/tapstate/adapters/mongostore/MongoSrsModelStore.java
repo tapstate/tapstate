@@ -490,6 +490,18 @@ public final class MongoSrsModelStore implements SrsModelStore {
             throw missing;
         }
     }
+    /** Reuses only the caller's just-proven read reference, with the full walk for other event coordinates. */
+    EventModelRange requireEvent(ClientSession session, String ring, SrsLogRecord event, ModelReference proven) {
+        requireActive.run();
+        var model = proven.model(); var key = model.key(); var fence = event.captureFence();
+        if (scope.cacheIncarnation().equals(key.cacheIncarnation()) && ring.equals(model.ringName())
+                && event.epoch() == key.captureEpoch() && event.schemaVer() == key.modelVersion()
+                && fence != null && fence.key().type() == WorkloadClaimType.CAPTURE
+                && scope.clusterId().equals(fence.key().clusterId()) && fence.equals(proven.fence())) return proven.range();
+        // A checkpoint may sit immediately before a new model starts. Its event then belongs
+        // to the earlier model and must retain that model's original range and error checks.
+        return requireEvent(session, ring, event, false);
+    }
     private EventModelRange eventRange(ClientSession session, String ring, SrsLogRecord event, boolean writing) {
         return eventReference(session, ring, event.epoch(), event.schemaVer(), event.captureFence(), writing).range();
     }

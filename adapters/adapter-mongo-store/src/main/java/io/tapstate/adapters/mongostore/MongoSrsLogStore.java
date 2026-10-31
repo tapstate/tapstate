@@ -359,6 +359,16 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 .map(row -> checkedRecord(session, ring, row));
     }
 
+    /** The caller has just proved this exact reference in the same transaction; it is never retained between calls. */
+    Optional<SrsLogRecord> loadInSession(ClientSession session, String ring, long sequence,
+            MongoSrsModelStore.ModelReference proven) {
+        return Optional.ofNullable(collection.find(session, new Document("_id", key(ring, sequence))).first()).map(row -> {
+            SrsLogRecord event = splitRecord(row);
+            if (models != null) models.requireEvent(session, ring, event, proven).requireAt(splitSequence(row), ring, event);
+            return event;
+        });
+    }
+
     private SrsLogBounds splitBounds(ClientSession session, String ring) {
         if (models != null) models.checkRing(session, ring);
         Document stored = boundsCollection.find(session, new Document("_id", boundsId(ring))).first();
