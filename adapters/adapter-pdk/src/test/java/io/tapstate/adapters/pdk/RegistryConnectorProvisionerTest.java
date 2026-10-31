@@ -38,6 +38,97 @@ import org.junit.jupiter.api.io.TempDir;
 class RegistryConnectorProvisionerTest {
 
     @Test
+    void stagesTheRegisteredHashFromTheReleaseSeedWithoutDownloadingIt(@TempDir Path dir) throws IOException {
+        Path seeds = Files.createDirectories(dir.resolve("connectors"));
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        Files.write(seeds.resolve("orders-connector.jar"), bytes);
+        var registry = new InMemoryConnectorRegistry();
+        String hash = registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes).registration().contentHash();
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds);
+
+        Path cached = provisioner.resolve("orders").classpath().getFirst();
+
+        assertThat(cached.getFileName().toString()).isEqualTo(hash + ".jar");
+        assertThat(ContentHash.of(Files.readAllBytes(cached))).isEqualTo(hash);
+        assertThat(registry.artifactCalls).as("the verified local seed avoids a second network transfer").isZero();
+    }
+
+    @Test
+    void aNonmatchingOptionalSeedCannotShadowTheRegisteredArtifact(@TempDir Path dir) throws IOException {
+        Path seeds = Files.createDirectories(dir.resolve("connectors"));
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        Files.writeString(seeds.resolve("orders-connector.jar"), "damaged release bytes");
+        var registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes);
+        Path cache = dir.resolve("plugins");
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cache, seeds);
+
+        Path loaded = provisioner.resolve("orders").classpath().getFirst();
+
+        assertThat(Files.readAllBytes(loaded)).isEqualTo(bytes);
+        assertThat(registry.artifactCalls).isEqualTo(1);
+        assertThat(Files.readString(seeds.resolve("orders-connector.jar"))).isEqualTo("damaged release bytes");
+        try (var files = Files.list(cache)) { assertThat(files.toList()).containsExactly(loaded); }
+    }
+
+    @Test
+    void aSeedDoesNotAuthorizeAnUnregisteredConnector(@TempDir Path dir) throws IOException {
+        Path seeds = Files.createDirectories(dir.resolve("connectors"));
+        Files.copy(Synthetic.annotatedConnector(dir.resolve("source")), seeds.resolve("orders-connector.jar"));
+        Path cache = dir.resolve("plugins");
+        var provisioner = new RegistryConnectorProvisioner(new InMemoryConnectorRegistry(), new ConnectorIntrospector(), cache, seeds);
+
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+        String hash;
+        try (var bytes = Files.newInputStream(seeds.resolve("orders-connector.jar"))) { hash = ContentHash.of(bytes); }
+        assertThatThrownBy(() -> provisioner.resolve("orders", hash)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+        assertThat(Files.exists(cache)).isFalse();
+    }
+
+    @Test
+    void anUnsupportedPublicationFilesystemFailsSafelyAndCleansItsTemporaryFile(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        var registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes);
+        try (var filesystem = java.nio.file.FileSystems.newFileSystem(
+                java.net.URI.create("jar:" + dir.resolve("cache.zip").toUri()), Map.of("create", "true"))) {
+            Path cache = filesystem.getPath("/plugins");
+            var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cache);
+            assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+            try (var files = Files.list(cache)) { assertThat(files.toList()).isEmpty(); }
+        }
+    }
+
+    @Test
+    void anInterruptedDownloadLeavesNoPublishedOrTemporaryCache(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        String hash = ContentHash.of(bytes);
+        var registration = new io.tapstate.spi.store.ConnectorRegistration("orders", hash, "1.3.5", RegistrationSource.SEED);
+        var registry = new io.tapstate.spi.store.ConnectorRegistry() {
+            @Override public io.tapstate.spi.store.RegistrationOutcome register(String id, String version, RegistrationSource source, byte[] input) {
+                throw new AssertionError("This path only downloads");
+            }
+            @Override public List<io.tapstate.spi.store.ConnectorRegistration> list() { return List.of(registration); }
+            @Override public java.util.Optional<byte[]> artifact(String input) { throw new AssertionError("Download must stream"); }
+            @Override public boolean hasArtifact(String input) { return true; }
+            @Override public boolean copyArtifactTo(String input, java.io.OutputStream target) throws IOException {
+                target.write(bytes, 0, 32);
+                Thread.currentThread().interrupt();
+                throw new java.io.InterruptedIOException("Transfer cancelled");
+            }
+        };
+        Path cache = dir.resolve("plugins");
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cache);
+        try {
+            assertSafeLoadFailure(() -> provisioner.resolve("orders"));
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            try (var files = Files.list(cache)) { assertThat(files.toList()).isEmpty(); }
+        } finally { Thread.interrupted(); }
+    }
+
+    @Test
     void resolvesARegisteredConnectorToARefStagedInTheContentAddressedCache(@TempDir Path dir) throws IOException {
         Path cacheDir = dir.resolve("plugins");
         byte[] artifact = Files.readAllBytes(Synthetic.annotatedConnector(dir));
@@ -415,6 +506,30 @@ class RegistryConnectorProvisionerTest {
         var exact = provisioner.resolve("orders", retained);
         assertThat(exact.contentHash()).isEqualTo(retained);
         assertThat(exact.className()).isEqualTo("synthetic.OrdersConnector");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"missing", "retained", "conflicting"})
+    void retainedSeedResolutionKeepsItsExactHashWithoutWeakeningIdAmbiguity(String seedState, @TempDir Path dir) throws IOException {
+        var registry = new InMemoryConnectorRegistry();
+        byte[] original = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("original")));
+        byte[] replacement = Files.readAllBytes(Synthetic.annotatedEmittingConnector(dir.resolve("replacement")));
+        String retained = registry.register("orders", "1.3.5", RegistrationSource.SEED, original).registration().contentHash();
+        registry.register("orders", "2.0.8", RegistrationSource.REGISTER, replacement);
+        Path seeds = Files.createDirectories(dir.resolve("seeds"));
+        if (!seedState.equals("missing"))
+            Files.write(seeds.resolve("orders-connector.jar"), seedState.equals("retained") ? original : replacement);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds);
+
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ConnectorError.AMBIGUOUS_REGISTRATION));
+        ConnectorRef exact = provisioner.resolve("orders", retained);
+
+        assertThat(exact.contentHash()).isEqualTo(retained);
+        assertThat(exact.className()).isEqualTo("synthetic.OrdersConnector");
+        assertThat(registry.artifactCalls).isEqualTo(seedState.equals("retained") ? 0 : 1);
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ConnectorError.AMBIGUOUS_REGISTRATION));
     }
 
     @Test
