@@ -562,6 +562,53 @@ class ScopedPipelineCaptureCoordinatorTest {
         public ConnectionReport testConnection(CaptureConfig config) { throw new AssertionError(); }
         public DiscoveredSchema discoverSchema(CaptureConfig config) { throw new AssertionError(); }
     }
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void snapshotCallbacksUseTheVerifiedSourcePolicyWithoutChangingTheFrozenModel(boolean sampled) {
+        try(var f=new Fixture(List.of("input"),8,ReadMode.SNAPSHOT_AND_CDC,Duration.ofSeconds(10),sampled?"mongodb":"fixture")) {
+            var frozen=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
+            f.memory.schemas().save(new DiscoveredSourceModel("input",f.source.connector(),1L,new SourceModel(List.of(frozen))));
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            var request=f.preparation.get().request();var seam=new SourcePosition("current-sample");
+            var observed=Map.of("orders",new SourceTable("orders",List.of(new SourceField("new-sample","INT32")),List.of(),List.of()));
+            if(sampled) {
+                f.snapshotCallback.get().prepare(request,seam,observed);
+                verify(f.preparation.get()).prepare(request,seam,observed,SourceModelComparison.SAMPLED_DOCUMENT);
+            } else {
+                assertThatThrownBy(() -> f.snapshotCallback.get().prepare(request,seam,observed))
+                        .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_FULL_PREPARATION_UNPROVEN));
+                verify(f.preparation.get(),never()).prepare(any(),any(),anyMap(),any());
+            }
+            assertThat(f.models().model(f.source).tables()).containsExactly(frozen);
+        }
+    }
+
+    @Test void retainedPlanningUsesOnlyThisConsumersExactPinAndNeverReplacesItsTargetInputsWithNewSamples() {
+        try(var f=new Fixture(List.of("input"),8,ReadMode.SNAPSHOT_AND_CDC,Duration.ofSeconds(10),"mongodb")) {
+            var observed=new SourceTable("orders",List.of(new SourceField("new-sample","STRING(20480)")),List.of(),List.of());
+            f.memory.schemas().save(new DiscoveredSourceModel("input","mongodb",1,new SourceModel(List.of(observed))));
+            String canonical="mck-key";String captureId=SourceCaptureIdentity.sharedCapture(canonical);
+            var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,canonical,captureId,
+                    SourceCaptureIdentity.physical(f.source.connector(),f.source.config()),UUID.randomUUID().toString());
+            when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
+            var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
+            when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString())).thenReturn(Optional.of(origin));
+            var key=f.streamingProgress.get().snapshot().models().get("orders");
+            var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
+            var srs=f.sources.srs(BUSINESS,() -> {});
+            when(srs.models().require(key)).thenReturn(new SrsModel(key,SrsRingbuffer.ringName(canonical,"orders"),pinned,0));
+            var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(SCOPE);
+            var captured=f.models();
+            var planning=f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured);
+            assertThat(planning.model(f.source).tables()).containsExactly(pinned);
+            assertThat(captured.model(f.source).tables()).containsExactly(observed);
+            assertThat(f.models().model(f.source).tables()).containsExactly(observed);
+            verify(srs.models(),never()).publishedForNewSnapshot(anyString(),anyMap());
+            var missing=new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain",canonical,"table","orders","version","0"),null);
+            when(srs.models().require(key)).thenThrow(missing);
+            assertThatThrownBy(() -> f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured)).isSameAs(missing);
+        }
+    }
+
     private static final class Fixture implements AutoCloseable {
         final InMemoryStorePort memory=new InMemoryStorePort();
         final PipelineStoreViews pipelines=mock(PipelineStoreViews.class);
@@ -573,6 +620,8 @@ class ScopedPipelineCaptureCoordinatorTest {
         final ExecutionAuthorization authorization=mock(ExecutionAuthorization.class);
         final CaptureOwnership ownership=mock(CaptureOwnership.class);
         final ConnectorProvisioner connectors=mock(ConnectorProvisioner.class);
+        final AtomicReference<io.tapstate.adapters.pdk.PdkCapturePort.SnapshotPreparer> snapshotCallback=new AtomicReference<>();
+        final AtomicReference<SrsSnapshotPreparation> preparation=new AtomicReference<>();
         final ScopedPipelineCaptureCoordinator.BoundedLoads boundedLoads=mock(ScopedPipelineCaptureCoordinator.BoundedLoads.class);
         final ScopedPipelineCaptureCoordinator.CompletedFullLookup completedFull=mock(ScopedPipelineCaptureCoordinator.CompletedFullLookup.class);
         final SnapshotBuffer buffer;
@@ -593,9 +642,12 @@ class ScopedPipelineCaptureCoordinatorTest {
         Fixture(List<String> ids,int capacity) { this(ids, capacity, ReadMode.SNAPSHOT_ONLY); }
         Fixture(List<String> ids,int capacity,ReadMode mode) {this(ids,capacity,mode,Duration.ofSeconds(10));}
         Fixture(List<String> ids,int capacity,ReadMode mode,Duration renewal) {
+            this(ids,capacity,mode,renewal,"fixture");
+        }
+        Fixture(List<String> ids,int capacity,ReadMode mode,Duration renewal,String connector) {
             buffer=new SnapshotBuffer(capacity);
             for(String id:ids) {
-                var definition=new SourceResource(id,null,"fixture",Map.of("database","x"),SourceMode.CDC,List.of(TableRef.literal("orders")),new Srs("key",null,null,null,true),null);
+                var definition=new SourceResource(id,null,connector,Map.of("database","x"),SourceMode.CDC,List.of(TableRef.literal("orders")),new Srs("key",null,null,null,true),null);
                 definitions.add(definition); memory.artifacts().create(definition);
             }
             source=definitions.getFirst();
@@ -620,15 +672,27 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(ownership.renew(any())).thenAnswer(call -> Optional.of(call.getArgument(0)));
             when(ownership.ttl()).thenReturn(Duration.ofSeconds(60));
             when(notes.guardedBy(any())).thenReturn(notes);
+            when(pipelines.sinkPreparations(any(),any(),any())).thenReturn(mock(SinkPreparationStore.class));
             when(notes.open(any())).thenAnswer(call -> new RequiredNoteScope(call.getArgument(0),1));
-            when(notes.prepareOrigin(any(),any())).thenAnswer(call -> call.getArgument(1));
-            when(connectors.resolve("fixture")).thenReturn(new ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"a".repeat(64),false));
+            var noteOrigins=new java.util.HashMap<RequiredNoteScope,RequiredNoteOrigin>();
+            when(notes.prepareOrigin(any(),any())).thenAnswer(call -> {
+                RequiredNoteOrigin origin=call.getArgument(1);
+                noteOrigins.put(call.getArgument(0),origin);return origin;
+            });
+            when(notes.origin(any())).thenAnswer(call -> noteOrigins.get(call.getArgument(0)));
+            var artifact=new ConnectorRef(List.of(),connector.equals("mongodb")
+                    ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
+            when(connectors.resolve(connector)).thenReturn(artifact);
+            when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
             runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
-                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> { guard.run(); opened.incrementAndGet(); return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead); });
+                    runtime,buffer,connectors,(original,config,guard,preparation,stream) -> {
+                        guard.run();if(preparation!=null)snapshotCallback.set(preparation);opened.incrementAndGet();
+                        return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead);
+                    });
             if (!bounded) streaming();
         }
         private SrsConsumerProgress progress(boolean complete, long membership, long epoch) {
@@ -661,6 +725,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(sources.srs(any(), any())).thenReturn(new SrsStores(chains, models, mock(SrsLogStore.class), consumers));
             doAnswer(call -> {
                 var preparation = mock(SrsSnapshotPreparation.class);
+                this.preparation.set(preparation);
                 when(preparation.request()).thenReturn(new SnapshotPreparation(1, new SourcePosition("seam")));
                 when(preparation.stillOwed()).thenReturn(List.of("orders"));
                 java.util.function.Function<SrsSnapshotPreparation, CapturePort> ports = call.getArgument(3);

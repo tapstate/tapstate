@@ -164,6 +164,9 @@ public enum IoError implements TapstateErrorCode {
      */
     DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id")),
 
+    /** Original prepared target bodies must fit their row and complete-scope budgets. */
+    SINK_MODEL_CAPACITY("io.sink-model-capacity", Set.of("pipeline", "target", "bytes", "limit")),
+
     /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
     CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt"));
 

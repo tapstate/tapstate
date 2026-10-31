@@ -27,6 +27,16 @@ public interface SrsModelStore {
                 Map.of("chain", key.miningChainId(), "table", key.table(), "version", String.valueOf(key.modelVersion())), null);
     }
 
+    /**
+     * Publishes a real observation or revalidates an already published compatible observation under
+     * this exact context and fence. Reuse never rewrites the immutable body or creates missing history.
+     * Implementations without observation reuse retain strict initial-publication behavior.
+     */
+    default SrsModel publishObservedInitial(SrsModelKey key, String ring, SourceTable observed,
+            WorkloadClaimFence originalCapture, SourceModelComparison comparison) {
+        return publishInitial(key, ring, observed, originalCapture);
+    }
+
     /** Each table/capture starts at actual version zero and advances by one; identical captured retries are safe. */
     SrsModel publish(SrsModel model, WorkloadClaimFence captureFence);
 

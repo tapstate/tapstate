@@ -139,6 +139,9 @@ final class StoreBackedDagSource implements DagSource {
     private final ParallelismBudget parallelismBudget;
     interface CapturedStartGuard {
         Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models);
+        default SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models) {
+            return models;
+        }
         CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
     }
     private final CapturedStartGuard capturedStartGuard;
@@ -244,6 +247,7 @@ final class StoreBackedDagSource implements DagSource {
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
         SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
         Map<String,String> confirmedHashes=pass==null?Map.of():capturedStartGuard.inspect(pass,snapshot,models);
+        if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
                 requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads);
@@ -779,7 +783,7 @@ final class StoreBackedDagSource implements DagSource {
             var runSources = capturedSources == null ? sourceVertices : physicalSources(sourceVertices,capturedSources);
             var scopedSources = capturedSources == null ? null : scopedSources(runSources,capturedSources);
             var scopedDirect = capturedSources == null ? null : scopedDirectSources(runSources,capturedSources);
-            var targetPreparations=new ArrayList<io.tapstate.spi.store.SinkPreparationStore.Input>();
+            var targetPreparations=new TargetPreparations(original==null?null:operators.pass().sinkPreparations(original.claim()),capturedSources);
             NodeVertices drawn = new NodeVertices();
             DAG dag = PipelineDagBuilder.build(
                     builtPipeline,
@@ -789,7 +793,7 @@ final class StoreBackedDagSource implements DagSource {
                     FencedSinkAckFactory.heldTo(scopedSources == null ? sinkAckFactory(pipeline,pipelineId,fence) :
                             scopedSources.isEmpty() && scopedDirect.isEmpty() ? boundedLoads.apply(fence,snapshotEpochs(runSources,capturedSources)) : new ScopedSrsSinkAckFactory(scopedSources,scopedDirect,runIdOf(fence)),fence),frontier,
                     shape, drawn);
-            if(original!=null)operators.pass().prepareSinkTargets(original.claim(),targetPreparations);
+            if(original!=null)targetPreparations.publish(operators.pass(),original.claim());
             return new PlannedDag(dag, shape, planned, nodeBatches(pipeline, runSources), drawn.byNode(),
                     drawn.feedingByNode());
         });
@@ -1978,7 +1982,7 @@ final class StoreBackedDagSource implements DagSource {
             ExecutionFence fence,PreparedOperators operators,PipelineCaptureBindings captureBindings,
             Map<String,ScopedSrsSinkAckFactory.Source> scopedSources,
             Map<String,ScopedDirectSinkAckFactory.Source> scopedDirect,
-            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations) {
+            TargetPreparations targetPreparations) {
         var originalOperators = operators == null ? null : operators.bind(fence);
         var manifest = originalOperators == null ? null : originalOperators.manifest();
         Runnable targetGuard=originalOperators==null?() -> {}:operators.pass().guardOriginal(originalOperators.claim());
@@ -2006,6 +2010,13 @@ final class StoreBackedDagSource implements DagSource {
             sourceEpochs.forEach((chain, epoch) -> { if (epoch > 0) snapshotEpochs.put(chain, epoch); });
         }
         Map<String, Step.Inline> stepsById = inlineStepsById(pipeline);
+        var allStreams=new java.util.HashSet<String>(targets.keySet());allStreams.addAll(viewTargets.keySet());
+        for(String stream:allStreams) {
+            var origins=new java.util.HashSet<String>();
+            sourceVertices.values().stream().filter(vertex -> vertex.stream().equals(stream)).forEach(vertex -> origins.add(vertex.sourceId()));
+            if(origins.isEmpty())collectTargetOrigins(pipeline,stream,sourceVertices,sourceKeyByTable,sourceKeysById,stepIds,origins,new java.util.HashSet<>());
+            targetPreparations.observeOrigins(stream,origins);
+        }
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
@@ -2265,7 +2276,7 @@ final class StoreBackedDagSource implements DagSource {
     private SupplierEx<? extends SinkWriter> viewSink(
             PipelineResource pipeline, ViewBlock view, Map<String, TargetTable> targets,
             Set<String> viewStreams, Map<String, List<String>> tablesBySourceId,boolean freshFullLoad,ExecutionFence fence,
-            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
+            TargetPreparations targetPreparations,Runnable targetGuard) {
         if (!(view instanceof ViewBlock.Inline inline)) {
             throw new IllegalArgumentException(
                     "view block is a use-reference; resolve it to an inline view first");
@@ -3437,7 +3448,7 @@ final class StoreBackedDagSource implements DagSource {
     private SupplierEx<? extends SinkWriter> sinkWriter(
             PipelineResource pipeline, SyncElement element, Map<String, TargetTable> targets,
             Set<String> serveStreams, Map<String, String> sourceIdByTable, boolean freshFullLoad,ExecutionFence fence,
-            List<io.tapstate.spi.store.SinkPreparationStore.Input> targetPreparations,Runnable targetGuard) {
+            TargetPreparations targetPreparations,Runnable targetGuard) {
         SourceResource sink = StoredArtifacts.requireSource(artifacts(), element.source());
         var writer=sinkWriterBinder.bind(
                 sink.connector(), sink.config(), writeMode(element.writeMode()), ddl(element.ddl()),
@@ -3973,8 +3984,39 @@ final class StoreBackedDagSource implements DagSource {
      * shipped onto the DAG. Production binds the PDK factory that resolves the connector member-side; a test
      * can bind a capturing sink so the topology runs without a real connector.
      */
+    private static void collectTargetOrigins(PipelineResource pipeline,String key,Map<String,SourceVertex> vertices,
+            Map<String,String> tables,Map<String,List<String>> sources,Set<String> steps,Set<String> result,Set<String> visited) {
+        var vertex=vertices.get(key);if(vertex!=null){result.add(vertex.sourceId());return;}
+        if(!visited.add(key))return;var step=stepOf(pipeline,key);if(step==null)return;
+        for(var ref:refsOf(step.from()))for(String upstream:upstreams(ref,tables,sources,vertices,steps))
+            collectTargetOrigins(pipeline,upstream,vertices,tables,sources,steps,result,visited);
+    }
+    static final class TargetPreparations {
+        final List<io.tapstate.spi.store.SinkPreparationStore.Input> inputs=new ArrayList<>();
+        final List<io.tapstate.spi.store.SinkPreparationStore.Prepared> models=new ArrayList<>();
+        final io.tapstate.spi.store.SinkPreparationStore store;
+        final io.tapstate.spi.store.PipelinePreparationInputs authoring;
+        final Set<String> sampledSources;
+        final Set<String> sampledStreams=new java.util.HashSet<>();
+        TargetPreparations(io.tapstate.spi.store.SinkPreparationStore store,PipelineCaptureBindings capture) {
+            this.store=store;this.authoring=capture==null?null:capture.authoring();this.sampledSources=capture==null?Set.of():capture.sampledSources();
+            if(!sampledSources.isEmpty() && (store==null || authoring==null))throw new IllegalArgumentException("sampled targets need original preparation access");
+        }
+        void observeOrigins(String stream,Set<String> origins) {
+            if(!origins.isEmpty() && sampledSources.containsAll(origins))sampledStreams.add(stream);
+        }
+        void publish(PipelineConvergencePass pass,io.tapstate.spi.store.WorkloadClaimFence claim) {
+            if(!models.isEmpty())pass.prepareSinkModels(claim,List.copyOf(inputs),List.copyOf(models));else pass.prepareSinkTargets(claim,List.copyOf(inputs));
+        }
+    }
+
     @FunctionalInterface
     interface SinkWriterBinder {
+        default SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                TargetPreparations plan,Runnable requireActive) {
+            return scoped(factory,original,plan.inputs,requireActive);
+        }
+
         default SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
                 List<io.tapstate.spi.store.SinkPreparationStore.Input> roster,Runnable requireActive) {
             if(original!=null && original.scope()!=null && factory instanceof PdkSinkWriterFactory)
@@ -4026,6 +4068,49 @@ final class StoreBackedDagSource implements DagSource {
             var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
             var bound=sink.forRun(run,run.assessTargets(sink.config(),sink.targets(),notes,provisioner,requireActive));
             requireActive.run();roster.addAll(bound.preparationInputs(original.scope()));return bound;
+        }
+
+        @Override public SupplierEx<? extends SinkWriter> scoped(SupplierEx<? extends SinkWriter> factory,ExecutionFence original,
+                TargetPreparations plan,Runnable requireActive) {
+            if(!(factory instanceof PdkSinkWriterFactory sink))return scoped(factory,original,plan.inputs,requireActive);
+            var eligible=new java.util.HashSet<>(plan.sampledStreams);eligible.retainAll(sink.targets().keySet());
+            // A shared physical target cannot inherit an exemption from only one of its input streams.
+            for(var target:sink.targets().values())if(sink.targets().entrySet().stream().anyMatch(entry -> entry.getValue().name().equals(target.name()) && !eligible.contains(entry.getKey())))
+                sink.targets().forEach((stream,model) -> {if(model.name().equals(target.name()))eligible.remove(stream);});
+            if(eligible.isEmpty())return scoped(factory,original,plan.inputs,requireActive);
+            if(notes==null || provisioner==null)throw new IllegalStateException("configured sampled targets require their original binder");
+            var run=ConfiguredSinkRun.prepare(original,sink.config(),sink.purpose(),notes,provisioner,requireActive,recoveryPinned.test(original.scope()));
+            var restored=new LinkedHashMap<>(sink.targets());
+            var keys=eligible.stream().map(stream -> new io.tapstate.spi.store.SinkPreparationStore.Key(original.scope(),sink.purpose(),sink.node().nodeId(),sink.targets().get(stream).name())).distinct().toList();
+            var retained=plan.store.retainedModels(keys,io.tapstate.core.model.OnFullLoad.valueOf(sink.onFullLoad().name()),sink.fullLoad(),plan.authoring);
+            for(String stream:eligible) {
+                var input=sink.targets().get(stream);var key=new io.tapstate.spi.store.SinkPreparationStore.Key(original.scope(),sink.purpose(),sink.node().nodeId(),input.name());
+                var body=retained.get(key);if(body!=null)restored.put(stream,restoreLogical(input,body.canonical()));
+            }
+            var frozenSink=sink.withTargets(restored);
+            // Only restored original structure, never the new sample, is assessed for an existing v2 target.
+            var identities=run.assessTargets(frozenSink.config(),restored,notes,provisioner,requireActive);
+            var candidates=eligible.stream().map(stream -> io.tapstate.adapters.pdk.PdkSinkPreparations.prepared(
+                    original.scope(),sink.node(),sink.purpose(),sink.onFullLoad(),sink.fullLoad(),identities.get(stream).target())).distinct().toList();
+            var resolved=plan.store.resolveModels(candidates,plan.authoring).stream().distinct().toList();
+            if(!new java.util.HashSet<>(candidates).equals(new java.util.HashSet<>(resolved)))
+                throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",original.pipelineId()),null);
+            var bound=frozenSink.forRun(run,identities);requireActive.run();plan.models.addAll(resolved);plan.inputs.addAll(bound.preparationInputs(original.scope()));return bound;
+        }
+        static TargetTable restoreLogical(TargetTable observed,byte[] canonical) {
+            var physical=io.tapstate.adapters.pdk.PdkSinkPreparations.target(canonical,observed.unwindIdentity());
+            var identity=observed.unwindIdentity();String from=null,to=null;
+            if(identity!=null && identity.sourceIdField()!=null) {
+                var names=physical.fields().stream().map(io.tapstate.spi.sink.TargetField::name).collect(java.util.stream.Collectors.toSet());
+                var missing=identity.parentKey().stream().filter(name -> !names.contains(name)).toList();
+                long keys=physical.fields().stream().filter(io.tapstate.spi.sink.TargetField::primaryKey).count();
+                if(keys>identity.parentKey().size() && missing.size()==1 && names.contains(identity.sourceIdField())){from=identity.sourceIdField();to=missing.getFirst();}
+            }
+            String original=from,logical=to;
+            java.util.function.UnaryOperator<String> rename=name -> Objects.equals(name,original)?logical:name;
+            return new TargetTable(physical.name(),physical.fields().stream().map(field -> new io.tapstate.spi.sink.TargetField(
+                    rename.apply(field.name()),field.type(),field.primaryKey(),field.inferredType(),field.numericType(),field.stringType())).toList(),
+                    physical.indexes().stream().map(index -> new io.tapstate.spi.sink.TargetIndex(index.fields().stream().map(rename).toList(),index.unique(),index.constrainsEveryRow())).toList(),identity);
         }
 
         @Override

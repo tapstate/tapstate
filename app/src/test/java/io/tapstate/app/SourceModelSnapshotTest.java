@@ -24,6 +24,19 @@ class SourceModelSnapshotTest {
         assertThat(snapshot.model(src).tables().getFirst().primaryKey()).containsExactly("original"); assertThat(reads.get()).isOne();
         assertThat(SourceModelSnapshot.capture("p",List.of(src),live).model(src).tables().getFirst().primaryKey()).containsExactly("newer");
     }
+    @Test void retainedPlanningObservationsDoNotRewritePublicDiscoveryOrTheCapturedInput() {
+        var store=new InMemoryStorePort();var source=source("src","mongodb");
+        var current=discovered("src","mongodb","new-sample");store.schemas().save(current);
+        var captured=SourceModelSnapshot.capture("p",List.of(source),store.schemas());
+        var pinned=discovered("src","mongodb","original-sample").model().tables().getFirst();
+        var planning=captured.withRetainedTables(source,Map.of("orders",pinned));
+        assertThat(planning.model(source).tables()).containsExactly(pinned);
+        assertThat(captured.model(source)).isEqualTo(current.model());
+        assertThat(store.schemas().get("src")).contains(current);
+        assertThatThrownBy(() -> captured.withRetainedTables(source,Map.of("missing-table",
+                new SourceTable("missing-table",List.of(),List.of(),List.of())))).isInstanceOf(TapstateException.class);
+    }
+
     @Test void absentMismatchedAndDiscoveredEmptyModelsKeepTheirDistinctMeanings() {
         var store = new InMemoryStorePort(); var absent = source("absent","mysql"); var mismatched = source("mismatched","mysql"); var empty = source("empty","mysql");
         store.schemas().save(discovered("mismatched","other","wrong"));

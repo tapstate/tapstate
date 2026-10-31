@@ -298,7 +298,8 @@
         "All native writers, planners and readers resolve one trusted effective physical chain and use matching ring/model/consumer keys. The canonical CAPTURE read identity and the original canonical shared notes namespace remain stable; the new physical identity must never create empty replacement necessary notes or change their original connector/config/artifact origin. Position-edit restrictions follow canonical historical identity across replacement namespaces.",
         "For A reading S1 and S2, B reading S1 and C reading S2, only damaged S1 and actual A/B are jointly recovered. A later explicit full may detach A from healthy S2 and update ordinary membership counters, but cannot reset S2 epoch/checkpoint/models or C authorization/cursor/execution. No running, stopped or completed Pipeline is automatically started.",
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
-        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
+        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation.",
+        "MongoDB sampling recovery: Only a host that proves the original source configuration and actual connector artifact as a supported MongoDB sampling implementation may separate current sampling observations from retained state. Sampled field membership, ordering, types and string widths are observations; their differences alone cannot prove DDL or refuse recovery. Declared constraints must be obtained from an authoritative source and their scope and meaning proved; unknown validators are not assumed discovered or absent. Actual Pipeline field/mapping/expression/conversion and target column/key/encoding contracts must be checked through verified processing mechanisms, without silent field loss, truncation, coercion or target widening. Required contracts that cannot be expressed or verified remain explicit pre-implementation gaps, never an all-sample-equal fallback or an implicit compatibility grant. Ordinary CDC, same-writer callbacks, retained snapshot pins and frozen discovery inputs are classified by role. Original checkpoint/token/model/ring/chain/cache/epoch/version, source-origin and live-fence proofs remain mandatory; retained model bytes and hashes are never rewritten. Old-model reuse requires valid original references and event binding, a model role sufficient for the processing contract, and compatible actual processing. A legitimately allocated new epoch preserves real observed metadata and event-version binding; conflicting immutable keys cannot be overwritten, skipped or resolved by inventing an epoch. Persistent record integrity, immutable-key publication and confirmed full receipt references/content remain exact; comparing such records with new samples is not itself receipt-integrity proof. No latest-model fallback, fabricated source cut, implicit full or clear-state permission is added. BSON shapes, namespaces, atomic domains and growth bounds are unchanged."
       ]
     },
     "shared-srs-replacement-srs_models": {
@@ -335,7 +336,8 @@
         "All native writers, planners and readers resolve one trusted effective physical chain and use matching ring/model/consumer keys. The canonical CAPTURE read identity and the original canonical shared notes namespace remain stable; the new physical identity must never create empty replacement necessary notes or change their original connector/config/artifact origin. Position-edit restrictions follow canonical historical identity across replacement namespaces.",
         "For A reading S1 and S2, B reading S1 and C reading S2, only damaged S1 and actual A/B are jointly recovered. A later explicit full may detach A from healthy S2 and update ordinary membership counters, but cannot reset S2 epoch/checkpoint/models or C authorization/cursor/execution. No running, stopped or completed Pipeline is automatically started.",
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
-        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
+        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation.",
+        "MongoDB sampling recovery: Only a host that proves the original source configuration and actual connector artifact as a supported MongoDB sampling implementation may separate current sampling observations from retained state. Sampled field membership, ordering, types and string widths are observations; their differences alone cannot prove DDL or refuse recovery. Declared constraints must be obtained from an authoritative source and their scope and meaning proved; unknown validators are not assumed discovered or absent. Actual Pipeline field/mapping/expression/conversion and target column/key/encoding contracts must be checked through verified processing mechanisms, without silent field loss, truncation, coercion or target widening. Required contracts that cannot be expressed or verified remain explicit pre-implementation gaps, never an all-sample-equal fallback or an implicit compatibility grant. Ordinary CDC, same-writer callbacks, retained snapshot pins and frozen discovery inputs are classified by role. Original checkpoint/token/model/ring/chain/cache/epoch/version, source-origin and live-fence proofs remain mandatory; retained model bytes and hashes are never rewritten. Old-model reuse requires valid original references and event binding, a model role sufficient for the processing contract, and compatible actual processing. A legitimately allocated new epoch preserves real observed metadata and event-version binding; conflicting immutable keys cannot be overwritten, skipped or resolved by inventing an epoch. Persistent record integrity, immutable-key publication and confirmed full receipt references/content remain exact; comparing such records with new samples is not itself receipt-integrity proof. No latest-model fallback, fabricated source cut, implicit full or clear-state permission is added. BSON shapes, namespaces, atomic domains and growth bounds are unchanged."
       ]
     },
     "shared-srs-replacement-srs_model_contexts": {
@@ -396,7 +398,8 @@
         "All native writers, planners and readers resolve one trusted effective physical chain and use matching ring/model/consumer keys. The canonical CAPTURE read identity and the original canonical shared notes namespace remain stable; the new physical identity must never create empty replacement necessary notes or change their original connector/config/artifact origin. Position-edit restrictions follow canonical historical identity across replacement namespaces.",
         "For A reading S1 and S2, B reading S1 and C reading S2, only damaged S1 and actual A/B are jointly recovered. A later explicit full may detach A from healthy S2 and update ordinary membership counters, but cannot reset S2 epoch/checkpoint/models or C authorization/cursor/execution. No running, stopped or completed Pipeline is automatically started.",
         "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
-        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation."
+        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation.",
+        "MongoDB sampling recovery: Only a host that proves the original source configuration and actual connector artifact as a supported MongoDB sampling implementation may separate current sampling observations from retained state. Sampled field membership, ordering, types and string widths are observations; their differences alone cannot prove DDL or refuse recovery. Declared constraints must be obtained from an authoritative source and their scope and meaning proved; unknown validators are not assumed discovered or absent. Actual Pipeline field/mapping/expression/conversion and target column/key/encoding contracts must be checked through verified processing mechanisms, without silent field loss, truncation, coercion or target widening. Required contracts that cannot be expressed or verified remain explicit pre-implementation gaps, never an all-sample-equal fallback or an implicit compatibility grant. Ordinary CDC, same-writer callbacks, retained snapshot pins and frozen discovery inputs are classified by role. Original checkpoint/token/model/ring/chain/cache/epoch/version, source-origin and live-fence proofs remain mandatory; retained model bytes and hashes are never rewritten. Old-model reuse requires valid original references and event binding, a model role sufficient for the processing contract, and compatible actual processing. A legitimately allocated new epoch preserves real observed metadata and event-version binding; conflicting immutable keys cannot be overwritten, skipped or resolved by inventing an epoch. Persistent record integrity, immutable-key publication and confirmed full receipt references/content remain exact; comparing such records with new samples is not itself receipt-integrity proof. No latest-model fallback, fabricated source cut, implicit full or clear-state permission is added. BSON shapes, namespaces, atomic domains and growth bounds are unchanged."
       ]
     },
     "shared-srs-replacement-srs_consumer_offsets": {
@@ -532,6 +535,19 @@
         "The existing CONFIG key supplies the existing tsai:1 provider AES/GCM ciphertext with owner and provider/baseUrl/model authenticated. No replacement key, rotation, node ACK, lease or CACHE/MASTER fallback. No plaintext key in database, API, logs, draft or browser storage.",
         "Provider remains openai-compatible with existing HTTPS public endpoint policy. Owner/baseUrl are each at most 4096 UTF-8 bytes, model at most 200 UTF-16 code units, API key at most 8192 characters without controls, and complete encoded BSON at most 256 KiB before any mutation.",
         "Absence of the owner row under verified schema/collection/indexes returns unconfigured, including explicit delete. No separate tombstone distinguishes arbitrary external whole-row deletion. Normal restart never recreates missing known structures or imports old settings."
+      ]
+    },
+    "original-target-model-v2": {
+      "goal": "Reuse the exact original target preparation structure without treating a new MongoDB sampling observation as a changed preparation or weakening receipt integrity.",
+      "entry": "Original fenced target preparation and ordinary recovery for verified sampled-source inputs; declared-only inputs keep their existing strict path.",
+      "prerequisites": [
+        "The original CACHE scope, complete target roster, preparation operation and Pipeline claim remain authoritative. Input keys, original modelHash, policy, fullLoad, phase, revisions and result are unchanged.",
+        "A strict row formatVersion 2 additionally retains targetModel exactly {formatVersion:1, canonical: BSON Binary subtype 0}. Canonical bytes are the unchanged ordered UTF-16 modelHash preimage; decode and exact re-encoding, name/key and SHA-256 checks bind it to both the row input and original claim manifest. No PDK objects, credentials, connection settings or row values are retained.",
+        "First publication freezes every input and original model body in the same actual CACHE client/session transaction competing on the original Pipeline claim. Complete BSON rows are at most 1048576 bytes and the canonical bodies for one PipelineIntentScope total at most 8388608 bytes; all limits are checked before any publication or backfill.",
+        "An existing formatVersion 1 row may gain a body only from a candidate whose complete canonical hash exactly equals the original input and manifest hash. The same fenced CACHE transaction preserves original operation, input, revision, phase, claim and result; an unknown PREPARING attempt never becomes READY or grants another destructive target call.",
+        "Changed observations may consume an existing v2 body only under the same captured authoring pipeline/source inputs and verified sampling-source origin. The original complete target roster, target key, policy and mode still match; original hash/receipt proofs are not replaced by observation compatibility.",
+        "Known missing or corrupt rows/bodies, unknown formats, unmatched legacy candidates, broken closure, changed authoring or lost fences refuse. No latest-model guess, automatic full, state clearing, target widening or replacement source model is authorized. Runtime expression, conversion, key and connector-write/error/settlement rules remain.",
+        "No new collection, cross-database transaction, migration scheduler or rolling mixed-version compatibility is introduced. New readers accept strict v1/v2 variants; old writers are excluded through the existing controlled same-version upgrade/restart boundary before v2 writes. Cleanup remains original scope retirement; bodies do not accumulate per restart."
       ]
     }
   },
@@ -2124,7 +2140,7 @@
     {
       "id": "mongo.cache.srs_chains",
       "resourceVersion": 3,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -2145,13 +2161,14 @@
       "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsChainStoreIT.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/MongoSampledStringWidthRestartIT.java"
       ]
     },
     {
       "id": "mongo.cache.srs_models",
       "resourceVersion": 1,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -2170,7 +2187,8 @@
       "growth": "Original retention remains; one chain-owned pending request with combined BSON size at most 262144 bytes, plus one new epoch model/context and existing consumer pin/floors. Models retain the original 1 MiB budget; one monotonic checkpoint boolean remains after consumption, without per-retry or permanent operation/model history. Capacity failure refuses rather than dropping required history. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsModelStoreIT.java",
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/MongoSampledStringWidthRestartIT.java"
       ]
     },
     {
@@ -2225,7 +2243,7 @@
     {
       "id": "mongo.cache.srs_consumers",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -2245,7 +2263,8 @@
       "consistency": "shared-srs-cache",
       "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction.",
       "evidence": [
-        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java"
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
+        "e2e/src/test/java/io/tapstate/e2e/MongoSampledStringWidthRestartIT.java"
       ]
     },
     {
@@ -2741,8 +2760,8 @@
     },
     {
       "id": "mongo.cache.sink_preparations",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
@@ -2756,9 +2775,9 @@
       "readers": [
         "io.tapstate.adapters.mongostore.MongoSinkPreparationStore"
       ],
-      "recovery": "runtime-state",
+      "recovery": "original-target-model-v2",
       "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "One original canonical target preparation body per scope/purpose/node/target; complete BSON row at most 1 MiB, canonical bodies at most 8 MiB per PipelineIntentScope. No restart/sample history; over-limit publication/backfill refuses atomically. Original scope retirement and receipt lifecycle remain.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSinkPreparationStoreIT.java"
       ]

@@ -3,6 +3,8 @@ package io.tapstate.app;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.function.SupplierEx;
+import com.hazelcast.instance.impl.HazelcastInstanceProxy;
+import com.hazelcast.internal.server.tcp.LinkedAddresses;
 import com.hazelcast.jet.config.JetConfig;
 import com.hazelcast.jet.config.JobConfig;
 import com.hazelcast.jet.core.AbstractProcessor;
@@ -137,10 +139,7 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "told apart; numbered within each member they would collide")
                     .doesNotHaveDuplicates();
         } finally {
-            if (second != null) {
-                second.shutdown();
-            }
-            first.shutdown();
+            stopMembers(first, second);
         }
     }
 
@@ -176,10 +175,7 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                     .as("and its stand-in is seen and classified all the same")
                     .hasSize(2);
         } finally {
-            if (second != null) {
-                second.shutdown();
-            }
-            first.shutdown();
+            stopMembers(first, second);
         }
     }
 
@@ -199,7 +195,7 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "reporting a stopped pipeline as running on the member that last ran it")
                     .isEmpty();
         } finally {
-            only.shutdown();
+            stopMembers(only, null);
         }
     }
 
@@ -243,10 +239,52 @@ class EveryMemberCanSayWhereAPipelinesWorkIsRunningTest {
                             + "read off the run rather than off what any one member remembers")
                     .containsExactly("node-b");
         } finally {
-            if (joiner != null) {
-                joiner.shutdown();
+            stopMembers(first, joiner);
+        }
+    }
+
+    @Test
+    void fixtureCleanupReleasesAMemberWhosePeerAddressWasRegisteredAsItsOwn() throws Exception {
+        int[] ports = twoFreePorts();
+        HazelcastInstance first = start(ports[0], ports[0], "node-a", "boot-a1");
+        HazelcastInstance second = null;
+        try {
+            second = start(ports[1], ports[0], "node-b", "boot-b1");
+            awaitMembers(first, 2);
+            awaitMembers(second, 2);
+            // Reproduce the alias left by the Linux self-connection without waiting for port reuse.
+            var node = ((HazelcastInstanceProxy) first).getOriginal().node;
+            var addresses = LinkedAddresses.getResolvedAddresses(first.getCluster().getLocalMember().getAddress());
+            addresses.addAllResolvedAddresses(second.getCluster().getLocalMember().getAddress());
+            node.getLocalAddressRegistry().register(node.getThisUuid(), addresses);
+            assertThat(node.getLocalAddressRegistry().uuidOf(second.getCluster().getLocalMember().getAddress()))
+                    .isEqualTo(node.getThisUuid());
+
+            stopMembers(first, null);
+
+            assertThat(Hazelcast.getAllHazelcastInstances()).doesNotContain(first).contains(second);
+            assertThat(first.getLifecycleService().isRunning()).isFalse();
+        } finally {
+            // Keep a defective cleanup implementation from contaminating the other regression cases.
+            try {
+                if (second != null) second.getLifecycleService().terminate();
+            } finally {
+                first.getLifecycleService().terminate();
             }
-            first.shutdown();
+        }
+    }
+
+    /** Releases only this case's members after its topology assertions have finished. */
+    private static void stopMembers(HazelcastInstance first, HazelcastInstance second) {
+        // Graceful Jet shutdown contacts peers after their ephemeral listeners have closed. On Linux,
+        // a reconnect can reuse that port and connect to itself, aborting shutdown and leaking a member
+        // into later cases. These disposable clusters need no graceful migration or job handoff.
+        try {
+            if (second != null) {
+                second.getLifecycleService().terminate();
+            }
+        } finally {
+            first.getLifecycleService().terminate();
         }
     }
 

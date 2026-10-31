@@ -6,6 +6,38 @@ import java.util.*;
 
 /** Original target preparation receipts, separate from operator state and necessary connector notes. */
 public interface SinkPreparationStore {
+    long MAX_MODEL_ROW_BYTES=1048576;
+    long MAX_SCOPE_MODEL_BYTES=8388608;
+    default boolean hasPreparedModels(){return false;}
+    /** Original v2 body, before any assessment of a new observation; changed authoring cannot use this shortcut. */
+    default Optional<Prepared> retainedModel(Key key,OnFullLoad policy,boolean fullLoad,PipelinePreparationInputs authoring){return Optional.empty();}
+    default Map<Key,Prepared> retainedModels(Collection<Key> keys,OnFullLoad policy,boolean fullLoad,PipelinePreparationInputs authoring) {
+        var result=new LinkedHashMap<Key,Prepared>();for(var key:keys)retainedModel(key,policy,fullLoad,authoring).ifPresent(model -> result.put(key,model));return Map.copyOf(result);
+    }
+
+    /** Read-only original model resolution; a legacy candidate must exactly match its recorded hash. */
+    default Prepared resolveModel(Prepared candidate,PipelinePreparationInputs authoring) {
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",candidate.input().key().scope().pipelineId()),null);
+    }
+    default List<Prepared> resolveModels(List<Prepared> candidates,PipelinePreparationInputs authoring) {
+        return candidates.stream().map(candidate -> resolveModel(candidate,authoring)).toList();
+    }
+    /** Freezes the complete roster and bodies, or atomically backfills exact-hash legacy candidates. */
+    default void prepareModels(List<Prepared> originalTargets) {
+        if(originalTargets.isEmpty()){prepareTargets(List.of());return;}
+        throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",originalTargets.getFirst().input().key().scope().pipelineId()),null);
+    }
+    default void prepareTargets(List<Input> originalTargets,List<Prepared> models) {
+        if(models.isEmpty())prepareTargets(originalTargets);
+        else if(originalTargets.size()==models.size())prepareModels(models);
+        else throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",originalTargets.getFirst().key().scope().pipelineId()),null);
+    }
+    record Prepared(Input input,byte[] canonical) {
+        public Prepared { Objects.requireNonNull(input,"input");canonical=Objects.requireNonNull(canonical,"canonical").clone(); }
+        @Override public byte[] canonical(){return canonical.clone();}
+        @Override public boolean equals(Object other){return other instanceof Prepared p && input.equals(p.input) && Arrays.equals(canonical,p.canonical);}
+        @Override public int hashCode(){return 31*input.hashCode()+Arrays.hashCode(canonical);}
+    }
     /** Controlled planning freezes one complete original target roster before a target may be opened. */
     void prepareTargets(List<Input> originalTargets);
     Snapshot load(Input originalTarget);

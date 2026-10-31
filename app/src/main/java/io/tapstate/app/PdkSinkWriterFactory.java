@@ -133,6 +133,9 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         }).assess(config(),targets);
         return forRun(run,unchanged);
     }
+    PdkSinkWriterFactory withTargets(Map<String,TargetTable> restored) {
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null);
+    }
     PdkSinkWriterFactory forRun(ConfiguredSinkRun run,Map<String,TargetIdentityPlan> identities) {
         if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
         if(!targets.keySet().equals(identities.keySet()))throw new IllegalArgumentException("frozen identities must cover every input stream");
