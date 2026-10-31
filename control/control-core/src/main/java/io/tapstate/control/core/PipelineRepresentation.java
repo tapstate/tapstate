@@ -697,8 +697,9 @@ public final class PipelineRepresentation {
         for (int index = 0; index < values.size(); index++) {
             Map<String, Object> value = object(values.get(index), path + "[" + index + "]");
             requireNoOptions(value, path + "[" + index + "]");
+            String id = textOrNull(value.get("id"), path + ".id");
             result.add(new SyncElement(
-                    textOrNull(value.get("id"), path + ".id"),
+                    id == null ? "sync_" + (index + 1) : id,
                     requiredText(value, "source", path),
                     enumValue(value(value, "write_mode", "writeMode"), WriteMode.values(), WriteMode::yaml,
                             path + ".writeMode"),
