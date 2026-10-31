@@ -11,6 +11,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -148,6 +149,10 @@ public final class PipelineExplainService {
                 evidence(Source.METRICS, RECORD_COUNT, facts.recordCount()),
                 evidence(Source.METRICS, "frontierStalledMillis", facts.frontierStalledMillis()),
                 evidence(Source.SNAPSHOT, "rowsDone", facts.snapshotRowsDone()));
+        if (facts.loadStages() != null) {
+            evidence = new ArrayList<>(evidence);
+            evidence.add(evidence(Source.SNAPSHOT, "initialLoad", facts.loadStages()));
+        }
         List<String> cannotSay = new ArrayList<>();
         if (time.freshness() == Freshness.UNKNOWN) {
             cannotSay.add(text("explain.cannot-age", Map.of()));
@@ -156,7 +161,9 @@ public final class PipelineExplainService {
         if (observation.state() == PipelineState.PAUSED) {
             cannotSay.add(text("explain.cannot-paused-job", Map.of()));
         }
-        cannotSay.add(text("explain.cannot-snapshot-phase", Map.of()));
+        if (facts.loadStages() == null) {
+            cannotSay.add(text("explain.cannot-snapshot-phase", Map.of()));
+        }
         return answer(observation, time, Kind.NO_MATCH, text("explain.no-match", Map.of()),
                 evidence, cannotSay, null);
     }
@@ -168,13 +175,16 @@ public final class PipelineExplainService {
     }
 
     private Facts facts(Observation observation) {
+        Map<String, String> loadStages = loadStages(observation.initialLoad());
         Map<String, Long> frontierStalledMillis = new TreeMap<>();
         Map<String, Long> stalled = new TreeMap<>();
         observation.metrics().forEach((name, value) -> {
             if (name.startsWith(STALLED_PREFIX) && value != null) {
                 String chain = name.substring(STALLED_PREFIX.length());
                 frontierStalledMillis.put(chain, value);
-                if (FrontierStallPressure.EXPLAIN.isOver(value)) {
+                // A table still in its initial load has no durable position to advance yet, so its pinned
+                // time grows with the load and says nothing about the target.
+                if (FrontierStallPressure.EXPLAIN.isOver(value) && !stillLoading(loadStages, chain)) {
                     stalled.put(chain, value);
                 }
             }
@@ -183,7 +193,25 @@ public final class PipelineExplainService {
         return new Facts(observation.metrics().get(RECONCILE_STREAK),
                 observation.metrics().get(RECORD_COUNT),
                 Collections.unmodifiableMap(new LinkedHashMap<>(frontierStalledMillis)),
-                Collections.unmodifiableMap(new LinkedHashMap<>(stalled)), rowsDone);
+                Collections.unmodifiableMap(new LinkedHashMap<>(stalled)), rowsDone, loadStages);
+    }
+
+    /** Each table's initial-load stage by name, or null when the observation carries no initial load. */
+    private static Map<String, String> loadStages(InitialLoad initialLoad) {
+        if (initialLoad == null || initialLoad.tables().isEmpty()) {
+            return null;
+        }
+        Map<String, String> stages = new TreeMap<>();
+        initialLoad.tables().forEach((table, load) -> stages.put(table, load.stage().name()));
+        return Collections.unmodifiableMap(stages);
+    }
+
+    private static boolean stillLoading(Map<String, String> loadStages, String chain) {
+        if (loadStages == null) {
+            return false;
+        }
+        String stage = loadStages.get(chain);
+        return stage != null && !InitialLoad.Stage.LANDED.name().equals(stage);
     }
 
     private Time time(Instant observedAt) {
@@ -243,6 +271,6 @@ public final class PipelineExplainService {
 
     private record Facts(Long reconcileFailures, Long recordCount,
             Map<String, Long> frontierStalledMillis, Map<String, Long> stalledChains,
-            long snapshotRowsDone) {
+            long snapshotRowsDone, Map<String, String> loadStages) {
     }
 }

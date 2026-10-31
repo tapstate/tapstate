@@ -9,6 +9,7 @@ import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.ExecutionPlan;
+import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
@@ -141,6 +142,57 @@ class PipelineExplainServiceTest {
         assertThat(answer.next().action()).isEqualTo(NextAction.CHECK_TARGET);
     }
 
+    /**
+     * A chain whose table is still in its initial load has no durable position to advance yet: its pinned time
+     * grows for as long as the load runs. Reported as stopped, a long load reads as a broken target.
+     */
+    @Test
+    void aChainWhoseTableIsStillLoadingIsNotDiagnosedAsStalled() {
+        Observation observation = loading(Map.of(
+                "recordCount", 100L,
+                "frontierStalledMillis.order_line", 1_127_598L,
+                "frontierStalledMillis.customer", 0L), Map.of(
+                "order_line", new InitialLoad.Table(InitialLoad.Stage.READING, 50_344L, 100_280L),
+                "customer", new InitialLoad.Table(InitialLoad.Stage.LANDED, 10_000L, 10_000L)));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.NO_MATCH);
+        assertThat(answer.evidence()).contains(new Evidence(Source.SNAPSHOT, "initialLoad",
+                Map.of("order_line", "READING", "customer", "LANDED")));
+        assertThat(answer.cannotSay()).doesNotContain("explain.cannot-snapshot-phase");
+    }
+
+    @Test
+    void aChainWhoseTableHasLandedIsStillDiagnosedAsStalled() {
+        Observation observation = loading(Map.of(
+                "recordCount", 100L,
+                "frontierStalledMillis.order_line", 1_127_598L), Map.of(
+                "order_line", new InitialLoad.Table(InitialLoad.Stage.LANDED, 100_280L, 100_280L)));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.FRONTIER_STALLED);
+        assertThat(answer.evidence()).extracting(Evidence::field)
+                .containsExactly("frontierStalledMillis.order_line");
+    }
+
+    @Test
+    void onlyTheChainsWhoseTablesHaveLandedAreNamedAsStalled() {
+        Observation observation = loading(Map.of(
+                "recordCount", 100L,
+                "frontierStalledMillis.order_line", 1_127_598L,
+                "frontierStalledMillis.customer", 96_000L), Map.of(
+                "order_line", new InitialLoad.Table(InitialLoad.Stage.READING, 50_344L, 100_280L),
+                "customer", new InitialLoad.Table(InitialLoad.Stage.LANDED, 10_000L, 10_000L)));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.FRONTIER_STALLED);
+        assertThat(answer.evidence()).extracting(Evidence::field)
+                .containsExactly("frontierStalledMillis.customer");
+    }
+
     @Test
     void subThresholdPausesRemainTypedEvidenceWithoutAStoppedChainDiagnosis() {
         Observation observation = observation(PipelineState.RUNNING, Map.of(
@@ -248,6 +300,14 @@ class PipelineExplainServiceTest {
             long rowsDone, Instant observedAt) {
         return new Observation(ID, state, metrics,
                 Map.of("orders", new TableSnapshot(rowsDone, null, null)), Map.of(), null, observedAt);
+    }
+
+    private static Observation loading(Map<String, Long> metrics, Map<String, InitialLoad.Table> tables) {
+        Instant observedAt = NOW.minusSeconds(2);
+        return new Observation(ID, PipelineState.RUNNING, metrics,
+                Map.of("orders", new TableSnapshot(60_344L, null, null)), Map.of(), null, observedAt, List.of(),
+                new InitialLoad("execution:" + ID + ":1:" + NOW.minusSeconds(1_200), observedAt,
+                        "snapshot_and_cdc", tables));
     }
 
     private static ObservationStore observations(Observation... values) {
