@@ -80,6 +80,10 @@ class RegistryConnectorProvisionerTest {
 
         assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
                 failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+        String hash;
+        try (var bytes = Files.newInputStream(seeds.resolve("orders-connector.jar"))) { hash = ContentHash.of(bytes); }
+        assertThatThrownBy(() -> provisioner.resolve("orders", hash)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
         assertThat(Files.exists(cache)).isFalse();
     }
 
@@ -502,6 +506,30 @@ class RegistryConnectorProvisionerTest {
         var exact = provisioner.resolve("orders", retained);
         assertThat(exact.contentHash()).isEqualTo(retained);
         assertThat(exact.className()).isEqualTo("synthetic.OrdersConnector");
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"missing", "retained", "conflicting"})
+    void retainedSeedResolutionKeepsItsExactHashWithoutWeakeningIdAmbiguity(String seedState, @TempDir Path dir) throws IOException {
+        var registry = new InMemoryConnectorRegistry();
+        byte[] original = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("original")));
+        byte[] replacement = Files.readAllBytes(Synthetic.annotatedEmittingConnector(dir.resolve("replacement")));
+        String retained = registry.register("orders", "1.3.5", RegistrationSource.SEED, original).registration().contentHash();
+        registry.register("orders", "2.0.8", RegistrationSource.REGISTER, replacement);
+        Path seeds = Files.createDirectories(dir.resolve("seeds"));
+        if (!seedState.equals("missing"))
+            Files.write(seeds.resolve("orders-connector.jar"), seedState.equals("retained") ? original : replacement);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds);
+
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ConnectorError.AMBIGUOUS_REGISTRATION));
+        ConnectorRef exact = provisioner.resolve("orders", retained);
+
+        assertThat(exact.contentHash()).isEqualTo(retained);
+        assertThat(exact.className()).isEqualTo("synthetic.OrdersConnector");
+        assertThat(registry.artifactCalls).isEqualTo(seedState.equals("retained") ? 0 : 1);
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOfSatisfying(TapstateException.class,
+                error -> assertThat(error.code()).isEqualTo(ConnectorError.AMBIGUOUS_REGISTRATION));
     }
 
     @Test

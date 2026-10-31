@@ -55,7 +55,7 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
 
     @Override
     public ConnectorRef resolve(String connectorId) {
-        return materialize(connectorId, resolveRegistration(connectorId));
+        return materialize(connectorId, resolveRegistration(connectorId), false);
     }
 
     @Override
@@ -68,14 +68,16 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         if (matches.size() != 1) {
             throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         }
-        return materialize(connectorId, matches.getFirst());
+        return materialize(connectorId, matches.getFirst(), true);
     }
 
-    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration) {
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash) {
         Path staged = stage(connectorId, registration.contentHash());
         if (seedDir != null) {
-            // Local bytes grant no authority: recheck the guarded registration after staging.
-            List<ConnectorRegistration> current = registry.findAll(connectorId);
+            // Local bytes grant no authority: recheck the original selector after staging.
+            // A retained hash can coexist with other versions; ID-only resolution cannot.
+            List<ConnectorRegistration> current = registry.findAll(connectorId).stream()
+                    .filter(candidate -> !retainedHash || candidate.contentHash().equals(registration.contentHash())).toList();
             if (current.size() != 1 || !current.getFirst().equals(registration))
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }

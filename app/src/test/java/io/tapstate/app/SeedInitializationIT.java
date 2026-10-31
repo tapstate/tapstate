@@ -79,7 +79,7 @@ class SeedInitializationIT {
                         assertThat(registry.readBytes.get()).as(mode + "/" + state).isEqualTo(expectedRead);
                         assertThat(registry.uploadBytes.get()).isEqualTo(state.equals("cold") ? bytes : 0);
                         System.out.printf("SEED_MEASUREMENT mode=%s trial=%d state=%s workers=%d preflight_ms=%d registration_ms=%d final_ms=%d total_ms=%d upload_ms=%d readback_ms=%d upload_bytes=%d readback_bytes=%d%n",
-                                mode, trial, state, reuseSeed ? cpu : 1, millis(checked - start), millis(registered - checked),
+                                mode, trial, state, reuseSeed ? Math.min(cpu, outcomes.size()) : 1, millis(checked - start), millis(registered - checked),
                                 millis(ready - registered), millis(ready - start), millis(registry.uploadNanos.get()),
                                 millis(registry.readNanos.get()), registry.uploadBytes.get(), registry.readBytes.get());
                     }
