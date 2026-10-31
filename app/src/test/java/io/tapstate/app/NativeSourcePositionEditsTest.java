@@ -67,7 +67,7 @@ class NativeSourcePositionEditsTest {
             var preparations = mock(PipelineStatePreparations.class); when(configuration.preparations()).thenReturn(preparations);
             when(preparations.read("flow")).thenReturn(Optional.of(new PipelinePreparation("flow", 1, PipelinePreparation.Phase.UNASSIGNED, null, null, null)));
             when(port.scope("flow")).thenReturn(scope); when(port.state()).thenReturn(mock(StateStore.class)); when(port.desired()).thenReturn(mock(DesiredStore.class));
-            when(reading.read("flow")).thenReturn(current); when(owners.unpreparedControl(scope)).thenReturn(control);
+            when(reading.read("flow")).thenReturn(current); when(owners.controlAfterPass(eq(scope), eq(true), any())).thenReturn(control);
             var chains = mock(SrsChainStore.class); var consumers = mock(SrsConsumerStore.class);
             when(cache.srs(any(), any())).thenReturn(new SrsStores(chains, mock(SrsModelStore.class), mock(SrsLogStore.class), consumers));
             for (String chain : List.of(a, b)) {
