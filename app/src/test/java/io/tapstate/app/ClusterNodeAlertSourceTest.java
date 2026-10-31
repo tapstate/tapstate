@@ -55,12 +55,12 @@ class ClusterNodeAlertSourceTest {
         try(var source=source()) {
             source.tick();var proofs=proofs();clearInvocations(runtime);
             live.removeIf(value->value.getUuid().toString().equals(peer.memberId()));source.tick();
-            verify(runtime).resourceInput(eq(peer.key().resource()),eq("cluster.node-unavailable"),eq(0L),anyString(),any(),argThat(input->input instanceof AlertInput.Conditions c && c.values().equals(List.of(AlertSignal.Condition.BAD))));
+            verify(runtime).sharedResourceInput(eq(peer.key().resource()),eq("cluster.node-unavailable"),eq(0L),anyString(),any(),argThat(input->input instanceof AlertInput.Conditions c && c.values().equals(List.of(AlertSignal.Condition.BAD))));
             assertThat(proofs.apply(peer.key().resource()).orElseThrow().expected()).isTrue();
             rows.put(peer.key(),new Row(peer,2,T,Phase.RETIRING,"67d93958-b5e1-4bb0-9273-f7bb29e48f01",T.plusSeconds(1)));
             clearInvocations(runtime);source.tick();
             assertThat(proofs.apply(peer.key().resource()).orElseThrow().expected()).isFalse();
-            verify(runtime,never()).resourceInput(eq(peer.key().resource()),anyString(),anyLong(),anyString(),any(),any());
+            verify(runtime,never()).sharedResourceInput(eq(peer.key().resource()),anyString(),anyLong(),anyString(),any(),any());
         }
     }
     @Test void aNewBootSupersedesTheOldMonitoringIdentityWithoutRecoveringIt() {
@@ -70,8 +70,8 @@ class ClusterNodeAlertSourceTest {
             live.removeIf(value->value.getUuid().toString().equals(peer.memberId()));live.add(member(replacement));clearInvocations(runtime);source.tick();
             var old=proofs.apply(peer.key().resource()).orElseThrow();assertThat(old.expected()).isFalse();assertThat(old.supersedingBootId()).isEqualTo("boot-next");
             assertThatThrownBy(previous.requireCurrent()::run).isInstanceOf(io.tapstate.core.common.TapstateException.class);
-            verify(runtime,never()).resourceInput(eq(peer.key().resource()),anyString(),anyLong(),anyString(),any(),any());
-            verify(runtime).resourceInput(eq(replacement.key().resource()),anyString(),anyLong(),anyString(),any(),argThat(input->input instanceof AlertInput.Conditions c && c.values().equals(List.of(AlertSignal.Condition.GOOD))));
+            verify(runtime,never()).sharedResourceInput(eq(peer.key().resource()),anyString(),anyLong(),anyString(),any(),any());
+            verify(runtime).sharedResourceInput(eq(replacement.key().resource()),anyString(),anyLong(),anyString(),any(),argThat(input->input instanceof AlertInput.Conditions c && c.values().equals(List.of(AlertSignal.Condition.GOOD))));
         }
     }
     @Test void aLostOriginalRegistrationRefusesProofAndMarksCollectionDegraded() {
