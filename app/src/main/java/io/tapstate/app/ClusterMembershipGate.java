@@ -35,7 +35,7 @@ final class ClusterMembershipGate implements SplitBrainProtectionFunction {
     // The single member bootstrap publishes one immutable owner identity.
     @SuppressWarnings("java:S3077")
     private volatile WorkloadOwner singleOwner;
-    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> true);
+    private final AtomicReference<BooleanSupplier> nodeSession = new AtomicReference<>(() -> false);
 
     /** A fixed deployment predicate, not a persisted majority decision or recovery epoch. */
     void bindSingle(WorkloadClaim original) {

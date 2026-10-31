@@ -78,7 +78,7 @@ final class MongoConfigurationSecurityStores {
             Objects.requireNonNull(record, "record");
             StoreIo.run(record.tokenId(), () -> transaction(session -> {
                 readIdentity(session);
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 tokens.replaceOne(session, new Document("_id", record.tokenId()), MongoTokenStore.toDocument(record),
                         new ReplaceOptions().upsert(true));
                 return null;
@@ -101,7 +101,7 @@ final class MongoConfigurationSecurityStores {
                 readIdentity(session);
                 Document row = tokens.find(session, new Document("_id", id)).first();
                 if (row == null || decodeToken(row).revoked()) return null;
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 tokens.updateOne(session, new Document("_id", id), new Document("$set", new Document("revoked", true)));
                 return null;
             }));

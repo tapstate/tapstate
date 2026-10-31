@@ -76,7 +76,7 @@ public final class MongoPipelineLayoutStore implements PipelineLayoutStore {
         StoreIo.run(() -> {
             try (var session = client.startSession()) {
                 session.withTransaction(() -> {
-                    ConfigurationVersion.advance(session, versions);
+                    ConfigurationVersion.advance(session, versions, client);
                     write.accept(session);
                     return null;
                 }, TRANSACTION);

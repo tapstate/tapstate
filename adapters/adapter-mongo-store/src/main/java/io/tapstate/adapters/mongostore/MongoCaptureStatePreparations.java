@@ -115,7 +115,7 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
             var binding=bindings.loadForTransaction(session).orElseThrow(MongoCaptureStatePreparations::fenced);
             // This is the existing CONFIG contention point used by authoring, binding and rebuild.
             // A dependency changed after our snapshot must abort and revalidate before any grant.
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             if(mode==CapturePreparation.Mode.SHARED_SRS) {
                 var prior=table.find(session,new Document("_id.clusterId",scope.clusterId()).append("_id.bindingVersion",scope.bindingVersion())
                         .append("_id.capture",OperatorStateText.encode(capture))).first();

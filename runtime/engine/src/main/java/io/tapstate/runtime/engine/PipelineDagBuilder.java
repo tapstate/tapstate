@@ -482,12 +482,13 @@ public final class PipelineDagBuilder {
         // can report.
         List<SinkNode> sinks = sinkNodes(pipeline, bindings);
         Map<String, List<String>> writersByChain = chains == null ? null : writersByChain(sinks, chains, shape);
+        var roster = writersByChain == null ? null : new SinkAckFactory.RunWriters(writersByChain, writersByOutput(sinks, chains, shape));
         boolean startsTheRun = sinkAck != null && writersByChain != null;
         for (SinkNode sink : sinks) {
             verticesOf(sink.upstream(), byKey).forEach(upstream -> drawn.feeds(sink.name(), upstream.getName()));
             if (shape.isNative(sink.name())) {
                 drawNativeSink(dag, sink, sinkAck, axes, chains, shape, byKey, outboundOrdinal, inboundOrdinal,
-                        startsTheRun ? writersByChain : null);
+                        startsTheRun ? roster : null);
                 drawn.add(sink.name(), ROUTE_VERTEX_PREFIX + sink.name());
                 drawn.add(sink.name(), sink.name());
                 startsTheRun = false;
@@ -500,7 +501,7 @@ public final class PipelineDagBuilder {
                     assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
                     sink.batch()), sink);
             if (startsTheRun) {
-                supplier = WriterRunStart.of(supplier, sinkAck, writersByChain);
+                supplier = WriterRunStart.of(supplier, sinkAck, roster);
                 startsTheRun = false;
             }
             Vertex vertex = dag.newVertex(sink.name(), supplier);
@@ -633,7 +634,7 @@ public final class PipelineDagBuilder {
     private static void drawNativeSink(DAG dag, SinkNode sink, SinkAckFactory sinkAck, ChainAxes axes,
             PipelineChains chains, ExecutionShape shape, Map<String, Vertex> byKey,
             Map<Vertex, Integer> outboundOrdinal, Map<Vertex, Integer> inboundOrdinal,
-            Map<String, List<String>> startsTheRun) {
+            SinkAckFactory.RunWriters startsTheRun) {
         String name = sink.name();
         Map<String, SinkTarget> targets = shape.sinkTargetsOf(name);
         int local = shape.localOf(name);
@@ -736,6 +737,16 @@ public final class PipelineDagBuilder {
             }
         }
         return byChain;
+    }
+
+    private static Map<String, Map<String, List<String>>> writersByOutput(List<SinkNode> sinks, PipelineChains chains, ExecutionShape shape) {
+        var outputs = new LinkedHashMap<String, Map<String, List<String>>>();
+        for (var sink : sinks) {
+            var streams = new LinkedHashMap<String, List<String>>(); var writers = writersOf(sink, shape);
+            for (String stream : chains.union(sink.upstream())) streams.put(stream, writers);
+            outputs.put(sink.name(), streams);
+        }
+        return outputs;
     }
 
     /**

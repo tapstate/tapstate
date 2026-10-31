@@ -111,11 +111,38 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
                     .append("cachePreparation", new Document("phase", "UNASSIGNED")).append("cacheRecovery", MongoCacheRecoveryFacts.encode(summary));
             replacement.remove("stateRebuild");
             MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(row,replacement,summary.previousScope());
+            MongoValidationPreparations.beginCacheReplacement(session, database, clusterId, row, replacement, running);
             intents().rebindStopped(session, summary, running.manifest().definitionHashes().get(id));
             if (table.replaceOne(session, row, replacement).getMatchedCount() != 1) throw MongoCacheRecoveryFacts.refused();
             result.add(summary);
         }
         return List.copyOf(result);
+    }
+
+    static final class ValidationClosure {
+        private final MongoCacheRecoveryStore owner;
+        private final StorageRecoveryCommands.Plan running;
+        private final String pipeline;
+        private ValidationClosure(MongoCacheRecoveryStore owner, StorageRecoveryCommands.Plan running, String pipeline) {
+            this.owner = owner; this.running = running; this.pipeline = pipeline;
+        }
+        String pipeline() { return pipeline; }
+        void require(MongoClient client, MongoDatabase database, ClientSession session) {
+            owner.active.run();
+            if (owner.client != client || !owner.database.getName().equals(database.getName())) throw MongoCacheRecoveryFacts.refused();
+            owner.requirePlan(session, running);
+            MongoValidationPreparations.requireCacheReplacement(session, database, owner.clusterId, pipeline, running);
+        }
+    }
+
+    boolean closeValidationReports(StorageRecoveryCommands.Plan running, int maximum) {
+        boolean complete = true;
+        for (String pipeline : running.manifest().affectedPipelineIds()) {
+            var closure = new ValidationClosure(this, running, pipeline);
+            var store = MongoValidationAdmissionStore.forRecovery(client, database, clusterId, active, closure);
+            if (!store.transaction(session -> store.closePipelineInTransaction(session, pipeline, maximum))) complete = false;
+        }
+        return complete;
     }
     @Override public Optional<PipelineCacheRecovery> read(String pipelineId) {
         return transaction(session -> MongoCacheRecoveryFacts.read(SystemCollections.OPERATOR_GENERATIONS.on(database)
@@ -216,6 +243,10 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
     }
     void requireStopped(StorageRecoveryCommands.Plan running) {
         transaction(session -> {
+            requireStopped(session, running); return null;
+        });
+    }
+    void requireStopped(ClientSession session, StorageRecoveryCommands.Plan running) {
             requirePlan(session,running);
             if (running.phase()!=StorageRecoveryCommands.Phase.RUNNING || running.manifest().selection().extent()!=StorageRecoveryCommands.Extent.CLUSTER)
                 throw MongoCacheRecoveryFacts.refused();
@@ -229,8 +260,6 @@ final class MongoCacheRecoveryStore implements CacheRecoveryStore {
                         || MongoPipelinePreparationFacts.decode(id,row,clusterId).phase()!=PipelinePreparation.Phase.UNASSIGNED)
                     throw MongoCacheRecoveryFacts.refused();
             }
-            return null;
-        });
     }
     private void requireTarget(ClientSession session, CacheAuthScope target) {
         active.run();

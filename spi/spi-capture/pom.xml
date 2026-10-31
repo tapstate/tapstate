@@ -17,6 +17,11 @@
     third-party (rule R2: the port depends on the core ring only).</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- The standard event envelope is the currency the read side yields (rule R2: core only). -->
     <dependency>
       <groupId>io.tapstate</groupId>

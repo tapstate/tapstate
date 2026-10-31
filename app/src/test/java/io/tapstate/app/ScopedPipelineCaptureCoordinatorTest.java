@@ -21,6 +21,31 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
+        try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            var route=run.validationRoute("input","orders");
+            assertThat(route.execution()).isEqualTo(ORIGINAL);assertThat(route.alias()).isEqualTo("input");
+            assertThat(route.capture()).isEqualTo(WorkloadClaimFence.from(f.capture));assertThat(route.epoch()).isOne();
+            assertThat(route.membershipRevision()).isOne();assertThat(route.preparation().birth().captureId()).isEqualTo(f.capture.key().resourceId());
+            var opening=new CaptureObservation.Context(route.preparation().captureId(),UUID.randomUUID().toString(),route.channel(),
+                    "another-alias","another-pipeline","physical-consumer",route.epoch(),0,route.capture(),List.of("orders"));
+            route.requireOpening(opening);
+            assertThatThrownBy(()->run.validationRoute("wrong","orders")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->run.validationRoute("input","wrong")).isInstanceOf(TapstateException.class);
+            var old=route.capture();var replaced=new WorkloadClaimFence(old.key(),old.owner(),old.claimGeneration()+1,old.executionGeneration(),old.topologyRevision());
+            when(f.cache.load(route.preparation())).thenReturn(new CaptureCacheState(route.preparation(),replaced,Optional.of(Fixture.streamingChain())));
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+        }
+    }
+    @Test void aRetiredOrSnapshotOnlySessionCannotSupplyACdcValidationRoute(){
+        try(var f=new Fixture()){
+            var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+            run.stopCapture("flow",false);
+            assertThatThrownBy(()->run.validationRoute("input","orders")).isInstanceOf(TapstateException.class);
+        }
+    }
     private static final CacheBusinessScope BUSINESS=new CacheBusinessScope("cluster",1,"cache");
     private static final PipelineIntentScope SCOPE=new PipelineIntentScope("cluster",1,"cache","flow",7);
     private static final WorkloadOwner OWNER=new WorkloadOwner("node","boot");
@@ -68,7 +93,7 @@ class ScopedPipelineCaptureCoordinatorTest {
     @Test void anAbsentLocalOwnerDoesNotProveItsExactCaptureTenureEnded() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
-            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","node-c")));
+            var gate=new ClusterMembershipGate(properties);gate.observeNodeSession(() -> true);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","node-c")));
             gate.canCommit(Set.of("node","node-b"));var raw=new InMemoryWorkloadClaimStore();
             var ownership=new CaptureOwnership("cluster",OWNER,gate,new ClusterWorkloadClaims(raw,gate),Duration.ofSeconds(60));
             var permit=ownership.acquire(new CaptureId("mck-key"));
@@ -611,6 +636,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var cached = new CaptureCacheState(prepared, WorkloadClaimFence.from(capture),
                     bounded ? Optional.empty() : Optional.of(streamingChain()));
             when(cache.load(prepared)).thenReturn(cached);
+            when(cache.control(any(),anyString())).thenAnswer(call->{var held=cache.load(call.getArgument(0));return new CaptureCachePreparations.Control(held.preparation(),held.claim(),held.chain().map(SrsChainState::epoch).orElse(0L),held.chain().map(value->value.servingTables().contains(call.getArgument(1,String.class))).orElse(false));});
             when(pipelines.snapshotStates(any(),any(),any())).thenReturn(snapshots);
             when(snapshots.advanceOrder(anyLong(),anyLong(),anyMap())).thenReturn(1L);
             when(snapshots.count(anyString(),anyString(),anyLong())).thenReturn(OptionalLong.of(1));
@@ -648,6 +674,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
             when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
             var consumers = mock(SrsConsumerStore.class);
+            when(consumers.attached(any(),anyString())).thenAnswer(call->{var run=call.getArgument(0,SrsConsumerRun.class);var member=consumers.find(run.context().key()).orElse(null);return member!=null&&!member.detached()&&member.context().equals(run.context())&&member.revision()==run.membershipRevision()&&member.commandFence().equals(run.originalClaim())&&member.tables().contains(call.getArgument(1,String.class));});
             streamingProgress.set(progress(false, 1, 1));
             when(consumers.find(streamingContext.key())).thenReturn(Optional.of(
                     new SrsConsumerMembership(streamingContext, 1, false, Set.of("orders"), PIPELINE)));

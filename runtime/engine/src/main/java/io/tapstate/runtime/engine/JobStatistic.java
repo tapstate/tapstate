@@ -23,8 +23,10 @@ final class JobStatistic {
     private long written;
     private boolean everWritten;
 
-    JobStatistic(String name) {
-        this.metric = Metrics.metric(name);
+    JobStatistic(String name) { this(name, false); }
+
+    JobStatistic(String name, boolean workerPublication) {
+        this.metric = workerPublication ? Metrics.threadSafeMetric(name) : Metrics.metric(name);
     }
 
     /** Writes {@code value} unless it is the value this statistic already carries. */

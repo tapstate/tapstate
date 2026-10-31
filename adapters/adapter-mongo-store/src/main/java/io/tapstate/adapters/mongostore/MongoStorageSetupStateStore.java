@@ -45,7 +45,7 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
             Status original = load(session);
             require(session, original, expected, purpose);
             if (expected.generation() >= Long.MAX_VALUE - 1) throw refused();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             Document filter = filter(expected).append("phase", original.phase().name());
             if (SystemCollections.STORAGE_SETUP.on(database).updateOne(session, filter,
                     new Document("$inc", new Document("generation", 1L))).getMatchedCount() != 1) throw refused();

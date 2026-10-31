@@ -231,7 +231,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                         || hasOtherResource(session, captured.id())
                         || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw refused();
                 new MongoPipelineStateMappings(client, database).requireNoRetainedIdentity(session, captured.id());
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 SourceConfigCipher cipher = cipherForWrite(session);
                 StorageBinding binding = new StorageBinding(expected, mode, 1L, captured.id(), cache);
                 sources.insertOne(session, codec.encode(captured, session).append("systemRole", DEFAULT_ROLE));
@@ -259,19 +259,23 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             if (checkAfterCommit) requireActive.run();
             return new io.tapstate.spi.store.StorageBindingCommit(result.binding(), result.preparation(), result.won()
                     ? Optional.of(new Creation(result.preparation(), targetFingerprint(cache),
-                            () -> { requireActive.run(); requireOriginalInitialPreparation(result.preparation()); })) : Optional.empty());
+                            () -> { requireActive.run(); requireOriginalInitialPreparation(result.preparation()); }, requireActive)) : Optional.empty());
         });
     }
 
     /** Publishing a separate recovery intent retires the original initial-creation invocation. */
     void requireOriginalInitialPreparation(CachePreparation expected) {
         StoreIo.run(() -> transaction(session -> {
-            var current = load(session).orElseThrow(MongoStorageBindingStore::refused);
-            if (!current.cachePreparation().equals(expected)) throw refused();
-            var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
-            if (row == null || MongoStorageRecoveryCommands.pending(row).isPresent()) throw refused();
+            requireOriginalInitialPreparation(session, expected);
             return null;
         }));
+    }
+
+    void requireOriginalInitialPreparation(ClientSession session, CachePreparation expected) {
+        var current = load(session).orElseThrow(MongoStorageBindingStore::refused);
+        if (!current.cachePreparation().equals(expected)) throw refused();
+        var row = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
+        if (row == null || MongoStorageRecoveryCommands.pending(row).isPresent()) throw refused();
     }
 
     @Override public StorageBinding complete(StorageSetupScope expected) {
@@ -287,7 +291,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     return bound;
                 }
                 requireSetup(state, expected, BOUND);
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 MongoFirstAdminStore.preparePending(session, database, expected, bound.bindingVersion(), bound.mode());
                 if (setup.updateOne(session, setupFilter(expected, BOUND),
                         new Document("$set", new Document("phase", "COMPLETE"))).getMatchedCount() != 1) throw refused();
@@ -444,14 +448,22 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return creation;
     }
 
+    /** Only the pure operation lifetime is safe inside the original CACHE transaction. */
+    static void requireFirstLocal(io.tapstate.spi.store.FirstCacheCreation invocation) {
+        if (!(invocation instanceof Creation creation)) throw refused();
+        creation.localActive.run();
+    }
+
     private record Committed(StorageBinding binding, CachePreparation preparation, boolean won) {}
     private static final class Creation implements io.tapstate.spi.store.FirstCacheCreation {
         private final CachePreparation preparation;
         private final String targetFingerprint;
         private final Runnable originalActive;
+        private final Runnable localActive;
         private final java.util.concurrent.atomic.AtomicBoolean consumed = new java.util.concurrent.atomic.AtomicBoolean();
-        private Creation(CachePreparation preparation, String targetFingerprint, Runnable originalActive) {
+        private Creation(CachePreparation preparation, String targetFingerprint, Runnable originalActive, Runnable localActive) {
             this.preparation = preparation; this.targetFingerprint = targetFingerprint; this.originalActive = originalActive;
+            this.localActive = localActive;
         }
         @Override public CachePreparation preparation() { return preparation; }
         @Override public void consume() {

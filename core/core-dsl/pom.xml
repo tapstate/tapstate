@@ -15,6 +15,11 @@
   <description>YAML parse / validate / CEL checking for .tap.yml artifacts; carries the grammar-scenario corpus</description>
 
   <dependencies>
+    <dependency>
+      <groupId>io.tapstate</groupId>
+      <artifactId>core-validation</artifactId>
+      <version>${revision}</version>
+    </dependency>
     <!-- compile scope: the error-code contract (TapstateException / TapstateErrorCode) — DslError
          is the dsl domain's first consumer -->
     <dependency>

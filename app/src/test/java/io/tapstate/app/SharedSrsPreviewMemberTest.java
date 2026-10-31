@@ -148,7 +148,7 @@ class SharedSrsPreviewMemberTest {
             when(claims.renew(any(),any())).thenAnswer(call -> raw.renew(call.getArgument(0),call.getArgument(1)));
             when(claims.release(any())).thenAnswer(call -> raw.release(call.getArgument(0)));
             var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
-            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("a","b","c")));gate.canCommit(Set.of("a","b"));
+            var gate=new ClusterMembershipGate(properties);gate.observeNodeSession(() -> true);gate.install(new ClusterMembership("cluster",1,Set.of("a","b","c")));gate.canCommit(Set.of("a","b"));
             ownership=PipelineActuationOwnership.scoped(BUSINESS,local,gate,new ClusterWorkloadClaims(claims,gate),TTL,Duration.ofSeconds(10),System::nanoTime);
             if(local.equals(OWNER))assertThat(ownership.permit(SCOPE).granted()).isTrue();
             current.set(plan(10,"c".repeat(64)));version.set(current.get().controlRevision());

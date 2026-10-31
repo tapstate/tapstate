@@ -149,7 +149,7 @@ final class TwoMemberCluster implements AutoCloseable {
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
-        Map<String, RealProcessServer.PreparedLaunch> prepared = new LinkedHashMap<>();
+        Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
         String seeds;
         RealProcessServer first = null;
         RealProcessServer second = null;
@@ -164,19 +164,19 @@ final class TwoMemberCluster implements AutoCloseable {
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
                     clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
-            prepared.put(NODE_A, preparedStore == null
+            preparedLaunches.put(NODE_A, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
                     : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
-            first = prepared.get(NODE_A).launch();
+            first = preparedLaunches.get(NODE_A).launch();
             if (!concurrent) first.awaitHealthy();
-            prepared.put(NODE_B, preparedStore == null
+            preparedLaunches.put(NODE_B, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments)
                     : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_B, stagingByNode), secondArguments));
-            second = prepared.get(NODE_B).launch();
+            second = preparedLaunches.get(NODE_B).launch();
             if (!concurrent) second.awaitHealthy();
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
-            try { closeOwned(first, second, prepared, clusterId); }
+            try { closeOwned(first, second, preparedLaunches, clusterId); }
             catch (RuntimeException | Error cleanup) {
                 if (cleanup != failure) failure.addSuppressed(cleanup);
             }
@@ -191,7 +191,7 @@ final class TwoMemberCluster implements AutoCloseable {
                 Throwable primary = startingFailure == null ? portFailures.getFirst() : startingFailure;
                 portFailures.stream().filter(cleanup -> cleanup != primary).forEach(primary::addSuppressed);
                 if (startingFailure == null) {
-                    try { closeOwned(first, second, prepared, clusterId); }
+                    try { closeOwned(first, second, preparedLaunches, clusterId); }
                     catch (RuntimeException | Error cleanup) {
                         if (cleanup != primary) primary.addSuppressed(cleanup);
                     }
@@ -341,7 +341,7 @@ final class TwoMemberCluster implements AutoCloseable {
 
     /** Closes owned members in their original order and retains every cleanup failure. */
     private static void closeOwned(RealProcessServer first, RealProcessServer second,
-            Map<String, RealProcessServer.PreparedLaunch> prepared, String clusterId) {
+            Map<String, RealProcessServer.PreparedLaunch> preparedLaunches, String clusterId) {
         Map<String, RealProcessServer> owned = new LinkedHashMap<>();
         if (second != null) owned.put(NODE_B, second);
         if (first != null) owned.put(NODE_A, first);
@@ -358,7 +358,7 @@ final class TwoMemberCluster implements AutoCloseable {
                 failures.add(failure);
             }
         }
-        for (RealProcessServer.PreparedLaunch launch : prepared.values()) {
+        for (RealProcessServer.PreparedLaunch launch : preparedLaunches.values()) {
             try {
                 launch.close();
             } catch (RuntimeException | Error failure) {
@@ -366,7 +366,7 @@ final class TwoMemberCluster implements AutoCloseable {
             }
         }
         Map<String, Path> logs = new LinkedHashMap<>();
-        prepared.forEach((nodeId, launch) -> logs.put(nodeId, launch.output()));
+        preparedLaunches.forEach((nodeId, launch) -> logs.put(nodeId, launch.output()));
         owned.forEach((nodeId, server) -> logs.put(nodeId, server.output()));
         try { FailureScene.writeMemberLogs(clusterId, logs); }
         catch (RuntimeException | Error failure) { failures.add(failure); }

@@ -77,6 +77,8 @@ class StoreBackedSinkAckFactoryTest {
                 new WorkloadOwner("node-a", "boot-a"), 1, 1, 0);
         SinkAck ack = soleWriter(memberWith(store), Map.of("orders", "mc-orders"), "pipe-1");
         var logger = (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(StoreBackedSinkAckFactory.class);
+        var previousLevel = logger.getLevel();
+        logger.setLevel(ch.qos.logback.classic.Level.INFO);
         var written = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>() {
             @Override
             protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
@@ -114,6 +116,7 @@ class StoreBackedSinkAckFactoryTest {
             else org.slf4j.MDC.put(key, previous);
             logger.detachAppender(written);
             written.stop();
+            logger.setLevel(previousLevel);
         }
     }
 

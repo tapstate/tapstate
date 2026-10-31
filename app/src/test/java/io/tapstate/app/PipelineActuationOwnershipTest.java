@@ -356,6 +356,7 @@ class PipelineActuationOwnershipTest {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
         return gate;

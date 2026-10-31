@@ -14,6 +14,9 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
+                        "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                        "validation.start", "validation.progress", "validation.stop", "validation.history",
+                        "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
@@ -224,7 +227,7 @@ class ControlOperationsTest {
         // dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(84);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
         assertThat(registry.resolve("cluster.context").exposure())
@@ -272,6 +275,9 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                        "validation.start", "validation.progress", "validation.stop", "validation.history",
+                        "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
@@ -328,4 +334,25 @@ class ControlOperationsTest {
         assertThat(delete.schema()).as("an MCP operation must carry a schema ref").isNotNull();
         assertThat(delete.description()).as("an MCP tool must carry a description").isNotBlank();
     }
+    @Test
+    void directFullValidationKeepsItsWriteAuditAndReadOnlyQueryBoundaries() {
+        for (String id : List.of("validation.save", "validation.start", "validation.stop", "validation.schedule-disable")) {
+            assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.WRITE);
+            assertThat(registry.resolve(id).audited()).as(id).isTrue();
+        }
+        assertThat(registry.resolve("validation.evaluate").scope()).isEqualTo(Scope.WRITE);
+        assertThat(registry.resolve("validation.evaluate").audited()).isFalse();
+        for (String id : List.of("validation.get", "validation.schedule-preview", "validation.progress", "validation.history",
+                "validation.report", "validation.roots", "validation.root")) {
+            assertThat(registry.resolve(id).scope()).as(id).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).as(id).isFalse();
+        }
+        for (String id : List.of("validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
+                "validation.start", "validation.progress", "validation.stop", "validation.history", "validation.report",
+                "validation.roots", "validation.root", "validation.schedule-disable")) {
+            assertThat(registry.resolve(id).exposure()).as(id).containsEntry(Frontend.REST, Maturity.CURRENT)
+                    .doesNotContainKey(Frontend.CLI).doesNotContainKey(Frontend.MCP);
+        }
+    }
+
 }

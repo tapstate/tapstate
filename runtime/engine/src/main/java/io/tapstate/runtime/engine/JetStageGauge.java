@@ -12,9 +12,9 @@ import java.util.Map;
  * stage rides in the name; it is a closed set of words with no dot in any of them, so the names split
  * back without a guess.
  *
- * <p>Readings can only be taken from the job's own threads, which is why a processor driven outside a
- * running job is given a gauge that reads nothing instead of this one. The handle for a name is kept once
- * obtained — it belongs to the processor rather than to whichever thread ran it.
+ * <p>Handles are acquired on the owning processor thread. A submitted worker uses a completely
+ * prebound set of thread-safe handles and performs no metric lookup. Accumulators and cached values
+ * still have one writer. Outside a running job the timer uses a gauge that reads nothing.
  *
  * <p>What is written is what moved. One unit of work changes the count, the sum and one bucket, so
  * publishing the whole distribution writes sixteen numbers that already hold that value — once per row
@@ -28,6 +28,19 @@ final class JetStageGauge implements StageGauge {
     static final String SUM_MICROS = ".sumMicros";
     static final String BUCKET = ".bucket.";
     static final String SINCE = ".since";
+
+    private final boolean workerPublication;
+    JetStageGauge() { this(false); }
+    JetStageGauge(boolean workerPublication) { this.workerPublication = workerPublication; }
+
+    /** Acquire all handles on the owning processor thread before publishing work to another thread. */
+    void bind(Stage stage, int bucketCount) {
+        String name = PREFIX + stage.attributeValue();
+        bindPart(name + COUNT); bindPart(name + SUM_MICROS); bindPart(name + SINCE);
+        JobStatistic[] handles = new JobStatistic[bucketCount];
+        for (int index = 0; index < bucketCount; index++) handles[index] = bindPart(name + BUCKET + index);
+        bucketsByStage.put(stage, handles);
+    }
 
     private final Map<String, JobStatistic> parts = new HashMap<>();
     private final Map<Stage, JobStatistic[]> bucketsByStage = new EnumMap<>(Stage.class);
@@ -52,8 +65,15 @@ final class JetStageGauge implements StageGauge {
         part(name + SINCE).set(countingSinceMillis);
     }
 
+    private JobStatistic bindPart(String name) {
+        return parts.computeIfAbsent(name, value -> new JobStatistic(value, workerPublication));
+    }
+
     private JobStatistic part(String name) {
-        return parts.computeIfAbsent(name, JobStatistic::new);
+        var found = parts.get(name);
+        if (found != null) return found;
+        if (workerPublication) throw new IllegalStateException("worker stage handle was not bound by its processor");
+        var created = new JobStatistic(name); parts.put(name, created); return created;
     }
 
     /** What one statistic is about: which stage, and which part of its distribution. */

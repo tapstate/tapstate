@@ -54,10 +54,27 @@ public final class StageTimer {
      * statistics when there is a job to write into, and one that counts for nobody when there is not — a
      * processor driven by hand has no job, and asking for a statistic handle there fails outright.
      */
+    public enum Publication { PROCESSOR, WORKER }
+
     public static StageTimer of(Stage stage, Processor.Context context) {
+        return of(stage, context, Publication.PROCESSOR);
+    }
+
+    /**
+     * WORKER captures every thread-safe job handle in an owning processing callback, before dispatch. The accumulator still has one
+     * writer: one admitted worker, or sequential processor/close callbacks. Queue delay is not a unit.
+     * Timing never certifies native exit, publication completion or resource release.
+     */
+    public static StageTimer of(Stage stage, Processor.Context context, Publication publication) {
+        Objects.requireNonNull(publication, "publication");
         boolean inAJob = context != null && context.hazelcastInstance() != null;
-        return new StageTimer(stage, inAJob ? new JetStageGauge() : StageGauge.none(),
-                System::nanoTime, System.currentTimeMillis());
+        StageGauge gauge = StageGauge.none();
+        if (inAJob) {
+            var bound = new JetStageGauge(publication == Publication.WORKER);
+            if (publication == Publication.WORKER) bound.bind(stage, BOUNDS.buckets());
+            gauge = bound;
+        }
+        return new StageTimer(stage, gauge, System::nanoTime, System.currentTimeMillis());
     }
 
     /** A timer that counts and reports to nobody, for a processor not yet initialised. */

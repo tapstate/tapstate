@@ -265,6 +265,15 @@ final class RealProcessServer implements ServerHandle {
                 List.of(), stagingDirectory, extraArguments);
     }
 
+    /** Prepares native storage with its original JVM limits and no legacy operator database setting. */
+    static PreparedLaunch prepareNative(String configurationUri,String listenAddress,Path stagingDirectory,
+            IntFunction<List<String>> extraArguments) {
+        return prepare(configurationUri,null,bootJar(),listenAddress,List.of("-Xmx768m","-XX:ActiveProcessorCount=2"),stagingDirectory,extraArguments);
+    }
+    static PreparedLaunch prepareNative(String configurationUri,String listenAddress,IntFunction<List<String>> extraArguments) {
+        return prepareNative(configurationUri,listenAddress,null,extraArguments);
+    }
+
     /** The same, listening on {@code listenAddress}. See {@link #start(String, String, IntFunction)}. */
     static RealProcessServer launching(String storeUri, Path jar, String listenAddress,
             IntFunction<List<String>> extraArguments) {
@@ -332,10 +341,8 @@ final class RealProcessServer implements ServerHandle {
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,
             String listenAddress, List<String> jvmOptions, Path stagingDirectory,
             IntFunction<List<String>> extraArguments) {
-        try (PreparedLaunch prepared = prepare(storeUri, operatorStateDatabase, jar, listenAddress,
-                jvmOptions, stagingDirectory, extraArguments)) {
-            return prepared.launch();
-        }
+        return launching(storeUri, operatorStateDatabase, jar, listenAddress, jvmOptions, stagingDirectory,
+                extraArguments, null);
     }
 
     private static RealProcessServer launching(String storeUri, String operatorStateDatabase, Path jar,

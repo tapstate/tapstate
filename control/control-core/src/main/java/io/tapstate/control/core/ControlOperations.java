@@ -24,6 +24,7 @@ public final class ControlOperations {
     // Every operation is staged at the one stage this build ships at, on every face it is open on. The
     // stage is not part of these names on purpose: a name that spelled it would go stale the moment the
     // build moved on, and a per-face stage is what lets one face open a surface the rest do not.
+    private static final Map<Frontend, Maturity> REST_ONLY = Map.of(Frontend.REST, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_ONLY = Map.of(Frontend.CLI, Maturity.CURRENT);
     private static final Map<Frontend, Maturity> CLI_AND_MCP =
             Map.of(Frontend.CLI, Maturity.CURRENT, Frontend.MCP, Maturity.CURRENT);
@@ -36,6 +37,31 @@ public final class ControlOperations {
     public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
+
+    public static final Operation VALIDATION_EVALUATE = new Operation("validation.evaluate", Scope.WRITE, false, null,
+            "Evaluate direct full validation choices through independent connector metadata without saving or starting.", REST_ONLY);
+    public static final Operation VALIDATION_SAVE = new Operation("validation.save", Scope.WRITE, true, null,
+            "Reevaluate and save a direct full validation definition using the expected fingerprint and task revision.", REST_ONLY);
+    public static final Operation VALIDATION_START = new Operation("validation.start", Scope.WRITE, true, null,
+            "Start only the fixed full validation command and query uncertain original admission without redispatch.", REST_ONLY);
+    public static final Operation VALIDATION_PROGRESS = new Operation("validation.progress", Scope.READ, false, null,
+            "Read the original validation run without recreating missing execution handles.", REST_ONLY);
+    public static final Operation VALIDATION_STOP = new Operation("validation.stop", Scope.WRITE, true, null,
+            "Stop only the original full validation command without changing its schedule or the Pipeline.", REST_ONLY);
+    public static final Operation VALIDATION_SCHEDULE_DISABLE = new Operation("validation.schedule-disable", Scope.WRITE, true, null,
+            "Disable future scheduled validation through the original configuration CAS without querying connectors or stopping an admitted run.", REST_ONLY);
+    public static final Operation VALIDATION_HISTORY = new Operation("validation.history", Scope.READ, false, null,
+            "Read bounded full validation history without creating a run or a missing report.", REST_ONLY);
+    public static final Operation VALIDATION_REPORT = new Operation("validation.report", Scope.READ, false, null,
+            "Read one original full validation report with exact counts and its observation premise.", REST_ONLY);
+    public static final Operation VALIDATION_ROOTS = new Operation("validation.roots", Scope.READ, false, null,
+            "Read a bounded page of the original report root observations with explicit value types.", REST_ONLY);
+    public static final Operation VALIDATION_ROOT = new Operation("validation.root", Scope.READ, false, null,
+            "Read one retained root observation without truncating its exact values or claiming physical drain.", REST_ONLY);
+    public static final Operation VALIDATION_GET = new Operation("validation.get", Scope.READ, false, null,
+            "Read one saved full validation definition without allocating execution state.", REST_ONLY);
+    public static final Operation VALIDATION_SCHEDULE_PREVIEW = new Operation("validation.schedule-preview", Scope.READ, false, null,
+            "Preview five future full validation occurrences in the selected time zone.", REST_ONLY);
 
     // system domain
     public static final Operation SYSTEM_VERSION = new Operation(
@@ -384,6 +410,7 @@ public final class ControlOperations {
     public static final Operation TOKEN_LIST = new Operation("token.list", Scope.ADMIN, false, null, CLI_ONLY);
 
     private static final List<Operation> ALL = List.of(
+            VALIDATION_EVALUATE, VALIDATION_SAVE, VALIDATION_GET, VALIDATION_SCHEDULE_PREVIEW, VALIDATION_START, VALIDATION_PROGRESS, VALIDATION_STOP, VALIDATION_HISTORY, VALIDATION_REPORT, VALIDATION_ROOTS, VALIDATION_ROOT, VALIDATION_SCHEDULE_DISABLE,
             AI_PROVIDER_GET,
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,

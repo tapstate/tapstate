@@ -20,6 +20,10 @@ import java.util.Map;
         ControlAuthProperties.class, ConnectorPluginProperties.class})
 @Import({ClusterMembershipConfiguration.class, StorageHttpFace.class})
 class StorageRootConfiguration {
+    @Bean io.tapstate.core.validation.ValidationMetadataBudget validationMetadataBudget(){return new io.tapstate.core.validation.ValidationMetadataBudget();}
+    @Bean(destroyMethod = "close") ValidationMemberResources validationMemberResources(io.tapstate.core.validation.ValidationMetadataBudget budget) { return new ValidationMemberResources(budget); }
+    @Bean MemoryValidationSchedules memoryValidationSchedules(){return new MemoryValidationSchedules();}
+    @Bean(destroyMethod = "close") ValidationOwnerTimers validationOwnerTimers() { return new ValidationOwnerTimers(); }
     @Bean CloudRuntimeSettings cloudRuntimeSettings(CloudProperties properties, MongoProperties mongo, Environment environment) {
         var settings = CloudRuntimeSettings.resolve(properties, environment.getProperty("CLUSTER_ID"));
         if (settings.cloud() && !mongo.isEnabled())

@@ -172,6 +172,100 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return Optional.ofNullable(find(session, id)).map(this::decode);
     }
 
+    record Version(String kind, String hash) {}
+
+    /** Probe total stored bytes before materializing any selected resource body or decrypted secret. */
+    Optional<Map<String, String>> validationInputsInTransaction(ClientSession session, Map<String, String> expected) {
+        var headers = versionsInTransaction(session, expected.keySet());
+        if (!headers.keySet().equals(expected.keySet()) || headers.entrySet().stream().anyMatch(entry -> !entry.getValue().hash().equals(expected.get(entry.getKey()))))
+            return Optional.empty();
+        requireValidationInputSize(session,expected.keySet());
+        var requested = List.copyOf(expected.keySet());
+        var result = new LinkedHashMap<String, String>(); long characters = 0;
+        for (var collection : collections.values()) {
+            try (var rows = collection.find(session, new Document("_id", new Document("$in", requested))).batchSize(64).iterator()) {
+                while (rows.hasNext()) {
+                    var resource = decode(rows.next()); var canonical = WRITER.write(resource); characters += canonical.length();
+                    if (characters > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS) throw validationInputLimit();
+                    if (result.putIfAbsent(resource.id(), canonical) != null || !expected.get(resource.id()).equals(CanonicalHash.of(resource)))
+                        throw unreadable("validation", "input-version");
+                }
+            }
+        }
+        if (!result.keySet().equals(expected.keySet())) throw unreadable("validation", "input-snapshot");
+        return Optional.of(Map.copyOf(result));
+    }
+    /** Includes all bodies already retained by lazy discovery before decoding the next one. */
+    private void requireValidationInputSize(ClientSession session,java.util.Collection<String> ids){
+        var requested = List.copyOf(ids); long stored = 0;
+        for (var collection : collections.values()) {
+            var size = collection.aggregate(session, List.of(new Document("$match", new Document("_id", new Document("$in", requested))),
+                    new Document("$group", new Document("_id", null).append("bytes", new Document("$sum", new Document("$bsonSize", "$$ROOT")))))).first();
+            if (size != null) {
+                var number = size.get("bytes"); long bytes;
+                if (number instanceof Integer value) bytes = value; else if (number instanceof Long value) bytes = value; else throw unreadable("validation", "input-size");
+                if (bytes < 0 || bytes > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_STORED_BYTES - stored) throw validationInputLimit();
+                stored += bytes;
+            }
+        }
+    }
+
+    io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs validationDeclarationsInTransaction(ClientSession session,
+            io.tapstate.spi.store.ValidationTaskStore.Selection selection,long configurationRevision,java.util.UUID parentGeneration){
+        var hashes=new LinkedHashMap<String,String>();var canonical=new LinkedHashMap<String,String>();
+        var known=new LinkedHashMap<String,Resource>();var parser=new io.tapstate.core.dsl.DslParser();
+        var snapshot=new java.util.AbstractMap<String,Resource>(){
+            private long characters;
+            @Override public Resource get(Object key){
+                if(!(key instanceof String id))return null;
+                if(known.containsKey(id))return known.get(id);
+                if(hashes.size()==1024)throw validationInputLimit();
+                var header=versionsInTransaction(session,List.of(id)).get(id);if(header==null)return null;
+                hashes.put(id,header.hash());requireValidationInputSize(session,hashes.keySet());
+                var body=validationInputsInTransaction(session,Map.of(id,header.hash())).orElseThrow(()->unreadable("validation","input-snapshot")).get(id);
+                characters+=body.length();if(characters>io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS)throw validationInputLimit();
+                var resource=parser.parse(body);known.put(id,resource);canonical.put(id,body);return resource;
+            }
+            @Override public Set<Map.Entry<String,Resource>> entrySet(){throw new UnsupportedOperationException("selected discovery uses named lookup only");}
+        };
+        var resource=snapshot.get(selection.pipelineId());
+        if(!(resource instanceof PipelineResource pipeline))throw new TapstateException(io.tapstate.core.validation.ValidationError.INVALID_CONTRACT,
+                Map.of("field","selection.pipeline"),null);
+        var required=new java.util.LinkedHashSet<String>();required.add(pipeline.id());long traversal=0;
+        var defaults=io.tapstate.core.dsl.ValidationDeclarations.Limits.defaults();
+        for(var output:selection.outputIds()){
+            long remaining=8L*1024*1024-traversal;if(remaining<=0)throw validationInputLimit();
+            var inspection=io.tapstate.core.dsl.ValidationDeclarations.inspect(pipeline,snapshot,
+                    new io.tapstate.core.dsl.ValidationDeclarations.Output(io.tapstate.core.dsl.ValidationDeclarations.OutputKind.SYNC,output),
+                    new io.tapstate.core.dsl.ValidationDeclarations.Limits(defaults.nodes(),defaults.references(),defaults.routes(),defaults.depth(),Math.min(defaults.metadataBytes(),remaining)));
+            traversal+=inspection.accountedMetadataBytes();required.addAll(inspection.requiredResourceIds());
+        }
+        hashes.keySet().retainAll(required);canonical.keySet().retainAll(required);
+        return new io.tapstate.spi.store.ValidationTaskStore.DeclarationInputs(selection,configurationRevision,hashes,canonical,parentGeneration);
+    }
+
+    private static TapstateException validationInputLimit() {
+        return new TapstateException(io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED, Map.of("limit", "validation.configurationInputs"), null);
+    }
+
+    /** Header-only version checks in the caller's actual CONFIG transaction; no secret or body materialization. */
+    Map<String, Version> versionsInTransaction(ClientSession session, java.util.Collection<String> ids) {
+        if (ids.isEmpty() || ids.size() > 1024) throw unreadable("validation", "dependency-count");
+        var result = new LinkedHashMap<String, Version>(); var requested = List.copyOf(ids);
+        for (var entry : collections.entrySet()) {
+            try (var rows = entry.getValue().find(session, new Document("_id", new Document("$in", requested)))
+                    .projection(new Document("_id", 1).append("kind", 1).append("contentHash", 1)).batchSize(128).iterator()) {
+                while (rows.hasNext()) {
+                    var row = rows.next();
+                    if (!(row.get("_id") instanceof String id) || !entry.getKey().equals(row.get("kind"))
+                            || !(row.get("contentHash") instanceof String hash) || !hash.matches("[a-f0-9]{64}")) throw unreadable("validation", "dependency-version");
+                    if (result.putIfAbsent(id, new Version(entry.getKey(), hash)) != null) throw unreadable(id, "cross-kind-identity");
+                }
+            }
+        }
+        return Map.copyOf(result);
+    }
+
     /** A pending rebuild keeps its exact authoring dependencies; unrelated configuration remains writable. */
     private void requireRebuildDependenciesUnchanged(ClientSession session, Set<String> changed) {
         if (changed.isEmpty()) return;
@@ -307,7 +401,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             try (ClientSession session = client.startSession()) {
                 try {
                     return session.withTransaction(() -> {
-                        ConfigurationVersion.advance(session, versions);
+                        ConfigurationVersion.advance(session, versions, client);
                         return body.apply(session);
                     }, TRANSACTION);
                 } catch (Refused refused) {

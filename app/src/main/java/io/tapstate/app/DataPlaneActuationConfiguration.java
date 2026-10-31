@@ -139,9 +139,21 @@ class DataPlaneActuationConfiguration {
     }
 
     @Bean(destroyMethod = "close")
+    ValidationCaptureObservations validationCaptureObservations(HazelcastInstance hazelcastMember,
+            ClusterProperties clusterProperties) {
+        var local = hazelcastMember.getCluster().getLocalMember();
+        return new ValidationCaptureObservations(clusterProperties.getId(),
+                local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE),
+                local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE),
+                new ValidationCaptureObservations.Limits(8, new ValidationCaptureHintRegistry.Limits(8,
+                        512 * 1024, new ValidationCaptureHintTap.Limits(4096, 1, 1024 * 1024))));
+    }
+
+    @Bean(destroyMethod = "close")
     CaptureRunUnit captureRunUnit(CapturePort capturePort, SrsCoordinator srsCoordinator,
-            SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember) {
-        return new CaptureRunUnit(capturePort, srsCoordinator, srsMetaStore, hazelcastMember);
+            SrsMetaStore srsMetaStore, HazelcastInstance hazelcastMember,
+            ValidationCaptureObservations validationCaptureObservations) {
+        return new CaptureRunUnit(capturePort, srsCoordinator, srsMetaStore, hazelcastMember, validationCaptureObservations);
     }
 
     @Bean

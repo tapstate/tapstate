@@ -684,6 +684,30 @@ class MongoStorageBindingStoreIT {
     }
 
     @Test
+    void firstCreationSeparatesItsPureCacheGuardFromOriginalConfigurationAuthority() {
+        withPrepared(f -> {
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database.getName(), "find", "storage_binding")) {
+                var live = new java.util.concurrent.atomic.AtomicBoolean(true); var checks = new AtomicInteger();
+                var material = SystemCollections.CLUSTER_KEYS.on(f.database).find(new Document("_id", "cluster")).first().getString("material");
+                byte[] bytes = java.util.Base64.getUrlDecoder().decode(material);
+                SourceConfigCipher cipher;
+                try { cipher = new SourceConfigCipher(bytes); } finally { java.util.Arrays.fill(bytes, (byte) 0); }
+                var nativeBindings = new MongoStorageBindingStore(witness.client, witness.database, SourceConfigCipherProvider.fixed(cipher));
+                var guarded = nativeBindings.guardedBy(() -> {
+                    checks.incrementAndGet(); if (!live.get()) throw new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null);
+                });
+                var grant = guarded.commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master")).firstCreation().orElseThrow();
+                MongoStorageBindingStore.consumeFirst(grant, MongoStorageBindingStore.targetFingerprint(CACHE));
+                int reads = witness.confirmedCommands(); int before = checks.get();
+                MongoStorageBindingStore.requireFirstLocal(grant);
+                assertThat(checks.get()).isGreaterThan(before); assertThat(witness.confirmedCommands()).isEqualTo(reads);
+                grant.requireActive(); assertThat(witness.confirmedCommands()).isGreaterThan(reads);
+                live.set(false); assertThatThrownBy(() -> MongoStorageBindingStore.requireFirstLocal(grant)).satisfies(MongoStorageBindingStoreIT::refused);
+            }
+        });
+    }
+
+    @Test
     void aLostInvocationBeforeAnyCacheWriteCannotBeReissuedAndAuthRecoveryDoesNotCreateBusiness() {
         withPrepared(f -> {
             String name = f.database.getName() + "_cache";

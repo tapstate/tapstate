@@ -6,6 +6,8 @@ import io.tapstate.spi.store.WorkloadClaimFence;
 import java.io.Serializable;
 import java.util.List;
 import java.util.Map;
+import java.util.LinkedHashMap;
+import java.util.Collections;
 
 /**
  * Resolves, on the member it runs on, the {@link SinkAck} a sink advances its durable watermark through. It
@@ -19,6 +21,26 @@ import java.util.Map;
  */
 @FunctionalInterface
 public interface SinkAckFactory extends Serializable {
+
+    /** Exact compiled writers by source stream and terminal output vertex, including zero-row writers. */
+    record RunWriters(Map<String, List<String>> byStream, Map<String, Map<String, List<String>>> byOutput) implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public RunWriters {
+            byStream = copy(byStream);
+            var outputs = new LinkedHashMap<String, Map<String, List<String>>>();
+            byOutput.forEach((output, streams) -> outputs.put(output, copy(streams)));
+            byOutput = Collections.unmodifiableMap(outputs);
+        }
+        private static Map<String, List<String>> copy(Map<String, List<String>> original) {
+            var result = new LinkedHashMap<String, List<String>>(); original.forEach((stream, writers) -> result.put(stream, List.copyOf(writers)));
+            return Collections.unmodifiableMap(result);
+        }
+    }
+    /** Actual Jet attempt, independent of the Pipeline's durable actuation/recovery coordinates. */
+    record ExecutionWriters(long jobId, long executionId, RunWriters writers) implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public ExecutionWriters { java.util.Objects.requireNonNull(writers); }
+    }
 
     /** A factory that resolves to an ack that records nothing - the default when no store is bound. */
     SinkAckFactory NONE = member -> (chain, srcpos) -> { };
@@ -49,6 +71,12 @@ public interface SinkAckFactory extends Serializable {
             WorkloadClaimFence fence) {
         beginRun(coordinator, writersByChain);
     }
+
+    /** Full actual roster; older acknowledgements retain their original stream/fence behavior. */
+    default void beginRun(HazelcastInstance coordinator, RunWriters writers) { beginRun(coordinator, writers.byStream()); }
+    default void beginRun(HazelcastInstance coordinator, RunWriters writers, WorkloadClaimFence fence) { beginRun(coordinator, writers.byStream(), fence); }
+    default void beginRun(HazelcastInstance coordinator, ExecutionWriters execution) { beginRun(coordinator, execution.writers()); }
+    default void beginRun(HazelcastInstance coordinator, ExecutionWriters execution, WorkloadClaimFence fence) { beginRun(coordinator, execution.writers(), fence); }
 
     /**
      * Resolves, on {@code member}, how the loads a source's changes wait for stand, read from the same durable

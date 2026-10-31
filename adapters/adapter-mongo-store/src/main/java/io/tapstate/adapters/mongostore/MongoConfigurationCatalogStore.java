@@ -56,7 +56,7 @@ final class MongoConfigurationCatalogStore implements CatalogStore {
             StoreIo.run(id, () -> {
                 try (var session = client.startSession()) {
                     session.withTransaction(() -> {
-                        ConfigurationVersion.advance(session, versions);
+                        ConfigurationVersion.advance(session, versions, client);
                         SourceConfigCipher cipher = ciphers.currentForWrite();
                         if (ciphers.requiresWriteFence()
                                 && !ciphers.fenceWrite(new SourceConfigWriteScope(session), cipher.activeKeyId())) {

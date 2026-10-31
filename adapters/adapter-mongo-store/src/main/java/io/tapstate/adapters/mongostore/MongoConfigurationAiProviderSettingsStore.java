@@ -62,7 +62,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         size(captured);
         transaction(session -> {
             var previous = original(session, owner, cipher);
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             if (!keys.fenceWrite(new SourceConfigWriteScope(session), cipher.activeKeyId())) throw invalid("key");
             var rows = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database);
             if (previous.isEmpty()) rows.insertOne(session, new Document(captured));
@@ -77,7 +77,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         transaction(session -> {
             var cipher = keys.currentForWrite();
             var previous = original(session, owner, cipher);
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             if (!keys.fenceWrite(new SourceConfigWriteScope(session), cipher.activeKeyId())) throw invalid("key");
             if (previous.isPresent()) SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database)
                     .deleteOne(session, new Document("_id", MongoAiProviderSettingsStore.id(owner)));
@@ -90,9 +90,14 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         if (identity == null || !cluster.equals(identity.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId")))
             throw invalid("identity");
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-        if (schema == null || !Integer.valueOf(2).equals(schema.get("installedVersion")))
+        if (schema == null || !Integer.valueOf(2).equals(schema.get("installedVersion"))
+                && !Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))
+                || Integer.valueOf(2).equals(schema.get("installedVersion")) && schema.containsKey("validation"))
             throw new TapstateException(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED,
                     Map.of("required", "2"), null);
+        if (Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion")))
+            MongoValidationSchema.requireReady(database, true);
+        else MongoValidationSchema.configurationHasValidation(database, schema);
         ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database));
         structure();
         var found = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database).find(session).limit(2).into(new ArrayList<>());
@@ -104,6 +109,10 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
     }
 
     private void structure() {
+        verifyStructure(database);
+    }
+
+    static void verifyStructure(MongoDatabase database) {
         if (!database.listCollectionNames().into(new ArrayList<>()).contains("ai_provider_settings")) throw invalid("collection");
         var indexes = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database).listIndexes().into(new ArrayList<>());
         if (indexes.size() != 1 || !"_id_".equals(indexes.getFirst().get("name"))

@@ -119,7 +119,23 @@ class HazelcastConfiguration {
                 membershipGate, bootId, storePorts, membershipStores, Hazelcast::newHazelcastInstance);
     }
 
-    /** Constructs the member through the same orchestration with a controllable factory. */
+    /** The member factory controls construction without changing the storage or lease protocol. */
+    HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
+            ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
+            @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
+            @Nullable KeyedStateStore nestStateStore, NestSettings nestSettings,
+            @Nullable NestDeadLetterStore nestDeadLetterStore,
+            @Nullable OperatorStateStores operatorStateStores, @Nullable SrsLogStore srsLogStore,
+            ObjectProvider<ClusterIdentityStore> clusterIdentities,
+            ObjectProvider<WorkloadClaimStore> workloadClaims,
+            ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts, Function<Config, HazelcastInstance> memberFactory) {
+        return hazelcastMember(properties, clusterProperties, controlProperties, srsMetaStore,
+                connectorProvisioner, snapshotBuffer, nestStateStore, nestSettings, nestDeadLetterStore,
+                operatorStateStores, srsLogStore, clusterIdentities, workloadClaims,
+                membershipGate, bootId, storePorts,
+                new org.springframework.beans.factory.support.StaticListableBeanFactory().getBeanProvider(ClusterMembershipStore.class), memberFactory);
+    }
+
     HazelcastInstance hazelcastMember(HazelcastProperties properties, ClusterProperties clusterProperties,
             ControlEndpointProperties controlProperties, @Nullable SrsMetaStore srsMetaStore,
             @Nullable ConnectorProvisioner connectorProvisioner, @Nullable SnapshotBuffer snapshotBuffer,
@@ -129,10 +145,8 @@ class HazelcastConfiguration {
             ObjectProvider<ClusterIdentityStore> clusterIdentities,
             ObjectProvider<WorkloadClaimStore> workloadClaims,
             ClusterMembershipGate membershipGate, BootId bootId, ObjectProvider<StorePort> storePorts,
-            ObjectProvider<ClusterMembershipStore> membershipStores,
-            Function<Config, HazelcastInstance> memberFactory) {
-        ClusterMemberPreflight.Identity identity =
-                ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
+            ObjectProvider<ClusterMembershipStore> membershipStores, Function<Config, HazelcastInstance> memberFactory) {
+        ClusterMemberPreflight.Identity identity = ClusterMemberPreflight.validate(properties, clusterProperties, controlProperties);
         warnAboutClusterProfile(clusterProperties);
         WorkloadClaimStore claimStore = workloadClaims.getIfAvailable();
         ClusterIdentityStore identityStore = clusterIdentities.getIfAvailable();
@@ -141,7 +155,7 @@ class HazelcastConfiguration {
             identity = ClusterMemberPreflight.singleIdentity(clusterProperties, identityStore, membershipStores.getIfAvailable());
         }
         long sessionAskedAt = System.nanoTime();
-        NodeSessionStartup startup;
+        NodeSessionStartup startup = null;
         if (identity != null) {
             try {
                 identity = clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE
@@ -150,21 +164,19 @@ class HazelcastConfiguration {
                 if (clusterProperties.getProfile() == ClusterProperties.Profile.SINGLE) membershipGate.bindSingle(identity.nodeSession());
                 startup = new NodeSessionStartup(claimStore, identity.nodeSession(), sessionAskedAt,
                         clusterProperties.getNodeSessionTtl(), clusterProperties.getNodeSessionRenewInterval());
-            } catch (RuntimeException startupFailure) {
+            } catch (RuntimeException | Error failure) {
                 if (identity.nodeSession() != null && claimStore != null) {
-                    try {
-                        claimStore.release(identity.nodeSession());
-                    } catch (RuntimeException cleanupFailure) {
-                        if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                    try { claimStore.release(identity.nodeSession()); }
+                    catch (RuntimeException | Error cleanup) {
+                        if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                        if (cleanup != failure) failure.addSuppressed(cleanup);
                     }
-
                 }
-                throw startupFailure;
+                throw failure;
             }
-        } else {
-            startup = null;
         }
         HazelcastInstance member;
+        var candidate = new java.util.concurrent.atomic.AtomicReference<HazelcastInstance>();
         try {
             Config config = memberConfig(properties, nestStateStore, nestSettings, srsLogStore);
             if (identity != null) {
@@ -179,9 +191,10 @@ class HazelcastConfiguration {
             MemberStorage storage = nativeStorage == null ? null : nativeStorage.getIfAvailable();
             if (storage != null) {
                 if (identity == null) throw ThreeLayerStorePort.refused();
-                storage.prepare(config, identity.nodeSession(), sessionAskedAt);
+                storage.prepare(config, identity.nodeSession(), sessionAskedAt, startup.lease());
             }
             member = startMember(() -> memberFactory.apply(config));
+            candidate.set(member);
             if (startup != null) {
                 startup.handOff(member);
                 member.getUserContext().put(NODE_SESSION_LEASE_CONTEXT_KEY, startup.lease());
@@ -290,15 +303,22 @@ class HazelcastConfiguration {
                 DurableNestDeadLetter.bindTo(member, nestDeadLetterStore);
             }
             return member;
-        } catch (RuntimeException | Error startupFailure) {
+        } catch (RuntimeException | Error failure) {
             if (startup != null) {
-                try {
-                    startup.abort();
-                } catch (RuntimeException | Error cleanupFailure) {
-                    if (cleanupFailure != startupFailure) startupFailure.addSuppressed(cleanupFailure);
+                try { startup.abort(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
                 }
             }
-            throw startupFailure;
+            if (candidate.get() != null && candidate.get().getLifecycleService().isRunning()) {
+                try { candidate.get().shutdown(); }
+                catch (RuntimeException | Error cleanup) {
+                    if (cleanup instanceof Error fatal && !(failure instanceof Error)) { fatal.addSuppressed(failure); throw fatal; }
+                    if (cleanup != failure) failure.addSuppressed(cleanup);
+                }
+            }
+            throw failure;
         }
     }
 
@@ -614,6 +634,14 @@ class HazelcastConfiguration {
             }
         }
         config.getJetConfig().setEnabled(true);
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationOwnerRouter.EXECUTOR)
+                .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationPipelineInitials.EXECUTOR)
+                .setPoolSize(4).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationPipelineInitials.LOOKUP_EXECUTOR)
+                .setPoolSize(2).setQueueCapacity(64).setStatisticsEnabled(true));
+        config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(NativeValidationCaptureRoutes.EXECUTOR)
+                .setPoolSize(2).setQueueCapacity(32).setStatisticsEnabled(true));
         Integer cooperativeThreads = properties.getJet().getCooperativeThreadCount();
         if (cooperativeThreads != null) {
             config.getJetConfig().setCooperativeThreadCount(cooperativeThreads);

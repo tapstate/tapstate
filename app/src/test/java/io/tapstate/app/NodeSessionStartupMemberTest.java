@@ -127,8 +127,13 @@ class NodeSessionStartupMemberTest {
             return delegate.acquire(key, owner, revision, ttl);
         }
         @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
-            renewals.incrementAndGet();
-            return refuse.get() ? Optional.empty() : delegate.renew(expected, ttl);
+            Optional<WorkloadClaim> renewed = refuse.get() ? Optional.empty() : delegate.renew(expected, ttl);
+            renewed.ifPresent(current -> {
+                assertThat(current.owner()).isEqualTo(expected.owner());
+                assertThat(current.claimGeneration()).isEqualTo(expected.claimGeneration());
+                renewals.incrementAndGet();
+            });
+            return renewed;
         }
         @Override public boolean release(WorkloadClaim expected) {
             releases.incrementAndGet();

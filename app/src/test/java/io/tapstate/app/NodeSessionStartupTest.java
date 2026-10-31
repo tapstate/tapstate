@@ -38,7 +38,7 @@ import static org.awaitility.Awaitility.await;
 class NodeSessionStartupTest {
 
     @Test
-    void aLeaseConstructionFailureReleasesTheReservedSession() {
+    void aLeaseConstructionFailureReleasesTheReservedNodeClaim() {
         assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), null))
                 .isInstanceOf(IllegalArgumentException.class);
     }
@@ -50,7 +50,7 @@ class NodeSessionStartupTest {
     }
 
     @Test
-    void cleanupPreservesTheConstructionFailure() {
+    void cleanupStillReleasesTheNodeClaimAndPreservesTheConstructionFailure() {
         IllegalStateException releaseFailure = new IllegalStateException("owned release failure");
         assertThat(failLeaseConstruction(Duration.ofSeconds(5), Duration.ofNanos(500_000), releaseFailure))
                 .isInstanceOf(IllegalArgumentException.class).hasSuppressedException(releaseFailure);
@@ -348,8 +348,9 @@ class NodeSessionStartupTest {
 
         @Override
         public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
-            if (factoryRunning.get()) renewedDuringFactory.countDown();
-            return refuseRenewals.get() ? Optional.empty() : delegate.renew(expected, ttl);
+            var renewed = refuseRenewals.get() ? Optional.<WorkloadClaim>empty() : delegate.renew(expected, ttl);
+            if (renewed.isPresent() && factoryRunning.get()) renewedDuringFactory.countDown();
+            return renewed;
         }
 
         @Override

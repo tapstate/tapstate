@@ -218,6 +218,8 @@ public final class Engine {
             this.originalManifest = originalManifest;
         }
         public long jobId() { return job.getId(); }
+        /** Original Job metadata only; no processor, reader or commit completion is inferred. */
+        public JobStatus status(){return job.getStatus();}
         public OperatorRunManifest operatorManifest() {
             if (originalManifest == null || !identity.equals(originalManifest.executionIdentity())
                     || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
