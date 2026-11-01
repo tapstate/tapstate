@@ -77,6 +77,40 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
+    @Test void aPendingRootStartWaitsForItsOwnForegroundAndMaintenanceBodiesToExit()throws Exception {
+        var reached=new CountDownLatch(1);var proceed=new CountDownLatch(1);var returned=new CountDownLatch(1);
+        var maintenanceEntered=new CountDownLatch(1);var maintenanceExit=new CountDownLatch(1);
+        var result=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
+        try(var f=new Fixture()){
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var local=new ValidationOwnerRouter.Local(){
+                @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request request){
+                    reached.countDown();try{assertThat(proceed.await(5,TimeUnit.SECONDS)).isTrue();var value=f.owners.reserve(request);result.set(value);return value;}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}finally{returned.countDown();}
+                }
+                @Override public ValidationOwnerRouter.LocalReceipt receipt(ValidationOwnerRouter.Request request){return f.owners.receipt(request);}
+            };
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,local,
+                    command->ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null),()->{},Duration.ofSeconds(5),System::nanoTime,f.owners::readPreparedOwner);
+                var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,f.resources,f.process,()->{})){
+                var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow","task",f.task.generation(),2,1,UUID.randomUUID());
+                try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.PENDING);}
+                assertThat(reached.await(3,TimeUnit.SECONDS)).isTrue();
+                try(var maintenance=f.resources.admitMaintenanceControl()){
+                    maintenance.execute(()->{maintenanceEntered.countDown();try{assertThat(maintenanceExit.await(5,TimeUnit.SECONDS)).isTrue();f.tasks.read("flow","task");}
+                        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}});
+                    assertThat(maintenanceEntered.await(2,TimeUnit.SECONDS)).isTrue();
+                    try(var progress=coordinator.read(op)){
+                        assertThat(progress.value().original()).isEqualTo(op);assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(3);proceed.countDown();
+                        assertThat(returned.await(1,TimeUnit.SECONDS)).as("A pending original must not become a disposed metadata refusal before its own paid responses return").isFalse();
+                    }finally{maintenanceExit.countDown();}
+                }
+                assertThat(returned.await(3,TimeUnit.SECONDS)).isTrue();assertThat(result.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+                assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
+            }
+        }finally{proceed.countDown();maintenanceExit.countDown();}
+    }
+
     @Test void preparedOwnerObservationDoesNotPrepareOrWriteEitherStorageDomain() {
         try(var f=new Fixture()){
             f.owners.readOwner("flow");

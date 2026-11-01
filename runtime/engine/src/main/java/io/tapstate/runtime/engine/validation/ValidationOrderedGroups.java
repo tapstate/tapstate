@@ -117,7 +117,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             lookahead = null;
             previous = null;
             Group leased = outstanding;
-            if (leased != null) leased.close();
+            if (leased != null) leased.closeIfOwned();
             try { close(); }
             catch (RuntimeException | Error cleanup) {
                 failure.record(cleanup);
@@ -125,6 +125,15 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             }
             throwFailure();
             throw stopped;
+        }
+    }
+
+    /** The merge takes a returned group before publishing it in its own pending slot. */
+    void handOff(Group group){
+        synchronized(group){
+            checkActive();
+            if(outstanding!=group||group.isClosed()||group.handedOff)throw new IllegalStateException("validation group handoff is not original");
+            group.handedOff=true;
         }
     }
 
@@ -187,7 +196,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     @Override public void close() {
         if (!closed.compareAndSet(false, true)) return;
         Group group = outstanding;
-        if (group != null) group.close();
+        if (group != null) group.closeIfOwned();
         lookahead = null;
         previous = null;
         try { input.close(); }
@@ -202,6 +211,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     public static final class Group implements AutoCloseable {
         private final AtomicReference<Sample> sample;
         private final long occurrences;
+        private boolean handedOff;
 
         private Group(Sample sample, long occurrences) {
             this.sample = new AtomicReference<>(sample);
@@ -219,6 +229,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             return retained;
         }
 
-        @Override public void close() { sample.set(null); }
+        private synchronized void closeIfOwned(){if(!handedOff)close();}
+        @Override public synchronized void close() { sample.set(null); }
     }
 }

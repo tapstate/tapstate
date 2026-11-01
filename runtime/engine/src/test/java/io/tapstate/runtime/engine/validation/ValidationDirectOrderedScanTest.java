@@ -77,6 +77,28 @@ class ValidationDirectOrderedScanTest {
         assertThatThrownBy(()->borrowed.get().state()).isInstanceOf(IllegalStateException.class);
     }
 
+    @Test void stoppingAfterPairDeliveryKeepsTheBorrowedSampleUntilTheConsumerExits()throws Exception{
+        var f=new Fixture();var source=new Rows(3);var target=new Rows(3);var writes=new AtomicInteger();
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
+        var borrowed=new AtomicReference<ValidationOrderedMerge.Pair>();var group=new AtomicReference<ValidationOrderedGroups.Group>();
+        var mapping=ValidationFullScan.Mapping.paired("mapping",guard->merge(source,target),(observation,pair,guard)->{
+            borrowed.set(pair);group.set(pair.source().orElseThrow());entered.countDown();
+            try{assertThat(resume.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+            assertThat(pair.source().orElseThrow()).isSameAs(group.get());group.get().key();group.get().sampleValues();group.get().occurrences();
+            guard.run();throw new AssertionError("a stopped borrowed pair cannot publish");
+        });
+        var scan=new ValidationFullScan(f.identity,f.spec,List.of(mapping),()->{},result->writes.incrementAndGet());
+        var result=new java.util.concurrent.FutureTask<Void>(()->{scan.run();return null;});var consumer=Thread.ofPlatform().daemon().start(result);
+        try{
+            assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();scan.cancel();scan.closeActive();resume.countDown();
+            var failed=catchThrowable(()->result.get(3,java.util.concurrent.TimeUnit.SECONDS));assertThat(failed).isInstanceOf(java.util.concurrent.ExecutionException.class);
+            assertThat(failed.getCause()).isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(ValidationError.EXECUTION_CANCELLED));
+            assertThat(scan.complete()).isFalse();assertThat(writes).hasValue(0);assertThat(source.closed&&target.closed).isTrue();
+            assertThat(group.get().isClosed()).isTrue();assertThatThrownBy(()->borrowed.get().state()).isInstanceOf(IllegalStateException.class);
+        }finally{resume.countDown();consumer.join(3000);}
+    }
+
     @Test void aLateTailFailureOrUnknownPublicationNeverCompletesTheMapping(){
         for(boolean tailFailure:List.of(true,false)){
             var f=new Fixture();var source=new Rows(4);var target=new Rows(4);var writes=new AtomicInteger();

@@ -156,7 +156,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                         if(operation.quotaMetadata!=null){borrowed=current;borrowedGeneration=current.countingGeneration;frames=1;}
                     }
                 }
-                var metadata=resources.admitRetainedMetadata(frames);operation.metadata=metadata.getFirst();
+                var metadata=resources.admitRetainedMetadataAfterControls(frames,Math.max(1,HANDOFF_NANOS-(handoffClock.getAsLong()-operation.created)),NativeValidationOwnerReservations.this::requireActive,operation.cancelled::get);operation.metadata=metadata.getFirst();
                 if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
                 var task = task(request); var definitions = configuration.validationTasks(NativeValidationOwnerReservations.this::requireActive);
                 var inputs = definitions.inputs(task, request.configurationRevision());
@@ -643,7 +643,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         @Override public void close() {
             Runnable callback;
             synchronized (this) {
-                cancelled.set(true); callback = activated && stopSignalled.compareAndSet(false, true) ? stop : null;
+                cancelled.set(true);resources.wakeMetadataWaiters(); callback = activated && stopSignalled.compareAndSet(false, true) ? stop : null;
             }
             if (callback != null) callback.run(); else disposeUnused();
         }
@@ -682,7 +682,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     }
     boolean closed(){return closed;}
     @Override public void close() {
-        if (closed) return; closed = true; expiry.cancel(false); member.getUserContext().remove(CONTEXT, this);
+        if (closed) return; closed = true;resources.wakeMetadataWaiters(); expiry.cancel(false); member.getUserContext().remove(CONTEXT, this);
         var failures = new ValidationFailureLatch();
         for (var pipeline : pipelines.values()) {
             for (var entry : pipeline.operations.values()) attempt(failures, entry::close);

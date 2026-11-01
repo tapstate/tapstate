@@ -219,7 +219,7 @@ final class NativeValidationRuns implements AutoCloseable {
             shared=NativeValidationRuns.this.shared(this);shared.quota.joined(original,this::requireRun,lifecycle::stop);shared.members.add(original.identity());
         }
         @Override public void requireOwner(){reservation.requireOwner();}
-        @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw invalid("runs.publicationClosed");}
+        @Override public void requireRun(){reservation.requireReserved();if(sealed.get())throw cancelled(original.identity());}
         @Override public void sealPublication(){sealed.set(true);var queue=candidates;if(queue!=null)queue.close();var value=shared;if(value!=null)value.quota.seal(original.identity());}
         private void applySavedDelay(){
             var saved=reservation.savedTask();var originalStart=original.admission();
@@ -324,7 +324,7 @@ final class NativeValidationRuns implements AutoCloseable {
             ValidationResultStore.Publication answer=null;var failure=new ValidationFailureLatch();
             try{actor.requireRun();answer=actor.reservation.access().results().publish(write);}
             catch(RuntimeException|Error failed){failure.record(failed);}
-            finally{try{release();}catch(RuntimeException|Error cleanup){failure.record(cleanup);}}
+            finally{try{release();}catch(RuntimeException|Error cleanup){failure.record(cleanup);ValidationFailureLatch.addContext(failure.get(),cleanup);}}
             if(failure.get()==null)result.complete(answer);else result.completeExceptionally(failure.get());
             if(failure.get() instanceof Error fatal)throw fatal;
         }

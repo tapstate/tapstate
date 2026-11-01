@@ -68,6 +68,16 @@ final class ValidationMemberResources implements AutoCloseable {
             try{require();return leases.stream().map(Metadata::new).toList();}
             catch(RuntimeException|Error failed){leases.forEach(io.tapstate.core.validation.ValidationMetadataBudget.Lease::close);throw failed;}
         }
+        List<Metadata> admitRetainedMetadataAfterControls(int frames,long timeoutNanos,Runnable active,java.util.function.BooleanSupplier cancelled){
+            require();
+            // A waiting receiver keeps its own bounded worker allocation, even for a remote entry.
+            try(var waiting=reserve(new ValidationLocalBudget.Amount(64L*1024,1,0,0),0)){
+                var leases=metadata.acquireRetainedBundleAfterControls(this,frames,timeoutNanos,()->{require();active.run();if(cancelled.getAsBoolean())throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",state.key.node()),null);});
+                try{require();return leases.stream().map(Metadata::new).toList();}
+                catch(RuntimeException|Error failed){leases.forEach(io.tapstate.core.validation.ValidationMetadataBudget.Lease::close);throw failed;}
+            }catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",state.key.node()),interrupted);}
+        }
+        void wakeMetadataWaiters(){metadata.wakeWaiters();}
         Metadata admitWorkMetadata(){
             require();var lease=metadata.acquireWork(this);
             try{require();return new Metadata(lease);}catch(RuntimeException|Error failed){lease.close();throw failed;}
@@ -127,7 +137,7 @@ final class ValidationMemberResources implements AutoCloseable {
         Snapshot snapshot() { synchronized (ValidationMemberResources.this) { return new Snapshot(state.budget.snapshot(), reserved, processors, processorCapacity, metadata.inUse()); } }
         private void require() { if (closed || retired) throw invalid("resources.contextClosed"); active.run(); }
         private ValidationMemberResources process(){return ValidationMemberResources.this;}
-        @Override public void close() { retired = true; }
+        @Override public void close() { retired = true;metadata.wakeWaiters(); }
     }
 
     /** Local envelope comes before durable owner acquisition; no invented owner identity is needed. */
@@ -416,9 +426,9 @@ final class ValidationMemberResources implements AutoCloseable {
     }
 
     private final class State {
-        final int cooperativeThreads; final ValidationLocalBudget budget; int processors;
+        final Key key;final int cooperativeThreads; final ValidationLocalBudget budget; int processors;
         State(Key key, int cooperativeThreads) {
-            this.cooperativeThreads = cooperativeThreads;
+            this.key=key;this.cooperativeThreads = cooperativeThreads;
             budget = new ValidationLocalBudget(key.cluster, key.node, key.boot, CAPACITY, 128, () -> {
                 if (closed) throw invalid("resources.processClosed");
             });
@@ -471,7 +481,7 @@ final class ValidationMemberResources implements AutoCloseable {
     @Override public void close() {
         List<State> retiring;List<Probe> originals;
         synchronized (this) { if (closed) return; closed = true; retiring = List.copyOf(members.values());originals=List.copyOf(probes); }
-        retiring.forEach(state -> state.budget.close());
+        metadata.wakeWaiters();retiring.forEach(state -> state.budget.close());
         // Original metadata handles still need bounded retry dispatch after native pool shutdown.
         originals.forEach(Probe::close);
         // Queued wrappers still run/exit their own original bodies. Removing them would lose ownership.

@@ -11,6 +11,49 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void deferredMetadataRetirementAndCancellationReturnTheWaitingWorkerWithoutReturningOtherFrames()throws Exception{
+        for(String ending:List.of("member","process","cancel")){
+            var budget=new ValidationMetadataBudget();var cancelled=new AtomicBoolean();
+            try(var process=new ValidationMemberResources(budget)){
+                var member=process.bind("cluster","node","boot",4,()->{});
+                try(var first=member.admitMetadata();var second=member.admitMetadata();var third=member.admitMetadata()){
+                    var result=new FutureTask<>(()->member.admitRetainedMetadataAfterControls(2,TimeUnit.SECONDS.toNanos(3),()->{},cancelled::get));
+                    var waiter=Thread.ofPlatform().daemon().start(result);
+                    try{
+                        awaitMetadataWait(waiter);assertThat(member.snapshot().processReserved()).isEqualTo(new ValidationLocalBudget.Amount(64L*1024,1,0,0));
+                        if(ending.equals("member"))member.close();else if(ending.equals("process"))process.close();else{cancelled.set(true);member.wakeMetadataWaiters();}
+                        var failed=catchThrowable(()->result.get(2,TimeUnit.SECONDS));assertThat(failed).isInstanceOf(ExecutionException.class).hasCauseInstanceOf(TapstateException.class);
+                        if(ending.equals("cancel"))assertThat(((TapstateException)failed.getCause()).code()).isEqualTo(ValidationError.EXECUTION_CANCELLED);
+                        assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().metadataFrames()).isEqualTo(3);
+                        try(var fourth=budget.acquire(new Object())){assertThat(budget.inUse()).isEqualTo(4);}
+                    }finally{waiter.interrupt();waiter.join(2000);}
+                }
+                assertThat(budget.inUse()).isZero();
+            }
+        }
+    }
+    @Test void aFailureAfterDeferredGrantReturnsItsWholeBundleAndWaitingWorker()throws Exception{
+        var budget=new ValidationMetadataBudget();var rejectGrant=new AtomicBoolean();var fatal=new AssertionError("original context failed after grant");
+        try(var process=new ValidationMemberResources(budget)){
+            var member=process.bind("cluster","node","boot",4,()->{if(rejectGrant.get()&&budget.inUse()==4)throw fatal;});
+            try(var first=member.admitMetadata();var second=member.admitMetadata();var third=member.admitMetadata()){
+                var result=new FutureTask<>(()->member.admitRetainedMetadataAfterControls(2,TimeUnit.SECONDS.toNanos(3),()->{},()->false));
+                var waiter=Thread.ofPlatform().daemon().start(result);
+                try{
+                    awaitMetadataWait(waiter);rejectGrant.set(true);third.close();
+                    var failed=catchThrowable(()->result.get(2,TimeUnit.SECONDS));assertThat(failed).isInstanceOf(ExecutionException.class);assertThat(failed.getCause()).isSameAs(fatal);
+                    assertThat(member.snapshot().metadataFrames()).isEqualTo(2);assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
+                    try(var thirdAgain=budget.acquire(new Object());var fourth=budget.acquire(new Object())){assertThat(budget.inUse()).isEqualTo(4);}
+                }finally{waiter.interrupt();waiter.join(2000);}
+            }
+            assertThat(budget.inUse()).isZero();
+        }
+    }
+    private static void awaitMetadataWait(Thread waiter)throws Exception{
+        long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(2);
+        while(waiter.getState()!=Thread.State.TIMED_WAITING&&waiter.isAlive()&&System.nanoTime()-deadline<0)TimeUnit.MILLISECONDS.sleep(1);
+        assertThat(waiter.getState()).isEqualTo(Thread.State.TIMED_WAITING);
+    }
     @Test void pendingMetadataReferencesReturnExactlyOnceAndNeverResurrectAfterFinalRelease() {
         try(var process=new ValidationMemberResources()) {
             var member=process.bind("cluster","node","boot",4,()->{});

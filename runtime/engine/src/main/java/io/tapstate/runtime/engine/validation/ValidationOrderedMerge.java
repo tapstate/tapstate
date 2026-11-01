@@ -38,6 +38,7 @@ public final class ValidationOrderedMerge implements AutoCloseable {
             synchronized (stateLock) {
                 checkActive();
                 if (outstanding != null && !outstanding.released.get()) {
+                    outstanding.close();outstanding=null;
                     throw new IllegalStateException("close the current validation pair before advancing");
                 }
                 outstanding = null;
@@ -74,9 +75,11 @@ public final class ValidationOrderedMerge implements AutoCloseable {
             if (fromSource ? sourcePending != null || sourceEof : targetPending != null || targetEof) return;
         }
         // Never hold the ownership lock while waiting for I/O; close must be able to cancel it.
-        ValidationOrderedGroups.Group fetched = (fromSource ? source : target).next().orElse(null);
+        var input=fromSource?source:target;
+        ValidationOrderedGroups.Group fetched = input.next().orElse(null);
         boolean transferred = false;
         try {
+            if(fetched!=null)input.handOff(fetched);
             synchronized (stateLock) {
                 checkActive();
                 if (fromSource) {
@@ -106,16 +109,18 @@ public final class ValidationOrderedMerge implements AutoCloseable {
     }
 
     @Override public void close() {
-        Pair leased;
+        ValidationOrderedGroups.Group sourceLeased,targetLeased;
         synchronized (stateLock) {
             if (closed) return;
             closed = true;
-            leased = outstanding;
+            sourceLeased=sourcePending;targetLeased=targetPending;
             outstanding = null;
             sourcePending = null;
             targetPending = null;
         }
-        if (leased != null) leased.close();
+        // A returned pair belongs to its consumer until that consumer exits. Only pending groups
+        // still belong to this merge; closing upstream readers must not invalidate borrowed samples.
+        if(sourceLeased!=null)sourceLeased.close();if(targetLeased!=null)targetLeased.close();
         boolean cleanupFailed = false;
         try { source.close(); }
         catch (RuntimeException | Error problem) {

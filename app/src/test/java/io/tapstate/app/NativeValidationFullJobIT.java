@@ -47,6 +47,82 @@ class NativeValidationFullJobIT {
             assertThat(job.getConfig().getInitialSnapshotName()).isNull();
         }
     }
+    @Test void aQueuedRootPublicationReleasedAfterStopRemainsCancellationWithoutAnExecutionFault()throws Exception{queuedPublicationAfterStop(null);}
+    @Test void anOrdinaryPublicationPayloadCleanupFailureSurvivesStopAndMirroring()throws Exception{queuedPublicationAfterStop(new IllegalStateException("original publication payload cleanup failed"));}
+    @Test void aFatalPublicationPayloadCleanupFailureSurvivesStopAndMirroring()throws Exception{queuedPublicationAfterStop(new AssertionError("original publication payload cleanup failed"));}
+    private void queuedPublicationAfterStop(Throwable cleanup)throws Exception{
+        var checkEntered=new java.util.concurrent.CountDownLatch(1);var checkRelease=new java.util.concurrent.CountDownLatch(1);
+        var controlsEntered=new java.util.concurrent.CountDownLatch(4);var controlsRelease=new ArrayList<java.util.concurrent.CountDownLatch>();
+        for(int index=0;index<4;index++)controlsRelease.add(new java.util.concurrent.CountDownLatch(1));
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})){
+            var start=prepare(f);var reservation=f.owners.take(start);var mapping=f.comparison.mappings().getFirst();
+            var plan=new Plan(start.run(),mapping,List.of(Plan.row(1,"source")),List.of(Plan.row(1,"target"))){
+                @Override ValidationRootCheck check(ValidationObservation observation,Runnable guard){checkEntered.countDown();waitFor(checkRelease);return super.check(observation,guard);}
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            waitFor(checkEntered);
+            if(cleanup!=null){
+                var originalBudget=reservation.resources().budget();
+                var instrumented=org.mockito.Mockito.mock(ValidationLocalBudget.Run.class,org.mockito.AdditionalAnswers.delegatesTo(originalBudget));
+                org.mockito.Mockito.doAnswer(call->{
+                    var lease=originalBudget.reserve(call.getArgument(0));
+                    boolean payload=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().endsWith("NativeValidationRuns$RootPublication")&&frame.getMethodName().equals("<init>")));
+                    if(!payload)return lease;
+                    var retained=org.mockito.Mockito.mock(ValidationLocalBudget.Reservation.class,org.mockito.AdditionalAnswers.delegatesTo(lease));
+                    org.mockito.Mockito.doAnswer(ignored->{lease.close();if(cleanup instanceof Error fatal)throw fatal;throw (RuntimeException)cleanup;}).when(retained).close();return retained;
+                }).when(instrumented).reserve(org.mockito.ArgumentMatchers.any(ValidationLocalBudget.Amount.class));
+                org.springframework.test.util.ReflectionTestUtils.setField(reservation.resources(),"budget",instrumented);
+            }
+            ((java.util.concurrent.ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"polling")).cancel(false);
+            await(()->runs.controlIdle(start.run()));
+            for(var release:controlsRelease)reservation.resources().executeControl(()->{controlsEntered.countDown();waitFor(release);},()->{throw new AssertionError("owned control must be queued");});
+            waitFor(controlsEntered);checkRelease.countDown();
+            var executor=(java.util.concurrent.ThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(f.process,"controls");
+            await(()->!runs.publicationsDrained(start.run())&&!executor.getQueue().isEmpty());
+            runs.stop(start.run());controlsRelease.getFirst().countDown();await(()->runs.publicationsDrained(start.run()));
+            controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);
+            // Polling was stopped only to make publication precede retirement on the real FIFO executor.
+            for(int attempt=0;attempt<100&&!runs.read(start.run()).drained();attempt++){runs.stop(start.run());Thread.sleep(10);}
+            await(()->runs.read(start.run()).drained());
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->reservation.access().reports().find(reference).filter(ValidationReports.Snapshot::closed).isPresent());
+            var report=reservation.access().reports().find(reference).orElseThrow();
+            assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);
+            if(cleanup==null)assertThat(report.failure()).isNull();
+            else assertThat(report.failure()).isNotNull().satisfies(failure->{assertThat(failure.technical()).contains("original publication payload cleanup failed");assertThat(failure.fatal()).isEqualTo(cleanup instanceof Error);});
+            assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isZero();
+        }finally{checkRelease.countDown();controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);}
+    }
+
+    @Test void stoppingAnOrderedConsumerKeepsItsBorrowedPairAndBudgetUntilItsActualExit()throws Exception{
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
+        var consumerExited=new AtomicBoolean();var borrowedPair=new AtomicReference<ValidationOrderedMerge.Pair>();var sample=new AtomicReference<ValidationOrderedGroups.Group>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})){
+            var start=prepare(f);var reservation=f.owners.take(start);var mapping=f.comparison.mappings().getFirst();
+            var plan=new Plan(start.run(),mapping,true){
+                @Override public List<ValidationFullScan.Mapping> mappings(){
+                    var original=super.mappings().getFirst();
+                    return List.of(ValidationFullScan.Mapping.paired(original.id(),original.open(),(observation,pair,guard)->{
+                        try{borrowedPair.set(pair);sample.set(pair.source().orElseThrow());entered.countDown();waitFor(resume);
+                        pair.source().orElseThrow().key();sample.get().sampleValues();sample.get().occurrences();
+                        return original.pairedChecker().read(observation,pair,guard);}finally{consumerExited.set(true);}
+                    }));
+                }
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            waitFor(entered);runs.stop(start.run());await(()->plan.closed);
+            assertThat(sample.get().isClosed()).isFalse();assertThat(borrowedPair.get().source().orElseThrow()).isSameAs(sample.get());
+            assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();assertThat(f.resources.snapshot().metadataFrames()).isPositive();
+            assertThat(consumerExited).isFalse();
+            resume.countDown();await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            var report=reservation.access().reports().find(reference).orElseThrow();
+            assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);assertThat(report.failure()).isNull();assertThat(sample.get().isClosed()).isTrue();assertThat(consumerExited).isTrue();
+        }finally{resume.countDown();}
+    }
+
     @Test void businessCompletionKeepsTheOriginalReservationUntilTheLastGuardedTaskletPollExits()throws Exception {
         var release=new java.util.concurrent.CountDownLatch(1);var entered=new java.util.concurrent.CountDownLatch(1);var workerMayFinish=new java.util.concurrent.CountDownLatch(1);
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
