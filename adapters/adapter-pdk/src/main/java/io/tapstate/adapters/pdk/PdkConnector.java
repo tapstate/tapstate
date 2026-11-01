@@ -71,11 +71,14 @@ final class PdkConnector implements AutoCloseable {
     private final ConnectorTrustMaterial trust;
     private final Runnable driveGuard;
     private final String specification;
+    private final io.tapstate.spi.store.CaptureOpeningJournal.Opening opening;
+    private volatile boolean physicallyStopped;
 
     private PdkConnector(String connectorId, ConnectorClassLoader loader, TapConnector connector,
                          ConnectorFunctions functions, TapConnectorContext context,
                          TapCodecsRegistry codecs, String stateNamespace, String pipelineId, Runnable closeNotes, Runnable driveGuard, ConnectorTrustMaterial trust,
-                         String specification) {
+                         String specification, io.tapstate.spi.store.CaptureOpeningJournal.Opening opening) {
+        this.opening = opening;
         this.specification=specification;
         this.trust = trust;
         this.connectorId = connectorId;
@@ -201,14 +204,17 @@ final class PdkConnector implements AutoCloseable {
             configuredGlobal = new ScopedDurableStateMap(captured.store(), global, List.of(), false, captured::requireActive);
         }
 
+        var opening = noteScopes == null ? null : noteScopes.newOpening();
         ConnectorClassLoader loader;
         try {
             PdkJsonProvider.prepareRuntime();
             loader = ConnectorClassLoader.shared(ref.classpath());
         } catch (RuntimeException | LinkageError e) {
+            if (opening != null) opening.closed();
             throw loadFailed(connectorId, e);
         }
         boolean opened = false;
+        boolean pluginAccess = false;
         ConnectorTrustMaterial material = null;
         try {
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
@@ -228,6 +234,8 @@ final class PdkConnector implements AutoCloseable {
                 // Construct under the connector's own loader so any context-loader-based PDK lookup
                 // resolves against the connector's classpath rather than the host.
                 Thread.currentThread().setContextClassLoader(connectorClass.getClassLoader());
+                if (opening != null) opening.accessing();
+                pluginAccess = true;
                 connector = connectorClass.getDeclaredConstructor().newInstance();
                 connector.registerCapabilities(functions, codecs);
             } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
@@ -273,7 +281,7 @@ final class PdkConnector implements AutoCloseable {
             context.setConnectorCapabilities(ConnectorCapabilities.create());
             PdkConnector result = new PdkConnector(
                     connectorId, loader, connector, functions, context, codecs, stateNamespace, pipelineId,
-                    () -> notesActive.set(false), driveGuard, material, ref.spec());
+                    () -> notesActive.set(false), driveGuard, material, ref.spec(), opening);
             try {
                 result.requireActive();
             } catch (RuntimeException | Error failure) {
@@ -287,6 +295,7 @@ final class PdkConnector implements AutoCloseable {
             // Release the loader on every failure path — a coded load/class error, an escaping VM error,
             // anything. A shared loader stays open for the artifact's other opens; this is a no-op on it.
             if (!opened) {
+                if (!pluginAccess && opening != null) opening.closed();
                 notesActive.set(false);
                 closeQuietly(loader);
                 if (material != null) material.close();
@@ -534,7 +543,10 @@ final class PdkConnector implements AutoCloseable {
     void stopForCleanup() throws Throwable {
         stopped = true;
         underLoaderForCleanup(() -> { connector.stop(context); return null; });
+        physicallyStopped = true;
     }
+
+    boolean cleanupVerified() { return physicallyStopped; }
 
     /**
      * Whether this connector would still consider itself running, as judged from the two facts the
@@ -557,6 +569,7 @@ final class PdkConnector implements AutoCloseable {
         closeNotes.run();
         closeQuietly(loader);
         trust.close();
+        if (opening != null && physicallyStopped) opening.closed();
     }
 
     private static void closeQuietly(ConnectorClassLoader loader) {

@@ -90,7 +90,8 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         if (identity == null || !cluster.equals(identity.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId")))
             throw invalid("identity");
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
-        if (schema == null || !Integer.valueOf(2).equals(schema.get("installedVersion")))
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)
+                || version < 2 || version > MongoConfigurationDomain.SCHEMA_VERSION)
             throw new TapstateException(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED,
                     Map.of("required", "2"), null);
         ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database));

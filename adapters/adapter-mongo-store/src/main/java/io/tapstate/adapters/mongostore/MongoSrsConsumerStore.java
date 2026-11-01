@@ -84,6 +84,9 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous) {
         return sharedRecoveryView(session,previous,null);
     }
+    SharedView explicitClearView(ClientSession session,CapturePreparation previous) {
+        return sharedRecoveryView(session,previous,null,true);
+    }
     SharedView cancelledSharedRecoveryView(ClientSession session,CapturePreparation previous,String operation,String planHash,String replacement) {
         var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",previous.chainId())).first();
         if(root==null)throw unavailable(previous.chainId());
@@ -93,11 +96,18 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return sharedRecoveryView(session,previous,control);
     }
     private SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous,MongoSrsRecoveryControls.Control cancellation) {
+        return sharedRecoveryView(session,previous,cancellation,false);
+    }
+    private SharedView sharedRecoveryView(ClientSession session,CapturePreparation previous,MongoSrsRecoveryControls.Control cancellation,
+            boolean explicitClear) {
         if(!session.hasActiveTransaction())throw new IllegalStateException("shared controls require their CACHE transaction");
         Objects.requireNonNull(previous,"previous");String chain=previous.chainId();
         if(previous.mode()!=CapturePreparation.Mode.SHARED_SRS || !scope.equals(previous.scope()))throw unavailable(chain);
             try {
                 var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+                if(explicitClear && root!=null && MongoCaptureClearControls.read(root).isPresent()) {
+                    root=new Document(root);root.remove("clearControl");root.put("formatVersion",1);
+                }
                 if(root==null || !chain.equals(root.get("_id")) || !previous.captureId().equals(root.get("captureId"))
                         || !MongoSrsRecoveryControls.read(root).equals(Optional.ofNullable(cancellation)))throw unavailable(chain);
                 var contexts=new MongoSrsModelContexts(database,scope);
@@ -898,6 +908,15 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private View administrativeView(ClientSession session,String chain) {
         var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
         if(root==null)throw unavailable(chain);
+        var explicit=MongoCaptureClearControls.read(root);
+        if(explicit.isPresent() && explicit.orElseThrow().phase()!=MongoCaptureClearControls.Phase.CANCELLED) {
+            var original=new Document(root);original.remove("clearControl");original.put("formatVersion",1);
+            var state=MongoSrsChainStore.controlState(original,scope,new MongoSrsModelContexts(database,scope));
+            var observed=relations(session,chain,root,state);
+            if(state.consumerCount()!=0 || !observed.cursors().isEmpty()
+                    || observed.members().values().stream().anyMatch(member -> !member.detached()))throw unavailable(chain);
+            return observed;
+        }
         var isolation=MongoSrsRecoveryControls.read(root);
         if(isolation.isEmpty())return relations(session,chain,root,chains.state(session,root));
         var state=MongoSrsChainStore.controlState(root,scope,new MongoSrsModelContexts(database,scope));

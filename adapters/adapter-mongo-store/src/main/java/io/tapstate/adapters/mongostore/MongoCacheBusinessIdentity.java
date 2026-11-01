@@ -11,6 +11,7 @@ import java.util.List;
 
 /** Business readiness is independent from authentication-only generation changes. */
 final class MongoCacheBusinessIdentity {
+    static final int SCHEMA_VERSION = 2;
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     MongoCacheBusinessIdentity(MongoDatabase database, CacheBusinessScope scope) { this.database = database; this.scope = scope; }
@@ -23,8 +24,9 @@ final class MongoCacheBusinessIdentity {
                 || !MongoCacheIdentity.READY.equals(identity.get("businessPhase"))) throw businessFenced();
         Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
         if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable();
-        if (version > 1) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY, Map.of("installed", String.valueOf(version), "supported", "1"), null);
-        if (version != 1 || !MongoCacheIdentity.READY.equals(schema.get("phase"))) throw businessFenced();
+        if (version > SCHEMA_VERSION) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
+                Map.of("installed", String.valueOf(version), "supported", String.valueOf(SCHEMA_VERSION)), null);
+        if (version != SCHEMA_VERSION || !MongoCacheIdentity.READY.equals(schema.get("phase"))) throw businessFenced();
         if (!(identity.get("businessPreparationId") instanceof String operation) || operation.isBlank()
                 || !operation.equals(schema.get("operationId")) || !(schema.get("epoch") instanceof Long epoch) || epoch < 1) throw unreadable();
         return identity;

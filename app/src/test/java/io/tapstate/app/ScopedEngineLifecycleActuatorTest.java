@@ -349,6 +349,19 @@ class ScopedEngineLifecycleActuatorTest {
         var actor = actuator(); actor.start("p"); assertThat(actor.isCarryingAJob("p")).isFalse(); assertThat(actor.failure("p")).isEmpty();
         verify(previous,never()).failure(); verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
     }
+    @Test void aPendingExternalRetirementSubmitsNoJobAndAReadyRetryCanStart() {
+        doAnswer(call -> {
+            assertThat((WorkloadClaimFence)call.getArgument(2)).isEqualTo(held.get());
+            ((Runnable)call.getArgument(4)).run();return null;
+        }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
+        var pending=new TapstateException(IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING,
+                Map.of("capture","capture","operation","original-clear","reason","clear-successor-not-ready"),null);
+        doThrow(pending).doNothing().when(fixedCapture).startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
+        var actor=actuator();actor.start("p");
+        assertThat(actor.isCarryingAJob("p")).isFalse();assertThat(actor.failure("p")).isEmpty();
+        verify(previous,never()).failure();verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
+        actor.start("p");verify(engine).submitRun(eq("p"),any(),anyMap(),any(),any(OperatorRunManifest.class));
+    }
     @Test void aSubmissionThatLosesAuthorityIsCancelledThroughOnlyItsReturnedConcreteHandle() {
         when(engine.submitRun(eq("p"),any(),anyMap(),any(),any(OperatorRunManifest.class))).thenAnswer(call -> { held.set(claim(3)); return submitted; });
         assertThatThrownBy(() -> actuator().start("p")).isInstanceOf(TapstateException.class);

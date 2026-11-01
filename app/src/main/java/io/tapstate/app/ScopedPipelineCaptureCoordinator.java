@@ -29,7 +29,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     record Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,
             CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes,Predicate<PipelineIntentScope> recoveryPinned,BoundedLoads boundedLoads,
-            CompletedFullLookup completedFull) {
+            CompletedFullLookup completedFull,CaptureOpeningJournal openingJournal) {
+        Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,
+                CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes,
+                Predicate<PipelineIntentScope> recoveryPinned,BoundedLoads boundedLoads,CompletedFullLookup completedFull) {
+            this(scope,pipelines,sources,configuration,preparations,notes,recoveryPinned,boundedLoads,completedFull,null);
+        }
         Stores(CacheBusinessScope scope,PipelineStoreViews pipelines,SrsStoreViews sources,CaptureStatePreparations configuration,CaptureCachePreparations preparations,RequiredNoteStore notes) {
             this(scope,pipelines,sources,configuration,preparations,notes,ignored -> false,BoundedLoads.NONE,CompletedFullLookup.NONE);
         }
@@ -318,7 +323,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 var config=source.selected.config().at(new PipelineNode(run.original.pipelineId(),source.id));
                 if(source.shared)config=config.sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));
                 var fixedConfig=config;
-                var notes=ConfiguredCaptureRun.prepare(run.original,config,stores.notes(),connectors,guard,stores.recoveryPinned().test(run.original.scope()));
+                var notes=journaled(ConfiguredCaptureRun.prepare(run.original,config,stores.notes(),connectors,guard,
+                        stores.recoveryPinned().test(run.original.scope()),stores.openingJournal()),source,guard);
                 CaptureHandoff output=new CaptureHandoff() {
                     @Override public void accept(Envelope row) {
                         guard.run(); if(!source.selected.tables().contains(row.src()))throw refused();
@@ -546,7 +552,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner.physical!=null && !owner.physical.live.get())throw refused();
         if(owner.physical!=null && before.servingTables().containsAll(requested))return;
         var configured=owner.configured;
-        if(configured==null)configured=ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,owner::require,stores.recoveryPinned().test(owner.origin.scope()));
+        if(configured==null)configured=journaled(ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,
+                owner::require,stores.recoveryPinned().test(owner.origin.scope()),stores.openingJournal()),owner.prepared,() -> owner.fence,owner::require);
         else {stores.notes().guardedBy(owner::require).origin(configured.primary());connectors.resolve(configured.connectorId(),configured.artifactHash());owner.require();}
         if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
@@ -603,6 +610,36 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
     }
     private static void throwFailure(Throwable failure){if(failure instanceof RuntimeException runtime)throw runtime;if(failure instanceof Error error)throw error;throw new IllegalStateException("capture failed",failure);}
+
+    private ConfiguredCaptureRun journaled(ConfiguredCaptureRun configured, Source source, Runnable guard) {
+        return journaled(configured, source.prepared,
+                () -> stores.preparations().load(source.prepared).claim(), guard);
+    }
+    private ConfiguredCaptureRun journaled(ConfiguredCaptureRun configured, CapturePreparation preparation,
+            Supplier<WorkloadClaimFence> capture, Runnable guard) {
+        if (stores.openingJournal() == null) return configured;
+        return configured.journaled(() -> {
+            for (int attempt = 0; ; attempt++) {
+                guard.run();
+                var node = execution.node().get().orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+                var request = new CaptureOpeningJournal.Request(preparation, configured.original().scope(),
+                        claim(configured.original()), capture.get(), node);
+                var registration = stores.openingJournal().prepare(request);
+                guard.run();
+                try {
+                    var opening = registration.register();
+                    // A positive no-access close is possible if execution was lost before plugin access.
+                    try { guard.run(); } catch (RuntimeException | Error lost) { opening.closed(); throw lost; }
+                    return opening;
+                } catch (TapstateException raced) {
+                    var reason = raced.args().get("reason");
+                    if (attempt >= 3 || raced.code() != IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING
+                            || !("registration-raced".equals(reason) || "registration-stale".equals(reason))) throw raced;
+                    // No connector has been accessed. A distinct invocation may compete for a new boundary.
+                }
+            }
+        });
+    }
     private void lost(Owner owner) {
         owner.ended.set(true);Throwable failure=null;
         synchronized(this) {

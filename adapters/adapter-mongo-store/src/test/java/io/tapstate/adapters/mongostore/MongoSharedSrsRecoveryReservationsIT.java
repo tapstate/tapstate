@@ -31,10 +31,167 @@ import static org.assertj.core.api.Assertions.*;
 class MongoSharedSrsRecoveryReservationsIT {
     @Container private static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     @Container private static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    static {
+        var owner=System.getProperty("tapstate.e2e.resource-owner");
+        if(owner!=null && !owner.isBlank())for(var fixture:List.of(CONFIG,CACHE))fixture.withLabel("io.tapstate.issue-loop.owner",owner)
+                .withTmpFs(Map.of("/data/db","rw,size=512m","/data/configdb","rw,size=16m"))
+                .withCreateContainerCmdModifier(c -> c.getHostConfig().withMemory(1024L<<20).withNanoCPUs(1_000_000_000L));
+    }
     private static final Runnable ACTIVE = () -> {};
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Duration TTL = Duration.ofMinutes(2);
     private static final StorageSetupScope SETUP = new StorageSetupScope("cluster-a", "install-a", "setup-a", 1);
+
+    @Test void aClearSuccessorUsesTaggedRecoveryAndPublishesTheGateWithoutLosingAnOldOpening() {
+        withFixture(initial -> {
+            var f=initial.explicitlyCleared();var journal=f.configuration.captureOpeningJournal();
+            var request=f.requests.get("a");var capture=WorkloadClaimFence.from(f.domain.workloadClaims(f.scope).read(
+                    new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,f.previous.captureId())).orElseThrow().claim());
+            var registration=journal.prepare(new CaptureOpeningJournal.Request(f.previous,request.pipeline(),request.originalPipeline(),capture,f.node));
+            var opening=registration.register();opening.accessing();
+            f.endAffectedTenures();var confirmed=f.confirmed();
+            var before=SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).find().first();
+            var pending=f.configuration.sharedRecoveryPreparations().reserve(confirmed);
+            var stored=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first();
+            assertThat(stored.getInteger("formatVersion")).isEqualTo(4);
+            assertThat(stored.get("currentRecovery",Document.class)).containsEntry("formatVersion",2).containsEntry("previous",MongoCapturePreparationFacts.row(f.previous));
+            assertThatThrownBy(() -> registration.register()).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> journal.prepare(new CaptureOpeningJournal.Request(f.previous,request.pipeline(),request.originalPipeline(),capture,f.node)))
+                    .isInstanceOf(TapstateException.class);
+            var reserved=SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).find().first();
+            assertThat(reserved.get("openingJournal")).isEqualTo(before.get("openingJournal"));
+            assertThat(reserved.getLong("resourceEpoch")).isEqualTo(before.getLong("resourceEpoch"));
+            assertThat(reserved.get("operation")).isEqualTo(before.get("operation"));
+            var applied=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(pending,f.node);
+            f.configuration.sharedRecoveryPreparations().complete(applied);
+            var ready=SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).find().first();
+            assertThat(ready.get("currentPreparation")).isEqualTo(MongoCapturePreparationFacts.row(pending.replacement()));
+            assertThat(ready.get("openingJournal")).isEqualTo(before.get("openingJournal"));
+            assertThat(ready.get("lastResult")).isEqualTo(before.get("lastResult"));assertThat(ready.get("gcPrefix")).isEqualTo(before.get("gcPrefix"));
+            var config=rows(f.config);
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(pending.replacement());
+            f.configuration.sharedRecoveryPreparations().complete(applied);assertThat(rows(f.config)).isEqualTo(config);
+            opening.closed();assertThat(SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).find().first()
+                    .get("openingJournal",Document.class).getList("unresolved",Document.class)).isEmpty();
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"reserve-before","reserve-after","ready-before","ready-after"})
+    void taggedRecoveryCommitBoundariesResumeOnlyTheSameOperationAndGate(String cut) {
+        withFixture(initial -> {
+            var f=initial.explicitlyCleared();f.endAffectedTenures();var confirmed=f.confirmed();
+            var before=rows(f.config);var count=new java.util.concurrent.atomic.AtomicInteger();
+            if(cut.startsWith("reserve")) {
+                var guarded=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                    if(count.incrementAndGet()==(cut.endsWith("before")?2:3))throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+                });
+                assertThatThrownBy(() -> guarded.reserve(confirmed)).isInstanceOf(TapstateException.class);
+                if(cut.endsWith("before"))assertThat(rows(f.config)).isEqualTo(before);
+            }
+            var pending=f.configuration.sharedRecoveryPreparations().reserve(confirmed);
+            var stored=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first();var group=rows(f.config);
+            try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster-a")) {
+                assertThat(reopened.sharedRecoveryPreparations().pending(f.auth(),confirmed.operationId()).orElseThrow().replacement()).isEqualTo(pending.replacement());
+            }
+            assertThat(rows(f.config)).isEqualTo(group);assertThat(stored.getInteger("formatVersion")).isEqualTo(4);
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(pending,f.node);count.set(0);before=rows(f.config);
+            if(cut.startsWith("ready")) {
+                var guarded=f.configuration.sharedRecoveryPreparations().guardedBy(() -> {
+                    if(count.incrementAndGet()==(cut.endsWith("before")?2:3))throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+                });
+                assertThatThrownBy(() -> guarded.complete(receipt)).isInstanceOf(TapstateException.class);
+                if(cut.endsWith("before"))assertThat(rows(f.config)).isEqualTo(before);
+            }
+            f.configuration.sharedRecoveryPreparations().complete(receipt);
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(pending.replacement());
+            assertThat(SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).find().first().get("currentPreparation"))
+                    .isEqualTo(MongoCapturePreparationFacts.row(pending.replacement()));
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"prepare","register","access"})
+    void aPreReservationSnapshotCannotCommitAnOpeningAfterTaggedRecoveryReserves(String boundary) {
+        withFixture(initial -> {
+            var f=initial.explicitlyCleared();f.endAffectedTenures();var confirmed=f.confirmed();
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var paused=new java.util.concurrent.atomic.AtomicBoolean();
+            var requests=ConcurrentHashMap.<Integer>newKeySet();
+            var listener=new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if(Thread.currentThread().getName().equals("late-opening") && event.getDatabaseName().equals(f.config.getName())
+                            && event.getCommandName().equals("find") && event.getCommand().getString("find").getValue().equals("capture_preparations"))requests.add(event.getRequestId());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    if(requests.remove(event.getRequestId()) && paused.compareAndSet(false,true)) {
+                        entered.countDown();try {assertThat(release.await(20,TimeUnit.SECONDS)).isTrue();}
+                        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    }
+                }
+            };
+            var settings=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(f.settings.uri())).addCommandListener(listener).build();
+            try(var client=MongoClients.create(settings);var threads=Executors.newSingleThreadExecutor(task -> new Thread(task,"late-opening"))) {
+                var database=client.getDatabase(f.config.getName());
+                var key=SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+                var cipher=SourceConfigCipherProvider.fixed(new SourceConfigCipher(Base64.getUrlDecoder().decode(key)));
+                var bindings=new MongoStorageBindingStore(client,database,cipher);var notes=new MongoRequiredNoteStore(client,database,cipher);
+                var journal=new MongoCaptureExternalRetirements(client,database,"cluster-a",bindings,notes,ACTIVE);
+                var request=f.requests.get("a");var capture=WorkloadClaimFence.from(f.domain.workloadClaims(f.scope).read(
+                        new WorkloadClaimKey(f.scope.clusterId(),WorkloadClaimType.CAPTURE,f.previous.captureId())).orElseThrow().claim());
+                var openingRequest=new CaptureOpeningJournal.Request(f.previous,request.pipeline(),request.originalPipeline(),capture,f.node);
+                var registration=boundary.equals("prepare")?null:journal.prepare(openingRequest);
+                var opening=boundary.equals("access")?registration.register():null;
+                var late=threads.submit(() -> {
+                    try {
+                        switch(boundary) {
+                            case "prepare" -> journal.prepare(openingRequest);
+                            case "register" -> registration.register();
+                            case "access" -> opening.accessing();
+                            default -> throw new IllegalArgumentException(boundary);
+                        }
+                        return Optional.<TapstateException>empty();
+                    }catch(TapstateException expected){return Optional.of(expected);}
+                });
+                try {
+                    assertThat(entered.await(20,TimeUnit.SECONDS)).isTrue();
+                    f.configuration.sharedRecoveryPreparations().reserve(confirmed);
+                    var after=rows(f.config);release.countDown();assertThat(late.get(20,TimeUnit.SECONDS)).isPresent();
+                    assertThat(rows(f.config)).isEqualTo(after);
+                }finally {release.countDown();}
+                if(opening!=null)opening.closed();
+            }
+        });
+    }
+
+    @Test void aTaggedReservationCanReconfirmItsExactCancelledCacheReceipt() {
+        withFixture(initial -> {
+            var f=initial.explicitlyCleared();f.endAffectedTenures();var original=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var cancelled=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(original,f.node);
+            var replanned=f.configuration.sharedRecoveryPreparations().replan(cancelled,f.manifest(cancelled.cancelledSnapshot()));
+            var confirmed=f.configuration.recoveryCommands().confirm(replanned);
+            var refresh=f.configuration.sharedRecoveryPreparations().reconfirmation(f.auth(),confirmed.operationId()).orElseThrow();
+            var fresh=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).cancel(refresh,f.node);
+            var rebound=f.configuration.sharedRecoveryPreparations().reserve(confirmed,fresh);
+            assertThat(rebound.replacement()).isEqualTo(original.replacement());
+            var saved=SystemCollections.CAPTURE_PREPARATIONS.on(f.config).find().first();
+            assertThat(saved.getInteger("formatVersion")).isEqualTo(4);
+            assertThat(saved.get("currentRecovery",Document.class).get("previous")).isEqualTo(MongoCapturePreparationFacts.row(f.previous));
+            assertThat(saved.get("currentRecovery",Document.class).getString("planHash")).isEqualTo(rebound.plan().planHash());
+            f.configuration.sharedRecoveryPreparations().complete(f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(rebound,f.node));
+            assertThat(f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).contains(original.replacement());
+        });
+    }
+
+    @Test void neitherOrdinaryLookupNorACompletedReplyRepairsADisagreeingTaggedGate() {
+        withFixture(initial -> {
+            var f=initial.explicitlyCleared();f.endAffectedTenures();var pending=f.configuration.sharedRecoveryPreparations().reserve(f.confirmed());
+            var receipt=f.domain.sharedSrsRecoveries(f.scope,ACTIVE).replace(pending,f.node);f.configuration.sharedRecoveryPreparations().complete(receipt);
+            var gates=SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config);var ready=gates.find().first();
+            gates.replaceOne(ready,new Document(ready).append("currentPreparation",MongoCapturePreparationFacts.row(f.previous)));
+            var damaged=rows(f.config);
+            assertThatThrownBy(() -> f.configuration.capturePreparations().read(f.scope,f.previous.captureId())).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.sharedRecoveryPreparations().complete(receipt)).isInstanceOf(TapstateException.class);
+            assertThat(rows(f.config)).isEqualTo(damaged);
+        });
+    }
 
     @Test void appliedLookupCannotCreateOrCancelAnUnappliedOriginalAttempt() {
         withFixture(f -> {
@@ -1084,6 +1241,33 @@ class MongoSharedSrsRecoveryReservationsIT {
     private record Fixture(MongoConfigurationDomain configuration, MongoDatabase config, MongoDatabase cache, MongoCacheDomain domain,
             MongoConnectionSettings settings, CacheBusinessScope scope, WorkloadClaimFence node,
             Map<String, CapturePreparationRequest> requests, CapturePreparation previous) {
+        Fixture explicitlyCleared() {
+            var claims=domain.workloadClaims(scope);var external=configuration.captureExternalRetirements();var controls=domain.capturePreparations(scope,ACTIVE).explicitClear();
+            CaptureClearPreparation clearing=null;var nextRequests=new TreeMap<String,CapturePreparationRequest>();
+            for(String id:List.of("a","b")) {
+                var intent=configuration.intents().load(id).orElseThrow();
+                assertThat(configuration.intents().compareAndSet(intent.scope(),intent.intentRevision(),new DesiredState(id,PipelineState.STOPPED,intent.desired().revision(),true))).isTrue();
+                var original=configuration.intents().load(id).orElseThrow();
+                var full=configuration.rebuilds().begin(new PipelineRebuildRequest("initial-explicit-clear-"+id,original,requests.get(id).originalPipeline(),0,requests.get(id).inputs()));
+                var consumers=domain.srs(scope,ACTIVE).consumers();
+                for(var member:consumers.forPipeline(original.scope()))if(!member.detached())consumers.detachForRebuild(full,member,node).orElseThrow();
+                if(id.equals("b")) {
+                    var note=configuration.requiredNotes().open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.chain."+previous.canonicalChainId(),RequiredNoteOwner.Kind.CHAIN,previous.canonicalChainId(),0));
+                    clearing=external.reserve(full,List.of(controls.inspect(previous)),external.resourceNotes(scope),CaptureResourceNotes.nameHash("fixture-slot"),
+                            configuration.requiredNotes().origin(note),true,List.of(new CaptureRetirementMember(OWNER.nodeId(),OWNER.bootId(),"fixture-member"))).getFirst();
+                }
+                var receipt=domain.pipelineRebuilds(scope,ACTIVE).prepare(full,node,TTL,Instant.parse("2026-10-19T16:00:00Z"));configuration.rebuilds().complete(receipt);
+                var acquired=claims.acquirePipeline(full.request().targetScope(),OWNER,1,TTL).claim();
+                var running=claims.advanceExecution(acquired,1,Set.of(OWNER.nodeId())).orElseThrow();
+                nextRequests.put(id,new CapturePreparationRequest(full.request().targetScope(),WorkloadClaimFence.from(running),node,"input",requests.get(id).inputs()));
+            }
+            external.frozen(clearing,controls.freeze(clearing,node));var attempt=external.beginExternal(clearing,node).orElseThrow();attempt.consume();attempt.ended();external.verified(clearing,attempt);
+            external.complete(clearing,List.of(controls.apply(clearing,node)));var next=clearing.replacement();
+            var consumers=domain.srs(scope,ACTIVE).consumers();
+            for(String id:List.of("a","b"))consumers.attach(new SrsConsumerContext(new SrsConsumerKey(next.chainId(),id,"input"),2),0,Set.of("orders"),nextRequests.get(id).originalPipeline()).orElseThrow();
+            nextRequests.put("c",requests.get("c"));
+            return new Fixture(configuration,config,cache,domain,settings,scope,node,nextRequests,next);
+        }
         WorkloadClaimFence publishStoreHistory() {
             var claims=domain.workloadClaims(scope);
             var acquired=claims.acquire(new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,previous.captureId()),OWNER,1,TTL).claim();

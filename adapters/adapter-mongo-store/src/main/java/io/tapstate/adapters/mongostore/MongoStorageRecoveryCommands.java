@@ -154,7 +154,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
                 || !original.owner.database.getName().equals(database.getName()))throw refused();
         var already=transaction(session -> {
             var current=requireSharedOperation(session,original.plan);
-            if(current.phase()==Phase.COMPLETE)return Optional.of(current);
+            if(current.phase()==Phase.COMPLETE){captureOwner(current).requireCompletedRecovery(session,current);return Optional.of(current);}
             if(current.phase()!=Phase.RUNNING)throw refused();
             return Optional.<Plan>empty();
         });
@@ -164,7 +164,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         var result=transaction(session -> {
             var row=root(session,original.plan.originalScope());
             var current=requireSharedOperation(row,original.plan);
-            if(current.phase()==Phase.COMPLETE)return current;
+            if(current.phase()==Phase.COMPLETE){captureOwner(current).requireCompletedRecovery(session,current);return current;}
             if(current.phase()!=Phase.RUNNING)throw refused();
             var retained=sharedPending(session,current);
             if(!retained.replacement.equals(original.replacement) || !retained.targetFingerprint.equals(original.targetFingerprint))throw refused();

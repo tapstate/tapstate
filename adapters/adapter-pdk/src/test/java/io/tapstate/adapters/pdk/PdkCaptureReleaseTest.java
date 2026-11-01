@@ -165,6 +165,32 @@ class PdkCaptureReleaseTest {
         assertThat(store.load(ConnectorStateNamespace.of(P1), "late")).isEmpty();
     }
 
+    @Test
+    void theFacadeDeadlineDoesNotInventPhysicalTermination(@TempDir Path dir) throws Exception {
+        String gate=CHANNEL+".observed";
+        var entered=new java.util.concurrent.CountDownLatch(1);
+        var release=new java.util.concurrent.CountDownLatch(1);
+        var ended=new java.util.concurrent.CountDownLatch(1);
+        System.getProperties().put(gate+".entered",entered);
+        System.getProperties().put(gate+".release",release);
+        System.getProperties().put(gate+".ended",ended);
+        try {
+            var reference=new ConnectorRef(List.of(Synthetic.gatedStopSource(dir,gate)),"synthetic.GatedStopSource","2.0.8",null);
+            var observedPort=new PdkCapturePort(id -> reference,store,PdkCapturePort.DEFAULT_PREFLIGHT_TIMEOUT,
+                    Duration.ofSeconds(5),System::nanoTime,Duration.ofMillis(100));
+            var observed=observedPort.beginObservedRelease(config().at(P1));
+            assertThat(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThat(observed.facade().get(5,java.util.concurrent.TimeUnit.SECONDS)).isPresent();
+            assertThat(observed.terminal()).isNotDone();
+            release.countDown();assertThat(ended.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            // This connector has no release function; even a completed close is no deletion receipt.
+            assertThat(observed.terminal().get(5,java.util.concurrent.TimeUnit.SECONDS)).isFalse();
+        }finally {
+            release.countDown();
+            for(String suffix:List.of("entered","release","ended"))System.getProperties().remove(gate+"."+suffix);
+        }
+    }
+
     /** A connector built on the postgres connector keeps its slot under the same note, and is answered for alike. */
     @Test
     void aSlotIsNamedWhateverTheConnectorIsCalled() {

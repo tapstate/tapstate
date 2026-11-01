@@ -1230,6 +1230,18 @@ io.capture-state-rebuild-required:
   message: "Capture {capture} has missing or unproven canonical claim history."
   solution: "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."
 
+io.capture-external-retirement-pending:
+  message: "Capture {capture} retirement {operation} is pending ({reason})."
+  solution: "Preserve the original notes and operation. Retry its reconciliation after the original physical openings or external call have positively ended; a new lease does not prove retirement."
+
+io.capture-external-retirement-unsupported:
+  message: "Capture {capture} retirement {operation} lacks original authority or identity ({reason})."
+  solution: "Restore the matching original control facts or use an explicitly authorized current-scope operation. Do not clear notes or treat missing evidence as permission to delete."
+
+io.capture-retirement-capacity:
+  message: "Capture {capture} retirement {operation} reached its control budget ({reason})."
+  solution: "Resolve the original pending openings or exact retired-prefix cleanup. Required uncertainty and retained dependencies cannot be evicted to make room."
+
 capture.still-ending:
   message: "Capture `{captureId}` has not finished stopping."
   solution: "Retry the original stop after the source call exits; retain its original resource identity."

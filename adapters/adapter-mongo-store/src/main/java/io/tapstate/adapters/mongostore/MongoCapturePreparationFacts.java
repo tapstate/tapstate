@@ -16,6 +16,9 @@ final class MongoCapturePreparationFacts {
     static Document id(CacheBusinessScope scope,String capture){return scope(scope).append("capture",OperatorStateText.encode(capture));}
     static Document row(CapturePreparation value){
         if(value.replacement()) {
+            if(value.chainId().matches("srs-clear-[a-f0-9]{64}"))
+                return new Document("formatVersion",3).append("original",row(value.birth()))
+                        .append("physicalChain",value.chainId()).append("preparationId",value.preparationId());
             if(!replacementChain(value.birth(),value.preparationId()).equals(value.chainId()))throw unreadable();
             return new Document("formatVersion",2).append("original",row(value.birth()))
                     .append("physicalChain",value.chainId()).append("preparationId",value.preparationId());
@@ -23,6 +26,9 @@ final class MongoCapturePreparationFacts {
         return new Document("_id",id(value.scope(),value.captureId())).append("formatVersion",1).append("phase","ISSUED")
             .append("mode",value.mode().name()).append("chain",OperatorStateText.encode(value.chainId())).append("captureId",value.captureId()).append("sourceIdentityHash",value.sourceIdentityHash()).append("preparationId",value.preparationId());}
     static CapturePreparation decode(Document row) {
+        if(row!=null && Integer.valueOf(4).equals(row.get("formatVersion")))return taggedRecovery(row).replacement();
+        if(row!=null && Integer.valueOf(3).equals(row.get("formatVersion")))
+            return row.containsKey("currentClear")?clearConfiguration(row,false):clearAnnex(row);
         if(row!=null && Integer.valueOf(2).equals(row.get("formatVersion"))) {
             if(row.containsKey("currentRecovery"))return recovery(row).orElseThrow(MongoCapturePreparationFacts::unreadable).replacement();
             return replacementAnnex(row);
@@ -40,6 +46,7 @@ final class MongoCapturePreparationFacts {
         }catch(IllegalArgumentException|NullPointerException|ClassCastException bad){throw unreadable();}
     }
     static CapturePreparation available(Document row) {
+        if(row!=null && Integer.valueOf(3).equals(row.get("formatVersion")))return clearConfiguration(row,true);
         var retained=recovery(row);
         if(retained.isEmpty())return birth(row);
         var original=retained.orElseThrow();
@@ -47,6 +54,7 @@ final class MongoCapturePreparationFacts {
         return original.replacement();
     }
     static CapturePreparation annex(Document row) {
+        if(row!=null && Integer.valueOf(3).equals(row.get("formatVersion")))return clearAnnex(row);
         return row!=null && Integer.valueOf(2).equals(row.get("formatVersion"))?replacementAnnex(row):birth(row);
     }
     private static CapturePreparation replacementAnnex(Document row) {
@@ -56,6 +64,39 @@ final class MongoCapturePreparationFacts {
             var replacement=replacement(original,row.getString("physicalChain"),row.getString("preparationId"));
             if(!row(replacement).equals(row))throw unreadable();return replacement;
         }catch(IllegalArgumentException|NullPointerException|ClassCastException bad){throw unreadable();}
+    }
+    private static CapturePreparation clearAnnex(Document row) {
+        try {
+            if(row==null || !row.keySet().equals(Set.of("formatVersion","original","physicalChain","preparationId"))
+                    || !Integer.valueOf(3).equals(row.get("formatVersion")))throw unreadable();
+            var birth=birth(row.get("original",Document.class));
+            var result=new CapturePreparation(birth.scope(),birth.mode(),row.getString("physicalChain"),birth.captureId(),
+                    birth.sourceIdentityHash(),row.getString("preparationId"),birth.canonicalChainId(),birth.birthPreparationId());
+            if(!result.chainId().matches("srs-clear-[a-f0-9]{64}") || !row(result).equals(row))throw unreadable();
+            return result;
+        }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable();}
+    }
+    private static CapturePreparation clearConfiguration(Document row,boolean requireReady) {
+        try {
+            if(!row.keySet().equals(Set.of("_id","formatVersion","original","currentClear")))throw unreadable();
+            var birth=birth(row.get("original",Document.class));var marker=row.get("currentClear",Document.class);
+            if(marker!=null)requireBytes(marker,4096);
+            if(marker==null || !marker.keySet().equals(Set.of("operationId","sequence","previousChain","previousPreparationId",
+                    "nextChain","nextPreparationId","phase","receiptHash")) || !(marker.get("sequence")instanceof Long sequence)
+                    || sequence<1 || sequence==Long.MAX_VALUE || !id(birth.scope(),birth.captureId()).equals(row.get("_id")))throw unreadable();
+            String phase=marker.getString("phase");
+            if(!Set.of("RESERVED","READY").contains(phase))throw unreadable();
+            if(requireReady && !"READY".equals(phase))throw new TapstateException(IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING,
+                    Map.of("capture",birth.captureId(),"operation",marker.getString("operationId"),"reason","clear-successor-not-ready"),null);
+            var previous=new CapturePreparation(birth.scope(),birth.mode(),marker.getString("previousChain"),birth.captureId(),
+                    birth.sourceIdentityHash(),marker.getString("previousPreparationId"),birth.canonicalChainId(),birth.birthPreparationId());
+            var result=new CapturePreparation(birth.scope(),birth.mode(),marker.getString("nextChain"),birth.captureId(),
+                    birth.sourceIdentityHash(),marker.getString("nextPreparationId"),birth.canonicalChainId(),birth.birthPreparationId());
+            if(!result.preparationId().equals(marker.getString("operationId"))
+                    || !result.chainId().equals(MongoCaptureExternalRetirements.clearChain(previous,result.preparationId()))
+                    || "READY".equals(phase) && !(marker.get("receiptHash")instanceof String hash && hash.matches("[a-f0-9]{64}")))throw unreadable();
+            return result;
+        }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable();}
     }
     enum RecoveryPhase { RESERVED, READY }
     record Recovery(CapturePreparation previous,CapturePreparation replacement,String planHash,RecoveryPhase phase) {
@@ -69,6 +110,7 @@ final class MongoCapturePreparationFacts {
     }
     static Optional<Recovery> recovery(Document row) {
         try {
+            if(row!=null && Integer.valueOf(4).equals(row.get("formatVersion")))return Optional.of(taggedRecovery(row));
             if(row!=null && Integer.valueOf(1).equals(row.get("formatVersion"))){birth(row);return Optional.empty();}
             var expected=new HashSet<>(BIRTH_FIELDS);expected.add("currentRecovery");
             if(row==null || !Integer.valueOf(2).equals(row.get("formatVersion")) || !row.keySet().equals(expected))throw unreadable();
@@ -85,11 +127,42 @@ final class MongoCapturePreparationFacts {
         }catch(IllegalArgumentException|NullPointerException|ClassCastException bad){throw unreadable();}
     }
     static Document configurationRow(Recovery value) {
+        if(value.previous().chainId().matches("srs-clear-[a-f0-9]{64}")) {
+            var row=new Document("_id",id(value.previous().scope(),value.previous().captureId())).append("formatVersion",4)
+                    .append("original",row(value.previous().birth()))
+                    .append("currentRecovery",new Document("formatVersion",2).append("operationId",value.replacement().preparationId())
+                            .append("planHash",value.planHash()).append("previous",row(value.previous())).append("replacement",row(value.replacement()))
+                            .append("phase",value.phase().name()));
+            requireBytes(row,8192);return row;
+        }
+        return legacyConfigurationRow(value);
+    }
+    /** Unchanged legacy wire form; a clear predecessor remains invalid to its original reader. */
+    static Document legacyConfigurationRow(Recovery value) {
         var row=row(value.replacement().birth());row.put("formatVersion",2);
         row.put("currentRecovery",new Document("formatVersion",1).append("operationId",value.replacement().preparationId())
                 .append("planHash",value.planHash()).append("previousPhysicalChain",value.previous().chainId())
                 .append("previousPreparationId",value.previous().preparationId()).append("physicalChain",value.replacement().chainId()).append("phase",value.phase().name()));
         return row;
+    }
+    private static Recovery taggedRecovery(Document row) {
+        try {
+            requireBytes(row,8192);
+            if(!Integer.valueOf(4).equals(row.get("formatVersion")) || !row.keySet().equals(Set.of("_id","formatVersion","original","currentRecovery")))throw unreadable();
+            var original=birth(row.get("original",Document.class));var control=row.get("currentRecovery",Document.class);
+            if(control==null || !control.keySet().equals(Set.of("formatVersion","operationId","planHash","previous","replacement","phase"))
+                    || !Integer.valueOf(2).equals(control.get("formatVersion")))throw unreadable();
+            var previous=clearAnnex(control.get("previous",Document.class));
+            var replacement=replacementAnnex(control.get("replacement",Document.class));
+            if(!original.equals(previous.birth()) || !original.equals(replacement.birth()) || !row.get("_id").equals(id(original.scope(),original.captureId()))
+                    || !replacement.preparationId().equals(control.getString("operationId")))throw unreadable();
+            var result=new Recovery(previous,replacement,control.getString("planHash"),RecoveryPhase.valueOf(control.getString("phase")));
+            if(!configurationRow(result).equals(row))throw unreadable();return result;
+        }catch(IllegalArgumentException|ClassCastException|NullPointerException invalid){throw unreadable();}
+    }
+    static void requireBytes(Document row,int limit) {
+        if(MongoCaptureExternalRetirements.bytes(row)>limit)throw new TapstateException(IoError.CAPTURE_RETIREMENT_CAPACITY,
+                Map.of("capture","capture-preparation","operation","encoding","reason","preparation-bson-bytes"),null);
     }
     static String replacementChain(CapturePreparation original,String operationId) {
         if(!UUID.fromString(operationId).toString().equals(operationId))throw new IllegalArgumentException("invalid replacement operation");

@@ -317,7 +317,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(scope, owner.original.cache(),
                     owner.memberStorage.sourceViews(), owner.configuration.capturePreparations(),
                     owner.original.cache().capturePreparations(scope, owner.memberStorage::requireNode), owner.configuration.requiredNotes(),owner::recoveryPinned,boundedLoads,
-                    owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull),
+                    owner.configuration.rebuilds().guardedBy(owner.memberStorage::requireNode)::completedFull,
+                    owner.configuration.captureOpeningJournal()),
                     new ScopedPipelineCaptureCoordinator.Execution(node::currentFence, authorization, ownership,
                             cluster.getWorkloadClaimRenewInterval(), owner.memberStorage::requireNode, clock), runtime, buffer, connectors);
         }
@@ -325,6 +326,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ConnectorProvisioner connectors,Engine engine,PipelineCaptureCoordinator captures,ExecutionAuthorization authorization) {
             return new NativePipelineRecovery(owner.configuration,owner.original.preparation().authScope(),owner.port,preparer,
                     connectors,engine,captures,authorization,owner.original::requireActive,owner::available,owner.original.cache());
+        }
+        @Bean(destroyMethod="close") NativeCaptureExternalRetirement nativeCaptureExternalRetirement(NativeBusinessContext owner,
+                NodeSessionLease node,ConnectorProvisioner connectors,HazelcastInstance member,PipelineCaptureCoordinator captures) {
+            var scope=owner.original.preparation().businessScope();
+            return new NativeCaptureExternalRetirement(scope,owner.configuration.captureExternalRetirements(),
+                    owner.original.cache().capturePreparations(scope,owner.memberStorage::requireNode).explicitClear(),
+                    owner.configuration.requiredNotes(),connectors,node::currentFence,owner.memberStorage::requireNode,member,(ScopedPipelineCaptureCoordinator)captures);
         }
         @Bean io.tapstate.core.lifecycle.ParallelismBudget parallelismBudget(org.springframework.core.env.Environment environment) {
             return new DataPlaneActuationConfiguration().parallelismBudget(
@@ -352,12 +360,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean ArtifactMutationService.PipelineDeletion nativePipelineDeletion(NativeBusinessContext owner,
                 PipelineActuationOwnership ownership, NodeSessionLease node, Engine engine, EngineLifecycleActuator actuator,
-                PipelineCaptureCoordinator captures, HazelcastInstance member, HazelcastExecutionPlans plans, ConnectorProvisioner connectors) {
+                PipelineCaptureCoordinator captures, HazelcastInstance member, HazelcastExecutionPlans plans, ConnectorProvisioner connectors,
+                NativeCaptureExternalRetirement external) {
             if (!(captures instanceof ScopedPipelineCaptureCoordinator nativeCaptures)) throw ThreeLayerStorePort.refused();
             HazelcastOperatorReadiness.bindRetirement(member,nativeCaptures,owner.memberStorage::requireNode);
             return new NativePipelineDeletion(owner.configuration,owner.original.cache(),owner.original.preparation().businessScope(),
                     ownership,() -> node.currentFence().orElseThrow(ThreeLayerStorePort::refused),owner.memberStorage::requireNode,
-                    engine,actuator,new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,connectors);
+                    engine,actuator,new HazelcastOperatorReadiness(member,Duration.ofSeconds(30)),plans,connectors,external);
         }
         @Bean(destroyMethod = "close") NativeSharedSrsRecovery nativeSharedSrsRecovery(NativeBusinessContext owner,
                 PipelineActuationOwnership ownership,NodeSessionLease node,Engine engine,EngineLifecycleActuator actuator,
@@ -403,7 +412,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,
-                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures) {
+                ConnectorProvisioner connectors, Engine engine, PipelineCaptureCoordinator captures,
+                NativeCaptureExternalRetirement externalRetirement) {
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
@@ -419,7 +429,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                 || manifest.isEmpty() || !job.orElseThrow().operatorManifest().equals(manifest.orElseThrow()))) throw ThreeLayerStorePort.refused();
                         if (manifest.isPresent() && manifest.orElseThrow().executionIdentity() instanceof ExecutionFence original
                                 && captures.forRun(request.originalScope(), request.originalClaim(), original).isCapturing(request.originalScope().pipelineId())) throw ThreeLayerStorePort.refused();
-                    }, cluster.getWorkloadClaimTtl(), clock);
+                    }, cluster.getWorkloadClaimTtl(), clock,externalRetirement::relinquished);
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
                         owner.memberStorage.requireNode(); if (!ownership.proveClaim(original.scope(), command)) throw ThreeLayerStorePort.refused();

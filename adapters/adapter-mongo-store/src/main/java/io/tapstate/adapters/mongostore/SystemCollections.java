@@ -260,6 +260,8 @@ public enum SystemCollections {
             new IndexSpec(List.of("_id.scope.clusterId","_id.scope.bindingVersion","_id.scope.cacheIncarnation","_id.scope.pipelineId","_id.scope.stateGeneration"),false,"sink_preparation_scope")),
     CAPTURE_PREPARATIONS("capture_preparations", Database.CONFIG, MongoCaptureStatePreparations.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("_id.clusterId","_id.bindingVersion","_id.capture"),false,"capture_preparation_history")),
+    CAPTURE_EXTERNAL_RETIREMENTS("capture_external_retirements", Database.CONFIG,
+            MongoCaptureExternalRetirements.class, Strategy.MIGRATED, 1),
     CACHE_SNAPSHOT_ORDERS("snapshot_orders",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1),
     CACHE_SNAPSHOT_COUNTS("snapshot_counts",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1,
             new IndexSpec(List.of("_id.scope"),false,"snapshot_scope")),

@@ -31,6 +31,7 @@ final class MongoSrsRecoveryControls {
     static Optional<Control> read(Document root) {
         try {
             if (root == null) throw unreadable();
+            root = MongoCaptureClearControls.ordinary(root);
             if (!root.containsKey("recoveryControl")) {
                 if (!Integer.valueOf(1).equals(root.get("formatVersion"))) throw unreadable();
                 return Optional.empty();
@@ -47,6 +48,7 @@ final class MongoSrsRecoveryControls {
     }
 
     static Document originalControlRoot(Document root) {
+        root = MongoCaptureClearControls.ordinary(root);
         var control = read(root);
         if (control.isEmpty()) return root;
         var original = new Document(root);
@@ -125,7 +127,7 @@ final class MongoSrsRecoveryControls {
         return result;
     }
 
-    private static Object canonical(Object value) {
+    static Object canonical(Object value) {
         if (value == null || value instanceof String || value instanceof Boolean || value instanceof Integer || value instanceof Long) return value;
         if (value instanceof Date date) return List.of("date-millis", date.getTime());
         if (value instanceof List<?> values) return values.stream().map(MongoSrsRecoveryControls::canonical).toList();

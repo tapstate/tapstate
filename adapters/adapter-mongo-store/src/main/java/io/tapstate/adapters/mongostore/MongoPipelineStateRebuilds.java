@@ -312,6 +312,13 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         if (!(original instanceof Pending pending)) throw fenced();
         pending.owner.requirePending(pending);
     }
+    static void requireOriginalInTransaction(MongoClient client,MongoDatabase database,ClientSession session,
+            PipelineRebuildPreparation original) {
+        if(!(original instanceof Pending pending) || pending.owner.client!=client
+                || !pending.owner.database.getName().equals(database.getName()))throw fenced();
+        var retained=pending.owner.retained(pending.request,pending.hash,pending.owner.requireOriginal(session,pending.request));
+        if(!encode(retained).equals(encode(pending)))throw fenced();
+    }
 
     static void requireOriginalActive(PipelineRebuildPreparation original) {
         if (!(original instanceof Pending pending)) throw fenced();
@@ -412,7 +419,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return CanonicalHash.ofText(JsonWriter.write(new Document("targetInputs", MongoPipelineSourcePreparations.encode(inputs))
                 .append("dependencyHashes", new java.util.TreeMap<>(dependencies))));
     }
-    private static Document claim(WorkloadClaimFence claim) {
+    static Document claim(WorkloadClaimFence claim) {
         return new Document("clusterId", claim.key().clusterId()).append("pipelineId", claim.key().resourceId())
                 .append("nodeId", claim.owner().nodeId()).append("bootId", claim.owner().bootId())
                 .append("claimGeneration", claim.claimGeneration()).append("executionGeneration", claim.executionGeneration())
