@@ -348,6 +348,7 @@ class NativeValidationOwnerReservationsIT {
         volatile Runnable localGuard = () -> {};
         volatile NativeValidationOwnerReservations.Startup startup=(saved,spec)->NativeValidationOwnerReservations.StartupGate.ready();
         Fixture() { this(64, 128); }
+        Fixture(int cooperativeThreads){this(64,128,System::nanoTime,false,Duration.ofSeconds(30),cooperativeThreads);}
         Fixture(Duration ownerTtl){this(64,128,System::nanoTime,false,ownerTtl);}
         Fixture(boolean peers){this(64,128,System::nanoTime,peers);}
         Fixture(int maxPipelines, int maxOperations) { this(maxPipelines, maxOperations, System::nanoTime); }
@@ -356,6 +357,9 @@ class NativeValidationOwnerReservationsIT {
             this(maxPipelines,maxOperations,handoffClock,peers,Duration.ofSeconds(30));
         }
         Fixture(int maxPipelines,int maxOperations,LongSupplier handoffClock,boolean peers,Duration ownerTtl){
+            this(maxPipelines,maxOperations,handoffClock,peers,ownerTtl,4);
+        }
+        Fixture(int maxPipelines,int maxOperations,LongSupplier handoffClock,boolean peers,Duration ownerTtl,int cooperativeThreads){
             this.ownerTtl=ownerTtl;
             this.maxPipelines = maxPipelines; this.maxOperations = maxOperations;
             this.handoffClock = handoffClock;
@@ -369,7 +373,7 @@ class NativeValidationOwnerReservationsIT {
             try (var schema = MongoConfigurationDomain.prepareValidationSchema(settings, "cluster", UUID.randomUUID())) { schema.prepareCache(cache); while (!schema.advance(20).ready()) {} }
             long nodeAskedAt = System.nanoTime();
             node = cache.workloadClaims(scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"), new WorkloadOwner("node", "boot"), 1, Duration.ofMinutes(5)).claim();
-            var config = new Config().setClusterName("native-owner-" + suffix); config.getJetConfig().setEnabled(true).setCooperativeThreadCount(4);
+            var config = new Config().setClusterName("native-owner-" + suffix); config.getJetConfig().setEnabled(true).setCooperativeThreadCount(cooperativeThreads);
             config.addExecutorConfig(new com.hazelcast.config.ExecutorConfig(ValidationOwnerRouter.EXECUTOR).setPoolSize(2).setQueueCapacity(16));
             config.getMemberAttributeConfig().setAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE, "node").setAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE, "boot");
             config.setProperty("hazelcast.logging.type", "none").setProperty("hazelcast.phone.home.enabled", "false").setProperty("hazelcast.shutdownhook.enabled", "false")
@@ -389,7 +393,7 @@ class NativeValidationOwnerReservationsIT {
                     new ValidationTaskSpec.Table("input", "input", "source", null, "orders", "model", "codec"),
                     new ValidationTaskSpec.Table("out", "views", "target", null, "orders", "model", "codec"), new ValidationTaskSpec.Keys("confirmed", keys, keys))));
             tasks.create(new ValidationTaskStore.Create(task, comparison, ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1000), UUID.randomUUID()));
-            resources = process.bind("cluster", "node", "boot", 4, () -> {}); owners = owner(resources);
+            resources = process.bind("cluster", "node", "boot", cooperativeThreads, () -> {}); owners = owner(resources);
         }
         ValidationOwnerRouter.Request request(String mode, long sequence) { return new ValidationOwnerRouter.Request("flow", "task", task.generation(), 1, sequence, mode, UUID.randomUUID(), UUID.randomUUID().toString()); }
         NativeValidationOwnerReservations owner(ValidationMemberResources.Member resources) {

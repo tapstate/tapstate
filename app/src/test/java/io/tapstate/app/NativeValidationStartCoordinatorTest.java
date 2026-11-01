@@ -674,12 +674,17 @@ class NativeValidationStartCoordinatorTest {
     }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
-    @Timeout(30) void stoppingAClosedOriginalAfterMemoEvictionRetainsRetriesUntilDrain(boolean unknownReply)throws Exception{
+    @Timeout(30) void stoppingAClosedOriginalAfterMemoEvictionRetainsRetriesUntilDrain(boolean unknownReply)throws Exception{closedOriginalStopRetries(unknownReply,2);}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    @Timeout(30) void threeCountFramesCannotStarveAnOriginalOwnerStopRetry(boolean unknownReply)throws Exception{closedOriginalStopRetries(unknownReply,3);}
+    private void closedOriginalStopRetries(boolean unknownReply,int retainedFrames)throws Exception{
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
-            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();
+            var resources=process.bind("cluster","a","boot-a",retainedFrames==3?8:2,()->{});var configuration=configuration();
             var current=new AtomicReference<>(snapshot("flow","task"));var drained=new AtomicBoolean();
-            var activations=new AtomicInteger();var stops=new AtomicInteger();var original=new AtomicReference<ValidationOperation>();
-            when(configuration.validationTasks(()->{}).read("flow","task")).thenAnswer(call->Optional.of(current.get()));
+            var forbiddenSnapshot=new AtomicBoolean();var activations=new AtomicInteger();var stops=new AtomicInteger();var original=new AtomicReference<ValidationOperation>();
+            when(configuration.validationTasks(any()).read("flow","task")).thenAnswer(call->{
+                if(forbiddenSnapshot.get())throw new AssertionError("Automatic scalar STOP cannot materialize a task snapshot");return Optional.of(current.get());});
             for(String node:List.of("a","b"))routing.commands.put(node,command->{
                 assertThat(command.request().command()).isEqualTo(original.get().command());
                 if(command.action()==ValidationOwnerRouter.Action.ACTIVATE){
@@ -701,11 +706,12 @@ class NativeValidationStartCoordinatorTest {
                 var op=operation(coordinator.context());original.set(op);
                 try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.ACCEPTED);}
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->activations.get()==1&&entryCount(coordinator)==0&&resources.snapshot().metadataFrames()==0);
-                var retained=resources.admitRetainedMetadata(2);
+                var retained=new ArrayList<ValidationMemberResources.Metadata>();for(int frame=0;frame<retainedFrames;frame++)retained.add(resources.admitRetainedMetadata());
                 try{
                     try(var response=coordinator.stop(op)){
                         assertThat(response.value().drain()).isEqualTo(unknownReply?ValidationOperation.Drain.UNKNOWN:ValidationOperation.Drain.NOT_DRAINED);
                     }
+                    if(retainedFrames==3)forbiddenSnapshot.set(true);
                     assertThat(entryCount(coordinator)).isOne();
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->stops.get()>=2);
                     assertThat(entryCount(coordinator)).isOne();
@@ -714,19 +720,24 @@ class NativeValidationStartCoordinatorTest {
                         var finished=new CountDownLatch(1);foreground.execute(finished::countDown);
                         assertThat(finished.await(2,TimeUnit.SECONDS)).isTrue();
                     }
-                }finally{retained.forEach(ValidationMemberResources.Metadata::close);}
-                assertThat(entryCount(coordinator)).isOne();drained.set(true);
+                    if(retainedFrames==3){drained.set(true);org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->entryCount(coordinator)==0);assertThat(resources.snapshot().metadataFrames()).isEqualTo(3);}
+                }finally{forbiddenSnapshot.set(false);retained.forEach(ValidationMemberResources.Metadata::close);}
+                if(retainedFrames==2)assertThat(entryCount(coordinator)).isOne();drained.set(true);
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->entryCount(coordinator)==0&&resources.snapshot().metadataFrames()==0);
                 assertThat(activations).hasValue(1);
                 assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
             }
         }
     }
-    @Test @Timeout(30) void anOwnerlessManualStopRecoversItsOriginalReceiptWithoutMoreClientCalls()throws Exception{
+    @Test @Timeout(30) void anOwnerlessManualStopRecoversItsOriginalReceiptWithoutMoreClientCalls()throws Exception{ownerlessStopRetries(2);}
+    @Test @Timeout(30) void threeCountFramesCannotStarveAnOwnerlessStopReceiptRetry()throws Exception{ownerlessStopRetries(3);}
+    private void ownerlessStopRetries(int retainedFrames)throws Exception{
         var visible=new AtomicBoolean();var receiptReads=new AtomicInteger();var stops=new CountDownLatch(1);
         var receivers=ConcurrentHashMap.<String>newKeySet();var original=new AtomicReference<ValidationOperation>();
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
-            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            var forbiddenSnapshot=new AtomicBoolean();var configuration=configuration();
+            var saved=snapshot("flow","task");when(configuration.validationTasks(any()).read("flow","task")).thenAnswer(call->{if(forbiddenSnapshot.get())throw new AssertionError("Original STOP receipt retry cannot load a task snapshot");return Optional.of(saved);});
+            var resources=process.bind("cluster","a","boot-a",retainedFrames==3?8:2,()->{});
             for(String node:List.of("a","b")){
                 routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
                 routing.receipts.put(node,request->{
@@ -739,14 +750,14 @@ class NativeValidationStartCoordinatorTest {
                     stops.countDown();return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STOPPED",false,false,false,true,true,null);
                 });
             }
-            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{})){
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
                 var op=operation(coordinator.context());original.set(op);
                 try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.UNKNOWN);}
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()==1&&resources.snapshot().metadataFrames()==0);
-                var retained=resources.admitRetainedMetadata(2);
+                var retained=new ArrayList<ValidationMemberResources.Metadata>();for(int frame=0;frame<retainedFrames;frame++)retained.add(resources.admitRetainedMetadata());
                 try{
                     try(var response=coordinator.stop(op)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);}
-                    assertThat(receiptReads.get()).isPositive();visible.set(true);
+                    assertThat(receiptReads.get()).isPositive();if(retainedFrames==3)forbiddenSnapshot.set(true);visible.set(true);
                     assertThat(stops.await(3,TimeUnit.SECONDS)).as("timer must recover and stop the original without client polling").isTrue();
                     org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(()->{
                         var entries=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(coordinator,"entries");
@@ -758,10 +769,55 @@ class NativeValidationStartCoordinatorTest {
                     assertThat(receivers).hasSize(1);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
                     assertThat(resources.snapshot().metadataFrames()).isLessThanOrEqualTo(3);
                     try(var foreground=resources.admitControl()){var done=new CountDownLatch(1);foreground.execute(done::countDown);assertThat(done.await(2,TimeUnit.SECONDS)).isTrue();}
-                }finally{retained.forEach(ValidationMemberResources.Metadata::close);}
+                }finally{forbiddenSnapshot.set(false);retained.forEach(ValidationMemberResources.Metadata::close);}
             }
         }
     }
+    @Test @Timeout(30) void aBusyStopAttemptCannotRotateItsSuccessorBackBehindIt()throws Exception{
+        var aEntered=new CountDownLatch(1);var aRelease=new CountDownLatch(1);var bStopped=new CountDownLatch(1);
+        var attempts=new ConcurrentHashMap<UUID,AtomicInteger>();var first=new AtomicReference<ValidationOperation>();var second=new AtomicReference<ValidationOperation>();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",8,()->{});var configuration=configuration();
+            when(configuration.validationTasks(any()).read(anyString(),eq("task"))).thenAnswer(call->Optional.of(snapshot(call.getArgument(0),"task")));
+            for(String node:List.of("a","b"))routing.commands.put(node,command->{
+                if(command.action()==ValidationOwnerRouter.Action.ACTIVATE)return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"RUNNING",true,false,false,false,false,null);
+                if(command.action()==ValidationOwnerRouter.Action.STATUS)return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null);
+                assertThat(command.action()).isEqualTo(ValidationOwnerRouter.Action.STOP);int number=attempts.computeIfAbsent(command.request().command(),ignored->new AtomicInteger()).incrementAndGet();
+                if(number==1)return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null);
+                if(command.request().command().equals(first.get().command())){
+                    if(number==2){aEntered.countDown();try{assertThat(aRelease.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
+                    return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null);
+                }
+                assertThat(command.request().command()).isEqualTo(second.get().command());bStopped.countDown();
+                return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STOPPED",true,false,false,true,true,null);
+            });
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                ((ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(coordinator,"stops")).cancel(false);
+                first.set(new ValidationOperation(coordinator.context(),"first","task",GENERATION,1,1,UUID.randomUUID()));
+                second.set(new ValidationOperation(coordinator.context(),"second","task",GENERATION,1,1,UUID.randomUUID()));
+                for(var op:List.of(first.get(),second.get())){
+                    try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0&&resources.snapshot().processReserved().bytes()==2L*1024*1024);
+                }
+                var held=new ArrayList<ValidationMemberResources.Metadata>();for(int frame=0;frame<3;frame++)held.add(resources.admitRetainedMetadata());
+                try{
+                    for(var op:List.of(first.get(),second.get())){
+                        try(var response=coordinator.stop(op)){assertThat(response.value().original()).isEqualTo(op);}
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->attempts.containsKey(op.command())&&resources.snapshot().metadataFrames()==3&&resources.snapshot().processReserved().bytes()==2L*1024*1024);
+                    }
+                    org.springframework.test.util.ReflectionTestUtils.invokeMethod(coordinator,"dispatchStops");assertThat(aEntered.await(2,TimeUnit.SECONDS)).isTrue();
+                    org.springframework.test.util.ReflectionTestUtils.invokeMethod(coordinator,"dispatchStops");aRelease.countDown();
+                    var permits=(Semaphore)org.springframework.test.util.ReflectionTestUtils.getField(process,"originalStopSlots");
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->permits.availablePermits()==1&&resources.snapshot().processReserved().bytes()==2L*1024*1024);
+                    org.springframework.test.util.ReflectionTestUtils.invokeMethod(coordinator,"dispatchStops");
+                    assertThat(bStopped.await(2,TimeUnit.SECONDS)).as("The successor keeps priority through ticks when the original retry permit is busy").isTrue();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->permits.availablePermits()==1&&resources.snapshot().processReserved().bytes()==2L*1024*1024);
+                    try(var foreground=coordinator.read(second.get())){assertThat(foreground.value().drain()).isEqualTo(ValidationOperation.Drain.DRAINED);}
+                }finally{aRelease.countDown();held.forEach(ValidationMemberResources.Metadata::close);}
+            }
+        }finally{aRelease.countDown();}
+    }
+
     @Test @Timeout(30) void sequenceAdvancementCannotPruneAnOwnerlessPendingStop()throws Exception {
         var visible=new AtomicBoolean();var oldCalls=new AtomicInteger();var stopped=new CountDownLatch(1);var original=new AtomicReference<ValidationOperation>();
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){

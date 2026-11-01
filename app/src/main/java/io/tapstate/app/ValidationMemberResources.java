@@ -21,6 +21,7 @@ final class ValidationMemberResources implements AutoCloseable {
     private record Key(String cluster, String node, String boot) {}
     record Snapshot(ValidationLocalBudget.Snapshot data, ValidationLocalBudget.Amount processReserved, int processors, int processorCapacity, int metadataFrames) {}
     private final io.tapstate.core.validation.ValidationMetadataBudget metadata;
+    private final Semaphore originalStopSlots=new Semaphore(1);
     ValidationMemberResources(){this(new io.tapstate.core.validation.ValidationMetadataBudget());}
     ValidationMemberResources(io.tapstate.core.validation.ValidationMetadataBudget metadata){this.metadata=Objects.requireNonNull(metadata); }
     private final Map<Key, State> members = new HashMap<>();
@@ -107,9 +108,11 @@ final class ValidationMemberResources implements AutoCloseable {
         Control admitMaintenanceControl(){
             var frame=admitMaintenanceMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
         }
-        /** Pending stops may run beside retained work while still leaving one foreground frame. */
-        Control admitStopControl(){
-            var frame=admitWorkMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
+        /** Exact original STOP/receipt scalars only; task/spec materialization still needs a metadata frame. */
+        Control admitOriginalStopControl(){
+            require();if(!originalStopSlots.tryAcquire())throw limit("validation.originalStopControls");
+            try{var body=control(null,false);body.released().whenComplete((ignored,failed)->originalStopSlots.release());return body;}
+            catch(RuntimeException|Error failed){originalStopSlots.release();throw failed;}
         }
         /** The request scope, not this worker, retains and eventually returns this exact member's frame. */
         Control admitControl(Metadata frame){frame.requireRetained(this);return control(frame,false);}
@@ -217,7 +220,7 @@ final class ValidationMemberResources implements AutoCloseable {
         private final CompletableFuture<Void> released=new CompletableFuture<>();
         private boolean submitted,retiring,exited,returned;private Throwable bodyFailure;
         private Control(Member member,Metadata frame,Unbound allocation,boolean ownsFrame){this.member=member;this.frame=frame;this.allocation=allocation;this.ownsFrame=ownsFrame;}
-        synchronized void require(){frame.requireRetained(member);if(retiring)throw invalid("resources.controlClosed");}
+        synchronized void require(){if(frame==null)member.require();else frame.requireRetained(member);if(retiring)throw invalid("resources.controlClosed");}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         void execute(Runnable command){
             Objects.requireNonNull(command);

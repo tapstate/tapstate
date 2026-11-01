@@ -323,6 +323,60 @@ class NativeValidationCommandsIT {
             }
         }
     }
+    @Test @org.junit.jupiter.api.Timeout(90) void threeLiveCountRunsDoNotPreventRetryingALostOriginalStop()throws Exception{
+        var reads=new java.util.concurrent.CountDownLatch(3);var stopAttempts=new AtomicInteger();
+        var releases=new java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.CountDownLatch>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(8);var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            var tasks=new LinkedHashMap<String,ValidationReportAdmission.Task>();tasks.put("flow",f.task);
+            for(String id:List.of("count-b","count-c")){
+                var pipe=new io.tapstate.core.model.PipelineResource(id,null,List.of(io.tapstate.core.model.SourceRef.spec("input",false)),null,null,
+                        new io.tapstate.core.model.ServeBlock.Inline("serving",io.tapstate.core.model.FromRef.literal("orders"),List.of(new io.tapstate.core.model.SyncElement("out","views",null,null,null)),null,null),null,null);
+                assertThat(f.configuration.artifacts().create(pipe)).isEqualTo(ArtifactMutation.CREATED);
+                var hashes=new TreeMap<>(f.comparison.dependencyHashes());hashes.remove("flow");hashes.put(id,io.tapstate.core.model.canonical.CanonicalHash.of(pipe));
+                var task=new ValidationReportAdmission.Task("cluster",id,"task",UUID.randomUUID());tasks.put(id,task);
+                assertThat(f.tasks.create(new ValidationTaskStore.Create(task,new ValidationTaskSpec(id,hashes,1,"rules",f.comparison.mappings()),ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            }
+            NativeValidationFullJob.Factory factory=original->{
+                var id=original.spec().task().pipelineId();var release=new java.util.concurrent.CountDownLatch(1);releases.put(id,release);var closed=new AtomicBoolean();var mapping=original.spec().task().mappings().getFirst();
+                return new NativeValidationFullJob.Plan(){
+                    public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
+                        reads.countDown();try{assertThat(release.await(30,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new NativeValidationCancellation("node");}
+                        guard.run();return scalar(mapping.source(),1);
+                    },guard->{guard.run();return scalar(mapping.target(),1);}));}
+                    public boolean drained(){return closed.get();}public void close(){closed.set(true);release.countDown();}
+                };
+            };
+            var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory);
+            Commands delivered=command->{
+                if(command.action()==Action.STOP&&command.request().pipeline().equals("flow")&&stopAttempts.incrementAndGet()==1)return commandUnavailable(command,Outcome.UNKNOWN,null);
+                return commands.execute(command);
+            };
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,delivered,()->{},Duration.ofSeconds(5));
+                var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,f.resources,f.process,()->{})){
+                var operations=new LinkedHashMap<String,io.tapstate.runtime.probe.ValidationOperation>();
+                try{
+                    for(var item:tasks.entrySet()){
+                        var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),item.getKey(),"task",item.getValue().generation(),1,1,UUID.randomUUID());operations.put(item.getKey(),op);
+                        try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                        int admitted=operations.size();await(()->reads.getCount()==3-admitted&&f.resources.snapshot().metadataFrames()==admitted);
+                    }
+                    assertThat(reads.await(15,java.util.concurrent.TimeUnit.SECONDS)).isTrue();await(()->f.resources.snapshot().metadataFrames()==3);
+                    assertThat(f.resources.snapshot().processors()).isEqualTo(3);assertThat(f.member.getJet().getJobs()).hasSize(3);
+                    try(var stopped=coordinator.stop(operations.get("flow"))){assertThat(stopped.value().original()).isEqualTo(operations.get("flow"));}
+                    await(()->stopAttempts.get()>=2&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                    try(var foreground=coordinator.read(operations.get("count-b"))){assertThat(foreground.value().state()).isEqualTo("RUNNING");}
+                    await(()->{try(var observed=coordinator.read(operations.get("flow"))){return "STOPPED".equals(observed.value().state())&&observed.value().drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
+                    for(String id:tasks.keySet())assertThat(f.tasks.read(id,"task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
+                }finally{
+                    releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);
+                    for(var op:operations.values())try{var original=f.tasks.read(op.pipeline(),op.task()).orElseThrow().full().permission();if(original!=null)runs.stop(original.start().run());}catch(io.tapstate.core.common.TapstateException alreadyReaped){}
+                    await(()->f.resources.snapshot().metadataFrames()==0);
+                }
+            }
+        }finally{releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);}
+    }
+
     private static AutoCloseable refuseReportBirth(NativeValidationOwnerReservationsIT.Fixture f){
         var admin=f.raw.getDatabase("admin");
         admin.runCommand(new org.bson.Document("configureFailPoint","failCommand").append("mode","alwaysOn")

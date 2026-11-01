@@ -190,6 +190,27 @@ class ValidationMemberResourcesTest {
             assertThat(member.snapshot().metadataFrames()).isZero();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
         }
     }
+    @Test void threeCountFramesKeepScalarStopAndForegroundAdmissibleUntilTheirOwnBodiesExit()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",8,()->{});var frames=new ArrayList<ValidationMemberResources.Metadata>();var counts=new ArrayList<ValidationMemberResources.Unbound>();
+            try{
+                for(int index=0;index<3;index++){frames.add(member.admitRetainedMetadata());counts.add(member.reserve(new ValidationLocalBudget.Amount(32L*1024*1024,3,2,2),1));}
+                var baseline=member.snapshot().processReserved();var stop=member.admitOriginalStopControl();
+                try{
+                    stop.execute(()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}});
+                    assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();assertThat(member.snapshot().metadataFrames()).isEqualTo(3);
+                    assertThatThrownBy(member::admitOriginalStopControl).isInstanceOf(TapstateException.class);
+                    try(var foreground=member.admitControl()){var done=new CountDownLatch(1);foreground.execute(done::countDown);assertThat(done.await(2,TimeUnit.SECONDS)).isTrue();foreground.released().toCompletableFuture().get(2,TimeUnit.SECONDS);}
+                    stop.close();assertThat(stop.released().toCompletableFuture()).isNotDone();assertThat(member.snapshot().metadataFrames()).isEqualTo(3);
+                    assertThat(member.snapshot().processReserved().bytes()).isEqualTo(baseline.bytes()+4L*1024*1024);
+                }finally{release.countDown();stop.close();stop.released().toCompletableFuture().get(2,TimeUnit.SECONDS);}
+                assertThat(member.snapshot().processReserved()).isEqualTo(baseline);
+                try(var next=member.admitOriginalStopControl()){next.close();next.released().toCompletableFuture().get(2,TimeUnit.SECONDS);}
+            }finally{release.countDown();frames.forEach(ValidationMemberResources.Metadata::close);counts.forEach(ValidationMemberResources.Unbound::close);}
+            assertThat(member.snapshot().metadataFrames()).isZero();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().processors()).isZero();
+        }finally{release.countDown();}
+    }
     @Test void aMinimalWorkerReceiptPreservesFatalDiagnosisPriority()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){
