@@ -86,8 +86,6 @@ final class MongoCapturePreparationFacts {
                     || sequence<1 || sequence==Long.MAX_VALUE || !id(birth.scope(),birth.captureId()).equals(row.get("_id")))throw unreadable();
             String phase=marker.getString("phase");
             if(!Set.of("RESERVED","READY").contains(phase))throw unreadable();
-            if(requireReady && !"READY".equals(phase))throw new TapstateException(IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING,
-                    Map.of("capture",birth.captureId(),"operation",marker.getString("operationId"),"reason","clear-successor-not-ready"),null);
             var previous=new CapturePreparation(birth.scope(),birth.mode(),marker.getString("previousChain"),birth.captureId(),
                     birth.sourceIdentityHash(),marker.getString("previousPreparationId"),birth.canonicalChainId(),birth.birthPreparationId());
             var result=new CapturePreparation(birth.scope(),birth.mode(),marker.getString("nextChain"),birth.captureId(),
@@ -95,6 +93,8 @@ final class MongoCapturePreparationFacts {
             if(!result.preparationId().equals(marker.getString("operationId"))
                     || !result.chainId().equals(MongoCaptureExternalRetirements.clearChain(previous,result.preparationId()))
                     || "READY".equals(phase) && !(marker.get("receiptHash")instanceof String hash && hash.matches("[a-f0-9]{64}")))throw unreadable();
+            if(requireReady && !"READY".equals(phase))throw new TapstateException(IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING,
+                    Map.of("capture",birth.captureId(),"operation",marker.getString("operationId"),"reason","clear-successor-not-ready"),null);
             return result;
         }catch(IllegalArgumentException|NullPointerException|ClassCastException invalid){throw unreadable();}
     }

@@ -9,6 +9,8 @@ import java.util.Map;
 import java.util.List;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /** Golden existing recovery shapes; accepting a new predecessor requires its own format contract. */
 class MongoCaptureSuccessorFactsTest {
@@ -75,6 +77,19 @@ class MongoCaptureSuccessorFactsTest {
         });
         marker.put("phase","READY");marker.put("receiptHash","c".repeat(64));
         assertThat(MongoCapturePreparationFacts.available(row)).isEqualTo(next);
+    }
+    @ParameterizedTest
+    @ValueSource(strings = {"nextPreparationId", "operationId", "nextChain"})
+    void malformedClearCoordinatesAreUnreadableBeforeAReservationCanBeReportedAsPending(String field) {
+        var original=birth();var next=cleared();
+        var marker=new Document("operationId",CLEAR).append("sequence",1L).append("previousChain",original.chainId())
+                .append("previousPreparationId",original.preparationId()).append("nextChain",next.chainId()).append("nextPreparationId",CLEAR)
+                .append("phase","RESERVED").append("receiptHash",null);
+        marker.put(field,field.equals("operationId")?BIRTH:"invalid");
+        var row=new Document("_id",MongoCapturePreparationFacts.id(original.scope(),original.captureId())).append("formatVersion",3)
+                .append("original",MongoCapturePreparationFacts.row(original)).append("currentClear",marker);
+        assertThatThrownBy(() -> MongoCapturePreparationFacts.available(row)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
     @Test void malformedTagsAndBudgetsCannotBeReadAsAnotherSupportedShape() {
         for(String damage:List.of("tag","inner-tag","extra","previous-birth","previous-recovery","nested","different-birth","next-clear","operation","hash","phase","id","bytes")) {
