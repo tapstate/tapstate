@@ -519,7 +519,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
     private boolean needed(Owner owner) {
         if(closed.get())return false;
-        if(owner.sessions.stream().anyMatch(original -> driving.get().test(original.pipelineId())))return true;
+        // A retained local session does not prove that its original scoped execution still owns actuation.
+        if(owner.sessions.stream().anyMatch(original -> driving.get().test(original.pipelineId())
+                && execution.authorization().authorized(original)))return true;
         if(owner.prepared.mode()!=CapturePreparation.Mode.SHARED_SRS)return false;
         owner.require();
         for(var member:retainedConsumers(owner)) {
