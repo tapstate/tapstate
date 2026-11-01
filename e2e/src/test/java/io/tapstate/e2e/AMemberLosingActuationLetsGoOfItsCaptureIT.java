@@ -124,6 +124,81 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
         }
     }
 
+    @Test
+    void aNonPurgingStopReleasesTheSupersededMembersCapture() {
+        String sourceUri = SharedMongo.replicaSetUrl("e2e_actuation_stop_source");
+        String targetUri = SharedMongo.replicaSetUrl("e2e_actuation_stop_target");
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+             MongoConfigurationDomain configuration = MongoConfigurationDomain.openExisting(
+                     new MongoConnectionSettings(storage.configurationUri(), null, BOUND));
+             MongoCacheDomain cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(), BOUND, "stop-witness");
+             MongoEndpoints mongo = new MongoEndpoints();
+             StoreDocuments documents = StoreDocuments.nativeSrsAt(storage.cacheUri())) {
+            var claims = cache.workloadClaims(configuration.bindings().cachePreparation().orElseThrow().businessScope());
+            EndpointAddress source = EndpointAddress.uri(sourceUri);
+            EndpointAddress target = EndpointAddress.uri(targetUri);
+            mongo.seed(source, TABLE, List.of(Map.of("id", 1L), Map.of("id", 2L)));
+            try (TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage)) {
+                cluster.awaitBothMembers();
+                ControlPlane control = cluster.first();
+                control.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
+                control.discoverSchema("handoff_src", CONNECTOR, Map.of("uri", sourceUri));
+                control.apply(resources(sourceUri, targetUri));
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                Await.until("the original pipeline to deliver its load", BOUND,
+                        () -> mongo.count(target, TABLE) == 2,
+                        () -> "target rows=" + mongo.count(target, TABLE));
+                Await.until("the target to confirm the original load", BOUND,
+                        () -> {
+                            TableSnapshot snapshot = control.snapshotTables(PIPELINE).get(TABLE);
+                            return snapshot != null && snapshot.landed();
+                        },
+                        () -> "snapshot=" + control.snapshotTables(PIPELINE));
+                Map<String, String> captures = control.captureOwnersOf(PIPELINE);
+                assertThat(captures).hasSize(1);
+                String captureId = captures.keySet().iterator().next();
+                String oldNode = captures.get(captureId);
+                assertThat(control.pipelineControllerOf(PIPELINE)).contains(oldNode);
+                String successor = oldNode.equals(TwoMemberCluster.NODE_A)
+                        ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
+                WorkloadClaimKey capture = new WorkloadClaimKey(
+                        control.clusterId(), WorkloadClaimType.CAPTURE, captureId);
+                WorkloadClaimKey actuation = new WorkloadClaimKey(
+                        control.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, PIPELINE);
+                assertThat(claims.read(capture)).hasValueSatisfying(reading -> {
+                    assertThat(reading.leased()).isTrue();
+                    assertThat(reading.claim().owner().nodeId()).isEqualTo(oldNode);
+                });
+
+                documents.handPipelineTo(control.clusterId(), PIPELINE, oldNode, successor);
+                Instant handedOffLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
+                Await.until("the successor to adopt its actuation claim", BOUND,
+                        () -> claims.read(actuation)
+                                .filter(reading -> reading.claim().owner().nodeId().equals(successor)
+                                        && !reading.claim().leaseUntil().equals(handedOffLease)).isPresent(),
+                        () -> "actuation=" + claims.read(actuation));
+                Instant adoptedLease = claims.read(actuation).orElseThrow().claim().leaseUntil();
+                Await.until("the successor to renew its adopted claim before the stop", BOUND,
+                        () -> claims.read(actuation)
+                                .filter(reading -> reading.claim().owner().nodeId().equals(successor)
+                                        && reading.claim().leaseUntil().isAfter(adoptedLease)).isPresent(),
+                        () -> "actuation=" + claims.read(actuation));
+
+                // Keep the capture records: purge must not manufacture the absence being asserted.
+                control.stop(PIPELINE, false);
+                Await.until("the successor to drive the non-purging stop", BOUND,
+                        () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
+                        () -> "state=" + control.state(PIPELINE));
+                Await.until("the superseded member to release the unused capture without purge", BOUND,
+                        () -> claims.read(capture).filter(reading -> reading.leased()).isEmpty(),
+                        () -> "capture=" + claims.read(capture));
+                assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
+                assertThat(cluster.processCarrying(successor).isAlive()).isTrue();
+                assertThat(mongo.count(target, TABLE)).isEqualTo(2);
+            }
+        }
+    }
+
     private static Map<String, String> resources(String sourceUri, String targetUri) {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("handoff_src.tap.yml", """
