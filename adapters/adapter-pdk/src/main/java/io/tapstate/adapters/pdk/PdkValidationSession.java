@@ -570,12 +570,9 @@ final class PdkValidationSession {
             PdkValidationActivityTask pending = delivery.get();
             if (pending != null) pending.cancel(true);
         }
-        synchronized (stopLock) {
-            PdkConnector opened = connector;
-            // Active initialization may allocate after this stop. The exiting invocation stops again.
-            // Once it exited, close performs the retry and retires the original host handle together.
-            if (opened != null && !queryExited) stop(opened);
-        }
+        // The original query still owns its native result and statement cleanup. Its cancellation
+        // signal and worker interruption must unwind those resources before finish disconnects the
+        // plugin. An interrupt-ignoring invocation keeps its original handle and exit receipt.
     }
 
     private void completeCleanup() {

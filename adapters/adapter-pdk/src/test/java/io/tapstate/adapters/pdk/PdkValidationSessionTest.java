@@ -130,6 +130,15 @@ class PdkValidationSessionTest {
                                 while (!((CountDownLatch)c.getConnectionConfig().get("release")).await(10, TimeUnit.MILLISECONDS)) {}
                                 throw new Exception("lookup tail failed");
                             }
+                            if (mode(c).startsWith("query-cleanup-")) {
+                                signal(c,"cleanupEntered");boolean released=false;
+                                while(!released)try{released=((CountDownLatch)c.getConnectionConfig().get("release")).await(10,TimeUnit.MILLISECONDS);}
+                                    catch(InterruptedException ignored){}
+                                if(((AtomicInteger)c.getConnectionConfig().get("stops")).get()!=0)
+                                    throw new java.sql.SQLException("connection closed before original result cleanup");
+                                count(c,"resultSetsClosed");
+                                if(mode(c).equals("query-cleanup-error"))throw new java.sql.SQLException("independent original query failure");
+                            }
                             if (mode(c).equals("block-query"))
                                 ((CountDownLatch) c.getConnectionConfig().get("release")).await();
                             if (mode(c).equals("abandon")) Thread.currentThread().interrupt();
@@ -154,7 +163,7 @@ class PdkValidationSessionTest {
                     }
                     public void stop(TapConnectionContext c) {
                         loader(); count(c, "stops");
-                        if (!mode(c).equals("held-init")) signal(c, "release");
+                        if (!mode(c).equals("held-init")&&!mode(c).startsWith("query-cleanup-")) signal(c, "release");
                         if (Thread.currentThread().isInterrupted()) count(c, "interruptedStops");
                         if (mode(c).equals("fatal-cleanup") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() == 1)
                             throw new AssertionError("fatal cleanup failed");
@@ -680,6 +689,29 @@ class PdkValidationSessionTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void cancellationUnwindsOriginalQueryResourcesBeforePluginStop(boolean independentFailure)throws Exception{
+        var probe=new Probe("ordered-cleanup",independentFailure?"query-cleanup-error":"query-cleanup-normal");
+        try(var io=Executors.newSingleThreadExecutor();var cursor=scan(probe,io)){
+            value(cursor);assertThat(probe.cleanupEntered.await(3,TimeUnit.SECONDS)).isTrue();var handle=(ValidationReadHandle)cursor;
+            try{
+                cursor.close();
+                assertThat(handle.workersExited().toCompletableFuture()).isNotDone();assertThat(PdkValidationReads.cleanupCompleted(handle).toCompletableFuture()).isNotDone();
+                assertThat(probe.stops).as("Plugin disconnect cannot race the original ResultSet cleanup").hasValue(0);
+            }finally{probe.release.countDown();}
+            Throwable failure=handle.workersExited().handle((ignored,failed)->failed).toCompletableFuture().get(3,TimeUnit.SECONDS);
+            PdkValidationReads.cleanupCompleted(handle).toCompletableFuture().get(3,TimeUnit.SECONDS);
+            assertThat(probe.resultSetsClosed).hasValue(1);assertThat(probe.stops).hasValue(1);
+            if(independentFailure)assertThat(failure).isNotNull().hasStackTraceContaining("independent original query failure");
+            else{
+                if(failure instanceof java.util.concurrent.CompletionException&&failure.getCause()!=null)failure=failure.getCause();
+                assertThat(failure).isInstanceOfSatisfying(TapstateException.class,cancelled->assertThat(cancelled.code()).isEqualTo(ValidationError.READ_CANCELLED));
+                var text=new java.io.StringWriter();failure.printStackTrace(new java.io.PrintWriter(text));assertThat(text.toString()).doesNotContain("connection closed before original result cleanup");
+            }
+        }finally{probe.release.countDown();}
+    }
+
     @Test void failedCleanupRetainsTheSameNativeHandleUntilRetrySucceeds() throws Exception {
         var probe = new Probe("retry", "stop-retry");
         try (var io = Executors.newSingleThreadExecutor()) {
@@ -820,12 +852,15 @@ class PdkValidationSessionTest {
         private final AtomicInteger interruptedStops = new AtomicInteger();
         private final CountDownLatch entered = new CountDownLatch(1);
         private final CountDownLatch release = new CountDownLatch(1);
+        private final CountDownLatch cleanupEntered = new CountDownLatch(1);
+        private final AtomicInteger resultSetsClosed = new AtomicInteger();
         private final AtomicReference<Consumer<List<TapTable>>> discovery = new AtomicReference<>();
         private Probe(String tag, String mode) { this.tag = tag; this.mode = mode; }
         private Map<String, Object> settings() {
-            return Map.of("tag", tag, "mode", mode, "inits", inits, "queries", queries,
+            var settings=new java.util.LinkedHashMap<String,Object>(Map.of("tag", tag, "mode", mode, "inits", inits, "queries", queries,
                     "discoveries", discoveries, "stops", stops, "entered", entered,
-                    "release", release, "discovery", discovery, "interruptedStops", interruptedStops);
+                    "release", release, "discovery", discovery, "interruptedStops", interruptedStops));
+            settings.put("cleanupEntered",cleanupEntered);settings.put("resultSetsClosed",resultSetsClosed);return settings;
         }
     }
 }
