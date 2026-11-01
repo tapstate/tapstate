@@ -36,7 +36,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private final ValidationMemberResources.Unbound registryBudget;
     private final ScheduledFuture<?> stops;
     private final Map<Key,Entry> entries=new LinkedHashMap<>();
-    private long retainedBytes;
+    private long retainedBytes;private int stopRotation;
     private volatile boolean closed;
     NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
             ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active){
@@ -195,6 +195,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             synchronized(entries){
                 if(!context.equals(original.context())||entries.get(Key.of(original))!=entry)return status(original,Outcome.UNKNOWN,null);
                 if(receipt.disposed()){
+                    entry.unsubmitted=true;
                     entry.observed=new Status(original,runId(original),Outcome.ACCEPTED,"STOPPED",false,false,false,false,Drain.DRAINED,receipt.reply().reasonCode(),List.of());
                     return entry.observed;
                 }
@@ -222,10 +223,11 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         }
         return accept(original,verb,fence,latest,true,known);
     }
-    private void dispatchReceipt(Entry entry,Verb verb){
+    private void dispatchReceipt(Entry entry,Verb verb){dispatchReceipt(entry,verb,false);}
+    private void dispatchReceipt(Entry entry,Verb verb,boolean maintenance){
         if(entry.inFlight||closed||entry.owner!=null||entry.receiver==null)return;
         final ValidationMemberResources.Control body;
-        try{body=resources.admitControl();}
+        try{body=maintenance?resources.admitMaintenanceControl():resources.admitControl();}
         catch(TapstateException refused){entry.observed=status(entry.original,Outcome.UNKNOWN,refused.code().code());return;}
         entry.inFlight=true;entry.body=body;
         try{body.execute(()->resolveReceipt(entry,verb,body));}
@@ -271,6 +273,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     /** Only routing memos are removed. Native actors and their independent resource receipts are untouched. */
     private void prune(ValidationOperation current,Fence fence){
+        reclaimExpiredScheduled();
         if(fence==null)return;var iterator=entries.values().iterator();
         while(iterator.hasNext()){
             var previous=iterator.next();var op=previous.original;
@@ -324,7 +327,12 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                 if(!checked.eligible()){publish(entry,checked.refusal());return;}
                 synchronized(entries){if(closed||entry.reservationAttempted)return;entry.reservationAttempted=true;}
                 var attempt=router.reserveAttempt(request(entry.original));var reply=attempt.reply();
-                synchronized(entries){if(attempt.dispatched())entry.receiver=attempt.receiver();}
+                synchronized(entries){
+                    if(attempt.dispatched())entry.receiver=attempt.receiver();
+                    // These router outcomes positively exclude a retained original allocation.
+                    entry.unsubmitted=!attempt.dispatched()||reply.outcome()==ValidationOwnerRouter.Outcome.CAPACITY
+                            ||reply.outcome()==ValidationOwnerRouter.Outcome.REDIRECT;
+                }
                 require();entry.body.require();
                 if(reply.outcome()!=ValidationOwnerRouter.Outcome.ACCEPTED){publish(entry,status(entry.original,outcome(reply.outcome()),reply.reasonCode()));return;}
                 var receiver=reply.receiver();
@@ -392,13 +400,33 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         stops.cancel(false);member.getUserContext().remove(BINDING,this);owned.forEach(ValidationMemberResources.Control::close);registryBudget.close();
     }
     private static final class Entry {
-        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,stop;
+        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,unsubmitted,stop;
         ValidationOwner owner;ValidationOwnerRouter.Receiver receiver;ValidationMemberResources.Control body;boolean retryStart;
         Entry(ValidationOperation original,long bytes,java.time.Instant latest){this.original=original;this.bytes=bytes;this.latest=latest;observed=status(original,Outcome.PENDING,null);}
     }
+    /** Entry-context routing memos are not native actors or durable occurrence history. */
+    private void reclaimExpiredScheduled(){
+        var now=clock.instant();var iterator=entries.values().iterator();
+        while(iterator.hasNext()){
+            var entry=iterator.next();
+            if(entry.latest==null||!now.isAfter(entry.latest)||entry.inFlight
+                    ||entry.stop&&entry.observed.drain()!=Drain.DRAINED)continue;
+            boolean disposed=entry.observed.drain()==Drain.DRAINED&&!entry.observed.admitted();
+            if(entry.owner==null&&(!entry.reservationAttempted||entry.unsubmitted)||disposed){
+                iterator.remove();retainedBytes-=entry.bytes;
+            }
+        }
+    }
     private void dispatchStops(){
-        synchronized(entries){if(closed)return;for(var entry:entries.values()){
+        synchronized(entries){if(closed)return;reclaimExpiredScheduled();
+            var ordered=List.copyOf(entries.values());if(ordered.isEmpty())return;
+            int offset=Math.floorMod(stopRotation++,ordered.size());
+            for(int index=0;index<ordered.size();index++){
+            var entry=ordered.get((offset+index)%ordered.size());
             if(entry.stop&&entry.owner!=null&&entry.observed.drain()!=Drain.DRAINED)dispatch(entry,Verb.STOP);
+            else if(entry.latest!=null&&clock.instant().isAfter(entry.latest)&&!entry.inFlight&&entry.owner==null
+                    &&entry.reservationAttempted&&entry.receiver!=null&&!entry.unsubmitted&&entry.observed.drain()!=Drain.DRAINED)
+                dispatchReceipt(entry,entry.stop?Verb.STOP:Verb.READ,true);
             else if(entry.retryStart&&!entry.inFlight){
                 // Coalesce only an explicit START that arrived behind another original control body.
                 entry.retryStart=false;

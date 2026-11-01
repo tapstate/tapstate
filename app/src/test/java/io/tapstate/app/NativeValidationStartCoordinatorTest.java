@@ -163,6 +163,104 @@ class NativeValidationStartCoordinatorTest {
             }
         }finally{if(held.get()!=null)held.get().close();}
     }
+    @Test @Timeout(60) void expiredUnsubmittedScheduledRefusalsCannotExhaustTheUnchangedTaskSequence()throws Exception{
+        var refuse=new AtomicBoolean(true);var held=new AtomicReference<ValidationMemberResources.Unbound>();
+        var bound=new AtomicReference<ValidationMemberResources.Member>();var caller=Thread.currentThread();
+        var now=new AtomicReference<java.time.Instant>(java.time.Instant.parse("2026-11-01T00:00:00Z"));
+        var clock=new java.time.Clock(){
+            public java.time.ZoneId getZone(){return java.time.ZoneOffset.UTC;}
+            public java.time.Clock withZone(java.time.ZoneId zone){return this;}
+            public java.time.Instant instant(){return now.get();}
+        };
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{
+                if(Thread.currentThread()==caller&&StackWalker.getInstance().walk(frames->frames.anyMatch(frame->
+                        frame.getClassName().equals(NativeValidationStartCoordinator.class.getName())&&frame.getMethodName().equals("scheduled")))
+                        &&refuse.compareAndSet(true,false))
+                    held.set(bound.get().reserve(new io.tapstate.runtime.engine.validation.ValidationLocalBudget.Amount(1,64,0,0),0));
+            });bound.set(resources);
+            for(String node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null));
+                routing.commands.put(node,command->new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STARTING",false,true,false,false,false,null));
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{},Duration.ofSeconds(5),clock)){
+                var latest=now.get().plusSeconds(30);ValidationOperation last=null;
+                for(int index=0;index<128;index++){
+                    refuse.set(true);last=operation(coordinator.context());
+                    try(var response=coordinator.startScheduled(last,latest)){
+                        assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.CAPACITY);
+                    }finally{var lease=held.getAndSet(null);if(lease!=null)lease.close();}
+                }
+                try(var response=coordinator.read(last)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.CAPACITY);}
+                assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isZero();
+                now.set(latest.plusSeconds(1));refuse.set(false);var fresh=operation(coordinator.context());
+                try(var response=coordinator.start(fresh)){assertThat(response.value().outcome()).isNotEqualTo(ValidationOperation.Outcome.CAPACITY);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(()->{
+                    try(var response=coordinator.read(fresh)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);}
+                });
+                assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                assertThat(fresh.sequence()).isEqualTo(1);
+            }
+        }finally{var lease=held.get();if(lease!=null)lease.close();}
+    }
+
+    @Test @Timeout(30) void expiredScheduledUnknownHandoffsWaitForTheirOriginalDisposedReceipt()throws Exception{
+        var now=new AtomicReference<java.time.Instant>(java.time.Instant.parse("2026-11-01T00:00:00Z"));
+        var clock=new java.time.Clock(){public java.time.ZoneId getZone(){return java.time.ZoneOffset.UTC;}public java.time.Clock withZone(java.time.ZoneId zone){return this;}public java.time.Instant instant(){return now.get();}};
+        var disposed=new AtomicBoolean();var reads=new AtomicInteger();var activations=new AtomicInteger();var original=new AtomicReference<ValidationOperation>();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            for(String node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+                routing.receipts.put(node,request->{assertThat(request.command()).isEqualTo(original.get().command());reads.incrementAndGet();
+                    return disposed.get()?new ValidationOwnerRouter.LocalReceipt(new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.REJECTED,null,null),true):ValidationOwnerRouter.LocalReceipt.unknown();});
+                routing.commands.put(node,command->{activations.incrementAndGet();throw new AssertionError("Uncertain/disposed starts cannot activate");});
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{},Duration.ofSeconds(5),clock)){
+                var op=operation(coordinator.context());original.set(op);var latest=now.get().plusSeconds(5);
+                try(var response=coordinator.startScheduled(op,latest)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);}
+                now.set(latest.plusSeconds(1));
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->reads.get()>0);
+                assertThat(entryCount(coordinator)).isOne();assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                disposed.set(true);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->entryCount(coordinator)==0&&resources.snapshot().metadataFrames()==0);
+                assertThat(activations).hasValue(0);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+            }
+        }
+    }
+    @Test @Timeout(30) void routineScheduledReceiptRecoveryPreservesForegroundControlHeadroom()throws Exception{
+        var now=new AtomicReference<java.time.Instant>(java.time.Instant.parse("2026-11-01T00:00:00Z"));
+        var clock=new java.time.Clock(){public java.time.ZoneId getZone(){return java.time.ZoneOffset.UTC;}public java.time.Clock withZone(java.time.ZoneId zone){return this;}public java.time.Instant instant(){return now.get();}};
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            for(String node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+                routing.receipts.put(node,request->{entered.countDown();while(release.getCount()!=0)try{release.await();}catch(InterruptedException interrupted){/* The original body retains its frame until exit. */}return ValidationOwnerRouter.LocalReceipt.unknown();});
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{},Duration.ofSeconds(5),clock)){
+                var latest=now.get().plusSeconds(5);
+                try{
+                    for(int index=0;index<4;index++)try(var response=coordinator.startScheduled(operation(coordinator.context()),latest)){
+                        assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);
+                    }
+                    now.set(latest.plusSeconds(1));org.springframework.test.util.ReflectionTestUtils.invokeMethod(coordinator,"dispatchStops");
+                    assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                    assertThat(resources.snapshot().metadataFrames()).isLessThanOrEqualTo(3);
+                    try(var foreground=resources.admitControl()){
+                        var completed=new CountDownLatch(1);foreground.execute(completed::countDown);
+                        assertThat(completed.await(2,TimeUnit.SECONDS)).isTrue();
+                    }
+                }finally{release.countDown();}
+            }
+        }finally{release.countDown();}
+    }
+
+    private static int entryCount(NativeValidationStartCoordinator coordinator){
+        var entries=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(coordinator,"entries");
+        synchronized(entries){return entries.size();}
+    }
+
     @Test @Timeout(30) void aScheduledTimeoutRetainsItsFrameUntilTheClosedContextBodyActuallyExits()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var lookups=new AtomicInteger();
         try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources();var caller=Executors.newSingleThreadExecutor()){
