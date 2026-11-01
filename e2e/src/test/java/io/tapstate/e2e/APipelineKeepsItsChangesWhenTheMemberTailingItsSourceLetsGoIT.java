@@ -130,6 +130,9 @@ class APipelineKeepsItsChangesWhenTheMemberTailingItsSourceLetsGoIT {
                     Await.until("the original shared tail to remain live after its local pipelines clear", HANDOVER,
                             () -> mongo.count(target, TABLE) > beforeExit,
                             () -> "rows=" + mongo.count(target, TABLE) + ", owner=" + remote.captureOwnersOf(remainingPipeline));
+                    assertThat(remote.captureOwnersOf(remainingPipeline).values())
+                            .as("the pre-exit change crossed through the original holder without early takeover")
+                            .containsOnly(holder);
 
                     cluster.processCarrying(holder).kill();
                     Await.until("the remaining joiner's member to take the capture over", HANDOVER,
