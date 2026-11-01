@@ -303,7 +303,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         while(iterator.hasNext()){
             var previous=iterator.next();var op=previous.original;
             if(previous.inFlight||!op.pipeline().equals(current.pipeline())||!op.task().equals(current.task())||!op.taskGeneration().equals(fence.generation()))continue;
-            if(previous.stop&&previous.owner!=null&&previous.observed.drain()!=Drain.DRAINED)continue;
+            if(previous.stop&&(previous.owner!=null||previous.reservationAttempted&&!previous.unsubmitted)&&previous.observed.drain()!=Drain.DRAINED)continue;
             if(fence.closed()||op.sequence()<fence.nextSequence()){iterator.remove();retainedBytes-=previous.bytes;}
         }
     }

@@ -54,6 +54,18 @@ class ValidationRunLifecycleTest {
         f.lifecycle.advance(); assertThat(f.processorsReturned).isEqualTo(1); assertThat(f.dataReturned).isEqualTo(1);
     }
 
+    @Test void explicitStopWinsWhileSuccessfulProgressIsStillBeingCollected()throws Exception {
+        var f=new Fixture();f.lifecycle.advance();f.execution.complete=true;f.execution.processors=true;f.execution.readers=true;
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);var first=new java.util.concurrent.atomic.AtomicBoolean(true);
+        f.execution.beforeProgress=()->{if(first.compareAndSet(true,false)){entered.countDown();try{assertThat(resume.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}};
+        var result=new java.util.concurrent.atomic.AtomicReference<ValidationRunLifecycle.Status>();var failed=new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var worker=Thread.ofPlatform().daemon().start(()->{try{result.set(f.lifecycle.advance());}catch(Throwable failure){failed.set(failure);}});
+        try{assertThat(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();f.lifecycle.stop();}finally{resume.countDown();}
+        worker.join(5000);assertThat(worker.isAlive()).isFalse();assertThat(failed.get()).isNull();
+        assertThat(result.get().state()).isEqualTo(ValidationRunState.STOPPED);assertThat(result.get().retired()).isTrue();assertThat(result.get().drained()).isTrue();
+    }
+
     @Test void completedBusinessWorkCannotRetireBeforeItsOriginalTaskletExits(){
         var f=new Fixture();f.lifecycle.advance();f.execution.complete=true;f.execution.readers=true;
         var waiting=f.lifecycle.advance();
@@ -214,9 +226,10 @@ class ValidationRunLifecycleTest {
         @Override public Mutation terminateLostOwner(LostOwner command) { throw new AssertionError(); }
         final class Work implements ValidationRunLifecycle.Execution {
             int starts; boolean complete, processors, readers, throwStart; final TapstateException failure = unknown();
+            Runnable beforeProgress=()->{};
             @Override public ValidationRunIdentity identity() { return Fixture.this.identity; }
             @Override public void start() { starts++; if (throwStart) throw failure; }
-            @Override public ValidationRunLifecycle.Progress progress() { return new ValidationRunLifecycle.Progress(complete, processors, readers, null); }
+            @Override public ValidationRunLifecycle.Progress progress() { beforeProgress.run();return new ValidationRunLifecycle.Progress(complete, processors, readers, null); }
             @Override public void cancel() {}
         }
     }

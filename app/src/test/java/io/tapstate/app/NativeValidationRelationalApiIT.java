@@ -52,7 +52,7 @@ class NativeValidationRelationalApiIT {
                 schema.prepareCache(cache);while(!schema.advance(20).ready()){}
             }
             try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
-                    "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                    "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--logging.level.io.tapstate.app.NativeValidationOwnerReservations=WARN","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=postgres-pair-http-signing-key")){
                 NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
@@ -184,7 +184,7 @@ class NativeValidationRelationalApiIT {
             if(textOnly)target.getCollection("checked_text_orders").insertMany(List.of(new Document("id","a"),new Document("id","B")));
             target.getCollection("checked_items").insertMany(List.of(item(9,90,"item"),item(11,110,"tail")));
             try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
-                    "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                    "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--logging.level.io.tapstate.app.NativeValidationOwnerReservations=WARN","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
                     "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
                     "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=relational-validation-http-signing-key")){
                 NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);var registrar=child.getBean(ConnectorArtifactRegistrar.class);

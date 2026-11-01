@@ -180,9 +180,9 @@ final class ValidationRunLifecycle {
                         if (progress.failure() != null) fail(progress.failure());
                         // The last guarded tasklet poll must still own its reservation. Normal completion
                         // cannot revoke that guard until the original supplier/Job exit is known.
-                        if (progress.businessComplete() && progress.processorsExited()) {
+                        if (progress.businessComplete() && progress.processorsExited() && stopping.compareAndSet(false,true)) {
                             if (original.identity().mode() != ValidationMode.FULL) throw invalid("run.incrementalCompletion");
-                            desiredComplete = true; stopping.set(true); local.sealPublication();
+                            desiredComplete = true; local.sealPublication();
                         }
                         if (stopping.get()) finish();
                     }

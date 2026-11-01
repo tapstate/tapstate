@@ -762,6 +762,66 @@ class NativeValidationStartCoordinatorTest {
             }
         }
     }
+    @Test @Timeout(30) void sequenceAdvancementCannotPruneAnOwnerlessPendingStop()throws Exception {
+        var visible=new AtomicBoolean();var oldCalls=new AtomicInteger();var stopped=new CountDownLatch(1);var original=new AtomicReference<ValidationOperation>();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();var saved=snapshot("flow","task");var sequence=new AtomicLong(1);
+            var consumedSpec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+            var consumedIdentity=new ValidationRunIdentity(new ValidationOwner("cluster","flow","a","boot-a",3,4,1),"task","other-consumed-original",ValidationMode.FULL,consumedSpec.fingerprint(),1,"direct-full-v1");
+            var consumed=new ValidationReportAdmission.Start(saved.task(),1,1,UUID.randomUUID().toString(),consumedIdentity);
+            when(configuration.validationTasks(any()).read("flow","task")).thenAnswer(call->Optional.of(new ValidationTaskStore.Snapshot(saved.task(),saved.revision(),saved.commandId(),saved.comparison(),saved.settings(),
+                    saved.schedulingRevision(),saved.schedulingCommandId(),false,new ValidationTaskStore.Mode(sequence.get(),sequence.get()==1?null:new ValidationTaskStore.Permission(consumed,ValidationTaskStore.Phase.CLOSED)),saved.incremental())));
+            for(String node:List.of("a","b")){
+                routing.behaviors.put(node,request->{if(request.command().equals(original.get().command()))oldCalls.incrementAndGet();return new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null);});
+                routing.receipts.put(node,request->request.command().equals(original.get().command())&&visible.get()
+                        ?new ValidationOwnerRouter.LocalReceipt(new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null),false):ValidationOwnerRouter.LocalReceipt.unknown());
+                routing.commands.put(node,command->{assertThat(command.action()).isEqualTo(ValidationOwnerRouter.Action.STOP);assertThat(command.request().command()).isEqualTo(original.get().command());stopped.countDown();
+                    return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STOPPED",false,false,false,true,true,null);});
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                var op=operation(coordinator.context());original.set(op);try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->oldCalls.get()==1&&resources.snapshot().metadataFrames()==0);
+                try(var response=coordinator.stop(op)){assertThat(response.value().drain()).isEqualTo(ValidationOperation.Drain.UNKNOWN);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0);
+                var held=new ArrayList<>(resources.admitRetainedMetadata(2));held.add(resources.admitWorkMetadata());
+                try{
+                    sequence.set(2);var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());
+                    try(var response=coordinator.start(next)){assertThat(response.value().original()).isEqualTo(next);}
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==3);
+                    assertThat(entryCount(coordinator)).as("Unknown original STOP remains pinned when another command consumes the sequence").isEqualTo(2);
+                }finally{held.forEach(ValidationMemberResources.Metadata::close);}
+                visible.set(true);assertThat(stopped.await(3,TimeUnit.SECONDS)).as("The original receiver receipt still recovers without another client request").isTrue();
+                assertThat(oldCalls).hasValue(1);
+            }
+        }
+    }
+
+    @Test @Timeout(30) void aLocallyUnsubmittedStopMemoCanBePrunedAfterSequenceAdvancement()throws Exception {
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var paused=new AtomicBoolean();var nextSequence=new AtomicLong(1);
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();var saved=snapshot("flow","task");
+            var consumedSpec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+            var consumedIdentity=new ValidationRunIdentity(new ValidationOwner("cluster","flow","a","boot-a",3,4,1),"task","other-consumed-original",ValidationMode.FULL,consumedSpec.fingerprint(),1,"direct-full-v1");
+            var consumed=new ValidationReportAdmission.Start(saved.task(),1,1,UUID.randomUUID().toString(),consumedIdentity);
+            when(configuration.validationTasks(any()).read("flow","task")).thenAnswer(call->{
+                boolean advancing=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationStartCoordinator.class.getName())&&frame.getMethodName().equals("advance")));
+                if(advancing&&paused.compareAndSet(false,true)){entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
+                return Optional.of(new ValidationTaskStore.Snapshot(saved.task(),1,saved.commandId(),saved.comparison(),saved.settings(),saved.schedulingRevision(),saved.schedulingCommandId(),false,
+                        new ValidationTaskStore.Mode(nextSequence.get(),nextSequence.get()==1?null:new ValidationTaskStore.Permission(consumed,ValidationTaskStore.Phase.CLOSED)),saved.incremental()));
+            });
+            for(var node:List.of("a","b"))routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                var old=operation(coordinator.context());try(var response=coordinator.start(old)){assertThat(response.value().original()).isEqualTo(old);}
+                try{assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();try(var response=coordinator.stop(old)){assertThat(response.value().original()).isEqualTo(old);}}finally{release.countDown();}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0);
+                assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isZero();nextSequence.set(2);
+                var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());try(var response=coordinator.start(next)){assertThat(response.value().original()).isEqualTo(next);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->resources.snapshot().metadataFrames()==0);
+                assertThat(entryCount(coordinator)).as("Positive local non-submission can be reclaimed; uncertain STOP remains covered separately").isEqualTo(1);
+            }
+        }finally{release.countDown();}
+    }
+
     static ValidationOperation operation(ValidationOperation.Context context){return new ValidationOperation(context,"flow","task",GENERATION,1,1,UUID.randomUUID());}
     static MongoConfigurationDomain configuration(){
         var configuration=mock(MongoConfigurationDomain.class);var tasks=mock(ValidationTaskStore.class);var reports=mock(ValidationReports.class);
