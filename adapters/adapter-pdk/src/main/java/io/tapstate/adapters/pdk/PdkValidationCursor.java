@@ -125,7 +125,10 @@ final class PdkValidationCursor implements ValidationReadHandle {
             checkActive();
             if (result == null) throw protocol();
             if (result.getError() != null) {
-                throw new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), result.getError());
+                Throwable reported=result.getError();
+                if(reported instanceof Error fatal)throw fatal;
+                if(reported instanceof TapstateException coded)throw coded;
+                throw new TapstateException(ValidationError.READ_FAILED, Map.of("table", table), reported);
             }
             if (result.getResults() == null) throw protocol();
             for (Map<String, Object> raw : result.getResults()) {

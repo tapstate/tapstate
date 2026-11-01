@@ -722,6 +722,46 @@ class NativeValidationStartCoordinatorTest {
             }
         }
     }
+    @Test @Timeout(30) void anOwnerlessManualStopRecoversItsOriginalReceiptWithoutMoreClientCalls()throws Exception{
+        var visible=new AtomicBoolean();var receiptReads=new AtomicInteger();var stops=new CountDownLatch(1);
+        var receivers=ConcurrentHashMap.<String>newKeySet();var original=new AtomicReference<ValidationOperation>();
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});
+            for(String node:List.of("a","b")){
+                routing.behaviors.put(node,request->new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.UNKNOWN,null,null));
+                routing.receipts.put(node,request->{
+                    assertThat(request.command()).isEqualTo(original.get().command());receivers.add(node);receiptReads.incrementAndGet();
+                    return visible.get()?new ValidationOwnerRouter.LocalReceipt(new ValidationOwnerRouter.Result(ValidationOwnerRouter.Outcome.ACCEPTED,
+                            new ValidationOwner("cluster","flow",node,"boot-"+node,3,4,1),null),false):ValidationOwnerRouter.LocalReceipt.unknown();
+                });
+                routing.commands.put(node,command->{
+                    assertThat(command.action()).isEqualTo(ValidationOwnerRouter.Action.STOP);assertThat(command.request().command()).isEqualTo(original.get().command());
+                    stops.countDown();return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"STOPPED",false,false,false,true,true,null);
+                });
+            }
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration(),routing.left,resources,process,()->{})){
+                var op=operation(coordinator.context());original.set(op);
+                try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.UNKNOWN);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()==1&&resources.snapshot().metadataFrames()==0);
+                var retained=resources.admitRetainedMetadata(2);
+                try{
+                    try(var response=coordinator.stop(op)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);}
+                    assertThat(receiptReads.get()).isPositive();visible.set(true);
+                    assertThat(stops.await(3,TimeUnit.SECONDS)).as("timer must recover and stop the original without client polling").isTrue();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(()->{
+                        var entries=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(coordinator,"entries");
+                        synchronized(entries){
+                            assertThat(entries).hasSize(1);var observed=(ValidationOperation.Status)org.springframework.test.util.ReflectionTestUtils.getField(entries.values().iterator().next(),"observed");
+                            assertThat(observed.drain()).isEqualTo(ValidationOperation.Drain.DRAINED);
+                        }
+                    });
+                    assertThat(receivers).hasSize(1);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+                    assertThat(resources.snapshot().metadataFrames()).isLessThanOrEqualTo(3);
+                    try(var foreground=resources.admitControl()){var done=new CountDownLatch(1);foreground.execute(done::countDown);assertThat(done.await(2,TimeUnit.SECONDS)).isTrue();}
+                }finally{retained.forEach(ValidationMemberResources.Metadata::close);}
+            }
+        }
+    }
     static ValidationOperation operation(ValidationOperation.Context context){return new ValidationOperation(context,"flow","task",GENERATION,1,1,UUID.randomUUID());}
     static MongoConfigurationDomain configuration(){
         var configuration=mock(MongoConfigurationDomain.class);var tasks=mock(ValidationTaskStore.class);var reports=mock(ValidationReports.class);

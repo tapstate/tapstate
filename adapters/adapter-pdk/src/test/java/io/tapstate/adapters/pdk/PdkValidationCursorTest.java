@@ -114,6 +114,28 @@ class PdkValidationCursorTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    void callbackFatalAndCodedFailuresKeepTheirIdentityThroughExitAndCleanup(boolean fatal)throws Exception{
+        Throwable original=fatal?new OutOfMemoryError("callback fatal fixture"):denied();
+        var cleanup=new IllegalStateException("callback cleanup fixture");var cancelled=new AtomicInteger();
+        try(var worker=Executors.newSingleThreadExecutor()){
+            var cursor=new PdkValidationCursor("table",consumer->{
+                var error=result();error.setError(original);
+                try{consumer.accept(error);}catch(RuntimeException|Error swallowed){/* Callback failure remains authoritative. */}
+            },row->{throw new AssertionError("Error callback cannot deliver rows");},()->{},()->{cancelled.incrementAndGet();throw cleanup;},worker,1,LIMITS);
+            try{
+                worker.submit(()->{}).get(3,TimeUnit.SECONDS);
+                assertThatThrownBy(cursor::next).isSameAs(original);
+                assertThatThrownBy(()->cursor.workersExited().toCompletableFuture().get(3,TimeUnit.SECONDS))
+                        .isInstanceOfSatisfying(java.util.concurrent.ExecutionException.class,failed->assertThat(failed.getCause()).isSameAs(original));
+                cursor.close();assertThatThrownBy(cursor::next).isSameAs(original);
+                assertThat(original.getSuppressed()).contains(cleanup);assertThat(cancelled).hasValue(1);
+                assertThat(cursor.rowsReleased().toCompletableFuture()).isCompleted();assertThat(cursor.availableRowSlots()).isEqualTo(1);
+            }finally{cursor.close();}
+        }
+    }
+
     @Test void fatalAdmissionStillCancelsOnlyItsOwnedQueryResource() {
         var fatal = new AssertionError("fatal admission");
         var cleaned = new AtomicInteger();

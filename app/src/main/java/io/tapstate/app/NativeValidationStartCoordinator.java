@@ -227,7 +227,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private void dispatchReceipt(Entry entry,Verb verb,boolean maintenance){
         if(entry.inFlight||closed||entry.owner!=null||entry.receiver==null)return;
         final ValidationMemberResources.Control body;
-        try{body=maintenance?resources.admitMaintenanceControl():resources.admitControl();}
+        try{body=maintenance?(entry.stop?resources.admitStopControl():resources.admitMaintenanceControl()):resources.admitControl();}
         catch(TapstateException refused){entry.observed=status(entry.original,Outcome.UNKNOWN,refused.code().code());return;}
         entry.inFlight=true;entry.body=body;
         try{body.execute(()->resolveReceipt(entry,verb,body));}
@@ -487,7 +487,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             for(int index=0;index<ordered.size();index++){
             var entry=ordered.get((offset+index)%ordered.size());
             if(entry.stop&&entry.owner!=null&&entry.observed.drain()!=Drain.DRAINED)dispatch(entry,Verb.STOP,false,null,true);
-            else if(entry.latest!=null&&clock.instant().isAfter(entry.latest)&&!entry.inFlight&&entry.owner==null
+            else if((entry.stop||entry.latest!=null&&clock.instant().isAfter(entry.latest))&&!entry.inFlight&&entry.owner==null
                     &&entry.reservationAttempted&&entry.receiver!=null&&!entry.unsubmitted&&entry.observed.drain()!=Drain.DRAINED)
                 dispatchReceipt(entry,entry.stop?Verb.STOP:Verb.READ,true);
             else if(entry.retryStart&&!entry.inFlight){
