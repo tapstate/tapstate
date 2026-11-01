@@ -144,6 +144,7 @@ final class PdkValidationSession {
     private final AtomicReference<PdkValidationActivityTask> delivery = new AtomicReference<>();
     private final Object callbackLock = new Object();
     private boolean queryOpen;
+    private long queryGeneration;
     private final Object stopLock = new Object();
     private volatile PdkConnector connector;
     private final Object activityLock = new Object();
@@ -152,6 +153,7 @@ final class PdkValidationSession {
     private final CompletableFuture<Void> cleanupCompleted = new CompletableFuture<>();
     private int decoding;
     private PdkValidationCursor.Decoder decoder;
+    private int maxNativeFields;
     private final PdkValidationQueryCancellation queryCancellation = new PdkValidationQueryCancellation();
 
     private PdkValidationSession(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
@@ -160,7 +162,8 @@ final class PdkValidationSession {
         this.connectorId = Objects.requireNonNull(connectorId, "connectorId");
         this.artifact = Objects.requireNonNull(artifact, "artifact");
         // Nested settings must already belong to the admitted, fixed run configuration.
-        this.settings = Collections.unmodifiableMap(new LinkedHashMap<>(settings));
+        this.settings = PdkValidationReads.boundedConnection(
+                new io.tapstate.spi.store.ConnectionConfig(connectorId,connectorId,settings),artifact).settings();
         this.codecBinding = Objects.requireNonNull(codecBinding, "codecBinding");
         this.scan = Objects.requireNonNull(scan, "scan");
         this.admission = Objects.requireNonNull(admission, "admission");
@@ -201,7 +204,12 @@ final class PdkValidationSession {
     }
 
     private ValidationReadHandle open(ExecutorService io, int maxInFlightRows, ValidationValues.Limits rowLimits) {
-        var cursor = new PdkValidationCursor(scan.table(), this::read, row -> decoder.decode(project(row)),
+        maxNativeFields=Math.min(rowLimits.nodes(),PdkValidationReads.POSTGRES_NATIVE_FIELDS);
+        var cursor = new PdkValidationCursor(scan.table(), this::read, row -> {
+            var selected=project(row);
+            if(PdkValidationReads.boundedPostgresPages(artifact))requireBoundedPostgresValues(connectorId,selected);
+            return decoder.decode(selected);
+        },
                 this::checkActive, this::cancel, io, maxInFlightRows, rowLimits, queryCancellation);
         cursor.workersExited().whenComplete((ignored, error) -> activityExited(true, error));
         return new PdkValidationReads.ManagedRead() {
@@ -220,6 +228,28 @@ final class PdkValidationSession {
             @Override public CompletionStage<Void> rowsReleased() { return cursor.rowsReleased(); }
             @Override public CompletionStage<Void> cleanupCompleted() { return cleanupCompleted.minimalCompletionStage(); }
         };
+    }
+
+    static void requireBoundedPostgresValues(String connectorId,Map<String,Object> row){
+        // A native array can contradict incomplete model metadata; never enter its expanding codec.
+        for(var entry:row.entrySet())if(entry.getValue() instanceof java.sql.Array)
+            throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",entry.getKey(),
+                    "rule","native-nested-codec-expansion-unproven"),null);
+    }
+
+    private void requirePostgresBufferCapability(){
+        try{
+            var loader=Thread.currentThread().getContextClassLoader();
+            var driver=Class.forName("org.postgresql.Driver",false,loader);
+            var parser=Class.forName("org.postgresql.util.PGPropertyMaxResultBufferParser",false,loader);
+            var method=parser.getMethod("parseProperty",String.class);
+            if(method.getReturnType()!=long.class||!java.lang.reflect.Modifier.isStatic(method.getModifiers())
+                    ||driver.getProtectionDomain().getCodeSource()==null||parser.getProtectionDomain().getCodeSource()==null
+                    ||!driver.getProtectionDomain().getCodeSource().getLocation().equals(parser.getProtectionDomain().getCodeSource().getLocation()))
+                throw new NoSuchMethodException("unproven native result buffer implementation");
+        }catch(ReflectiveOperationException|LinkageError unavailable){
+            throw new TapstateException(ConnectorError.CAPABILITY_MISSING,Map.of("connector",connectorId,"capability","postgres-result-buffer"),unavailable);
+        }
     }
 
     private void activityExited(boolean query, Throwable error) {
@@ -257,8 +287,19 @@ final class PdkValidationSession {
                         Map.of("connector", connectorId, "capability", "query-by-advance-filter"), null);
                 invoke(() -> { opened.connector().init(opened.context()); return null; });
                 checkAlive(opened);
+                boolean paged=PdkValidationReads.boundedPostgresPages(artifact);
+                if(paged)requirePostgresBufferCapability();
                 TapTable model = discover(opened);
                 checkAlive(opened);
+                if(paged)for(var field:model.getNameFieldMap().values()){
+                    var type=PdkTypeMapping.resolve(field.getTapType()).type();
+                    if(type==io.tapstate.core.common.TapstateType.ARRAY||type==io.tapstate.core.common.TapstateType.MAP)
+                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),
+                                "rule","native-nested-codec-expansion-unproven"),null);
+                }
+                if(paged)for(var field:model.getNameFieldMap().values())
+                    if(PdkTypeMapping.resolve(field.getTapType()).type()==io.tapstate.core.common.TapstateType.UNKNOWN)
+                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),"rule","field-model-unknown"),null);
                 var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs());
                 var admittedDecoder = Objects.requireNonNull(admission.prepare(model, codecs), "admitted decoder");
                 decoder = raw -> {
@@ -270,7 +311,11 @@ final class PdkValidationSession {
                     return decoded;
                 };
                 checkAlive(opened);
+                if(paged&&(model.getNameFieldMap()==null||model.getNameFieldMap().size()>maxNativeFields))
+                    throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.nativeFields"),null);
                 if (scan instanceof Metadata) return null;
+                if(paged&&scan.ascendingKeys().isEmpty())throw new TapstateException(ConnectorError.CAPABILITY_MISSING,
+                        Map.of("connector",connectorId,"capability","bounded-query-stable-order"),null);
                 TapAdvanceFilter filter = TapAdvanceFilter.create().batchSize(scan.batchSize());
                 for (String key : scan.ascendingKeys()) filter.sort(SortOn.ascending(key));
                 if (scan instanceof Lookup lookup) filter.match(match(model, codecs, lookup));
@@ -279,20 +324,29 @@ final class PdkValidationSession {
                     scan.projection().forEach(projection::include);
                     filter.projection(projection);
                 }
-                // One complete invocation; callback size is a hint, never an overall row limit or offset.
-                synchronized (callbackLock) { queryOpen = true; }
-                try {
-                    invoke(() -> {
-                        query.query(opened.context(), filter, model, result -> deliver(opened, rows, result));
-                        return null;
-                    });
-                } finally {
-                    synchronized (callbackLock) {
-                        queryOpen = false;
-                        if (delivery.get() != null) failure.record(protocol());
+                int offset=0;
+                for(;;){
+                    if(paged)filter.limit(PdkValidationReads.POSTGRES_PAGE_ROWS).skip(offset);
+                    var received=new java.util.concurrent.atomic.AtomicInteger();
+                    final long generation;
+                    synchronized(callbackLock){queryOpen=true;generation=++queryGeneration;}
+                    try{
+                        invoke(()->{
+                            query.query(opened.context(),filter,model,result->{
+                                if(paged&&result!=null&&result.getResults()!=null
+                                        &&received.addAndGet(result.getResults().size())>PdkValidationReads.POSTGRES_PAGE_ROWS)throw protocol();
+                                deliver(opened,rows,result,generation);
+                            });return null;
+                        });
+                    }finally{
+                        synchronized(callbackLock){queryOpen=false;if(delivery.get()!=null)failure.record(protocol());}
                     }
+                    checkAlive(opened);
+                    if(!paged||received.get()<PdkValidationReads.POSTGRES_PAGE_ROWS)break;
+                    if(offset>Integer.MAX_VALUE-PdkValidationReads.POSTGRES_PAGE_ROWS)
+                        throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.nativeOffset"),null);
+                    offset+=PdkValidationReads.POSTGRES_PAGE_ROWS;
                 }
-                checkAlive(opened);
                 return null;
             });
         } catch (Throwable reported) {
@@ -329,7 +383,7 @@ final class PdkValidationSession {
         return values;
     }
 
-    private void deliver(PdkConnector opened, Consumer<FilterResults> consumer, FilterResults result) {
+    private void deliver(PdkConnector opened, Consumer<FilterResults> consumer, FilterResults result,long generation) {
         PdkValidationActivityTask task = new PdkValidationActivityTask(() -> {
             try {
                 return opened.underLoader(() -> {
@@ -344,7 +398,7 @@ final class PdkValidationSession {
         try {
             synchronized (callbackLock) {
                 checkActive();
-                if (!queryOpen || delivery.get() != null) throw protocol();
+                if (!queryOpen || generation!=queryGeneration || delivery.get() != null) throw protocol();
                 synchronized (activityLock) {
                     if (queryExited || decoding != 0) throw protocol();
                     decoding++;

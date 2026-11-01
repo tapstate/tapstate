@@ -35,7 +35,16 @@ class NativeValidationRelationalApiIT {
 
     @Test @Timeout(180) void mysqlNonBinaryTextKeysAreRefusedDuringPreflight()throws Exception{verify(true,true);}
     private void verify(boolean mysql)throws Exception{verify(mysql,false);}
-    private void verify(boolean mysql,boolean textOnly)throws Exception{
+    @Test @Timeout(180) void postgresWideNativePageIsChargedBeforeQueryAndPreservesAllRows()throws Exception{verify(false,false,true);}
+    private void verify(boolean mysql,boolean textOnly)throws Exception{verify(mysql,textOnly,false);}
+    @Test @Timeout(180) void postgresStricterResultBufferFailsAsIncompleteWithoutChangingSavedSource()throws Exception{verify(false,false,true,true);}
+    private void verify(boolean mysql,boolean textOnly,boolean wide)throws Exception{verify(mysql,textOnly,wide,false);}
+    @Test @Timeout(180) void postgresDuplicateIdentityAcrossNativePagesRetainsExactMultiplicity()throws Exception{verify(false,false,false,false,true);}
+    private void verify(boolean mysql,boolean textOnly,boolean wide,boolean smallerCap)throws Exception{verify(mysql,textOnly,wide,smallerCap,false);}
+    @Test @Timeout(180) void postgresNativeArrayExpansionIsRefusedBeforeQueryButScalarKeysAndCountRemainAvailable()throws Exception{verify(false,false,false,false,false,"array");}
+    @Test @Timeout(180) void postgresJsonbScalarCodecRemainsBoundedWithoutBlockingCountOrKeys()throws Exception{verify(false,false,false,false,false,"json");}
+    private void verify(boolean mysql,boolean textOnly,boolean wide,boolean smallerCap,boolean duplicatePages)throws Exception{verify(mysql,textOnly,wide,smallerCap,duplicatePages,null);}
+    private void verify(boolean mysql,boolean textOnly,boolean wide,boolean smallerCap,boolean duplicatePages,String nested)throws Exception{
         int port=mysql?3306:5432;String kind=mysql?"mysql":"postgres";
         try(var sql=new GenericContainer<>(mysql?"mysql:8.0":"postgres:16").withExposedPorts(port).withStartupTimeout(Duration.ofSeconds(75))){
             if(mysql)sql.withEnv("MYSQL_ROOT_PASSWORD",PASSWORD).withEnv("MYSQL_DATABASE",DB).withEnv("MYSQL_USER","validation").withEnv("MYSQL_PASSWORD",PASSWORD)
@@ -44,6 +53,16 @@ class NativeValidationRelationalApiIT {
                     .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\n",2));
             sql.start();String statement="CREATE TABLE orders (id BIGINT PRIMARY KEY, payload VARCHAR(32), amount BIGINT); INSERT INTO orders VALUES (1,'same',9007199254740993),(2,'two',9007199254740993); "
                     +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
+            if(wide)statement="CREATE TABLE orders (id BIGINT PRIMARY KEY,payload TEXT,amount BIGINT); INSERT INTO orders SELECT n,repeat(chr(30028),20000),9007199254740993 FROM generate_series(1,1000) AS n; "
+                    +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
+            if(duplicatePages)statement="CREATE TABLE orders (id BIGINT PRIMARY KEY,payload VARCHAR(32),amount BIGINT); INSERT INTO orders SELECT n,'same',CASE WHEN n BETWEEN 50 AND 90 THEN 50 ELSE n END FROM generate_series(1,100) AS n; "
+                    +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
+            if(nested!=null){
+                String type=nested.equals("array")?"TEXT[]":"JSONB";
+                String value=nested.equals("array")?"array_fill('a'::text,ARRAY[100000])":"to_jsonb(array_fill('a'::text,ARRAY[100000]))";
+                statement="CREATE TABLE orders(id BIGINT PRIMARY KEY,payload "+type+",amount BIGINT); INSERT INTO orders SELECT n,"+value+",9007199254740993 FROM generate_series(1,2) AS n; "
+                        +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
+            }
             if(mysql)statement+=" CREATE TABLE text_orders (id VARCHAR(32) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci PRIMARY KEY); INSERT INTO text_orders VALUES ('a'),('B');";
             var seeded=mysql?sql.execInContainer("mysql","--protocol=TCP","--host=127.0.0.1","--user=validation","--password="+PASSWORD,"--batch",DB,"-e",statement)
                     :sql.execInContainer("psql","-U","validation","-d",DB,"-c",statement);
@@ -55,11 +74,12 @@ class NativeValidationRelationalApiIT {
                 var ordered=sql.execInContainer("mysql","--protocol=TCP","--host=127.0.0.1","--user=validation","--password="+PASSWORD,"--batch","--skip-column-names",DB,"-e","SELECT id FROM text_orders ORDER BY id");
                 assertThat(ordered.getExitCode()).isZero();assertThat(ordered.getStdout().strip()).isEqualTo("a\nB");
             }
-            exercise(kind,source,textOnly);
+            if(smallerCap)source.put("extParams","?maxResultBuffer=1000000");
+            exercise(kind,source,textOnly,wide,smallerCap,duplicatePages,nested,sql);
         }
     }
 
-    private void exercise(String kind,Map<String,Object> source,boolean textOnly)throws Exception{
+    private void exercise(String kind,Map<String,Object> source,boolean textOnly,boolean wide,boolean smallerCap,boolean duplicatePages,String nested,GenericContainer sql)throws Exception{
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"relational_http","admin",PASSWORD);
         try(var schema=io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
                 new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId(),UUID.randomUUID());
@@ -71,6 +91,17 @@ class NativeValidationRelationalApiIT {
             var target=observer.getDatabase(targetName);
             target.getCollection("checked_orders").insertMany(List.of(new Document("id",1L).append("payload","same").append("amount",9007199254740993L),
                     new Document("id",2L).append("payload","two").append("amount",9007199254740993L)));
+            if(wide){
+                target.getCollection("checked_orders").deleteMany(new Document());
+                var rows=new ArrayList<Document>();var payload=String.valueOf((char)30028).repeat(20000);
+                for(long id=1;id<=1000;id++)rows.add(new Document("id",id).append("payload",payload).append("amount",9007199254740993L));
+                target.getCollection("checked_orders").insertMany(rows);
+            }
+            if(duplicatePages){
+                target.getCollection("checked_orders").deleteMany(new Document());var rows=new ArrayList<Document>();
+                for(long id=1;id<=100;id++)rows.add(new Document("id",id).append("payload","same").append("amount",id>=50&&id<=90?50L:id));
+                target.getCollection("checked_orders").insertMany(rows);
+            }
             if(textOnly)target.getCollection("checked_text_orders").insertMany(List.of(new Document("id","a"),new Document("id","B")));
             target.getCollection("checked_items").insertMany(List.of(item(9,90,"item"),item(11,110,"tail")));
             try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
@@ -100,6 +131,70 @@ class NativeValidationRelationalApiIT {
                                 refused->{assertThat(refused.getStatusCode().value()).isEqualTo(400);assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-text-ordering-unproven");});
                     }
                     assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
+                    return;
+                }
+                if(nested!=null){
+                    if(nested.equals("array"))assertThatThrownBy(()->post(http,write,"evaluate",selection("full_column","FULL_COLUMN")))
+                            .isInstanceOfSatisfying(org.springframework.web.client.HttpClientErrorException.class,refused->{
+                                assertThat(refused.getStatusCode().value()).isEqualTo(400);
+                                assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-nested-codec-expansion-unproven","payload");
+                            });
+                    else{
+                        var input=selection("full_column","FULL_COLUMN");var evaluated=post(http,write,"evaluate",input);
+                        var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                        var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","flow","task","full_column","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString());
+                        var report=runWithFailure(http,write,read,operation);
+                        assertThat(report).containsEntry("terminal","FAILED");assertThat(report.get("result").toString()).startsWith("INCOMPLETE");
+                    }
+                    for(String method:List.of("COUNT","UNIQUE_KEY")){
+                        String task=method.toLowerCase(Locale.ROOT);var input=selection(task,method);var evaluated=post(http,write,"evaluate",input);
+                        var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                        var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","flow","task",task,"taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString());
+                        assertThat(run(http,write,read,operation)).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount","0");
+                    }
+                    assertThat(StoredArtifacts.requireSource(artifacts,"input").config()).isEqualTo(source);
+                    return;
+                }
+                if(duplicatePages){
+                    var input=new LinkedHashMap<String,Object>(selection("unique_key","UNIQUE_KEY"));
+                    var confirmations=new LinkedHashMap<String,Object>((Map<String,Object>)input.get("confirmations"));
+                    confirmations.put("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","amount","target","amount"))));input.put("confirmations",confirmations);
+                    var evaluated=post(http,write,"evaluate",input);
+                    var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                    var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","flow","task","unique_key","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString());
+                    var report=run(http,write,read,operation);assertThat(report).containsEntry("result","COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount","1");
+                    var ref=(Map)report.get("reference");String query="?generation="+ref.get("generation")+"&sequence="+ref.get("sequence");
+                    var path="/api/pipelines/flow/validation-tasks/unique_key/reports/"+ref.get("run")+"/roots";
+                    var roots=get(http,read,path+query);assertThat(roots).containsEntry("total","1");
+                    var detail=get(http,read,path+"/"+((Map)((List)roots.get("items")).getFirst()).get("id")+query);
+                    assertThat(detail.toString()).contains("SOURCE_DUPLICATE","TARGET_DUPLICATE");
+                    var multiplicities=new ArrayList<String>();collectMultiplicity(detail,multiplicities);
+                    assertThat(multiplicities).hasSizeGreaterThanOrEqualTo(2).allMatch("41"::equals);
+                    return;
+                }
+                if(wide){
+                    var input=selection("full_column","FULL_COLUMN");var evaluated=post(http,write,"evaluate",input);
+                    var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                    var operation=new LinkedHashMap<String,Object>(Map.of("context",evaluated.get("context"),"pipeline","flow","task","full_column","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString()));
+                    try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor();var locked=new PostgresTableLock(sql)){
+                        var result=executor.submit(()->smallerCap?runWithFailure(http,write,read,operation):run(http,write,read,operation,Duration.ofSeconds(90)));
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15)).untilAsserted(()->{
+                            var waiting=sql.execInContainer("psql","-U","validation","-d",DB,"-t","-A","-c","SELECT count(*) FROM pg_locks WHERE relation='orders'::regclass AND NOT granted;");
+                            assertThat(waiting.getExitCode()).isZero();assertThat(Integer.parseInt(waiting.getStdout().strip())).isPositive();
+                        });
+                        // The query is blocked before fetching any rows; the immutable run has already paid its native window.
+                        var budget=child.getBean(ValidationMemberResources.Member.class).snapshot();
+                        try{assertThat(budget.data().reserved().bytes()).isGreaterThanOrEqualTo(192L*1024*1024);
+                            assertThat(budget.data().capacity().bytes()).isEqualTo(256L*1024*1024);}
+                        finally{locked.close();}
+                        var report=result.get(90,java.util.concurrent.TimeUnit.SECONDS);
+                        if(smallerCap){
+                            assertThat(report).containsEntry("terminal","FAILED");assertThat(report.get("result").toString()).startsWith("INCOMPLETE");
+                            assertThat(StoredArtifacts.requireSource(artifacts,"input").config()).isEqualTo(source);
+                        }else assertThat(report).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount","0");
+                        assertThat((List<?>)report.get("mappings")).hasSize(2);
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(()->assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().data().runs()).isZero());
+                    }
                     return;
                 }
                 var operations=new LinkedHashMap<String,Map<String,Object>>();var inputs=new LinkedHashMap<String,Map<String,Object>>();
@@ -154,6 +249,33 @@ class NativeValidationRelationalApiIT {
             }finally{for(var name:List.of(targetName,storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))observer.getDatabase(name).drop();}
         }
     }
+    private static void collectMultiplicity(Object value,List<String> counts){
+        if(value instanceof Map<?,?> map){
+            if("occurrences".equals(map.get("name"))&&map.get("value") instanceof Map<?,?> scalar)counts.add(String.valueOf(scalar.get("value")));
+            for(var child:map.values())collectMultiplicity(child,counts);
+        }else if(value instanceof List<?> items)for(var child:items)collectMultiplicity(child,counts);
+    }
+    private static final class PostgresTableLock implements AutoCloseable {
+        private final java.io.PipedOutputStream commands=new java.io.PipedOutputStream();
+        private final java.io.PipedInputStream input;
+        private final java.io.ByteArrayOutputStream output=new java.io.ByteArrayOutputStream();
+        private final com.github.dockerjava.api.async.ResultCallback.Adapter<com.github.dockerjava.api.model.Frame> running;
+        private boolean closed;
+        PostgresTableLock(GenericContainer sql)throws Exception{
+            input=new java.io.PipedInputStream(commands);
+            var docker=org.testcontainers.DockerClientFactory.instance().client();
+            var exec=docker.execCreateCmd(sql.getContainerId()).withAttachStdin(true).withAttachStdout(true).withAttachStderr(true)
+                    .withCmd("psql","-U","validation","-d",DB,"-X","-q","-t","-A","-v","ON_ERROR_STOP=1").exec();
+            running=docker.execStartCmd(exec.getId()).withStdIn(input).exec(new com.github.dockerjava.api.async.ResultCallback.Adapter<com.github.dockerjava.api.model.Frame>(){@Override public void onNext(com.github.dockerjava.api.model.Frame frame){output.writeBytes(frame.getPayload());}});
+            commands.write("BEGIN; LOCK TABLE orders IN ACCESS EXCLUSIVE MODE; SELECT 'locked';\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));commands.flush();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).until(()->output.toString(java.nio.charset.StandardCharsets.UTF_8).contains("locked"));
+        }
+        public void close()throws Exception{
+            if(closed)return;closed=true;
+            commands.write("COMMIT;\n\\q\n".getBytes(java.nio.charset.StandardCharsets.UTF_8));commands.flush();commands.close();
+            assertThat(running.awaitCompletion(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue();running.close();input.close();
+        }
+    }
     private static Document item(long id,long secondary,String payload){return new Document("id",id).append("secondary",secondary).append("alias_id",id).append("alias_secondary",secondary).append("payload",payload);}
     private static Path artifact(String kind){return Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it."+kind+"-jar")));}
     private static Map<String,Object> selection(String task,String method){
@@ -162,10 +284,22 @@ class NativeValidationRelationalApiIT {
         return Map.of("pipelineId","flow","taskId",task,"expectedRevision","0","method",method,"mappings",List.of(
                 Map.of("mappingId","orders","outputId","out","sourceId","input","table","orders"),Map.of("mappingId","items","outputId","out","sourceId","input","table","items")),"confirmations",confirmations);
     }
-    private static Map<String,Object> run(RestClient http,String write,String read,Map<String,Object> operation){
+    private static Map<String,Object> runWithFailure(RestClient http,String write,String read,Map<String,Object> operation){
+        var start=post(http,write,"start",operation);assertThat(start.get("outcome")).isIn("PENDING","ACCEPTED");
+        var completed=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).pollInterval(Duration.ofMillis(100))
+                .ignoreExceptionsMatching(failure->failure instanceof org.springframework.web.client.HttpClientErrorException.NotFound||failure instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests)
+                .untilAsserted(()->{
+                    var report=get(http,read,"/api/pipelines/flow/validation-tasks/"+operation.get("task")+"/reports/"+start.get("run")+"?generation="+operation.get("taskGeneration")+"&sequence="+operation.get("sequence"));
+                    assertThat(report.get("terminal")).isIn("COMPLETED","FAILED","STOPPED");completed.set(report);
+                });
+        return completed.get();
+    }
+    private static Map<String,Object> run(RestClient http,String write,String read,Map<String,Object> operation){return run(http,write,read,operation,Duration.ofSeconds(25));}
+    private static Map<String,Object> run(RestClient http,String write,String read,Map<String,Object> operation,Duration timeout){
         var start=post(http,write,"start",operation);assertThat(start.get("outcome")).isIn("PENDING","ACCEPTED");
         var completed=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();var retried=new java.util.concurrent.atomic.AtomicBoolean();
-        try{org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(25)).pollInterval(Duration.ofMillis(100))
+        try{org.awaitility.Awaitility.await().atMost(timeout).pollInterval(Duration.ofMillis(100))
                 .ignoreExceptionsMatching(failure->failure instanceof org.springframework.web.client.HttpClientErrorException.NotFound||failure instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests).untilAsserted(()->{
                     var current=post(http,read,"progress",operation);assertThat(current.get("original")).isEqualTo(operation);
                     // Passive receipt recovery does not activate. The caller explicitly retries only this original once.

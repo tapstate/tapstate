@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.*;
 /** Serial direct-table ordered pairs, checked and published under the original owner. */
 final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64*1024,8192,32);
-    private static final long READ_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
+    static final long POSTGRES_RESULT_BYTES=PdkValidationReads.POSTGRES_RESULT_BYTES;
+    private static final long METADATA_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
     private final NativeValidationOwnerReservations.Reservation original;
     private final Clock clock;
     private final String nodeId;
@@ -57,6 +58,16 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                     (observation,pair,guard)->check(selected,observation,pair,guard)));
         }
         this.mappings=List.copyOf(mappings);
+        long pairedBytes=0;
+        for(var declared:declarations){
+            var mapping=declared.mapping();
+            pairedBytes=Math.max(pairedBytes,Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId())),rowReadBytes(artifacts.get(mapping.target().sourceId()))));
+        }
+        // The two ordered readers coexist. Grow this original allocation before opening any native context;
+        // the unchanged process slice refuses growth when its complete native window does not fit.
+        var envelope=original.resources().budget().envelope();
+        long needed=Math.addExact(16L*1024*1024,pairedBytes);
+        if(needed>envelope.bytes())original.resources().growTo(new ValidationLocalBudget.Amount(needed,envelope.workers(),envelope.connections(),envelope.reads()),1);
     }
     @Override public List<ValidationFullScan.Mapping> mappings(){return mappings;}
     @Override public Throwable failure(){return failure.get();}
@@ -86,7 +97,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         require();guard.run();awaitClosed(guard);
         var declared=declarations.get(index);var side=source?declared.mapping().source():declared.mapping().target();
         var fields=components(declared.mapping(),source).stream().map(value->value.path().getFirst()).toList();
-        var read=admit();PdkValidationReads.MetadataRead handle=null;
+        var read=admit(METADATA_BYTES);PdkValidationReads.MetadataRead handle=null;
         try{
             var resource=resource(side);var connection=connection(side,resource);
             handle=PdkValidationReads.inspect(connection,artifact(resource),CanonicalHash.of(resource),side.table(),
@@ -118,9 +129,10 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private ValidationReadHandle reader(int index,boolean source,Runnable guard){
         require();guard.run();awaitClosed(guard);
         var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
-        var keys=components(mapping,source);var read=admit();ValidationReadHandle raw=null;
+        var keys=components(mapping,source);var resource=resource(side);var artifact=artifact(resource);
+        var read=admit(rowReadBytes(artifact));ValidationReadHandle raw=null;
         try{
-            var resource=resource(side);var connection=connection(side,resource);var artifact=artifact(resource);
+            var connection=connection(side,resource);
             var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
             Runnable active=()->{require();guard.run();};
             raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW);
@@ -158,8 +170,22 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         finally{consumers.decrementAndGet();releaseWorking();}
     }
 
-    private Read admit(){
-        var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(READ_BYTES,2,1,1));
+    static long rowReadBytes(ConnectorRef artifact){
+        Objects.requireNonNull(artifact);
+        // Native pages bound map cardinality even before decoding rejects an oversized row. The
+        // driver caps each query's raw payload; charge its UTF-16 expansion separately. Map entries
+        // include field/key/scalar overhead for the admitted model, independently of row validity.
+        long mapBytes=Math.multiplyExact((long)PdkValidationReads.POSTGRES_PAGE_ROWS,Math.multiplyExact((long)PdkValidationReads.POSTGRES_NATIVE_FIELDS,256L));
+        long nativeBytes=postgres(artifact)?Math.addExact(Math.multiplyExact(3L,POSTGRES_RESULT_BYTES),mapBytes):0L;
+        return Math.addExact(METADATA_BYTES,nativeBytes);
+    }
+    private static boolean postgres(ConnectorRef artifact){return PdkValidationReads.boundedPostgresPages(artifact);}
+    static ConnectionConfig rowConnection(SourceResource resource,ConnectorRef artifact){
+        return PdkValidationReads.boundedConnection(new ConnectionConfig(resource.id(),resource.connector(),resource.config()),artifact);
+    }
+
+    private Read admit(long bytes){
+        var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(bytes,2,1,1));
         var read=new Read(lease);
         synchronized(reads){reads.add(read);}
         return read;
@@ -228,8 +254,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private boolean full(){return original.spec().method()==ValidationMethod.FULL_COLUMN;}
     private SourceResource resource(ValidationTaskSpec.Table table){return StoredArtifacts.requireSource(saved.artifacts(),table.sourceId());}
     private ConnectorRef artifact(SourceResource resource){var found=artifacts.get(resource.id());if(found==null)throw invalid("artifactScope");return found;}
-    private static ConnectionConfig connection(ValidationTaskSpec.Table table,SourceResource resource){
-        var config=new ConnectionConfig(resource.id(),resource.connector(),resource.config());
+    private ConnectionConfig connection(ValidationTaskSpec.Table table,SourceResource resource){
+        var config=rowConnection(resource,artifact(resource));
         if(table.database()!=null&&!table.database().equals(config.settings().get("database"))
                 ||table.schema()!=null&&!table.schema().equals(config.settings().get("schema")))throw invalid("physicalNamespace");
         return config;

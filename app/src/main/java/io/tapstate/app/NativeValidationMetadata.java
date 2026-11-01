@@ -97,7 +97,7 @@ final class NativeValidationMetadata {
         private Side read(ValidationDirectMappings.Declared declared,boolean source,List<String> fields){
             require();var side=source?declared.mapping().source():declared.mapping().target();
             var resource=StoredArtifacts.requireSource(selected.artifacts(),side.sourceId());var artifact=artifact(resource);
-            var connection=new ConnectionConfig(resource.id(),resource.connector(),resource.config());
+            var connection=method==ValidationMethod.COUNT?new ConnectionConfig(resource.id(),resource.connector(),resource.config()):NativeValidationPdkRows.rowConnection(resource,artifact);
             var probe=method==ValidationMethod.COUNT?member.admitProbe():member.admitProbeWithConsumer();
             synchronized(this){if(closed){probe.close();throw invalid("scopeClosed");}active.add(probe);}
             probe.released().whenComplete((ignored,failed)->{if(failed!=null)record(failed);synchronized(Scope.this){active.remove(probe);}releaseIfDone();});

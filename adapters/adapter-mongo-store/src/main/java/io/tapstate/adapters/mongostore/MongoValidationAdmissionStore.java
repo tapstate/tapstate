@@ -419,7 +419,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
                 .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1)).first();
         if (task == null) return null;
-        return validateTask(task, start.task());
+        var checked = validateTask(task, start.task());
+        if (checked != null) MongoValidationSchema.requireTaskCoverage(database, session, checked);
+        return checked;
     }
     private Document validateTask(Document task, Task expected) {
         return validateTask(task, expected, validation != null || recovery != null);
@@ -446,7 +448,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (Integer.valueOf(2).equals(task.get("formatVersion"))) {
             if (!(modes.get("full", Document.class).get("scheduledAdmission") instanceof Document scheduled)) throw unreadable("scheduled-watermark");
             var watermark = MongoValidationTaskCodec.watermark(scheduled);
-            if (watermark.scopeRevision() != revision || watermark.lastSequence() != null && watermark.lastSequence() >= modes.get("full", Document.class).getLong("nextStartSequence")) throw unreadable("scheduled-scope");
+            if (watermark.scopeRevision() != revision || watermark.lastSequence() != null && watermark.lastSequence() >= modes.get("full", Document.class).getLong("nextStartSequence")
+                    || watermark.lastDue() != null && !ValidationScheduleIdentity.command(expected.clusterId(),expected.pipelineId(),expected.taskId(),expected.generation(),
+                            watermark.scopeRevision(),watermark.lastDue()).equals(watermark.lastCommand())) throw unreadable("scheduled-scope");
             if (modes.get("incremental", Document.class).containsKey("scheduledAdmission")) throw unreadable("scheduled-incremental");
         } else if (modes.get("full", Document.class).containsKey("scheduledAdmission")) throw unreadable("scheduled-legacy");
         bounded(admissionMetadata(task, modes), 16 * 1024);
@@ -500,7 +504,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                     var id = row.get("_id", Document.class);
                     original = new Task(clusterId, pipeline, id.getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration")));
                 } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
-                validateTask(row, original);
+                validateTask(row, original); MongoValidationSchema.requireTaskCoverage(database, session, row);
                 if (recovery == null && tasks.updateOne(session, new Document("_id", row.get("_id")).append("taskGeneration", row.get("taskGeneration"))
                         .append("revision", row.get("revision")).append("modes", row.get("modes")),
                         new Document("$set", new Document("closed", true))).getMatchedCount() != 1) throw unreadable("task-close");
@@ -530,7 +534,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 var row = cursor.next(); Task task;
                 try { task = new Task(cluster, pipeline, row.get("_id", Document.class).getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration"))); }
                 catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
-                validateTask(row, task, true);
+                validateTask(row, task, true); MongoValidationSchema.requireTaskCoverage(database, session, row);
                 for (var selected : ValidationMode.values()) {
                     var held = permission(mode(row, selected));
                     if (held != null && !phase(held).equals("CLOSED") && (currentOwner == null
@@ -554,7 +558,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 var row = cursor.next(); Task task;
                 try { task = new Task(clusterId, current.pipelineId(), row.get("_id", Document.class).getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration"))); }
                 catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
-                validateTask(row, task, true);
+                validateTask(row, task, true); MongoValidationSchema.requireTaskCoverage(database, session, row);
                 for (var mode : ValidationMode.values()) {
                     var held = permission(mode(row, mode));
                     if (held != null && !phase(held).equals("CLOSED")) {

@@ -35,6 +35,16 @@ class PdkValidationSessionTest {
 
     @AfterEach void closeDecoder() { decodeIo.close(); }
 
+    @Test void nativeArrayValuesAreRefusedBeforeAnExpandingCodecCanReadThem(){
+        var calls=new AtomicInteger();
+        var nativeArray=(java.sql.Array)java.lang.reflect.Proxy.newProxyInstance(getClass().getClassLoader(),new Class<?>[]{java.sql.Array.class},
+                (proxy,method,args)->{calls.incrementAndGet();throw new AssertionError("Native array must not be materialized");});
+        assertThatThrownBy(()->PdkValidationSession.requireBoundedPostgresValues("postgres",Map.of("payload",nativeArray)))
+                .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED));
+        assertThat(calls).hasValue(0);
+        assertThatCode(()->PdkValidationSession.requireBoundedPostgresValues("postgres",Map.of("id",1L,"payload","text","bytes",new byte[]{1}))).doesNotThrowAnyException();
+    }
+
     @BeforeAll static void connectorFixture() {
         Path jar = SyntheticJar.compileToJar(fixtureDirectory, "synthetic.ValidationQuery", """
                 package synthetic;

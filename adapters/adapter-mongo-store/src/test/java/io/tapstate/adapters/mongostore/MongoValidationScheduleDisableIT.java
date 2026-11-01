@@ -31,7 +31,9 @@ class MongoValidationScheduleDisableIT {
             var off=new ValidationTaskStore.DisableSchedule(create.task(),1,UUID.randomUUID());
             assertThat(f.tasks.disableSchedule(off)).isEqualTo(ValidationTaskStore.Write.APPLIED);assertThat(f.tasks.disableSchedule(off)).isEqualTo(ValidationTaskStore.Write.DUPLICATE);
             var after=f.read(create.task());assertThat(after.revision()).isEqualTo(2);assertThat(after.settings()).isEqualTo(offSettings);assertThat(after.comparison()).isEqualTo(before.comparison());
-            assertThat(after.full()).isEqualTo(enabled.full());assertThat(after.incremental()).isEqualTo(before.incremental());
+            assertThat(after.full().nextStartSequence()).isEqualTo(enabled.full().nextStartSequence());
+            assertThat(after.full().permission()).isEqualTo(enabled.full().permission());
+            assertThat(after.full().scheduledAdmission()).isEqualTo(new ValidationTaskStore.ScheduledAdmission(2,null,null,null));assertThat(after.incremental()).isEqualTo(before.incremental());
             assertThat(after.schedulingRevision()).isEqualTo(before.schedulingRevision());assertThat(after.schedulingCommandId()).isEqualTo(before.schedulingCommandId());
             var stale=new ValidationReportAdmission.Start(create.task(),1,2,UUID.randomUUID().toString(),accepted.start().run());
             assertThat(accepted.access().admissions().reserve(stale)).isNotIn(ValidationReportAdmission.Reservation.RESERVED,ValidationReportAdmission.Reservation.DUPLICATE);

@@ -22,6 +22,53 @@ import java.util.function.Function;
  * until close, both worker/row lifetime stages and native cleanup complete. No production context or mutable PDK model escapes.
  */
 public final class PdkValidationReads {
+    public static final int POSTGRES_PAGE_ROWS=64;
+    public static final int POSTGRES_NATIVE_FIELDS=8192;
+    public static final long POSTGRES_RESULT_BYTES=16L*1024*1024;
+    /** A native allocation quirk, not connector eligibility or a new read permission. */
+    public static boolean boundedPostgresPages(ConnectorRef artifact){return artifact.className().equals("io.tapdata.connector.postgres.PostgresConnector");}
+    /** Caps this independent utility connection without changing the saved Source or security options. */
+    public static ConnectionConfig boundedConnection(ConnectionConfig original,ConnectorRef artifact){
+        Objects.requireNonNull(original);Objects.requireNonNull(artifact);
+        if(!boundedPostgresPages(artifact))return original;
+        var settings=new LinkedHashMap<String,Object>(original.settings());
+        if(settings.get("databaseUrlPattern")!=null)throw unsupported("databaseUrlPattern","native-result-buffer-unproven");
+        Object ext=settings.get("extParams");
+        if(ext!=null&&!(ext instanceof String))throw unsupported("extParams","native-result-buffer-parameters");
+        // The Java connector consumes this bean property; legacy API schema aliases are not reinterpreted.
+        String value=ext!=null?(String)ext:"";
+        if(value.startsWith("?"))value=value.substring(1);
+        if(value.startsWith(":"))throw unsupported("extParams","native-result-buffer-parameters");
+        var parameters=new ArrayList<String>();long maximum=POSTGRES_RESULT_BYTES;
+        try{
+            for(var parameter:value.split("&")){
+                if(parameter.isEmpty())continue;
+                var pair=parameter.split("=",2);
+                if(java.net.URLDecoder.decode(pair[0],java.nio.charset.StandardCharsets.UTF_8).equals("maxResultBuffer")){
+                    if(pair.length!=2)throw new IllegalArgumentException("missing buffer bound");
+                    maximum=Math.min(maximum,configuredBufferBytes(java.net.URLDecoder.decode(pair[1],java.nio.charset.StandardCharsets.UTF_8)));
+                }else parameters.add(parameter);
+            }
+            if(settings.get("properties") instanceof Map<?,?> properties&&properties.get("maxResultBuffer")!=null)
+                maximum=Math.min(maximum,configuredBufferBytes(String.valueOf(properties.get("maxResultBuffer"))));
+        }catch(IllegalArgumentException|ArithmeticException invalid){throw unsupported("extParams.maxResultBuffer","native-result-buffer-parameters");}
+        parameters.add("maxResultBuffer="+maximum);
+        String bounded="?"+String.join("&",parameters);
+        settings.put("extParams",bounded);
+        return new ConnectionConfig(original.id(),original.connectorId(),settings);
+    }
+    private static long configuredBufferBytes(String value){
+        if(value.strip().equals("-1"))return POSTGRES_RESULT_BYTES;
+        var parsed=java.util.regex.Pattern.compile("([0-9]+)([kKmMgGtT]|p|pct|percent)?").matcher(value.strip());
+        if(!parsed.matches())throw new IllegalArgumentException("unrecognized buffer bound");
+        long amount=Long.parseLong(parsed.group(1));String unit=parsed.group(2)==null?"":parsed.group(2).toLowerCase(java.util.Locale.ROOT);
+        if(amount==0)return 0;
+        if(unit.equals("p")||unit.equals("pct")||unit.equals("percent"))return Math.max(1,Math.multiplyExact(Runtime.getRuntime().maxMemory()/100,Math.min(amount,90)));
+        // Choosing the decimal interpretation never enlarges an existing binary-unit bound.
+        long multiplier=switch(unit){case "k"->1000L;case "m"->1000000L;case "g"->1000000000L;case "t"->1000000000000L;default->1L;};
+        return Math.multiplyExact(amount,multiplier);
+    }
+
     interface ManagedRead extends ValidationReadHandle {
         CompletionStage<Void> cleanupCompleted();
     }
@@ -82,7 +129,7 @@ public final class PdkValidationReads {
 
     /**
      * Construction submits no work; first next starts after the caller owns the lifetime handle.
-     * The independent native scan must return a complete ascending stream, without offset or limit.
+     * The independent scan returns a complete ascending stream. Native bounded pages have no overall result limit.
      */
     public static ValidationReadHandle scan(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
             String table, Binding expected, List<ValidationKeyBinding.Component> keys, boolean fullColumns,

@@ -833,6 +833,42 @@ class MongoValidationTaskStoreIT {
         }
     }
 
+    @Test void reportBirthRefusesLegacyBytesRestoredUnderPositiveScheduledCoverage() {
+        try(var f=new Fixture()) {
+            var create=f.create("flow");f.tasks.create(create);var saved=f.read(create.task());
+            var start=scheduled(saved,java.time.Instant.parse("2026-11-01T00:01:00Z"),1);
+            var admissions=new MongoValidationAdmissionStore(f.configClient,f.configDb,"cluster",()->{});
+            assertThat(admissions.reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            var legacy=f.document(create.task());legacy.put("formatVersion",1);
+            legacy.get("modes",Document.class).get("full",Document.class).remove("scheduledAdmission");
+            f.collection().replaceOne(new Document("_id",legacy.get("_id")),legacy);
+            var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,saved.settings().full().method());
+            assertThatThrownBy(()->admissions.open(new ValidationReportAdmission.Open(start,spec)))
+                    .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.document(create.task())).isEqualTo(legacy);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments()).isZero();
+        }
+    }
+
+    @Test void reportBirthRejectsANoncanonicalScheduledCommandInTheOriginalHeader() {
+        try(var f=new Fixture()) {
+            var create=f.create("flow");f.tasks.create(create);var saved=f.read(create.task());
+            var due=java.time.Instant.parse("2026-11-01T00:01:00Z");var start=scheduled(saved,due,1);
+            var admissions=new MongoValidationAdmissionStore(f.configClient,f.configDb,"cluster",()->{});
+            assertThat(admissions.reserve(start)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            var corrupt=f.document(create.task());
+            corrupt.get("modes",Document.class).get("full",Document.class).put("scheduledAdmission",
+                    MongoValidationTaskCodec.watermark(new ScheduledAdmission(1,due,UUID.fromString("00000000-0000-4000-8000-000000000001"),1L)));
+            f.collection().replaceOne(new Document("_id",corrupt.get("_id")),corrupt);
+            assertThatThrownBy(()->f.read(create.task())).isInstanceOf(TapstateException.class);
+            var spec=new ValidationRunSpec(saved.comparison(),ValidationMode.FULL,saved.settings().full().method());
+            assertThatThrownBy(()->admissions.open(new ValidationReportAdmission.Open(start,spec)))
+                    .isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.document(create.task())).isEqualTo(corrupt);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments()).isZero();
+        }
+    }
+
     @Test void directAdmissionRejectsMalformedWatermarksWithCodedStorageErrors() {
         try(var f=new Fixture()) {
             var create=f.create("flow");f.tasks.create(create);
