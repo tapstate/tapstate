@@ -193,7 +193,7 @@ class NativeValidationCommandsIT {
             }
         }
     }
-    @Test void localMetadataPressureWaitsForTheOriginalQuotaThenSubmitsOneJob()throws Exception{
+    @Test void localMetadataPressureRefusesBeforeAdmissionThenAFreshAttemptSubmitsOneJob()throws Exception{
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
                 var processors=new ValidationProcessorRegistry(f.member,()->{})){
             var prepared=new AtomicInteger();
@@ -204,20 +204,15 @@ class NativeValidationCommandsIT {
                 };};
             try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,
                     new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory),()->{},Duration.ofSeconds(5))){
-                var request=f.request("FULL",1);var reserved=router.reserve(request);assertThat(reserved.outcome()).isEqualTo(Outcome.ACCEPTED);var owner=owner(reserved);
-                var identity=f.owners.original(request,owner).run();
-                var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,request.run(),f.task.generation(),1);
-                try(var first=f.resources.admitMetadata();var second=f.resources.admitMetadata();var third=f.resources.admitMetadata()){
-                    assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(4);
-                    assertThat(router.command(Command.of(Action.ACTIVATE,request,owner)).outcome()).isEqualTo(Outcome.ACCEPTED);
-                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(()->{
-                        var waiting=runs.read(identity);assertThat(waiting.state()).isEqualTo(ValidationRunState.STARTING);assertThat(waiting.controlUnknown()).isTrue();
-                        assertThat(waiting.failure()).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,error->assertThat(error.args()).containsEntry("limit","validation.metadataFrames"));
-                        assertThat(f.tasks.read("flow","task").orElseThrow().full().permission().phase()).isEqualTo(ValidationTaskStore.Phase.OPEN);
-                    });
-                    assertThat(f.configuration.validationReports(()->{}).find(reference)).isEmpty();assertThat(prepared).hasValue(0);
-                    assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
+                try(var first=f.resources.admitMetadata();var second=f.resources.admitMetadata();var third=f.resources.admitMetadata();var fourth=f.resources.admitMetadata()){
+                    var refused=router.reserve(f.request("FULL",1));assertThat(refused.outcome()).isEqualTo(Outcome.CAPACITY);
+                    assertThat(f.tasks.read("flow","task").orElseThrow().full().permission()).isNull();
+                    assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
+                    assertThat(f.owners.readOwner("flow").filter(WorkloadClaimReading::leased)).isEmpty();assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(prepared).hasValue(0);
                 }
+                var request=f.request("FULL",1);var reserved=router.reserve(request);assertThat(reserved.outcome()).isEqualTo(Outcome.ACCEPTED);var owner=owner(reserved);
+                var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,request.run(),f.task.generation(),1);
+                assertThat(router.command(Command.of(Action.ACTIVATE,request,owner)).outcome()).isEqualTo(Outcome.ACCEPTED);
                 await(()->f.configuration.validationReports(()->{}).find(reference).map(report->report.terminal()==ValidationRunState.COMPLETED).orElse(false));
                 assertThat(prepared).hasValue(1);assertThat(f.member.getJet().getJobs()).hasSize(1);
                 assertThat(f.configuration.validationReports(()->{}).history("flow","task",ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(1);
@@ -232,7 +227,7 @@ class NativeValidationCommandsIT {
             try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,
                     new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory),()->{},Duration.ofSeconds(5))){
                 var request=f.request("FULL",1);var reserved=router.reserve(request);var owner=owner(reserved);var identity=f.owners.original(request,owner).run();
-                try(var first=f.resources.admitMetadata();var second=f.resources.admitMetadata();var third=f.resources.admitMetadata()){
+                try(var failure=refuseReportBirth(f)){
                     router.command(Command.of(Action.ACTIVATE,request,owner));
                     await(()->runs.read(identity).controlUnknown());
                     router.command(Command.of(Action.STOP,request,owner));
@@ -328,10 +323,18 @@ class NativeValidationCommandsIT {
             }
         }
     }
+    private static AutoCloseable refuseReportBirth(NativeValidationOwnerReservationsIT.Fixture f){
+        var admin=f.raw.getDatabase("admin");
+        admin.runCommand(new org.bson.Document("configureFailPoint","failCommand").append("mode","alwaysOn")
+                .append("data",new org.bson.Document("failCommands",List.of("insert")).append("namespace",f.configName+".validation_reports").append("errorCode",2)));
+        return ()->admin.runCommand(new org.bson.Document("configureFailPoint","failCommand").append("mode","off"));
+    }
     private static void stopBeforeBirth(NativeValidationOwnerReservationsIT.Fixture f,NativeValidationRuns runs,ValidationOwnerRouter router,Request request,ValidationOwner owner)throws Exception{
-        var identity=f.owners.original(request,owner).run();router.command(Command.of(Action.ACTIVATE,request,owner));
-        await(()->runs.read(identity).controlUnknown());router.command(Command.of(Action.STOP,request,owner));
-        await(()->f.tasks.read("flow",request.task()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&runs.original(request,owner).isEmpty());
+        try(var failure=refuseReportBirth(f)){
+            var identity=f.owners.original(request,owner).run();router.command(Command.of(Action.ACTIVATE,request,owner));
+            await(()->runs.read(identity).controlUnknown());router.command(Command.of(Action.STOP,request,owner));
+            await(()->f.tasks.read("flow",request.task()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&runs.original(request,owner).isEmpty());
+        }
     }
     private static ValidationOwner owner(Reply reply){return new ValidationOwner("cluster","flow",reply.receiver().node(),reply.receiver().boot(),reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
     private static ValidationCountScan.Scalar scalar(ValidationTaskSpec.Table table,long value){return new ValidationCountScan.Scalar(table,value,new ValidationCheckEvent.ReadBoundary("fixture-count","v1",Instant.EPOCH,Instant.EPOCH));}

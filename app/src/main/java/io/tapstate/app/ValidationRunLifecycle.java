@@ -62,6 +62,7 @@ final class ValidationRunLifecycle {
 
     private final ValidationControlStore.Run original;
     private final ValidationReportAdmission admissions;
+    private final java.time.Instant scheduledDue;
     private final ValidationControlStore control;
     private final Activation activation;
     private final Local local;
@@ -78,11 +79,20 @@ final class ValidationRunLifecycle {
 
     ValidationRunLifecycle(ValidationControlStore.Run original, ValidationReportAdmission admissions,
             ValidationControlStore control, Activation activation, Local local) {
+        this(original, admissions, control, activation, local, null);
+    }
+    ValidationRunLifecycle(ValidationControlStore.Run original, ValidationReportAdmission admissions,
+            ValidationControlStore control, Activation activation, Local local, java.time.Instant scheduledDue) {
+        this.scheduledDue = scheduledDue;
         this.original = Objects.requireNonNull(original); this.admissions = Objects.requireNonNull(admissions);
         this.control = Objects.requireNonNull(control); this.activation = Objects.requireNonNull(activation); this.local = Objects.requireNonNull(local);
         if (original.admission() == null || original.snapshot() == null) throw invalid("run.originalSnapshot");
     }
     ValidationControlStore.Run original() { return original; }
+
+    private ValidationReportAdmission.Reservation reserveOriginal() {
+        return scheduledDue == null ? admissions.reserve(original.admission()) : admissions.reserveScheduled(original.admission(), scheduledDue, new ValidationScheduleCalculator());
+    }
 
     /** Deadline/owner-loss safe: local fences and cancellation signal do not perform durable I/O. */
     void stop() { stopping.set(true); local.sealPublication(); var current = execution; if (current != null) current.cancel(); }
@@ -100,7 +110,7 @@ final class ValidationRunLifecycle {
                 local.requireOwner();
                 reconcileTransition();
                 if (!reserved) {
-                    var answer = admissions.reserve(original.admission());
+                    var answer = reserveOriginal();
                     if (answer == ValidationReportAdmission.Reservation.RESERVED || answer == ValidationReportAdmission.Reservation.DUPLICATE) reserved = true;
                     else { admissionRejected = true; fail(invalid("run.originalAdmission")); }
                 }
@@ -110,7 +120,7 @@ final class ValidationRunLifecycle {
                         ValidationControlStore.Join answer;
                         try { answer = control.join(original); }
                         catch (TapstateException uncertain) {
-                            var permission = admissions.reserve(original.admission());
+                            var permission = reserveOriginal();
                             if (permission != ValidationReportAdmission.Reservation.CLOSED) throw uncertain;
                             joinRejected = true; if (!stopping.get()) fail(uncertain); answer = null;
                         }

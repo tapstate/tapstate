@@ -150,17 +150,20 @@ public final class ValidationProblemQuota {
      * The caller supplies that external proof; terminal state alone does not establish it here.
      * Repair flags, cleanup, visible result counts or an unknown terminal CAS must never call this.
      */
-    public synchronized void retireSealedTerminalRun(ValidationRunIdentity run, ValidationRunState terminal) {
+    public synchronized void retireSealedTerminalRun(ValidationRunIdentity run, ValidationRunState terminal) { retireSealedTerminalRun(run, terminal, false); }
+    /** Exact pending originals may already be durably joined despite a lost response; this never reopens a closed quota. */
+    public synchronized void retireSealedTerminalRun(ValidationRunIdentity run, ValidationRunState terminal, boolean pendingOriginals) {
         identity(run);
         Objects.requireNonNull(terminal, "terminal");
         if (!terminal.terminal() || terminal == ValidationRunState.COMPLETED
                 && run.mode() == io.tapstate.core.validation.ValidationMode.INCREMENTAL) throw invalid("run.terminal");
-        discardSealed(run);
+        discardSealed(run, pendingOriginals);
     }
 
     /** Caller proves irreversible original birth closure and expired stores; this is local disposal, not a terminal claim. */
-    public synchronized void discardExpiredSealedRun(ValidationRunIdentity run){identity(run);discardSealed(run);}
-    private void discardSealed(ValidationRunIdentity run){
+    public synchronized void discardExpiredSealedRun(ValidationRunIdentity run){discardExpiredSealedRun(run,false);}
+    public synchronized void discardExpiredSealedRun(ValidationRunIdentity run,boolean pendingOriginals){identity(run);discardSealed(run,pendingOriginals);}
+    private void discardSealed(ValidationRunIdentity run,boolean pendingOriginals){
         RunSlots active = runs.get(run);
         if (active == null) return;
         if (!active.sealed) throw new IllegalStateException("local publication must be sealed before retirement");
@@ -168,7 +171,7 @@ public final class ValidationProblemQuota {
         problems -= active.roots.size();
         metadataBytes -= active.bytes;
         // Retirement never unlocks overflow. Empty generations are closed, not reused for later runs.
-        if (runs.isEmpty() && state == State.OPEN) state = State.CLOSED;
+        if (runs.isEmpty() && !pendingOriginals && state == State.OPEN) state = State.CLOSED;
     }
 
     /** Owner loss or explicit generation retirement is irreversible; unknown reservations remain. */

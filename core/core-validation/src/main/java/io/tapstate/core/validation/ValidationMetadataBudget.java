@@ -18,7 +18,7 @@ public final class ValidationMetadataBudget {
     public Lease acquire(Object owner){return acquire(owner,Kind.CONTROL,1).getFirst();}
     /** Retryable discovery and history leave room for a foreground response and native probe. */
     public Lease acquireMaintenance(Object owner){return acquire(owner,Kind.MAINTENANCE,1).getFirst();}
-    /** Long-lived definitions and quotas retain at most two slots, preserving control headroom. */
+    /** Long-lived definitions and shared quotas leave at least one foreground control slot. */
     public Lease acquireRetained(Object owner){return acquireRetainedBundle(owner,1).getFirst();}
     /** Preparation and native probes keep a control slot even when their cleanup remains unresolved. */
     public Lease acquireWork(Object owner){return acquire(owner,Kind.WORK,1).getFirst();}
@@ -28,7 +28,7 @@ public final class ValidationMetadataBudget {
         Objects.requireNonNull(owner,"metadata owner");
         if(frames<1||frames>FRAMES-2||frames!=1&&kind!=Kind.RETAINED)throw new IllegalArgumentException("invalid metadata frame bundle");
         boolean retained=kind==Kind.RETAINED,work=kind!=Kind.CONTROL;
-        if((retained&&retainedFrames>FRAMES-2-frames)||(work&&workFrames>FRAMES-1-frames)
+        if((retained&&retainedFrames>FRAMES-1-frames)||(work&&workFrames>FRAMES-1-frames)
                 ||(kind==Kind.MAINTENANCE&&slots.availablePermits()<3)||!slots.tryAcquire(frames))
             throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.metadataFrames"),null);
         if(retained)retainedFrames+=frames;if(work)workFrames+=frames;

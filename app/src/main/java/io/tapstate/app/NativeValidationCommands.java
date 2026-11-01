@@ -28,7 +28,7 @@ final class NativeValidationCommands implements Commands {
         }
         if(command.action()==Action.ACTIVATE&&start==null){
             start=owners.original(command.request(),command.owner());var reservation=owners.take(start);
-            runs.start(start,new NativeValidationFullJob(reservation,processors,member,process,runs,factory));
+            runs.start(start,new NativeValidationFullJob(reservation,processors,member,process,runs,factory),command.scheduledDue());
         }
         if(start==null){
             var pending=owners.pending(command.request(),command.owner(),command.action()==Action.STOP).orElse(null);

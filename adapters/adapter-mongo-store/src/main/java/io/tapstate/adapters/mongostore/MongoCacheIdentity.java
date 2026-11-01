@@ -62,6 +62,14 @@ final class MongoCacheIdentity {
         });
     }
 
+    void verifyStoppedValidationMaintenance(io.tapstate.spi.store.CacheBusinessScope business, String originalOperation) {
+        transaction(session -> {
+            requireReady(session); new MongoCacheBusinessIdentity(database, business).requireValidationPreparation(session, originalOperation);
+            requireValidationOperation(schemas.find(session, new Document("_id", "business")).first(), business, originalOperation);
+            requireStoppedClaims(session, business); return null;
+        });
+    }
+
     private void requireStoppedClaims(ClientSession session, io.tapstate.spi.store.CacheBusinessScope business) {
         var unsafe = new Document("_id.clusterId", business.clusterId()).append("$or", java.util.List.of(
                 new Document("leaseUntil", new Document("$not", new Document("$type", "date"))),

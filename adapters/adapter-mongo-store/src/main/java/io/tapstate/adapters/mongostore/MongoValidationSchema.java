@@ -23,12 +23,61 @@ final class MongoValidationSchema {
         validateMarker(result); return result;
     }
 
+    static Document configurationMarker(String operation, String phase, long initialized, CacheBusinessScope scope) {
+        var result = marker(operation, phase, initialized, scope);
+        result.put("formatVersion", 2);
+        result.put("scheduledAdmission", scheduledMarker(operation, "READY", null, 0));
+        return validateMarker(result);
+    }
+    static Document recoveredMarker(Document previous, String operation, long initialized, CacheBusinessScope scope) {
+        var result = marker(operation, "READY", initialized, scope);
+        if (Integer.valueOf(2).equals(previous.get("formatVersion"))) {
+            result.put("formatVersion", 2); result.put("scheduledAdmission", previous.get("scheduledAdmission"));
+        }
+        return validateMarker(result);
+    }
+    static Document scheduledMarker(String operation, String phase, Document cursor, long initialized) {
+        return new Document("formatVersion", 1).append("operationId", operation).append("phase", phase).append("cursor", cursor).append("initializedTasks", initialized);
+    }
+    static boolean scheduledReady(MongoDatabase database, ClientSession session) {
+        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        if (schema == null || !schema.containsKey("validation")) return false;
+        var marker = configurationMarker(schema);
+        if (!Integer.valueOf(2).equals(marker.get("formatVersion"))) return false;
+        return "READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"));
+    }
+    static void requireTaskCoverage(MongoDatabase database, ClientSession session, Document task) {
+        boolean covered = scheduledReady(database, session);
+        if (covered != Integer.valueOf(2).equals(task.get("formatVersion"))) throw unreadable("scheduled-task-coverage");
+    }
+    static void requireMutationReady(MongoDatabase database, ClientSession session) {
+        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        var marker = requireConfiguration(schema, "READY");
+        if (Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
+    }
+
     static Document validateMarker(Document value) {
-        if (value == null || !value.keySet().equals(Set.of("formatVersion", "operationId", "phase", "initializedPipelines", "scope"))
-                || !Integer.valueOf(1).equals(value.get("formatVersion")) || !(value.get("operationId") instanceof String operation)
+        boolean covered = value != null && Integer.valueOf(2).equals(value.get("formatVersion"));
+        var fields = new HashSet<>(Set.of("formatVersion", "operationId", "phase", "initializedPipelines", "scope"));
+        if (covered) fields.add("scheduledAdmission");
+        if (value == null || !value.keySet().equals(fields)
+                || !covered && !Integer.valueOf(1).equals(value.get("formatVersion")) || !(value.get("operationId") instanceof String operation)
                 || operation.isBlank() || operation.length() > 512 || !(value.get("phase") instanceof String phase)
                 || !Set.of("PREPARING", "READY").contains(phase) || !(value.get("initializedPipelines") instanceof Long count)
                 || count < 0 || count == Long.MAX_VALUE) throw unreadable("marker");
+        if (covered) {
+            if (!(value.get("scheduledAdmission") instanceof Document watermark)) throw unreadable("scheduled-marker");
+            if (watermark == null || !watermark.keySet().equals(Set.of("formatVersion", "operationId", "phase", "cursor", "initializedTasks"))
+                    || !Integer.valueOf(1).equals(watermark.get("formatVersion")) || !(watermark.get("operationId") instanceof String upgrade)
+                    || upgrade.isBlank() || upgrade.length() > 512 || !(watermark.get("phase") instanceof String scheduledPhase)
+                    || !Set.of("PREPARING", "READY").contains(scheduledPhase)
+                    || !(watermark.get("initializedTasks") instanceof Long tasks) || tasks < 0 || tasks == Long.MAX_VALUE
+                    || watermark.get("cursor") != null && !(watermark.get("cursor") instanceof Document)) throw unreadable("scheduled-marker");
+            var cursor = watermark.get("cursor", Document.class);
+            if (cursor != null && (!cursor.keySet().equals(Set.of("pipelineId", "taskId")) || !(cursor.get("pipelineId") instanceof String pipeline)
+                    || pipeline.isBlank() || pipeline.length() > 512 || !(cursor.get("taskId") instanceof String task) || task.isBlank() || task.length() > 512)) throw unreadable("scheduled-cursor");
+            if (MongoValidationTaskCodec.bsonBytes(watermark) > 4096 || MongoValidationTaskCodec.bsonBytes(value) > 8192) throw unreadable("scheduled-marker-bytes");
+        }
         scope(value); MongoValidationPreparationFacts.bounded(value); return value;
     }
 
@@ -45,6 +94,7 @@ final class MongoValidationSchema {
         if (schema == null || !Integer.valueOf(VERSION).equals(schema.get("installedVersion"))) throw unreadable("version");
         if (!(schema.get("validation") instanceof Document value)) throw unreadable("marker");
         var marker = validateMarker(value);
+        if (!Integer.valueOf(1).equals(marker.get("formatVersion"))) throw unreadable("cache-marker-format");
         if (!phase.equals(marker.get("phase"))) throw refused(); return marker;
     }
 
@@ -92,6 +142,7 @@ final class MongoValidationSchema {
         var schema = table.on(database).find(new Document("_id", configuration ? "config" : "business")).first();
         if (configuration && !configurationHasValidation(database, schema)) throw unreadable("version");
         var marker = configuration ? requireConfiguration(schema, "READY") : requireVersionTwo(schema, "READY");
+        if (configuration && Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
         var identity = (configuration ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.CACHE_IDENTITY)
                 .on(database).find(new Document("_id", "cluster")).first();
         var original = scope(marker);

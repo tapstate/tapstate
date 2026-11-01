@@ -7,9 +7,24 @@ import org.junit.jupiter.api.Test;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void pendingMetadataReferencesReturnExactlyOnceAndNeverResurrectAfterFinalRelease() {
+        try(var process=new ValidationMemberResources()) {
+            var member=process.bind("cluster","node","boot",4,()->{});
+            var original=member.admitRetainedMetadata();var pending=original.retainIfAlive();
+            var callbacks=new AtomicInteger();original.whenCompanionReturns(callbacks::incrementAndGet);
+            assertThat(member.snapshot().metadataFrames()).isOne();assertThat(original.references()).isEqualTo(2);
+            pending.close();pending.close();assertThat(callbacks).hasValue(1);assertThat(original.references()).isEqualTo(1);
+            var next=original.retainIfAlive();original.close();
+            assertThat(member.snapshot().metadataFrames()).isOne();next.requireRetained(member);
+            assertThatThrownBy(()->original.requireRetained(member)).isInstanceOf(TapstateException.class);
+            next.close();assertThat(member.snapshot().metadataFrames()).isZero();assertThat(original.retainIfAlive()).isNull();
+        }
+    }
+
     @Test void preOwnerControlKeepsBudgetUntilOriginalBodyExitsAcrossContextClosure()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){

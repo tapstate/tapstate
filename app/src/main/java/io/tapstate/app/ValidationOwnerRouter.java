@@ -90,9 +90,11 @@ final class ValidationOwnerRouter implements AutoCloseable {
     }
     enum Action { ACTIVATE,STATUS,STOP,CANCEL_UNUSED }
     /** Immutable original coordinates only. No spec, executable object, model or connection crosses the wire. */
-    record Command(Action action,Request request,String cluster,String node,String boot,long claim,long execution,long topology) implements Serializable {
+    record Command(Action action,Request request,String cluster,String node,String boot,long claim,long execution,long topology,java.time.Instant scheduledDue) implements Serializable {
+        Command(Action action,Request request,String cluster,String node,String boot,long claim,long execution,long topology){this(action,request,cluster,node,boot,claim,execution,topology,null);}
         Command{Objects.requireNonNull(action);Objects.requireNonNull(request);id(cluster);id(node);id(boot);
             if(claim<1||execution<1||topology<0)throw invalid("routing.commandOwner");}
+        Command scheduled(java.time.Instant due){if(action!=Action.ACTIVATE)throw invalid("routing.scheduledAction");return new Command(action,request,cluster,node,boot,claim,execution,topology,Objects.requireNonNull(due));}
         ValidationOwner owner(){return new ValidationOwner(cluster,request.pipeline(),node,boot,claim,execution,topology);}
         static Command of(Action action,Request request,ValidationOwner owner){return new Command(action,request,owner.clusterId(),owner.nodeId(),owner.bootId(),owner.claimGeneration(),owner.executionGeneration(),owner.topologyRevision());}
     }

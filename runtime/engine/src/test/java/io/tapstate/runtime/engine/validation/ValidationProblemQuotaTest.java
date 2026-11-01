@@ -85,6 +85,30 @@ class ValidationProblemQuotaTest {
         assertThat(quota.metadataBytes()).isEqualTo(charged);
     }
 
+    @Test void aPendingOriginalKeepsOnlyAnOpenGenerationAvailableForItsDelayedJoinReceipt() {
+        for (boolean expired : java.util.List.of(false, true)) {
+            var quota = quota(); var first = run("one", "first", ValidationMode.FULL); var pending = run("two", "pending", ValidationMode.INCREMENTAL);
+            quota.join(first, () -> {}); quota.reserve(first, root(1)); quota.seal(first);
+            if (expired) quota.discardExpiredSealedRun(first, true);
+            else quota.retireSealedTerminalRun(first, ValidationRunState.STOPPED, true);
+            assertThat(quota.state()).isEqualTo(ValidationProblemQuota.State.OPEN);
+            assertThat(quota.join(pending, () -> {})).isEqualTo(ValidationProblemQuota.Join.JOINED);
+            assertThat(quota.reserve(pending, root(2)).permit()).isPresent();
+            quota.seal(pending); quota.retireSealedTerminalRun(pending, ValidationRunState.STOPPED);
+            assertThat(quota.state()).isEqualTo(ValidationProblemQuota.State.CLOSED);
+            assertThat(quota.join(first, () -> {})).isEqualTo(ValidationProblemQuota.Join.CLOSED);
+        }
+    }
+
+    @Test void pendingOriginalsCannotReviveAnOverflowedGeneration() {
+        var quota = quota(); var first = run("one", "first", ValidationMode.FULL); var pending = run("two", "pending", ValidationMode.INCREMENTAL);
+        quota.join(first, () -> {});
+        for (int i = 0; i < 1001; i++) quota.reserve(first, root(i));
+        quota.seal(first); quota.retireSealedTerminalRun(first, ValidationRunState.STOPPED, true);
+        assertThat(quota.state()).isEqualTo(ValidationProblemQuota.State.LIMIT_REACHED);
+        assertThat(quota.join(pending, () -> {})).isEqualTo(ValidationProblemQuota.Join.CLOSED);
+    }
+
     @Test void knownSealedTerminalRetirementReleasesSlotsWithoutRevivingAnOverflowGeneration() {
         var quota = quota();
         var first = run("one", "first", ValidationMode.FULL);

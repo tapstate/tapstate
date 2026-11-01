@@ -31,24 +31,16 @@ class ValidationMetadataBudgetTest {
         }
         assertThat(budget.inUse()).isZero();
     }
-    @Test void retainedDefinitionsLeaveTwoControlFrames(){
+    @Test void retainedDefinitionsAndSharedQuotaLeaveOneControlFrame(){
         var budget=new ValidationMetadataBudget();var owner=new Object();
-        try(var retained=budget.acquireRetained(owner);var second=budget.acquireRetained(owner)){
-            assertThat(budget.inUse()).isEqualTo(2);
+        try(var first=budget.acquireRetained(owner);var second=budget.acquireRetained(owner);var quota=budget.acquireRetained(owner)){
+            assertThat(budget.inUse()).isEqualTo(3);
             assertThatThrownBy(()->budget.acquireRetained(owner)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(()->budget.acquireWork(owner)).isInstanceOf(TapstateException.class);
             assertThatThrownBy(()->budget.acquireMaintenance(owner)).isInstanceOf(TapstateException.class);
-            try(var response=budget.acquire(owner);var recovery=budget.acquire(owner)){
-                assertThat(budget.inUse()).isEqualTo(4);
-                assertThatThrownBy(()->budget.acquire(owner)).isInstanceOf(TapstateException.class);
-            }
-        }
-        assertThat(budget.inUse()).isZero();
-        try(var first=budget.acquireRetained(owner);var second=budget.acquireRetained(owner)){
+            try(var response=budget.acquire(owner)){assertThat(budget.inUse()).isEqualTo(4);}
             first.close();first.close();
-            try(var replacement=budget.acquireRetained(owner)){
-                assertThat(budget.inUse()).isEqualTo(2);
-                assertThatThrownBy(()->budget.acquireRetained(owner)).isInstanceOf(TapstateException.class);
-            }
+            try(var replacement=budget.acquireRetained(owner)){assertThat(budget.inUse()).isEqualTo(3);}
         }
         assertThat(budget.inUse()).isZero();
     }
@@ -66,13 +58,16 @@ class ValidationMetadataBudgetTest {
     }
     @Test void completeRetainedBundlesRefuseWithoutLeavingAPartialLease(){
         var budget=new ValidationMetadataBudget();var owner=new Object();
-        try(var first=budget.acquireRetained(owner)){
-            assertThatThrownBy(()->budget.acquireRetainedBundle(owner,2)).isInstanceOf(TapstateException.class);
-            assertThat(budget.inUse()).isOne();
-        }
         var pair=budget.acquireRetainedBundle(owner,2);
-        try{assertThat(budget.inUse()).isEqualTo(2);assertThatThrownBy(()->budget.acquireRetained(owner)).isInstanceOf(TapstateException.class);}
-        finally{pair.forEach(ValidationMetadataBudget.Lease::close);}
+        try{
+            assertThatThrownBy(()->budget.acquireRetainedBundle(owner,2)).isInstanceOf(TapstateException.class);
+            assertThat(budget.inUse()).isEqualTo(2);
+            try(var third=budget.acquireRetained(owner)){
+                assertThat(budget.inUse()).isEqualTo(3);
+                assertThatThrownBy(()->budget.acquireRetainedBundle(owner,2)).isInstanceOf(TapstateException.class);
+                assertThat(budget.inUse()).isEqualTo(3);
+            }
+        }finally{pair.forEach(ValidationMetadataBudget.Lease::close);}
         assertThat(budget.inUse()).isZero();
     }
     @Test void unresolvedWorkCannotConsumeTheControlSlotOrEnlargeThePool(){

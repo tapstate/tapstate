@@ -55,7 +55,9 @@ class NativeValidationReportHistoryIT {
             assertThat(access.history().expired(WorkloadClaimFence.from(f.node),first)).isTrue();blocked.set(false);
             await(()->{try{runs.read(first.identity());return false;}catch(io.tapstate.core.common.TapstateException removed){return true;}});
             var root=new ValidationRoot("mapping","out",new ValidationKey(List.of(ValidationKey.Part.number(1))),List.of());
-            assertThat(runs.reserveConfirmed(second.identity(),root).orElseThrow().permit()).isPresent();
+            var publication=new java.util.concurrent.atomic.AtomicReference<io.tapstate.runtime.engine.validation.ValidationProblemQuota.Reservation>();
+            await(()->{var value=runs.reserveConfirmed(second.identity(),root);value.ifPresent(publication::set);return value.isPresent();});
+            assertThat(publication.get().permit()).isPresent();
             await(()->f.resources.snapshot().metadataFrames()==2);assertThat(runs.read(second.identity()).waiting()).isTrue();
             var third=new ValidationReportAdmission.Task("cluster","flow","third",UUID.randomUUID());
             f.tasks.create(new ValidationTaskStore.Create(third,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,1000),UUID.randomUUID()));
@@ -134,6 +136,69 @@ class NativeValidationReportHistoryIT {
         access.control().transition(new ValidationControlStore.Transition(original,ValidationRunState.RUNNING,ValidationRunState.COMPLETED));
         access.control().retire(new ValidationControlStore.Retirement(original,start.report(),ValidationRunState.COMPLETED));return original;
     }
+    @Test void aCommittedSiblingJoinWithLostReplyKeepsItsPendingQuotaThroughLastLocalRetirement() throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
+            f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()));
+            var first=waiting(f,runs,f.task,2,ValidationMethod.FULL_COLUMN);
+            var sibling=new ValidationReportAdmission.Task("cluster","flow","pending",UUID.randomUUID());
+            f.tasks.create(new ValidationTaskStore.Create(sibling,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()));
+            var request=new ValidationOwnerRouter.Request("flow",sibling.taskId(),sibling.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var accepted=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
+            await(()->accepted.get()!=null||f.owners.control("flow",()->accepted.set(f.owners.reserve(request))));
+            assertThat(accepted.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var start=f.owners.original(request,accepted.get().owner());
+            var committed=new java.util.concurrent.atomic.AtomicBoolean();var replyAllowed=new java.util.concurrent.atomic.AtomicBoolean();var installed=new java.util.concurrent.atomic.AtomicBoolean();
+            await(()->installed.get()||f.owners.control("flow",()->{
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD;}
+                    public ValidationRunLifecycle.Execution create(){throw new AssertionError("pending fixture creates no Job");}
+                });
+                var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");
+                var actor=actors.get(start.run());
+                var lifecycle=(ValidationRunLifecycle)org.springframework.test.util.ReflectionTestUtils.getField(actor,"lifecycle");
+                var original=(ValidationControlStore)org.springframework.test.util.ReflectionTestUtils.getField(lifecycle,"control");
+                var delayed=(ValidationControlStore)java.lang.reflect.Proxy.newProxyInstance(ValidationControlStore.class.getClassLoader(),new Class<?>[]{ValidationControlStore.class},(proxy,method,args)->{
+                    if(method.getName().equals("join")) {
+                        if(!committed.get()) { original.join((ValidationControlStore.Run)args[0]);committed.set(true); }
+                        if(!replyAllowed.get())throw new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","lost-join-reply"),null);
+                    }
+                    try{return method.invoke(original,args);}catch(java.lang.reflect.InvocationTargetException failure){throw failure.getCause();}
+                });
+                org.springframework.test.util.ReflectionTestUtils.setField(lifecycle,"control",delayed);installed.set(true);
+            }));
+            await(()->committed.get()&&runs.read(start.run()).controlUnknown());
+            runs.stop(first.identity());
+            await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return !actors.containsKey(first.identity());});
+            replyAllowed.set(true);
+            await(()->runs.read(start.run()).waiting());
+            assertThat(runs.read(start.run()).state()).isEqualTo(ValidationRunState.STARTING);
+            runs.stop(start.run());await(()->f.resources.snapshot().metadataFrames()==0);
+            assertThat(f.member.getJet().getJobs()).isEmpty();
+        }
+    }
+
+    @Test void closingTheRunRegistryStillReleasesQuotaWhenTheLastUnusedReservationReturns() throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers)) {
+            f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()));
+            var first=waiting(f,runs,f.task,2,ValidationMethod.FULL_COLUMN);
+            var sibling=new ValidationReportAdmission.Task("cluster","flow","unused",UUID.randomUUID());
+            f.tasks.create(new ValidationTaskStore.Create(sibling,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()));
+            var request=new ValidationOwnerRouter.Request("flow",sibling.taskId(),sibling.generation(),1,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var accepted=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
+            await(()->accepted.get()!=null||f.owners.control("flow",()->accepted.set(f.owners.reserve(request))));
+            assertThat(accepted.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var pending=f.owners.take(f.owners.original(request,accepted.get().owner()));
+            runs.stop(first.identity());
+            await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return actors.isEmpty();});
+            assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
+            runs.close();org.springframework.test.util.ReflectionTestUtils.invokeMethod(runs,"tick");
+            var polling=(java.util.concurrent.ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"polling");
+            assertThat(polling.isCancelled()).isFalse();
+            pending.close();await(()->f.resources.snapshot().metadataFrames()==0);
+            assertThat(f.member.getJet().getJobs()).isEmpty();
+        }
+    }
+
     private static ValidationControlStore.Run waiting(NativeValidationOwnerReservationsIT.Fixture f,NativeValidationRuns runs,
             ValidationReportAdmission.Task task,long revision,ValidationMethod method)throws Exception{
         var request=new ValidationOwnerRouter.Request("flow",task.taskId(),task.generation(),revision,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());

@@ -27,7 +27,7 @@ import static org.assertj.core.api.Assertions.*;
 /** Real CONFIG/CACHE domains and native leases; reservation does not execute business validation. */
 @RequiresDocker
 class NativeValidationOwnerReservationsIT {
-    @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0")).withCommand("--replSet","docker-rs","--bind_ip_all","--setParameter","enableTestCommands=1");
 
     @Test void concurrentRootProducingReservationsCannotHoldEachOthersQuotaFrames()throws Exception{
         try(var f=new Fixture();var callers=Executors.newFixedThreadPool(2)){
@@ -102,7 +102,7 @@ class NativeValidationOwnerReservationsIT {
             var task = f.tasks.read("flow", "task").orElseThrow(); assertThat(task.full().permission()).isNull(); assertThat(task.incremental().permission()).isNull();
             assertThat(f.configuration.preparations().read("flow").orElseThrow().phase()).isEqualTo(PipelinePreparation.Phase.UNASSIGNED);
             assertThat(f.raw.getDatabase(f.cacheName).getCollection("pipeline_state").countDocuments()).isZero();
-            assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
+            assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(3);
         }
     }
 

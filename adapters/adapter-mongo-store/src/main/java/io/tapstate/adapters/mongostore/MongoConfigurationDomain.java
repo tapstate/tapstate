@@ -1,6 +1,10 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.ReadConcern;
+import com.mongodb.TransactionOptions;
+import com.mongodb.client.ClientSession;
+import java.util.UUID;
+import java.util.function.Function;
 import com.mongodb.ReadPreference;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
@@ -133,6 +137,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public int schemaVersion() { requireOpen(); return installedSchemaVersion; }
     public String databaseName() { requireOpen(); return connection.database().getName(); }
 
+    static MongoStorageBindingStore maintenanceBindings(MongoConnection connection, String cluster) {
+        return new MongoStorageBindingStore(connection.client(), connection.database(), new PersistentKey(connection.database(), cluster));
+    }
+
     /** Explicit offline maintenance only. The operator must stop old writers before opening it. */
     public static ValidationSchemaPreparation prepareValidationSchema(MongoConnectionSettings settings, String clusterId, java.util.UUID operation) {
         return ValidationSchemaPreparation.open(settings, clusterId, operation, true);
@@ -238,7 +246,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row))
-                            .append("validation", MongoValidationSchema.marker(operation.toString(), "PREPARING", 0, scope)))).getMatchedCount() != 1)
+                            .append("validation", MongoValidationSchema.configurationMarker(operation.toString(), "PREPARING", 0, scope)))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                 } else requireOperation(row);
                 return null;
@@ -290,7 +298,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
-                    var marker = MongoValidationSchema.marker(operation.toString(), "READY", 0, scope);
+                    var marker = MongoValidationSchema.configurationMarker(operation.toString(), "READY", 0, scope);
                     if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row)).append("validation", marker))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return status(marker);
@@ -339,7 +347,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         if (initialized == Long.MAX_VALUE - 1) throw MongoValidationSchema.unreadable("initialized-pipelines");
                         initialized++; phase = "PREPARING";
                     }
-                    var next = MongoValidationSchema.marker(operation.toString(), phase, initialized, scope);
+                    var next = MongoValidationSchema.configurationMarker(operation.toString(), phase, initialized, scope);
                     if (schemas.updateOne(session, new Document("_id", "config").append("installedVersion", row.getInteger("installedVersion")).append("validation", marker),
                             new Document("$set", new Document("validation", next))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
                     return status(next);
@@ -647,7 +655,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 if (!original.operationId().equals(marker.get("operationId"))) {
                     ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()), connection.client());
                     if (schemas.updateOne(session, previous, new Document("$set", new Document("validation",
-                            MongoValidationSchema.marker(original.operationId(), "READY", 0, scope)))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
+                            MongoValidationSchema.recoveredMarker(marker, original.operationId(), 0, scope)))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
                 }
                 requireOpen(); local.run(); return null;
             });
@@ -749,7 +757,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     var scope = new io.tapstate.spi.store.CacheBusinessScope(clusterId, running.originalScope().bindingVersion(), running.originalScope().cacheIncarnation());
                     if (scope.equals(MongoValidationSchema.scope(marker)) && !running.operationId().equals(marker.get("operationId"))) throw MongoValidationSchema.refused();
                     if (schemas.updateOne(session, original, new Document("$set", new Document("validation",
-                            MongoValidationSchema.marker(running.operationId(), "READY", marker.getLong("initializedPipelines"), scope)))).getMatchedCount() != 1)
+                            MongoValidationSchema.recoveredMarker(marker, running.operationId(), marker.getLong("initializedPipelines"), scope)))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     requireOpen(); local.run(); return null;
                 });
@@ -1061,5 +1069,111 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private static TapstateException invalidKey() {
             return new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_INVALID, Map.of(), null);
         }
+    }
+
+    /** Explicit offline, resumable coverage of existing validation task rows. No ordinary access calls it. */
+    public static final class ValidationScheduledPreparation implements AutoCloseable {
+        public record Status(String operation, boolean ready, long initializedTasks) {}
+        private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
+                .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+        private final MongoConnection connection;
+        private final MongoStorageBindingStore bindings;
+        private final String cluster;
+        private final UUID operation;
+        private final io.tapstate.spi.store.CachePreparation preparation;
+        private final java.time.Duration timeout;
+        private volatile boolean closed;
+
+        private ValidationScheduledPreparation(MongoConnection connection, String cluster, UUID operation, java.time.Duration timeout) {
+            this.connection = connection; this.cluster = Objects.requireNonNull(cluster); this.operation = Objects.requireNonNull(operation); this.timeout = timeout;
+            bindings = MongoConfigurationDomain.maintenanceBindings(connection, cluster);
+            preparation = bindings.cachePreparation().orElseThrow(MongoValidationSchema::refused);
+        }
+
+        public static ValidationScheduledPreparation open(MongoConnectionSettings settings, String cluster, UUID operation) {
+            var connection = MongoConnection.forConfiguration(settings);
+            try {
+                connection.verifyConnectivity();
+                var handle = new ValidationScheduledPreparation(connection, cluster, operation, settings.serverSelectionTimeout());
+                handle.verifyOffline(); handle.begin(); return handle;
+            } catch (RuntimeException | Error failure) { connection.close(); throw failure; }
+        }
+
+        private void verifyOffline() {
+            var original = bindings.load().orElseThrow(MongoValidationSchema::refused);
+            String birth = transaction(session -> {
+                var schema = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).find(session, new Document("_id", "config")).first();
+                return MongoValidationSchema.requireConfiguration(schema, "READY").getString("operationId");
+            });
+            try (var cache = MongoCacheDomain.connect(original.cache(), timeout, "validation-scheduled-maintenance")) {
+                cache.requireRecoveryTarget(original);
+                cache.verifyStoppedValidationMaintenance(preparation, birth);
+            }
+        }
+
+        private void begin() {
+            transaction(session -> {
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(connection.database());
+                var schema = schemas.find(session, new Document("_id", "config")).first();
+                var marker = MongoValidationSchema.requireConfiguration(schema, "READY");
+                if (!preparation.businessScope().equals(MongoValidationSchema.scope(marker))) throw MongoValidationSchema.refused();
+                if (Integer.valueOf(2).equals(marker.get("formatVersion"))) { requireOperation(marker); return null; }
+                // The shared CONFIG revision write conflicts with every supported concurrent authoring/admission.
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()), connection.client());
+                MongoValidationAdmissionStore.verifyScheduledUpgradeRows(session, connection.database(), cluster, false);
+                var next = new Document(marker).append("formatVersion", 2)
+                        .append("scheduledAdmission", MongoValidationSchema.scheduledMarker(operation.toString(), "PREPARING", null, 0));
+                replaceMarker(session, marker, next); return null;
+            });
+        }
+
+        /** Each original transaction converts at most one bounded row and advances its cursor together. */
+        public Status advance(int maximumTasks) {
+            if (maximumTasks < 1 || maximumTasks > 20) throw new IllegalArgumentException("maintenance batch must contain 1 to 20 tasks");
+            verifyOffline(); Status result = null;
+            for (int index = 0; index < maximumTasks; index++) {
+                result = transaction(session -> {
+                    var database = connection.database(); var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+                    var schema = schemas.find(session, new Document("_id", "config")).first();
+                    var marker = MongoValidationSchema.requireConfiguration(schema, "READY"); var upgrade = requireOperation(marker);
+                    if ("READY".equals(upgrade.get("phase"))) return status(upgrade);
+                    ConfigurationVersion.advanceScheduledPreparation(session, database, operation.toString());
+                    var progress = MongoValidationAdmissionStore.advanceScheduledUpgradeTask(session, database, cluster, operation.toString(), upgrade);
+                    var cursor = progress.cursor(); long initialized = progress.initialized(); String phase = progress.phase();
+                    var next = new Document(marker).append("scheduledAdmission", MongoValidationSchema.scheduledMarker(operation.toString(), phase, cursor, initialized));
+                    replaceMarker(session, marker, next); return status(next.get("scheduledAdmission", Document.class));
+                });
+                if (result.ready()) return result;
+            }
+            return result;
+        }
+
+        private Document requireOperation(Document marker) {
+            var upgrade = marker.get("scheduledAdmission", Document.class);
+            if (!Integer.valueOf(2).equals(marker.get("formatVersion")) || upgrade == null || !operation.toString().equals(upgrade.get("operationId"))) throw MongoValidationSchema.refused();
+            return upgrade;
+        }
+        private void replaceMarker(ClientSession session, Document original, Document next) {
+            MongoValidationSchema.validateMarker(next);
+            if (SystemCollections.SCHEMA_MIGRATIONS.on(connection.database()).updateOne(session, new Document("_id", "config").append("validation", original),
+                    new Document("$set", new Document("validation", next))).getMatchedCount() != 1) throw MongoValidationSchema.refused();
+        }
+        private Status status(Document upgrade) { return new Status(operation.toString(), "READY".equals(upgrade.get("phase")), upgrade.getLong("initializedTasks")); }
+        private <T> T transaction(Function<ClientSession, T> work) {
+            return StoreIo.call(() -> {
+                if (closed) throw MongoValidationSchema.refused();
+                try (var session = connection.client().startSession()) {
+                    return session.withTransaction(() -> {
+                        if (closed) throw MongoValidationSchema.refused();
+                        var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(connection.database()).find(session, new Document("_id", "cluster")).first();
+                        if (identity == null || !cluster.equals(identity.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
+                                || !bindings.cachePreparationForTransaction(session).filter(preparation::equals).isPresent()) throw MongoValidationSchema.refused();
+                        MongoValidationSchema.verify(connection.database(), MongoValidationSchema.CONFIG);
+                        return work.apply(session);
+                    }, TRANSACTION);
+                }
+            });
+        }
+        @Override public void close() { closed = true; connection.close(); }
     }
 }

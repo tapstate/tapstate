@@ -133,7 +133,15 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             }
             operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
             operation.preparing = true;
-            var metadata=resources.admitRetainedMetadata(retainedFrames(request));operation.metadata=metadata.getFirst();
+            int frames=retainedFrames(request);Owner borrowed=null;long borrowedGeneration=0;
+            if(frames==2&&local.owner!=null&&!local.owner.retired.get()&&local.owner.lease.authorized()){
+                var current=local.owner;
+                if(current.quotaMetadata!=null&&current.quotaGeneration==current.countingGeneration){
+                    operation.quotaMetadata=current.quotaMetadata.retainIfAlive();
+                    if(operation.quotaMetadata!=null){borrowed=current;borrowedGeneration=current.countingGeneration;frames=1;}
+                }
+            }
+            var metadata=resources.admitRetainedMetadata(frames);operation.metadata=metadata.getFirst();
             if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
             var task = task(request); var definitions = configuration.validationTasks(this::requireActive);
             var inputs = definitions.inputs(task, request.configurationRevision());
@@ -151,6 +159,8 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             operation.claimUncertain = true;
             var owner = ensureOwner(local); operation.claimUncertain = false; if (owner == null) return operation.redirect();
             operation.owner = owner; operation.access = local.access; owner.lease.require();
+            if(borrowed!=null&&(borrowed!=owner||borrowedGeneration!=owner.countingGeneration))return operation.reject();
+            if(operation.quotaMetadata!=null){owner.quotaMetadata=operation.quotaMetadata;owner.quotaGeneration=owner.countingGeneration;}
             if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
             NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
                     known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
@@ -588,7 +598,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     }
     private final class Owner {
         final Pipeline pipeline; final AtomicBoolean retired = new AtomicBoolean(); final ValidationOwnerLease lease; final long created = handoffClock.getAsLong();
-        volatile long countingGeneration;
+        volatile long countingGeneration,quotaGeneration;volatile ValidationMemberResources.Metadata quotaMetadata;
         Owner(Pipeline pipeline, WorkloadClaim claim, ClusterWorkloadClaims claims, long askedAt) {
             this.pipeline = pipeline;
             lease = new ValidationOwnerLease(pipeline.pipeline, claim, askedAt, ttl, System::nanoTime, () -> {

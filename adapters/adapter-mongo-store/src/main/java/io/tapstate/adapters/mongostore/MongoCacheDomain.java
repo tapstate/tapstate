@@ -331,6 +331,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         facts(original.authScope()).verifyValidationMaintenance(original.businessScope(), operation, configurationComplete);
     }
 
+    void verifyStoppedValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String originalOperation) {
+        businessActive(); new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
+        facts(original.authScope()).verifyStoppedValidationMaintenance(original.businessScope(), originalOperation);
+    }
+
     void verifyValidationReady(io.tapstate.spi.store.CachePreparation original, String operation) {
         verifyValidationMaintenance(original, operation, true);
         StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));

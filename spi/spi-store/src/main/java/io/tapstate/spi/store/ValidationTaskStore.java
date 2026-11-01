@@ -58,7 +58,15 @@ public interface ValidationTaskStore {
     record Permission(ValidationReportAdmission.Start start, Phase phase) {
         public Permission { Objects.requireNonNull(start); Objects.requireNonNull(phase); }
     }
-    record Mode(long nextStartSequence, Permission permission) {
+    record ScheduledAdmission(long scopeRevision, java.time.Instant lastDue, UUID lastCommand, Long lastSequence) {
+        public ScheduledAdmission {
+            if (scopeRevision < 1 || scopeRevision == Long.MAX_VALUE
+                    || (lastDue == null) != (lastCommand == null) || (lastDue == null) != (lastSequence == null)
+                    || lastSequence != null && (lastSequence < 1 || lastSequence == Long.MAX_VALUE)) throw invalid("task.scheduledAdmission");
+        }
+    }
+    record Mode(long nextStartSequence, Permission permission, ScheduledAdmission scheduledAdmission) {
+        public Mode(long nextStartSequence, Permission permission) { this(nextStartSequence, permission, null); }
         public Mode {
             if (nextStartSequence < 1 || permission == null && nextStartSequence != 1
                     || permission != null && permission.start().sequence() + 1 != nextStartSequence) throw invalid("task.mode");
@@ -72,6 +80,9 @@ public interface ValidationTaskStore {
             if (revision < 1 || revision == Long.MAX_VALUE || schedulingRevision < 1 || schedulingRevision > revision) throw invalid("task.revisions");
             ValidationTaskStore.mode(task, revision, full, ValidationMode.FULL);
             ValidationTaskStore.mode(task, revision, incremental, ValidationMode.INCREMENTAL);
+            var watermark = full.scheduledAdmission();
+            if (incremental.scheduledAdmission() != null || watermark != null && (watermark.scopeRevision() != revision
+                    || watermark.lastSequence() != null && watermark.lastSequence() >= full.nextStartSequence())) throw invalid("task.scheduledAdmissionScope");
         }
         public Mode mode(ValidationMode selected) { return Objects.requireNonNull(selected) == ValidationMode.FULL ? full : incremental; }
     }

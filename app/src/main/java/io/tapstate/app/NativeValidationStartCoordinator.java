@@ -335,6 +335,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             if(expired(entry)){router.command(ValidationOwnerRouter.Command.of(ValidationOwnerRouter.Action.CANCEL_UNUSED,request(entry.original),entry.owner),entry.receiver);publish(entry,status(entry.original,Outcome.REJECTED,ValidationError.EXECUTION_CANCELLED.code()));return;}
             boolean stop;synchronized(entries){if(closed)return;stop=entry.stop;}
             var command=ValidationOwnerRouter.Command.of(stop?ValidationOwnerRouter.Action.STOP:verb==Verb.READ?ValidationOwnerRouter.Action.STATUS:ValidationOwnerRouter.Action.ACTIVATE,request(entry.original),entry.owner);
+            if(command.action()==ValidationOwnerRouter.Action.ACTIVATE&&entry.latest!=null)command=command.scheduled(entry.latest.minusSeconds(5));
             publish(entry,project(entry.original,router.command(command,entry.receiver)));
         }catch(TapstateException refused){publish(entry,status(entry.original,Outcome.UNKNOWN,refused.code().code()));}
         catch(RuntimeException|Error defect){publish(entry,status(entry.original,Outcome.UNKNOWN,null));throw defect;}

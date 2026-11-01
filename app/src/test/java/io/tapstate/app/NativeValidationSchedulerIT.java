@@ -70,9 +70,13 @@ class NativeValidationSchedulerIT {
             }finally{f.raw.getDatabase(source).drop();f.raw.getDatabase(target).drop();}
         }
     }
-    @Test @Timeout(90) void twoActualMembersDetectOneIntervalAndCreateOnePdkRun()throws Exception{
+    @Test @Timeout(90) void twoActualMembersDetectOneIntervalAndCreateOnePdkRun()throws Exception{verifyTwoMembers(false);}
+    @Test @Timeout(120) void delayedOccurrenceCannotRebaseAfterAnInterveningManualRun()throws Exception{verifyTwoMembers(true);}
+    @Test @Timeout(120) void independentlySkewedMembersCannotReadmitAnOldCycleAfterManualCompletion()throws Exception{verifyTwoMembers(true,true);}
+    private void verifyTwoMembers(boolean delayedPeer)throws Exception{verifyTwoMembers(delayedPeer,false);}
+    private void verifyTwoMembers(boolean delayedPeer,boolean skewed)throws Exception{
         try(var f=new NativeValidationOwnerReservationsIT.Fixture(true)){
-            var source="schedule_source_"+f.suffix;var target="schedule_target_"+f.suffix;var time=new Time();HazelcastInstance peer=null;NodeSessionLease peerLease=null;
+            var source="schedule_source_"+f.suffix;var target="schedule_target_"+f.suffix;var time=new Time();var peerTime=skewed?new Time():time;HazelcastInstance peer=null;NodeSessionLease peerLease=null;
             try{
                 NativeValidationMetadataIT.seed(f,source,target);var artifact=NativeValidationPdkCountIT.artifact("mongodb");
                 var task=create(f,time,new ValidationSchedule.Interval(1,ValidationSchedule.Unit.MINUTES,time.instant(),"UTC"),artifact);
@@ -86,19 +90,47 @@ class NativeValidationSchedulerIT {
                                 new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,new NativeValidationPdkPlans(id->artifact,time)),()->{},Duration.ofSeconds(5));
                         var right=new ValidationOwnerRouter(peer,gate,()->WorkloadClaimFence.from(node),f.owners::readOwner,request->ValidationOwnerRouter.Result.capacity(),()->{},Duration.ofSeconds(5));
                         var a=new NativeValidationStartCoordinator(f.member,f.configuration,left,f.resources,f.process,()->{},Duration.ofSeconds(12),time);
-                        var b=new NativeValidationStartCoordinator(peer,f.configuration,right,peerResources,f.process,()->{},Duration.ofSeconds(12),time)){
+                        var b=new NativeValidationStartCoordinator(peer,f.configuration,right,peerResources,f.process,()->{},Duration.ofSeconds(12),peerTime)){
                     var facts=new MemoryValidationSchedules();
+                    var peerEntered=new CountDownLatch(1);var releasePeer=new CountDownLatch(1);
+                    Runnable peerActive=()->{
+                        if(delayedPeer&&Thread.currentThread().getName().equals("validation-schedule-start")){
+                            peerEntered.countDown();
+                            try{if(!releasePeer.await(30,TimeUnit.SECONDS))throw new AssertionError("delayed scheduler fixture timeout");}
+                            catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                        }
+                    };
                     try(var first=new NativeValidationScheduler(f.configuration,f.resources,f.process,()->a,facts,time,new ValidationScheduleCalculator(),()->{});
-                            var second=new NativeValidationScheduler(f.configuration,peerResources,f.process,()->b,facts,time,new ValidationScheduleCalculator(),()->{})){
+                            var second=new NativeValidationScheduler(f.configuration,peerResources,f.process,()->b,facts,peerTime,new ValidationScheduleCalculator(),peerActive)){
                         first.start();second.start();
                         await(()->fact(facts,a,task,1).isPresent()&&fact(facts,b,task,1).isPresent());
                         time.now.set(Instant.parse("2026-10-29T00:01:01Z"));
+                        if(skewed)peerTime.now.set(Instant.parse("2026-10-29T00:01:04Z"));
                         try{await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));}
                         catch(org.awaitility.core.ConditionTimeoutException failed){throw new AssertionError("scheduled original: a="+fact(facts,a,task,1)+"; b="+fact(facts,b,task,1)+"; originalA="+observed(facts,a,task,1)+"; originalB="+observed(facts,b,task,1)+"; mode="+f.tasks.read("flow",task.taskId()).orElseThrow().full()+"; resources="+f.resources.snapshot()+"; reports="+f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)),failed);}
                         assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(2);
                         assertThat(f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(1);
                         assertThat(f.member.getJet().getJobs()).hasSize(1);
-                    }
+                        if(delayedPeer){
+                            assertThat(peerEntered.await(5,TimeUnit.SECONDS)).isTrue();
+                            await(()->f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&f.resources.snapshot().metadataFrames()==0);
+                            var manual=new ValidationOperation(a.context(),"flow",task.taskId(),task.generation(),1,2,UUID.randomUUID());
+                            try(var accepted=a.start(manual)){assertThat(accepted.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.ACCEPTED);}
+                            await(()->f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()==3
+                                    &&f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED
+                                    &&f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()==2
+                                    &&f.resources.snapshot().metadataFrames()==0);
+                            assertThat(f.member.getJet().getJobs()).hasSize(2);
+                            releasePeer.countDown();
+                            await(()->{synchronized(second){
+                                var values=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(second,"entries");
+                                return values.values().stream().noneMatch(value->Boolean.TRUE.equals(org.springframework.test.util.ReflectionTestUtils.getField(value,"pending")));
+                            }});
+                            assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(3);
+                            assertThat(f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(2);
+                            assertThat(f.member.getJet().getJobs()).hasSize(2);
+                        }
+                    }finally{releasePeer.countDown();}
                 }finally{peerResources.close();}
             }finally{
                 if(peerLease!=null){var stopped=peer;peerLease.stopAndClose(()->{if(stopped!=null)stopped.shutdown();});}else if(peer!=null)peer.shutdown();

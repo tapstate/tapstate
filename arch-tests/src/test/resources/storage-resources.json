@@ -602,6 +602,27 @@
         "CONFIG schema 3 requires both exact AI structures and the original validation marker/collections/indexes. Partial, conflicting or lost structures never fall back, grant birth, trigger automatic DDL or authorize a replacement. CONFIG and CACHE retain independent transactions; CACHE validation schema remains 2.",
         "Existing schema marker fields, validation generation/preparation/operation/counts, full fences, encrypted owner row, keyring and all row formats remain unchanged; bounded original preparation and retry must prove the same identities."
       ]
+    },
+    "validation-scheduled-watermark-v2": {
+      "goal": "Prevent repeated execution of one canonical scheduled occurrence after intervening manual FULL runs, report retention, member replacement or CACHE loss, without reconstructing authority from observations.",
+      "entry": "Fresh original controlled validation preparation, or explicit offline resource-local upgrade under the existing CONFIG migration owner/fence; no ordinary access migration. Restore original CONFIG and matching key for loss/corruption; never reconstruct the watermark from CACHE, current rows or report history.",
+      "prerequisites": [
+        "Task row format 2 preserves the existing task generation, definition, mode counters and current OPEN/BORN/CLOSED permissions. FULL additionally requires scheduledAdmission with scopeRevision equal to the current configuration revision and nullable lastDue/lastCommand/lastSequence, initially all null only for a positively established new revision scope. INCREMENTAL fields/behavior remain unchanged and no incremental execution is added.",
+        "A scheduled reservation carries canonical UTC due/command and the original task generation/configuration revision. In the existing actual CONFIG transaction, verify original authorization/fences, enabled current schedule and period identity, compare the watermark and FULL sequence/permission, then reserve the OPEN launch ticket and advance the watermark together. Due <= the recorded due for that revision is refused/recovered as the original, never rebased to a later sequence. CACHE join and native execution retain their existing independent original-ticket/fence protocol; no cross-domain transaction is claimed.",
+        "Manual FULL ticket admission preserves the watermark. A legitimate definition revision update creates a new revision scope with no prior occurrence; delayed previous-revision requests remain rejected. Report/history expiration never deletes or resets the watermark. Task deletion first closes original permissions; same-name recreation uses a fresh generation.",
+        "Legacy format-1 rows support their original manual/history behavior, but scheduled admission is refused until the explicit controlled coverage transition. Missing/invalid format-2 fields or markers refuse; absence is never evidence that an occurrence has not run.",
+        "Controlled transition requires all old members stopped/isolated, schedules OFF, both mode permissions absent or CLOSED, current original CONFIG/CACHE identities, complete valid rows and exclusive existing CONFIG migration fencing. In bounded original-operation batches, upgrade each row, preserve generation/next sequences/closed permissions/reports/keys/binding, increment configuration revision exactly once with a deterministic migration command, keep schedule OFF and establish an empty watermark for that new revision. Old revision occurrences are invalidated rather than guessed. Resume the same recorded upgrade; unknown/partial results stay gated. Only an explicit later schedule save enables future occurrences; no backfill."
+      ]
+    },
+    "validation-scheduled-marker-v2": {
+      "goal": "Positively gate the resource-local scheduled-admission layout and resumable offline transition without conflating schema composition, inventing old occurrence receipts or losing original preparation facts.",
+      "entry": "The same original controlled validation birth or an explicit new offline resource-local upgrade operation. Ordinary open/startup/API access never creates, repairs or upgrades structures or markers.",
+      "prerequisites": [
+        "Global installed CONFIG versions keep their existing composition meanings: base1, separately identified historical validation2/native-AI2, composed3. No global schema4 is introduced. AI fields/cryptography/key material and CACHE schema/row formats remain unchanged.",
+        "Validation marker format2 preserves original operationId, phase, initializedPipelines and exact CacheBusinessScope. It adds one scheduledAdmission engineering subdocument with formatVersion1, upgrade operationId, PREPARING/READY, bounded task cursor and initializedTasks. Row-format2 readiness is published only after the same fenced controlled operation has established every task revision scope. This is engineering schema state, never an approval flag or permission from a private record.",
+        "Old validation marker1 remains readable for original manual/history capabilities but never proves scheduled coverage. New fresh controlled birth publishes marker2 and task-row-format2 coverage. Unsupported versions, malformed fields, partial/missing known structures or lost readiness refuse without fallback or lazy repair. Old binaries reject the new marker/row shape; all members must use the compatible binary before controlled transition.",
+        "The original CONFIG migration owner/fence and actual CONFIG client/session govern PREPARING, each bounded task-row conversion/cursor and READY. All old schedules are OFF and mode permissions quiescent before mutation; ordinary validation mutations remain gated through PREPARING. Preserve original birth scope/facts and original exact restart/loss rules. A crash resumes the same upgrade identity/cursor; no new key, lease, ACK, business-row copy, cache reset or implicit enable is created."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -688,6 +709,10 @@
     "validation-cache-r3": {
       "atomicDomain": "CACHE",
       "fencing": "The original complete VALIDATION claim fence and fixed CacheBusinessScope compete with the Pipeline control, mode slots and stop latch in one CACHE client/session. A valid NODE_SESSION and an original independent CONFIG capability authorize first birth, with CONFIG checks outside the CACHE retry callback. First birth and cancellation serialize on one control key with PREPARED/CANCELLED/RETIRED receipts. A closed predecessor is replaced only by exact generation/preparation/revision CAS while retaining known claim counters. No production claim/state is borrowed; no CONFIG/CACHE atomic transaction is claimed."
+    },
+    "validation-config-scheduled-watermark-v4": {
+      "atomicDomain": "CONFIG",
+      "fencing": "The original task generation, immutable run identity, command and mode sequence compete on the same task permission. Reserve advances the sequence and fixes OPEN. Report insert and OPEN-to-BORN are one transaction. Revocation closes OPEN or seals the exact BORN report and closes the permission atomically. Root publication and report sealing compete in the same CONFIG client/session. No CACHE lease read grants a CONFIG transaction. Independent CONFIG validation preparation and its closing operation gate new admissions in the same CONFIG transaction; production preparation and cached production models grant no validation rights. FULL ticket reservation and the revision-bound occurrence high-watermark share the same actual CONFIG client/session/transaction and existing complete fence. Manual starts preserve it; no CACHE observation or report retention grants a fresh occurrence."
     }
   },
   "resources": [
@@ -1474,24 +1499,24 @@
     },
     {
       "id": "mongo.config.schema_migrations",
-      "resourceVersion": 4,
-      "proposalVersion": 4,
+      "resourceVersion": 5,
+      "proposalVersion": 5,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "schema_migrations"
       ],
-      "responsibility": "Storage-domain schema version and migration ownership, distinguishing original base schema 1, independently approved historical validation and native-AI schema 2, and composed schema 3 with both complete components. Existing validation markers and rows retain their strict original shapes; ordinary access never creates, upgrades or repairs resources.",
+      "responsibility": "Existing CONFIG composition 1/2/3 and original migration ownership. Validation marker format 2 positively records task-row-format 2 scheduled-admission coverage and one bounded controlled-upgrade operation while retaining original validation birth/scope facts. Ordinary open, startup and APIs never upgrade or repair the marker.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoConfigurationDomain"
       ],
-      "recovery": "validation-ai-schema-composition",
+      "recovery": "validation-scheduled-marker-v2",
       "consistency": "config",
-      "growth": "One bounded aggregate per Cluster/domain; no event or lease history.",
+      "growth": "One existing bounded schema aggregate per Cluster/domain; added controlled-upgrade fact <=4 KiB actual BSON and complete validation marker <=8 KiB. No new resource/index/TTL/history/lease/ACK. Original global composition versions, AI component/row format, keys, binding and CACHE schema/row formats are unchanged.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java"
@@ -3233,24 +3258,24 @@
     },
     {
       "id": "mongo.config.validation_tasks",
-      "resourceVersion": 1,
-      "proposalVersion": 2,
+      "resourceVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_tasks"
       ],
-      "responsibility": "Pipeline-bound validation configuration and its two bounded one-time report birth permissions. Immutable taskGeneration, separate configuration revision and monotonic nextStartSequence per FULL/INCREMENTAL; one OPEN/BORN/CLOSED permission per mode binds original command and run.",
+      "responsibility": "Pipeline-bound validation configuration and bounded report-birth permissions. Task row format 2 additionally retains one FULL scheduled-admission high-watermark for the current configuration revision; manual FULL starts preserve it. No request history or per-occurrence rows.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
       ],
-      "recovery": "validation-configuration",
-      "consistency": "validation-config-r3",
-      "growth": "At most two current permissions and counters per task; added admission metadata <=16 KiB actual BSON per task. No request history or per-run tombstones. Config deletion first closes original permissions; same-name recreation uses a fresh generation. Existing total CONFIG budgets reject new work when exhausted.",
+      "recovery": "validation-scheduled-watermark-v2",
+      "consistency": "validation-config-scheduled-watermark-v4",
+      "growth": "Two current permissions/counters per task and one FULL watermark <=1 KiB actual BSON, counted inside the existing <=16 KiB admission-metadata allowance. No new collection, index, TTL, event history, lease or per-run tombstone. Existing task/CONFIG total budgets remain unchanged; capacity rejects before mutation.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java"

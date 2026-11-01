@@ -160,15 +160,41 @@ final class ValidationMemberResources implements AutoCloseable {
         }
     }
 
+    private static final class MetadataReferences {
+        final io.tapstate.core.validation.ValidationMetadataBudget.Lease lease;
+        int count = 1;
+        Metadata notificationOwner;Runnable companionReturned;
+        MetadataReferences(io.tapstate.core.validation.ValidationMetadataBudget.Lease lease) { this.lease = lease; }
+    }
     final class Metadata implements AutoCloseable {
-        private final io.tapstate.core.validation.ValidationMetadataBudget.Lease lease;
-        private Metadata(io.tapstate.core.validation.ValidationMetadataBudget.Lease lease){this.lease=lease;}
+        private final MetadataReferences shared;
+        private final java.util.concurrent.atomic.AtomicBoolean returned = new java.util.concurrent.atomic.AtomicBoolean();
+        private Metadata(io.tapstate.core.validation.ValidationMetadataBudget.Lease lease){this.shared=new MetadataReferences(lease);}
+        private Metadata(MetadataReferences shared){this.shared=shared;}
         long reservedBytes() { return ValidationTaskStore.Inputs.WORK_RESERVATION_BYTES; }
         void requireRetained(Member member){
-            if(member.process()!=ValidationMemberResources.this)throw invalid("resources.metadataOwner");lease.requireRetained(member);member.require();
+            if(returned.get() || member.process()!=ValidationMemberResources.this)throw invalid("resources.metadataOwner");shared.lease.requireRetained(member);member.require();
         }
-        /** Return after the actual read/planner and every retained definition have relinquished ownership. */
-        @Override public void close(){lease.close();}
+        /** A non-owning generation pointer may borrow only while another real reference remains. */
+        Metadata retainIfAlive(){synchronized(shared){if(shared.count==0)return null;shared.count++;return new Metadata(shared);}}
+        int references(){synchronized(shared){return shared.count;}}
+        void whenCompanionReturns(Runnable notify){synchronized(shared){
+            if(returned.get()||shared.count==0)throw invalid("resources.metadataOwner");
+            if(shared.notificationOwner!=null&&shared.notificationOwner!=this)throw new IllegalStateException("metadata already has a cleanup owner");
+            shared.notificationOwner=this;shared.companionReturned=java.util.Objects.requireNonNull(notify);
+        }}
+        /** Every pending reservation/actor relinquishes its own handle; the final reference returns the slot. */
+        @Override public void close(){
+            if(!returned.compareAndSet(false,true))return;
+            Runnable notify;
+            synchronized(shared){
+                if(shared.notificationOwner==this){shared.notificationOwner=null;shared.companionReturned=null;}
+                if(--shared.count==0)shared.lease.close();
+                notify=shared.count==1?shared.companionReturned:null;
+            }
+            // Never invoke a registry callback while holding the shared-reference monitor.
+            if(notify!=null)notify.run();
+        }
     }
 
     /** A queued or running original control body retains its allocation until actual exit. */

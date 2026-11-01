@@ -30,12 +30,13 @@ final class NativeValidationRuns implements AutoCloseable {
         this.owners=Objects.requireNonNull(owners);this.resources=Objects.requireNonNull(resources);this.process=Objects.requireNonNull(process);
         polling=process.controlTicks(this::tick);
     }
-    ValidationRunLifecycle.Status start(ValidationReportAdmission.Start original,ValidationRunLifecycle.Activation activation) {
+    ValidationRunLifecycle.Status start(ValidationReportAdmission.Start original,ValidationRunLifecycle.Activation activation) { return start(original,activation,null); }
+    ValidationRunLifecycle.Status start(ValidationReportAdmission.Start original,ValidationRunLifecycle.Activation activation,java.time.Instant scheduledDue) {
         if(closed)throw invalid("runs.contextClosed");
         var existing=runs.get(original.run());if(existing!=null){if(!existing.original.admission().equals(original))throw invalid("runs.originalCommand");return existing.observed;}
         var reservation=owners.take(original);var snapshot=reservation.spec();
         var run=new ValidationControlStore.Run(original.run(),reservation.countingGeneration(),original,snapshot);
-        var candidate=new Actor(run,reservation,Objects.requireNonNull(activation));
+        var candidate=new Actor(run,reservation,Objects.requireNonNull(activation),scheduledDue);
         synchronized(runs) {
             if(closed)throw invalid("runs.contextClosed");existing=runs.get(original.run());
             if(existing!=null)return existing.observed;if(runs.size()==128)throw capacity();
@@ -62,13 +63,13 @@ final class NativeValidationRuns implements AutoCloseable {
     boolean controlIdle(ValidationRunIdentity original){var actor=runs.get(original);return actor==null||!actor.inFlight.get();}
     Optional<ValidationReportMetadata.Failure> reportFailure(ValidationRunIdentity original){var actor=runs.get(original);return actor==null?Optional.empty():Optional.ofNullable(actor.reportFailure);}
     void stop(ValidationRunIdentity original) {var run=runs.get(original);if(run==null)throw invalid("runs.originalUnavailable");run.lifecycle.stop();run.dispatch();}
-    private void tick(){var ordered=List.copyOf(runs.values());if(ordered.isEmpty()){if(closed)polling.cancel(false);return;}int offset=Math.floorMod(rotation.getAndIncrement(),ordered.size());for(int index=0;index<ordered.size();index++)ordered.get((offset+index)%ordered.size()).dispatch();}
+    private void tick(){synchronized(quotas){for(var shared:List.copyOf(quotas.values()))releaseShared(shared);}var ordered=List.copyOf(runs.values());if(ordered.isEmpty()){synchronized(quotas){if(closed&&quotas.isEmpty())polling.cancel(false);}return;}int offset=Math.floorMod(rotation.getAndIncrement(),ordered.size());for(int index=0;index<ordered.size();index++)ordered.get((offset+index)%ordered.size()).dispatch();}
     private Shared shared(Actor actor) {
         var key=new Generation(actor.original.identity().owner(),actor.original.countingGeneration());
         synchronized(quotas) {
-            var current=quotas.get(key);if(current!=null){actor.reservation.takeQuotaMetadata().close();return current;}
+            var current=quotas.get(key);if(current!=null){current.members.add(actor.original.identity());actor.reservation.takeQuotaMetadata().close();return current;}
             var frame=actor.reservation.takeQuotaMetadata();
-            try {current=new Shared(key,frame,new ValidationOwnerQuota(key.owner(),key.counting(),8L*1024*1024,actor.reservation.access().control(),actor.reservation::requireOwner));quotas.put(key,current);return current;}
+            try {current=new Shared(key,frame,new ValidationOwnerQuota(key.owner(),key.counting(),8L*1024*1024,actor.reservation.access().control(),actor.reservation::requireOwner));current.members.add(actor.original.identity());var retained=current;frame.whenCompanionReturns(()->releaseShared(retained));quotas.put(key,current);return current;}
             catch(RuntimeException|Error failed){frame.close();throw failed;}
         }
     }
@@ -93,7 +94,7 @@ final class NativeValidationRuns implements AutoCloseable {
         volatile boolean mirrorReady;
         final ValidationReports reports;
         final io.tapstate.core.logging.SecretRedactor reportRedactor;
-        Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation) {
+        Actor(ValidationControlStore.Run original,NativeValidationOwnerReservations.Reservation reservation,ValidationRunLifecycle.Activation activation,java.time.Instant scheduledDue) {
             this.original=original;this.reservation=reservation;allocation=reservation.resources();control=allocation.controlExecutor();
             reports=reservation.access().reports();var secrets=new ArrayList<String>();var sources=new ArrayList<String>();
             for(var resource:reservation.declarations.artifacts().list())if(resource instanceof io.tapstate.core.model.SourceResource source){sources.add(source.id());secretScalars(source.config(),secrets);}
@@ -114,7 +115,7 @@ final class NativeValidationRuns implements AutoCloseable {
                     }
                 }
             };
-            lifecycle=new ValidationRunLifecycle(original,reservation.access().admissions(),reservation.access().control(),factory,this);
+            lifecycle=new ValidationRunLifecycle(original,reservation.access().admissions(),reservation.access().control(),factory,this,scheduledDue);
             observed=lifecycle.status();
         }
         void dispatch() {
@@ -168,7 +169,7 @@ final class NativeValidationRuns implements AutoCloseable {
             if(execution instanceof ValidationJobExecution job)job.releaseFactories();runs.remove(original.identity(),this);
         }
         private void disposeExpiredOriginal(){
-            var value=shared;if(value!=null){value.quota.expired(original.identity());value.members.remove(original.identity());releaseShared(value);}
+            var value=shared;if(value!=null){value.quota.expired(original.identity(),value.frame.references()>1);value.members.remove(original.identity());releaseShared(value);}
             reservation.releaseClosedContextMetadata();
             if(execution instanceof ValidationJobExecution job)job.releaseFactories();runs.remove(original.identity(),this);
         }
@@ -231,7 +232,7 @@ final class NativeValidationRuns implements AutoCloseable {
             }
             var failure=lifecycle.executionFailure();
             reservation.rememberTerminal(terminal,lifecycle.status().admitted(),NativeValidationReportFailure.code(failure),lifecycle.reportBorn());
-            var value=shared;if(value!=null){value.quota.retired(original,terminal);value.members.remove(original.identity());releaseShared(value);}
+            var value=shared;if(value!=null){value.quota.retired(original,terminal,value.frame.references()>1);value.members.remove(original.identity());releaseShared(value);}
             reservation.releaseAfterKnownTerminal();retirementReleased=true;
         }
         @Override public void processorsExited(){allocation.processorsExited();}
@@ -243,7 +244,7 @@ final class NativeValidationRuns implements AutoCloseable {
     }
     private void releaseShared(Shared shared) {
         synchronized(quotas) {
-            if(shared.members.isEmpty()&&quotas.remove(shared.generation,shared))shared.frame.close();
+            if(shared.members.isEmpty()&&shared.frame.references()==1&&quotas.remove(shared.generation,shared))shared.frame.close();
         }
     }
     /** Empty means bounded backpressure, not a lost root or permission to publish. Capacity is not timing confirmation. */

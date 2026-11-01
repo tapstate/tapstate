@@ -67,8 +67,18 @@ final class ConfigurationVersion {
                     || !MongoConfigurationDomain.LAYOUT.equals(identities.getFirst().get("layoutId"))) throw MongoValidationSchema.unreadable("identity");
             if (operation != null) {
                 if (!operation.equals(marker.get("operationId")) || !"PREPARING".equals(marker.get("phase"))) throw MongoValidationSchema.refused();
-            } else if (!"READY".equals(marker.get("phase"))) throw MongoValidationSchema.refused();
+            } else if (!"READY".equals(marker.get("phase")) || Integer.valueOf(2).equals(marker.get("formatVersion"))
+                    && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw MongoValidationSchema.refused();
         } else if (operation != null) throw MongoValidationSchema.refused();
+    }
+
+    static void advanceScheduledPreparation(ClientSession session, com.mongodb.client.MongoDatabase database, String operation) {
+        var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        var marker = MongoValidationSchema.requireConfiguration(row, "READY");
+        var upgrade = marker.get("scheduledAdmission", Document.class);
+        if (!Integer.valueOf(2).equals(marker.get("formatVersion")) || upgrade == null
+                || !operation.equals(upgrade.get("operationId")) || !"PREPARING".equals(upgrade.get("phase"))) throw MongoValidationSchema.refused();
+        advanceRaw(session, SystemCollections.CONFIGURATION_VERSION.on(database));
     }
 
     private static void advanceRaw(ClientSession session, MongoCollection<Document> versions) {

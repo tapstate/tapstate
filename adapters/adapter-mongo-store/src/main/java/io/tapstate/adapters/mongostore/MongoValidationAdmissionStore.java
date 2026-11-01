@@ -11,6 +11,8 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationMode;
+import io.tapstate.core.validation.ValidationSchedule;
+import io.tapstate.core.validation.ValidationScheduleIdentity;
 import io.tapstate.core.validation.ValidationRunIdentity;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.ValidationReportAdmission;
@@ -72,7 +74,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
         @Override public java.util.Optional<Snapshot> read(String pipeline, String task) {
             identifier(pipeline); identifier(task);
-            return call(session -> java.util.Optional.ofNullable(document(session, pipeline, task)).map(row -> MongoValidationTaskCodec.snapshot(row, owner.clusterId)));
+            return call(session -> java.util.Optional.ofNullable(document(session, pipeline, task)).map(row -> {
+                MongoValidationSchema.requireTaskCoverage(owner.database, session, row); return MongoValidationTaskCodec.snapshot(row, owner.clusterId);
+            }));
         }
 
         @Override public Page list(String pipeline,int offset,int limit){
@@ -80,7 +84,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             return call(session->{
                 var filter=new Document("_id.clusterId",owner.clusterId).append("_id.pipelineId",pipeline);var result=new java.util.ArrayList<Snapshot>();
                 try(var cursor=owner.tasks.find(session,filter).sort(new Document("_id.taskId",1)).skip(offset).limit(limit).iterator()){
-                    while(cursor.hasNext())result.add(MongoValidationTaskCodec.snapshot(cursor.next(),owner.clusterId));
+                    while(cursor.hasNext()){var row=cursor.next();MongoValidationSchema.requireTaskCoverage(owner.database,session,row);result.add(MongoValidationTaskCodec.snapshot(row,owner.clusterId));}
                 }
                 long total=owner.tasks.countDocuments(session,filter);if(total>MAX_TASKS_PER_PIPELINE)throw taskLimit("validation.taskCount");
                 return new Page(result,total,offset,limit);
@@ -144,7 +148,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 }
                 MongoValidationPreparations.requireTaskAuthoringParent(session, owner.database, owner.clusterId, command.task().pipelineId());
                 if (!currentResources(session, command.comparison())) return Write.CONFLICT;
-                var row = MongoValidationTaskCodec.initial(command);
+                var row = MongoValidationTaskCodec.initial(command, MongoValidationSchema.scheduledReady(owner.database, session));
                 ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);
                 capacity(session, command.task().pipelineId(), null, row);
                 owner.tasks.insertOne(session, row); return Write.APPLIED;
@@ -166,7 +170,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 }
                 if(!currentResources(session,command.comparison()))return new Created(Write.CONFLICT,null);
                 if(!MongoValidationPreparations.taskParentGeneration(session,owner.database,owner.clusterId,command.pipelineId(),true).equals(parent))throw MongoValidationPreparations.fenced();
-                var row=MongoValidationTaskCodec.initial(new Create(task,command.comparison(),command.settings(),command.commandId()));
+                var row=MongoValidationTaskCodec.initial(new Create(task,command.comparison(),command.settings(),command.commandId()), MongoValidationSchema.scheduledReady(owner.database, session));
                 ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database), owner.client);capacity(session,task.pipelineId(),null,row);
                 owner.tasks.insertOne(session,row);return new Created(Write.APPLIED,candidate);
             });
@@ -203,7 +207,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 var raw=owner.tasks.withDocumentClass(org.bson.RawBsonDocument.class).find(session,new Document("_id",taskId(command.task()))).batchSize(1).first();
                 if(raw==null)return Write.CONFLICT;
                 if(raw.getByteLength()>Inputs.MAX_STORED_BYTES)throw taskLimit("validation.taskDefinitionBytes");
-                var previous=raw.decode(owner.tasks.getCodecRegistry().get(Document.class));var current=MongoValidationTaskCodec.snapshot(previous,owner.clusterId);
+                var previous=raw.decode(owner.tasks.getCodecRegistry().get(Document.class));MongoValidationSchema.requireTaskCoverage(owner.database,session,previous);var current=MongoValidationTaskCodec.snapshot(previous,owner.clusterId);
                 if(!current.task().equals(command.task()))return Write.CONFLICT;if(current.closed())return Write.CLOSED;
                 if(current.commandId().equals(command.commandId()))return current.revision()==command.expectedRevision()+1&&!current.settings().full().scheduleEnabled()?Write.DUPLICATE:Write.CONFLICT;
                 if(current.revision()!=command.expectedRevision())return Write.CONFLICT;
@@ -220,6 +224,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             return call(session -> {
                 var row = owner.tasks.find(session, new Document("_id", taskId(task))).projection(taskHeader()).first();
                 if (row == null || validateTask(row, task, true) == null) return Closure.STALE;
+                MongoValidationSchema.requireTaskCoverage(owner.database, session, row);
                 boolean wasClosed = Boolean.TRUE.equals(row.get("closed"));
                 boolean pending = false;
                 for (var selected : ValidationMode.values()) { var permission = permission(mode(row, selected)); if (permission != null && !phase(permission).equals("CLOSED")) pending = true; }
@@ -237,7 +242,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }
 
         private Document document(ClientSession session, String pipeline, String task) {
-            return owner.definitionDocument(session, pipeline, task);
+            var row = owner.definitionDocument(session, pipeline, task);
+            if (row != null) MongoValidationSchema.requireTaskCoverage(owner.database, session, row);
+            return row;
         }
 
         private void capacity(ClientSession session, String pipeline, Document previous, Document next) {
@@ -261,6 +268,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         private <T> T call(Function<ClientSession, T> action) {
             return owner.transaction(() -> MongoValidationSchema.requireReady(owner.database, true), session -> {
                 if (!MongoValidationPreparations.validationEnabled(session, owner.database, owner.clusterId)) throw unreadable("schema");
+                MongoValidationSchema.requireMutationReady(owner.database, session);
                 return action.apply(session);
             });
         }
@@ -295,12 +303,30 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         return true;
     }
 
-    @Override public Reservation reserve(Start start) {
+    @Override public Reservation reserve(Start start) { return reserve(start, null, null); }
+    @Override public Reservation reserveScheduled(Start start, java.time.Instant due, ValidationSchedule.Calculator calculator) { return reserve(start, Objects.requireNonNull(due), Objects.requireNonNull(calculator)); }
+    private Reservation reserve(Start start, java.time.Instant due, ValidationSchedule.Calculator calculator) {
         requireStart(start);
         return transaction(true, () -> {}, session -> {
             var task = task(session, start); if (task == null) return Reservation.STALE;
+            MongoValidationSchema.requireTaskCoverage(database, session, task);
             if (Boolean.TRUE.equals(task.get("closed"))) return Reservation.CLOSED;
             var mode = mode(task, start.run().mode()); var held = permission(mode);
+            if (due != null) {
+                if (start.run().mode() != ValidationMode.FULL || !MongoValidationSchema.scheduledReady(database, session)
+                        || !Integer.valueOf(2).equals(task.get("formatVersion"))) return Reservation.STALE;
+                var fullRow = definitionDocument(session, start.task().pipelineId(), start.task().taskId());
+                var saved = MongoValidationTaskCodec.snapshot(fullRow, clusterId);
+                var full = saved.settings().full();
+                if (!full.scheduleEnabled() || full.schedule() == null || saved.revision() != start.configurationRevision()
+                        || !ValidationScheduleIdentity.command(clusterId, start.task().pipelineId(), start.task().taskId(), start.task().generation(), start.configurationRevision(), due).toString().equals(start.commandId())
+                        || !calculator.nextAfter(full.schedule(), due.minusNanos(1), ValidationSchedule.SearchBudget.DEFAULT).equals(due)) return Reservation.STALE;
+                var watermark = saved.full().scheduledAdmission();
+                if (watermark == null || watermark.scopeRevision() != saved.revision()) throw unreadable("scheduled-coverage");
+                if (watermark.lastDue() != null && !due.isAfter(watermark.lastDue())
+                        && !(due.equals(watermark.lastDue()) && watermark.lastCommand().toString().equals(start.commandId())
+                        && watermark.lastSequence() == start.sequence() && held != null && identity(start).equals(held.get("identity")))) return Reservation.STALE;
+            }
             if (held != null && held.getLong("sequence") == start.sequence()) {
                 if (!identity(start).equals(held.get("identity"))) return Reservation.STALE;
                 return phase(held).equals("CLOSED") ? Reservation.CLOSED : Reservation.DUPLICATE;
@@ -318,6 +344,8 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             }
             var next = new Document("nextStartSequence", start.sequence() + 1)
                     .append("permission", new Document("sequence", start.sequence()).append("phase", "OPEN").append("identity", identity(start)));
+            if (mode.containsKey("scheduledAdmission")) next.put("scheduledAdmission", mode.get("scheduledAdmission"));
+            if (due != null) next.put("scheduledAdmission", MongoValidationTaskCodec.watermark(new ValidationTaskStore.ScheduledAdmission(start.configurationRevision(), due, java.util.UUID.fromString(start.commandId()), start.sequence())));
             updateMode(session, task, start, next); return Reservation.RESERVED;
         });
     }
@@ -397,7 +425,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         return validateTask(task, expected, validation != null || recovery != null);
     }
     private static Document validateTask(Document task, Task expected, boolean requireClosureFlag) {
-        if (!Integer.valueOf(1).equals(task.get("formatVersion")) || !(task.get("revision") instanceof Long revision) || revision < 1
+        if ((!Integer.valueOf(1).equals(task.get("formatVersion")) && !Integer.valueOf(2).equals(task.get("formatVersion"))) || !(task.get("revision") instanceof Long revision) || revision < 1
                 || !(task.get("taskGeneration") instanceof String generation) || !(task.get("modes") instanceof Document modes)
                 || !modes.keySet().equals(Set.of("full", "incremental")) || task.containsKey("closed") && !(task.get("closed") instanceof Boolean)
                 || requireClosureFlag && !(task.get("closed") instanceof Boolean)) throw unreadable("task");
@@ -415,6 +443,12 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                         || original.configurationRevision() > revision) throw unreadable("permission-scope");
             }
         }
+        if (Integer.valueOf(2).equals(task.get("formatVersion"))) {
+            if (!(modes.get("full", Document.class).get("scheduledAdmission") instanceof Document scheduled)) throw unreadable("scheduled-watermark");
+            var watermark = MongoValidationTaskCodec.watermark(scheduled);
+            if (watermark.scopeRevision() != revision || watermark.lastSequence() != null && watermark.lastSequence() >= modes.get("full", Document.class).getLong("nextStartSequence")) throw unreadable("scheduled-scope");
+            if (modes.get("incremental", Document.class).containsKey("scheduledAdmission")) throw unreadable("scheduled-incremental");
+        } else if (modes.get("full", Document.class).containsKey("scheduledAdmission")) throw unreadable("scheduled-legacy");
         bounded(admissionMetadata(task, modes), 16 * 1024);
         return task;
     }
@@ -579,7 +613,8 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var modes = task.get("modes", Document.class);
         var value = modes.get(modeName(mode));
         if (!(value instanceof Document row) || !(row.get("nextStartSequence") instanceof Long next) || next < 1
-                || !(row.keySet().equals(Set.of("nextStartSequence")) || row.keySet().equals(Set.of("nextStartSequence", "permission"))))
+                || !(row.keySet().equals(Set.of("nextStartSequence")) || row.keySet().equals(Set.of("nextStartSequence", "permission"))
+                || row.keySet().equals(Set.of("nextStartSequence", "scheduledAdmission")) || row.keySet().equals(Set.of("nextStartSequence", "permission", "scheduledAdmission"))))
             throw unreadable("mode");
         var held = permission(row);
         if (held != null && held.getLong("sequence") + 1 != next || held == null && next != 1) throw unreadable("mode-sequence");
@@ -653,7 +688,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     io.tapstate.spi.store.ValidationTaskStore.Snapshot retentionTask(ClientSession session,Task expected){
         if(!clusterId.equals(expected.clusterId()))throw unreadable("retention-cluster");requirePipeline(expected.pipelineId());
         var row=tasks.find(session,new Document("_id",taskId(expected))).first();if(row==null)return null;
-        var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
+        MongoValidationSchema.requireTaskCoverage(database,session,row);var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
         // Birth and authoring use this same CONFIG write fence. No new lease or acknowledgement is introduced.
         ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
         return saved;
@@ -671,7 +706,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             requireActive.run(); verifyStructures(); verifyAdditionalStructures.run();
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
-                    requireActive.run(); if (validation != null) validation.enter(client, database, session, admission);
+                    requireActive.run();
+                    if (validation != null || recovery != null) MongoValidationSchema.requireMutationReady(database, session);
+                    if (validation != null) validation.enter(client, database, session, admission);
                     if (recovery != null) {
                         if (admission) throw unreadable("recovery-admission");
                         recovery.require(client, database, session);
@@ -687,6 +724,62 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             if (row == null || !"collection".equals(row.get("type"))) throw unreadable("validation-collection");
         }
     }
+    record ScheduledUpgradeProgress(Document cursor, long initialized, String phase) {}
+    static ScheduledUpgradeProgress advanceScheduledUpgradeTask(ClientSession session, MongoDatabase database, String cluster, String operation, Document upgrade) {
+        var tasks = SystemCollections.VALIDATION_TASKS.on(database);
+        long initialized = upgrade.getLong("initializedTasks");
+        if (tasks.countDocuments(session, new Document("_id.clusterId", cluster).append("formatVersion", 2)) != initialized)
+            throw MongoValidationSchema.unreadable("scheduled-initialized-tasks");
+        var query = new Document("_id.clusterId", cluster); var cursor = upgrade.get("cursor", Document.class);
+        if (cursor != null) query.put("$or", java.util.List.of(new Document("_id.pipelineId", new Document("$gt", cursor.getString("pipelineId"))),
+                new Document("_id.pipelineId", cursor.getString("pipelineId")).append("_id.taskId", new Document("$gt", cursor.getString("taskId")))));
+        var row = tasks.find(session, query).sort(new Document("_id.pipelineId", 1).append("_id.taskId", 1)).limit(1).first();
+        String phase;
+        if (row == null) { verifyScheduledUpgradeRows(session, database, cluster, true); phase = "READY"; }
+        else {
+            if (!Integer.valueOf(1).equals(row.get("formatVersion"))) throw MongoValidationSchema.unreadable("scheduled-upgrade-row");
+            var saved = scheduledUpgradeRow(row, cluster);
+            if (saved.revision() >= Long.MAX_VALUE - 1) throw MongoValidationSchema.refused();
+            var command = java.util.UUID.nameUUIDFromBytes(("validation-scheduled-upgrade-v1\n" + operation + "\n" + saved.task().generation()).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            var next = new Document(row).append("formatVersion", 2).append("revision", saved.revision() + 1).append("lastMutationId", command.toString());
+            var modes = new Document(row.get("modes", Document.class));
+            modes.put("full", new Document(modes.get("full", Document.class)).append("scheduledAdmission",
+                    MongoValidationTaskCodec.watermark(new io.tapstate.spi.store.ValidationTaskStore.ScheduledAdmission(saved.revision() + 1, null, null, null))));
+            next.put("modes", modes); MongoValidationTaskCodec.snapshot(next, cluster);
+            if (MongoValidationTaskCodec.reservedBytes(next) > MongoValidationTaskCodec.MAX_TASK_BYTES) throw MongoValidationSchema.refused();
+            if (tasks.replaceOne(session, row, next).getMatchedCount() != 1) throw MongoValidationSchema.refused();
+            var id = row.get("_id", Document.class);
+            cursor = new Document("pipelineId", id.getString("pipelineId")).append("taskId", id.getString("taskId"));
+            if (initialized == Long.MAX_VALUE - 1) throw MongoValidationSchema.refused();
+            initialized++; phase = "PREPARING";
+        }
+        return new ScheduledUpgradeProgress(cursor, initialized, phase);
+    }
+
+    private static io.tapstate.spi.store.ValidationTaskStore.Snapshot scheduledUpgradeRow(Document row, String cluster) {
+        var saved = MongoValidationTaskCodec.snapshot(row, cluster);
+        if (saved.settings().full().scheduleEnabled() || saved.full().permission() != null && saved.full().permission().phase() != io.tapstate.spi.store.ValidationTaskStore.Phase.CLOSED
+                || saved.incremental().permission() != null && saved.incremental().permission().phase() != io.tapstate.spi.store.ValidationTaskStore.Phase.CLOSED) throw MongoValidationSchema.refused();
+        return saved;
+    }
+
+    static void verifyScheduledUpgradeRows(ClientSession session, MongoDatabase database, String cluster, boolean covered) {
+        var tasks = SystemCollections.VALIDATION_TASKS.on(database); long totalBytes = 0;
+        String pipeline = null; long pipelineBytes = 0; int pipelineCount = 0;
+        try (var rows = tasks.find(session, new Document("_id.clusterId", cluster)).sort(new Document("_id.pipelineId", 1).append("_id.taskId", 1)).batchSize(20).iterator()) {
+            while (rows.hasNext()) {
+                var row = rows.next(); var saved = scheduledUpgradeRow(row, cluster);
+                if (!Integer.valueOf(covered ? 2 : 1).equals(row.get("formatVersion"))) throw MongoValidationSchema.unreadable("scheduled-upgrade-coverage");
+                long bytes = MongoValidationTaskCodec.reservedBytes(row);
+                if (bytes > MongoValidationTaskCodec.MAX_TASK_BYTES) throw MongoValidationSchema.refused();
+                if (!saved.task().pipelineId().equals(pipeline)) { pipeline = saved.task().pipelineId(); pipelineBytes = 0; pipelineCount = 0; }
+                totalBytes += bytes; pipelineBytes += bytes;
+                if (++pipelineCount > MongoValidationAdmissionStore.MAX_TASKS_PER_PIPELINE || totalBytes > MongoValidationTaskCodec.MAX_CLUSTER_TASK_BYTES
+                        || pipelineBytes > MongoValidationTaskCodec.MAX_PIPELINE_TASK_BYTES) throw MongoValidationSchema.refused();
+            }
+        }
+    }
+
     static Document taskId(Task task) {
         return new Document("clusterId", task.clusterId()).append("pipelineId", task.pipelineId()).append("taskId", task.taskId());
     }
@@ -704,6 +797,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                         .append("executionGeneration", owner.executionGeneration()).append("topologyRevision", owner.topologyRevision()));
     }
     private static String modeName(ValidationMode mode) { return mode == ValidationMode.FULL ? "full" : "incremental"; }
+    static void requireAdmissionBounds(Document task) { bounded(admissionMetadata(task, task.get("modes", Document.class)), 16 * 1024); }
     private static Document admissionMetadata(Document task, Document modes) {
         var maximumModes = new Document();
         for (var entry : modes.entrySet()) {

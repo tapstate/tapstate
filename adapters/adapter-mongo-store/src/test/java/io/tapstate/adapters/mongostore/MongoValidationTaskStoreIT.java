@@ -809,6 +809,151 @@ class MongoValidationTaskStoreIT {
     }
 
     record Reserved(MongoConfigurationDomain.ValidationAccess access, ValidationReportAdmission.Start start) {}
+    @Test void positiveScheduledCoverageRefusesLegacyRowsAcrossAllOrdinaryTaskPaths() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); f.tasks.create(create);
+            var legacy = f.document(create.task()); legacy.put("formatVersion", 1);
+            legacy.get("modes", Document.class).get("full", Document.class).remove("scheduledAdmission");
+            f.collection().replaceOne(new Document("_id", legacy.get("_id")), legacy);
+            long version = f.configuration.configurationRevision();
+            for (Runnable action : List.<Runnable>of(
+                    () -> f.tasks.update(new Update(create.task(), 1, create.comparison(), create.settings(), UUID.randomUUID())),
+                    () -> f.tasks.disableSchedule(new DisableSchedule(create.task(), 1, UUID.randomUUID())),
+                    () -> f.tasks.inputs(create.task(), 1), () -> f.tasks.list("flow", 0, 20),
+                    () -> f.tasks.create(create), () -> f.tasks.close(create.task()))) {
+                assertThatThrownBy(action::run).isInstanceOf(TapstateException.class);
+                assertThat(f.document(create.task())).isEqualTo(legacy);
+                assertThat(f.configuration.configurationRevision()).isEqualTo(version);
+            }
+        }
+    }
+
+    @Test void directAdmissionRejectsMalformedWatermarksWithCodedStorageErrors() {
+        try(var f=new Fixture()) {
+            var create=f.create("flow");f.tasks.create(create);
+            var start=scheduled(f.read(create.task()),java.time.Instant.parse("2026-11-01T00:01:00Z"),1);
+            var admissions=new MongoValidationAdmissionStore(f.configClient,f.configDb,"cluster",()->{});
+            var original=f.document(create.task());
+            for(Object broken:List.of("wrong-bson-type",new Document("scopeRevision",1L).append("lastDue","invalid")
+                    .append("lastCommand",UUID.randomUUID().toString()).append("lastSequence",1L))) {
+                var row=new org.bson.RawBsonDocument(original,new org.bson.codecs.DocumentCodec()).decode(new org.bson.codecs.DocumentCodec());
+                row.get("modes",Document.class).get("full",Document.class).put("scheduledAdmission",broken);
+                f.collection().replaceOne(new Document("_id",row.get("_id")),row);
+                for(Runnable action:List.<Runnable>of(()->admissions.reserve(start),()->admissions.open(start),()->admissions.close(start))) {
+                    assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,failure->assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                    assertThat(f.document(create.task())).isEqualTo(row);
+                }
+            }
+        }
+    }
+
+    @Test void scheduledWatermarkSurvivesManualPermissionAndReportHistoryLoss() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); var due = java.time.Instant.parse("2026-11-01T00:01:00Z");
+            var schedule = new ValidationSchedule.Interval(1, ValidationSchedule.Unit.MINUTES, due.minusSeconds(60), "UTC");
+            var settings = new Settings(new Full(ValidationMethod.COUNT, 1, schedule, true, 1), create.settings().incremental());
+            f.tasks.create(new Create(create.task(), create.comparison(), settings, create.commandId()));
+            var admissions = new MongoValidationAdmissionStore(f.configClient, f.configDb, "cluster", () -> {});
+            var first = scheduled(f.read(create.task()), due, 1);
+            assertThat(admissions.reserveScheduled(first, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            assertThat(admissions.reserveScheduled(first, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.DUPLICATE);
+            assertThat(admissions.close(first)).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            var manual = new ValidationReportAdmission.Start(first.task(), 1, 2, UUID.randomUUID().toString(),
+                    new ValidationRunIdentity(first.run().owner(), first.task().taskId(), "manual", ValidationMode.FULL, first.run().specHash(), 1, first.run().comparisonRulesVersion()));
+            assertThat(admissions.reserve(manual)).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            admissions.close(manual);
+            SystemCollections.VALIDATION_REPORTS.on(f.configDb).deleteMany(new Document());
+            var delayed = scheduled(f.read(create.task()), due, 3);
+            assertThat(admissions.reserveScheduled(delayed, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+            assertThat(f.read(create.task()).full().nextStartSequence()).isEqualTo(3);
+            assertThat(f.read(create.task()).full().scheduledAdmission().lastDue()).isEqualTo(due);
+            var future = scheduled(f.read(create.task()), due.plusSeconds(60), 3);
+            assertThat(admissions.reserveScheduled(future, due.plusSeconds(60), intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            assertThat(admissions.reserveScheduled(first, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+            admissions.close(future);
+            var saved = f.read(create.task());
+            f.tasks.update(new Update(saved.task(), saved.revision(), saved.comparison(), saved.settings(), UUID.randomUUID()));
+            assertThat(f.read(create.task()).full().scheduledAdmission()).isEqualTo(new ScheduledAdmission(2, null, null, null));
+            assertThat(admissions.reserveScheduled(delayed, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+        }
+    }
+
+    @Test void scheduledRaceUsesOneConfigTransactionAndNeverRebasesTheLoser() throws Exception {
+        try (var f = new Fixture(); var workers = Executors.newFixedThreadPool(2)) {
+            var create = f.create("flow"); var due = java.time.Instant.parse("2026-11-01T00:01:00Z");
+            var schedule = new ValidationSchedule.Interval(1, ValidationSchedule.Unit.MINUTES, due.minusSeconds(60), "UTC");
+            f.tasks.create(new Create(create.task(), create.comparison(), new Settings(new Full(ValidationMethod.COUNT, 1, schedule, true, 1), create.settings().incremental()), create.commandId()));
+            var a = new MongoValidationAdmissionStore(f.configClient, f.configDb, "cluster", () -> {});
+            var b = new MongoValidationAdmissionStore(f.configClient, f.configDb, "cluster", () -> {});
+            var start = scheduled(f.read(create.task()), due, 1); var gate = new CountDownLatch(1);
+            var one = workers.submit(() -> { gate.await(); return a.reserveScheduled(start, due, intervalCalculator()); });
+            var two = workers.submit(() -> { gate.await(); return b.reserveScheduled(start, due, intervalCalculator()); }); gate.countDown();
+            assertThat(List.of(one.get(10, TimeUnit.SECONDS), two.get(10, TimeUnit.SECONDS)))
+                    .containsExactlyInAnyOrder(ValidationReportAdmission.Reservation.RESERVED, ValidationReportAdmission.Reservation.DUPLICATE);
+            assertThat(f.read(create.task()).full().nextStartSequence()).isEqualTo(2);
+            assertThat(f.read(create.task()).full().scheduledAdmission().lastSequence()).isEqualTo(1);
+            a.close(start);
+            var wrongDue = due.plusSeconds(1); var wrong = scheduled(f.read(create.task()), wrongDue, 2);
+            assertThat(a.reserveScheduled(wrong, wrongDue, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+        }
+    }
+
+    @Test void legacyScheduledUpgradeIsExplicitBoundedResumableAndPreservesClosedRuns() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow"); f.tasks.create(create);
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb);
+            var schema = schemas.find(new Document("_id", "config")).first();
+            var marker = new Document(schema.get("validation", Document.class)); marker.put("formatVersion", 1); marker.remove("scheduledAdmission");
+            schemas.updateOne(new Document("_id", "config"), new Document("$set", new Document("validation", marker)));
+            var legacy = new Document(f.document(create.task())); legacy.put("formatVersion", 1);
+            legacy.get("modes", Document.class).get("full", Document.class).remove("scheduledAdmission");
+            f.collection().replaceOne(new Document("_id", legacy.get("_id")), legacy);
+            try (var ordinary = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(ordinary.validationTasks(() -> {}).read("flow", create.task().taskId()).orElseThrow().full().scheduledAdmission()).isNull();
+            }
+            assertThat(f.document(create.task())).isEqualTo(legacy);
+            var cacheBefore = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.cacheDb).find().first();
+            var operation = UUID.randomUUID();
+            try (var upgrade = MongoConfigurationDomain.ValidationScheduledPreparation.open(f.settings, "cluster", operation)) {
+                assertThatThrownBy(() -> f.tasks.update(new Update(create.task(), 1, create.comparison(), create.settings(), UUID.randomUUID()))).isInstanceOf(TapstateException.class);
+                assertThat(upgrade.advance(1).ready()).isFalse();
+                assertThat(f.document(create.task()).getLong("revision")).isEqualTo(2);
+            }
+            assertThatThrownBy(() -> MongoConfigurationDomain.ValidationScheduledPreparation.open(f.settings, "cluster", UUID.randomUUID())).isInstanceOf(TapstateException.class);
+            try (var resumed = MongoConfigurationDomain.ValidationScheduledPreparation.open(f.settings, "cluster", operation)) {
+                assertThat(resumed.advance(1).ready()).isTrue();
+                assertThat(resumed.advance(1).initializedTasks()).isEqualTo(1);
+            }
+            var saved = f.read(create.task());
+            assertThat(saved.task()).isEqualTo(create.task()); assertThat(saved.revision()).isEqualTo(2);
+            assertThat(saved.full().nextStartSequence()).isEqualTo(1); assertThat(saved.settings()).isEqualTo(create.settings());
+            assertThat(saved.full().scheduledAdmission()).isEqualTo(new ScheduledAdmission(2, null, null, null));
+            assertThat(SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.cacheDb).find().first()).isEqualTo(cacheBefore);
+            assertThat(schemas.find(new Document("_id", "config")).first().getInteger("installedVersion")).isEqualTo(schema.getInteger("installedVersion"));
+            var damaged = f.document(create.task()); damaged.get("modes", Document.class).get("full", Document.class).remove("scheduledAdmission");
+            f.collection().replaceOne(new Document("_id", damaged.get("_id")), damaged);
+            assertThatThrownBy(() -> f.read(create.task())).isInstanceOf(TapstateException.class);
+        }
+    }
+
+    private static ValidationReportAdmission.Start scheduled(Snapshot snapshot, java.time.Instant due, long sequence) {
+        var task = snapshot.task();
+        var command = ValidationScheduleIdentity.command(task.clusterId(), task.pipelineId(), task.taskId(), task.generation(), snapshot.revision(), due);
+        var spec = new ValidationRunSpec(snapshot.comparison(), ValidationMode.FULL, snapshot.settings().full().method());
+        var owner = new ValidationOwner(task.clusterId(), task.pipelineId(), "node", "boot", 1, 1, 1);
+        return new ValidationReportAdmission.Start(task, snapshot.revision(), sequence, command.toString(),
+                new ValidationRunIdentity(owner, task.taskId(), "cycle-" + sequence, ValidationMode.FULL, spec.fingerprint(), snapshot.comparison().mappingRevision(), snapshot.comparison().comparisonRulesVersion()));
+    }
+    private static ValidationSchedule.Calculator intervalCalculator() {
+        return new ValidationSchedule.Calculator() {
+            public ValidationSchedule.Preview preview(ValidationSchedule schedule, java.time.Instant base, long revision, ValidationSchedule.SearchBudget budget) { throw new UnsupportedOperationException(); }
+            public java.time.Instant nextAfter(ValidationSchedule schedule, java.time.Instant after, ValidationSchedule.SearchBudget budget) {
+                var interval = (ValidationSchedule.Interval) schedule; long seconds = Math.multiplyExact(interval.every(), 60);
+                return interval.anchor().plusSeconds(Math.multiplyExact(Math.floorDiv(java.time.Duration.between(interval.anchor(), after).getSeconds(), seconds) + 1, seconds));
+            }
+        };
+    }
+
     static final class Fixture implements AutoCloseable {
         final String suffix = UUID.randomUUID().toString().replace("-", "");
         final com.mongodb.client.MongoClient configClient = MongoClients.create(CONFIG.getReplicaSetUrl()), cacheClient = MongoClients.create(CACHE.getReplicaSetUrl());

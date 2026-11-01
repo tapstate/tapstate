@@ -14,6 +14,38 @@ import java.util.function.Consumer;
 import static org.assertj.core.api.Assertions.*;
 
 class MongoValidationTaskCodecTest {
+    @Test void malformedScheduledFactsAreDiagnosableStorageErrors() {
+        var task = new io.tapstate.spi.store.ValidationReportAdmission.Task("cluster", "flow", "full", UUID.randomUUID());
+        var row = MongoValidationTaskCodec.initial(new ValidationTaskStore.Create(task, spec(false), ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1000), UUID.randomUUID()));
+        row.get("modes", Document.class).get("full", Document.class).put("scheduledAdmission",
+                new Document("scopeRevision", 1L).append("lastDue", "invalid").append("lastCommand", UUID.randomUUID().toString()).append("lastSequence", 1L));
+        unreadable(() -> MongoValidationTaskCodec.snapshot(row, "cluster"));
+        var scope = new io.tapstate.spi.store.CacheBusinessScope("cluster", 1, "cache");
+        var marker = MongoValidationSchema.configurationMarker("operation", "READY", 0, scope);
+        marker.put("scheduledAdmission", "wrong-bson-type");
+        unreadable(() -> MongoValidationSchema.validateMarker(marker));
+        var nullPhase=MongoValidationSchema.configurationMarker("operation","READY",0,scope);
+        nullPhase.get("scheduledAdmission",Document.class).put("phase",null);
+        unreadable(()->MongoValidationSchema.validateMarker(nullPhase));
+    }
+
+    @Test void fullWatermarkHasExplicitCoverageAndNeverDefaultsMissingFacts() {
+        var task = new io.tapstate.spi.store.ValidationReportAdmission.Task("cluster", "flow", "full", UUID.randomUUID());
+        var create = new ValidationTaskStore.Create(task, spec(false), ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1000), UUID.randomUUID());
+        var row = MongoValidationTaskCodec.initial(create);
+        assertThat(row.getInteger("formatVersion")).isEqualTo(2);
+        var saved = MongoValidationTaskCodec.snapshot(copy(row), "cluster");
+        assertThat(saved.full().scheduledAdmission()).isEqualTo(new ValidationTaskStore.ScheduledAdmission(1, null, null, null));
+        var missing = copy(row); missing.get("modes", Document.class).get("full", Document.class).remove("scheduledAdmission");
+        unreadable(() -> MongoValidationTaskCodec.snapshot(missing, "cluster"));
+        var corrupt = copy(row); corrupt.get("modes", Document.class).get("full", Document.class).get("scheduledAdmission", Document.class).put("lastSequence", 1L);
+        unreadable(() -> MongoValidationTaskCodec.snapshot(corrupt, "cluster"));
+        var legacy = MongoValidationTaskCodec.initial(create, false);
+        assertThat(MongoValidationTaskCodec.snapshot(copy(legacy), "cluster").full().scheduledAdmission()).isNull();
+        var changed = MongoValidationTaskCodec.update(row, saved, new ValidationTaskStore.Update(task, 1, spec(false), create.settings(), UUID.randomUUID()));
+        assertThat(MongoValidationTaskCodec.snapshot(changed, "cluster").full().scheduledAdmission().scopeRevision()).isEqualTo(2);
+    }
+
     @Test void countRoundTripsWithoutKeysModelsOrCodecsAndKeepsNativeIntegerWidths() {
         var spec = spec(false); var settings = ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1_000);
         var encoded = MongoValidationTaskCodec.definition(spec, settings); var binary = new RawBsonDocument(encoded, new DocumentCodec());

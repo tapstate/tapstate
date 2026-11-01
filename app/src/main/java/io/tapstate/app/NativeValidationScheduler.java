@@ -6,8 +6,6 @@ import io.tapstate.core.validation.*;
 import io.tapstate.runtime.engine.validation.ValidationLocalBudget;
 import io.tapstate.runtime.probe.ValidationOperation;
 import io.tapstate.spi.store.*;
-import java.io.*;
-import java.nio.charset.StandardCharsets;
 import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -61,7 +59,9 @@ final class NativeValidationScheduler implements AutoCloseable {
         synchronized(this){
             require();
             if(saved.closed()||!full.scheduleEnabled()||full.schedule()==null){entries.remove(key);if(writer!=null)writer.forget(saved.task());return;}
-            ensureRegistry();var previous=entries.get(key);
+            ensureRegistry();
+            if(saved.full().scheduledAdmission()==null){entries.remove(key);publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,ValidationError.RULE_UNSUPPORTED.code(),null,null);return;}
+            var previous=entries.get(key);
             if(previous!=null&&previous.task.equals(saved.task())&&previous.revision==saved.revision())return;
             if(previous==null&&entries.size()==MAX_TASKS){publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,ValidationError.VALUE_LIMIT_EXCEEDED.code(),null,null);return;}
             final Instant next;
@@ -103,7 +103,9 @@ final class NativeValidationScheduler implements AutoCloseable {
                 frame.requireRetained(resources);var saved=configuration.validationTasks(this::require).read(due.entry().task.pipelineId(),due.entry().task.taskId()).orElse(null);
                 require();
                 if(saved==null||saved.closed()||!saved.task().equals(due.entry().task)||saved.revision()!=due.entry().revision||!saved.settings().full().scheduleEnabled())return;
-                var mode=saved.full();var permission=mode.permission();
+                var mode=saved.full();var permission=mode.permission();var watermark=mode.scheduledAdmission();
+                // This is only an early refusal; the original CONFIG transaction arbitrates the ticket again.
+                if(watermark!=null&&watermark.lastDue()!=null&&!due.at().isAfter(watermark.lastDue()))return;
                 if(permission!=null&&permission.start().commandId().equals(due.command().toString()))return;
                 if(permission!=null&&permission.phase()!=ValidationTaskStore.Phase.CLOSED
                         &&coordinator.permissionOwnerLease(saved)!=ValidationOperation.OwnerLease.NOT_LIVE){
@@ -141,11 +143,6 @@ final class NativeValidationScheduler implements AutoCloseable {
         if(closed)return;closed=true;if(polling!=null)polling.cancel(false);entries.clear();if(writer!=null)writer.close();if(starts!=null)starts.shutdown();
     }
     static UUID command(ValidationReportAdmission.Task task,long revision,Instant occurrence){
-        try(var bytes=new ByteArrayOutputStream();var out=new DataOutputStream(bytes)){
-            for(var value:List.of("validation-full-cycle-v1",task.clusterId(),task.pipelineId(),task.taskId(),task.generation().toString(),ValidationSchedule.RULES_VERSION)){
-                var encoded=value.getBytes(StandardCharsets.UTF_8);out.writeInt(encoded.length);out.write(encoded);
-            }
-            out.writeLong(revision);out.writeLong(occurrence.getEpochSecond());out.writeInt(occurrence.getNano());out.flush();return UUID.nameUUIDFromBytes(bytes.toByteArray());
-        }catch(IOException impossible){throw new IllegalStateException("validation cycle identity unavailable",impossible);}
+        return ValidationScheduleIdentity.command(task.clusterId(), task.pipelineId(), task.taskId(), task.generation(), revision, occurrence);
     }
 }

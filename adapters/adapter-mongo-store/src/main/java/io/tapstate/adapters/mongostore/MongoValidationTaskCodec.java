@@ -24,10 +24,11 @@ final class MongoValidationTaskCodec {
 
     record Definition(ValidationTaskSpec comparison, ValidationTaskStore.Settings settings) {}
 
-    static Document initial(ValidationTaskStore.Create command) {
-        return new Document("_id", MongoValidationAdmissionStore.taskId(command.task())).append("formatVersion", 1)
+    static Document initial(ValidationTaskStore.Create command) { return initial(command, true); }
+    static Document initial(ValidationTaskStore.Create command, boolean covered) {
+        return new Document("_id", MongoValidationAdmissionStore.taskId(command.task())).append("formatVersion", covered ? 2 : 1)
                 .append("taskGeneration", command.task().generation().toString()).append("revision", 1L).append("closed", false)
-                .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L)))
+                .append("modes", new Document("full", initialMode(covered, 1L)).append("incremental", new Document("nextStartSequence", 1L)))
                 .append("definition", definition(command.comparison(), command.settings())).append("lastMutationId", command.commandId().toString())
                 .append("schedulingRevision", 1L).append("schedulingCommandId", command.commandId().toString());
     }
@@ -37,30 +38,64 @@ final class MongoValidationTaskCodec {
                 .append("definition", definition(command.comparison(), command.settings()));
         if (command.settings().incremental().firstCheckDelayMillis() != current.settings().incremental().firstCheckDelayMillis())
             next.append("schedulingRevision", current.schedulingRevision() + 1).append("schedulingCommandId", command.commandId().toString());
+        if (Integer.valueOf(2).equals(previous.get("formatVersion"))) {
+            var modes = new Document(previous.get("modes", Document.class));
+            modes.put("full", new Document(modes.get("full", Document.class)).append("scheduledAdmission", watermark(new ValidationTaskStore.ScheduledAdmission(current.revision() + 1, null, null, null))));
+            next.put("modes", modes);
+        }
         return next;
+    }
+
+    static Document initialMode(boolean covered, long revision) {
+        var mode = new Document("nextStartSequence", 1L);
+        if (covered) mode.put("scheduledAdmission", watermark(new ValidationTaskStore.ScheduledAdmission(revision, null, null, null)));
+        return mode;
+    }
+    static Document watermark(ValidationTaskStore.ScheduledAdmission value) {
+        return new Document("scopeRevision", value.scopeRevision()).append("lastDue", value.lastDue() == null ? null : value.lastDue().toString())
+                .append("lastCommand", value.lastCommand() == null ? null : value.lastCommand().toString()).append("lastSequence", value.lastSequence());
+    }
+    static ValidationTaskStore.ScheduledAdmission watermark(Document value) {
+        try {
+        fields(value, "scopeRevision", "lastDue", "lastCommand", "lastSequence");
+        if (bsonBytes(value) > 1024) throw unreadable();
+        var due = value.get("lastDue"); var command = value.get("lastCommand"); var sequence = value.get("lastSequence");
+        if (due != null && !(due instanceof String) || command != null && !(command instanceof String)
+                || sequence != null && !(sequence instanceof Long)) throw unreadable();
+        var result = new ValidationTaskStore.ScheduledAdmission(number(value, "scopeRevision"), due == null ? null : Instant.parse((String) due),
+                command == null ? null : uuid(value, "lastCommand"), (Long) sequence);
+        if (!watermark(result).equals(value)) throw unreadable(); return result;
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }
 
     static ValidationTaskStore.Snapshot snapshot(Document row, String cluster) {
         try {
             fields(row, "_id", "formatVersion", "taskGeneration", "revision", "closed", "modes", "definition", "lastMutationId", "schedulingRevision", "schedulingCommandId");
-            version(row); var identity = row.get("_id", Document.class); fields(identity, "clusterId", "pipelineId", "taskId");
+            if (!Integer.valueOf(1).equals(row.get("formatVersion")) && !Integer.valueOf(2).equals(row.get("formatVersion"))) throw unreadable(); var identity = row.get("_id", Document.class); fields(identity, "clusterId", "pipelineId", "taskId");
             if (!cluster.equals(identity.get("clusterId"))) throw unreadable();
             var task = new ValidationReportAdmission.Task(cluster, identity.getString("pipelineId"), identity.getString("taskId"), uuid(row, "taskGeneration"));
             var definition = definition(row.get("definition", Document.class)); var modes = row.get("modes", Document.class); fields(modes, "full", "incremental");
+            MongoValidationAdmissionStore.requireAdmissionBounds(row);
+            var full = mode(modes.get("full", Document.class), Integer.valueOf(2).equals(row.get("formatVersion")));
+            var watermark = full.scheduledAdmission();
+            if (watermark != null && watermark.lastDue() != null && !ValidationScheduleIdentity.command(cluster, task.pipelineId(), task.taskId(), task.generation(),
+                    watermark.scopeRevision(), watermark.lastDue()).equals(watermark.lastCommand())) throw unreadable();
             return new ValidationTaskStore.Snapshot(task, number(row, "revision"), uuid(row, "lastMutationId"), definition.comparison(), definition.settings(),
-                    number(row, "schedulingRevision"), uuid(row, "schedulingCommandId"), bool(row, "closed"), mode(modes.get("full", Document.class)), mode(modes.get("incremental", Document.class)));
-        } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable(); }
+                    number(row, "schedulingRevision"), uuid(row, "schedulingCommandId"), bool(row, "closed"), full, mode(modes.get("incremental", Document.class), false));
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }
 
-    private static ValidationTaskStore.Mode mode(Document row) {
-        if (row == null || !(row.keySet().equals(Set.of("nextStartSequence")) || row.keySet().equals(Set.of("nextStartSequence", "permission")))) throw unreadable();
+    private static ValidationTaskStore.Mode mode(Document row, boolean covered) {
+        var expected = new HashSet<>(Set.of("nextStartSequence")); if (covered) expected.add("scheduledAdmission");
+        if (row != null && row.containsKey("permission")) expected.add("permission");
+        if (row == null || !row.keySet().equals(expected)) throw unreadable();
         var permission = row.get("permission", Document.class); ValidationTaskStore.Permission current = null;
         if (permission != null) {
             fields(permission, "sequence", "phase", "identity"); var start = MongoValidationAdmissionStore.decodeIdentity(permission.get("identity", Document.class));
             if (start.sequence() != number(permission, "sequence")) throw unreadable();
             current = new ValidationTaskStore.Permission(start, ValidationTaskStore.Phase.valueOf(permission.getString("phase")));
         } else if (row.containsKey("permission")) throw unreadable();
-        return new ValidationTaskStore.Mode(number(row, "nextStartSequence"), current);
+        return new ValidationTaskStore.Mode(number(row, "nextStartSequence"), current, covered ? watermark(row.get("scheduledAdmission", Document.class)) : null);
     }
 
     static UUID uuid(Document row, String field) {
@@ -92,7 +127,7 @@ final class MongoValidationTaskCodec {
             result.comparison().requireFor(result.settings().full().method(), ValidationMode.FULL);
             if (!definition(result.comparison(), result.settings()).equals(row)) throw unreadable();
             return result;
-        } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable(); }
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }
 
     static Document comparison(ValidationTaskSpec spec) {
@@ -130,7 +165,7 @@ final class MongoValidationTaskCodec {
             var result = new ValidationTaskSpec(row.getString("pipelineId"), dependencies, number(row, "mappingRevision"), row.getString("comparisonRulesVersion"), mappings);
             if (!comparison(result).equals(row)) throw unreadable();
             return result;
-        } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable(); }
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }
 
     static Document run(ValidationRunSpec spec) {
@@ -144,7 +179,7 @@ final class MongoValidationTaskCodec {
             var spec = new ValidationRunSpec(comparison(row.get("comparison", Document.class)), ValidationMode.valueOf(row.getString("mode")),
                     ValidationMethod.valueOf(row.getString("method")));
             if (!run(spec).equals(row)) throw unreadable(); return spec;
-        } catch (NullPointerException | ClassCastException | IllegalArgumentException | TapstateException invalid) { throw unreadable(); }
+        } catch (NullPointerException | ClassCastException | IllegalArgumentException | java.time.DateTimeException | TapstateException invalid) { throw unreadable(); }
     }
 
     private static Document table(ValidationTaskSpec.Table table) {
