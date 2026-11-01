@@ -163,7 +163,9 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
     static boolean theClusterIsChanging(Throwable failed) {
         Throwable cause = failed;
         for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
-            if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException) {
+            if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException
+                    || cause instanceof IllegalStateException && "Master address unknown: instance is not yet initialized or is shut down"
+                            .equals(cause.getMessage())) {
                 return true;
             }
         }

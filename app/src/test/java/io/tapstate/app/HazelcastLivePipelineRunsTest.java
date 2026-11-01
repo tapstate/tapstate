@@ -193,6 +193,34 @@ class HazelcastLivePipelineRunsTest {
     }
 
     @Test
+    void aJobWithoutAMasterDuringMergingHasTheRetryableMembershipRefusal() {
+        var unavailable = new IllegalStateException(
+                "Master address unknown: instance is not yet initialized or is shut down");
+        var job = proxy(com.hazelcast.jet.Job.class, (instance, method, arguments) -> {
+            if ("getName".equals(method.getName())) throw unavailable;
+            throw new UnsupportedOperationException(method.getName());
+        });
+        var runs = new HazelcastLivePipelineRuns(memberListing(() -> List.of(job)), BOUND);
+
+        assertThatThrownBy(runs::runs).isInstanceOfSatisfying(TapstateException.class, failure -> {
+            assertThat(failure.code()).isEqualTo(ClusterError.MEMBERSHIP_UNREADABLE);
+            assertThat(failure.getCause()).isSameAs(unavailable);
+        });
+    }
+
+    @Test
+    void anUnrelatedJobMetadataInvariantStillComesOutUncoded() {
+        var defect = new IllegalStateException("job metadata invariant violated");
+        var job = proxy(com.hazelcast.jet.Job.class, (instance, method, arguments) -> {
+            if ("getName".equals(method.getName())) throw defect;
+            throw new UnsupportedOperationException(method.getName());
+        });
+        var runs = new HazelcastLivePipelineRuns(memberListing(() -> List.of(job)), BOUND);
+
+        assertThatThrownBy(runs::runs).isSameAs(defect);
+    }
+
+    @Test
     void anyOtherFailureComesOutAsItWent() {
         IllegalStateException defect = new IllegalStateException("a defect, not the cluster being busy");
         HazelcastLivePipelineRuns runs = new HazelcastLivePipelineRuns(memberListing(() -> {
