@@ -169,9 +169,14 @@ class NativeValidationReportHistoryIT {
             await(()->committed.get()&&runs.read(start.run()).controlUnknown());
             runs.stop(first.identity());
             await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return !actors.containsKey(first.identity());});
+            var reservation=f.owners.take(start);var control=reservation.access().control();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var reference=new ValidationReports.Reference("flow",sibling.taskId(),ValidationMode.FULL,start.run().runId(),sibling.generation(),1);
             replyAllowed.set(true);
-            await(()->runs.read(start.run()).waiting());
-            assertThat(runs.read(start.run()).state()).isEqualTo(ValidationRunState.STARTING);
+            await(()->control.read(start.run().owner(),original).map(value->value.state().terminal()).orElse(false)
+                    ||f.configuration.validationReports(()->{}).find(reference).isPresent());
+            assertThat(control.read(start.run().owner(),original).orElseThrow().state()).isEqualTo(ValidationRunState.STARTING);
+            assertThat(runs.read(start.run()).waiting()).isTrue();
             runs.stop(start.run());await(()->f.resources.snapshot().metadataFrames()==0);
             assertThat(f.member.getJet().getJobs()).isEmpty();
         }
@@ -192,9 +197,8 @@ class NativeValidationReportHistoryIT {
             await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return actors.isEmpty();});
             assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
             runs.close();org.springframework.test.util.ReflectionTestUtils.invokeMethod(runs,"tick");
-            var polling=(java.util.concurrent.ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"polling");
-            assertThat(polling.isCancelled()).isFalse();
-            pending.close();await(()->f.resources.snapshot().metadataFrames()==0);
+            pending.close();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10))
+                    .untilAsserted(()->assertThat(f.resources.snapshot().metadataFrames()).isZero());
             assertThat(f.member.getJet().getJobs()).isEmpty();
         }
     }

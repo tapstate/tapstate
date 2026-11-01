@@ -919,6 +919,12 @@ class MongoValidationSchemaIT {
             configuration.retirements().complete(receipt);
         }
         ValidationControlStore.Run reserveRun(MongoConfigurationDomain context, MongoValidationPreparations.Permission original, WorkloadClaim owner, String task, String run) {
+            // These retained-protocol fixtures intentionally seed complete legacy permission headers.
+            // Positive row-two coverage and refusal of mismatched rows have separate typed-task tests.
+            var schemas=SystemCollections.SCHEMA_MIGRATIONS.on(configDb);
+            var legacy=new Document(configSchema().get("validation",Document.class));
+            legacy.put("formatVersion",1);legacy.remove("scheduledAdmission");
+            schemas.updateOne(new Document("_id","config"),new Document("$set",new Document("validation",legacy)));
             var taskIdentity = new ValidationReportAdmission.Task("cluster", original.subject().pipelineId(), task, UUID.randomUUID());
             SystemCollections.VALIDATION_TASKS.on(configDb).insertOne(new Document("_id", MongoValidationAdmissionStore.taskId(taskIdentity))
                     .append("formatVersion", 1).append("taskGeneration", taskIdentity.generation().toString()).append("revision", 1L).append("closed", false)

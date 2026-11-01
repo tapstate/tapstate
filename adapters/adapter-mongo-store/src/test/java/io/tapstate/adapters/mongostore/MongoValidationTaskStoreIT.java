@@ -471,6 +471,11 @@ class MongoValidationTaskStoreIT {
 
     @Test void authoringNeverExceedsTheRecoveryHeaderCountAndClosingStillWorksAtThatCapacity() {
         try (var f = new Fixture()) {
+            // Retained compact row-one headers belong to the explicit legacy coverage contract.
+            var schemas=SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb);
+            var marker=new Document(schemas.find(new Document("_id","config")).first().get("validation",Document.class));
+            marker.put("formatVersion",1);marker.remove("scheduledAdmission");
+            schemas.updateOne(new Document("_id","config"),new Document("$set",new Document("validation",marker)));
             var rows = new ArrayList<Document>();
             for (int i = 0; i < MongoValidationAdmissionStore.MAX_TASKS_PER_PIPELINE; i++) rows.add(new Document("_id",
                     new Document("clusterId", "cluster").append("pipelineId", "flow").append("taskId", "retained-" + i)).append("formatVersion", 1)
@@ -875,6 +880,38 @@ class MongoValidationTaskStoreIT {
             f.tasks.update(new Update(saved.task(), saved.revision(), saved.comparison(), saved.settings(), UUID.randomUUID()));
             assertThat(f.read(create.task()).full().scheduledAdmission()).isEqualTo(new ScheduledAdmission(2, null, null, null));
             assertThat(admissions.reserveScheduled(delayed, due, intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+        }
+    }
+
+    @Test void replacingLostCachePreservesTheAuthoritativeScheduledWatermark() {
+        try(var f=new Fixture()) {
+            f.configuration.bindings().complete(new StorageSetupScope("cluster","installation","setup",1));
+            f.configuration.firstAdmin().create(f.configuration.firstAdmin().load().orElseThrow().scope(),new User("admin","fixture-hash","admin"));
+            var create=f.create("flow");var due=java.time.Instant.parse("2026-11-01T00:01:00Z");
+            var schedule=new ValidationSchedule.Interval(1,ValidationSchedule.Unit.MINUTES,due.minusSeconds(60),"UTC");
+            f.tasks.create(new Create(create.task(),create.comparison(),new Settings(new Full(ValidationMethod.COUNT,1,schedule,true,1),create.settings().incremental()),create.commandId()));
+            var admission=new MongoValidationAdmissionStore(f.configClient,f.configDb,"cluster",()->{});
+            var start=scheduled(f.read(create.task()),due,1);
+            assertThat(admission.reserveScheduled(start,due,intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.RESERVED);
+            admission.close(start);
+            var before=f.document(create.task()).get("modes",Document.class).get("full",Document.class).get("scheduledAdmission",Document.class);
+            var marker=SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).find(new Document("_id","config")).first().get("validation",Document.class).get("scheduledAdmission",Document.class);
+            f.cacheDb.drop();
+            try(var target=MongoCacheDomain.connect(f.endpoint,Duration.ofSeconds(5),"watermark-cache-loss")) {
+                var auth=f.configuration.prepareAuthenticationRecovery(target,()->{});
+                var hashes=new TreeMap<String,String>();f.configuration.artifacts().list().forEach(resource->hashes.put(resource.id(),CanonicalHash.of(resource)));
+                var manifest=new StorageRecoveryCommands.Manifest(new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.CLUSTER,Set.of()),Set.of("flow"),hashes,
+                        CacheRecoveryStore.clusterDependencyHash(auth.authScope(),f.configuration.cacheRecoveries().inspectCluster(auth.authScope())),f.configuration.configurationRevision());
+                var commands=f.configuration.recoveryCommands();
+                f.configuration.cacheRecoveries().stageCluster(commands.confirm(commands.plan(auth.authScope(),manifest,null,null)));
+                var running=commands.current(auth.authScope()).orElseThrow();
+                f.configuration.prepareStoppedRecovery(target,running,()->{});commands.complete(running);
+                assertThat(f.read(create.task()).full().scheduledAdmission().lastDue()).isEqualTo(due);
+                assertThat(f.document(create.task()).get("modes",Document.class).get("full",Document.class).get("scheduledAdmission",Document.class)).isEqualTo(before);
+                assertThat(SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).find(new Document("_id","config")).first().get("validation",Document.class).get("scheduledAdmission",Document.class)).isEqualTo(marker);
+                var delayed=scheduled(f.read(create.task()),due,2);
+                assertThat(admission.reserveScheduled(delayed,due,intervalCalculator())).isEqualTo(ValidationReportAdmission.Reservation.STALE);
+            }
         }
     }
 
