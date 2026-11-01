@@ -635,8 +635,17 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         NestInbound edge = vertex.inbound().get(ordinal);
         Map<Object, Touched> touched = new LinkedHashMap<>();
         boolean snapshotWaves = canUseSnapshotWaves(edge);
+        boolean childSnapshotWaves = canUseChildSnapshotWaves(edge);
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
+                if (childSnapshotWaves && touched.isEmpty()) {
+                    if (processChildSnapshotWave(edge, inbox)) {
+                        if (!flush()) return;
+                        continue;
+                    }
+                    // A failed probe is not repeated for every row of the same append drain.
+                    childSnapshotWaves = false;
+                }
                 if (snapshotWaves && !snapshotRootsHaveHistory && touched.isEmpty() && processFreshSnapshotWave(inbox)) {
                     if (!flush()) return;
                 } else if (!processArrival(edge, item, inbox, touched)) {
@@ -669,6 +678,74 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return vertex.pathId().isEmpty() && !slots.isEmpty()
                 && slots.stream().allMatch(slot -> slot.isReference()
                         && slot.as() == io.tapstate.core.model.EmbedAs.OBJECT && slot.children().isEmpty());
+    }
+
+    private boolean canUseChildSnapshotWaves(NestInbound edge) {
+        return vertex.pathId().isEmpty() && edge.pathId().size() == 1 && !edge.isCascade()
+                && !edge.carriesTouches() && !edge.carriesDepartures() && !edge.tracksKeyChanges()
+                && slots.stream().anyMatch(slot -> !slot.isReference() && slot.children().isEmpty()
+                        && slot.as() == io.tapstate.core.model.EmbedAs.ARRAY
+                        && slot.stateField().equals(edge.pathId().getFirst()));
+    }
+
+    /** Child snapshots can retain a bounded wave without publishing a rootless document. */
+    private boolean processChildSnapshotWave(NestInbound edge, Inbox inbox) {
+        List<Envelope> rows = new java.util.ArrayList<>();
+        Set<Object> keys = new LinkedHashSet<>();
+        long inputBytes = 0;
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || rows.size() == DrainFolding.MAX_KEYS_HELD) break;
+            Object key = NestKeys.valuesOf(NestKeys.rowOf(event), edge.keyFields(), vertex.mapName());
+            long weight = PayloadBytes.of(event);
+            if ((!keys.contains(key) && keys.size() == RootWrites.KEYS)
+                    || (!rows.isEmpty() && weight > RootWrites.BYTES - inputBytes)) break;
+            keys.add(key); rows.add(event); inputBytes += weight;
+        }
+        if (keys.size() < 2) return false;
+        Map<Object, RootAssembly> loaded = store.loadAll(keys);
+        if (loaded.values().stream().anyMatch(RootAssembly::rootPresent)) return false;
+        Map<Object, Touched> wave = new LinkedHashMap<>();
+        keys.forEach(key -> {
+            RootAssembly state = loaded.get(key);
+            wave.put(key, new Touched(state == null ? new RootAssembly() : state, state == null));
+        });
+        for (Envelope event : rows) handle(edge, event, wave);
+        ChildWrites writes = new ChildWrites();
+        for (var entry : wave.entrySet()) {
+            Touched document = entry.getValue();
+            document.assembly.reconcileMissingObjects(slots);
+            writes.add(entry.getKey(), document);
+        }
+        writes.flush();
+        wave.forEach((key, document) -> {
+            recentReferenceStates.remove(key);
+            weighStoredRoot(key, document);
+        });
+        // Even a partially successful persistence wave leaves every input available for replay.
+        removeAcknowledgedSnapshotRows(inbox, rows);
+        return true;
+    }
+
+    /** Rootless direct-child snapshots retain every input until all bounded replacements succeed. */
+    private final class ChildWrites {
+        private final Map<Object, RootAssembly> replacements = new LinkedHashMap<>();
+        private final Set<Object> firstFilings = new LinkedHashSet<>();
+        private long bytes;
+
+        void add(Object key, Touched document) {
+            long weight = StateWaveSize.of(document.assembly);
+            if (!replacements.isEmpty() && weight > RootWrites.BYTES - bytes) flush();
+            replacements.put(key, document.assembly);
+            if (document.heldNothing) firstFilings.add(key);
+            bytes += weight;
+        }
+
+        void flush() {
+            if (replacements.isEmpty()) return;
+            store.saveAll(replacements, firstFilings);
+            replacements.clear(); firstFilings.clear(); bytes = 0;
+        }
     }
 
     private boolean canUseSnapshotWaves(NestInbound edge) {

@@ -181,15 +181,14 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     }
 
     private <T> T transaction(boolean mutation, java.util.function.Function<ClientSession, T> action) {
-        return access.metadataTransaction(table, target, mutation, session -> {
-            Document inventory = MongoOperatorInventory.require(session, access.database, placement.scope());
+        return access.operatorTransaction(table, target, mutation, (session, inventory) -> {
             if (!MongoOperatorInventory.knowsPlacement(inventory, placement)) {
                 if (table.on(target).find(session, new Document("_id.placement", address)).projection(new Document("_id", 1)).first() != null)
                     throw access.unreadable("operator-inventory");
                 if (mutation) MongoOperatorInventory.rememberPlacement(session, access.database, inventory, placement);
             }
             if (placement.resource() == OperatorPlacement.Resource.NEST_STATE) {
-                new MongoCacheNestShapeStore(access, placement.database()).requirePath(session, placement);
+                new MongoCacheNestShapeStore(access, placement.database()).requirePath(session, placement, inventory);
             }
             return action.apply(session);
         });

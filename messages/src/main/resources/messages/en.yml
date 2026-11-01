@@ -1046,8 +1046,8 @@ nest.parent-absent:
   message: "An event of chain {chain} in {bucket} at {order} hangs from a row that is gone, and was handed over after {heldFor} rather than placed in a document."
   solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving."
 nest.state-served-from-cold-layer:
-  message: "Nest namespace {namespace} served {backfills} of {accesses} state reads from storage rather than memory ({share}), {millis} each; {entries} of {stored} entries are in memory ({resident})."
-  solution: "Raise this pipeline's in-memory entry budget so more of its working set stays resident, or accept the round trips if the throughput they allow is enough."
+  message: "Nest namespace {namespace} loaded {backfills} cold keys among {accesses} state key accesses ({share}); cold-loader callbacks averaged {millis}; {entries} of {stored} entries are in memory ({resident})."
+  solution: "Inspect cold-key traffic, backend latency and batching. Increase the in-memory entry budget only when the measured working set and available memory justify it."
 nest.key-change-tracking-requires-before-image:
   message: "Stream {alias} tracks structural key changes, but the row an update of source table {table} replaces does not carry {columns}."
   solution: "Configure that source to send whole row images rather than minimal ones - on MySQL that is binlog_row_image=FULL, on PostgreSQL a full replica identity on the table - or turn key tracking off for that stream. A minimal image sends the columns identifying the row and nothing else, so the earlier row arrives without the one this compares and reads as a row that used to hang under nothing."

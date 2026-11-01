@@ -29,6 +29,129 @@ class RootStateWriteBatchingTest {
     private static final NestTopology TREE = NestTopology.compile("p", "doc",
             nest("order", List.of("order_id"), embed("customer", "customer_id", "cust_ref",
                     EmbedAs.OBJECT, "customer", null)), tables());
+    private static final NestTopology ARRAY_TREE = NestTopology.compile("p", "doc",
+            nest("order", List.of("order_id"),
+                    embed("item", "order_id", "order_id", EmbedAs.ARRAY, "lines", List.of("line_no")),
+                    embed("customer", "customer_id", "cust_ref", EmbedAs.OBJECT, "customer", null)), tables());
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayChildrenBeforeRootsUseBoundedReadsAndWrites(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        TestInbox lines = lineRows(32);
+        f.assembler.process(1, lines);
+        assertThat(lines).isEmpty();
+        assertThat(f.drainRaw()).isEmpty();
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16);
+        f.feed(32, false);
+        assertArrayDocuments(f.drain(), 32);
+    }
+
+    @Test void partialChildWaveFailureKeepsInputsAndReplaysEveryLine() throws Exception {
+        var durable = new RecordingStore(); durable.failuresLeft = 1;
+        Fixture failed = arrayFixture(durable, false);
+        TestInbox lines = lineRows(16);
+        assertThatThrownBy(() -> failed.assembler.process(1, lines))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state batch failed");
+        assertThat(lines.size()).isEqualTo(32);
+        assertThat(failed.drainRaw()).isEmpty();
+        Fixture replay = arrayFixture(durable, false);
+        replay.assembler.process(1, lines);
+        assertThat(lines).isEmpty();
+        assertThat(replay.drainRaw()).isEmpty();
+        replay.feed(16, false);
+        assertArrayDocuments(replay.drain(), 16);
+    }
+
+    private static Fixture arrayFixture(RecordingStore store, boolean folding) throws Exception {
+        return new Fixture(ARRAY_TREE, folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange(),
+                128, store, false, NestClock.SYSTEM);
+    }
+
+    @Test void existingRootsDoNotCauseOneWaveProbeForEveryAppendRow() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.feed(32, false); f.drain(); f.roots.batchReads = 0;
+        f.assembler.process(1, lineRows(32));
+        assertThat(f.roots.batchReads).isLessThanOrEqualTo(1);
+        assertThat(f.drain()).hasSize(64);
+    }
+
+    @Test void aSingleParentDrainIsScannedForBatchingOnlyOnce() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        int[] scans = {0};
+        TestInbox inbox = new TestInbox();
+        var observed = (com.hazelcast.jet.core.Inbox) java.lang.reflect.Proxy.newProxyInstance(
+                getClass().getClassLoader(), new Class<?>[]{com.hazelcast.jet.core.Inbox.class}, (proxy, method, args) -> {
+                    if (method.getName().equals("iterator")) scans[0]++;
+                    return method.invoke(inbox, args);
+                });
+        for (int i = 0; i < 100; i++) inbox.add(Envelope.read(i, "item",
+                row("item_id", i, "order_id", 1, "line_no", i), null).withOrder(at(i + 1)));
+        f.assembler.process(1, observed);
+        assertThat(inbox).isEmpty();
+        assertThat(scans[0]).isEqualTo(1);
+    }
+
+    @Test void childWaveRetainsTheLatestVersionOfARepeatedLine() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        TestInbox lines = lineRows(2);
+        lines.add(Envelope.read(100, "item", row("item_id", 1L, "order_id", 0, "line_no", 1, "value", 99), null)
+                .withOrder(at(100)));
+        lines.add(Envelope.read(1, "item", row("item_id", 1L, "order_id", 0, "line_no", 1, "value", -1), null)
+                .withOrder(at(1)));
+        f.assembler.process(1, lines);
+        assertThat(f.drain()).isEmpty();
+        f.feed(2, false);
+        var documents = f.drain();
+        var first = documents.stream().filter(value -> value.after().get("order_id").equals(0)).findFirst().orElseThrow();
+        var children = (List<?>) first.after().get("lines");
+        assertThat(children).hasSize(2);
+        assertThat(((Map<?, ?>) children.getFirst()).get("value")).isEqualTo(99);
+    }
+
+    @Test void retainedChildStateCountsAgainstTheWholeWriteWaveBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        for (int id = 0; id < 2; id++) {
+            var initial = new TestInbox();
+            initial.add(Envelope.read(id, "item", row("item_id", id, "order_id", id, "line_no", 1, "wide", wide), null)
+                    .withOrder(at(id + 1)));
+            f.assembler.process(1, initial);
+        }
+        f.roots.batches.clear();
+        var additions = new TestInbox();
+        for (int id = 0; id < 2; id++) additions.add(Envelope.read(id, "item",
+                row("item_id", id + 2, "order_id", id, "line_no", 2), null).withOrder(at(id + 3)));
+        f.assembler.process(1, additions);
+        assertThat(additions).isEmpty();
+        assertThat(f.roots.batches).containsExactly(1, 1);
+        assertThat(f.drain()).isEmpty();
+    }
+
+    private static TestInbox lineRows(int orders) {
+        TestInbox rows = new TestInbox();
+        for (int id = 0; id < orders; id++) for (int line = 1; line <= 2; line++) {
+            long offset = id * 2L + line;
+            rows.add(Envelope.read(offset, "item", row("item_id", offset, "order_id", id, "line_no", line), null)
+                    .withOrder(at(offset)).withPositions(Map.of("item", new ChainPosition(at(offset), "line-" + offset))));
+        }
+        return rows;
+    }
+
+    private static void assertArrayDocuments(List<Envelope> documents, int count) {
+        assertThat(documents).hasSize(count);
+        for (Envelope document : documents) {
+            int id = (Integer) document.after().get("order_id");
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+            assertThat(document.after().get("lines")).isEqualTo(List.of(
+                    row("item_id", id * 2L + 1, "order_id", id, "line_no", 1),
+                    row("item_id", id * 2L + 2, "order_id", id, "line_no", 2)));
+            assertThat(document.positions()).containsEntry("item", new ChainPosition(at(id * 2L + 2), "line-" + (id * 2L + 2)));
+        }
+    }
 
     @Test void independentFreshRootsPersistInBoundedGroupsBeforeTheirOutputs() throws Exception {
         Fixture f = new Fixture(NestSendPolicy.everyChange(), 128);
@@ -335,13 +458,16 @@ class RootStateWriteBatchingTest {
             this(policy, capacity, durable, bounded, NestClock.SYSTEM);
         }
         Fixture(NestSendPolicy policy, int capacity, RecordingStore durable, boolean bounded, NestClock clock) throws Exception {
+            this(TREE, policy, capacity, durable, bounded, clock);
+        }
+        Fixture(NestTopology tree, NestSendPolicy policy, int capacity, RecordingStore durable, boolean bounded, NestClock clock) throws Exception {
             roots = durable;
             out = new TestOutbox(capacity);
             customers.save(List.of("C1"), row("customer_id", "C1", "name", "Ada"));
-            assembler = new AssemblerProcessor(TREE.assembler(), TREE.slots(), roots, "doc", bounded ? axes : null,
-                    bounded ? Map.of(0, List.of("order"), TREE.lookups().getFirst().touchOrdinal(), List.of("customer")) : null,
+            assembler = new AssemblerProcessor(tree.assembler(), tree.slots(), roots, "doc", bounded ? axes : null,
+                    bounded ? Map.of(0, List.of("order"), tree.lookups().getFirst().touchOrdinal(), List.of("customer")) : null,
                     ReplayFloor.NONE, NestSettings.defaults(), clock, policy,
-                    new HeapNestStore<>(), (from, released) -> {}, Map.of(TREE.lookups().getFirst().mapName(), customers));
+                    new HeapNestStore<>(), (from, released) -> {}, Map.of(tree.lookups().getFirst().mapName(), customers));
             assembler.init(out, new TestProcessorContext());
         }
         TestInbox inbox(int count, boolean sameKey) {

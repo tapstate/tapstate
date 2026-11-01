@@ -50,6 +50,7 @@ final class MapNestStore<S> implements NestStore<S> {
     private final ProtectedMap<Object, S> map;
     private final NestStateStats stats;
     private final NestStateGauge gauge;
+    private boolean keyPublisherBound;
 
     MapNestStore(IMap<Object, S> map) {
         this(map, null, NestStateGauge.NONE);
@@ -64,6 +65,7 @@ final class MapNestStore<S> implements NestStore<S> {
     @Override
     public S load(Object key) {
         countAccess();
+        if (stats != null) stats.readKeys(map.getName(), 1);
         S state = map.get(key);
         publishReading();
         return state;
@@ -85,7 +87,9 @@ final class MapNestStore<S> implements NestStore<S> {
             return Map.of();
         }
         countAccess();
-        Map<Object, S> loaded = map.getAll(new LinkedHashSet<>(keys));
+        Set<Object> distinct = new LinkedHashSet<>(keys);
+        if (stats != null) stats.readKeys(map.getName(), distinct.size());
+        Map<Object, S> loaded = map.getAll(distinct);
         publishReading();
         return loaded;
     }
@@ -109,6 +113,10 @@ final class MapNestStore<S> implements NestStore<S> {
         NestStateStats.Counted counted = stats.counted(namespace);
         gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
+        if (!keyPublisherBound) {
+            stats.publishKeys(namespace, gauge.keyPublisher(namespace));
+            keyPublisherBound = true;
+        } else stats.refreshKeys(namespace);
     }
 
     /**
@@ -125,7 +133,7 @@ final class MapNestStore<S> implements NestStore<S> {
 
     @Override
     public void save(Object key, S state) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Carried<>(state));
         publishReading();
     }
@@ -155,7 +163,7 @@ final class MapNestStore<S> implements NestStore<S> {
             save(key, state);
             return;
         }
-        countAccess();
+        countWrite();
         map.set(key, state);
         publishReading();
     }
@@ -169,7 +177,7 @@ final class MapNestStore<S> implements NestStore<S> {
             save(only.getKey(), only.getValue(), firstFilings.contains(only.getKey()));
             return;
         }
-        states.keySet().forEach(ignored -> countAccess());
+        states.keySet().forEach(ignored -> countWrite());
         map.setAll(states);
         publishReading();
     }
@@ -181,7 +189,7 @@ final class MapNestStore<S> implements NestStore<S> {
      */
     @Override
     public void add(Object key, Object element) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Grown<>(element));
         publishReading();
     }
@@ -192,7 +200,7 @@ final class MapNestStore<S> implements NestStore<S> {
         Map<Object, Set<Object>> snapshot = new LinkedHashMap<>();
         additions.forEach((key, elements) -> snapshot.put(key,
                 Collections.unmodifiableSet(new LinkedHashSet<>(elements))));
-        snapshot.keySet().forEach(ignored -> countAccess());
+        snapshot.keySet().forEach(ignored -> countWrite());
         // ADD-only union is idempotent across a partial protected retry. The lookup owns these keys
         // and cannot handle a later removal while this synchronous operation is still in progress.
         map.executeOnKeys(snapshot.keySet(), new GrownBatch<>(snapshot));
@@ -206,14 +214,14 @@ final class MapNestStore<S> implements NestStore<S> {
      */
     @Override
     public void remove(Object key, Object element) {
-        countAccess();
+        countWrite();
         map.executeOnKey(key, new Shrunk<>(element));
         publishReading();
     }
 
     @Override
     public void remove(Object key) {
-        countAccess();
+        countWrite();
         map.delete(key);
         publishReading();
     }
@@ -243,6 +251,11 @@ final class MapNestStore<S> implements NestStore<S> {
      * stopped being true of is the write onto a key a read has just found nothing under, which is put across
      * the map for exactly this reason and makes no trip at all.
      */
+    private void countWrite() {
+        countAccess();
+        if (stats != null) stats.writeKeys(map.getName(), 1);
+    }
+
     private void countAccess() {
         if (stats != null) {
             stats.access(map.getName());

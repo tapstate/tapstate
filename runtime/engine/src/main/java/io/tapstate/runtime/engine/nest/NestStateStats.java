@@ -50,6 +50,34 @@ public final class NestStateStats {
         counters.backfillNanos.add(nanos);
     }
 
+    public void readKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.readKeys.add(keys); value.publishKeys(); }
+    }
+    public void writeKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.writeKeys.add(keys); value.publishKeys(); }
+    }
+    public void coldKeys(String namespace, long keys) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.coldKeys.add(keys); value.publishKeys(); }
+    }
+    public io.tapstate.core.lifecycle.NestKeyAccess keyAccess(String namespace) {
+        Counters counted = counters(namespace);
+        synchronized (counted) { return counted.keyAccess(); }
+    }
+
+    /** One replaceable publisher per member/namespace; remote loaders keep an idle owner current. */
+    void publishKeys(String namespace, java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> publisher) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.publisher = publisher; value.publishKeys(); }
+    }
+
+    void refreshKeys(String namespace) {
+        Counters value = counters(namespace);
+        synchronized (value) { value.publishKeys(); }
+    }
+
     /**
      * Marks that one key of {@code namespace} was holding {@code pending} changes for something that has not
      * arrived. What is kept is the deepest ever reported rather than the last, because the last is whichever
@@ -104,6 +132,14 @@ public final class NestStateStats {
         private final LongAdder accesses = new LongAdder();
         private final LongAdder backfills = new LongAdder();
         private final LongAdder backfillNanos = new LongAdder();
+        private final LongAdder readKeys = new LongAdder();
+        private final LongAdder writeKeys = new LongAdder();
+        private final LongAdder coldKeys = new LongAdder();
+        private java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> publisher;
+        private io.tapstate.core.lifecycle.NestKeyAccess keyAccess() {
+            return new io.tapstate.core.lifecycle.NestKeyAccess(readKeys.sum(), writeKeys.sum(), coldKeys.sum(), "local");
+        }
+        private void publishKeys() { if (publisher != null) publisher.accept(keyAccess()); }
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
     }
 }

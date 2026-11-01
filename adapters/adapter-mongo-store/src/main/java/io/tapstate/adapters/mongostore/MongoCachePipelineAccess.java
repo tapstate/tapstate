@@ -19,6 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
+import java.util.function.BiFunction;
 
 /** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
 final class MongoCachePipelineAccess {
@@ -158,6 +159,29 @@ final class MongoCachePipelineAccess {
                 new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()), requireActive).verifyRetired(session, retired);
     }
 
+    /** Reuses validation facts only inside this callback, including on every transaction retry. */
+    <T> T operatorTransaction(SystemCollections table, MongoDatabase target, boolean mutation,
+            BiFunction<ClientSession, Document, T> action) {
+        requireModelPin();
+        T result = transaction(session -> {
+            PreparedState current = preparedState(session);
+            Document inventory = MongoOperatorInventory.require(session, database, scope, current.claim());
+            if (!database.getName().equals(target.getName())) {
+                String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
+                MongoOperatorInventory.requireDatabase(inventory, target.getName(), preparation, scope);
+            }
+            new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
+            if (mutation) {
+                // These writes remain real conflict fences in the same session as the payload.
+                proveClaim(session);
+                updateState(session, current.state(), new Document(), false);
+            }
+            return action.apply(session, inventory);
+        });
+        requireActive.run();
+        return result;
+    }
+
     <T> T operatorPreparation(Function<ClientSession, T> action) {
         var local = TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
         return transaction(false, local, session -> {
@@ -197,17 +221,22 @@ final class MongoCachePipelineAccess {
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {
+        return preparedState(session).state();
+    }
+
+    private PreparedState preparedState(ClientSession session) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);
         if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
                 || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
-        requirePreparedClaim(session);
-        return state;
+        return new PreparedState(state, requirePreparedClaim(session));
     }
 
-    private void requirePreparedClaim(ClientSession session) {
+    private record PreparedState(Document state, Document claim) { }
+
+    private Document requirePreparedClaim(ClientSession session) {
         MongoCacheWorkloadClaimStore.requireCollection(database);
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
@@ -222,6 +251,7 @@ final class MongoCachePipelineAccess {
             if (!scope.equals(decoded)) throw claimFenced();
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable("pipeline-claim-scope"); }
         if (MongoCachePipelinePreparations.phase(row, scope) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
+        return row;
     }
 
     void requireScope(Document row) {

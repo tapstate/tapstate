@@ -36,6 +36,28 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void batchReadsValidateClaimAndInventoryOnceInTheActualTransaction() {
+        withFixture(f -> {
+            var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+            f.writer(at).save(at.mapName(), "one", new byte[]{1});
+            Map<String, Integer> finds = new LinkedHashMap<>();
+            Map<String, Integer> indexes = new LinkedHashMap<>();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (!event.getDatabaseName().equals(f.database.getName())) return;
+                String command = event.getCommandName();
+                if (command.equals("find")) finds.merge(event.getCommand().getString("find").getValue(), 1, Integer::sum);
+                if (command.equals("listIndexes")) indexes.merge(event.getCommand().getString("listIndexes").getValue(), 1, Integer::sum);
+            }};
+            try (var client = observed(listener)) {
+                var reader = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client, client.getDatabase(f.database.getName()),
+                        SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE), at);
+                assertThat(reader.loadAll(at.mapName(), List.of("one", "missing"))).containsOnlyKeys("one");
+            }
+            assertThat(finds).containsEntry("workload_claims", 1).containsEntry("operator_cleanup", 1).containsEntry("nest_state", 1);
+            assertThat(indexes).containsEntry("operator_cleanup", 1);
+        });
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"200,1,1", "257,1,2", "2,3145728,2"})
     void ordinaryBatchWritesUseBoundedCommandsAndClearOnlyReplacedMarkers(int count, int stateBytes, int commands) {

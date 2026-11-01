@@ -29,6 +29,24 @@ class TheColdLayerCountsTheTripsItMakesTest {
 
     private HazelcastInstance member;
 
+    @Test void keyCountsIncludeDistinctBatchReadsAndImplicitLoadsFromCarriedWrites() {
+        member = memberWith(new EmptyColdLayer());
+        var stats = NestStateStats.of(member);
+        var store = new MapNestStore<String>(member.getMap(NAMESPACE), stats, NestStateGauge.NONE);
+        store.loadAll(java.util.List.of("a", "b", "a", "c"));
+        assertThat(stats.keyAccess(NAMESPACE).reads()).isEqualTo(3);
+        assertThat(stats.keyAccess(NAMESPACE).coldLoads()).isEqualTo(3);
+        assertThat(stats.counted(NAMESPACE).accesses()).isEqualTo(1);
+        store.save("new", "value");
+        assertThat(stats.keyAccess(NAMESPACE).writes()).isEqualTo(1);
+        assertThat(stats.keyAccess(NAMESPACE).coldLoads()).isEqualTo(4);
+        store.load("new");
+        assertThat(stats.keyAccess(NAMESPACE).reads()).isEqualTo(4);
+        assertThat(stats.keyAccess(NAMESPACE).coldLoads()).isEqualTo(4);
+        store.saveAll(java.util.Map.of("x", "value", "y", "value"), java.util.Set.of("x", "y"));
+        assertThat(stats.keyAccess(NAMESPACE).writes()).isEqualTo(3);
+    }
+
     @AfterEach
     void stopMember() {
         if (member != null) {

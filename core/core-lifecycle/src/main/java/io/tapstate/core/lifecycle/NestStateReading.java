@@ -42,7 +42,12 @@ import java.util.OptionalLong;
  * @param stored how many keys the layer behind the memory holds, where there is one to ask
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-        long pendingHighWater, OptionalLong stored) {
+        long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess) {
+
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null);
+    }
 
     /** A reading from a run with no cold layer to ask, whose state is however much is in memory. */
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis) {
