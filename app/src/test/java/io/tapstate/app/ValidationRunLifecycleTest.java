@@ -54,6 +54,24 @@ class ValidationRunLifecycleTest {
         f.lifecycle.advance(); assertThat(f.processorsReturned).isEqualTo(1); assertThat(f.dataReturned).isEqualTo(1);
     }
 
+    @Test void completedBusinessWorkCannotRetireBeforeItsOriginalTaskletExits(){
+        var f=new Fixture();f.lifecycle.advance();f.execution.complete=true;f.execution.readers=true;
+        var waiting=f.lifecycle.advance();
+        assertThat(waiting.state()).isEqualTo(ValidationRunState.RUNNING);assertThat(waiting.retired()).isFalse();
+        assertThat(f.closed).isFalse();assertThat(waiting.failure()).isNull();
+        f.execution.processors=true;var complete=f.lifecycle.advance();
+        assertThat(complete.state()).isEqualTo(ValidationRunState.COMPLETED);assertThat(complete.retired()).isTrue();
+        assertThat(complete.drained()).isTrue();assertThat(complete.failure()).isNull();
+    }
+
+    @Test void stoppingWhileCompletedWorkWaitsForItsTaskletStillProducesStopped(){
+        var f=new Fixture();f.lifecycle.advance();f.execution.complete=true;f.execution.readers=true;
+        assertThat(f.lifecycle.advance().retired()).isFalse();f.lifecycle.stop();
+        var stopped=f.lifecycle.advance();assertThat(stopped.state()).isEqualTo(ValidationRunState.STOPPED);assertThat(stopped.retired()).isTrue();
+        assertThat(stopped.drained()).isFalse();f.execution.processors=true;
+        var drained=f.lifecycle.advance();assertThat(drained.state()).isEqualTo(ValidationRunState.STOPPED);assertThat(drained.drained()).isTrue();
+    }
+
     @Test void jetAndReaderExitWithoutBusinessCompletionCannotProduceCompleted() {
         var f = new Fixture(); f.lifecycle.advance(); f.execution.processors = true; f.execution.readers = true;
         assertThat(f.lifecycle.advance().state()).isEqualTo(ValidationRunState.RUNNING); assertThat(f.closed).isFalse();
@@ -109,7 +127,7 @@ class ValidationRunLifecycleTest {
     }
 
     @Test void aKnownStopWinsAgainstFullBusinessCompletionWithoutAnImpossibleCompletionRetry() {
-        var f = new Fixture(); f.lifecycle.advance(); f.actual = ValidationRunState.STOPPING; f.execution.complete = true;
+        var f = new Fixture(); f.lifecycle.advance(); f.actual = ValidationRunState.STOPPING; f.execution.complete = true; f.execution.processors = true;
         var status = f.lifecycle.advance();
         assertThat(status.state()).isEqualTo(ValidationRunState.STOPPED); assertThat(status.retired()).isTrue(); assertThat(status.controlUnknown()).isFalse();
     }

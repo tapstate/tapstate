@@ -291,15 +291,6 @@ final class PdkValidationSession {
                 if(paged)requirePostgresBufferCapability();
                 TapTable model = discover(opened);
                 checkAlive(opened);
-                if(paged)for(var field:model.getNameFieldMap().values()){
-                    var type=PdkTypeMapping.resolve(field.getTapType()).type();
-                    if(type==io.tapstate.core.common.TapstateType.ARRAY||type==io.tapstate.core.common.TapstateType.MAP)
-                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),
-                                "rule","native-nested-codec-expansion-unproven"),null);
-                }
-                if(paged)for(var field:model.getNameFieldMap().values())
-                    if(PdkTypeMapping.resolve(field.getTapType()).type()==io.tapstate.core.common.TapstateType.UNKNOWN)
-                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),"rule","field-model-unknown"),null);
                 var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs());
                 var admittedDecoder = Objects.requireNonNull(admission.prepare(model, codecs), "admitted decoder");
                 decoder = raw -> {
@@ -314,6 +305,15 @@ final class PdkValidationSession {
                 if(paged&&(model.getNameFieldMap()==null||model.getNameFieldMap().size()>maxNativeFields))
                     throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.nativeFields"),null);
                 if (scan instanceof Metadata) return null;
+                if(paged)for(var field:model.getNameFieldMap().values()){
+                    var type=PdkTypeMapping.resolve(field.getTapType()).type();
+                    if(type==io.tapstate.core.common.TapstateType.ARRAY||type==io.tapstate.core.common.TapstateType.MAP)
+                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),
+                                "rule","native-nested-codec-expansion-unproven"),null);
+                }
+                if(paged)for(var field:model.getNameFieldMap().values())
+                    if(PdkTypeMapping.resolve(field.getTapType()).type()==io.tapstate.core.common.TapstateType.UNKNOWN)
+                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",connectorId,"field",field.getName(),"rule","field-model-unknown"),null);
                 if(paged&&scan.ascendingKeys().isEmpty())throw new TapstateException(ConnectorError.CAPABILITY_MISSING,
                         Map.of("connector",connectorId,"capability","bounded-query-stable-order"),null);
                 TapAdvanceFilter filter = TapAdvanceFilter.create().batchSize(scan.batchSize());

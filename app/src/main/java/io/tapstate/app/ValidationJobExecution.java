@@ -54,8 +54,9 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         try {
             originalJob=graph.submit(jet,()->{if(cancelled.get())throw cancelled();requireCurrent.run();});
             originalJob.getFuture().whenComplete((ignored,failed)->{
-                processors.seal();
                 if(failed!=null){var cause=unwrap(failed);if(!(cause instanceof CancellationException)&&!cancelled.get())failure.record(cause);}
+                // Publishing physical exit must not precede the original Job's failure receipt.
+                processors.seal();
             });
         }catch(RuntimeException|Error failed){failure.record(failed);throw failed;}
         finally{submissionReturned=true;}

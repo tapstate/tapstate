@@ -119,9 +119,12 @@ final class NativeValidationMetadata {
                 catch(RuntimeException|Error refused){closeUnsubmitted(reader,refused);throw refused;}
                 var model=await(probe.consumerExecutor().submit(reader::result));require();
                 if(source)ValidationDirectMappings.requireSourceTable(declared,model.model());
-                if(method==ValidationMethod.FULL_COLUMN)for(var field:model.model().fields())
+                if(method==ValidationMethod.FULL_COLUMN)for(var field:model.model().fields()){
                     if(field.type()==io.tapstate.core.common.TapstateType.UNKNOWN)throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
                             Map.of("node",side.nodeId(),"field",field.name(),"rule","field-model-unknown"),null);
+                    if(PdkValidationReads.boundedPostgresPages(artifact)&&(field.type()==io.tapstate.core.common.TapstateType.ARRAY||field.type()==io.tapstate.core.common.TapstateType.MAP))
+                        throw new TapstateException(ValidationError.RULE_UNSUPPORTED,Map.of("node",side.nodeId(),"field",field.name(),"rule","native-nested-codec-expansion-unproven"),null);
+                }
                 charge(model.model());return new Side(model,null,artifact.contentHash());
             }catch(RuntimeException|Error failed){record(failed);throw failed;}
             finally{

@@ -134,6 +134,11 @@ class NativeValidationRelationalApiIT {
                     return;
                 }
                 if(nested!=null){
+                    var emptyKeys=new LinkedHashMap<String,Object>(selection("unique_key","UNIQUE_KEY"));emptyKeys.put("confirmations",Map.of());
+                    var candidates=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();
+                    assertThatCode(()->candidates.set(post(http,write,"evaluate",emptyKeys))).doesNotThrowAnyException();
+                    var sourceSide=(Map)((Map)((List)candidates.get().get("mappings")).getFirst()).get("source");
+                    assertThat((List<Map>)sourceSide.get("candidates")).anySatisfy(candidate->assertThat(candidate.get("fields")).isEqualTo(List.of("id")));
                     if(nested.equals("array"))assertThatThrownBy(()->post(http,write,"evaluate",selection("full_column","FULL_COLUMN")))
                             .isInstanceOfSatisfying(org.springframework.web.client.HttpClientErrorException.class,refused->{
                                 assertThat(refused.getStatusCode().value()).isEqualTo(400);

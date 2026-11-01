@@ -107,8 +107,11 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             require();guard.run();var observed=handle.result();
             if(!observed.binding().equals(binding(side)))throw invalid("savedModelChanged");
             if(source)ValidationDirectMappings.requireSourceTable(declared,observed.model());
-            for(var field:observed.model().fields())
+            for(var field:observed.model().fields()){
                 if(field.type()==io.tapstate.core.common.TapstateType.UNKNOWN)throw unsupported(side.nodeId(),side.table()+"/"+field.name(),"field-model-unknown");
+                if(PdkValidationReads.boundedPostgresPages(artifact(resource))&&(field.type()==io.tapstate.core.common.TapstateType.ARRAY||field.type()==io.tapstate.core.common.TapstateType.MAP))
+                    throw unsupported(side.nodeId(),side.table()+"/"+field.name(),"native-nested-codec-expansion-unproven");
+            }
             return observed;
         }catch(RuntimeException|Error failed){record(failed);throw failed;}
         finally{
