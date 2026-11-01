@@ -184,13 +184,13 @@ class AMemberLosingActuationLetsGoOfItsCaptureIT {
                                         && reading.claim().leaseUntil().isAfter(adoptedLease)).isPresent(),
                         () -> "actuation=" + claims.read(actuation));
 
-                // Keep the capture records: purge must not manufacture the absence being asserted.
+                // A non-purging stop retains its capture record; absence cannot prove lease release.
                 control.stop(PIPELINE, false);
                 Await.until("the successor to drive the non-purging stop", BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent(),
                         () -> "state=" + control.state(PIPELINE));
                 Await.until("the superseded member to release the unused capture without purge", BOUND,
-                        () -> claims.read(capture).filter(reading -> reading.leased()).isEmpty(),
+                        () -> claims.read(capture).filter(reading -> !reading.leased()).isPresent(),
                         () -> "capture=" + claims.read(capture));
                 assertThat(cluster.processCarrying(oldNode).isAlive()).isTrue();
                 assertThat(cluster.processCarrying(successor).isAlive()).isTrue();
