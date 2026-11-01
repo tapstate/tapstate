@@ -25,6 +25,7 @@ import java.util.*;
 final class PdkValidationModelVersion {
     private static final String PROFILE="pdk-validation-model-v1";
     private static final String DOCUMENT_PROFILE="pdk-validation-document-model-v1";
+    private static final String DOCUMENT_SCOPE_PROFILE="pdk-validation-document-scope-v1";
     private static final String CODEC_PROFILE="pdk-validation-codecs-v2";
     private static final Set<String> DOCUMENT_STATISTICS=Set.of("size","storageSize","avgObjSize","indexSize");
     private static final long MAX_BYTES=1024L*1024;
@@ -58,6 +59,19 @@ final class PdkValidationModelVersion {
         return profile+":"+CanonicalHash.ofText(JsonWriter.write(List.of(profile,canonicalModel(model,artifact))));
     }
 
+    /**
+     * A document collection's sampled fields describe data, not column DDL. Persist its native
+     * namespace/collection contract; every actual read separately pins the complete current model.
+     * The connector still receives its own unchanged model and all registered codecs retain priority.
+     */
+    static String scopeVersion(TapTable model,ConnectorRef artifact){
+        if(!documentFields(artifact))return of(model,artifact);
+        // Validate and account the complete model even when some inferred properties are not scope.
+        canonicalModel(model,artifact);
+        var scope=Arrays.asList(DOCUMENT_SCOPE_PROFILE,new Walker(true,true).value(model,0));
+        return DOCUMENT_SCOPE_PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(scope));
+    }
+
     /** Internal bounded representation, also used to verify complete schema-property differences. */
     static Object canonicalModel(TapTable model,ConnectorRef artifact){return canonicalModel(model,documentFields(artifact));}
 
@@ -88,9 +102,10 @@ final class PdkValidationModelVersion {
         private enum Slot { VALUE, NAMED_FIELDS, NAMED_FIELD, TABLE_ATTRIBUTES }
         private long bytes;
         private int nodes;
-        private final boolean documentFields;
+        private final boolean documentFields,documentScope;
         private final IdentityHashMap<Object,Boolean> active=new IdentityHashMap<>();
-        Walker(boolean documentFields){this.documentFields=documentFields;}
+        Walker(boolean documentFields){this(documentFields,false);}
+        Walker(boolean documentFields,boolean documentScope){this.documentFields=documentFields;this.documentScope=documentScope;}
         Object value(Object value,int depth){return value(value,depth,Slot.VALUE);}
         private Object value(Object value,int depth,Slot slot){
             if(depth>MAX_DEPTH||++nodes>MAX_NODES)throw limit();
@@ -146,6 +161,8 @@ final class PdkValidationModelVersion {
                     // Document inference replaces fields in random sample order. Its layout ordinal
                     // is not a physical column or a named query/codec input. Keep primary-key order,
                     // all types and attributes, and the original live model supplied to the plugin.
+                    if(documentScope&&depth==0&&value.getClass()==TapTable.class
+                            &&Set.of("getNameFieldMap","getMaxPos","getMaxPKPos").contains(reader.getName()))continue;
                     if(documentFields&&slot==Slot.NAMED_FIELD&&value.getClass()==TapField.class&&reader.getName().equals("getPos"))continue;
                     if(documentFields&&depth==0&&value.getClass()==TapTable.class&&reader.getName().equals("getMaxPos"))continue;
                     charge(64L+2L*reader.getName().length());

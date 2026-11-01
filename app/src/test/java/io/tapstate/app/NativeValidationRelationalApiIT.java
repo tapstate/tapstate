@@ -41,6 +41,7 @@ class NativeValidationRelationalApiIT {
     private void verify(boolean mysql,boolean textOnly,boolean wide)throws Exception{verify(mysql,textOnly,wide,false);}
     @Test @Timeout(180) void postgresDuplicateIdentityAcrossNativePagesRetainsExactMultiplicity()throws Exception{verify(false,false,false,false,true);}
     private void verify(boolean mysql,boolean textOnly,boolean wide,boolean smallerCap)throws Exception{verify(mysql,textOnly,wide,smallerCap,false);}
+    @Test @Timeout(180) void bsonDataChangesAfterSaveAreComparedInsteadOfChangingTheReadSchema()throws Exception{verify(false,false,false,false,false,"inference");}
     @Test @Timeout(180) void postgresNativeArrayExpansionIsRefusedBeforeQueryButScalarKeysAndCountRemainAvailable()throws Exception{verify(false,false,false,false,false,"array");}
     @Test @Timeout(180) void postgresJsonbScalarCodecRemainsBoundedWithoutBlockingCountOrKeys()throws Exception{verify(false,false,false,false,false,"json");}
     private void verify(boolean mysql,boolean textOnly,boolean wide,boolean smallerCap,boolean duplicatePages)throws Exception{verify(mysql,textOnly,wide,smallerCap,duplicatePages,null);}
@@ -57,7 +58,7 @@ class NativeValidationRelationalApiIT {
                     +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
             if(duplicatePages)statement="CREATE TABLE orders (id BIGINT PRIMARY KEY,payload VARCHAR(32),amount BIGINT); INSERT INTO orders SELECT n,'same',CASE WHEN n BETWEEN 50 AND 90 THEN 50 ELSE n END FROM generate_series(1,100) AS n; "
                     +"CREATE TABLE items (id BIGINT PRIMARY KEY, secondary BIGINT, alias_id BIGINT, alias_secondary BIGINT, payload VARCHAR(32)); INSERT INTO items VALUES(9,90,9,90,'item'),(11,110,11,110,'tail');";
-            if(nested!=null){
+            if(nested!=null&&!nested.equals("inference")){
                 String type=nested.equals("array")?"TEXT[]":"JSONB";
                 String value=nested.equals("array")?"array_fill('a'::text,ARRAY[100000])":"to_jsonb(array_fill('a'::text,ARRAY[100000]))";
                 statement="CREATE TABLE orders(id BIGINT PRIMARY KEY,payload "+type+",amount BIGINT); INSERT INTO orders SELECT n,"+value+",9007199254740993 FROM generate_series(1,2) AS n; "
@@ -131,6 +132,28 @@ class NativeValidationRelationalApiIT {
                                 refused->{assertThat(refused.getStatusCode().value()).isEqualTo(400);assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-text-ordering-unproven");});
                     }
                     assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
+                    return;
+                }
+                if("inference".equals(nested)){
+                    var input=selection("full_column","FULL_COLUMN");var evaluated=post(http,write,"evaluate",input);
+                    var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                    // These are data changes between saving and running, followed by a stable read window.
+                    // MongoDB has no column DDL here; numerically equal integer widths retain identity.
+                    for(String name:List.of("checked_orders","checked_items"))for(var row:target.getCollection(name).find()){
+                        var update=new Document("id",((Number)row.get("id")).intValue());
+                        if(name.equals("checked_orders"))update.append("payload","changed-".repeat(40));
+                        target.getCollection(name).updateOne(new Document("_id",row.get("_id")),new Document("$set",update));
+                    }
+                    target.getCollection("checked_items").insertOne(item(99,990,"extra-tail"));
+                    var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","flow","task","full_column","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString());
+                    var report=run(http,write,read,operation);
+                    assertThat(report).containsEntry("terminal","COMPLETED").containsEntry("failure",null)
+                            .containsEntry("result","COMPLETE_WITH_OBSERVATIONS").containsEntry("rootCount","3");
+                    var ref=(Map)report.get("reference");String query="?generation="+ref.get("generation")+"&sequence="+ref.get("sequence");
+                    var path="/api/pipelines/flow/validation-tasks/full_column/reports/"+ref.get("run")+"/roots";var roots=get(http,read,path+query);
+                    assertThat(roots).containsEntry("total","3");var details=new StringBuilder();
+                    for(var root:(List<Map>)roots.get("items"))details.append(get(http,read,path+"/"+root.get("id")+query));
+                    assertThat(details.toString()).contains("TARGET_VALUE","payload","TARGET_EXTRA").doesNotContain("TARGET_TYPE");
                     return;
                 }
                 if(nested!=null){

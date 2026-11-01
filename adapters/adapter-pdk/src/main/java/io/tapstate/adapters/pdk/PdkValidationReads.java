@@ -117,7 +117,7 @@ public final class PdkValidationReads {
         inputs(connection,artifact,configurationHash);
         var result=new AtomicReference<Metadata>();
         var reader=deferred(table,query,decode,submit->PdkValidationSession.inspect(connection.connectorId(),artifact,connection.settings(),table,projection,model->{
-            String version=PdkValidationModelVersion.of(model,artifact);
+            String version=PdkValidationModelVersion.scopeVersion(model,artifact);
             var structural=PdkSchemaDiscoverer.structuralModel(List.of(model)).tables().getFirst();
             if(!table.equals(structural.name()))throw invalid("metadata.tableScope");
             var described=new Metadata(structural,new Binding(version,
@@ -229,8 +229,9 @@ public final class PdkValidationReads {
         }
         var decoder=new PdkValidationRows(model,codecs,path->PdkValidationRows.Rule.AUTO,rowLimits,
                 artifact.className().equals("io.tapdata.mongodb.MongodbConnector"));
+        String currentModel=PdkValidationModelVersion.of(model,artifact);
         return raw->{
-            requireModel(model,artifact,configurationHash,expected,"beforeRow");
+            requireCurrentModel(model,artifact,currentModel,"beforeRow");
             var row=decoder.decode(raw);
             for(var component:keys){
                 var value=row.fields().get(component.path().getFirst());
@@ -238,16 +239,20 @@ public final class PdkValidationReads {
                         &&!component.logicalTypes().equals(Set.of("object-id")))
                     throw unsupported(component.path().getFirst(),"native-object-id-key-domain");
             }
-            requireModel(model,artifact,configurationHash,expected,"afterRow");
+            requireCurrentModel(model,artifact,currentModel,"afterRow");
             return row;
         };
     }
 
     private static void requireModel(TapTable model, ConnectorRef artifact, String configurationHash, Binding expected,String phase){
-        String actual=PdkValidationModelVersion.of(model,artifact);
+        String actual=PdkValidationModelVersion.scopeVersion(model,artifact);
         if(!actual.equals(expected.modelVersion()))throw invalid("modelChanged."+phase+"."+model.getId());
         if(!PdkValidationModelVersion.codecBinding(artifact,configurationHash,actual)
                 .equals(expected.codecBinding()))throw invalid("codecChanged."+phase+"."+model.getId());
+    }
+
+    private static void requireCurrentModel(TapTable model,ConnectorRef artifact,String expected,String phase){
+        if(!PdkValidationModelVersion.of(model,artifact).equals(expected))throw invalid("modelChanged."+phase+"."+model.getId());
     }
 
     private static List<String> fields(List<ValidationKeyBinding.Component> keys){

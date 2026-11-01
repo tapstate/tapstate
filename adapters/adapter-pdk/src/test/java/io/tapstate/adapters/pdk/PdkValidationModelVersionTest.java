@@ -21,6 +21,53 @@ class PdkValidationModelVersionTest {
         fields.put("value",new TapField("value","VARCHAR(64)").pos(2).tapType(new TapString().bytes(64L)));
         var model=new TapTable("records");model.setNameFieldMap(fields);return model;
     }
+    @Test void documentDataInferenceDoesNotBecomeColumnDdlButTheActualReadModelRemainsStrict(){
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();
+        second.getNameFieldMap().get("id").setDataType("INTEGER");
+        second.getNameFieldMap().get("id").setTapType(new TapNumber().bit(32).fixed(true).precision(10).scale(0));
+        second.getNameFieldMap().get("value").setDataType("STRING(1500)");
+        second.getNameFieldMap().get("value").setTapType(new TapString().bytes(1500L));
+        second.add(new TapField("optional","STRING(100)").tapType(new TapString().bytes(100L)));
+        assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        second.setId("another");assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        second.setId(first.getId());second.setTableAttr(Map.of("capped",true,"maxSize",1000));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        first.setTableAttr(Map.of("opaque",new Object()));
+        assertThatThrownBy(()->PdkValidationModelVersion.scopeVersion(first,artifact)).isInstanceOf(TapstateException.class);
+    }
+
+    @Test void documentCollectionDefinitionsRemainBoundEvenWithoutFixedColumnDdl(){
+        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var first=table();var second=table();
+        first.setTableAttr(Map.of("timeField","at","metaField","group","granularity","seconds"));
+        second.setTableAttr(Map.of("timeField","at","metaField","group","granularity","hours"));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        second.setTableAttr(Map.of("timeField","other","metaField","group","granularity","seconds"));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        second.setTableAttr(first.getTableAttr());second.setCharset("different");
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+    }
+
+    @Test void aCustomCodecCannotMutateTheActualDocumentReadModelBehindTheStableScope()throws Exception{
+        var model=table();var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        String configuration="b".repeat(64);String version=PdkValidationModelVersion.scopeVersion(model,artifact);
+        var expected=new PdkValidationReads.Binding(version,PdkValidationModelVersion.codecBinding(artifact,configuration,version));
+        var calls=new java.util.concurrent.atomic.AtomicInteger();var registry=new io.tapdata.entity.codec.TapCodecsRegistry();
+        registry.registerToTapValue(String.class,(value,type)->{
+            calls.incrementAndGet();((TapString)model.getNameFieldMap().get("value").getTapType()).bytes(200L);
+            return new io.tapdata.entity.schema.value.TapStringValue("custom:"+value);
+        });
+        var codecs=new PdkValidationCodecs("mongo",expected.codecBinding(),registry);
+        var method=PdkValidationReads.class.getDeclaredMethod("decoder",TapTable.class,PdkValidationCodecs.class,ConnectorRef.class,String.class,PdkValidationReads.Binding.class,List.class,io.tapstate.core.validation.ValidationValues.Limits.class);method.setAccessible(true);
+        var keys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER,java.util.Set.of("exact-number")));
+        var decoder=(PdkValidationCursor.Decoder)method.invoke(null,model,codecs,artifact,configuration,expected,keys,new io.tapstate.core.validation.ValidationValues.Limits(8192,100,12));
+        assertThatThrownBy(()->decoder.decode(Map.of("id",1L,"value","same"))).isInstanceOfSatisfying(TapstateException.class,
+                changed->{assertThat(changed.code()).isEqualTo(ValidationError.INVALID_CONTRACT);assertThat(changed.args()).containsEntry("field","pdkRead.modelChanged.afterRow.records");});
+        assertThat(calls).hasValue(1);
+    }
+
     @Test void equivalentMetadataMapsAndRuntimeLabelsDoNotChangeTheSchemaIdentity(){
         var first=table();var second=table();
         var reversed=new LinkedHashMap<String,TapField>();
