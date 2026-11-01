@@ -47,7 +47,8 @@ class NativeValidationPdkRowsIT {
             var allocation = original.resources();
             var plan = new NativeValidationPdkRows(original, original.declarations, List.of(), Map.of(), Clock.systemUTC());
             // Isolate the production retention state machine from plugin behavior covered by adapter tests.
-            var read = ReflectionTestUtils.invokeMethod(plan, "admit");
+            long nativeBytes=NativeValidationPdkRows.rowReadBytes(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector",null,null));
+            var read = ReflectionTestUtils.invokeMethod(plan, "admit",nativeBytes);
             var workers = new CompletableFuture<Void>();
             var rows = new CompletableFuture<Void>();
             var cleanup = new CompletableFuture<Void>();

@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.*;
 
 /** Serial direct-table ordered pairs, checked and published under the original owner. */
 final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
+    private static final System.Logger LOG=System.getLogger(NativeValidationPdkRows.class.getName());
     private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64*1024,8192,32);
     static final long POSTGRES_RESULT_BYTES=PdkValidationReads.POSTGRES_RESULT_BYTES;
     private static final long METADATA_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
@@ -105,7 +106,19 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                     original.resources().decodeExecutor(),ROW);
             read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),handle.cleanupCompleted());read.opened();
             require();guard.run();var observed=handle.result();
-            if(!observed.binding().equals(binding(side)))throw invalid("savedModelChanged");
+            var expected=binding(side);
+            if(!observed.binding().equals(expected)){
+                // Keep diagnostics bounded to identities/digests; never emit configuration or row values.
+                var resolved=artifact(resource);
+                LOG.log(System.Logger.Level.WARNING,io.tapstate.core.common.JsonWriter.write(Map.ofEntries(
+                        Map.entry("code",ValidationError.INVALID_CONTRACT.code()),Map.entry("event","validation-binding-mismatch"),
+                        Map.entry("mapping",declared.mapping().mappingId()),Map.entry("side",source?"source":"destination"),Map.entry("table",side.table()),
+                        Map.entry("expectedModel",expected.modelVersion()),Map.entry("observedModel",observed.binding().modelVersion()),
+                        Map.entry("expectedCodec",expected.codecBinding()),Map.entry("observedCodec",observed.binding().codecBinding()),
+                        Map.entry("artifact",resolved.contentHash()),Map.entry("configuration",CanonicalHash.of(resource)),
+                        Map.entry("specification",resolved.spec()==null?"absent":CanonicalHash.ofText(resolved.spec())))));
+                throw invalid("savedModelChanged");
+            }
             if(source)ValidationDirectMappings.requireSourceTable(declared,observed.model());
             for(var field:observed.model().fields()){
                 if(field.type()==io.tapstate.core.common.TapstateType.UNKNOWN)throw unsupported(side.nodeId(),side.table()+"/"+field.name(),"field-model-unknown");
