@@ -41,6 +41,97 @@ class MongoCaptureExternalRetirementsIT {
     }
     @AfterAll static void stop(){if(server!=null)server.stop();}
 
+    @ParameterizedTest
+    @ValueSource(booleans={false,true})
+    void aHeldAliasWithoutItsRetainedOriginRefusesBeforePublishingAnything(boolean completing) throws Exception {
+        fixture(f -> {
+            var retirement=f.configuration.captureExternalRetirements();var notes=f.configuration.requiredNotes();
+            var shared=f.shared(notes);
+            var source=notes.initialize(RequiredNoteOwner.forNode(f.prepared.scope().bindingVersion(),
+                    new PipelineNode("flow","input"),PipelineNode.Purpose.CAPTURE,1));
+            notes.prepareOrigin(source,notes.origin(shared));
+            var clear=f.clear();
+            var observed=retirement.resourceNotes(f.prepared.scope()).stream().filter(n -> n.scope().equals(source)).findFirst().orElseThrow();
+            retirement.relinquishAliases(clear,List.of(new CaptureAliasObservation(observed,"original-slot")));
+            var key=new Document("_id",new Document("bindingVersion",source.owner().bindingVersion()).append("namespace",source.owner().namespace()));
+            var table=SystemCollections.PDK_NOTE_SCOPES.on(f.database);
+            var hold=table.find(key).first().get("externalRetirementHold",Document.class);
+            table.updateOne(key,new Document("$set",new Document("originGeneration",0L)));
+            SystemCollections.PDK_NOTE_ORIGINS.on(f.database).deleteOne(key);
+            var before=table.find(key).first();
+            try(var client=MongoClients.create(server.getReplicaSetUrl());var session=client.startSession()) {
+                var database=client.getDatabase(f.database.getName());
+                var store=new MongoRequiredNoteStore(client,database,new SourceConfigCipher(new byte[32]));
+                session.startTransaction();
+                try {
+                    assertThatThrownBy(() -> {
+                        if(completing)store.completeHeldAliases(session,shared,List.of(hold));
+                        else store.heldAliases(session,shared,List.of(observed),List.of(f.prepared.canonicalChainId()),hold.getString("resourceManifestHash"));
+                    }).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_SCOPE_UNAVAILABLE));
+                } finally {session.abortTransaction();}
+            }
+            assertThat(table.find(key).first()).isEqualTo(before);
+            assertThat(SystemCollections.PDK_NOTE_ORIGINS.on(f.database).find(key).first()).isNull();
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans={false,true})
+    void aliasReadmissionAndReservationCompeteWithoutChangingTheRetainedNotes(boolean reserved) throws Exception {
+        fixture(f -> {
+            var retirement=f.configuration.captureExternalRetirements();var notes=f.configuration.requiredNotes();var shared=f.shared(notes);
+            var owner=RequiredNoteOwner.forNode(f.prepared.scope().bindingVersion(),new PipelineNode("flow","input"),PipelineNode.Purpose.CAPTURE,1);
+            var source=notes.initialize(owner);var origin=notes.origin(shared);notes.prepareOrigin(source,origin);
+            notes.compareAndSet(source,"slot",0,new byte[]{7,9},false);notes.prepareCarry(new RequiredNoteCarry(shared,source));
+            var clear=f.clear();var observed=retirement.resourceNotes(f.prepared.scope()).stream().filter(n -> n.scope().equals(source)).findFirst().orElseThrow();
+            retirement.relinquishAliases(clear,List.of(new CaptureAliasObservation(observed,"original-slot")));
+            var cache=f.cache.capturePreparations(f.prepared.scope(),() -> {}).explicitClear();
+            if(reserved)retirement.reserve(clear,List.of(cache.inspect(f.prepared)),retirement.resourceNotes(f.prepared.scope()),
+                    CaptureResourceNotes.nameHash("original-slot"),origin,true,List.of(new CaptureRetirementMember(A.nodeId(),A.bootId(),"member-a")));
+            f.configuration.rebuilds().complete(f.cache.pipelineRebuilds(f.prepared.scope(),() -> {}).prepare(clear,f.node,TTL,Instant.now()));
+            var next=notes.open(RequiredNoteOwner.forNode(owner.bindingVersion(),new PipelineNode("flow","input"),PipelineNode.Purpose.CAPTURE,2));
+            var before=f.control();
+            if(reserved) {
+                assertThatThrownBy(() -> notes.prepareOrigin(next,origin)).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_REFERENCED));
+                assertThat(f.control()).isEqualTo(before);
+            } else {
+                assertThat(notes.prepareOrigin(next,origin)).isEqualTo(origin);
+                assertThat(retirement.resourceNotes(f.prepared.scope()).stream().filter(n -> n.scope().equals(next))).singleElement().satisfies(n -> assertThat(n.resumable()).isTrue());
+                assertThatThrownBy(() -> retirement.reserve(clear,List.of(cache.inspect(f.prepared)),retirement.resourceNotes(f.prepared.scope()),
+                        CaptureResourceNotes.nameHash("original-slot"),origin,true,List.of(new CaptureRetirementMember(A.nodeId(),A.bootId(),"member-a"))))
+                        .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                assertThat(f.control().get("operation")).isNull();
+            }
+            assertThat(notes.read(next,"slot").bytes()).containsExactly(7,9);
+        });
+    }
+
+    @Test void aFrozenSharedScopeMayOnlyMaterializeTheExactExistingCarry() throws Exception {
+        fixture(f -> {
+            var retirement=f.configuration.captureExternalRetirements();var notes=f.configuration.requiredNotes();var shared=f.shared(notes);
+            var source=notes.initialize(RequiredNoteOwner.forNode(f.prepared.scope().bindingVersion(),new PipelineNode("flow","input"),PipelineNode.Purpose.CAPTURE,1));
+            notes.prepareOrigin(source,notes.origin(shared));notes.compareAndSet(source,"slot",0,new byte[]{7,9},false);
+            notes.prepareCarry(new RequiredNoteCarry(shared,source));notes.compareAndSet(shared,"blocked",0,null,true);
+            var clear=f.clear();var observed=retirement.resourceNotes(f.prepared.scope()).stream().filter(n -> n.scope().equals(source)).findFirst().orElseThrow();
+            retirement.relinquishAliases(clear,List.of(new CaptureAliasObservation(observed,"original-slot")));
+            var cache=f.cache.capturePreparations(f.prepared.scope(),() -> {}).explicitClear();
+            var held=retirement.reserve(clear,List.of(cache.inspect(f.prepared)),retirement.resourceNotes(f.prepared.scope()),
+                    CaptureResourceNotes.nameHash("original-slot"),notes.origin(shared),true,List.of(new CaptureRetirementMember(A.nodeId(),A.bootId(),"member-a"))).getFirst();
+            retirement.frozen(held,cache.freeze(held,f.node));
+            assertThat(notes.compareAndSet(shared,"slot",0,new byte[]{7,9},false)).isTrue();
+            for(String key:List.of("slot","absent","blocked")) {
+                var before=notes.read(shared,key);
+                assertThatThrownBy(() -> notes.compareAndSet(shared,key,before.revision(),new byte[]{8},false))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,failure -> assertThat(failure.code()).isEqualTo(IoError.NOTE_REFERENCED));
+                assertThat(notes.read(shared,key)).isEqualTo(before);
+            }
+            assertThatThrownBy(() -> notes.compareAndSet(shared,"slot",1,null,true)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            assertThat(notes.read(shared,"slot").bytes()).containsExactly(7,9);
+        });
+    }
+
     @Test void revisionExhaustionRefusesBeforeMakingTheControlUnreadable() throws Exception {
         fixture(f -> {
             var table=SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.database);

@@ -369,7 +369,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                 || !(hold.get("noteScope")instanceof Document owner) || !scope.owner().namespace().equals(owner.get("namespace"))
                 || !Long.valueOf(scope.generation()).equals(owner.get("generation"))
                 || !(hold.get("releasedThrough")instanceof Long released) || released<1
-                || !Long.valueOf(released).equals(owner.get("stateGeneration")))throw unavailable();
+                || !released.equals(owner.get("stateGeneration")))throw unavailable();
         if(!java.util.Set.of("CLEAR","DELETE").contains(hold.getString("kind"))
                 || !Long.valueOf(scope.generation()).equals(hold.get("physicalGeneration"))
                 || !scope.owner().ownerId().equals(owner.get("pipelineId")) || !Long.valueOf(scope.owner().bindingVersion()).equals(owner.get("bindingVersion")))throw unavailable();
@@ -390,7 +390,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if(!(physical.get("externalRetirementAdmission")instanceof Long admitted) || admitted>hold.getLong("releasedThrough"))throw referenced();
             var mapping=MongoPipelineStateMappings.decode(source.owner().ownerId(),operators.find(session,new Document("_id",source.owner().ownerId())).first());
             if(mapping.stateGeneration()!=hold.getLong("releasedThrough") && mapping.stateGeneration()!=hold.getLong("releasedThrough")+1)throw referenced();
-            if(!aliasOriginHash(retainedOrigin(session,source,physical)).equals(hold.getString("originDigest")))throw unavailable();
+            var origin=retainedOrigin(session,source,physical);
+            if(origin==null || !aliasOriginHash(origin).equals(hold.getString("originDigest")))throw unavailable();
             for(var incoming:incoming(session,source.owner(),physical))if(!cohort.contains(incoming.shared().owner().ownerId()))throw referenced();
             result.put(source.owner().namespace(),new Document(hold));
         }
@@ -423,7 +424,9 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             var metadata=verifyPhysicalScope(session,scope,true);requireAliasHold(scope,hold);
             if(!hold.equals(metadata.get("externalRetirementHold")))throw unavailable();
             requirePrivateUnreferenced(session,scope);
-            var context=retainedOrigin(session,scope,metadata);var next=new RequiredNoteScope(owner,scope.generation()+1);
+            var context=retainedOrigin(session,scope,metadata);
+            if(context==null)throw unavailable();
+            var next=new RequiredNoteScope(owner,scope.generation()+1);
             if(next.generation()<=scope.generation())throw unreadable("generation");
             origins.deleteOne(session,byScope(owner).append("generation",scope.generation()));
             var result=new Document("operationId",hold.get("operationId")).append("stateGeneration",owner.stateGeneration())
