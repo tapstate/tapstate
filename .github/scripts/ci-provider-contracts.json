@@ -1,5 +1,20 @@
 {
   "classes": {
+    "io.tapstate.adapters.mongostore.MongoCaptureOpeningShapesTest": {
+      "module": "adapters/adapter-mongo-store",
+      "providers": {
+        "nativeDamage": {
+          "kind": "source",
+          "projection": "strict"
+        },
+        "controlDamage": {
+          "kind": "source",
+          "projection": "strict"
+        }
+      },
+      "source": "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCaptureOpeningShapesTest.java",
+      "source_sha256": "734caee0cd9ec0857d8dfbff8274c90bf5b435d2af0f04d4c67cae150fdfdfa3"
+    },
     "io.tapstate.adapters.pdk.PdkTypeMappingTest": {
       "module": "adapters/adapter-pdk",
       "providers": {
