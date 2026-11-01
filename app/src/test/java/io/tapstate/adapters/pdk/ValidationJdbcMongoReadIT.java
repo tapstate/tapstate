@@ -237,7 +237,7 @@ class ValidationJdbcMongoReadIT {
             ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
             ExecutorService queryIo, ExecutorService decodeIo) {
         var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
-                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                new PdkValidationSession.Lookup(table, List.of("id"), List.of(), 2, binding, key),
                 (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
                     if (path.getLast().equals("items")) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.ARRAY);
                     if (Set.of("customer", "shipping", "product").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.OBJECT);
@@ -412,7 +412,7 @@ class ValidationJdbcMongoReadIT {
             ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
             ExecutorService queryIo, ExecutorService decodeIo) {
         var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
-                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                new PdkValidationSession.Lookup(table, List.of("id"), List.of(), 2, binding, key),
                 arrayAdmission(ARRAY_LIMITS), (model, codecs, logical) -> {
                     var match = new LinkedHashMap<String, Object>();
                     for (int i = 0; i < binding.components().size(); i++) match.put(binding.components().get(i).path().getFirst(), logical.parts().get(i).value());
@@ -808,7 +808,7 @@ class ValidationJdbcMongoReadIT {
             ValidationKeyBinding binding, ValidationKey key, ValidationReadScope scope, List<ValidationReadHandle> handles,
             ExecutorService queryIo, ExecutorService decodeIo) {
         var handle = scope.open(table, guard -> PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
-                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, key),
+                new PdkValidationSession.Lookup(table, List.of("id"), List.of(), 2, binding, key),
                 (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
                     if (Set.of("id", "customer_id", "region_id").contains(path.getLast())) return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
                     return PdkValidationRows.Rule.AUTO;
@@ -944,7 +944,7 @@ class ValidationJdbcMongoReadIT {
         var binding = new ValidationKeyBinding("root", List.of(new ValidationKeyBinding.Component(List.of(keyField),
                 ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number"))), Set.of(), LIMITS);
         return PdkValidationSession.lookup(kind, artifact, settings, "retained-" + kind + "-artifact",
-                new PdkValidationSession.Lookup(table, List.of(), List.of(), 2, binding, logical),
+                new PdkValidationSession.Lookup(table, List.of(keyField), List.of(), 2, binding, logical),
                 (model, codecs) -> new PdkValidationRows(model, codecs, path -> {
                     if (path.size() == 1 && List.of(keyField, "amount", "price", "fractional").contains(path.getFirst()))
                         return PdkValidationRows.Rule.of(PdkValidationRows.Shape.EXACT_NUMBER);
@@ -988,7 +988,7 @@ class ValidationJdbcMongoReadIT {
                 new ValidationKeyBinding.Component(List.of("amount"), ValidationKey.Kind.EXACT_NUMBER, Set.of("exact-number")),
                 new ValidationKeyBinding.Component(List.of("label"), ValidationKey.Kind.TEXT, Set.of("text"))), Set.of(), LIMITS);
         var logical = new ValidationKey(List.of(ValidationKey.Part.number(amount), ValidationKey.Part.text(" O'Brien ")));
-        var lookup = new PdkValidationSession.Lookup("lookup_records", List.of(), List.of("record_key", "amount", "label"), 2, binding, logical);
+        var lookup = new PdkValidationSession.Lookup("lookup_records", List.of("record_key"), List.of("record_key", "amount", "label"), 2, binding, logical);
         var ids = new ArrayList<Long>();
         var projection = ValidationStaticMap.compile("price", new TransformBody.MapProjection(
                 Map.of("price", FieldRule.rename("amount"))), LIMITS);

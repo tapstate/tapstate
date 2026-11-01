@@ -737,8 +737,10 @@ class MongoValidationSchemaIT {
 
     private static Document emptyTaskHeader(String task) {
         return new Document("_id", new Document("clusterId", "cluster").append("pipelineId", "flow0").append("taskId", task))
-                .append("formatVersion", 1).append("taskGeneration", UUID.randomUUID().toString()).append("revision", 1L).append("closed", false)
-                .append("modes", new Document("full", new Document("nextStartSequence", 1L)).append("incremental", new Document("nextStartSequence", 1L)));
+                .append("formatVersion", 2).append("taskGeneration", UUID.randomUUID().toString()).append("revision", 1L).append("closed", false)
+                .append("modes", new Document("full", new Document("nextStartSequence", 1L)
+                        .append("scheduledAdmission",new Document("scopeRevision",1L).append("lastDue",null).append("lastCommand",null).append("lastSequence",null)))
+                        .append("incremental", new Document("nextStartSequence", 1L)));
     }
 
     private static boolean attemptRecovery(MongoConfigurationDomain configuration, MongoCacheDomain cache, StorageRecoveryCommands.Plan running) {
