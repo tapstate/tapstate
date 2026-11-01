@@ -39,7 +39,11 @@ class NativeValidationPdkRowsIT {
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(ints={0,1,2})
-    void cancellationReceiptsKeepAsynchronousCleanupDiagnosesThroughRetryAndFinalMirror(int kind)throws Exception {
+    void cancellationReceiptsKeepAsynchronousCleanupDiagnosesThroughRetryAndFinalMirror(int kind)throws Exception {verifyCancellationReceipt(kind);}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={3,4,5})
+    void nestedAndConcurrentCancellationReceiptsKeepOnlyRealCleanupFailures(int kind)throws Exception {verifyCancellationReceipt(kind);}
+    private void verifyCancellationReceipt(int kind)throws Exception {
         var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
         var workers=new CompletableFuture<Void>();var returned=new CompletableFuture<Void>();var cleaned=new CompletableFuture<Void>();
         var closes=new java.util.concurrent.atomic.AtomicInteger();
@@ -49,10 +53,15 @@ class NativeValidationPdkRowsIT {
             var nativePlan=new java.util.concurrent.atomic.AtomicReference<NativeValidationPdkRows>();
             var diagnosis=kind==1?new AssertionError("Original asynchronous native cleanup failed"):
                     new TapstateException(ValidationError.READ_FAILED,Map.of("table","original-asynchronous-cleanup"),null);
+            var interrupted=new TapstateException(ValidationError.READ_CANCELLED,Map.of("table","orders"),new InterruptedException());
+            if(kind==5)interrupted.addSuppressed(diagnosis);
             var cancelled=new TapstateException(ValidationError.READ_CANCELLED,Map.of("table","orders"),
-                    kind==2?new IllegalStateException("Unexpected original native cancellation cause"):null);
+                    kind==2?new IllegalStateException("Unexpected original native cancellation cause"):kind>=4?interrupted:null);
             if(kind==0)cancelled.addSuppressed(diagnosis);
+            if(kind==3)cancelled.addSuppressed(interrupted);
             Throwable receipt=kind==1?diagnosis:cancelled;
+            if(kind==3){var wrapper=new java.util.concurrent.CompletionException(cancelled);wrapper.addSuppressed(interrupted);receipt=wrapper;}
+            final Throwable originalReceipt=receipt;
             try {
                 runs.start(start,new NativeValidationFullJob(original,registry,f.member,f.process,runs,reservation->{
                     var plan=new NativeValidationPdkRows(reservation,reservation.declarations,List.of(),Map.of(),Clock.systemUTC());nativePlan.set(plan);
@@ -70,18 +79,23 @@ class NativeValidationPdkRowsIT {
                     };
                 }));
                 assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());NativeValidationFullJobIT.await(()->closes.get()>0);NativeValidationFullJobIT.await(()->original.cancelled.get());
-                workers.completeExceptionally(receipt);returned.complete(null);
-                assertThat(nativePlan.get().failure()).as("The retained original worker receipt keeps its real diagnosis").isSameAs(kind==2?cancelled:diagnosis);
+                workers.completeExceptionally(originalReceipt);returned.complete(null);
+                if(kind==3||kind==4)assertThat(nativePlan.get().failure()).as("Pure original cancellation chains carry no execution fault").isNull();
+                else assertThat(nativePlan.get().failure()).as("The retained original worker receipt keeps its real diagnosis").isSameAs(kind==2?cancelled:diagnosis);
                 assertThat(nativePlan.get().drained()).isFalse();assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();
                 nativePlan.get().close();assertThat(closes.get()).isGreaterThanOrEqualTo(2);
             }finally{resume.countDown();workers.completeExceptionally(cancelled);returned.complete(null);cleaned.complete(null);}
             var reference=new io.tapstate.spi.store.ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
             NativeValidationFullJobIT.await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
             NativeValidationFullJobIT.await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
-            assertThat(nativePlan.get().drained()).isTrue();var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
-            if(kind==1)assertThat(failure.fatal()).isTrue();
-            else if(kind==0)assertThat(failure.params()).containsEntry("table","original-asynchronous-cleanup");
-            else assertThat(failure.technical()).contains("Unexpected original native cancellation cause");
+            assertThat(nativePlan.get().drained()).isTrue();var failure=access.reports().find(reference).orElseThrow().failure();
+            if(kind==3||kind==4)assertThat(failure).isNull();
+            else{
+                assertThat(failure).isNotNull();
+                if(kind==1)assertThat(failure.fatal()).isTrue();
+                else if(kind==0||kind==5)assertThat(failure.params()).containsEntry("table","original-asynchronous-cleanup");
+                else assertThat(failure.technical()).contains("Unexpected original native cancellation cause");
+            }
         }finally{resume.countDown();returned.complete(null);cleaned.complete(null);}
     }
 
