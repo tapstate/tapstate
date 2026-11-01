@@ -35,7 +35,8 @@ public final class PdkCapabilityDeriver implements CapabilityDeriver {
         return derive(connectorId,provisioner.resolve(connectorId,contentHash));
     }
 
-    private ConnectorCapabilities derive(String connectorId,ConnectorRef original) {
+    // Artifact resolution and streaming can overlap; plugin construction/probing stays serialized.
+    private synchronized ConnectorCapabilities derive(String connectorId,ConnectorRef original) {
         PdkConnector connector = PdkConnector.open(connectorId,original,Map.of());
         try {
             return toCapabilities(connector.functions());

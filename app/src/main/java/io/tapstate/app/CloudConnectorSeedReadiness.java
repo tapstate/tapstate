@@ -8,6 +8,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 import io.tapstate.adapters.pdk.SeedOutcome;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -219,6 +220,7 @@ final class CloudConnectorSeedReadiness {
         for (Artifact artifact : artifacts) {
             String id = artifact.id();
             SeedOutcome outcome = byPath.get(seedDir.resolve(id + "-connector.jar"));
+            if (outcome instanceof SeedOutcome.Failed failed) preserveQuota(failed.cause());
             if (!(outcome instanceof SeedOutcome.Seeded seeded)
                     || !seeded.outcome().registration().connectorId().equals(id)
                     || !seeded.outcome().registration().contentHash().equals(artifact.sha256())
@@ -281,6 +283,7 @@ final class CloudConnectorSeedReadiness {
         try {
             present = registry.copyArtifactTo(artifact.sha256(), check);
         } catch (IOException | UncheckedIOException | TapstateException failure) {
+            preserveQuota(failure);
             LOG.warn("Stored connector verification failed [connector={}, error_code={}, exception_type={}].", artifact.id(),
                     failure instanceof TapstateException coded ? coded.code().code() : BootError.CLOUD_CONNECTORS_INVALID.code(),
                     failure.getClass().getSimpleName());
@@ -443,10 +446,16 @@ final class CloudConnectorSeedReadiness {
         }
     }
 
+    private static void preserveQuota(Throwable failure) {
+        if (failure instanceof TapstateException coded && coded.code() == IoError.STORE_QUOTA_EXCEEDED)
+            throw new TapstateException(IoError.STORE_QUOTA_EXCEEDED, Map.of(), null);
+    }
+
     private static <T> T readPort(String id, Supplier<T> reader) {
         try {
             return reader.get();
         } catch (TapstateException | UncheckedIOException failure) {
+            preserveQuota(failure);
             throw invalid(id, "registered-artifact-unavailable");
         }
     }

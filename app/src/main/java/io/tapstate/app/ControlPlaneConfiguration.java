@@ -548,7 +548,7 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectorProvisioner connectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties) {
-        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir());
+        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(), properties.getSeedDir());
     }
 
     // The startup seed sweep: the release's connectors/ directory goes through the same
@@ -566,7 +566,7 @@ class ControlPlaneConfiguration {
 
     @Bean
     SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar) {
-        return new SeedConnectorSweep(registrar);
+        return new SeedConnectorSweep(registrar, Math.max(1, Runtime.getRuntime().availableProcessors()));
     }
 
     @Bean

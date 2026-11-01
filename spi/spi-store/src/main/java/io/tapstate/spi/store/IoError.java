@@ -32,6 +32,9 @@ public enum IoError implements TapstateErrorCode {
      */
     STORE_UNAVAILABLE("io.store-unavailable", Set.of("detail")),
 
+    /** The endpoint explicitly refused a write because its storage quota is exhausted. Carries no server data. */
+    STORE_QUOTA_EXCEEDED("io.store-quota-exceeded", Set.of()),
+
     /**
      * The store rejected the credentials for the operation. Carries no placeholder on purpose: echoing
      * anything back risks leaking a credential.

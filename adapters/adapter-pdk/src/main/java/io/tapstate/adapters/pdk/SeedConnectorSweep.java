@@ -4,6 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.RegistrationSource;
 
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.NotDirectoryException;
@@ -14,6 +15,11 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Stream;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorCompletionService;
+import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * The startup seed sweep: registers every {@code *.jar} directly in a seed directory through the
@@ -35,9 +41,17 @@ public final class SeedConnectorSweep {
     private static final String JAR_SUFFIX = ".jar";
 
     private final ConnectorArtifactRegistrar registrar;
+    private final int parallelism;
 
     public SeedConnectorSweep(ConnectorArtifactRegistrar registrar) {
+        this(registrar, 1);
+    }
+
+    /** Bounds independent registrations; the assembly chooses the deployment-specific default. */
+    public SeedConnectorSweep(ConnectorArtifactRegistrar registrar, int parallelism) {
         this.registrar = Objects.requireNonNull(registrar, "registrar");
+        if (parallelism < 1) throw new IllegalArgumentException("parallelism must be positive");
+        this.parallelism = parallelism;
     }
 
     /** Sweeps {@code seedDir}, returning one outcome per {@code *.jar} file, sorted by file name. */
@@ -58,17 +72,54 @@ public final class SeedConnectorSweep {
             throw new UncheckedIOException(
                     "seed path is not a directory: " + seedDir, new NotDirectoryException(seedDir.toString()));
         }
-        List<SeedOutcome> outcomes = new ArrayList<>();
-        for (Path artifact : seedJars(seedDir)) {
-            if (selected != null && !selected.contains(artifact.getFileName().toString())) continue;
-            try {
-                outcomes.add(new SeedOutcome.Seeded(
-                        artifact, registrar.register(artifact, RegistrationSource.SEED)));
-            } catch (TapstateException | UncheckedIOException e) {
-                outcomes.add(new SeedOutcome.Failed(artifact, e));
+        List<Path> artifacts = seedJars(seedDir).stream()
+                .filter(path -> selected == null || selected.contains(path.getFileName().toString())).toList();
+        int workers = Math.min(parallelism, artifacts.size());
+        if (workers <= 1) return artifacts.stream().map(this::register).toList();
+        SeedOutcome[] outcomes = new SeedOutcome[artifacts.size()];
+        AtomicInteger next = new AtomicInteger();
+        List<Future<?>> tasks = new ArrayList<>();
+        boolean interrupted = false;
+        // Only worker loops are queued, not a future (or artifact bytes) for every input file.
+        try (var executor = Executors.newFixedThreadPool(workers)) {
+            var completed = new ExecutorCompletionService<Void>(executor);
+            for (int worker = 0; worker < workers; worker++) {
+                tasks.add(completed.submit(() -> {
+                    int index;
+                    while ((index = next.getAndIncrement()) < artifacts.size()) {
+                        outcomes[index] = register(artifacts.get(index));
+                    }
+                    if (Thread.currentThread().isInterrupted())
+                        throw new UncheckedIOException(new InterruptedIOException("Connector seed sweep interrupted"));
+                }, null));
             }
+            try {
+                for (int worker = 0; worker < workers; worker++) completed.take().get();
+            } catch (InterruptedException failure) {
+                interrupted = true;
+                tasks.forEach(task -> task.cancel(true));
+                throw new UncheckedIOException(new InterruptedIOException("Connector seed sweep interrupted"));
+            } catch (ExecutionException failure) {
+                tasks.forEach(task -> task.cancel(true));
+                if (failure.getCause() instanceof RuntimeException runtime) throw runtime;
+                if (failure.getCause() instanceof Error error) throw error;
+                throw new IllegalStateException("Unexpected seed worker failure", failure.getCause());
+            }
+        } finally {
+            // Executor.close waits for in-flight publication/cleanup before restoring interruption.
+            if (interrupted) Thread.currentThread().interrupt();
         }
-        return List.copyOf(outcomes);
+        return List.of(outcomes);
+    }
+
+    private SeedOutcome register(Path artifact) {
+        if (Thread.currentThread().isInterrupted())
+            throw new UncheckedIOException(new InterruptedIOException("Connector seed sweep interrupted"));
+        try {
+            return new SeedOutcome.Seeded(artifact, registrar.register(artifact, RegistrationSource.SEED));
+        } catch (TapstateException | UncheckedIOException failure) {
+            return new SeedOutcome.Failed(artifact, failure);
+        }
     }
 
     /** The regular {@code *.jar} files (extension matched case-insensitively) directly in the seed
