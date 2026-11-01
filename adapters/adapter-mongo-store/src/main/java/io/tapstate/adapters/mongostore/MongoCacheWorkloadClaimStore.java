@@ -10,6 +10,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.CapturePreparation;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -56,7 +57,13 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
             if(key.type()==WorkloadClaimType.CAPTURE) {
                 var row=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
                 if(row==null)throw MongoCapturePreparationFacts.history(key.resourceId());
-                MongoCaptureCachePreparations.requirePreparation(row,key,scope);return store.acquireExisting(key,owner,topologyRevision,ttl);
+                var prepared=MongoCaptureCachePreparations.requirePreparation(row,key,scope);
+                if(prepared.mode()==CapturePreparation.Mode.SHARED_SRS) {
+                    var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",prepared.chainId())).first();
+                    if(root==null)throw MongoCapturePreparationFacts.history(key.resourceId());
+                    MongoCaptureClearControls.ordinary(root);
+                }
+                return store.acquireExisting(key,owner,topologyRevision,ttl);
             }
             return store.acquire(key,owner,topologyRevision,ttl);
         });

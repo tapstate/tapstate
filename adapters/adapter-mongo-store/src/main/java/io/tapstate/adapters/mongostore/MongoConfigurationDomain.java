@@ -33,7 +33,7 @@ import java.util.Objects;
  */
 public final class MongoConfigurationDomain implements AutoCloseable {
     static final String LAYOUT = "three-layer-v1";
-    static final int SCHEMA_VERSION = 2;
+    static final int SCHEMA_VERSION = 3;
     private final MongoConnection connection;
     private final MongoConfigurationArtifactStore artifacts;
     private final MongoConfigurationCatalogStore catalog;
@@ -167,6 +167,23 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
         requireOpen();return new MongoCaptureStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);
+    }
+
+    public io.tapstate.spi.store.CaptureOpeningJournal captureOpeningJournal() {
+        return captureExternalRetirements();
+    }
+    public io.tapstate.spi.store.CaptureExternalRetirements captureExternalRetirements() {
+        requireOpen();
+        return new MongoCaptureExternalRetirements(connection.client(), connection.database(), clusterId, bindings,
+                (MongoRequiredNoteStore)requiredNotes, this::requireOpen);
+    }
+    /** Offline maintenance entry: isolate every old writer before obtaining the original CACHE observation. */
+    public java.util.List<io.tapstate.spi.store.CapturePreparation> legacyCapturePreparations(io.tapstate.spi.store.CacheBusinessScope scope) {
+        requireOpen();return ((MongoCaptureExternalRetirements)captureExternalRetirements()).legacyPreparations(scope);
+    }
+    /** Publishes CONFIG coverage first. The supplied CACHE observation publishes its own version separately. */
+    public io.tapstate.spi.store.CaptureStorageUpgrade.ConfigurationReceipt adoptLegacyCaptureStorage(io.tapstate.spi.store.CaptureStorageUpgrade.CacheObservation original) {
+        requireOpen();return ((MongoCaptureExternalRetirements)captureExternalRetirements()).adoptLegacy(original);
     }
 
     public io.tapstate.spi.store.PipelineStatePreparations preparations() {

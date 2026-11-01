@@ -15,13 +15,22 @@ final class PipelineDeletionCoordinator {
     @FunctionalInterface interface Isolation {
         Isolated isolate(PipelineRetirementRequest original,Optional<OperatorRunManifest> captured);
     }
+    @FunctionalInterface interface ExternalRetirement {
+        void retired(PipelineRetirementReceipt original,List<SrsConsumerMembership> memberships);
+    }
     private final PipelineRetirements configuration;private final PipelineCacheRetirements cache;
     private final SrsConsumerStore consumers;private final PipelinePrivateNoteRetirement notes;
     private final Supplier<WorkloadClaimFence> node;private final Runnable activeNode;private final Isolation isolation;
+    private final ExternalRetirement external;
     PipelineDeletionCoordinator(PipelineRetirements configuration,PipelineCacheRetirements cache,SrsConsumerStore consumers,
             PipelinePrivateNoteRetirement notes,Supplier<WorkloadClaimFence> node,Runnable activeNode,Isolation isolation) {
+        this(configuration,cache,consumers,notes,node,activeNode,isolation,(original,memberships) -> {});
+    }
+    PipelineDeletionCoordinator(PipelineRetirements configuration,PipelineCacheRetirements cache,SrsConsumerStore consumers,
+            PipelinePrivateNoteRetirement notes,Supplier<WorkloadClaimFence> node,Runnable activeNode,Isolation isolation,ExternalRetirement external) {
         this.configuration=Objects.requireNonNull(configuration);this.cache=Objects.requireNonNull(cache);this.consumers=Objects.requireNonNull(consumers);
         this.notes=Objects.requireNonNull(notes);this.node=Objects.requireNonNull(node);this.activeNode=Objects.requireNonNull(activeNode);this.isolation=Objects.requireNonNull(isolation);
+        this.external=Objects.requireNonNull(external);
     }
     PipelineRetirementResult delete(PipelineRetirementRequest original,Optional<OperatorRunManifest> manifest) {
         activeNode.run();var completed=configuration.completed(original.scope().pipelineId(),original.operationId());
@@ -50,6 +59,7 @@ final class PipelineDeletionCoordinator {
             guard.run();
         }
         guard.run();var receipt=cache.retire(original,currentNode,isolated.cache());guard.run();
+        external.retired(receipt,members);guard.run();
         notes.delete(original,configuration,guard,local);guard.run();return configuration.complete(receipt);
     }
     private PipelineRetirementResult same(PipelineRetirementRequest original,PipelineRetirementResult result) {

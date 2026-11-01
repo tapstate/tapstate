@@ -147,6 +147,15 @@ final class MongoPipelineRetirements implements PipelineRetirements {
     static void requireOriginalActive(PipelineRetirementPreparation original) {
         if(!(original instanceof Pending pending))throw fenced();pending.owner.active.run();
     }
+    static MongoPipelineRetirementFacts.Fact originalFact(PipelineRetirementPreparation original) {
+        if(!(original instanceof Pending pending))throw fenced();return pending.fact;
+    }
+    static void requireOriginalInTransaction(MongoClient client,MongoDatabase database,ClientSession session,PipelineRetirementPreparation original) {
+        if(!(original instanceof Pending pending) || pending.owner.client!=client || !pending.owner.database.getName().equals(database.getName()))throw fenced();
+        pending.owner.requireBusiness(session,pending.request().scope());
+        var current=pending.owner.retained(session,pending.request(),pending.owner.mapping(session,pending.request().scope().pipelineId()));
+        if(!pending.fact.equals(current.fact) || !pending.previous.equals(current.previous))throw fenced();
+    }
     private record Pending(MongoPipelineRetirements owner,MongoPipelineRetirementFacts.Fact fact,PipelinePreparation previous) implements PipelineRetirementPreparation {
         public PipelineRetirementRequest request(){return fact.request();}public String privateScopesHash(){return fact.notesHash();}
         public int privateScopesCount(){return fact.notesCount();}public PipelinePreparation previousPreparation(){return previous;}

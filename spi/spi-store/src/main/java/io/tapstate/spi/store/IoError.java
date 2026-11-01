@@ -165,7 +165,16 @@ public enum IoError implements TapstateErrorCode {
     DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id")),
 
     /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
-    CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt"));
+    CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt")),
+
+    /** Original physical openings or external effects still prevent destructive retirement. */
+    CAPTURE_EXTERNAL_RETIREMENT_PENDING("io.capture-external-retirement-pending", Set.of("capture", "operation", "reason")),
+
+    /** Required original resource identity or retirement authority cannot be established. */
+    CAPTURE_EXTERNAL_RETIREMENT_UNSUPPORTED("io.capture-external-retirement-unsupported", Set.of("capture", "operation", "reason")),
+
+    /** A bounded lifecycle control refuses more work without evicting necessary evidence. */
+    CAPTURE_RETIREMENT_CAPACITY("io.capture-retirement-capacity", Set.of("capture", "operation", "reason"));
 
     private final String code;
     private final Set<String> placeholders;

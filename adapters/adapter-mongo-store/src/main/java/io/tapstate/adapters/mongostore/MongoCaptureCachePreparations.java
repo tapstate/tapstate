@@ -252,6 +252,9 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             return loadInSession(session,preparation);
         });
     }
+    @Override public CaptureClearCache explicitClear() {
+        return new MongoCaptureClearCache(client,database,scope,targetFingerprint,active,retention);
+    }
     @Override public CaptureCacheState load(CapturePreparation original){Objects.requireNonNull(original,"original");requireScope(original);return transaction(() -> {},session -> loadInSession(session,original));}
     private CaptureCacheState loadInSession(ClientSession session,CapturePreparation original) {
         var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,original.captureId());

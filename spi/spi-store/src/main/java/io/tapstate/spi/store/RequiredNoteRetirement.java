@@ -4,6 +4,8 @@ package io.tapstate.spi.store;
 public interface RequiredNoteRetirement {
     /** Whether this exact operation already published its retirement result. */
     default boolean completed() { return false; }
+    /** A confirmed retired predecessor allocated this generation, which has never admitted a source. */
+    default boolean unadmittedSuccessor() { return false; }
 
     RequiredNoteScope scope();
     String operationId();

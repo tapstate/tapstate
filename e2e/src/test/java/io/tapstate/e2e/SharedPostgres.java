@@ -86,7 +86,8 @@ final class SharedPostgres {
                             "-c", "wal_level=logical",
                             "-c", "max_wal_senders=32",
                             "-c", "max_replication_slots=32");
-            String owner = System.getProperty("tapstate.e2e.resource-owner");
+            String owner = System.getenv("TAPSTATE_ISSUE_LOOP_OWNER");
+            if (owner == null || owner.isBlank()) owner = System.getProperty("tapstate.e2e.resource-owner");
             if (owner != null && !owner.isBlank()) {
                 starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
                         "io.tapstate.e2e.resource-owner"), owner);

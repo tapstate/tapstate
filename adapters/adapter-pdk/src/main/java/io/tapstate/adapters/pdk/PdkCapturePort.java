@@ -731,6 +731,25 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** Release keeps the original connector purpose without changing its logical node identity. */
     public Optional<TapstateException> release(CaptureConfig config, PipelineNode.Purpose purpose) {
+        return release(config,purpose,null);
+    }
+
+    /** The facade timeout does not terminate the original physical external call. */
+    public record ObservedRelease(CompletableFuture<Boolean> terminal,
+            CompletableFuture<Optional<TapstateException>> facade) {}
+
+    public ObservedRelease beginObservedRelease(CaptureConfig config) {
+        var terminal=new CompletableFuture<Boolean>();var facade=new CompletableFuture<Optional<TapstateException>>();
+        var caller=new Thread(() -> {
+            try {facade.complete(release(config,PipelineNode.Purpose.CAPTURE,terminal::complete));}
+            catch(Throwable failure){terminal.completeExceptionally(failure);facade.completeExceptionally(failure);
+                if(failure instanceof VirtualMachineError fatal)throw fatal;}
+        },"tapstate-release-observer-"+config.connectorId());
+        caller.setDaemon(true);caller.start();return new ObservedRelease(terminal,facade);
+    }
+
+    private Optional<TapstateException> release(CaptureConfig config, PipelineNode.Purpose purpose,
+            java.util.function.Consumer<Boolean> actualTerminal) {
         Objects.requireNonNull(config, "config"); Objects.requireNonNull(purpose, "purpose");
         if ((purpose != PipelineNode.Purpose.CAPTURE && stateStore != null)
                 || (purpose != PipelineNode.Purpose.CAPTURE && config.sharedNotes() != null)) {
@@ -738,6 +757,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         }
         if ((stateStore == null && noteScopes == null) || (config.node() == null && config.sharedNotes() == null)) {
             // Nothing was kept anywhere a later drive could read it, so nothing was set up through it either.
+            if(actualTerminal!=null)actualTerminal.accept(false);
             return Optional.empty();
         }
         FencedStateStore notes = stateStore == null ? null : new FencedStateStore(stateStore);
@@ -749,6 +769,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
         });
         AtomicReference<List<String>> named = new AtomicReference<>();
         CompletableFuture<Void> released = new CompletableFuture<>();
+        var invoked=new java.util.concurrent.atomic.AtomicBoolean();
+        var cleanupVerified=new java.util.concurrent.atomic.AtomicBoolean();
         Thread thread = new Thread(() -> {
             try {
                 String connectorId = config.connectorId();
@@ -774,6 +796,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     named.set(names);
                     ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
                     if (release != null) {
+                        invoked.set(true);
                         LOG.info("connector {} is letting go of what it set up on its source to read changes ({})",
                                 connectorId,
                                 names.isEmpty() ? "nothing its notes name" : String.join(", ", names));
@@ -786,6 +809,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 } finally {
                     connector.stopQuietly();
                     connector.close();
+                    cleanupVerified.set(connector.cleanupVerified());
                 }
                 released.complete(null);
             } catch (Throwable failure) {
@@ -793,6 +817,8 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 if (failure instanceof VirtualMachineError fatal) {
                     throw fatal;
                 }
+            } finally {
+                if(actualTerminal!=null)actualTerminal.accept(invoked.get() && cleanupVerified.get() && !released.isCompletedExceptionally());
             }
         }, "tapstate-release-" + config.connectorId());
         thread.setDaemon(true);

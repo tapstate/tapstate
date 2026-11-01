@@ -216,7 +216,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         requireOrdinary();
         requireOriginScope(scope);
         Objects.requireNonNull(origin, "origin");
-        return withOriginIndexes(() -> transaction(session -> {
+        return withOriginIndexes(() -> transaction(session -> prepareOrigin(session,scope,origin)));
+    }
+
+    RequiredNoteOrigin prepareOrigin(ClientSession session,RequiredNoteScope scope,RequiredNoteOrigin origin) {
+        requireOrdinary();requireOriginScope(scope);
             SourceConfigCipher cipher = cipherForWrite(session);
             Document metadata = verifyScope(session, scope, true);
             RequiredNoteOrigin retained = retainedOrigin(session, scope, metadata);
@@ -233,7 +237,226 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                             .append("originGeneration", 0L),
                     new Document("$set", new Document("originGeneration", scope.generation()))).getMatchedCount() != 1) throw unavailable();
             return origin;
-        }));
+    }
+    boolean missingOrigin(ClientSession session,RequiredNoteScope scope) {
+        return retainedOrigin(session,scope,verifyScope(session,scope,false))==null;
+    }
+
+    RequiredNoteOrigin originalOrigin(ClientSession session,RequiredNoteScope scope) {
+        requireOriginScope(scope);
+        var result=retainedOrigin(session,scope,verifyScope(session,scope,false));
+        if(result==null)throw unavailable();return result;
+    }
+
+    /** Capture the exact clear authority while its original Pipeline mapping is still current. */
+    void holdAliases(ClientSession session,io.tapstate.spi.store.PipelineRebuildPreparation original,List<io.tapstate.spi.store.CaptureAliasObservation> contexts) {
+        holdAliases(session,original.request().originalScope(),original.request().operationId(),original.confirmationHash(),"CLEAR",contexts);
+    }
+    void holdAliases(ClientSession session,io.tapstate.spi.store.PipelineRetirementPreparation original,List<io.tapstate.spi.store.CaptureAliasObservation> contexts) {
+        holdAliases(session,original.request().scope(),original.request().operationId(),
+                MongoCaptureClearControls.hash(MongoPipelineRetirementFacts.encode(MongoPipelineRetirements.originalFact(original))),"DELETE",contexts);
+    }
+    private void holdAliases(ClientSession session,io.tapstate.spi.store.PipelineIntentScope authorizingScope,String operation,String authorization,
+            String kind,List<io.tapstate.spi.store.CaptureAliasObservation> contexts) {
+        var permitted=retirementScopes(session,authorizingScope,operation);
+        requireResourceNotes(session,contexts.stream().map(io.tapstate.spi.store.CaptureAliasObservation::notes).toList());
+        for(var observed:contexts) {
+            var scope=observed.notes().scope();
+            if(!permitted.contains(scope) || !scope.owner().hasPurpose(io.tapstate.core.model.PipelineNode.Purpose.CAPTURE))throw unavailable();
+            var fixed=new Retirement(scope,operation);checkRetiringOwner(session,fixed,true);
+            var metadata=verifyPhysicalScope(session,scope,false);
+            // Non-resource and never-opened source reservations have no external retirement obligation.
+            var origin=retainedOrigin(session,scope,metadata);if(origin==null)continue;
+            var previous=metadata.get("externalRetirementHold",Document.class);
+            var token=aliasScope(scope);
+            String resourceHash=MongoCaptureClearControls.hash(new Document("originDigest",aliasOriginHash(origin))
+                    .append("resourceNameHash",io.tapstate.spi.store.CaptureResourceNotes.nameHash(observed.resourceName())));
+            var grant=new Document("noteScope",token).append("operationId",operation).append("kind",kind)
+                    .append("authorizingScope",MongoPipelinePreparationFacts.scope(authorizingScope))
+                    .append("physicalGeneration",scope.generation()).append("originDigest",aliasOriginHash(origin)).append("resourceManifestHash",resourceHash)
+                    .append("grantId",MongoCaptureClearControls.hash(new Document("scope",token).append("operation",operation).append("authorization",authorization)))
+                    .append("authorizationHash",authorization)
+                    .append("releasedThrough",authorizingScope.stateGeneration());
+            grant.append("grantHash",MongoCaptureClearControls.hash(new Document(grant)));
+            if(MongoCaptureExternalRetirements.bytes(grant)>2048)throw MongoCaptureExternalRetirements.capacity(null,"alias-authority-bytes");
+            if(previous!=null) {
+                requireAliasHold(scope,previous);
+                if(previous.equals(grant))continue;
+                if(previous.getLong("releasedThrough")>=scope.owner().stateGeneration())throw unavailable();
+            }
+            if(scopes.updateOne(session,byScope(scope.owner()).append("generation",scope.generation()).append("writeFence",metadata.get("writeFence")),
+                    new Document("$set",new Document("externalRetirementHold",grant).append("externalRetirementAdmission",scope.owner().stateGeneration()))
+                            .append("$inc",new Document("writeFence",1L))).getMatchedCount()!=1)throw unavailable();
+        }
+    }
+
+    private static Document aliasScope(RequiredNoteScope scope) {
+        return new Document("bindingVersion",scope.owner().bindingVersion()).append("namespace",scope.owner().namespace())
+                .append("pipelineId",scope.owner().ownerId()).append("stateGeneration",scope.owner().stateGeneration()).append("generation",scope.generation());
+    }
+    record ResourceNotes(RequiredNoteScope scope,RequiredNoteOrigin origin,RequiredNoteValue slot,boolean mayCarrySlot,
+            List<RequiredNoteScope> carries,boolean resumable,Document metadata,long configurationRevision) implements io.tapstate.spi.store.CaptureResourceNotes {}
+    List<io.tapstate.spi.store.CaptureResourceNotes> resourceNotes(ClientSession session,io.tapstate.spi.store.CacheBusinessScope business) {
+        var result=new ArrayList<io.tapstate.spi.store.CaptureResourceNotes>();
+        long revision=ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+        for(var metadata:scopes.find(session,new Document("_id.bindingVersion",business.bindingVersion())
+                .append("ownerKind",new Document("$in",List.of("CHAIN","PIPELINE"))))) {
+            var kind=RequiredNoteOwner.Kind.valueOf(metadata.getString("ownerKind"));
+            var key=metadata.get("_id",Document.class);String namespace=key.getString("namespace");
+            long generation=0;
+            if(kind==RequiredNoteOwner.Kind.PIPELINE) {
+                var mapping=MongoPipelineStateMappings.decode(metadata.getString("ownerId"),operators.find(session,new Document("_id",metadata.getString("ownerId"))).first());
+                generation=mapping.stateGeneration();
+                var candidate=new RequiredNoteOwner(business.bindingVersion(),namespace,kind,metadata.getString("ownerId"),generation);
+                if(!candidate.hasPurpose(io.tapstate.core.model.PipelineNode.Purpose.CAPTURE))continue;
+            }
+            var owner=new RequiredNoteOwner(business.bindingVersion(),namespace,kind,metadata.getString("ownerId"),generation);
+            var token=scopeOf(owner,metadata);var origin=retainedOrigin(session,token,metadata);
+            if(origin==null)continue;
+            var value=decode(token,"tapdata_pg_slot",notes.find(session,byNote(token,"tapdata_pg_slot")).first());
+            var carries=kind==RequiredNoteOwner.Kind.CHAIN?outgoing(session,owner,metadata).stream().map(RequiredNoteCarry::source).toList():List.<RequiredNoteScope>of();
+            if(kind==RequiredNoteOwner.Kind.PIPELINE)incoming(session,owner,metadata);
+            boolean mayCarry=value.revision()==0 && !blocked(session,owner,ALL_KEYS) && !blocked(session,owner,"removed:tapdata_pg_slot");
+            var hold=metadata.get("externalRetirementHold",Document.class);
+            boolean retained=kind==RequiredNoteOwner.Kind.PIPELINE && !unadmittedSuccessor(metadata) && (hold==null || !(metadata.get("externalRetirementAdmission")instanceof Long admitted)
+                    || admitted>hold.getLong("releasedThrough"));
+            result.add(new ResourceNotes(token,origin,value,mayCarry,carries,retained,new Document(metadata),revision));
+        }
+        return List.copyOf(result);
+    }
+    void requireResourceNotes(ClientSession session,List<io.tapstate.spi.store.CaptureResourceNotes> observations) {
+        for(var observation:observations) {
+            if(!(observation instanceof ResourceNotes original))throw unavailable();
+            if(original.configurationRevision()!=ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(database)))throw unavailable();
+            var scope=original.scope();var current=scopes.find(session,byScope(scope.owner())).first();
+            if(!original.metadata().equals(current) || !original.origin().equals(retainedOrigin(session,scope,current)))throw unavailable();
+            verifyPhysicalScope(session,scope,true);
+        }
+    }
+    String resourceFactsHash(ClientSession session,List<io.tapstate.spi.store.CaptureResourceNotes> observations) {
+        return resourceFactsForCoordinates(session,observations.stream().map(value -> new Document("bindingVersion",value.scope().owner().bindingVersion())
+                .append("namespace",value.scope().owner().namespace())).toList());
+    }
+    String resourceFactsForCoordinates(ClientSession session,List<Document> coordinates) {
+        var facts=new java.util.TreeMap<String,Document>();
+        for(var coordinate:coordinates) {
+            var metadata=scopes.find(session,new Document("_id",coordinate)).first();if(metadata==null)throw unavailable();
+            var identity=new Document(metadata);identity.remove("writeFence");identity.remove("externalRetirementHold");identity.remove("externalRetirementAdmission");
+            var kind=RequiredNoteOwner.Kind.valueOf(metadata.getString("ownerKind"));
+            var owner=new RequiredNoteOwner(coordinate.getLong("bindingVersion"),coordinate.getString("namespace"),kind,metadata.getString("ownerId"),
+                    kind==RequiredNoteOwner.Kind.PIPELINE?1:0);
+            var scope=new RequiredNoteScope(owner,metadata.getLong("generation"));
+            var values=new Document();
+            for(String name:List.of("tapdata_pg_slot","firstConnectorId")) {
+                var value=decode(scope,name,notes.find(session,byNote(scope,name)).first());
+                values.put(name,value.bytes()==null?null:Base64.getEncoder().encodeToString(value.bytes()));
+            }
+            var context=retainedOrigin(session,scope,metadata);
+            var edges=carryRows.find(session,new Document("$or",List.of(new Document("_id.sourceBindingVersion",owner.bindingVersion()).append("_id.sourceNamespace",owner.namespace()),
+                    new Document("_id.sharedBindingVersion",owner.bindingVersion()).append("_id.sharedNamespace",owner.namespace())))).sort(new Document("_id",1)).into(new ArrayList<>());
+            facts.put(coordinate.getString("namespace"),new Document("scope",identity).append("values",values)
+                    .append("origin",context==null?null:aliasOriginHash(context)).append("carries",edges));
+        }
+        return MongoCaptureClearControls.hash(new Document("resources",facts));
+    }
+    private static String aliasOriginHash(RequiredNoteOrigin origin) {
+        return io.tapstate.core.model.canonical.CanonicalHash.ofText(JsonWriter.write(List.of(origin.connectorId(),origin.artifactHash(),
+                Base64.getEncoder().encodeToString(origin.settings()))));
+    }
+    private static void requireAliasHold(RequiredNoteScope scope,Document hold) {
+        if(!hold.keySet().equals(java.util.Set.of("noteScope","operationId","authorizationHash","originDigest","releasedThrough","grantHash",
+                "authorizingScope","physicalGeneration","resourceManifestHash","grantId","kind"))
+                || !(hold.get("noteScope")instanceof Document owner) || !scope.owner().namespace().equals(owner.get("namespace"))
+                || !Long.valueOf(scope.generation()).equals(owner.get("generation"))
+                || !(hold.get("releasedThrough")instanceof Long released) || released<1
+                || !Long.valueOf(released).equals(owner.get("stateGeneration")))throw unavailable();
+        if(!java.util.Set.of("CLEAR","DELETE").contains(hold.getString("kind"))
+                || !Long.valueOf(scope.generation()).equals(hold.get("physicalGeneration"))
+                || !scope.owner().ownerId().equals(owner.get("pipelineId")) || !Long.valueOf(scope.owner().bindingVersion()).equals(owner.get("bindingVersion")))throw unavailable();
+        var encoded=new Document(hold);encoded.remove("grantHash");
+        if(!MongoCaptureClearControls.hash(encoded).equals(hold.getString("grantHash")))throw unavailable();
+    }
+
+    /** Same-session closure of every incoming/outgoing edge; no ordinary expired-G handle is used. */
+    List<Document> heldAliases(ClientSession session,RequiredNoteScope shared,List<io.tapstate.spi.store.CaptureResourceNotes> related,List<String> cohort,String resourceHash) {
+        var metadata=verifyPhysicalScope(session,shared,true);outgoing(session,shared.owner(),metadata);
+        var result=new java.util.TreeMap<String,Document>();
+        for(var observed:related) {
+            var source=observed.scope();if(source.owner().kind()!=RequiredNoteOwner.Kind.PIPELINE)continue;
+            var physical=verifyPhysicalScope(session,source,true);var hold=physical.get("externalRetirementHold",Document.class);
+            if(unadmittedSuccessor(physical))continue;
+            if(hold==null)throw referenced();requireAliasHold(source,hold);
+            if(!resourceHash.equals(hold.getString("resourceManifestHash")))throw referenced();
+            if(!(physical.get("externalRetirementAdmission")instanceof Long admitted) || admitted>hold.getLong("releasedThrough"))throw referenced();
+            var mapping=MongoPipelineStateMappings.decode(source.owner().ownerId(),operators.find(session,new Document("_id",source.owner().ownerId())).first());
+            if(mapping.stateGeneration()!=hold.getLong("releasedThrough") && mapping.stateGeneration()!=hold.getLong("releasedThrough")+1)throw referenced();
+            if(!aliasOriginHash(retainedOrigin(session,source,physical)).equals(hold.getString("originDigest")))throw unavailable();
+            for(var incoming:incoming(session,source.owner(),physical))if(!cohort.contains(incoming.shared().owner().ownerId()))throw referenced();
+            result.put(source.owner().namespace(),new Document(hold));
+        }
+        if(result.size()>64)throw MongoCaptureExternalRetirements.capacity(null,"alias-authority-count");
+        return List.copyOf(result.values());
+    }
+    void requireHeldAliases(ClientSession session,List<Document> expected,List<String> cohort) {
+        for(var hold:expected) {
+            var coordinate=hold.get("noteScope",Document.class);
+            var scope=new RequiredNoteScope(new RequiredNoteOwner(coordinate.getLong("bindingVersion"),coordinate.getString("namespace"),
+                    RequiredNoteOwner.Kind.PIPELINE,coordinate.getString("pipelineId"),coordinate.getLong("stateGeneration")),coordinate.getLong("generation"));
+            var metadata=verifyCarrySource(session,scope,true);requireAliasHold(scope,hold);
+            var current=highestAliasHold(scope,hold,metadata);
+            if(!(metadata.get("externalRetirementAdmission")instanceof Long admitted) || admitted>current.getLong("releasedThrough"))throw referenced();
+            for(var incoming:incoming(session,scope.owner(),metadata))if(!cohort.contains(incoming.shared().owner().ownerId()))throw referenced();
+        }
+    }
+
+    void completeHeldAliases(ClientSession session,RequiredNoteScope shared,List<Document> expected) {
+        for(var expectedHold:expected) {
+            var saved=expectedHold.get("noteScope",Document.class);
+            var priorOwner=new RequiredNoteOwner(saved.getLong("bindingVersion"),saved.getString("namespace"),RequiredNoteOwner.Kind.PIPELINE,
+                    saved.getString("pipelineId"),saved.getLong("stateGeneration"));
+            var current=scopes.find(session,byScope(priorOwner)).first();
+            var hold=highestAliasHold(new RequiredNoteScope(priorOwner,saved.getLong("generation")),expectedHold,current);
+            var coordinate=hold.get("noteScope",Document.class);
+            var owner=new RequiredNoteOwner(coordinate.getLong("bindingVersion"),coordinate.getString("namespace"),RequiredNoteOwner.Kind.PIPELINE,
+                    coordinate.getString("pipelineId"),coordinate.getLong("stateGeneration"));
+            var scope=new RequiredNoteScope(owner,coordinate.getLong("generation"));
+            var metadata=verifyPhysicalScope(session,scope,true);requireAliasHold(scope,hold);
+            if(!hold.equals(metadata.get("externalRetirementHold")))throw unavailable();
+            requirePrivateUnreferenced(session,scope);
+            var context=retainedOrigin(session,scope,metadata);var next=new RequiredNoteScope(owner,scope.generation()+1);
+            if(next.generation()<=scope.generation())throw unreadable("generation");
+            origins.deleteOne(session,byScope(owner).append("generation",scope.generation()));
+            var result=new Document("operationId",hold.get("operationId")).append("stateGeneration",owner.stateGeneration())
+                    .append("fromGeneration",scope.generation()).append("toGeneration",next.generation());
+            boolean deleting="DELETE".equals(hold.getString("kind"));
+            var external=new Document("grantId",hold.get("grantId")).append("operationId",hold.get("operationId"))
+                    .append("fromGeneration",scope.generation()).append("toGeneration",next.generation()).append("kind",hold.get("kind"));
+            if(scopes.updateOne(session,byScope(owner).append("generation",scope.generation()).append("externalRetirementHold",hold),
+                    new Document("$set",new Document("generation",next.generation()).append("originGeneration",deleting?0L:next.generation())
+                            .append("lastRetirement",result).append("externalRetirementResult",external).append("externalRetirementAdmission",0L))
+                            .append("$unset",new Document("externalRetirementHold",""))).getMatchedCount()!=1)throw unavailable();
+            if(!deleting)origins.insertOne(session,originDocument(next,context,cipherForWrite(session)));
+        }
+    }
+    private static Document highestAliasHold(RequiredNoteScope scope,Document expected,Document metadata) {
+        var current=metadata==null?null:metadata.get("externalRetirementHold",Document.class);
+        if(current==null)throw unavailable();requireAliasHold(scope,current);
+        if(current.getLong("releasedThrough")<expected.getLong("releasedThrough") || !current.get("originDigest").equals(expected.get("originDigest"))
+                || !current.get("physicalGeneration").equals(expected.get("physicalGeneration"))
+                || !current.get("resourceManifestHash").equals(expected.get("resourceManifestHash")))throw unavailable();
+        return current;
+    }
+    boolean reclaimRetiredToken(ClientSession session,RequiredNoteScope retired,int limit) {
+        if(limit<1 || limit>256)throw new IllegalArgumentException("invalid note reclamation batch");
+        var current=scopes.find(session,byScope(retired.owner())).first();
+        if(scopeOf(retired.owner(),current).generation()<=retired.generation())throw unavailable();
+        if(retired.owner().kind()==RequiredNoteOwner.Kind.PIPELINE)
+            for(var carry:incoming(session,retired.owner(),current))if(carry.source().generation()<=retired.generation())throw referenced();
+        var filter=new Document("_id.bindingVersion",retired.owner().bindingVersion()).append("_id.namespace",retired.owner().namespace())
+                .append("_id.generation",new Document("$lte",retired.generation()));
+        var old=notes.find(session,filter).projection(new Document("_id",1)).limit(limit).into(new ArrayList<>());
+        if(!old.isEmpty())notes.deleteMany(session,new Document("_id",new Document("$in",old.stream().map(d -> d.get("_id")).toList())));
+        return old.isEmpty();
     }
 
     @Override
@@ -258,9 +481,13 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             try {
                 return transaction(session -> {
                     SourceConfigCipher cipher = cipherForWrite(session);
-                    verifyScope(session, scope, true);
+                    var metadata=verifyScope(session, scope, true);
                     requirePrivateUnreferenced(session, scope);
                     RequiredNoteValue current = decode(scope, key, notes.find(session, byNote(scope, key)).first());
+                    if(metadata.containsKey("externalRetirementHold") && !java.util.Arrays.equals(current.bytes(),captured))throw referenced();
+                    if(scope.owner().kind()==RequiredNoteOwner.Kind.CHAIN && sharedFrozen(session,scope.owner())
+                            && (!java.util.Arrays.equals(current.bytes(),captured) || blockEarlierValue)
+                            && !exactCarriedMaterialization(session,scope,metadata,key,current,captured,blockEarlierValue))throw referenced();
                     if (current.revision() != expectedRevision) throw new Refused();
                     if (expectedRevision == Long.MAX_VALUE) throw unreadable("revision");
                     long next = expectedRevision + 1;
@@ -300,6 +527,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return StoreIo.call(() -> transaction(session -> {
             SourceConfigCipher cipher = cipherForWrite(session);
             Document metadata = verifyScope(session, scope, true);
+            if(metadata.containsKey("externalRetirementHold"))throw referenced();
+            if(scope.owner().kind()==RequiredNoteOwner.Kind.CHAIN && sharedFrozen(session,scope.owner()))throw referenced();
             requirePrivateUnreferenced(session, scope);
             if (scope.generation() == Long.MAX_VALUE) throw unreadable("generation");
             RequiredNoteOrigin origin = scope.owner().kind() == RequiredNoteOwner.Kind.GLOBAL ? null
@@ -349,6 +578,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         return withCarryIndexes(() -> transaction(session -> {
             cipherForWrite(session);
             Document target = verifyScope(session, carry.shared(), true);
+            if(sharedFrozen(session,carry.shared().owner()))throw referenced();
             List<RequiredNoteCarry> retained = outgoing(session, carry.shared().owner(), target);
             for (RequiredNoteCarry existing : retained) {
                 if (carryId(existing).equals(carryId(carry))) {
@@ -360,9 +590,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             }
             if (blocked(session, carry.shared().owner(), ALL_KEYS)) throw unavailable();
             Document source = verifyScope(session, carry.source(), true);
+            requireAliasAdmission(session,carry.source(),source,false);
             incoming(session, carry.source().owner(), source);
             compatibleOrigins(session, carry.shared(), target, carry.source(), source);
             carryRows.insertOne(session, carryDocument(carry));
+            MongoCaptureExternalRetirements.fenceCohortChange(session,database);
             changeCount(session, carry.shared(), "outgoingCarries", carryCount(target, "outgoingCarries"), 1);
             changeCount(session, carry.source(), "incomingCarries", carryCount(source, "incomingCarries"), 1);
             return carry;
@@ -416,7 +648,11 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     public RequiredNoteScope retireShared(RequiredNoteScope shared) {
         requireOrdinary();
         requireShared(shared);
-        return withCarryIndexes(() -> transaction(session -> {
+        return withCarryIndexes(() -> transaction(session -> retireShared(session,shared)));
+    }
+
+    RequiredNoteScope retireShared(ClientSession session,RequiredNoteScope shared) {
+        requireOrdinary();requireShared(shared);
             cipherForWrite(session);
             Document metadata = verifyScope(session, shared, true);
             RequiredNoteOrigin origin = retainedOrigin(session, shared, metadata);
@@ -439,7 +675,6 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                             .append("$set", new Document("outgoingCarries", 0L).append("originGeneration", 0L))).getMatchedCount();
             if (matched != 1) throw unavailable();
             return new RequiredNoteScope(shared.owner(), shared.generation() + 1);
-        }));
     }
 
     private Document verifyCarrySource(ClientSession session, RequiredNoteScope source, boolean write) {
@@ -626,6 +861,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                 });
             }
             @Override public RequiredNoteScope scope() { return original; }
+            @Override public boolean unadmittedSuccessor() {
+                return transaction(session -> {checkRetiringOwner(session,fixed,false);
+                    return MongoRequiredNoteStore.unadmittedSuccessor(verifyPhysicalScope(session,original,false));});
+            }
             @Override public String operationId() { return operationId; }
             @Override public RequiredNoteStore notes() { return view; }
             @Override public java.util.Optional<RequiredNoteOrigin> origin() {
@@ -660,7 +899,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             origins.deleteOne(session, byScope(original.owner()).append("generation", original.generation()));
             if (scopes.updateOne(session, byScope(original.owner()).append("generation", original.generation()),
                     new Document("$set", new Document("generation", next).append("originGeneration", 0L)
-                            .append("lastRetirement", result))).getMatchedCount() != 1) throw unavailable();
+                            .append("lastRetirement", result)).append("$unset",new Document("externalRetirementResult","").append("externalRetirementAdmission",""))).getMatchedCount() != 1) throw unavailable();
             return new RequiredNoteScope(original.owner(), next);
         })));
     }
@@ -679,6 +918,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private void checkRetirementToken(ClientSession session, Retirement fixed) {
         Document metadata = verifyPhysicalScope(session, fixed.scope(), false);
+        if(metadata.containsKey("externalRetirementHold"))throw referenced();
         requirePrivateUnreferenced(session, fixed.scope());
         RequiredNoteOrigin origin = retainedOrigin(session, fixed.scope(), metadata);
         if (origin == null && notes.find(session, new Document("_id.bindingVersion", fixed.scope().owner().bindingVersion())
@@ -932,6 +1172,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || mapping.stateGeneration() != owner.stateGeneration()) {
                 throw unavailable();
             }
+            if(!authoringOnly) {
+                var metadata=scopes.find(session,byScope(owner)).first();
+                if(metadata!=null)requireAliasAdmission(session,scopeOf(owner,metadata),metadata,write);
+            }
             var recovery=MongoCacheRecoveryFacts.read(operator);
             if (!authoringOnly && recovery.isPresent() && MongoPipelinePreparationFacts.decode(owner.ownerId(),operator,
                     recovery.orElseThrow().targetScope().clusterId()).phase()!=io.tapstate.spi.store.PipelinePreparation.Phase.COMPLETE)
@@ -952,6 +1196,74 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             throw new TapstateException(StoreError.SOURCE_CONFIG_KEYRING_INVALID, Map.of(), null);
         }
         return cipher;
+    }
+
+    private void requireAliasAdmission(ClientSession session,RequiredNoteScope privateScope,Document metadata,boolean admitting) {
+        if(!admitting)return;
+        var hold=metadata.get("externalRetirementHold",Document.class);
+        if(hold==null) {
+            if(!unadmittedSuccessor(metadata))return;
+            for(var control:SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).find(session,
+                    new Document("_id.bindingVersion",privateScope.owner().bindingVersion()).append("operation.resourceCoordinates.namespace",privateScope.owner().namespace()))) {
+                var operation=control.get("operation",Document.class);
+                if(operation!=null && !java.util.Set.of("READY","CANCELLED","POLICY_RETAINED").contains(operation.getString("phase")))throw referenced();
+                if(SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).updateOne(session,control,new Document("$inc",new Document("revision",1L))).getMatchedCount()!=1)throw unavailable();
+            }
+            if(scopes.updateOne(session,byScope(privateScope.owner()).append("generation",privateScope.generation()).append("externalRetirementAdmission",0L),
+                    new Document("$set",new Document("externalRetirementAdmission",privateScope.owner().stateGeneration())).append("$inc",new Document("writeFence",1L))).getMatchedCount()!=1)throw unavailable();
+            return;
+        }
+        requireAliasHold(privateScope,hold);
+        for(var carry:incoming(session,privateScope.owner(),metadata)) {
+            for(var control:SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).find(session,
+                    new Document("_id.bindingVersion",privateScope.owner().bindingVersion()))) {
+                var prepared=MongoCapturePreparationFacts.annex(control.get("currentPreparation",Document.class));
+                if(!prepared.canonicalChainId().equals(carry.shared().owner().ownerId()))continue;
+                var operation=control.get("operation",Document.class);
+                if(operation!=null && !java.util.Set.of("CANCELLED","POLICY_RETAINED","READY").contains(operation.getString("phase")))throw referenced();
+                // The CONFIG write conflicts with a concurrent final dependency/alias check.
+                if(SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).updateOne(session,control,
+                        new Document("$inc",new Document("revision",1L))).getMatchedCount()!=1)throw unavailable();
+            }
+        }
+        for(var control:SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).find(session,
+                new Document("_id.bindingVersion",privateScope.owner().bindingVersion())
+                        .append("aliasAuthorities.noteScope.namespace",privateScope.owner().namespace()))) {
+            var operation=control.get("operation",Document.class);
+            if(operation!=null && !java.util.Set.of("CANCELLED","POLICY_RETAINED","READY").contains(operation.getString("phase")))throw referenced();
+            if(SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).updateOne(session,control,
+                    new Document("$inc",new Document("revision",1L))).getMatchedCount()!=1)throw unavailable();
+        }
+        if(admitting && privateScope.owner().stateGeneration()>hold.getLong("releasedThrough")) {
+            if(scopes.updateOne(session,byScope(privateScope.owner()).append("generation",privateScope.generation()).append("externalRetirementHold",hold),
+                    new Document("$max",new Document("externalRetirementAdmission",privateScope.owner().stateGeneration()))).getMatchedCount()!=1)throw unavailable();
+        }
+    }
+    private boolean sharedFrozen(ClientSession session,RequiredNoteOwner owner) {
+        for(var control:SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(database).find(session,new Document("_id.bindingVersion",owner.bindingVersion()))) {
+            var prepared=MongoCapturePreparationFacts.annex(control.get("currentPreparation",Document.class));
+            if(!owner.ownerId().equals(prepared.canonicalChainId()))continue;
+            var operation=control.get("operation",Document.class);
+            if(operation!=null && !java.util.Set.of("READY","CANCELLED","POLICY_RETAINED","RESERVED").contains(operation.getString("phase")))return true;
+        }
+        return false;
+    }
+    private boolean exactCarriedMaterialization(ClientSession session,RequiredNoteScope shared,Document metadata,String key,
+            RequiredNoteValue own,byte[] candidate,boolean removing) {
+        if(removing || candidate==null || own.revision()!=0 || blocked(session,shared.owner(),ALL_KEYS)
+                || blocked(session,shared.owner(),"removed:"+key))return false;
+        boolean found=false;
+        for(var carry:outgoing(session,shared.owner(),metadata)) {
+            if(!carry.shared().equals(shared))throw unavailable();
+            var source=verifyCarrySource(session,carry.source(),false);
+            if(!incoming(session,carry.source().owner(),source).contains(carry))throw unavailable();
+            compatibleOrigins(session,shared,metadata,carry.source(),source);
+            var value=decode(carry.source(),key,notes.find(session,byNote(carry.source(),key)).first());
+            if(value.bytes()==null)continue;
+            if(!java.util.Arrays.equals(value.bytes(),candidate))return false;
+            found=true;
+        }
+        return found;
     }
 
     private static RequiredNoteScope scopeOf(RequiredNoteOwner owner, Document document) {
@@ -977,7 +1289,28 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         long incoming = carryCount(document, "incomingCarries");
         if ((owner.kind() != RequiredNoteOwner.Kind.CHAIN && outgoing != 0)
                 || (owner.kind() != RequiredNoteOwner.Kind.PIPELINE && incoming != 0)) throw unreadable("carryCount");
+        if(document.containsKey("externalRetirementHold")) {
+            if(owner.kind()!=RequiredNoteOwner.Kind.PIPELINE || !(document.get("externalRetirementAdmission")instanceof Long admitted) || admitted<1)
+                throw unreadable("externalRetirementHold");
+            requireAliasHold(new RequiredNoteScope(owner,generation),document.get("externalRetirementHold",Document.class));
+        }else if(document.containsKey("externalRetirementAdmission") && (!(document.get("externalRetirementResult")instanceof Document)
+                || !(document.get("externalRetirementAdmission")instanceof Long admitted) || admitted<0))throw unreadable("externalRetirementHold");
+        if(document.get("externalRetirementResult")instanceof Document result) {
+            if(!result.keySet().equals(java.util.Set.of("grantId","operationId","fromGeneration","toGeneration","kind"))
+                    || !(result.get("grantId")instanceof String grant) || !grant.matches("[a-f0-9]{64}")
+                    || !(result.get("fromGeneration")instanceof Long from) || !(result.get("toGeneration")instanceof Long to)
+                    || from<1 || from>=Long.MAX_VALUE-1 || to!=from+1 || to>generation
+                    || !java.util.Set.of("CLEAR","DELETE").contains(result.getString("kind"))
+                    || !(document.get("lastRetirement")instanceof Document last) || !result.get("operationId").equals(last.get("operationId"))
+                    || !result.get("fromGeneration").equals(last.get("fromGeneration")) || !result.get("toGeneration").equals(last.get("toGeneration")))
+                throw unreadable("externalRetirementResult");
+        }
         return new RequiredNoteScope(owner, generation);
+    }
+    private static boolean unadmittedSuccessor(Document metadata) {
+        return metadata!=null && !metadata.containsKey("externalRetirementHold")
+                && metadata.get("externalRetirementResult")instanceof Document result
+                && metadata.get("generation").equals(result.get("toGeneration")) && Long.valueOf(0).equals(metadata.get("externalRetirementAdmission"));
     }
 
     private RequiredNoteValue decode(RequiredNoteScope scope, String key, Document document) {

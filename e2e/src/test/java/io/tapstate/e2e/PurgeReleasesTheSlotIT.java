@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
@@ -54,6 +55,49 @@ class PurgeReleasesTheSlotIT {
     static void requireDockerAndRealConnectors() {
         DockerGate.require();
         RealConnectorGate.require("postgres", "mongodb");
+    }
+
+    @Test
+    void finalExplicitNativeClearReleasesTheSharedPostgresSlot() throws Exception {
+        Map<String, Object> source = SharedPostgres.settings("final_native_clear");
+        createTables(source);
+        String targetUri = SharedMongo.replicaSetUrl("final_native_clear_target");
+        String p = "final_clear_orders";
+        String q = "final_clear_customers";
+
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage); MongoEndpoints mongo = new MongoEndpoints()) {
+            ControlPlane control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            Map<String, String> resources = new LinkedHashMap<>();
+            resources.put(SOURCE_ID + ".tap.yml",
+                    sourceYaml(source).replace("config: {", "config: { autoClearSlot: true,"));
+            resources.put(TARGET_ID + ".tap.yml", targetYaml(targetUri));
+            resources.put(p + ".tap.yml", Workspaces.pipelineYaml(p, SOURCE_ID, TARGET_ID, ORDERS));
+            resources.put(q + ".tap.yml", Workspaces.pipelineYaml(q, SOURCE_ID, TARGET_ID, CUSTOMERS));
+            control.apply(resources);
+            control.discoverSchema(SOURCE_ID, "postgres", discoveryConfig(source));
+            Target target = new Target(mongo, targetUri);
+
+            start(control, p);
+            carry(source, target, ORDERS, 1);
+            String originalSlot = PostgresSlots.only(source).name();
+            start(control, q);
+            carry(source, target, CUSTOMERS, 1);
+            assertThat(PostgresSlots.names(source)).containsExactly(originalSlot);
+
+            control.stop(p, true);
+            awaitState(control, p, PipelineState.STOPPED);
+            assertThat(PostgresSlots.names(source)).as("the peer still needs the original slot")
+                    .containsExactly(originalSlot);
+            carry(source, target, CUSTOMERS, 2);
+
+            control.stop(q, true);
+            awaitState(control, q, PipelineState.STOPPED);
+            awaitNoSlot(source, "the final explicit native clear to release the original shared PostgreSQL slot");
+        }
     }
 
     @ParameterizedTest
