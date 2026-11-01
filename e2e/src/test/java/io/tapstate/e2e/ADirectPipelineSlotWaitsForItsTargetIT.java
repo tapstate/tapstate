@@ -112,7 +112,9 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
                                 PostgresSlots.of(source))
                         .isTrue();
 
+                String boot = originalBoot(storage);
                 server.kill();
+                awaitOriginalBootExpired(storage, boot);
             } finally {
                 server.close();
             }
@@ -131,6 +133,35 @@ class ADirectPipelineSlotWaitsForItsTargetIT {
                         () -> String.valueOf(PostgresSlots.of(source)));
                 assertThat(PostgresSlots.names(source)).as("one slot throughout").hasSize(1);
             }
+        }
+    }
+
+    private static String originalBoot(PreparedNativeStore storage) {
+        try (var client = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+            var claims = io.tapstate.adapters.mongostore.SystemCollections.CACHE_WORKLOAD_CLAIMS
+                    .on(client.getDatabase(storage.cacheDatabase()));
+            var sessions = claims.find(new org.bson.Document("_id.clusterId", storage.clusterId())
+                    .append("_id.resourceType", io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION.name()))
+                    .into(new java.util.ArrayList<org.bson.Document>());
+            assertThat(sessions).as("the original process's exact native node session").hasSize(1);
+            return sessions.getFirst().getString("ownerBootId");
+        }
+    }
+
+    private static void awaitOriginalBootExpired(PreparedNativeStore storage, String boot) {
+        assertThat(boot).isNotBlank();
+        try (var client = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+            var claims = io.tapstate.adapters.mongostore.SystemCollections.CACHE_WORKLOAD_CLAIMS
+                    .on(client.getDatabase(storage.cacheDatabase()));
+            Await.until("the killed process's original claims to expire before reusing its stable node id", BOUND,
+                    () -> claims.aggregate(List.of(
+                            new org.bson.Document("$match", new org.bson.Document("_id.clusterId", storage.clusterId())
+                                    .append("ownerBootId", boot)),
+                            new org.bson.Document("$project", new org.bson.Document("leased",
+                                    new org.bson.Document("$gt", List.of("$leaseUntil", "$$NOW"))))))
+                            .into(new java.util.ArrayList<org.bson.Document>()).stream()
+                            .noneMatch(claim -> Boolean.TRUE.equals(claim.getBoolean("leased"))),
+                    () -> "original boot=" + boot);
         }
     }
 

@@ -14,6 +14,8 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.util.concurrent.TimeUnit;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -54,6 +56,13 @@ public final class ObservedMongoConnector implements TapConnector {
                 String start = "START " + offset;
                 appendTailObservation(tail, start);
                 try {
+                    // An opt-in fixture barrier pins cursor selection before source backlog forwarding.
+                    Path hold = witness.resolveSibling(witness.getFileName() + ".hold-tail");
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+                    while (Files.exists(hold)) {
+                        if (System.nanoTime() - deadline >= 0) throw new AssertionError("tail fixture barrier was not released");
+                        Thread.sleep(10);
+                    }
                     stream.streamRead(context, tables, offset, size, consumer);
                 } finally {
                     appendTailObservation(tail, "END");
