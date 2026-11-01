@@ -238,6 +238,30 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
             throw failed;
         }
     }
+    /** Passive original-owner observations never reserve, activate, or cancel an execution. */
+    private boolean dispatchStatus(Entry entry){
+        if(entry.inFlight||closed||entry.owner==null)return false;
+        final ValidationMemberResources.Control body;
+        try{body=resources.admitMaintenanceControl();}
+        catch(TapstateException refused){return false;}
+        entry.inFlight=true;entry.body=body;
+        try{body.execute(()->{
+            try{
+                require();body.require();
+                var known=lookup(entry.original).known();
+                if(known!=null&&known.closed()&&entry.owner.equals(known.start().run().owner()))
+                    synchronized(entries){entry.originalClosed=true;}
+                var reply=router.command(ValidationOwnerRouter.Command.of(ValidationOwnerRouter.Action.STATUS,request(entry.original),entry.owner),entry.receiver);
+                require();body.require();publish(entry,project(entry.original,reply));
+            }catch(TapstateException unavailable){publish(entry,status(entry.original,Outcome.UNKNOWN,unavailable.code().code()));}
+            finally{synchronized(entries){if(entry.body==body){entry.inFlight=false;entry.body=null;}}}
+        });return true;}
+        catch(RuntimeException|Error failed){
+            if(body.released().toCompletableFuture().isDone()){entry.inFlight=false;entry.body=null;body.close();}
+            if(failed instanceof TapstateException||failed instanceof RejectedExecutionException)return false;
+            throw failed;
+        }
+    }
     private ValidationOwnerRouter.Receiver receiver(ValidationOperation original){
         synchronized(entries){var entry=entries.get(Key.of(original));return entry==null?null:entry.receiver;}
     }
@@ -273,6 +297,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     /** Only routing memos are removed. Native actors and their independent resource receipts are untouched. */
     private void prune(ValidationOperation current,Fence fence){
+        reclaimSettled();
         reclaimExpiredScheduled();
         if(fence==null)return;var iterator=entries.values().iterator();
         while(iterator.hasNext()){
@@ -286,10 +311,13 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private void dispatch(Entry entry,Verb verb){dispatch(entry,verb,false);}
     private void dispatch(Entry entry,Verb verb,boolean known){dispatch(entry,verb,known,null);}
     private void dispatch(Entry entry,Verb verb,boolean known,ResponseScope scope){
+        dispatch(entry,verb,known,scope,false);
+    }
+    private void dispatch(Entry entry,Verb verb,boolean known,ResponseScope scope,boolean maintenance){
         if(entry.inFlight||closed)return;
         if(entry.reservationAttempted&&entry.owner==null&&!known)return;
         ValidationMemberResources.Control body;
-        try{body=scope==null?resources.admitControl():scope.entryControl();}
+        try{body=maintenance?resources.admitStopControl():scope==null?resources.admitControl():scope.entryControl();}
         catch(TapstateException refused){entry.observed=status(entry.original,Outcome.CAPACITY,refused.code().code());return;}
         entry.inFlight=true;entry.body=body;
         try{body.execute(()->advance(entry,verb));}
@@ -350,12 +378,31 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         finally{synchronized(entries){entry.inFlight=false;entry.body=null;}}
     }
     private boolean expired(Entry entry){return !entry.stop&&entry.latest!=null&&clock.instant().isAfter(entry.latest);}
-    private void publish(Entry entry,Status result){synchronized(entries){entry.observed=compact(result);}}
+    private void publish(Entry entry,Status result){synchronized(entries){entry.observed=compact(result);entry.completed|=completed(result);}}
+    private static boolean completed(Status result){return result.outcome()==Outcome.ACCEPTED&&result.admitted()&&result.retired()
+            &&!result.controlUnknown()&&result.drain()==Drain.DRAINED&&result.state()!=null&&ValidationRunState.valueOf(result.state()).terminal();}
     private Status original(ValidationOperation operation,Verb verb,Known known){
+            synchronized(entries){
+                var entry=entries.get(Key.of(operation));
+                if(verb==Verb.STOP&&entry==null){
+                    if(closed)return status(operation,Outcome.REJECTED,null);
+                    reclaimSettled();reclaimExpiredScheduled();long bytes=bytes(operation);
+                    if(entries.size()==MAX_ENTRIES||bytes>MAX_BYTES-retainedBytes)return status(operation,Outcome.CAPACITY,null);
+                    entry=new Entry(operation,bytes,null);entry.owner=known.start().run().owner();entry.reservationAttempted=true;
+                    entries.put(Key.of(operation),entry);retainedBytes+=bytes;
+                }
+                if(entry!=null&&entry.original.equals(operation)){
+                    if(verb==Verb.STOP){entry.stop=true;entry.retryStart=false;}
+                    if(known.closed()&&known.start().run().owner().equals(entry.owner))entry.originalClosed=true;
+                }
+            }
             var command=ValidationOwnerRouter.Command.of(verb==Verb.STOP?ValidationOwnerRouter.Action.STOP:
                     verb==Verb.START&&!known.closed()?ValidationOwnerRouter.Action.ACTIVATE:ValidationOwnerRouter.Action.STATUS,request(known.start()),known.start().run().owner());
             var response=router.command(command,receiver(operation));
-            return response.outcome()==ValidationOwnerRouter.Outcome.ACCEPTED?project(operation,response):known.passive();
+            var result=response.outcome()==ValidationOwnerRouter.Outcome.ACCEPTED?project(operation,response):known.passive();
+            synchronized(entries){var entry=entries.get(Key.of(operation));
+                if(entry!=null&&entry.original.equals(operation)&&known.start().run().owner().equals(entry.owner))publish(entry,result);}
+            return result;
     }
     private Lookup lookup(ValidationOperation operation){
         require();var tasks=configuration.validationTasks(this::require);
@@ -400,9 +447,19 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         stops.cancel(false);member.getUserContext().remove(BINDING,this);owned.forEach(ValidationMemberResources.Control::close);registryBudget.close();
     }
     private static final class Entry {
-        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,unsubmitted,stop;
+        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,unsubmitted,stop,completed,originalClosed;
         ValidationOwner owner;ValidationOwnerRouter.Receiver receiver;ValidationMemberResources.Control body;boolean retryStart;
         Entry(ValidationOperation original,long bytes,java.time.Instant latest){this.original=original;this.bytes=bytes;this.latest=latest;observed=status(original,Outcome.PENDING,null);}
+    }
+    /** Exact original closure can forget a route, never release native resources or assert drain. */
+    private void reclaimSettled(){
+        var iterator=entries.values().iterator();
+        while(iterator.hasNext()){
+            var entry=iterator.next();
+            if(!entry.inFlight&&(entry.completed||entry.originalClosed&&(!entry.stop||entry.observed.drain()==Drain.DRAINED))){
+                iterator.remove();retainedBytes-=entry.bytes;
+            }
+        }
     }
     /** Entry-context routing memos are not native actors or durable occurrence history. */
     private void reclaimExpiredScheduled(){
@@ -418,12 +475,12 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         }
     }
     private void dispatchStops(){
-        synchronized(entries){if(closed)return;reclaimExpiredScheduled();
+        synchronized(entries){if(closed)return;reclaimSettled();reclaimExpiredScheduled();
             var ordered=List.copyOf(entries.values());if(ordered.isEmpty())return;
-            int offset=Math.floorMod(stopRotation++,ordered.size());
+            int offset=Math.floorMod(stopRotation++,ordered.size());boolean statusDispatched=false;
             for(int index=0;index<ordered.size();index++){
             var entry=ordered.get((offset+index)%ordered.size());
-            if(entry.stop&&entry.owner!=null&&entry.observed.drain()!=Drain.DRAINED)dispatch(entry,Verb.STOP);
+            if(entry.stop&&entry.owner!=null&&entry.observed.drain()!=Drain.DRAINED)dispatch(entry,Verb.STOP,false,null,true);
             else if(entry.latest!=null&&clock.instant().isAfter(entry.latest)&&!entry.inFlight&&entry.owner==null
                     &&entry.reservationAttempted&&entry.receiver!=null&&!entry.unsubmitted&&entry.observed.drain()!=Drain.DRAINED)
                 dispatchReceipt(entry,entry.stop?Verb.STOP:Verb.READ,true);
@@ -433,6 +490,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                 if(entry.stop||entry.observed.drain()==Drain.DRAINED)continue;
                 if(entry.owner==null&&entry.receiver!=null)dispatchReceipt(entry,Verb.START);else dispatch(entry,Verb.START);
             }
+            else if(!statusDispatched&&entry.owner!=null)statusDispatched=dispatchStatus(entry);
         }}
     }
     private static final class EntryCall implements Callable<Status>,Serializable,HazelcastInstanceAware {

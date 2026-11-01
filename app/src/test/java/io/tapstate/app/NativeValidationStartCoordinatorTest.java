@@ -579,6 +579,149 @@ class NativeValidationStartCoordinatorTest {
             }
         }
     }
+    @Test @Timeout(30) void completedManualTasksCannotPermanentlyExhaustTheSharedEntryRegistry()throws Exception{
+        completedDistinctTasks(false,false,Closure.EXACT);
+    }
+    @Test @Timeout(30) void closedManualStopsWaitForTheirOriginalDrainReceiptBeforeMemoReclamation()throws Exception{
+        completedDistinctTasks(true,false,Closure.EXACT);
+    }
+    @Test @Timeout(30) void closedManualMemosCanBeReclaimedAfterOwnerReceiptReapingWithoutInventingDrain()throws Exception{
+        completedDistinctTasks(false,true,Closure.EXACT);
+    }
+    private enum Closure { EXACT,LATER_TICKET,OTHER_OWNER,UNAVAILABLE }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value=Closure.class,names={"LATER_TICKET","OTHER_OWNER","UNAVAILABLE"})
+    @Timeout(30) void aMemoNeedsItsOwnVerifiedClosedTicketAndOwnerBeforeReclamation(Closure closure)throws Exception{
+        completedDistinctTasks(false,true,closure);
+    }
+    private void completedDistinctTasks(boolean waitForDrain,boolean receiptReaped,Closure closure)throws Exception{
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();
+            var saved=new ConcurrentHashMap<String,ValidationTaskStore.Snapshot>();var activations=new AtomicInteger();
+            var drained=new AtomicBoolean(!waitForDrain);var statusReads=new AtomicInteger();
+            var closedLookups=new AtomicInteger();
+            when(configuration.validationTasks(()->{}).read(eq("flow"),anyString())).thenAnswer(call->{
+                var value=saved.get(call.getArgument(1));
+                if(value!=null&&value.full().permission()!=null){
+                    closedLookups.incrementAndGet();
+                    if(closure==Closure.UNAVAILABLE)throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","fixture.unavailable"),null);
+                }
+                return Optional.ofNullable(value);
+            });
+            for(String node:List.of("a","b"))routing.commands.put(node,command->{
+                if(command.action()==ValidationOwnerRouter.Action.ACTIVATE){
+                    activations.incrementAndGet();var request=command.request();var before=saved.get(request.task());
+                    var spec=new ValidationRunSpec(before.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+                    var owner=command.owner();if(closure==Closure.OTHER_OWNER)owner=new ValidationOwner(owner.clusterId(),owner.pipelineId(),owner.nodeId(),owner.bootId(),owner.claimGeneration()+1,owner.executionGeneration(),owner.topologyRevision());
+                    boolean later=closure==Closure.LATER_TICKET;long sequence=later?2:1;
+                    var identity=new ValidationRunIdentity(owner,request.task(),later?"later-"+request.run():request.run(),ValidationMode.FULL,spec.fingerprint(),1,"direct-full-v1");
+                    var start=new ValidationReportAdmission.Start(before.task(),1,sequence,later?UUID.randomUUID().toString():request.command().toString(),identity);
+                    saved.put(request.task(),new ValidationTaskStore.Snapshot(before.task(),1,before.commandId(),before.comparison(),before.settings(),1,
+                            before.schedulingCommandId(),false,new ValidationTaskStore.Mode(sequence+1,new ValidationTaskStore.Permission(start,waitForDrain?ValidationTaskStore.Phase.OPEN:ValidationTaskStore.Phase.CLOSED)),before.incremental()));
+                }else{
+                    assertThat(command.action()).isIn(ValidationOwnerRouter.Action.STATUS,ValidationOwnerRouter.Action.STOP);statusReads.incrementAndGet();
+                    if(closure==Closure.OTHER_OWNER&&command.owner().equals(saved.get(command.request().task()).full().permission().start().run().owner()))
+                        return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"COMPLETED",true,false,false,true,true,null);
+                    if(receiptReaped)return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.REJECTED,null);
+                    if(command.action()==ValidationOwnerRouter.Action.STOP){
+                        var before=saved.get(command.request().task());
+                        saved.put(command.request().task(),new ValidationTaskStore.Snapshot(before.task(),1,before.commandId(),before.comparison(),before.settings(),1,before.schedulingCommandId(),false,
+                                new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(before.full().permission().start(),ValidationTaskStore.Phase.CLOSED)),before.incremental()));
+                    }
+                }
+                boolean terminal=!receiptReaped&&saved.get(command.request().task()).full().permission().phase()==ValidationTaskStore.Phase.CLOSED;
+                return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,terminal?"COMPLETED":"STARTING",true,false,false,terminal,terminal&&drained.get(),null);
+            });
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                ValidationOperation first=null;
+                for(int index=0;index<129;index++){
+                    String task="task-"+index;saved.put(task,snapshot("flow",task));
+                    var op=new ValidationOperation(coordinator.context(),"flow",task,GENERATION,1,1,UUID.randomUUID());if(first==null)first=op;
+                    if(index==128&&closure!=Closure.EXACT){
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->closedLookups.get()>0);
+                        if(closure==Closure.OTHER_OWNER)try(var foreign=coordinator.read(first)){
+                            assertThat(foreign.value().drain()).isEqualTo(ValidationOperation.Drain.DRAINED);
+                        }
+                        try(var full=coordinator.start(op)){assertThat(full.value().outcome()).isEqualTo(ValidationOperation.Outcome.CAPACITY);}
+                        assertThat(entryCount(coordinator)).isEqualTo(128);assertThat(activations).hasValue(128);
+                        assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isEqualTo(128);return;
+                    }
+                    if(index==128&&waitForDrain){
+                        try(var full=coordinator.start(op)){assertThat(full.value().outcome()).isEqualTo(ValidationOperation.Outcome.CAPACITY);}
+                        assertThat(activations).hasValue(128);assertThat(entryCount(coordinator)).isEqualTo(128);drained.set(true);
+                    }
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).pollInterval(Duration.ofMillis(2)).untilAsserted(()->{
+                        try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.ACCEPTED);}
+                    });
+                    int expected=index+1;
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).pollInterval(Duration.ofMillis(2)).until(()->
+                            activations.get()==expected&&resources.snapshot().metadataFrames()==0&&resources.snapshot().processReserved().bytes()==2L*1024*1024);
+                    if(waitForDrain)try(var stopped=coordinator.stop(op)){
+                        assertThat(stopped.value().drain()).isEqualTo(drained.get()?ValidationOperation.Drain.DRAINED:ValidationOperation.Drain.NOT_DRAINED);
+                    }
+                }
+                assertThat(activations).hasValue(129);
+                try(var replay=coordinator.start(first)){
+                    assertThat(replay.value().outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);
+                    if(receiptReaped){assertThat(replay.value().state()).isNull();assertThat(replay.value().drain()).isEqualTo(ValidationOperation.Drain.UNKNOWN);}
+                    else assertThat(replay.value().state()).isEqualTo("COMPLETED");
+                }
+                assertThat(activations).hasValue(129);
+                assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isEqualTo(129);
+                if(waitForDrain||receiptReaped)assertThat(statusReads).hasPositiveValue();
+            }
+        }
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={true,false})
+    @Timeout(30) void stoppingAClosedOriginalAfterMemoEvictionRetainsRetriesUntilDrain(boolean unknownReply)throws Exception{
+        try(var routing=new ValidationOwnerRouterTest.Fixture(Duration.ofSeconds(5),1);var process=new ValidationMemberResources()){
+            var resources=process.bind("cluster","a","boot-a",2,()->{});var configuration=configuration();
+            var current=new AtomicReference<>(snapshot("flow","task"));var drained=new AtomicBoolean();
+            var activations=new AtomicInteger();var stops=new AtomicInteger();var original=new AtomicReference<ValidationOperation>();
+            when(configuration.validationTasks(()->{}).read("flow","task")).thenAnswer(call->Optional.of(current.get()));
+            for(String node:List.of("a","b"))routing.commands.put(node,command->{
+                assertThat(command.request().command()).isEqualTo(original.get().command());
+                if(command.action()==ValidationOwnerRouter.Action.ACTIVATE){
+                    activations.incrementAndGet();var before=current.get();var spec=new ValidationRunSpec(before.comparison(),ValidationMode.FULL,ValidationMethod.COUNT);
+                    var identity=new ValidationRunIdentity(command.owner(),"task",command.request().run(),ValidationMode.FULL,spec.fingerprint(),1,"direct-full-v1");
+                    var start=new ValidationReportAdmission.Start(before.task(),1,1,command.request().command().toString(),identity);
+                    current.set(new ValidationTaskStore.Snapshot(before.task(),1,before.commandId(),before.comparison(),before.settings(),1,before.schedulingCommandId(),false,
+                            new ValidationTaskStore.Mode(2,new ValidationTaskStore.Permission(start,ValidationTaskStore.Phase.CLOSED)),before.incremental()));
+                }else if(command.action()==ValidationOwnerRouter.Action.STOP){
+                    stops.incrementAndGet();
+                    if(unknownReply&&!drained.get())return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null);
+                }else{
+                    assertThat(command.action()).isEqualTo(ValidationOwnerRouter.Action.STATUS);
+                    return ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.REJECTED,null);
+                }
+                return new ValidationOwnerRouter.CommandReply(ValidationOwnerRouter.Outcome.ACCEPTED,command,"COMPLETED",true,false,false,true,drained.get(),null);
+            });
+            try(var coordinator=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resources,process,()->{})){
+                var op=operation(coordinator.context());original.set(op);
+                try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.ACCEPTED);}
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->activations.get()==1&&entryCount(coordinator)==0&&resources.snapshot().metadataFrames()==0);
+                var retained=resources.admitRetainedMetadata(2);
+                try{
+                    try(var response=coordinator.stop(op)){
+                        assertThat(response.value().drain()).isEqualTo(unknownReply?ValidationOperation.Drain.UNKNOWN:ValidationOperation.Drain.NOT_DRAINED);
+                    }
+                    assertThat(entryCount(coordinator)).isOne();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->stops.get()>=2);
+                    assertThat(entryCount(coordinator)).isOne();
+                    assertThat(resources.snapshot().metadataFrames()).isLessThanOrEqualTo(3);
+                    try(var foreground=resources.admitControl()){
+                        var finished=new CountDownLatch(1);foreground.execute(finished::countDown);
+                        assertThat(finished.await(2,TimeUnit.SECONDS)).isTrue();
+                    }
+                }finally{retained.forEach(ValidationMemberResources.Metadata::close);}
+                assertThat(entryCount(coordinator)).isOne();drained.set(true);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->entryCount(coordinator)==0&&resources.snapshot().metadataFrames()==0);
+                assertThat(activations).hasValue(1);
+                assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();
+            }
+        }
+    }
     static ValidationOperation operation(ValidationOperation.Context context){return new ValidationOperation(context,"flow","task",GENERATION,1,1,UUID.randomUUID());}
     static MongoConfigurationDomain configuration(){
         var configuration=mock(MongoConfigurationDomain.class);var tasks=mock(ValidationTaskStore.class);var reports=mock(ValidationReports.class);

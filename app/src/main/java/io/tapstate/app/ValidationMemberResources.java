@@ -97,6 +97,10 @@ final class ValidationMemberResources implements AutoCloseable {
         Control admitMaintenanceControl(){
             var frame=admitMaintenanceMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
         }
+        /** Pending stops may run beside retained work while still leaving one foreground frame. */
+        Control admitStopControl(){
+            var frame=admitWorkMetadata();try{return control(frame,true);}catch(RuntimeException|Error failed){frame.close();throw failed;}
+        }
         /** The request scope, not this worker, retains and eventually returns this exact member's frame. */
         Control admitControl(Metadata frame){frame.requireRetained(this);return control(frame,false);}
         private Control control(Metadata frame,boolean ownsFrame){
