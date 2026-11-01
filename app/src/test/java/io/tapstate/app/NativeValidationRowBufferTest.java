@@ -18,7 +18,8 @@ class NativeValidationRowBufferTest {
         assertThat(independent.settings().get("extParams")).isEqualTo("?sslmode=verify-full&binaryTransfer=false&maxResultBuffer=16777216");
         assertThat(independent.settings()).doesNotContainKey("additionalString");
         assertThat(source.config()).isEqualTo(settings);
-        assertThat(NativeValidationPdkRows.rowReadBytes(POSTGRES)).isGreaterThan(NativeValidationPdkRows.POSTGRES_RESULT_BYTES+1000L*65536);
+        assertThat(NativeValidationPdkRows.rowReadBytes(POSTGRES,1)).isGreaterThan(3*NativeValidationPdkRows.POSTGRES_RESULT_BYTES);
+        assertThat(NativeValidationPdkRows.rowReadBytes(POSTGRES,2)-NativeValidationPdkRows.rowReadBytes(POSTGRES,1)).isEqualTo(64L*256);
     }
     @Test void encodedDuplicateAndStricterOriginalBoundsCannotRaiseTheReadCap(){
         var source=new SourceResource("input",null,"postgres",Map.of("extParams","?%6daxResultBuffer=2000000&maxResultBuffer=1000000&ssl=true"),null,null,null,null);

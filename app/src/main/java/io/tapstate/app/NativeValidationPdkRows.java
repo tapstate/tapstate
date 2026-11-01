@@ -64,13 +64,11 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         long pairedBytes=0;
         for(var declared:declarations){
             var mapping=declared.mapping();
-            pairedBytes=Math.max(pairedBytes,Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId())),rowReadBytes(artifacts.get(mapping.target().sourceId()))));
+            pairedBytes=Math.max(pairedBytes,Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId()),0),rowReadBytes(artifacts.get(mapping.target().sourceId()),0)));
         }
-        // The two ordered readers coexist. Grow this original allocation before opening any native context;
-        // the unchanged process slice refuses growth when its complete native window does not fit.
-        var envelope=original.resources().budget().envelope();
-        long needed=Math.addExact(16L*1024*1024,pairedBytes);
-        if(needed>envelope.bytes())original.resources().growTo(new ValidationLocalBudget.Amount(needed,envelope.workers(),envelope.connections(),envelope.reads()),1);
+        // Admit driver/raw/UTF-16 and metadata windows before discovery. Business map allocation
+        // is admitted from both verified models below, before either business query can start.
+        growPaired(pairedBytes);
     }
     @Override public List<ValidationFullScan.Mapping> mappings(){return mappings;}
     @Override public Throwable failure(){return failure.get();}
@@ -84,6 +82,9 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                 if(!working.compareAndSet(null,lease))lease.close();
             }
             var from=metadata(index,true,guard);var to=metadata(index,false,guard);
+            var mapping=declarations.get(index).mapping();
+            growPaired(Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId()),from.model().fields().size()),
+                    rowReadBytes(artifacts.get(mapping.target().sourceId()),to.model().fields().size())));
             require();guard.run();current=new Table(index,from,to);
             source=groups(index,true,guard);target=groups(index,false,guard);
             var merge=new ValidationOrderedMerge(source,target);active.set(merge);
@@ -148,12 +149,15 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         require();guard.run();awaitClosed(guard);
         var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
         var keys=components(mapping,source);var resource=resource(side);var artifact=artifact(resource);
-        var read=admit(rowReadBytes(artifact));ValidationReadHandle raw=null;
+        var table=current;if(table==null||table.index()!=index)throw invalid("tableSequence");
+        int nativeFields=(source?table.source():table.target()).model().fields().size();
+        var read=admit(rowReadBytes(artifact,nativeFields));ValidationReadHandle raw=null;
         try{
             var connection=connection(side,resource);
             var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
             Runnable active=()->{require();guard.run();};
-            raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW);
+            raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW,
+                    postgres(artifact)?nativeFields:PdkValidationReads.POSTGRES_NATIVE_FIELDS);
             var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),PdkValidationReads.cleanupCompleted(handle));read.opened();require();guard.run();
             return new ValidationReadHandle(){
                 @Override public Optional<Row> next(){require();guard.run();return handle.next();}
@@ -188,12 +192,18 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         finally{consumers.decrementAndGet();releaseWorking();}
     }
 
-    static long rowReadBytes(ConnectorRef artifact){
+    private void growPaired(long pairedBytes){
+        var envelope=original.resources().budget().envelope();long needed=Math.addExact(16L*1024*1024,pairedBytes);
+        if(needed>envelope.bytes())original.resources().growTo(new ValidationLocalBudget.Amount(needed,envelope.workers(),envelope.connections(),envelope.reads()),1);
+    }
+    static long rowReadBytes(ConnectorRef artifact){return rowReadBytes(artifact,PdkValidationReads.POSTGRES_NATIVE_FIELDS);}
+    static long rowReadBytes(ConnectorRef artifact,int nativeFields){
         Objects.requireNonNull(artifact);
+        if(nativeFields<0||nativeFields>PdkValidationReads.POSTGRES_NATIVE_FIELDS)throw new IllegalArgumentException("invalid native field bound");
         // Native pages bound map cardinality even before decoding rejects an oversized row. The
         // driver caps each query's raw payload; charge its UTF-16 expansion separately. Map entries
         // include field/key/scalar overhead for the admitted model, independently of row validity.
-        long mapBytes=Math.multiplyExact((long)PdkValidationReads.POSTGRES_PAGE_ROWS,Math.multiplyExact((long)PdkValidationReads.POSTGRES_NATIVE_FIELDS,256L));
+        long mapBytes=Math.multiplyExact((long)PdkValidationReads.POSTGRES_PAGE_ROWS,Math.multiplyExact((long)nativeFields,256L));
         long nativeBytes=postgres(artifact)?Math.addExact(Math.multiplyExact(3L,POSTGRES_RESULT_BYTES),mapBytes):0L;
         return Math.addExact(METADATA_BYTES,nativeBytes);
     }

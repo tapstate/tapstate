@@ -135,11 +135,19 @@ public final class PdkValidationReads {
             String table, Binding expected, List<ValidationKeyBinding.Component> keys, boolean fullColumns,
             Runnable requireCurrent, ExecutorService query, ExecutorService decode, int capacity,
             ValidationValues.Limits rowLimits) {
+        return scan(connection,artifact,configurationHash,table,expected,keys,fullColumns,requireCurrent,query,decode,capacity,rowLimits,POSTGRES_NATIVE_FIELDS);
+    }
+    /** The caller admits this effective model/projection field bound before the native query starts. */
+    public static ValidationReadHandle scan(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
+            String table, Binding expected, List<ValidationKeyBinding.Component> keys, boolean fullColumns,
+            Runnable requireCurrent, ExecutorService query, ExecutorService decode, int capacity,
+            ValidationValues.Limits rowLimits,int nativeFieldLimit) {
+        if(nativeFieldLimit<1||nativeFieldLimit>POSTGRES_NATIVE_FIELDS)throw new IllegalArgumentException("invalid native field bound");
         inputs(connection,artifact,configurationHash); var confirmed=List.copyOf(keys); var fields=fields(confirmed);
         return deferred(table,query,decode,submit->PdkValidationSession.scan(connection.connectorId(),artifact,connection.settings(),expected.codecBinding(),
                 new PdkValidationSession.Scan(table,fields,fullColumns?List.of():fields,Math.min(capacity,64)),
                 (model,codecs)->decoder(model,codecs,artifact,configurationHash,expected,confirmed,rowLimits),
-                requireCurrent,submit,decode,capacity,rowLimits));
+                requireCurrent,submit,decode,capacity,rowLimits,nativeFieldLimit));
     }
 
     /**

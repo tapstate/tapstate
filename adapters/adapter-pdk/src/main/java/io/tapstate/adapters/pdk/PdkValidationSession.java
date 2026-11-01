@@ -178,10 +178,15 @@ final class PdkValidationSession {
     static ValidationReadHandle scan(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
             String codecBinding, Scan scan, ReadAdmission admission, Runnable requireAuthorized,
             ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits) {
+        return scan(connectorId,artifact,settings,codecBinding,scan,admission,requireAuthorized,io,decodeIo,maxInFlightRows,rowLimits,PdkValidationReads.POSTGRES_NATIVE_FIELDS);
+    }
+    static ValidationReadHandle scan(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
+            String codecBinding, Scan scan, ReadAdmission admission, Runnable requireAuthorized,
+            ExecutorService io, ExecutorService decodeIo, int maxInFlightRows, ValidationValues.Limits rowLimits,int nativeFieldLimit) {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, codecBinding, scan,
                 admission, null, requireAuthorized, decodeIo);
-        return session.open(io, maxInFlightRows, rowLimits);
+        return session.open(io, maxInFlightRows, rowLimits,nativeFieldLimit);
     }
 
     static ValidationReadHandle lookup(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
@@ -206,8 +211,14 @@ final class PdkValidationSession {
     }
 
     private ValidationReadHandle open(ExecutorService io, int maxInFlightRows, ValidationValues.Limits rowLimits) {
-        maxNativeFields=Math.min(rowLimits.nodes(),PdkValidationReads.POSTGRES_NATIVE_FIELDS);
+        return open(io,maxInFlightRows,rowLimits,PdkValidationReads.POSTGRES_NATIVE_FIELDS);
+    }
+    private ValidationReadHandle open(ExecutorService io,int maxInFlightRows,ValidationValues.Limits rowLimits,int nativeFieldLimit){
+        if(nativeFieldLimit<1||nativeFieldLimit>PdkValidationReads.POSTGRES_NATIVE_FIELDS)throw new IllegalArgumentException("invalid native field bound");
+        maxNativeFields=Math.min(rowLimits.nodes(),nativeFieldLimit);
         var cursor = new PdkValidationCursor(scan.table(), this::read, row -> {
+            if(PdkValidationReads.boundedPostgresPages(artifact)&&row.size()>maxNativeFields)
+                throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.nativeFields"),null);
             var selected=project(row);
             if(PdkValidationReads.boundedPostgresPages(artifact))requireBoundedPostgresValues(connectorId,selected);
             return decoder.decode(selected);

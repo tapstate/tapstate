@@ -33,6 +33,84 @@ class NativeValidationRelationalApiIT {
     @Test @Timeout(180) void mysqlMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(true);}
     @Test @Timeout(180) void postgresMappingsAndAllMethodsUseTheRealHttpAndScheduledRun()throws Exception{verify(false);}
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"UNIQUE_KEY","FULL_COLUMN"})
+    @Timeout(180) void smallPostgresPairsFitTheOriginalProcessCapacityAndReadBothSides(String method)throws Exception{
+        try(var sql=new GenericContainer<>("postgres:16").withExposedPorts(5432).withEnv("POSTGRES_PASSWORD",PASSWORD)
+                .withEnv("POSTGRES_USER","validation").withEnv("POSTGRES_DB",DB).withStartupTimeout(Duration.ofSeconds(75))
+                .withCommand("postgres","-c","log_statement=all")
+                .waitingFor(Wait.forLogMessage(".*database system is ready to accept connections.*\\n",2))){
+            sql.start();var seed=sql.execInContainer("psql","-U","validation","-d",DB,"-c",
+                    "CREATE TABLE orders(id BIGINT PRIMARY KEY,payload VARCHAR(32)); INSERT INTO orders VALUES(1,'same'); "
+                    +"CREATE TABLE checked_orders(id BIGINT PRIMARY KEY,payload VARCHAR(32)); INSERT INTO checked_orders VALUES(1,'same');");
+            assertThat(seed.getExitCode()).as(seed.getStderr()).isZero();
+            var connection=Map.<String,Object>of("host",sql.getHost(),"port",sql.getMappedPort(5432),"database",DB,"schema","public","user","validation","password",PASSWORD);
+            var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"postgres_pair_http","admin",PASSWORD);
+            try(var schema=io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
+                    new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId(),UUID.randomUUID());
+                    var cache=io.tapstate.adapters.mongostore.MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,storage.cacheUri(),storage.cacheDatabase(),null),Duration.ofSeconds(5),"postgres-pair-fixture")){
+                schema.prepareCache(cache);while(!schema.advance(20).ready()){}
+            }
+            try(var app=new SpringApplicationBuilder(Bootstrap.class).environment(CloudFixtureEnvironment.isolated()).run(
+                    "--server.address=127.0.0.1","--server.port=0","--logging.level.root=ERROR","--tapstate.hz.member-port=0","--tapstate.hz.jet.cooperative-thread-count=2",
+                    "--tapstate.store.mongo.uri="+storage.configurationUri(),"--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),
+                    "--tapstate.connectors.plugins-dir="+work.resolve("plugins"),"--tapstate.control.auth.jwt-secret=postgres-pair-http-signing-key")){
+                NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
+                var connector=child.getBean(ConnectorArtifactRegistrar.class).register(artifact("postgres"),RegistrationSource.REGISTER).registration().connectorId();
+                var artifacts=child.getBean(ArtifactStore.class);
+                assertThat(artifacts.create(new SourceResource("input",null,connector,connection,SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null))).isEqualTo(ArtifactMutation.CREATED);
+                assertThat(artifacts.create(new SourceResource("target",null,connector,connection,null,null,null,null))).isEqualTo(ArtifactMutation.CREATED);
+                assertThat(artifacts.create(new PipelineResource("flow",null,List.of(SourceRef.spec("input",false)),null,null,
+                        new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("input.orders")),List.of(new SyncElement("out","target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null))).isEqualTo(ArtifactMutation.CREATED);
+                var tokens=child.getBean(TokenService.class);String write=tokens.create(Scope.WRITE),read=tokens.create(Scope.READ);
+                var http=RestClient.create("http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort());
+                var input=Map.of("pipelineId","flow","taskId","pair","expectedRevision","0","method",method,
+                        "mappings",List.of(Map.of("mappingId","orders","outputId","out","sourceId","input","table","orders")),
+                        "confirmations",Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
+                var evaluated=post(http,write,"evaluate",input);
+                var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                assertThat(saved).containsEntry("outcome","APPLIED");
+                assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().data().capacity().bytes()).isEqualTo(256L*1024*1024);
+                if(method.equals("FULL_COLUMN"))try(var query=java.util.concurrent.Executors.newSingleThreadExecutor();var decode=java.util.concurrent.Executors.newSingleThreadExecutor()){
+                    var resource=StoredArtifacts.requireSource(artifacts,"input");
+                    var ref=child.getBean(io.tapstate.adapters.pdk.ConnectorProvisioner.class).resolve(connector);
+                    var config=new ConnectionConfig(resource.id(),resource.connector(),resource.config());
+                    var hash=io.tapstate.core.model.canonical.CanonicalHash.of(resource);var limits=new io.tapstate.core.validation.ValidationValues.Limits(64L*1024,8192,32);
+                    io.tapstate.adapters.pdk.PdkValidationReads.Metadata metadata;
+                    try(var inspected=io.tapstate.adapters.pdk.PdkValidationReads.inspect(config,ref,hash,"orders",List.of(),()->{},query,decode,limits)){metadata=inspected.result();}
+                    assertThat(metadata.model().fields()).hasSize(2);
+                    var keys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER,Set.of("exact-number")));
+                    try(var rejected=io.tapstate.adapters.pdk.PdkValidationReads.scan(config,ref,hash,"orders",metadata.binding(),keys,true,()->{},query,decode,2,limits,1)){
+                        assertThatThrownBy(rejected::next).isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                failure->{assertThat(failure.code()).isEqualTo(io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED);assertThat(failure.args()).containsEntry("limit","validation.nativeFields");});
+                        rejected.close();io.tapstate.adapters.pdk.PdkValidationReads.cleanupCompleted(rejected).toCompletableFuture().get(10,java.util.concurrent.TimeUnit.SECONDS);
+                    }
+                    assertThat(sql.getLogs().toUpperCase(Locale.ROOT)).doesNotContain("LIMIT 64");
+                    try(var admitted=io.tapstate.adapters.pdk.PdkValidationReads.scan(config,ref,hash,"orders",metadata.binding(),keys,true,()->{},query,decode,2,limits,2)){
+                        try(var row=admitted.next().orElseThrow()){assertThat(row.values().fields()).containsOnlyKeys("id","payload");}
+                        assertThat(admitted.next()).isEmpty();
+                    }
+                    assertThat(sql.getLogs().toUpperCase(Locale.ROOT)).contains("LIMIT 64");
+                }
+                for(int sequence=1;sequence<=2;sequence++){
+                    var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","flow","task","pair","taskGeneration",saved.get("taskGeneration"),"revision","1","sequence",Integer.toString(sequence),"command",UUID.randomUUID().toString());
+                    var start=post(http,write,"start",operation);var status=new java.util.concurrent.atomic.AtomicReference<Map<String,Object>>();var retried=new java.util.concurrent.atomic.AtomicBoolean();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100))
+                            .ignoreExceptionsMatching(failure->failure instanceof org.springframework.web.client.HttpClientErrorException.NotFound||failure instanceof org.springframework.web.client.HttpClientErrorException.TooManyRequests).until(()->{
+                        var observed=post(http,read,"progress",operation);status.set(observed);
+                        if("ACCEPTED".equals(observed.get("outcome"))&&Boolean.FALSE.equals(observed.get("admitted"))&&Boolean.FALSE.equals(observed.get("controlUnknown"))&&"STARTING".equals(observed.get("state"))&&retried.compareAndSet(false,true))post(http,write,"start",operation);
+                        return "COMPLETED".equals(observed.get("state"))||"FAILED".equals(observed.get("state"))||"STOPPED".equals(observed.get("state"));
+                    });
+                    assertThat(status.get()).as("supported PostgreSQL pair must complete inside its unchanged capacity").containsEntry("state","COMPLETED");
+                    var report=get(http,read,"/api/pipelines/flow/validation-tasks/pair/reports/"+start.get("run")+"?generation="+saved.get("taskGeneration")+"&sequence="+sequence);
+                    assertThat(report).containsEntry("method",method).containsEntry("closed",true).containsEntry("rootCount",sequence==1?"0":method.equals("UNIQUE_KEY")?"2":"1");
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).until(()->"DRAINED".equals(post(http,read,"progress",operation).get("drain"))&&child.getBean(ValidationMemberResources.Member.class).snapshot().data().runs()==0);
+                    if(sequence==1){var fault=sql.execInContainer("psql","-U","validation","-d",DB,"-c",method.equals("UNIQUE_KEY")?"UPDATE checked_orders SET id=2;":"UPDATE checked_orders SET payload='different';");assertThat(fault.getExitCode()).isZero();}
+                }
+            }finally{try(var raw=MongoClients.create(storage.configurationUri())){for(var database:List.of(storage.configurationDatabase(),storage.cacheDatabase(),storage.masterDatabase()))raw.getDatabase(database).drop();}}
+        }
+    }
+
     @Test @Timeout(180) void mysqlNonBinaryTextKeysAreRefusedDuringPreflight()throws Exception{verify(true,true);}
     private void verify(boolean mysql)throws Exception{verify(mysql,false);}
     @Test @Timeout(180) void postgresWideNativePageIsChargedBeforeQueryAndPreservesAllRows()throws Exception{verify(false,false,true);}
@@ -212,7 +290,10 @@ class NativeValidationRelationalApiIT {
                         });
                         // The query is blocked before fetching any rows; the immutable run has already paid its native window.
                         var budget=child.getBean(ValidationMemberResources.Member.class).snapshot();
-                        try{assertThat(budget.data().reserved().bytes()).isGreaterThanOrEqualTo(192L*1024*1024);
+                        // This fixture has three native columns. Keep raw/UTF-16, both metadata
+                        // windows and non-reader space, without an unrelated 8192-column map charge.
+                        long minimumWindow=3*NativeValidationPdkRows.POSTGRES_RESULT_BYTES+48L*1024*1024+64L*3*256;
+                        try{assertThat(budget.data().reserved().bytes()).isGreaterThanOrEqualTo(minimumWindow);
                             assertThat(budget.data().capacity().bytes()).isEqualTo(256L*1024*1024);}
                         finally{locked.close();}
                         var report=result.get(90,java.util.concurrent.TimeUnit.SECONDS);
