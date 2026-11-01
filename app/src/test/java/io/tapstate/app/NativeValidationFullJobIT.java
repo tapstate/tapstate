@@ -205,6 +205,61 @@ class NativeValidationFullJobIT {
         }finally{resume.countDown();}
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void anOuterJetFailureAfterStopIsKnownBeforeDrainAndFinalReportMirroring(boolean fatal)throws Exception {
+        var state=new ValidationJobExecutionTest.State();state.delayReceipt=true;state.readers.set(true);
+        state.callbackFailure=fatal?new AssertionError("Original outer Jet report failure"):new IllegalStateException("Original outer Jet report failure");
+        ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            var execution=new AtomicReference<ValidationJobExecution>();
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){var value=ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);execution.set(value);return value;}
+                });
+                assertThat(state.callbackEntered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->original.cancelled.get());state.callbackRelease.countDown();
+                assertThat(state.originalJobEnded.await(8,TimeUnit.SECONDS)).isTrue();await(()->state.exited.get());
+                assertThat(state.failure()).isNull();assertThat(execution.get().progress().processorsExited()).as("Original Job receipt is still unresolved").isFalse();
+                assertThat(f.resources.snapshot().processors()).as("Original processor receipt remains owned while Job diagnosis is unresolved").isEqualTo(1);
+                var pendingReference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+                assertThat(access.reports().find(pendingReference).orElseThrow().terminal()).as("No final mirror before the original Job receipt").isNull();
+            }finally{state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(java.util.Objects.requireNonNullElseGet(state.originalFailure.get(),()->new java.util.concurrent.CancellationException("Fixture cleanup")));}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
+            assertThat(failure.technical()).contains("Original outer Jet report failure");if(fatal)assertThat(failure.fatal()).isTrue();
+        }finally{state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
+    @Test void stopDuringGraphAuthorizationCreatesNoJobAndMirrorsNoExecutionFailure()throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);var paused=new AtomicBoolean();
+        var state=new ValidationJobExecutionTest.State();state.readers.set(true);ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            f.localGuard=()->{
+                boolean submitting=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals("io.tapstate.runtime.engine.validation.ValidationJobGraph")&&frame.getMethodName().equals("submit")));
+                if(submitting&&paused.compareAndSet(false,true)){entered.countDown();waitFor(resume);}
+            };
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){return ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);}
+                });
+                assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());assertThat(state.cancelled).isTrue();
+            }finally{resume.countDown();}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processors()==0);
+            assertThat(f.member.getJet().getJobs()).as("A cancelled pre-handoff graph creates no original or replacement Job").isEmpty();
+            assertThat(access.reports().find(reference).orElseThrow().failure()).isNull();
+        }finally{resume.countDown();if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
     @Test void nativeCountUsesTheOriginalFullSlotJobAndConfigSummaryWithoutCreatingRoots()throws Exception {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
             var registry=new ValidationProcessorRegistry(f.member,()->{})) {
@@ -281,12 +336,16 @@ class NativeValidationFullJobIT {
             var terminal=new AtomicReference<org.bson.Document>();
             // A long finished run may already have released its live owner. Read the exact durable
             // fixture record, rather than extending that owner merely to inspect its final result.
-            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(90)).until(()->{
+            try{org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(90)).until(()->{
                 var saved=stored.find(exactRun).first();
                 if(saved==null||!Boolean.TRUE.equals(saved.getBoolean("retired"))||!ValidationRunState.valueOf(saved.getString("state")).terminal())return false;
                 if(f.tasks.read("flow","task").orElseThrow().full().permission().phase()!=ValidationTaskStore.Phase.CLOSED)return false;
                 terminal.set(saved);return true;
-            });
+            });}catch(org.awaitility.core.ConditionTimeoutException unresolved){
+                var facts=String.valueOf(stored.find(exactRun).first());
+                throw new AssertionError("Original quota run="+start.run().runId()+"; checked="+plan.checked.get()+"; resources="+f.resources.snapshot()
+                        +"; retained="+facts.substring(0,Math.min(facts.length(),4096)),unresolved);
+            }
             assertThat(terminal.get()).containsEntry("state",ValidationRunState.STOPPED.name());
             var pipeline=stored.find(new org.bson.Document("_id.kind","pipeline").append("_id.clusterId",start.run().owner().clusterId())
                     .append("_id.pipelineId",start.run().owner().pipelineId())).first();

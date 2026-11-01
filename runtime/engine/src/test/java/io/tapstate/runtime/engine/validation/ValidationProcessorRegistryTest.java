@@ -25,6 +25,25 @@ class ValidationProcessorRegistryTest {
 
     private static final Map<String, WorkerTiming> TIMINGS = new ConcurrentHashMap<>();
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    @Timeout(40) void localSealIsCodedCancellationBeforeAnyFurtherDelegation(boolean entered)throws Exception {
+        try(var fixture=new Fixture()) {
+            var calls=new AtomicInteger();var run=fixture.registry.register(identity(UUID.randomUUID().toString()),Set.of("check"),()->{});
+            var tracked=run.wrap("check",ProcessorSupplier.of(()->new AbstractProcessor(){@Override public boolean complete(){calls.incrementAndGet();return false;}}));
+            var context=(ProcessorSupplier.Context)Proxy.newProxyInstance(ProcessorSupplier.Context.class.getClassLoader(),new Class<?>[]{ProcessorSupplier.Context.class},
+                    (proxy,method,args)->{if(method.getName().equals("hazelcastInstance"))return fixture.member;throw new AssertionError("Unexpected factory context: "+method.getName());});
+            Processor processor=null;
+            try {
+                if(entered){tracked.init(context);processor=tracked.get(1).iterator().next();}
+                run.seal();var actual=processor;
+                if(entered)assertThatThrownBy(actual::complete).isInstanceOfSatisfying(TapstateException.class,stopped->assertThat(stopped.code()).isEqualTo(ValidationError.EXECUTION_CANCELLED));
+                else assertThatThrownBy(()->tracked.init(context)).isInstanceOfSatisfying(TapstateException.class,stopped->assertThat(stopped.code()).isEqualTo(ValidationError.EXECUTION_CANCELLED));
+                assertThat(calls).hasValue(0);
+            }finally{if(processor!=null)processor.close();tracked.close(null);run.seal();assertThat(run.processorsExited()).isTrue();run.forget();}
+        }
+    }
+
     @Test @Timeout(40) void actualGuardedJetWorkerPublishesOneUnitWithoutThreadContextOrPollUnits() throws Exception {
         try (var fixture = new Fixture()) {
             for (boolean failing : List.of(false, true)) {

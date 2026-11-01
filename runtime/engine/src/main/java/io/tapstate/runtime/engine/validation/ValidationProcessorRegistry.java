@@ -77,7 +77,8 @@ public final class ValidationProcessorRegistry implements AutoCloseable {
                 if (permissionBytes > 8192) throw invalid("processors.permissions");
             }
             synchronized (this) {
-                if (!vertices.containsKey(vertex) || sealed || factories.putIfAbsent(vertex, delegate) != null) throw invalid("processors.originalVertex");
+                requireOpen();
+                if (!vertices.containsKey(vertex) || factories.putIfAbsent(vertex, delegate) != null) throw invalid("processors.originalVertex");
             }
             // The actual native factory and its resources stay on this original member. Only its
             // bounded lookup token and declared scheduling/security metadata travel in the DAG.
@@ -94,15 +95,20 @@ public final class ValidationProcessorRegistry implements AutoCloseable {
                 if (runs.remove(id, this)) { synchronized (this) { factories.clear(); } bytes -= charge; }
             }
         }
+        private void requireOpen(){
+            if(closed)throw invalid("processors.registryClosed");
+            if(sealed)throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
+        }
         private void require() {
-            synchronized (this) { if (sealed || closed) throw invalid("processors.runClosed"); }
+            synchronized (this) { requireOpen(); }
             requireLocal.run(); requireCurrent.run();
-            synchronized (this) { if (sealed || closed) throw invalid("processors.runClosed"); }
+            synchronized (this) { requireOpen(); }
         }
         private void enter(String vertex) {
             require();
             synchronized (this) {
-                if (sealed || closed || vertices.get(vertex) != Phase.NEW) throw invalid("processors.executionReentry");
+                requireOpen();
+                if (vertices.get(vertex) != Phase.NEW) throw invalid("processors.executionReentry");
                 vertices.put(vertex, Phase.ENTERED); active++;
             }
         }

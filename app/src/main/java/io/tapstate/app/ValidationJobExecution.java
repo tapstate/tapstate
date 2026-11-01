@@ -9,7 +9,7 @@ import io.tapstate.runtime.engine.validation.ValidationProcessorRegistry;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.CompletionException;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** One actual validation Job and its original local work. All transport runs on admitted control IO. */
@@ -39,6 +39,9 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     // Publishes the original job handle; submission and cancellation use the job lifecycle APIs.
     @SuppressWarnings("java:S3077")
     private volatile Job originalJob;
+    // Publishes one thread-safe future for the original Job, including lookup after an uncertain submission.
+    @SuppressWarnings("java:S3077")
+    private volatile CompletableFuture<Void> originalFuture;
     private volatile boolean submissionReturned, forgotten;
 
     ValidationJobExecution(ValidationRunIdentity identity, ValidationJobGraph graph, ValidationProcessorRegistry.Run processors,
@@ -54,13 +57,15 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     @Override public void start() {
         if(!attempted.compareAndSet(false,true))throw invalid("job.executionAlreadyAttempted");
         try {
-            originalJob=graph.submit(jet,()->{if(cancelled.get())throw cancelled();requireCurrent.run();});
-            originalJob.getFuture().whenComplete((ignored,failed)->{
-                if(failed!=null){var cause=unwrap(failed);if(!(cause instanceof CancellationException)&&!cancelled.get())failure.record(cause);}
-                // Publishing physical exit must not precede the original Job's failure receipt.
-                processors.seal();
-            });
-        }catch(RuntimeException|Error failed){failure.record(failed);throw failed;}
+            originalJob=graph.submit(jet,()->{if(cancelled.get())throw cancelled();requireCurrent.run();if(cancelled.get())throw cancelled();});
+            observeOriginalFuture(originalJob);
+        }catch(RuntimeException|Error failed){
+            NativeValidationCancellation.record(failure,failed,cancelled.get());
+            if(cancelled.get()&&!graph.handedToJet()&&failure.get()==null){processors.seal();return;}
+            if(failure.get() instanceof Error fatal)throw fatal;
+            if(failure.get() instanceof RuntimeException original)throw original;
+            throw failed;
+        }
         finally{submissionReturned=true;}
     }
     @Override public void cancel() {
@@ -73,11 +78,13 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
         if(!cancelled.get())return;requireOriginalCleanup.run();
         Job known=originalJob;
         if(known==null&&graph.handedToJet()) {known=graph.reconcile(jet,requireOriginalCleanup).orElse(null);if(known!=null)originalJob=known;}
-        if(known!=null)known.cancel();
+        if(known!=null){observeOriginalFuture(known);known.cancel();}
     }
     @Override public ValidationRunLifecycle.Progress progress() {
+        boolean businessComplete=work.businessComplete();boolean jobExited=originalJobExited();boolean readersReleased=work.readersReleased();
+        // Reader exit may publish its last cleanup failure; sample the diagnosis after those physical facts.
         var reported=work.failure();if(reported!=null)failure.record(reported);
-        return new ValidationRunLifecycle.Progress(work.businessComplete(),processors.processorsExited(),work.readersReleased(),failure.get());
+        return new ValidationRunLifecycle.Progress(businessComplete&&failure.get()==null,jobExited&&processors.processorsExited(),readersReleased,failure.get());
     }
     boolean submissionReturned(){return submissionReturned;}
     boolean knownNoSubmission(){return submissionReturned&&!graph.handedToJet();}
@@ -85,10 +92,26 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     /** Forget native factories only after real exit. Unknown control/Job identity stays with its caller. */
     void releaseFactories() {
         if(forgotten)return;
-        if(!processors.processorsExited()||!work.readersReleased())throw invalid("job.resourcesNotReleased");
+        if(!originalJobExited()||!processors.processorsExited()||!work.readersReleased())throw invalid("job.resourcesNotReleased");
         processors.forget();forgotten=true;
     }
-    private static Throwable unwrap(Throwable failure){while(failure instanceof CompletionException&&failure.getCause()!=null)failure=failure.getCause();return failure;}
+    private void observeOriginalFuture(Job job){
+        if(originalFuture!=null)return;
+        var future=Objects.requireNonNull(job.getFuture(),"original Job future");originalFuture=future;
+        future.whenComplete((ignored,failed)->{if(failed!=null)recordJobFailure(failed);processors.seal();});
+    }
+    private boolean originalJobExited(){
+        if(!attempted.get())return true;
+        var future=originalFuture;if(future==null)return knownNoSubmission();
+        if(!future.isDone())return false;
+        // A dependent callback can lag completion. Consume the original terminal result before publishing exit.
+        try{future.join();}catch(RuntimeException|Error failed){recordJobFailure(failed);}
+        processors.seal();return true;
+    }
+    private void recordJobFailure(Throwable reported){
+        if(reported instanceof CancellationException&&!cancelled.get())reported=new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),reported);
+        NativeValidationCancellation.record(failure,reported,cancelled.get());
+    }
     private TapstateException cancelled(){return new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);}
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field",field),null);}
 }

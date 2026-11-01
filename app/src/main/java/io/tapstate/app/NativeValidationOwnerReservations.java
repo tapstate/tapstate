@@ -191,6 +191,16 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 operation.requireReserved(); return operation.reply();
             } catch (TapstateException refusal) {
                 if (operation == null) throw refusal;
+                if(refusal.code()==ValidationError.VALUE_LIMIT_EXCEEDED){
+                    var state=resources.snapshot();var raw=refusal.args().get("limit");
+                    var limit=raw instanceof String text&&text.matches("[A-Za-z0-9.-]{1,128}")?text:"unspecified";
+                    LOG.log(System.Logger.Level.WARNING,io.tapstate.core.common.JsonWriter.write(Map.ofEntries(
+                            Map.entry("event","validation-owner-admission-refused"),Map.entry("code",refusal.code().code()),Map.entry("limit",limit),
+                            Map.entry("pipeline",request.pipeline()),Map.entry("task",request.task()),Map.entry("command",request.command().toString()),
+                            Map.entry("metadataFrames",state.metadataFrames()),Map.entry("reservedBytes",state.processReserved().bytes()),
+                            Map.entry("reservedWorkers",state.processReserved().workers()),Map.entry("reservedConnections",state.processReserved().connections()),
+                            Map.entry("reservedReads",state.processReserved().reads()),Map.entry("processors",state.processors()),Map.entry("processorCapacity",state.processorCapacity()))));
+                }
                 operation.reason = refusal.code().code(); operation.cancelled.set(true);
                 if (operation.claimUncertain) { operation.unknown = true; return new Result(Outcome.UNKNOWN, null, operation.reason); }
                 return new Result(refusal.code() == ValidationError.VALUE_LIMIT_EXCEEDED ? Outcome.CAPACITY : Outcome.REJECTED, null, operation.reason);

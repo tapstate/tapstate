@@ -238,10 +238,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         void unopened(){signal(1|2|4|16);}
         void stage(Throwable error){
             if(error==null)return;
-            while(error instanceof java.util.concurrent.CompletionException&&error.getCause()!=null)error=error.getCause();
-            if(requested&&(error instanceof java.util.concurrent.CancellationException||error instanceof TapstateException coded
-                    &&(coded.code()==ValidationError.READ_CANCELLED||coded.code()==ValidationError.EXECUTION_CANCELLED)))return;
-            record(error);
+            NativeValidationCancellation.record(failure,error,requested);
         }
         void signal(int bits){settled.getAndUpdate(value->value|bits);finish();}
         void close(){
