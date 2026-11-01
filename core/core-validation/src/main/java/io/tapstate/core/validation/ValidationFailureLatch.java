@@ -30,6 +30,8 @@ public final class ValidationFailureLatch {
     public Throwable get() { return failure.get(); }
 
     /** Bounded, identity-deduplicated context; never build direct cause/suppression cycles. */
+    // The Throwable monitor makes its bounded suppression check-and-add atomic across callers.
+    @SuppressWarnings("java:S2445")
     public static void addContext(Throwable primary, Throwable secondary) {
         Objects.requireNonNull(primary, "primary");
         if (secondary == null || primary == secondary || primary.getCause() == secondary

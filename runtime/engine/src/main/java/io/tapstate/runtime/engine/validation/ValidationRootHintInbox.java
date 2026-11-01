@@ -67,7 +67,7 @@ public final class ValidationRootHintInbox implements AutoCloseable {
         }
         if (registered == null || registered.isEmpty() || registered.size() > limits.senders()) throw invalid("hint.senders");
         var states = new LinkedHashMap<String, SenderState>();
-        long bytes = 16 * 1024;
+        long bytes = 16L * 1024;
         for (Sender sender : registered) {
             Objects.requireNonNull(sender, "sender");
             bytes += 512L + sender.retainedBytes();

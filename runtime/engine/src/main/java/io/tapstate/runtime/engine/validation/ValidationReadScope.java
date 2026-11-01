@@ -102,6 +102,8 @@ public final class ValidationReadScope implements AutoCloseable {
 
     private final class Entry {
         private final String table;
+        // Publishes the original read handle; scope locking and its atomic close attempt guard cancellation.
+        @SuppressWarnings("java:S3077")
         private volatile ValidationScopedRead read;
         private boolean openingExited;
         private Entry(String table) { this.table = table; }

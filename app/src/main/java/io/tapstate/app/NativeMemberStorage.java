@@ -16,6 +16,8 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
     private final ClusterProperties properties;
     private final WorkloadClaimStore claims;
     private final SrsStores sources;
+    // Publishes the startup lease handle; NodeSessionLease owns its atomic lease state.
+    @SuppressWarnings("java:S3077")
     private volatile NodeSessionLease startupLease;
     private final AtomicReference<NodeSessionLease> lease = new AtomicReference<>();
     // Publishes the joined member; Hazelcast provides concurrency safety for its operations.

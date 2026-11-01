@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.*;
 /** Serial direct-table ordered pairs, checked and published under the original owner. */
 final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static final System.Logger LOG=System.getLogger(NativeValidationPdkRows.class.getName());
-    private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64*1024,8192,32);
+    private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64L*1024,8192,32);
     static final long POSTGRES_RESULT_BYTES=PdkValidationReads.POSTGRES_RESULT_BYTES;
     private static final long METADATA_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
     private final NativeValidationOwnerReservations.Reservation original;
@@ -34,6 +34,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private final AtomicReference<ValidationLocalBudget.Reservation> working=new AtomicReference<>();
     private final AtomicReference<ValidationOrderedMerge> active=new AtomicReference<>();
     private final ValidationFailureLatch failure=new ValidationFailureLatch();
+    // Publishes read metadata or cleanup handles; atomic close and exit receipts own their lifetime.
+    @SuppressWarnings("java:S3077")
     private volatile Table current;
     private volatile boolean closed;
 
@@ -210,6 +212,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         private final ValidationLocalBudget.Reservation lease;
         private final AtomicInteger settled=new AtomicInteger();
         private final AtomicBoolean closing=new AtomicBoolean(),released=new AtomicBoolean();
+        // Publishes read metadata or cleanup handles; atomic close and exit receipts own their lifetime.
+        @SuppressWarnings("java:S3077")
         private volatile Runnable closer;
         private volatile boolean requested;
         Read(ValidationLocalBudget.Reservation lease){this.lease=lease;}

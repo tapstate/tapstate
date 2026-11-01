@@ -572,7 +572,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (complete) requireKnownPipelinePermissions(session, database, clusterId, current.pipelineId(), current.claimGeneration());
         return complete;
     }
-    void requireOriginalInTransaction(ClientSession session, Start start, boolean closed) {
+    Document requireOriginalInTransaction(ClientSession session, Start start, boolean closed) {
         var task = task(session, start); if (task == null) throw unreadable("original-task");
         var selected = mode(task, start.run().mode()); var held = permission(selected);
         if (closed) {
@@ -581,10 +581,10 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 throw unreadable("original-permission-closure");
         } else if (Boolean.TRUE.equals(task.get("closed")) || held == null || !identity(start).equals(held.get("identity"))
                 || !Set.of("OPEN", "BORN").contains(phase(held))) throw unreadable("original-permission");
+        return task;
     }
     void requireBornInTransaction(ClientSession session, Start start) {
-        requireOriginalInTransaction(session, start, false);
-        var task = task(session, start); var held = matching(mode(task, start.run().mode()), start);
+        var task=requireOriginalInTransaction(session,start,false);var held=matching(mode(task,start.run().mode()),start);
         if (held == null || !phase(held).equals("BORN")) throw unreadable("original-report-birth");
         var report = reports.find(session, new Document("_id", reportId(start.run()))).first();
         requireReport(report, start);
@@ -592,8 +592,8 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (report.getBoolean("closed")) throw unreadable("original-report-closed");
     }
     void requireRunSnapshotInTransaction(ClientSession session, Start start, io.tapstate.core.validation.ValidationRunSpec snapshot) {
-        requireOriginalInTransaction(session, start, false);
-        if (task(session, start).containsKey("definition") && snapshot == null)
+        var task=requireOriginalInTransaction(session,start,false);
+        if (task.containsKey("definition") && snapshot == null)
             throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "control.specSnapshot"), null);
         if (snapshot != null) new Open(start, snapshot);
     }
@@ -628,7 +628,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         if (!mode.containsKey("permission")) return null;
         if (!(mode.get("permission") instanceof Document held) || !held.keySet().equals(Set.of("sequence", "phase", "identity"))
                 || !(held.get("sequence") instanceof Long sequence) || sequence < 1 || sequence == Long.MAX_VALUE
-                || !(held.get("identity") instanceof Document identity) || !Long.valueOf(sequence).equals(identity.get("sequence")))
+                || !(held.get("identity") instanceof Document identity) || !sequence.equals(identity.get("sequence")))
             throw unreadable("permission");
         phase(held); return held;
     }

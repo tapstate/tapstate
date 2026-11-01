@@ -96,6 +96,7 @@ final class MongoValidationStoredObservation {
         var parts=new ArrayList<ValidationKey.Part>();for(var item:encoded){var row=(Document)item;fields(row,"kind","binarySubtype","value");
             var kind=ValidationKey.Kind.valueOf(string(row,"kind"));int subtype=(Integer)row.get("binarySubtype");
             Object value=kind==ValidationKey.Kind.BINARY?row.get("value"):value(document(row,"value"),0);
+            if(value==null)throw unreadable();
             var part=switch(kind){
                 case EXACT_NUMBER -> ValidationKey.Part.number((BigDecimal)value);case TEXT -> ValidationKey.Part.text((String)value);
                 case BOOLEAN -> ValidationKey.Part.bool((Boolean)value);case BINARY -> ValidationKey.Part.binary(subtype,((Binary)value).getData());

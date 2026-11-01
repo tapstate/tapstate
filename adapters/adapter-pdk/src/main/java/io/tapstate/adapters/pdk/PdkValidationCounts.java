@@ -43,6 +43,8 @@ public final class PdkValidationCounts implements AutoCloseable {
     private final Object state = new Object(), cleanup = new Object();
     private final ValidationFailureLatch failures = new ValidationFailureLatch();
     private final CompletableFuture<Void> exited = new CompletableFuture<>();
+    // Publishes the original connector to cleanup; the cleanup monitor owns stop and release.
+    @SuppressWarnings("java:S3077")
     private volatile PdkConnector connector;
     private boolean started, returned;
     private volatile boolean cancelled;
@@ -78,12 +80,13 @@ public final class PdkValidationCounts implements AutoCloseable {
             if (started || returned) throw invalid("alreadyAttempted");
             started = true;
         }
+        Outcome outcome=null;
         try {
             check();
             var opened = PdkConnector.open(connection.connectorId(), artifact, connection.settings());
             connector = opened;
             check();
-            return opened.underLoader(() -> {
+            outcome=opened.underLoader(() -> {
                 check(); opened.connector().init(opened.context()); check();
                 // COUNT never discovers value models: schema discovery may sample business rows.
                 var table = new TapTable(request.table());
@@ -113,7 +116,8 @@ public final class PdkValidationCounts implements AutoCloseable {
                 requireTable(opened); check(); return new Outcome(operation,count);
             });
         } catch (Throwable failed) {
-            record(failed); throw failure();
+            record(failed);
+            if(failures.get() instanceof InterruptedException)Thread.currentThread().interrupt();
         } finally {
             // Preserve the body outcome, but a fatal cleanup error must dominate an ordinary error.
             boolean interrupted = Thread.interrupted();
@@ -125,8 +129,9 @@ public final class PdkValidationCounts implements AutoCloseable {
                 if (failed == null) exited.complete(null); else exited.completeExceptionally(failed);
                 if (interrupted) Thread.currentThread().interrupt();
             }
-            if (failures.get() != null) throw failure();
         }
+        if(failures.get()!=null)throw failure();
+        return Objects.requireNonNull(outcome,"count outcome");
     }
 
     /**
@@ -135,6 +140,7 @@ public final class PdkValidationCounts implements AutoCloseable {
      * the actual method, fixed namespace and exact scalar contract are still checked on this session.
      * Logical connector IDs never grant a capability, and no missing command falls back to statistics.
      */
+    @SuppressWarnings("java:S1872") // Connector implementations live in isolated loaders, without a host implementation dependency.
     private Operation operation(PdkConnector opened){
         if(request.operation()!=Operation.NATIVE_PROTOCOL)return request.operation();
         for(Class<?> type=opened.connector().getClass();type!=null;type=type.getSuperclass())

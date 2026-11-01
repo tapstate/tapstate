@@ -62,7 +62,7 @@ public final class ValidationKeyRecommendations {
                     || candidates < 1 || candidates > 2048 || comparisons < 1 || comparisons > 65536
                     || bytes < 1 || bytes > 16L * 1024 * 1024) throw invalid("keyRecommendations.limits");
         }
-        public static Limits defaults() { return new Limits(4096, 128, 256, 16384, 1024 * 1024); }
+        public static Limits defaults() { return new Limits(4096, 128, 256, 16384, 1024L * 1024); }
     }
 
     /**

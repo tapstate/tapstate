@@ -29,6 +29,33 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationOwnerReservationsIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0")).withCommand("--replSet","docker-rs","--bind_ip_all","--setParameter","enableTestCommands=1");
 
+    @Test void aFatalStartupFailureSurvivesACompanionCleanupFailureAndReleasesThePipelineLock(){
+        var fatal=new AssertionError("startup failed");var cleanup=new IllegalStateException("companion cleanup failed");
+        var borrowed=new java.util.concurrent.atomic.AtomicReference<ValidationMemberResources.Metadata>();
+        try(var f=new Fixture()){
+            var pipelines=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(f.owners,"pipelines");
+            f.startup=(saved,spec)->{
+                var pipeline=pipelines.get("flow");
+                var operations=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(pipeline,"operations");
+                var reservation=operations.values().iterator().next();
+                var original=(ValidationMemberResources.Metadata)org.springframework.test.util.ReflectionTestUtils.getField(reservation,"metadata");
+                var companion=original.retainIfAlive();assertThat(companion).isNotNull();borrowed.set(companion);
+                companion.whenCompanionReturns(()->{throw cleanup;});throw fatal;
+            };
+            try{
+                var failed=catchThrowable(()->f.owners.reserve(f.request("FULL",1)));
+                assertThat(failed).isSameAs(fatal);assertThat(failed.getSuppressed()).contains(cleanup);
+                var pipeline=pipelines.get("flow");
+                var operations=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(pipeline,"operations");
+                assertThat(operations).hasSize(1);
+                assertThat(org.springframework.test.util.ReflectionTestUtils.getField(operations.values().iterator().next(),"unknown")).isEqualTo(true);
+                assertThat(org.springframework.test.util.ReflectionTestUtils.getField(pipeline,"references")).isEqualTo(0);
+                var lock=(java.util.concurrent.locks.ReentrantLock)org.springframework.test.util.ReflectionTestUtils.getField(pipeline,"lock");
+                assertThat(lock.isLocked()).isFalse();assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(1);
+            }finally{var companion=borrowed.get();if(companion!=null)companion.close();}
+        }
+    }
+
     @Test void concurrentRootProducingReservationsCannotHoldEachOthersQuotaFrames()throws Exception{
         try(var f=new Fixture();var callers=Executors.newFixedThreadPool(2)){
             assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);

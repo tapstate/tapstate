@@ -350,6 +350,8 @@ public final class ValidationPredicate {
         else if (value instanceof BigInteger i) budget.spend(1L + i.bitLength() / 32L);
         else budget.spend(1);
     }
+    // Decimal string conversion would change the value of finite binary operands.
+    @SuppressWarnings("java:S2111")
     private static BigDecimal exact(Number value) {
         if (value instanceof BigDecimal d) return d;
         if (value instanceof BigInteger i) return new BigDecimal(i);

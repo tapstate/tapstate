@@ -51,5 +51,11 @@ public final class ValidationOwnerRanking {
         }
     }
 
-    private record Candidate(String nodeId, byte[] score) {}
+    private static final class Candidate {
+        private final String nodeId;
+        private final byte[] score;
+        private Candidate(String nodeId,byte[] score){this.nodeId=nodeId;this.score=score;}
+        private String nodeId(){return nodeId;}
+        private byte[] score(){return score;}
+    }
 }

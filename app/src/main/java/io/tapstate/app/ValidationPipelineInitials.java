@@ -298,7 +298,11 @@ final class ValidationPipelineInitials implements SourceInitialLoadObserver, Aut
         final ConcurrentMap<Attempt, ConcurrentMap<String, Life>> sources = new ConcurrentHashMap<>();
         final Object originLock=new Object(),budgetLock=new Object();
         final Map<Attempt,Long> charges=new HashMap<>();
+        // Publishes immutable attempt/writer snapshots; originLock and budgetLock guard transitions.
+        @SuppressWarnings("java:S3077")
         volatile Attempt latestOrigin;
+        // Publishes immutable attempt/writer snapshots; originLock and budgetLock guard transitions.
+        @SuppressWarnings("java:S3077")
         volatile SinkAckFactory.RunWriters roster;
         long rosterBytes;
         volatile boolean closed;

@@ -36,6 +36,8 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     private final Runnable requireCurrent, requireOriginalCleanup;
     private final AtomicBoolean attempted = new AtomicBoolean(), cancelled = new AtomicBoolean();
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
+    // Publishes the original job handle; submission and cancellation use the job lifecycle APIs.
+    @SuppressWarnings("java:S3077")
     private volatile Job originalJob;
     private volatile boolean submissionReturned, forgotten;
 

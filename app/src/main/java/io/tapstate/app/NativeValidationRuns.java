@@ -81,14 +81,27 @@ final class NativeValidationRuns implements AutoCloseable {
         final ValidationRunLifecycle lifecycle;
         final AtomicBoolean inFlight=new AtomicBoolean(),sealed=new AtomicBoolean();
         final AtomicInteger pendingPublications=new AtomicInteger();
-        volatile Shared shared;volatile ValidationRunLifecycle.Execution execution;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile Shared shared;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationRunLifecycle.Execution execution;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
         volatile io.tapstate.runtime.engine.validation.ValidationCandidateQueue candidates;
         io.tapstate.runtime.engine.validation.ValidationDelayController delays;
         ValidationControlStore.Delay confirmedDelay;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
         volatile ValidationRunLifecycle.Status observed;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
         volatile ValidationControlStore.Status terminalKnown;
         java.time.Instant terminalKnownAt,readingStarted,readingFinished;
         boolean reportSettled,retirementReleased,expired;
+        // Publishes actor handles or snapshots; inFlight, lifecycle and quota guards protect mutation.
+        @SuppressWarnings("java:S3077")
         volatile ValidationReportMetadata.Failure reportFailure;
         final AtomicBoolean mirrorWaiting=new AtomicBoolean();
         volatile boolean mirrorReady;

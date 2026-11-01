@@ -95,7 +95,8 @@ class PdkValidationSessionTest {
                                     || !filter.getSortOnList().get(0).getKey().equals("id")
                                     || filter.getSortOnList().get(0).getSort() != SortOn.ASCENDING)
                                 throw new IllegalStateException("wrong scan request");
-                            if (mode(c).equals("query-failure")) throw new Exception("query failed first");
+                            if (mode(c).equals("query-failure") || mode(c).equals("fatal-cleanup")) throw new Exception("query failed first");
+                            if (mode(c).equals("fatal-body")) throw new AssertionError("fatal query failed");
                             if (mode(c).equals("projection")) {
                                 if (filter.getProjection() == null
                                         || !new java.util.HashSet<>(filter.getProjection().getIncludeFields())
@@ -155,7 +156,9 @@ class PdkValidationSessionTest {
                         loader(); count(c, "stops");
                         if (!mode(c).equals("held-init")) signal(c, "release");
                         if (Thread.currentThread().isInterrupted()) count(c, "interruptedStops");
-                        if ((mode(c).equals("query-failure") || mode(c).equals("stop-failure") || mode(c).equals("stop-retry"))
+                        if (mode(c).equals("fatal-cleanup") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() == 1)
+                            throw new AssertionError("fatal cleanup failed");
+                        if ((mode(c).equals("query-failure") || mode(c).equals("stop-failure") || mode(c).equals("stop-retry") || mode(c).equals("fatal-body"))
                                 && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() == 1
                                 || mode(c).equals("stop-retry-twice") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get() <= 2)
                             throw new IllegalStateException("cleanup failed");
@@ -649,6 +652,21 @@ class PdkValidationSessionTest {
         }
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"fatal-cleanup","fatal-body"})
+    void fatalFailureDominatesTheOtherPhaseWithoutLosingCleanupOwnership(String mode)throws Exception{
+        var probe=new Probe("dual-failure",mode);
+        try(var io=Executors.newSingleThreadExecutor();var cursor=scan(probe,io)){
+            io.submit(()->{}).get(3,TimeUnit.SECONDS);
+            var failure=catchThrowable(cursor::next);
+            assertThat(failure).isInstanceOf(AssertionError.class).hasMessage(mode.equals("fatal-cleanup")?"fatal cleanup failed":"fatal query failed");
+            assertThat(failure.getSuppressed()).anySatisfy(context->assertThat(context).isInstanceOf(TapstateException.class));
+            var handle=(ValidationReadHandle)cursor;
+            assertThat(handle.workersExited().toCompletableFuture()).isCompletedExceptionally();
+            assertThat(PdkValidationReads.cleanupCompleted(handle).toCompletableFuture()).isNotDone();
+            cursor.close();PdkValidationReads.cleanupCompleted(handle).toCompletableFuture().get(3,TimeUnit.SECONDS);
+        }
+    }
     @Test void queryFailureRemainsPrimaryWhenCleanupAlsoFails() throws Exception {
         var probe = new Probe("fail", "query-failure");
         try (var io = Executors.newSingleThreadExecutor(); var cursor = scan(probe, io)) {

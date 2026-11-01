@@ -37,6 +37,8 @@ public final class ValidationFullScan {
     private final Runnable requireCurrent;
     private final Consumer<ValidationRootCheck> publish;
     private final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean();
+    // Publishes the current merge; its stateLock serializes close with consumption.
+    @SuppressWarnings("java:S3077")
     private volatile ValidationOrderedMerge active;
     private volatile boolean complete;
     private volatile int completedMappings;

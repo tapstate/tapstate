@@ -39,6 +39,8 @@ public final class ValidationCaptureObservations implements CaptureObservation.F
     private final String bootId;
     private final ReentrantLock control = new ReentrantLock();
     private final Map<String, Opening> retained = new LinkedHashMap<>();
+    // Publishes List.copyOf snapshots; contained openings own their retirement state.
+    @SuppressWarnings("java:S3077")
     private volatile List<Opening> current = List.of();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Thread maintenance;

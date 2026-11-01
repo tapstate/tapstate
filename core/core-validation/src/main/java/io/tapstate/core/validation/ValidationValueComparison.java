@@ -288,6 +288,8 @@ public final class ValidationValueComparison {
         return source.equals(target) ? null : difference(Kind.VALUE, path);
     }
 
+    // Cross-domain float consent compares exact binary values, not rounded decimal text.
+    @SuppressWarnings("java:S2111")
     private static boolean numericEquals(Number left, Number right) {
         boolean floatingLeft = left instanceof Float || left instanceof Double;
         boolean floatingRight = right instanceof Float || right instanceof Double;

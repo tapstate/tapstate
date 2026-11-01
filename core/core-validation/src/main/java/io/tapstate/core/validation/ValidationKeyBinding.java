@@ -195,6 +195,8 @@ public final class ValidationKeyBinding {
         return true;
     }
 
+    // This explicit policy requires the exact binary value, including its decimal expansion.
+    @SuppressWarnings("java:S2111")
     private static ValidationKey.Part number(Object value, NumericPolicy policy) {
         if (value instanceof BigDecimal decimal) return ValidationKey.Part.number(decimal);
         if (value instanceof BigInteger integer) return ValidationKey.Part.number(integer);

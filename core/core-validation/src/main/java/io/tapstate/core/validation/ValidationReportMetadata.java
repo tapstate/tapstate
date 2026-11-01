@@ -19,7 +19,7 @@ public final class ValidationReportMetadata {
             if(code!=null)text(code,256);Objects.requireNonNull(params);if(params.size()>32)throw limit();
             for(var entry:params.entrySet()){text(entry.getKey(),128);text(entry.getValue(),512);}
             params=Map.copyOf(params);text(exceptionType,256);text(message,2048);text(technical,8192);
-            long characters=(code==null?0:code.length())+exceptionType.length()+message.length()+technical.length();
+            long characters=(long)(code==null?0:code.length())+exceptionType.length()+message.length()+technical.length();
             for(var entry:params.entrySet())characters+=entry.getKey().length()+entry.getValue().length();
             if(characters>12*1024)throw limit();
         }

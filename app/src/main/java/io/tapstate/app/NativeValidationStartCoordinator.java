@@ -216,7 +216,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         synchronized(entries){
             var entry=entries.get(Key.of(original));
             if(entry!=null&&!entry.original.equals(original))return status(original,Outcome.REJECTED,null);
-            if(!known&&needsReceipt(original)){
+            if(!known&&entry!=null&&needsReceipt(original)){
                 if(verb==Verb.STOP){entry.stop=true;entry.retryStart=false;}
                 dispatchReceipt(entry,verb);return entry.observed;
             }
@@ -447,7 +447,13 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
         stops.cancel(false);member.getUserContext().remove(BINDING,this);owned.forEach(ValidationMemberResources.Control::close);registryBudget.close();
     }
     private static final class Entry {
-        final ValidationOperation original;final long bytes;final java.time.Instant latest;volatile Status observed;boolean inFlight,reservationAttempted,unsubmitted,stop,completed,originalClosed;
+        final ValidationOperation original;
+        final long bytes;
+        final java.time.Instant latest;
+        // Publishes status snapshots; the entries monitor guards their replacement and routing state.
+        @SuppressWarnings("java:S3077")
+        volatile Status observed;
+        boolean inFlight,reservationAttempted,unsubmitted,stop,completed,originalClosed;
         ValidationOwner owner;ValidationOwnerRouter.Receiver receiver;ValidationMemberResources.Control body;boolean retryStart;
         Entry(ValidationOperation original,long bytes,java.time.Instant latest){this.original=original;this.bytes=bytes;this.latest=latest;observed=status(original,Outcome.PENDING,null);}
     }

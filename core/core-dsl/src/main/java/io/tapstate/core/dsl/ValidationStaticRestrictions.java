@@ -41,7 +41,7 @@ public final class ValidationStaticRestrictions {
             if (nodes < 1 || nodes > 4096 || fields < 1 || fields > 65536 || reasons < 1 || reasons > 4096
                     || bytes < 1 || bytes > 16L * 1024 * 1024) throw invalid("staticRestrictions.limits");
         }
-        public static Limits defaults() { return new Limits(1024, 16384, 256, 1024 * 1024); }
+        public static Limits defaults() { return new Limits(1024, 16384, 256, 1024L * 1024); }
     }
     public record Report(List<Reason> reasons, int examinedNodes, int examinedFields, long accountedBytes) {
         public Report { reasons = List.copyOf(reasons); }

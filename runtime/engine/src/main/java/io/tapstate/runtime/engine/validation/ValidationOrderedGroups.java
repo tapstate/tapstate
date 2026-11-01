@@ -45,8 +45,14 @@ public final class ValidationOrderedGroups implements AutoCloseable {
     private Instant startedAt;
     private Instant observedThrough;
     private final AtomicBoolean closed = new AtomicBoolean();
+    // One consumer owns progression; immutable keys/samples and the group atomic guard support close.
+    @SuppressWarnings("java:S3077")
     private volatile Sample lookahead;
+    // One consumer owns progression; immutable keys/samples and the group atomic guard support close.
+    @SuppressWarnings("java:S3077")
     private volatile Group outstanding;
+    // One consumer owns progression; immutable keys/samples and the group atomic guard support close.
+    @SuppressWarnings("java:S3077")
     private volatile ValidationKey previous;
     private long expectedOrdinal;
     private boolean eof;

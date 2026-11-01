@@ -99,7 +99,7 @@ class ValidationNestArrayMembersTest {
         assertThat(result.groups()).noneMatch(Group::targetConflict);
         var targetConflict = members(parent, List.of("items"), List.of(member(11, 1, "A"), member(12, 2, "B")),
                 List.of(member(11, 1, "A"), member(11, 2, "B")));
-        assertThat(targetConflict.groups()).allMatch(Group::targetConflict);
+        assertThat(targetConflict.groups()).isNotEmpty().allMatch(Group::targetConflict);
     }
 
     @Test void emptyCompleteArraysAreValidButOneCompletedSideIsNotEnough() {

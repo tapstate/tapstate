@@ -146,6 +146,8 @@ final class PdkValidationSession {
     private boolean queryOpen;
     private long queryGeneration;
     private final Object stopLock = new Object();
+    // Publishes the original connector to cancellation; stopLock serializes its cleanup.
+    @SuppressWarnings("java:S3077")
     private volatile PdkConnector connector;
     private final Object activityLock = new Object();
     private final CompletableFuture<Void> workersExited = new CompletableFuture<>();
@@ -353,7 +355,6 @@ final class PdkValidationSession {
             failure.record(reported);
             primary = failure.get();
             ValidationFailureLatch.addContext(primary, reported);
-            throw primary;
         } finally {
             try { finish(); }
             catch (Throwable cleanup) {
@@ -361,9 +362,10 @@ final class PdkValidationSession {
                 Throwable dominant = failure.get();
                 ValidationFailureLatch.addContext(dominant, primary);
                 ValidationFailureLatch.addContext(dominant, cleanup);
-                if (primary == null || dominant instanceof Error) throw dominant;
             }
         }
+        Throwable result=failure.get();
+        if(result!=null)throw result;
     }
 
     private DataMap match(TapTable model, PdkValidationCodecs codecs, Lookup lookup) {

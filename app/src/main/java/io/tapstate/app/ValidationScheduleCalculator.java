@@ -143,8 +143,14 @@ public final class ValidationScheduleCalculator implements ValidationSchedule.Ca
         if (!fields.possible()) throw new TapstateException(ValidationError.SCHEDULE_NO_DATE, Map.of(), null);
         return fields;
     }
-    private record Fields(int[] minutes, int[] hours, boolean[] days, boolean[] months, boolean[] weekdays,
-                          boolean anyDay, boolean anyWeekday) {
+    private static final class Fields {
+        private final int[] minutes,hours;
+        private final boolean[] days,months,weekdays;
+        private final boolean anyDay,anyWeekday;
+        private Fields(int[] minutes,int[] hours,boolean[] days,boolean[] months,boolean[] weekdays,boolean anyDay,boolean anyWeekday){
+            this.minutes=minutes;this.hours=hours;this.days=days;this.months=months;this.weekdays=weekdays;
+            this.anyDay=anyDay;this.anyWeekday=anyWeekday;
+        }
         private boolean matches(LocalDate date) {
             if (!months[date.getMonthValue()]) return false;
             boolean dom = days[date.getDayOfMonth()]; boolean dow = weekdays[date.getDayOfWeek().getValue() % 7];

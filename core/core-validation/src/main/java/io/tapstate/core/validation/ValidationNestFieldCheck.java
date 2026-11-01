@@ -132,8 +132,9 @@ public final class ValidationNestFieldCheck {
         return left.kind() == FieldKind.EMBED_PATH ? left : right;
     }
     private static boolean overlaps(String left, String right) {
-        String shorter = left.length() <= right.length() ? left : right;
-        String longer = shorter == left ? right : left;
+        boolean leftShorter=left.length()<=right.length();
+        String shorter=leftShorter?left:right;
+        String longer=leftShorter?right:left;
         return longer.startsWith(shorter) && (longer.length() == shorter.length() || longer.charAt(shorter.length()) == '.');
     }
     private static void requireScope(ValidationObservation actual, ValidationObservation expected) {

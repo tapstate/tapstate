@@ -74,6 +74,8 @@ final class ValidationRunLifecycle {
     private ValidationRunState terminalChoice;
     private ValidationControlStore.Transition pendingTransition;
     private boolean admissionRejected, joinRejected;
+    // Publishes the execution for concurrent stop; synchronized transitions and cancel own its state.
+    @SuppressWarnings("java:S3077")
     private volatile Execution execution;
     private Throwable controlFailure;
 

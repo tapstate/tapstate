@@ -101,7 +101,18 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
         final ValidationRunIdentity identity;final ValidationRunSpec spec;final ValidationMemberResources.Run allocation;
         final ValidationFailureLatch failures=new ValidationFailureLatch();
         final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean(),cleanupRequested=new AtomicBoolean();
-        volatile Plan plan;volatile ValidationFullScan scan;volatile ValidationCountScan counts;volatile ValidationLocalBudget.Reservation planLease;
+        // Publishes the original worker/cleanup handles; their lifecycle APIs serialize cancellation and release.
+        @SuppressWarnings("java:S3077")
+        volatile Plan plan;
+        // Publishes the original worker/cleanup handles; their lifecycle APIs serialize cancellation and release.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationFullScan scan;
+        // Publishes the original worker/cleanup handles; their lifecycle APIs serialize cancellation and release.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationCountScan counts;
+        // Publishes the original worker/cleanup handles; their lifecycle APIs serialize cancellation and release.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationLocalBudget.Reservation planLease;
         volatile boolean workerOutstanding,finished,cleanupExited;
         Work(ValidationRunIdentity identity,ValidationRunSpec spec,ValidationMemberResources.Run allocation) {
             this.identity=identity;this.spec=spec;this.allocation=allocation;

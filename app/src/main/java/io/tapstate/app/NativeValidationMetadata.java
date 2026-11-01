@@ -13,7 +13,7 @@ import java.util.concurrent.*;
 
 /** Pre-owner independent metadata over selected CONFIG declarations; no task, count result or Job is created. */
 final class NativeValidationMetadata {
-    private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64*1024,8192,32);
+    private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64L*1024,8192,32);
     record Projection(List<String> source,List<String> target){
         Projection{source=fields(source);target=fields(target);if(source.size()!=target.size())throw invalid("keyArity");}
         private static List<String> fields(List<String> fields){
@@ -94,6 +94,8 @@ final class NativeValidationMetadata {
             if(artifactBytes>4L*1024*1024)throw limit("connectorMetadata");
             require();artifacts.put(source.connector(),retained);return retained;
         }
+        // Probe takes each original handle and its retry/drain receipts before worker submission.
+        @SuppressWarnings("java:S2095")
         private Side read(ValidationDirectMappings.Declared declared,boolean source,List<String> fields){
             require();var side=source?declared.mapping().source():declared.mapping().target();
             var resource=StoredArtifacts.requireSource(selected.artifacts(),side.sourceId());var artifact=artifact(resource);

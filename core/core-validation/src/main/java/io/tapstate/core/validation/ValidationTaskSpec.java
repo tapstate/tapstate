@@ -19,7 +19,7 @@ import java.util.TreeMap;
 public record ValidationTaskSpec(String pipelineId, Map<String, String> dependencyHashes, long mappingRevision,
                                  String comparisonRulesVersion, List<Mapping> mappings) {
     public static final int MAX_MAPPINGS = 1024;
-    public static final long MAX_METADATA_BYTES = 1024 * 1024;
+    public static final long MAX_METADATA_BYTES = 1024L * 1024;
     public enum OutputKind { VIEW, SYNC }
 
     /** Resource references and actual physical names only; never credentials, driver objects or row values. */

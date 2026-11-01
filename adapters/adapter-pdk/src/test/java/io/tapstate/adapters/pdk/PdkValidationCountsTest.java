@@ -55,7 +55,8 @@ class PdkValidationCountsTest {
                         if (!t.getId().equals("records") || q.getLimit()!=null || q.getSkip()!=null)
                             throw new AssertionError("wrong count scope");
                         if (mode(c).equals("missing")) throw new Exception("missing namespace");
-                        if (mode(c).equals("fail")) throw new Exception("native count failed");
+                        if (mode(c).equals("fail") || mode(c).equals("fatal-cleanup")) throw new Exception("native count failed");
+                        if (mode(c).equals("fatal-body")) throw new AssertionError("fatal count failed");
                         return mode(c).equals("zero") ? 0L : 9007199254740993L;
                     });
                     f.supportGetTableInfoFunction((c,t) -> {
@@ -81,7 +82,9 @@ class PdkValidationCountsTest {
                 }
                 public void stop(TapConnectionContext c) throws Throwable {
                     loader(); called(c,"stops");
-                    if (mode(c).equals("cleanup") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get()==1)
+                    if (mode(c).equals("fatal-cleanup") && ((AtomicInteger)c.getConnectionConfig().get("stops")).get()==1)
+                        throw new AssertionError("fatal cleanup failed");
+                    if ((mode(c).equals("cleanup") || mode(c).equals("fatal-body")) && ((AtomicInteger)c.getConnectionConfig().get("stops")).get()==1)
                         throw new Exception("first cleanup failed");
                 }
                 public void discoverSchema(TapConnectionContext c,List<String> t,int n,Consumer<List<TapTable>> sink) {
@@ -250,6 +253,21 @@ class PdkValidationCountsTest {
             assertThat(reader.drained()).isTrue();assertThat((AtomicInteger)settings.get("counts")).hasValue(0);
             assertThat((AtomicInteger)settings.get("stops")).hasValue(2);
         }finally{release.countDown();reader.close();}
+    }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"fatal-cleanup","fatal-body"})
+    void fatalFailureDominatesTheOtherPhaseWithoutLosingCleanupOwnership(String mode){
+        var settings=settings(mode);var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
+        try{
+            var failure=catchThrowable(reader::count);
+            assertThat(failure).isInstanceOf(AssertionError.class).hasMessage(mode.equals("fatal-cleanup")?"fatal cleanup failed":"fatal count failed");
+            assertThat(failure.getSuppressed()).anySatisfy(context->{
+                if(mode.equals("fatal-cleanup"))assertThat(context).isInstanceOf(TapstateException.class);
+                else assertThat(context).isInstanceOf(Exception.class).hasMessage("first cleanup failed");
+            });
+            assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();assertThat(reader.drained()).isFalse();
+            reader.close();assertThat(reader.drained()).isTrue();assertThat((AtomicInteger)settings.get("stops")).hasValue(2);
+        }finally{reader.close();}
     }
     @Test void failedCleanupKeepsTheOriginalHandleForRetry() {
         var settings=settings("cleanup");var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);

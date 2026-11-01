@@ -36,7 +36,7 @@ public final class ValidationStructuralRestrictions {
             if (nodes < 1 || nodes > 4096 || visits < 1 || visits > 131072 || reasons < 1 || reasons > 4096
                     || bytes < 1 || bytes > 16L * 1024 * 1024) throw invalid("structuralRestrictions.limits");
         }
-        public static Limits defaults() { return new Limits(1024, 16384, 256, 1024 * 1024); }
+        public static Limits defaults() { return new Limits(1024, 16384, 256, 1024L * 1024); }
     }
     public record Report(ValidationMethod method, List<Reason> reasons, int visitedSteps, long accountedBytes) {
         public Report { Objects.requireNonNull(method, "method"); reasons = List.copyOf(reasons); }

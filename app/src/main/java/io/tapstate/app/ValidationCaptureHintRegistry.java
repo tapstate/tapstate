@@ -118,6 +118,8 @@ public final class ValidationCaptureHintRegistry implements AutoCloseable {
     private final AtomicLong callbackCompleted = new AtomicLong();
     private final AtomicInteger broadcasting = new AtomicInteger();
     private final ValidationFailureLatch failure = new ValidationFailureLatch();
+    // Publishes List.copyOf snapshots; registrations own their callback and retirement guards.
+    @SuppressWarnings("java:S3077")
     private volatile List<Registration> current = List.of();
     private volatile boolean closed;
     private long bytes;

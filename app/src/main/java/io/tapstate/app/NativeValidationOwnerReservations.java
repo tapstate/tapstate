@@ -27,7 +27,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private static final String CONTEXT = "tapstate.validation-owner-reservations";
     private static final int MAX_PIPELINES = 64, MAX_OPERATIONS = 128;
     private static final long HANDOFF_NANOS = Duration.ofSeconds(30).toNanos();
-    private static final ValidationLocalBudget.Amount CONTROL_ENVELOPE=new ValidationLocalBudget.Amount(64*1024,1,0,0);
+    private static final ValidationLocalBudget.Amount CONTROL_ENVELOPE=new ValidationLocalBudget.Amount(64L*1024,1,0,0);
     @FunctionalInterface interface Startup {StartupGate inspect(ValidationSavedDeclarations saved,ValidationRunSpec spec);}
     record StartupGate(boolean controlOnly,Supplier<ValidationRunLifecycle.Readiness> current){
         StartupGate{Objects.requireNonNull(current);}
@@ -112,76 +112,93 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     }
 
     @Override public Result reserve(Request request) {
-        requireActive(); var local = pipeline(request.pipeline());
-        if (!local.lock.tryLock()) { unpin(local); return new Result(Outcome.BUSY, null, null); }
-        Reservation operation = null;Handoff handoff=null;
-        try {
-            refreshLifetime(local);
-            reap(local);
-            for(var previous:local.operations.values())if(sameBlock(previous.request,request)&&previous.blocked.contains(request.command()))
-                return new Result(Outcome.REJECTED,null,ValidationError.EXECUTION_CANCELLED.code());
-            var key = new Operation(request.task(), request.taskGeneration(), request.mode(), request.command());
-            operation = local.operations.get(key);
-            if (operation != null) {
-                if (!operation.request.equals(request)) return new Result(Outcome.REJECTED, null, ValidationError.INVALID_CONTRACT.code());
-                return operation.reply();
-            }
-            if (local.operations.size() == maxOperations) reapSupersededHandoffs(local);
-            if (local.operations.size() == maxOperations) {
-                handoff=compactPredecessor(local,request);if(handoff==null)return Result.capacity();
-                local.operations.remove(handoff.key(),handoff.displaced());
-            }
-            operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
-            operation.preparing = true;
-            int frames=retainedFrames(request);Owner borrowed=null;long borrowedGeneration=0;
-            if(frames==2&&local.owner!=null&&!local.owner.retired.get()&&local.owner.lease.authorized()){
-                var current=local.owner;
-                if(current.quotaMetadata!=null&&current.quotaGeneration==current.countingGeneration){
-                    operation.quotaMetadata=current.quotaMetadata.retainIfAlive();
-                    if(operation.quotaMetadata!=null){borrowed=current;borrowedGeneration=current.countingGeneration;frames=1;}
+        requireActive();var attempt=new ReserveAttempt(request);var failures=new ValidationFailureLatch();
+        var local=pipeline(request.pipeline());attempt.local=local;
+        if(!local.lock.tryLock()){unpin(local);return new Result(Outcome.BUSY,null,null);}
+        Result result=null;Throwable bodyFailure=null,cleanupFailure=null;
+        try{result=attempt.prepare();}catch(RuntimeException|Error failed){bodyFailure=failed;}
+        try{attempt.cleanup();}catch(RuntimeException|Error failed){cleanupFailure=failed;}
+        if(bodyFailure!=null)failures.record(bodyFailure);
+        if(cleanupFailure!=null){
+            failures.record(cleanupFailure);ValidationFailureLatch.addContext(failures.get(),bodyFailure);
+            ValidationFailureLatch.addContext(failures.get(),cleanupFailure);
+        }
+        throwFailure(failures);return Objects.requireNonNull(result,"reservation result");
+    }
+    /** One caller owns preparation and cleanup; failures escape only after lock and pin release. */
+    private final class ReserveAttempt {
+        private final Request request;private Pipeline local;private Reservation operation;private Handoff handoff;
+        private ReserveAttempt(Request request){this.request=request;}
+        private Result prepare(){
+            try {
+                refreshLifetime(local);
+                reap(local);
+                for(var previous:local.operations.values())if(sameBlock(previous.request,request)&&previous.blocked.contains(request.command()))
+                    return new Result(Outcome.REJECTED,null,ValidationError.EXECUTION_CANCELLED.code());
+                var key = new Operation(request.task(), request.taskGeneration(), request.mode(), request.command());
+                operation = local.operations.get(key);
+                if (operation != null) {
+                    if (!operation.request.equals(request)) return new Result(Outcome.REJECTED, null, ValidationError.INVALID_CONTRACT.code());
+                    return operation.reply();
                 }
+                if (local.operations.size() == maxOperations) reapSupersededHandoffs(local);
+                if (local.operations.size() == maxOperations) {
+                    handoff=compactPredecessor(local,request);if(handoff==null)return Result.capacity();
+                    local.operations.remove(handoff.key(),handoff.displaced());
+                }
+                operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
+                operation.preparing = true;
+                int frames=retainedFrames(request);Owner borrowed=null;long borrowedGeneration=0;
+                if(frames==2&&local.owner!=null&&!local.owner.retired.get()&&local.owner.lease.authorized()){
+                    var current=local.owner;
+                    if(current.quotaMetadata!=null&&current.quotaGeneration==current.countingGeneration){
+                        operation.quotaMetadata=current.quotaMetadata.retainIfAlive();
+                        if(operation.quotaMetadata!=null){borrowed=current;borrowedGeneration=current.countingGeneration;frames=1;}
+                    }
+                }
+                var metadata=resources.admitRetainedMetadata(frames);operation.metadata=metadata.getFirst();
+                if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
+                var task = task(request); var definitions = configuration.validationTasks(NativeValidationOwnerReservations.this::requireActive);
+                var inputs = definitions.inputs(task, request.configurationRevision());
+                if (inputs.isEmpty()) return operation.reject();
+                operation.declarations = ValidationSavedDeclarations.inspect(inputs.orElseThrow(), configuration.bindings().load().orElseThrow(() -> unauthorized(request.pipeline())).defaultSourceId());
+                var saved = operation.declarations.original().task();
+                operation.spec = new ValidationRunSpec(saved.comparison(), ValidationMode.valueOf(request.mode()),
+                        request.mode().equals("FULL") ? saved.settings().full().method() : ValidationMethod.FULL_COLUMN);
+                if(needsQuota(operation.spec)!=(operation.quotaMetadata!=null))return operation.reject();
+                var selected = saved.mode(operation.spec.mode());
+                if (selected.permission() != null && selected.permission().start().sequence() == request.startSequence()) return operation.reject();
+                if (selected.nextStartSequence() != request.startSequence()) return operation.reject();
+                operation.startup=startup.inspect(operation.declarations,operation.spec);operation.dataEnvelope=envelope(saved,operation.spec);
+                operation.unbound = resources.reserve(operation.startup.controlOnly()?CONTROL_ENVELOPE:operation.dataEnvelope, operation.startup.controlOnly()?0:1);
+                operation.claimUncertain = true;
+                var owner = ensureOwner(local); operation.claimUncertain = false; if (owner == null) return operation.redirect();
+                operation.owner = owner; operation.access = local.access; owner.lease.require();
+                if(borrowed!=null&&(borrowed!=owner||borrowedGeneration!=owner.countingGeneration))return operation.reject();
+                if(operation.quotaMetadata!=null){owner.quotaMetadata=operation.quotaMetadata;owner.quotaGeneration=owner.countingGeneration;}
+                if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
+                NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
+                        known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
+                var current = definitions.read(request.pipeline(), request.task()).orElse(null);
+                if (current == null || !current.task().equals(task) || current.revision() != request.configurationRevision() || current.closed()
+                        || current.mode(operation.spec.mode()).nextStartSequence() != request.startSequence()) return operation.reject();
+                if (current.mode(operation.spec.mode()).permission() != null && current.mode(operation.spec.mode()).permission().phase() != ValidationTaskStore.Phase.CLOSED)
+                    return operation.busy();
+                if (operation.cancelled.get()) return operation.reject();
+                var identity = new ValidationRunIdentity(owner.lease.owner(), request.task(), request.run(), operation.spec.mode(), operation.spec.fingerprint(),
+                        operation.spec.task().mappingRevision(), operation.spec.task().comparisonRulesVersion());
+                operation.bound = operation.unbound.bind(identity, owner.lease::require);
+                operation.requireReserved(); return operation.reply();
+            } catch (TapstateException refusal) {
+                if (operation == null) throw refusal;
+                operation.reason = refusal.code().code(); operation.cancelled.set(true);
+                if (operation.claimUncertain) { operation.unknown = true; return new Result(Outcome.UNKNOWN, null, operation.reason); }
+                return new Result(refusal.code() == ValidationError.VALUE_LIMIT_EXCEEDED ? Outcome.CAPACITY : Outcome.REJECTED, null, operation.reason);
+            } catch (RuntimeException | Error defect) {
+                if (operation != null) operation.cancelled.set(true); throw defect;
             }
-            var metadata=resources.admitRetainedMetadata(frames);operation.metadata=metadata.getFirst();
-            if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
-            var task = task(request); var definitions = configuration.validationTasks(this::requireActive);
-            var inputs = definitions.inputs(task, request.configurationRevision());
-            if (inputs.isEmpty()) return operation.reject();
-            operation.declarations = ValidationSavedDeclarations.inspect(inputs.orElseThrow(), configuration.bindings().load().orElseThrow(() -> unauthorized(request.pipeline())).defaultSourceId());
-            var saved = operation.declarations.original().task();
-            operation.spec = new ValidationRunSpec(saved.comparison(), ValidationMode.valueOf(request.mode()),
-                    request.mode().equals("FULL") ? saved.settings().full().method() : ValidationMethod.FULL_COLUMN);
-            if(needsQuota(operation.spec)!=(operation.quotaMetadata!=null))return operation.reject();
-            var selected = saved.mode(operation.spec.mode());
-            if (selected.permission() != null && selected.permission().start().sequence() == request.startSequence()) return operation.reject();
-            if (selected.nextStartSequence() != request.startSequence()) return operation.reject();
-            operation.startup=startup.inspect(operation.declarations,operation.spec);operation.dataEnvelope=envelope(saved,operation.spec);
-            operation.unbound = resources.reserve(operation.startup.controlOnly()?CONTROL_ENVELOPE:operation.dataEnvelope, operation.startup.controlOnly()?0:1);
-            operation.claimUncertain = true;
-            var owner = ensureOwner(local); operation.claimUncertain = false; if (owner == null) return operation.redirect();
-            operation.owner = owner; operation.access = local.access; owner.lease.require();
-            if(borrowed!=null&&(borrowed!=owner||borrowedGeneration!=owner.countingGeneration))return operation.reject();
-            if(operation.quotaMetadata!=null){owner.quotaMetadata=operation.quotaMetadata;owner.quotaGeneration=owner.countingGeneration;}
-            if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
-            NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
-                    known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
-            var current = definitions.read(request.pipeline(), request.task()).orElse(null);
-            if (current == null || !current.task().equals(task) || current.revision() != request.configurationRevision() || current.closed()
-                    || current.mode(operation.spec.mode()).nextStartSequence() != request.startSequence()) return operation.reject();
-            if (current.mode(operation.spec.mode()).permission() != null && current.mode(operation.spec.mode()).permission().phase() != ValidationTaskStore.Phase.CLOSED)
-                return operation.busy();
-            if (operation.cancelled.get()) return operation.reject();
-            var identity = new ValidationRunIdentity(owner.lease.owner(), request.task(), request.run(), operation.spec.mode(), operation.spec.fingerprint(),
-                    operation.spec.task().mappingRevision(), operation.spec.task().comparisonRulesVersion());
-            operation.bound = operation.unbound.bind(identity, owner.lease::require);
-            operation.requireReserved(); return operation.reply();
-        } catch (TapstateException refusal) {
-            if (operation == null) throw refusal;
-            operation.reason = refusal.code().code(); operation.cancelled.set(true);
-            if (operation.claimUncertain) { operation.unknown = true; return new Result(Outcome.UNKNOWN, null, operation.reason); }
-            return new Result(refusal.code() == ValidationError.VALUE_LIMIT_EXCEEDED ? Outcome.CAPACITY : Outcome.REJECTED, null, operation.reason);
-        } catch (RuntimeException | Error defect) {
-            if (operation != null) operation.cancelled.set(true); throw defect;
-        } finally {
+        }
+        private void cleanup(){
             try {
                 if (operation != null) {
                     operation.preparing = false;
@@ -477,12 +494,42 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         final Pipeline pipeline; final Request request; final long created = handoffClock.getAsLong();
         final AtomicBoolean cancelled = new AtomicBoolean(), stopSignalled = new AtomicBoolean();
         volatile boolean preparing, activated, accepted, superseded, completed, locallyDisposed, claimUncertain, unknown, reportPending; volatile String reason;
-        volatile Owner owner; volatile ValidationSavedDeclarations declarations; volatile ValidationRunSpec spec;
-        volatile StartupGate startup;volatile ValidationLocalBudget.Amount dataEnvelope;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile Owner owner;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationSavedDeclarations declarations;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationRunSpec spec;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile StartupGate startup;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationLocalBudget.Amount dataEnvelope;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
         volatile MongoConfigurationDomain.ValidationAccess access;
-        volatile ValidationMemberResources.Metadata metadata,quotaMetadata; volatile ValidationMemberResources.Unbound unbound; volatile ValidationMemberResources.Run bound;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationMemberResources.Metadata metadata,quotaMetadata;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationMemberResources.Unbound unbound;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationMemberResources.Run bound;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
         private volatile Runnable stop;
-        private volatile ValidationRunState terminal;private boolean terminalAdmitted,terminalWithoutReport;private volatile TerminalReceipt previous;private Set<UUID> blocked=Set.of();
+        private volatile ValidationRunState terminal;
+        private boolean terminalAdmitted,terminalWithoutReport;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        private volatile TerminalReceipt previous;
+        private Set<UUID> blocked=Set.of();
         Reservation(Pipeline pipeline, Request request) { this.pipeline = pipeline; this.request = request; }
         synchronized ValidationMemberResources.Metadata takeQuotaMetadata(){
             requireReserved();var frame=quotaMetadata;if(frame==null)throw new IllegalStateException("root quota was not admitted with its original declaration");
@@ -592,13 +639,21 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private static final class Pipeline {
         final String pipeline; final ReentrantLock lock = new ReentrantLock();
         final Map<Operation, Reservation> operations = new ConcurrentHashMap<>();
-        volatile MongoConfigurationDomain.ValidationAccess access; volatile Owner owner;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile MongoConfigurationDomain.ValidationAccess access;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile Owner owner;
         int references;
         Pipeline(String pipeline) { this.pipeline = pipeline; }
     }
     private final class Owner {
         final Pipeline pipeline; final AtomicBoolean retired = new AtomicBoolean(); final ValidationOwnerLease lease; final long created = handoffClock.getAsLong();
-        volatile long countingGeneration,quotaGeneration;volatile ValidationMemberResources.Metadata quotaMetadata;
+        volatile long countingGeneration,quotaGeneration;
+        // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
+        @SuppressWarnings("java:S3077")
+        volatile ValidationMemberResources.Metadata quotaMetadata;
         Owner(Pipeline pipeline, WorkloadClaim claim, ClusterWorkloadClaims claims, long askedAt) {
             this.pipeline = pipeline;
             lease = new ValidationOwnerLease(pipeline.pipeline, claim, askedAt, ttl, System::nanoTime, () -> {

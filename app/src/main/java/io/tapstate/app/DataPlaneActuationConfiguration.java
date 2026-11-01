@@ -146,7 +146,7 @@ class DataPlaneActuationConfiguration {
                 local.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE),
                 local.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE),
                 new ValidationCaptureObservations.Limits(8, new ValidationCaptureHintRegistry.Limits(8,
-                        512 * 1024, new ValidationCaptureHintTap.Limits(4096, 1, 1024 * 1024))));
+                        512L * 1024, new ValidationCaptureHintTap.Limits(4096, 1, 1024L * 1024))));
     }
 
     @Bean(destroyMethod = "close")

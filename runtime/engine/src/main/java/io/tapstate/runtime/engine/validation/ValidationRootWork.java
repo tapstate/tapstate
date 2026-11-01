@@ -41,6 +41,8 @@ public final class ValidationRootWork {
     private final AtomicBoolean cancellationRequested = new AtomicBoolean();
     private final AtomicBoolean released = new AtomicBoolean();
     private volatile boolean exited;
+    // The worker publishes its finished result before exited; cancellation only discards the reference.
+    @SuppressWarnings("java:S3077")
     private volatile ValidationRootCheck result;
 
     private ValidationRootWork(ValidationObservation observation, Checker checker, Runnable requireAuthorized,

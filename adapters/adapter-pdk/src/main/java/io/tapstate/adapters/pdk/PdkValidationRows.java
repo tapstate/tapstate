@@ -103,6 +103,8 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
             rule=new Rule(Shape.INSTANT,PdkValidationTemporal.LegacyEncoding.EPOCH_SECONDS);
         }
         Payload payload = payload(selected, fieldModel == null ? null : fieldModel.nativeType(), field, rule);
+        // Connector-native BSON classes can live in loaders isolated from the host's BSON classes.
+        @SuppressWarnings("java:S1872")
         boolean objectId=rawValue&&raw!=null&&raw.getClass().getName().equals("org.bson.types.ObjectId");
         if(objectId){
             // The runtime class establishes the domain. The chosen codec must retain its exact

@@ -43,11 +43,11 @@ public interface ValidationReports {
                 admission.run().runId(),admission.task().generation(),admission.sequence());}
     }
     record RootSummary(String id,ValidationRoot root,Map<String,Object> summary){
-        public RootSummary{id=hash(id);Objects.requireNonNull(root);summary=owned(summary,128*1024);}
+        public RootSummary{id=hash(id);Objects.requireNonNull(root);summary=owned(summary,128L*1024);}
     }
     record RootDetail(String id,long revision,ValidationRoot root,Map<String,Object> observation){
         public RootDetail{id=hash(id);if(revision<1)throw invalid("report.rootRevision");
-            Objects.requireNonNull(root);observation=owned(observation,8*1024*1024);}
+            Objects.requireNonNull(root);observation=owned(observation,8L*1024*1024);}
     }
     /**
      * Caller supplies a known original CACHE retirement, never a request DTO or a cross-store commit

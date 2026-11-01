@@ -62,7 +62,11 @@ final class NativeValidationCaptureRegistrar implements AutoCloseable {
     final class Lease implements AutoCloseable {
         private final ValidationReportAdmission.Start original;private final ValidationCaptureRoute route;
         private final ValidationCaptureHintRegistry.Registration registration;private final ValidationMemberResources.Metadata paid;
-        private final AtomicBoolean inFlight=new AtomicBoolean();private volatile boolean closing;private volatile Throwable failure;
+        private final AtomicBoolean inFlight=new AtomicBoolean();
+        private volatile boolean closing;
+        // Publishes failure identity before releasing the inFlight maintenance guard.
+        @SuppressWarnings("java:S3077")
+        private volatile Throwable failure;
         private Lease(ValidationReportAdmission.Start original,ValidationCaptureRoute route,ValidationCaptureHintRegistry.Registration registration,ValidationMemberResources.Metadata paid){this.original=original;this.route=route;this.registration=registration;this.paid=paid;}
         ValidationCaptureRoute route(){return route;}
         boolean accepting(){return !closing&&registration.accepting();}
