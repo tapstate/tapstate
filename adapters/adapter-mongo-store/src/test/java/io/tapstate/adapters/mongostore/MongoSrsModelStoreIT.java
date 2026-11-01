@@ -1374,7 +1374,7 @@ class MongoSrsModelStoreIT {
                 SystemCollections.CACHE_IDENTITY.on(database).insertOne(new Document("_id", "cluster").append("clusterId", SCOPE.clusterId())
                         .append("layoutId", MongoConfigurationDomain.LAYOUT).append("bindingVersion", 1L).append("cacheIncarnation", SCOPE.cacheIncarnation())
                         .append("businessPhase", "READY").append("businessPreparationId", "business-a").append("authGeneration", 1L).append("claimAdmissionFence", 0L));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION).append("phase", "READY").append("epoch", 1L).append("operationId", "business-a"));
                 var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).acquire(
                         new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-a"), new WorkloadOwner("node-a", "boot-a"), 1, Duration.ofSeconds(30)).claim();
                 SystemCollections.SRS_CHAINS.on(database).insertOne(new Document("_id", CHAIN).append("formatVersion", 1).append("epoch", 7L)
