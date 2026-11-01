@@ -148,12 +148,12 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
                     require();scan.run();
                 }
             }
-            catch(RuntimeException|Error failed){record(failed);}
+            catch(RuntimeException|Error failed){recordReadFailure(failed);}
             finally{try{closePlan();}catch(RuntimeException|Error failed){record(failed);}}
             if(failures.get() instanceof Error fatal)throw fatal;
         }
         void require(){
-            throwFailure();if(cancelled.get())throw new TapstateException(ValidationError.EXECUTION_CANCELLED,Map.of("node",identity.owner().nodeId()),null);
+            throwFailure();if(cancelled.get())throw new NativeValidationCancellation(identity.owner().nodeId());
             original.requireReserved();
         }
         void publishRoot(ValidationRootCheck check){
@@ -219,8 +219,18 @@ final class NativeValidationFullJob implements ValidationRunLifecycle.Activation
             var lease=planLease;var current=plan;
             if(lease!=null&&!workerOutstanding&&(current==null||cleanupExited&&current.drained()))lease.close();
         }
+        private void recordReadFailure(Throwable failed){
+            var cause=failed.getCause();
+            boolean cancellationCause=cause==null||((cause instanceof java.util.concurrent.CancellationException||cause instanceof InterruptedException)
+                    &&cause.getCause()==null&&cause.getSuppressed().length==0);
+            if(cancelled.get()&&failed instanceof TapstateException coded&&cancellationCause
+                    &&(coded.code()==ValidationError.EXECUTION_CANCELLED||coded.code()==ValidationError.READ_CANCELLED)){
+                // Expected cancellation is control flow; failures collected during its unwind remain diagnoses.
+                for(var secondary:failed.getSuppressed())record(secondary);
+            }else record(failed);
+        }
         void record(Throwable failed){failures.record(failed);ValidationFailureLatch.addContext(failures.get(),failed);}
-        void recordPlanFailure(){var current=plan;if(current!=null){var failed=current.failure();if(failed!=null)record(failed);}}
+        void recordPlanFailure(){var current=plan;if(current!=null){var failed=current.failure();if(failed!=null)recordReadFailure(failed);}}
         @Override public void throwFailure(){recordPlanFailure();if(failures.get() instanceof Error fatal)throw fatal;if(failures.get() instanceof RuntimeException failed)throw failed;}
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","fullJob."+field),null);}

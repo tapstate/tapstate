@@ -550,7 +550,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             requireReserved();return saved;
         }
         void requireReserved() {
-            requireOwner(); if (cancelled.get() || bound == null) throw invalid("owner.reservationClosed");
+            requireOwner();
+            if(cancelled.get())throw new NativeValidationCancellation(owner.lease.owner().nodeId());
+            if(bound==null)throw invalid("owner.reservationClosed");
         }
         void requireOwner() {
             requireActive(); if (owner == null || owner.retired.get()) throw invalid("owner.reservationClosed");
