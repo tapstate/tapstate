@@ -16,6 +16,7 @@ import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.ObservationStore;
 
 import java.time.Clock;
@@ -184,7 +185,7 @@ public final class PipelineExplainService {
                 frontierStalledMillis.put(chain, value);
                 // A table still in its initial load has no durable position to advance yet, so its pinned
                 // time grows with the load and says nothing about the target.
-                if (FrontierStallPressure.EXPLAIN.isOver(value) && !stillLoading(loadStages, chain)) {
+                if (FrontierStallPressure.EXPLAIN.isOver(value) && !stillLoading(loadStages, observation, chain)) {
                     stalled.put(chain, value);
                 }
             }
@@ -206,9 +207,14 @@ public final class PipelineExplainService {
         return Collections.unmodifiableMap(stages);
     }
 
-    private static boolean stillLoading(Map<String, String> loadStages, String chain) {
+    /**
+     * Whether the chain's table is still in its initial load. Without an initial-load reading, as a copy publishes,
+     * a table the snapshot reports read through but not yet landed is still loading.
+     */
+    private static boolean stillLoading(Map<String, String> loadStages, Observation observation, String chain) {
         if (loadStages == null) {
-            return false;
+            TableSnapshot table = observation.snapshot().get(chain);
+            return table != null && !table.landed();
         }
         String stage = loadStages.get(chain);
         return stage != null && !InitialLoad.Stage.LANDED.name().equals(stage);

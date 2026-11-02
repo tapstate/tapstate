@@ -163,6 +163,26 @@ class PipelineExplainServiceTest {
         assertThat(answer.cannotSay()).doesNotContain("explain.cannot-snapshot-phase");
     }
 
+    /**
+     * A copy publishes per-table landed flags without an initial-load reading. A table read through and not yet
+     * landed is still loading, so its pinned time is no more a stall than a table the reading names as loading.
+     */
+    @Test
+    void withoutAnInitialLoadReadingATableNotYetLandedIsNotDiagnosedAsStalled() {
+        Observation observation = new Observation(ID, PipelineState.RUNNING, Map.of(
+                "recordCount", 100L,
+                "frontierStalledMillis.order_line", 248_780L,
+                "frontierStalledMillis.customer", 96_000L), Map.of(
+                "order_line", new TableSnapshot(100_280L, null, null, false),
+                "customer", new TableSnapshot(10_000L, 10_000L, 100, true)), Map.of(), null, NOW.minusSeconds(2));
+
+        PipelineExplanation answer = service(observation).explain(ID);
+
+        assertThat(answer.kind()).isEqualTo(Kind.FRONTIER_STALLED);
+        assertThat(answer.evidence()).extracting(Evidence::field)
+                .containsExactly("frontierStalledMillis.customer");
+    }
+
     @Test
     void aChainWhoseTableHasLandedIsStillDiagnosedAsStalled() {
         Observation observation = loading(Map.of(
