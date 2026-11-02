@@ -8,11 +8,13 @@ import java.util.Objects;
 /** A short-lived, always-aborted permission probe; it never runs storage migrations. */
 public final class MongoStorageConnectionProbe implements StorageConnectionProbe {
     private final Duration timeout;
-    public MongoStorageConnectionProbe(Duration timeout) { this.timeout = Objects.requireNonNull(timeout, "timeout"); }
+    private final java.util.function.Function<String,com.mongodb.ConnectionString> parser;
+    public MongoStorageConnectionProbe(Duration timeout) { this(timeout, com.mongodb.ConnectionString::new); }
+    MongoStorageConnectionProbe(Duration timeout, java.util.function.Function<String,com.mongodb.ConnectionString> parser) {
+        this.timeout = Objects.requireNonNull(timeout, "timeout"); this.parser = Objects.requireNonNull(parser, "parser");
+    }
     @Override public StorageBinding.Connection normalize(StorageBinding.Connection candidate) {
-        var normalized = MongoStorageConnectionInput.normalize(candidate);
-        return new StorageBinding.Connection(normalized.kind(), MongoStorageConnectionInput.databaseUri(normalized),
-                normalized.database(), normalized.caPem());
+        return MongoStorageConnectionInput.normalizeDatabase(candidate, parser);
     }
     @Override public StorageBinding.Connection validate(StorageBinding.Connection candidate) {
         return MongoStorageConnectionInput.validate(candidate);

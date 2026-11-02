@@ -22,6 +22,22 @@ class MongoStorageConnectionInputTest {
                     .isInstanceOf(TapstateException.class).hasMessageNotContaining("secret");
         }
     }
+    @Test void oneNormalizationRoundResolvesSrvTxtOnceWithoutCachingAnotherRound() {
+        var lookups = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.function.Function<String,com.mongodb.ConnectionString> parser = uri -> new com.mongodb.ConnectionString(uri,
+                (name, type) -> { lookups.incrementAndGet(); return java.util.List.of("authSource=admin"); });
+        var probe = new MongoStorageConnectionProbe(java.time.Duration.ofSeconds(1), parser);
+        var input = input("mongodb+srv://alice:secret@cluster.example.invalid/selected?tls=true", StorageBinding.Connection.Kind.MONGODB);
+        var normalized = probe.normalize(input);
+        assertThat(lookups).hasValue(1);
+        var parsed = MongoStorageConnectionInput.syntaxOnly(normalized.uri());
+        assertThat(parsed.getCredential().getSource()).isEqualTo("admin");
+        assertThat(parsed.getSslEnabled()).isTrue();
+        assertThat(parsed.getDatabase()).isEqualTo("selected");
+        probe.normalize(input);
+        assertThat(lookups).hasValue(2);
+    }
+
     @Test void freezesOriginalAuthenticationDatabaseAndKeepsOptionsAndSeeds() {
         var normalized = MongoStorageConnectionInput.normalize(input(
                 "mongodb://alice:pa%40ss@host1:27017,host2:27017/original?replicaSet=rs&tls=true", StorageBinding.Connection.Kind.MONGODB));

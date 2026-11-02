@@ -30,7 +30,23 @@ public final class MongoStorageConnectionInput {
         return new ConnectionString(uri, (name, type) -> java.util.List.of());
     }
 
+    static StorageBinding.Connection normalize(StorageBinding.Connection input, java.util.function.Function<String,ConnectionString> parser) {
+        return normalize(input, true, parser);
+    }
     private static StorageBinding.Connection normalize(StorageBinding.Connection input, boolean resolveDns) {
+        return normalize(input, resolveDns, ConnectionString::new);
+    }
+    private record Parsed(StorageBinding.Connection connection, ConnectionString parsed) {}
+    private static StorageBinding.Connection normalize(StorageBinding.Connection input, boolean resolveDns,
+            java.util.function.Function<String,ConnectionString> parser) {
+        return parseNormalized(input, resolveDns, parser).connection();
+    }
+    static StorageBinding.Connection normalizeDatabase(StorageBinding.Connection input, java.util.function.Function<String,ConnectionString> parser) {
+        var captured = parseNormalized(input, true, parser); var connection = captured.connection();
+        return new StorageBinding.Connection(connection.kind(), databaseUri(connection, captured.parsed()), connection.database(), connection.caPem());
+    }
+    private static Parsed parseNormalized(StorageBinding.Connection input, boolean resolveDns,
+            java.util.function.Function<String,ConnectionString> parser) {
         Objects.requireNonNull(input, "input");
         String uri = input.uri();
         try {
@@ -48,8 +64,8 @@ public final class MongoStorageConnectionInput {
                 if (!options.containsKey("tls") && !options.containsKey("ssl")) uri = append(uri, "tls=true");
             }
             StorageBinding.Connection normalized = new StorageBinding.Connection(input.kind(), uri, input.database(), input.caPem());
+            ConnectionString parsed = resolveDns ? MongoConnection.parseConnectionString(uri, parser) : syntaxOnly(uri);
             try (MongoConnection connection = MongoConnection.forCache(normalized, Duration.ofSeconds(10), null)) {
-                ConnectionString parsed = resolveDns ? MongoConnection.parseConnectionString(uri, ConnectionString::new) : syntaxOnly(uri);
                 connection.selectedDatabase(parsed);
                 if (!resolveDns && !input.database().equals(parsed.getDatabase())) throw refused();
                 connection.buildClientSettings(parsed);
@@ -59,16 +75,19 @@ public final class MongoStorageConnectionInput {
                         && parsed.getCredential().getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_256
                         && parsed.getCredential().getAuthenticationMechanism() != AuthenticationMechanism.SCRAM_SHA_1))) throw refused();
             }
-            return normalized;
+            return new Parsed(normalized, parsed);
         } catch (IllegalArgumentException invalid) {
             throw refused();
         }
     }
 
     /** Freezes the effective original authSource before changing a logical target database. */
-    public static String databaseUri(StorageBinding.Connection normalized) {
+    public static String databaseUri(StorageBinding.Connection normalized) { return databaseUri(normalized, ConnectionString::new); }
+    static String databaseUri(StorageBinding.Connection normalized, java.util.function.Function<String,ConnectionString> parser) {
+        return databaseUri(normalized, MongoConnection.parseConnectionString(normalized.uri(), parser));
+    }
+    private static String databaseUri(StorageBinding.Connection normalized, ConnectionString parsed) {
         String uri = normalized.uri();
-        ConnectionString parsed = MongoConnection.parseConnectionString(uri, ConnectionString::new);
         if (!options(uri).containsKey("authsource") && parsed.getCredential() != null) {
             uri = append(uri, "authSource=" + java.net.URLEncoder.encode(parsed.getCredential().getSource(), StandardCharsets.UTF_8));
         }
