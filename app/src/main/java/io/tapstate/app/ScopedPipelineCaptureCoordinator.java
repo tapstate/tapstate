@@ -554,7 +554,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner.physical!=null && !owner.physical.live.get() && !owner.physical.ioExitConfirmed)return true;
         if(closed.get())return false;
         if(owner.drainingReports())return owner.reportTimeRemaining()&&owner.physical!=null&&owner.physical.reports.hasPendingReports();
-        if(owner.sessions.stream().anyMatch(original -> driving.get().test(original.pipelineId())))return true;
+        if(owner.sessions.stream().anyMatch(original -> driving.get().test(original.pipelineId())
+                && execution.authorization().authorized(original)))return true;
         if(owner.prepared.mode()!=CapturePreparation.Mode.SHARED_SRS)return false;
         owner.require();
         for(var member:retainedConsumers(owner)) {

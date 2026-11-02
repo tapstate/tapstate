@@ -7,7 +7,6 @@ import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
-import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.runtime.engine.OperatorMapCoordinates;
 import io.tapstate.spi.store.OperatorPlacement;
 import io.tapstate.spi.store.PipelineIntentScope;
@@ -143,26 +142,24 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
             // Read before the stop: "gone afterwards" means nothing at all unless something was there.
             // Each namespace separately, because the dimension side is what carries a stale value and a
             // reading over the fact mirror alone would pass with the other two untouched.
-            awaitHeld(database, SystemCollections.CACHE_JOIN_FACTS, "the fact mirror to hold the driving rows");
-            awaitHeld(database, SystemCollections.CACHE_JOIN_DIMENSIONS, "the dimension mirror to hold the customers");
-            awaitHeld(database, SystemCollections.CACHE_JOIN_INDEXES, "the reverse index to hold a bucket per customer");
+            var original = NativePipelineScopes.current(storage, PIPELINE_ID);
+            awaitHeld(database, SystemCollections.CACHE_JOIN_FACTS, original, "the fact mirror to hold the driving rows");
+            awaitHeld(database, SystemCollections.CACHE_JOIN_DIMENSIONS, original, "the dimension mirror to hold the customers");
+            awaitHeld(database, SystemCollections.CACHE_JOIN_INDEXES, original, "the reverse index to hold a bucket per customer");
 
             // Asked to clear. A stop that was asked to keep leaves all of this standing, which is the
             // point of the flag; what is under test here is that clearing reaches the join at all.
             control.stop(PIPELINE_ID, true);
-            Await.until(
-                    PIPELINE_ID + " to reach " + PipelineState.STOPPED,
-                    () -> control.state(PIPELINE_ID).filter(PipelineState.STOPPED::equals).isPresent(),
-                    () -> String.valueOf(control.state(PIPELINE_ID)));
+            var successor = NativePipelineScopes.awaitCleared(control, storage, original, Duration.ofSeconds(60));
 
-            assertThat(held(database, SystemCollections.CACHE_JOIN_FACTS))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_FACTS, successor))
                     .as("the fact mirror after the stop")
                     .isZero();
-            assertThat(held(database, SystemCollections.CACHE_JOIN_DIMENSIONS))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_DIMENSIONS, successor))
                     .as("the dimension mirror after the stop - the one that serves a rebuilt run values "
                             + "its source no longer holds")
                     .isZero();
-            assertThat(held(database, SystemCollections.CACHE_JOIN_INDEXES))
+            assertThat(held(database, SystemCollections.CACHE_JOIN_INDEXES, successor))
                     .as("the reverse index after the stop")
                     .isZero();
             assertThat(neighbor.load(neighborPlacement.mapName(), KEY))
@@ -207,12 +204,15 @@ class AStoppedPipelineLetsGoOfItsJoinStateIT {
      * Waits for a namespace to hold something. Polled rather than read once: the target row reaching Mongo
      * says the join emitted, and the write through to the layer behind the map is a separate journey.
      */
-    private static void awaitHeld(MongoDatabase database, SystemCollections table, String what) {
-        Await.until(what, () -> held(database, table) > 0, () -> table.collectionName() + " holds 0 entries");
+    private static void awaitHeld(
+            MongoDatabase database, SystemCollections table, PipelineIntentScope scope, String what) {
+        Await.until(what, () -> held(database, table, scope) > 0,
+                () -> table.collectionName() + " holds 0 entries in " + scope);
     }
 
-    private static long held(MongoDatabase database, SystemCollections table) {
-        return table.on(database).countDocuments(new Document("_id.placement.scope.pipelineId", PIPELINE_ID));
+    private static long held(MongoDatabase database, SystemCollections table, PipelineIntentScope scope) {
+        return table.on(database).countDocuments(
+                new Document("_id.placement.scope", NativePipelineScopes.document(scope)));
     }
 
     private static void awaitName(
