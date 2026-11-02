@@ -160,10 +160,18 @@ class StorageAuthenticationTest {
             var original = authentication.managed();
             var created = original.service().exchangeCode("code", "cluster.example");
             assertThat(original.service().clusterContextView(created.token()).orElseThrow().ec2PublicIp()).isEqualTo("192.0.2.7");
+            var bootstrap = org.springframework.test.util.ReflectionTestUtils.getField(authentication, "bootstrap");
+            var temporary = (BootstrapCloudSessions)org.springframework.test.util.ReflectionTestUtils.getField(bootstrap, "sessions");
+            var counted = spy(temporary);
+            var service = (io.tapstate.control.core.CloudSessionService)org.springframework.test.util.ReflectionTestUtils.getField(original.service(), "sessions");
+            org.springframework.test.util.ReflectionTestUtils.setField(service, "sessions", counted);
             var proof = authentication.credentials().authenticateContext(created.token()).orElseThrow();
             assertThat(proof.storageScope()).isEmpty();
             assertThat(proof.organizationId()).contains("organization");
+            verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
+            clearInvocations(counted);
             proof.requireActive().run();
+            verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
             phase.set(StorageSetupStateStore.Phase.COMPLETE);
             assertThatThrownBy(proof.requireActive()::run).isInstanceOf(TapstateException.class);
             assertThatThrownBy(authentication::managed).isInstanceOf(TapstateException.class);
