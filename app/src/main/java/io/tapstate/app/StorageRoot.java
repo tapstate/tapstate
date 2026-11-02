@@ -260,7 +260,7 @@ final class StorageRoot implements AutoCloseable {
             var original = prepareInitialSetup(committed, target);
             authentication.install(original); phase = Phase.AUTH_READY;
             initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
-            if (startBusiness) startInitialBusiness(original, assembly);
+            if (startBusiness) startInitialBusiness(original, assembly, true);
         } catch (RuntimeException | Error failure) {
             initializationProgress.failed(scope, failure);
             throw failure;
@@ -269,6 +269,10 @@ final class StorageRoot implements AutoCloseable {
 
     private void startInitialBusiness(StorageRuntime.Bound original,
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        startInitialBusiness(original, assembly, false);
+    }
+    private void startInitialBusiness(StorageRuntime.Bound original,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly, boolean awaitInitialReadiness) {
         var authority = original.preparation().authScope();
         boolean tracked = authority.authGeneration() == 1;
         var scope = tracked ? original.binding().setup() : null;
@@ -277,7 +281,8 @@ final class StorageRoot implements AutoCloseable {
             initializationProgress.started(scope, StorageInitializationProgress.Stage.START_RUNTIME);
         }
         try {
-            runtime.startInitialBusiness(original, assembly);
+            if (awaitInitialReadiness || initialSourceTestPending) runtime.startInitialBusiness(original, assembly);
+            else runtime.startBusiness(original, assembly);
             if (tracked) {
                 initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
                 initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
@@ -308,7 +313,7 @@ final class StorageRoot implements AutoCloseable {
             var original = prepareInitialSetup(committed, target);
             authentication.install(original); phase = Phase.AUTH_READY;
             initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
-            startInitialBusiness(original, Objects.requireNonNull(retainedAssembly, "initial business assembly"));
+            startInitialBusiness(original, Objects.requireNonNull(retainedAssembly, "initial business assembly"), true);
         } catch (RuntimeException | Error failure) {
             initializationProgress.failed(scope, failure); throw failure;
         }
