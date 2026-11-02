@@ -55,6 +55,25 @@ class ValidationOrderedMergeTest {
         assertThat(right.borrowed).hasValue(0);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"GROUP","INPUT","HANDOFF"})
+    void aReturnedGroupsPublicMonitorCannotBlockItsOriginalOwnership(String operation)throws Exception {
+        try(var groups=groups(rows("source_key",1));var worker=Executors.newSingleThreadExecutor()) {
+            var group=groups.next().orElseThrow();var entered=new CountDownLatch(1);
+            Runnable action=switch(operation){case "GROUP"->group::close;case "INPUT"->groups::close;case "HANDOFF"->()->groups.handOff(group);default->throw new IllegalArgumentException(operation);};
+            synchronized(group){
+                var completed=worker.submit(()->{entered.countDown();action.run();});
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
+                assertThatCode(()->completed.get(1,TimeUnit.SECONDS)).as("Original ownership must not wait on the public value monitor").doesNotThrowAnyException();
+            }
+            if(operation.equals("HANDOFF")){
+                groups.close();assertThat(group.isClosed()).isFalse();
+                assertThat(group.sampleValues().fields()).containsEntry("source_key",1L);group.close();
+            }
+            assertThat(group.isClosed()).isTrue();
+        }
+    }
+
     @Test void entireDuplicateGroupIsCountedAcrossOneRowDeliverySlotsWithOnlyASampleRetained() {
         var rows = new Rows("source_key", 30000, ordinal -> Map.of("source_key", 4L, "sample", ordinal));
         try (var groups = groups(rows); var group = groups.next().orElseThrow()) {

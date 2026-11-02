@@ -130,7 +130,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
 
     /** The merge takes a returned group before publishing it in its own pending slot. */
     void handOff(Group group){
-        synchronized(group){
+        synchronized(group.ownershipLock){
             checkActive();
             if(outstanding!=group||group.isClosed()||group.handedOff)throw new IllegalStateException("validation group handoff is not original");
             group.handedOff=true;
@@ -209,6 +209,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
 
     /** Only the first sample is retained; multiplicity covers the entire group, including all batches. */
     public static final class Group implements AutoCloseable {
+        private final Object ownershipLock = new Object();
         private final AtomicReference<Sample> sample;
         private final long occurrences;
         private boolean handedOff;
@@ -229,7 +230,7 @@ public final class ValidationOrderedGroups implements AutoCloseable {
             return retained;
         }
 
-        private synchronized void closeIfOwned(){if(!handedOff)close();}
-        @Override public synchronized void close() { sample.set(null); }
+        private void closeIfOwned(){synchronized(ownershipLock){if(!handedOff)sample.set(null);}}
+        @Override public void close() { synchronized(ownershipLock){sample.set(null);} }
     }
 }
