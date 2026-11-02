@@ -558,8 +558,10 @@ class ManagedMongoStoreIsolationIT {
             try (var process = installationProcess(files, seeds, "lost")) {
                 firstPid = process.process.pid(); var management = process.management(files, setup.token());
                 assertThat(admin.getDatabase(cache).listCollectionNames().into(new ArrayList<>())).isEmpty();
-                var initial = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
-                assertThat(initial.get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+                    var initial = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                    assertThat(initial.get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                });
                 assertThatThrownBy(() -> process.publicClient().post().uri("/api/storage/recovery/plan")
                         .header(OnPremInstallation.CAPABILITY_HEADER, setup.token()).body(Map.of("scope", "CLUSTER", "pipelineIds", List.of()))
                         .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
@@ -1426,6 +1428,7 @@ class ManagedMongoStoreIsolationIT {
                         assertThat(assemblies.get()).isEqualTo(1);
                         assertThat(admin.getDatabase(configDb).getCollection("storage_setup").find().first()).containsEntry("phase","COMPLETE");
                     }
+                    response.clientDisconnected.countDown();
                     var child=childRef.get(); var member=child.getBean(com.hazelcast.core.HazelcastInstance.class);
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                     publish.countDown();
@@ -1448,13 +1451,14 @@ class ManagedMongoStoreIsolationIT {
                     var row = admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "atlas-store")).first();
                     assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
                 });
-                } finally { publish.countDown(); }
-            } finally { publish.countDown(); }
+                } finally { response.clientDisconnected.countDown(); publish.countDown(); }
+            } finally { response.clientDisconnected.countDown(); publish.countDown(); }
         }
     }
 
     private static final class DisconnectedResponse implements jakarta.servlet.Filter {
         final java.util.concurrent.CountDownLatch finished=new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch clientDisconnected=new java.util.concurrent.CountDownLatch(1);
         final AtomicReference<java.io.IOException> failure=new AtomicReference<>();
         private final java.util.concurrent.atomic.AtomicBoolean first=new java.util.concurrent.atomic.AtomicBoolean(true);
         @Override public void doFilter(jakarta.servlet.ServletRequest request,jakarta.servlet.ServletResponse response,jakarta.servlet.FilterChain chain)
@@ -1468,16 +1472,24 @@ class ManagedMongoStoreIsolationIT {
                     observed=new jakarta.servlet.ServletOutputStream() {
                         @Override public boolean isReady() { return output.isReady(); }
                         @Override public void setWriteListener(jakarta.servlet.WriteListener listener) { output.setWriteListener(listener); }
-                        @Override public void write(int value) throws java.io.IOException { try { output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void flush() throws java.io.IOException { try { output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void write(int value) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void flush() throws java.io.IOException { try { awaitClientDisconnect(); output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
                         @Override public void close() throws java.io.IOException { try { output.close(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
                     }; return observed;
                 }
             };
-            try { chain.doFilter(request,wrapped); wrapped.flushBuffer(); }
+            try { chain.doFilter(request,wrapped); awaitClientDisconnect(); wrapped.flushBuffer(); }
             catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; }
             finally { finished.countDown(); }
+        }
+        private void awaitClientDisconnect() throws java.io.IOException {
+            try {
+                if (!clientDisconnected.await(60, java.util.concurrent.TimeUnit.SECONDS))
+                    throw new AssertionError("the test did not disconnect its HTTP client");
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt(); throw new java.io.IOException(failure);
+            }
         }
     }
 
@@ -2280,7 +2292,7 @@ class ManagedMongoStoreIsolationIT {
                         io.tapstate.control.core.StorageSetupService.Layer.class);
                 for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE))
                     stamps.put(layer, service.test(issued.scope(), permission, candidate, layer).testStamp());
-                assertThat(targetTests).hasValue(1);
+                assertThat(targetTests).as("the CACHE proof does not execute the default Source test").hasValue(0);
                 allowedAudit.set(false);
                 assertThatThrownBy(() -> service.commit("owner", issued.scope(), permission, candidate, stamps))
                         .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
@@ -2324,6 +2336,7 @@ class ManagedMongoStoreIsolationIT {
                             .isInstanceOf(TapstateException.class);
                     assertThat(reopened.users().find("another")).isEmpty();
                 }
+                assertThat(targetTests).as("commit and reopen retain the binding without testing MASTER").hasValue(0);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                 assertThat(admin.getDatabase(masterDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                 assertThat(SystemCollections.AUDIT.on(admin.getDatabase(configDb)).find().into(new ArrayList<>()).toString())

@@ -14,7 +14,7 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
-                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
@@ -93,6 +93,7 @@ class ControlOperationsTest {
     @Test
     void scopesMatchTheOperationInventory() {
         assertThat(registry.resolve("artifact.apply").scope()).isEqualTo(Scope.WRITE);
+        assertThat(registry.resolve("storage.setup.activate").scope()).isEqualTo(Scope.WRITE);
         assertThat(registry.resolve("artifact.validate").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("pipeline.preview").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("artifact.get").scope()).isEqualTo(Scope.READ);
@@ -156,7 +157,7 @@ class ControlOperationsTest {
     void auditFlagMarksOnlyTheStateMutatingOperations() {
         for (String id :
                 List.of(
-                        "storage.setup.commit", "storage.recovery.plan", "storage.recovery.confirm", "configuration.export", "configuration.import.preflight", "configuration.import.commit",
+                        "storage.setup.commit", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "configuration.export", "configuration.import.preflight", "configuration.import.commit",
                         "artifact.apply",
                         "artifact.delete",
                         "source.create",
@@ -222,7 +223,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(84);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(85);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
@@ -253,7 +254,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.MCP))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
-                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status", "system.version",
                         "connector.list", "connector.get",
                         "source.draft", "source.list",
@@ -275,7 +276,7 @@ class ControlOperationsTest {
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",
-                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
+                        "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "cluster.context", "view.list",
                         "pipeline-draft.list", "pipeline-draft.get", "pipeline-draft.create",
