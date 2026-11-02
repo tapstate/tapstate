@@ -640,10 +640,20 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         boolean snapshotWaves = canUseSnapshotWaves(edge);
         boolean childSnapshotWaves = canUseChildSnapshotWaves(edge);
         boolean rootReadAhead = canPrefetchRootReads(edge);
+        boolean ownedRootWaves = rootReadAhead && slots.stream().allMatch(slot -> slot.children().isEmpty()
+                && (slot.isReference() ? slot.as() == io.tapstate.core.model.EmbedAs.OBJECT
+                        : slot.as() == io.tapstate.core.model.EmbedAs.ARRAY));
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
                 if (rootReadAhead && prefetchedRoots.isEmpty()) {
                     rootReadAhead = prefetchRootReads(inbox, touched);
+                }
+                if (ownedRootWaves && touched.isEmpty()) {
+                    if (processOwnedRootSnapshotWave(inbox)) {
+                        if (!flush()) return;
+                        continue;
+                    }
+                    ownedRootWaves = false;
                 }
                 if (childSnapshotWaves && touched.isEmpty()) {
                     if (processChildSnapshotWave(edge, inbox)) {
@@ -735,6 +745,74 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             retainedBytes += weight;
         }
         return withinBudget;
+    }
+
+    /** Only this distinct READ prefix may batch owned-root replacements; CDC keeps ordinary settlement. */
+    private boolean processOwnedRootSnapshotWave(Inbox inbox) {
+        Map<Object, Envelope> rows = new LinkedHashMap<>();
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || (event.after() == null && event.before() == null)) break;
+            Object key;
+            try {
+                key = NestKeys.valuesOf(NestKeys.rowOf(event), vertex.partitionKey(), vertex.mapName());
+            } catch (TapstateException invalidRow) {
+                break;
+            }
+            // Only consume already bounded read-ahead, including known absence. No second read probe.
+            if (!prefetchedRoots.containsKey(key) || rows.containsKey(key)) break;
+            rows.put(key, event);
+            if (rows.size() == RootWrites.KEYS) break;
+        }
+        if (rows.size() < 2 || (sending.foldingAllowed() && !snapshotKeysAreDistinct(inbox, rows.keySet()))) {
+            return false;
+        }
+        Map<Object, Touched> wave = new LinkedHashMap<>();
+        Map<String, Map<Object, Map<String, Object>>> snapshots = new LinkedHashMap<>();
+        Map<String, Set<Object>> inspected = new LinkedHashMap<>();
+        if (sending.foldingAllowed()) {
+            // Keep reference reads grouped. Include held and incoming roots because an older
+            // replay can leave the held reference unchanged; neither preview mutates held state.
+            Map<Object, Touched> previews = new LinkedHashMap<>();
+            int index = 0;
+            for (var entry : rows.entrySet()) {
+                RootAssembly held = prefetchedRoots.get(entry.getKey());
+                if (held != null) previews.put(index++, new Touched(held, false));
+                Envelope event = entry.getValue();
+                RootAssembly incoming = new RootAssembly();
+                incoming.applyRoot(NestKeys.rowOf(event), NestKeys.orderOf(event), event.positions());
+                previews.put(index++, new Touched(incoming, true));
+            }
+            snapshots.putAll(resolveReferences(previews));
+            long referenceBytes = snapshots.values().stream().flatMap(values -> values.values().stream())
+                    .mapToLong(PayloadBytes::ofRow).sum();
+            // The response is key-bounded, not streamed. Do not retain oversized reference batches.
+            if (referenceBytes > RootWrites.BYTES) return false;
+        }
+        List<Envelope> admitted = new java.util.ArrayList<>();
+        long bytes = 0;
+        for (var entry : rows.entrySet()) {
+            Object key = entry.getKey();
+            Envelope event = entry.getValue();
+            Touched document = touched(key, wave);
+            document.ts = event.ts();
+            document.inputBytes = PayloadBytes.of(event);
+            document.assembly.applyRoot(NestKeys.rowOf(event), NestKeys.orderOf(event), event.positions());
+            document.assembly.reconcileMissingObjects(slots);
+            if (!sending.foldingAllowed()) readSnapshotReferences(document.assembly, snapshots, inspected);
+            long renderedBytes = document.assembly.render(slots, snapshots).map(rendered -> PayloadBytes.of(
+                    Envelope.insert(event.ts(), outputStream, rendered, null).withPositions(document.assembly.covered())
+                            .withRemoved(document.assembly.embedsNotRendered(slots, rendered)))).orElse(0L);
+            bytes += Math.max(StateWaveSize.of(document.assembly), Math.max(document.inputBytes, renderedBytes));
+            admitted.add(event);
+            // An inspected state has already been mutated. Include that final candidate, then stop;
+            // settlement splits at the byte limit and writes an oversized state alone. Retention is
+            // bounded by one budget plus one candidate, not a hard cap on a loadAll response.
+            if (bytes >= RootWrites.BYTES) break;
+        }
+        settle(wave, false, false, snapshots, true);
+        removeAcknowledgedSnapshotRows(inbox, admitted);
+        return true;
     }
 
     private boolean canUseChildSnapshotWaves(NestInbound edge) {
@@ -1497,8 +1575,13 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects,
             Map<String, Map<Object, Map<String, Object>>> snapshots) {
+        settle(touched, allowMissingReferences, allowMissingObjects, snapshots, false);
+    }
+
+    private void settle(Map<Object, Touched> touched, boolean allowMissingReferences, boolean allowMissingObjects,
+            Map<String, Map<Object, Map<String, Object>>> snapshots, boolean ownedSnapshot) {
         Map<String, Map<Object, Map<String, Object>>> resolved = snapshots == null ? resolveReferences(touched) : snapshots;
-        RootWrites writes = new RootWrites();
+        RootWrites writes = new RootWrites(ownedSnapshot);
         touched.forEach((key, document) -> {
             document.emissionBytes = -1;
             recentReferenceStates.remove(key);
@@ -1565,21 +1648,28 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         else keeping.remove(key);
     }
 
-    /** Independent reference-only roots with no owned subtree share bounded replacement waves. */
+    /** Reference-only roots and explicitly admitted owned snapshots share bounded replacement writes. */
     private final class RootWrites {
         private static final int KEYS = 16;
         private static final long BYTES = 8L * 1024 * 1024;
         private final Map<Object, Touched> pending = new LinkedHashMap<>();
         private final boolean referenceOnly = referenceOnlyRootShape();
+        private final boolean ownedSnapshot;
         private long pendingBytes;
 
+        RootWrites() { this(false); }
+        RootWrites(boolean ownedSnapshot) { this.ownedSnapshot = ownedSnapshot; }
+
         void weigh(Touched document, Envelope emission) {
-            if (referenceOnly) document.emissionBytes = Math.max(document.assembly.rootPayloadBytes(),
+            if (referenceOnly || ownedSnapshot) document.emissionBytes = Math.max(document.assembly.rootPayloadBytes(),
                     Math.max(document.inputBytes, PayloadBytes.of(emission)));
         }
 
         boolean canGroup(Touched document) {
-            return referenceOnly && !document.rootDeleted
+            if (ownedSnapshot && document.emissionBytes >= 0) {
+                document.emissionBytes = Math.max(document.emissionBytes, StateWaveSize.of(document.assembly));
+            }
+            return (referenceOnly || ownedSnapshot) && !document.rootDeleted
                     && document.emissionBytes >= 0 && document.emissionBytes <= BYTES
                     && document.assembly.pending() == 0 && document.assembly.tombstones() == 0
                     && document.assembly.elements() <= elementLimit;
