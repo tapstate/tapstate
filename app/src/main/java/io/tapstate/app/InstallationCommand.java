@@ -60,9 +60,11 @@ final class InstallationCommand {
                             : MongoConfigurationDomain.openExisting(OnPremInstallation.settings(files, mongo));
                 }
                 var original = configuration;
-                var states = new InstallationSetupStates(files, () -> Optional.ofNullable(original).map(MongoConfigurationDomain::setupStates));
+                var states = new InstallationSetupStates(files, () -> Optional.ofNullable(original).map(MongoConfigurationDomain::setupStates),
+                        () -> completedActivationAllowed(files, original));
                 var status = states.load();
-                var purpose = status.phase() == StorageSetupStateStore.Phase.COMPLETE ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
+                var purpose = status.phase() == StorageSetupStateStore.Phase.COMPLETE && isLiveFirstAdministratorEntry(files)
+                        ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
                 var capabilities = new SetupCapabilityService(states, clock, files::requireOwner,
                         () -> { throw InstallationFiles.refused(); }, () -> requireFirstAdministratorReady(files, original, mongo));
                 var issued = capabilities.issue(status.scope(), purpose);
@@ -75,7 +77,8 @@ final class InstallationCommand {
     }
 
     private static void requireFirstAdministratorReady(InstallationFiles files, MongoConfigurationDomain configuration, MongoProperties mongo) {
-        if (configuration == null || files.stage().handoff() != InstallationFiles.Handoff.RESTARTED) throw InstallationFiles.refused();
+        if (configuration == null) throw InstallationFiles.refused();
+        requireLiveFirstAdministratorEntry(files);
         var status = configuration.firstAdmin().load().orElseThrow(InstallationFiles::refused);
         if (status.phase() != FirstAdminStore.Phase.PENDING) throw InstallationFiles.refused();
         var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
@@ -83,12 +86,42 @@ final class InstallationCommand {
         try (var cache = MongoCacheDomain.connect(binding.cache(), mongo.getServerSelectionTimeout(), "installation-authorization")) {
             cache.loadAuthScope(preparation.authScope()); cache.loadBusinessScope(preparation.businessScope());
         }
-        var source = configuration.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
-                .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
-        if (!(source.config().get("uri") instanceof String uri)) throw StorageRuntime.unavailable();
-        var master = new StorageBinding.Connection(source.connector().equals("mongodb-atlas") ? StorageBinding.Connection.Kind.ATLAS : StorageBinding.Connection.Kind.MONGODB,
-                uri, MongoDatabaseNames.fromUri(uri), source.config().get(StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca ? ca : null);
-        new MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()).test(master);
+
+    }
+
+    private static boolean completedActivationAllowed(InstallationFiles files, MongoConfigurationDomain configuration) {
+        if (configuration == null || isLiveFirstAdministratorEntry(files)) return false;
+        var binding = configuration.bindings().load().orElseThrow(InstallationFiles::refused);
+        var preparation = configuration.bindings().cachePreparation().orElseThrow(InstallationFiles::refused);
+        if (binding.mode() != StorageBinding.Mode.OP || preparation.authScope().authGeneration() != 1) return false;
+        InstallationSetupStates.requireOriginal(files.stage().scope(), binding.setup());
+        OnPremInstallation.requireActivationPreparation(configuration, preparation);
+        return true;
+    }
+
+    private static void requireLiveFirstAdministratorEntry(InstallationFiles files) {
+        if (!isLiveFirstAdministratorEntry(files)) throw InstallationFiles.refused();
+    }
+    private static boolean isLiveFirstAdministratorEntry(InstallationFiles files) {
+        try {
+            var address = java.net.URI.create(files.stage().managementUrl());
+            if (!"http".equals(address.getScheme()) || !"127.0.0.1".equals(address.getHost()) || address.getPort() < 1
+                    || address.getRawUserInfo() != null || address.getRawQuery() != null || address.getRawFragment() != null)
+                throw InstallationFiles.refused();
+            var client = java.net.http.HttpClient.newBuilder().connectTimeout(java.time.Duration.ofSeconds(3))
+                    .followRedirects(java.net.http.HttpClient.Redirect.NEVER).build();
+            try (client) {
+                var request = java.net.http.HttpRequest.newBuilder(address.resolve("/auth/storage-entry"))
+                        .timeout(java.time.Duration.ofSeconds(3)).GET().build();
+                var response = client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() != 200) return false;
+                if (!(io.tapstate.core.common.JsonReader.parse(response.body()) instanceof java.util.Map<?,?> body))
+                    throw InstallationFiles.refused();
+                return "OP".equals(body.get("mode")) && "FIRST_ADMIN_REQUIRED".equals(body.get("entry"));
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt(); throw InstallationFiles.refused();
+        } catch (java.io.IOException | IllegalArgumentException invalid) { return false; }
     }
 
     @Configuration(proxyBeanMethods = false)

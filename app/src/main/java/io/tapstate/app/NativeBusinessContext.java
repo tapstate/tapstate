@@ -45,6 +45,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
     private List<HandlerMapping> handlers = List.of();
+    private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
+    private volatile Thread initialTestCaller;
 
     NativeBusinessContext(StorageRoot root, StorageRuntime.Bound original, ConfigurableApplicationContext parent) {
         this.root = root; this.original = original; this.parent = parent;
@@ -70,7 +72,15 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             if (!binding.equals(original.binding())) return Optional.empty();
             return configuration.artifacts().get(binding.defaultSourceId())
                     .filter(SourceResource.class::isInstance).map(SourceResource.class::cast);
-        }, port.connectionTestResults(), parent.getBean(Clock.class)));
+        }, port.connectionTestResults(), parent.getBean(Clock.class), original.binding().defaultSourceId(), () -> {
+            var fence = context.getBean(NodeSessionLease.class).currentFence().orElseThrow(StorageRuntime::unavailable);
+            return new DefaultSourceVerification.Execution(fence.owner(), fence.claimGeneration());
+        }, execution -> port.workloadClaims().read(new WorkloadClaimKey(original.preparation().businessScope().clusterId(),
+                WorkloadClaimType.NODE_SESSION, execution.owner().nodeId()))
+                .filter(reading -> reading.leased() && reading.claim().owner().equals(execution.owner())
+                        && reading.claim().claimGeneration() == execution.generation()).isPresent(),
+        result -> result.items().stream().anyMatch(item -> io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())),
+        Duration.ofSeconds(60)));
         var overrides = new LinkedHashMap<String,Object>();
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
@@ -105,21 +115,33 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var ordered = new ArrayList<>(context.getBeansOfType(HandlerMapping.class).values());
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
-        // The first-admin page uses the same formal result and observer as ordinary Source tests.
-        if (original.preparation().authScope().mode() == StorageBinding.Mode.OP) {
+
+    }
+
+    @Override public void afterInitialReady() {
+        if (!initialTestSubmitted.compareAndSet(false, true)) return;
+        var caller = new Thread(() -> {
             try {
-                if (configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING) {
-                    var binding = configuration.bindings().load().filter(original.binding()::equals).orElseThrow(StorageRuntime::unavailable);
-                    var source = configuration.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
-                            .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
-                    context.getBean(ConnectionTestService.class).test(source.id(), source.connector(), source.config(),
-                            "installation:" + binding.setup().installationId());
-                }
-            } catch (io.tapstate.core.common.TapstateException unavailable) {
-                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class)
-                        .warn("Initial application-data verification unavailable [{}]", unavailable.code().code());
+                original.requireBusiness();
+                var binding = configuration.bindings().load().filter(original.binding()::equals).orElseThrow(StorageRuntime::unavailable);
+                var source = configuration.artifacts().get(binding.defaultSourceId()).filter(SourceResource.class::isInstance)
+                        .map(SourceResource.class::cast).orElseThrow(StorageRuntime::unavailable);
+                context.getBean(ConnectionTestService.class).test(source.id(), source.connector(), source.config(),
+                        "installation:" + binding.setup().installationId());
+            } catch (io.tapstate.core.common.TapstateException failed) {
+                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).warn("Default Source test unavailable [{}]", failed.code().code());
+            } catch (RuntimeException | Error defect) {
+                org.slf4j.LoggerFactory.getLogger(NativeBusinessContext.class).error("Default Source test defect [{}]", defect.getClass().getName());
+                throw defect;
             }
-        }
+        }, "tapstate-initial-default-source-test");
+        caller.setDaemon(true); initialTestCaller = caller; caller.start();
+    }
+    boolean canTestDefaultSource() {
+        if (!active.get()) return false;
+        var tester = context.getBean(ConnectionTester.class);
+        return (!(tester instanceof io.tapstate.adapters.pdk.PdkConnectionTester pdk) || pdk.defaultTestAvailable())
+                && context.getBean(DefaultSourceVerification.class).snapshot().status() != DefaultSourceVerification.Status.CHECKING;
     }
 
     Optional<org.springframework.boot.availability.ApplicationAvailability> availability() {
@@ -215,6 +237,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     @Override public synchronized void close() {
         active.set(false); handlers = List.of();
+        var initial = initialTestCaller; if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
         try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }

@@ -20,6 +20,8 @@ final class StorageRuntime implements AutoCloseable {
         default boolean available() { return true; }
         /** A candidate may wait for its existing membership gate; it must never override that gate. */
         default void awaitAvailability() {}
+        /** Called after original first-setup readiness; hands off without waiting for the probe. */
+        default void afterInitialReady() {}
         @Override void close();
     }
     private final MongoConfigurationDomain configuration;
@@ -144,8 +146,20 @@ final class StorageRuntime implements AutoCloseable {
 
     synchronized void startRecoveredBusiness(Bound original, Function<Bound, ? extends Business> assembly,
             io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication) {
+        startBusinessOwned(original, assembly, running, beforePublication, running != null);
+    }
+
+    synchronized void startInitialBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
+        startBusinessOwned(original, assembly, null, () -> {}, true);
+    }
+
+    private void startBusinessOwned(Bound original, Function<Bound, ? extends Business> assembly,
+            io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication, boolean awaitReady) {
         requireOriginal(original);
-        if (business != null) return;
+        if (business != null) {
+            if (awaitReady && !businessStarted()) throw unavailable();
+            return;
+        }
         if (cleanupUnknown) throw unavailable();
         verifyCompletedSetup(original);
         verifyRecoveryPublication(original, running);
@@ -153,12 +167,12 @@ final class StorageRuntime implements AutoCloseable {
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
         try {
             candidate.start();
-            if (running != null) candidate.awaitAvailability();
+            if (awaitReady) candidate.awaitAvailability();
             requireOriginal(original);
             verifyCompletedSetup(original);
             original.requireActive();
             verifyRecoveryPublication(original, running);
-            if (running != null && !candidate.available()) throw unavailable();
+            if (awaitReady && !candidate.available()) throw unavailable();
             beforePublication.run();
             requireOriginal(original);
             business = candidate;

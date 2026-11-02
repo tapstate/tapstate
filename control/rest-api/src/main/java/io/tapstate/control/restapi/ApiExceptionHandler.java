@@ -57,6 +57,12 @@ class ApiExceptionHandler {
         return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
     }
 
+    @ExceptionHandler(UnavailableCodedException.class)
+    ResponseEntity<ApiError> handle(UnavailableCodedException e) {
+        var rendered = handle((TapstateException)e);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).cacheControl(CacheControl.noStore()).body(rendered.getBody());
+    }
+
     /**
      * A start that did not go ahead answers with the coded error a client already knows how to read, and
      * beside it what the start checks said and what the start had already changed in the definition.
@@ -165,6 +171,7 @@ class ApiExceptionHandler {
             Map.entry("artifact.pipeline-not-stopped", HttpStatus.CONFLICT),
             Map.entry("artifact.reclaim-incomplete", HttpStatus.INTERNAL_SERVER_ERROR),
             Map.entry("connector.not-found", HttpStatus.NOT_FOUND),
+            Map.entry("connector.test-timeout", HttpStatus.GATEWAY_TIMEOUT),
             Map.entry("pipeline.not-found", HttpStatus.NOT_FOUND),
             Map.entry("pipeline.already-exists", HttpStatus.CONFLICT),
             Map.entry("pipeline.id-mismatch", HttpStatus.BAD_REQUEST),

@@ -119,6 +119,82 @@ class PdkConnectionTesterTest {
                 });
     }
 
+    @Test void anEmptyManagedTestCannotCertifyAConnection(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.emptyTestReport(dir)), "synthetic.EmptyTestReport", "2.0.8", null);
+        try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {
+            assertThatThrownBy(() -> tester.testDefault(config(), System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos())).isInstanceOf(IllegalStateException.class);
+            assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
+    @Test void theOriginalExpiredDeadlineDoesNotGetAnotherBudgetOrOpenAConnector() {
+        var resolves = new java.util.concurrent.atomic.AtomicInteger();
+        try (var tester = new PdkConnectionTester(ignored -> { resolves.incrementAndGet(); throw new AssertionError("must not resolve"); }, Clock.systemUTC(), ignored -> true)) {
+            assertThatThrownBy(() -> tester.testDefault(config(), System.nanoTime() - 1)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ConnectorError.TEST_TIMEOUT));
+            assertThat(resolves).hasValue(0); assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
+    @Test void replacingABusinessTesterCannotBypassAnUnfinishedNodeSlot(@TempDir Path dir) throws Exception {
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var ref = new ConnectorRef(List.of(Synthetic.passingTest(dir)), "synthetic.PassingTest", "2.0.8", null);
+        try (var slot = new PdkConnectionTester.DefaultSourceSlot(Clock.systemUTC(), java.time.Duration.ofMillis(30), java.time.Duration.ofMillis(40))) {
+            ConnectorProvisioner blocked = ignored -> {
+                boolean interrupted = false;
+                while (true) try { if (!release.await(3, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release missing"); break; }
+                catch (InterruptedException retry) { interrupted = true; }
+                if (interrupted) Thread.currentThread().interrupt();
+                return ref;
+            };
+            var retired = new PdkConnectionTester(blocked, Clock.systemUTC(), ignored -> true, slot);
+            assertThatThrownBy(() -> retired.testDefault(config(), System.nanoTime() + java.time.Duration.ofMillis(30).toNanos())).isInstanceOf(TapstateException.class);
+            retired.close();
+            try (var replacement = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true, slot)) {
+                assertThatThrownBy(() -> replacement.testDefault(config(), System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos())).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ConnectorError.INSTANCES_BUSY));
+                release.countDown();
+                long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(2);
+                while (!replacement.defaultTestAvailable() && System.nanoTime() < deadline) Thread.sleep(1);
+                assertThat(replacement.defaultTestAvailable()).isTrue();
+            }
+        } finally { release.countDown(); }
+    }
+
+    @Test void aKnownTypedPdkDiagnosticIsAFailedReportAfterOwnedCleanup(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.thrownTypedTestDiagnostic(dir)), "synthetic.TypedTestDiagnostic", "2.0.8", null);
+        try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {
+            var result = tester.testDefault(config(), System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos());
+            assertThat(result.outcome()).isEqualTo(Outcome.FAILED);
+            assertThat(result.items().getFirst().connectorErrorCode()).isEqualTo("28000");
+            assertThat(result.items().getFirst().reason()).isEqualTo("bad credentials");
+            assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
+    @Test void anOversizedManagedReportRemainsAnUncertainCodedResult(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.oversizedTestReport(dir)), "synthetic.OversizedReport", "2.0.8", null);
+        try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {
+            assertThatThrownBy(() -> tester.testDefault(config(), System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos())).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.DOCUMENT_TOO_LARGE));
+            assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
+    @Test void managedSourceProgrammingDefectsRemainBareThroughTheRealPdkDrive(@TempDir Path dir) {
+        for (String defect : List.of("NullPointerException", "IllegalStateException", "LinkageError")) {
+            String name = "Default" + defect;
+            var jar = Synthetic.defectTest(dir.resolve(name), name, defect);
+            var ref = new ConnectorRef(List.of(jar), "synthetic." + name, "2.0.8", null);
+            try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true,
+                    java.time.Duration.ofSeconds(5), java.time.Duration.ofMillis(100))) {
+                assertThatThrownBy(() -> tester.testDefault(config(), System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos())).isInstanceOf(defect.equals("LinkageError") ? LinkageError.class
+                        : defect.equals("NullPointerException") ? NullPointerException.class : IllegalStateException.class);
+                assertThat(tester.defaultTestAvailable()).isTrue();
+            }
+        }
+    }
+
     @Test
     void anIncompatibleConnectorIsStillRefusedBeforeAnyTestRuns(@TempDir Path dir) {
         // The connection tester provisions through the same open path as the read/write ports: an

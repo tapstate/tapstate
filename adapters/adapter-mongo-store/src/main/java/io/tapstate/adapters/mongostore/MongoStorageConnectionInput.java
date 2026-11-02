@@ -17,6 +17,20 @@ public final class MongoStorageConnectionInput {
     private MongoStorageConnectionInput() {}
 
     public static StorageBinding.Connection normalize(StorageBinding.Connection input) {
+        return normalize(input, true);
+    }
+
+    /** Validates explicit URI intent without consulting DNS or opening a client. */
+    public static StorageBinding.Connection validate(StorageBinding.Connection input) {
+        return normalize(input, false);
+    }
+
+    static ConnectionString syntaxOnly(String uri) {
+        // TXT values belong to the eventual live connection, not to local input validation.
+        return new ConnectionString(uri, (name, type) -> java.util.List.of());
+    }
+
+    private static StorageBinding.Connection normalize(StorageBinding.Connection input, boolean resolveDns) {
         Objects.requireNonNull(input, "input");
         String uri = input.uri();
         try {
@@ -35,8 +49,9 @@ public final class MongoStorageConnectionInput {
             }
             StorageBinding.Connection normalized = new StorageBinding.Connection(input.kind(), uri, input.database(), input.caPem());
             try (MongoConnection connection = MongoConnection.forCache(normalized, Duration.ofSeconds(10), null)) {
-                ConnectionString parsed = MongoConnection.parseConnectionString(uri, ConnectionString::new);
+                ConnectionString parsed = resolveDns ? MongoConnection.parseConnectionString(uri, ConnectionString::new) : syntaxOnly(uri);
                 connection.selectedDatabase(parsed);
+                if (!resolveDns && !input.database().equals(parsed.getDatabase())) throw refused();
                 connection.buildClientSettings(parsed);
                 if (input.kind() == StorageBinding.Connection.Kind.ATLAS
                         && (parsed.getUsername() == null || parsed.getPassword() == null

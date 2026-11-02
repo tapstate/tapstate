@@ -9,6 +9,19 @@ class MongoStorageConnectionInputTest {
     private static StorageBinding.Connection input(String uri, StorageBinding.Connection.Kind kind) {
         return new StorageBinding.Connection(kind, uri, "selected", null);
     }
+    @Test void validatesAnUnresolvableDefaultSrvWithoutLookingUpTxtOrRewritingItsIntent() {
+        var original = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                "mongodb+srv://alice:secret@unresolvable.example.invalid/selected?tls=true", "selected", null);
+        assertThat(MongoStorageConnectionInput.validate(original)).isEqualTo(original);
+        assertThat(MongoDatabaseNames.fromUri(original.uri())).isEqualTo("selected");
+    }
+    @Test void localValidationStillRejectsUnsafeTlsAndMismatchedDatabase() {
+        for (String uri : new String[]{"mongodb+srv://alice:secret@unresolvable.example.invalid/other?tls=true",
+                "mongodb+srv://alice:secret@unresolvable.example.invalid/selected?tlsInsecure=true"}) {
+            assertThatThrownBy(() -> MongoStorageConnectionInput.validate(input(uri, StorageBinding.Connection.Kind.MONGODB)))
+                    .isInstanceOf(TapstateException.class).hasMessageNotContaining("secret");
+        }
+    }
     @Test void freezesOriginalAuthenticationDatabaseAndKeepsOptionsAndSeeds() {
         var normalized = MongoStorageConnectionInput.normalize(input(
                 "mongodb://alice:pa%40ss@host1:27017,host2:27017/original?replicaSet=rs&tls=true", StorageBinding.Connection.Kind.MONGODB));

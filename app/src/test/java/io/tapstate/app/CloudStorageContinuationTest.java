@@ -73,6 +73,90 @@ class CloudStorageContinuationTest {
         @Override public void close() { try { root.close(); } finally { caches.close(); configurations.close(); } }
     }
 
+    @Test void initialActivationNeverCallsTheDefaultTargetBeforeBusinessReadiness() {
+        try (var f = new Fixture()) {
+            doThrow(new AssertionError("default target must run only after readiness")).when(f.target).test(any(), any(), any());
+            var business = f.business();
+            f.continueWith(business);
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            verify(f.target, never()).test(any(), any(), any());
+            verify(business).start();
+        }
+    }
+
+    @Test void initialSourceTestIsHandedOffOnlyAfterActualBusinessAvailability() {
+        try (var f = new Fixture()) {
+            var business = f.business(); var ready = new java.util.concurrent.atomic.AtomicBoolean();
+            when(business.available()).thenAnswer(ignored -> ready.get());
+            doAnswer(ignored -> {
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+                verify(business, never()).afterInitialReady();
+                ready.set(true); return null;
+            }).when(business).awaitAvailability();
+            doAnswer(ignored -> {
+                assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+                assertThat(f.root.runtime().businessStarted()).isTrue(); return null;
+            }).when(business).afterInitialReady();
+            f.continueWith(business);
+            verify(business).awaitAvailability(); verify(business).afterInitialReady();
+        }
+    }
+    @Test void activationHandoffReturnsWithoutWaitingAndCoalescesTheOriginalOperation() throws Exception {
+        try (var f = new Fixture()) {
+            var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            Runnable work = () -> {
+                calls.incrementAndGet(); entered.countDown();
+                try { if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release missing"); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new AssertionError(interrupted); }
+            };
+            try {
+                f.root.handoffActivation(f.committed, work);
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(f.root.initialActivationPending()).isTrue();
+                f.root.handoffActivation(f.committed, work);
+                assertThat(calls).hasValue(1);
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+        }
+    }
+
+    @Test void anInflightRealContinuationDoesNotBlockAnotherActivationRequest() throws Exception {
+        try (var f = new Fixture(); var requests = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            f.root.runtime().loadBound().orElseThrow();
+            var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
+            var business = f.business();
+            doAnswer(ignored -> {
+                entered.countDown();
+                if (!release.await(5, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("release missing");
+                return null;
+            }).when(business).awaitAvailability();
+            try {
+                f.root.handoffActivation(f.committed, () -> f.continueWith(business));
+                assertThat(entered.await(2, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                requests.submit(() -> f.root.handoffActivation(f.committed, () -> f.continueWith(business)))
+                        .get(1, java.util.concurrent.TimeUnit.SECONDS);
+                verify(business, times(1)).start();
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+        }
+    }
+    @Test void aFailedAssemblyReportsUnavailableEvenAfterStorageCompletion() throws Exception {
+        try (var f = new Fixture()) {
+            f.root.runtime().loadBound().orElseThrow();
+            var business = f.business(); doThrow(StorageRuntime.unavailable()).when(business).start();
+            f.root.handoffActivation(f.committed, () -> f.continueWith(business));
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(2)).until(() -> !f.root.initialActivationPending());
+            var principal = mock(TapstatePrincipal.class); when(principal.credentialType()).thenReturn(CredentialType.CLOUD_SESSION);
+            when(principal.permits(any())).thenReturn(true);
+            var caller = StorageControlAccess.ordinary(StorageBinding.Mode.CLOUD, SETUP, PREPARATION.authScope(), principal, "organization", () -> {});
+            var snapshot = f.root.snapshot(caller, () -> {});
+            assertThat(snapshot.setupPhase()).isEqualTo("COMPLETE");
+            assertThat(snapshot.businessPhase()).isEqualTo(StorageControlDispatcher.BusinessPhase.UNAVAILABLE);
+            assertThat(snapshot.allowedActions()).contains("storage.setup.activate").doesNotContain("storage.test", "storage.setup.commit");
+        }
+    }
+
     private static final class InlineExecutor extends java.util.concurrent.AbstractExecutorService {
         private boolean closed;
         @Override public void execute(Runnable task) {
@@ -248,26 +332,24 @@ class CloudStorageContinuationTest {
             assertThat(f.root.runtime().businessStarted()).isTrue();
             assertThatThrownBy(temporary.requireActive()::run).isInstanceOf(TapstateException.class);
             assertThatCode(f.root.managedAuthentication().requireActive()::run).doesNotThrowAnyException();
-            var order = inOrder(f.target, f.cache, f.bindings, business);
-            order.verify(f.target).test(new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS,
-                    "mongodb://target/master?tls=true", "master", "saved-master-ca"), SOURCE,
-                    new StorageSetupService.ConnectorIdentity("a".repeat(64), "b".repeat(64)));
+            var order = inOrder(f.cache, f.bindings, business);
             order.verify(f.cache).prepareFirstAuth(f.grant);
             order.verify(f.cache).prepareInitialBusiness(eq(PREPARATION), any());
             order.verify(f.bindings).complete(SETUP); order.verify(business).start();
+            verify(f.target, never()).test(any(), any(), any());
             verify(business, times(1)).start(); verify(f.cache, times(1)).prepareFirstAuth(f.grant);
             verify(f.cache, never()).close();
         }
     }
 
-    @Test void failedSavedTargetCheckRetainsTheUnconsumedGrantAndNeverPublishesCompletion() {
+    @Test void anUnavailableDefaultTargetDoesNotBlockCacheActivation() {
         try (var f = new Fixture()) {
-            doThrow(StorageRuntime.unavailable()).doNothing().when(f.target).test(any(), any(), any());
+            doThrow(StorageRuntime.unavailable()).when(f.target).test(any(), any(), any());
             var business = f.business();
-            assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
-            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.bindings, never()).complete(any());
-            assertThat(f.root.runtime().business()).isEmpty();
-            f.continueWith(business); verify(f.cache, times(1)).prepareFirstAuth(f.grant);
+            f.continueWith(business);
+            verify(f.cache).prepareFirstAuth(f.grant); verify(f.bindings).complete(SETUP);
+            verify(f.target, never()).test(any(), any(), any());
+            assertThat(f.root.runtime().businessStarted()).isTrue();
         }
     }
 
@@ -301,7 +383,7 @@ class CloudStorageContinuationTest {
             var successor = f.business(); f.continueWith(successor);
             verify(failed, times(1)).close(); verify(f.cache, never()).close();
             verify(f.cache, times(1)).prepareInitialBusiness(eq(PREPARATION), any());
-            verify(f.target, times(1)).test(any(), any(), any()); verify(successor).start();
+            verify(f.target, never()).test(any(), any(), any()); verify(successor).start();
         }
     }
 

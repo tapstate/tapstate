@@ -35,6 +35,11 @@ class StorageRootConfiguration {
     @Bean ControlPlaneConfiguration.SigningSecret signingSecret(ControlAuthProperties properties) {
         return new ControlPlaneConfiguration().signingSecret(properties);
     }
+    @Bean(destroyMethod = "close")
+    io.tapstate.adapters.pdk.PdkConnectionTester.DefaultSourceSlot defaultSourceTestSlot(Clock clock) {
+        return new io.tapstate.adapters.pdk.PdkConnectionTester.DefaultSourceSlot(clock);
+    }
+
     @Bean(destroyMethod = "close") StorageRoot storageRoot(MongoProperties mongo, CloudRuntimeSettings cloud,
             ObjectProvider<CloudSdkBridge> bridge, BootId boot, MetricsHistoryProperties history,
             TokenSecrets secrets, Clock clock, ControlPlaneConfiguration.SigningSecret signing,
@@ -99,13 +104,10 @@ class StorageRootConfiguration {
                     var state = configuration.setupStates().load();
                     if (state.phase() != StorageSetupStateStore.Phase.COMPLETE) {
                         entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.SETUP_REQUIRED;
-                    } else if (installation != null && !installation.normalStartupAllowed()) {
-                        entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.RESTART_REQUIRED;
                     } else if (phase == StorageRoot.Phase.AUTH_READY || phase == StorageRoot.Phase.BUSINESS_READY) {
                         entry = io.tapstate.control.restapi.StorageEntryStatus.Entry.LOGIN;
                         if (installation != null && configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase() == FirstAdminStore.Phase.PENDING)
-                            entry = phase == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted()
-                                    && installation.files().stage().handoff() == InstallationFiles.Handoff.RESTARTED
+                            entry = phase == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted() && installation.firstAdministratorReady()
                                     ? io.tapstate.control.restapi.StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED
                                     : io.tapstate.control.restapi.StorageEntryStatus.Entry.UNAVAILABLE;
                     }
@@ -162,7 +164,7 @@ class StorageRootConfiguration {
                 new AuditGate(configuration.audit(), clock), clock, root::requireActive,
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
-                        root.continueCloudSetup(committed, target, original -> factories.getObject().create(original));
+                        root.handoffActivation(committed, () -> root.continueCloudSetup(committed, target, original -> factories.getObject().create(original)));
                 }, root::coordinateSetup, (expected, tested, active) -> {},
                 root.mode() == StorageBinding.Mode.CLOUD ? root.initializationProgress() : null);
     }
@@ -201,6 +203,7 @@ class StorageRootConfiguration {
     @Bean ApplicationRunner loadRetainedStorage(StorageRoot root, ObjectProvider<StorageBusinessFactory> factories,
             ObjectProvider<StorageSetupService.DefaultTarget> targets, ObjectProvider<OnPremInstallation> installations) {
         return arguments -> {
+            root.retainInitialAssembly(original -> factories.getObject().create(original));
             var installation = installations.getIfAvailable();
             if (installation != null) {
                 try { installation.resumePreparation(); }

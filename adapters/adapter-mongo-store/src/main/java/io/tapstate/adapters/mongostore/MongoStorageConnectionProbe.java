@@ -14,6 +14,9 @@ public final class MongoStorageConnectionProbe implements StorageConnectionProbe
         return new StorageBinding.Connection(normalized.kind(), MongoStorageConnectionInput.databaseUri(normalized),
                 normalized.database(), normalized.caPem());
     }
+    @Override public StorageBinding.Connection validate(StorageBinding.Connection candidate) {
+        return MongoStorageConnectionInput.validate(candidate);
+    }
     @Override public void test(StorageBinding.Connection normalized) {
         try (var connection = MongoConnection.forCache(normalized, timeout, null)) {
             connection.verifyConnectivity();

@@ -11,15 +11,22 @@ final class InstallationSetupStates implements StorageSetupStateStore {
     private final InstallationFiles files;
     private final Supplier<Optional<StorageSetupStateStore>> configuration;
     private final Runnable active;
+    private final java.util.function.BooleanSupplier completedActivationAllowed;
 
     InstallationSetupStates(InstallationFiles files, Supplier<Optional<StorageSetupStateStore>> configuration) {
-        this(files, configuration, () -> {});
+        this(files, configuration, () -> {}, () -> false);
     }
-    private InstallationSetupStates(InstallationFiles files, Supplier<Optional<StorageSetupStateStore>> configuration, Runnable active) {
+    InstallationSetupStates(InstallationFiles files, Supplier<Optional<StorageSetupStateStore>> configuration,
+            java.util.function.BooleanSupplier completedActivationAllowed) {
+        this(files, configuration, () -> {}, completedActivationAllowed);
+    }
+    private InstallationSetupStates(InstallationFiles files, Supplier<Optional<StorageSetupStateStore>> configuration, Runnable active,
+            java.util.function.BooleanSupplier completedActivationAllowed) {
         this.files = Objects.requireNonNull(files); this.configuration = Objects.requireNonNull(configuration); this.active = Objects.requireNonNull(active);
+        this.completedActivationAllowed = Objects.requireNonNull(completedActivationAllowed);
     }
     @Override public StorageSetupStateStore guardedBy(Runnable guard) {
-        return new InstallationSetupStates(files, configuration, () -> { active.run(); guard.run(); });
+        return new InstallationSetupStates(files, configuration, () -> { active.run(); guard.run(); }, completedActivationAllowed);
     }
     @Override public Status load() {
         active.run(); var store = configuration.get();
@@ -35,7 +42,11 @@ final class InstallationSetupStates implements StorageSetupStateStore {
             requireRetainedGeneration(expected);
             // Never hold the file lock while competing with a final CONFIG transaction. Its
             // authorization callbacks also read these files, so the opposite order can deadlock.
-            var result = store.orElseThrow().guardedBy(active).rotate(expected, purpose);
+            var selected = store.orElseThrow().guardedBy(active);
+            var mapped = continuationPurpose(selected, purpose);
+            var result = selected.guardedBy(() -> {
+                if (mapped != purpose && !completedActivationAllowed.getAsBoolean()) throw InstallationFiles.refused();
+            }).rotate(expected, mapped);
             files.locked(() -> {
                 var stage = files.stage(); requireOriginal(stage.scope(), result.scope()); requireGenerationFloor(stage.scope(), result.scope());
                 files.saveStage(stage.withScope(result.scope())); return null;
@@ -54,7 +65,10 @@ final class InstallationSetupStates implements StorageSetupStateStore {
         active.run(); var store = configuration.get();
         if (store.isPresent()) {
             requireRetainedGeneration(expected);
-            store.orElseThrow().guardedBy(active).requireCurrent(expected, purpose);
+            var selected = store.orElseThrow().guardedBy(active);
+            var mapped = continuationPurpose(selected, purpose);
+            selected.requireCurrent(expected, mapped);
+            if (mapped != purpose && !completedActivationAllowed.getAsBoolean()) throw InstallationFiles.refused();
             requireRetainedGeneration(expected); active.run(); return;
         }
         files.locked(() -> {
@@ -66,6 +80,14 @@ final class InstallationSetupStates implements StorageSetupStateStore {
             active.run(); return null;
         });
     }
+    private StorageSetupStateStore.Purpose continuationPurpose(StorageSetupStateStore store, Purpose requested) {
+        if (requested == Purpose.SETUP && store.load().phase() == Phase.COMPLETE) {
+            if (!completedActivationAllowed.getAsBoolean()) throw InstallationFiles.refused();
+            return Purpose.FIRST_ADMIN;
+        }
+        return requested;
+    }
+
     private void requireRetainedGeneration(StorageSetupScope expected) {
         var retained = files.stage().scope(); requireOriginal(retained, expected); requireGenerationFloor(retained, expected);
     }

@@ -21,6 +21,10 @@ public final class DelegatingConnectionProbe implements ConnectionProbe {
         this.tester = Objects.requireNonNull(tester, "tester");
     }
 
+    @Override public ConnectionTestResult probeDefault(ConnectionConfig config, long deadlineNanos) {
+        return tester.testDefault(config, deadlineNanos);
+    }
+
     @Override
     public ConnectionTestResult probe(ConnectionConfig config) {
         return tester.test(config);

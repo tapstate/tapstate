@@ -42,6 +42,33 @@ class OnPremInstallationTest {
         }
     }
 
+    @Test void completedInitialRecoveryUsesItsExactReceiptInsteadOfMintingOriginalCreationAuthority() {
+        var configuration = mock(MongoConfigurationDomain.class);
+        var commands = mock(io.tapstate.spi.store.StorageRecoveryCommands.class);
+        var scope = new io.tapstate.spi.store.CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1);
+        var preparation = new io.tapstate.spi.store.CachePreparation("setup", scope);
+        var source = new io.tapstate.core.model.SourceResource("views", null, "mongodb", java.util.Map.of("uri", "mongodb://host/views"), null, null, null, null);
+        var completed = mock(io.tapstate.spi.store.StorageRecoveryCommands.Plan.class);
+        var manifest = new io.tapstate.spi.store.StorageRecoveryCommands.Manifest(
+                new io.tapstate.spi.store.StorageRecoveryCommands.Selection(io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER, java.util.Set.of()),
+                java.util.Set.of(), java.util.Map.of("views", io.tapstate.core.model.canonical.CanonicalHash.of(source)), "a".repeat(64), 1);
+        when(configuration.recoveryCommands()).thenReturn(commands);
+        when(commands.current(scope)).thenReturn(Optional.of(completed));
+        when(completed.originalScope()).thenReturn(scope); when(completed.operationId()).thenReturn("recovery");
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE);
+        when(completed.manifest()).thenReturn(manifest);
+        when(commands.find(scope, "recovery")).thenReturn(Optional.of(completed));
+        when(configuration.initialOpRecoverySource(scope, true)).thenReturn(source);
+        doThrow(StorageRuntime.unavailable()).when(configuration).requireOriginalInitialPreparation(preparation);
+        assertThatCode(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).doesNotThrowAnyException();
+        verify(configuration, never()).requireOriginalInitialPreparation(preparation);
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING);
+        assertThatThrownBy(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).isInstanceOf(TapstateException.class);
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE);
+        when(commands.find(scope, "recovery")).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).isInstanceOf(TapstateException.class);
+    }
+
     @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
         var files = InstallationFiles.initialize(directory.resolve("reopen"));
         var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
