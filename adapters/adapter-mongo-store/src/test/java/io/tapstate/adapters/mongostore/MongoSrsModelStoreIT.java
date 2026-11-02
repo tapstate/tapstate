@@ -16,6 +16,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceIndex;
 import io.tapstate.spi.store.SourceTable;
+import io.tapstate.spi.store.SourceModelComparison;
 import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsModel;
@@ -54,7 +55,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 /** Adapter witnesses with explicit business/chain facts; this does not exercise production domain preparation. */
 @RequiresDocker
 class MongoSrsModelStoreIT {
-    @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container private static final MongoDBContainer MONGO = ownedMongo();
+    private static MongoDBContainer ownedMongo() {
+        var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+        String owner=System.getProperty("tapstate.e2e.resource-owner");
+        if(owner!=null && !owner.isBlank()) mongo.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",
+                "io.tapstate.e2e.resource-owner"),owner).withTmpFs(Map.of("/data/db","rw,size=1g","/data/configdb","rw,size=16m"));
+        return mongo;
+    }
     private static final CacheBusinessScope SCOPE = new CacheBusinessScope("cluster-a", 1, "incarnation-a");
     private static final String CHAIN = "chain-a";
     private static final String RING = "srs.chain-a.orders";
@@ -133,6 +141,28 @@ class MongoSrsModelStoreIT {
                     .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_CAPACITY));
             assertThat(snapshotFacts(f.database())).isEqualTo(before);
             assertThat(f.models().publishInitial(key(0),RING,table("id",null),f.fence()).key()).isEqualTo(key(0));
+        });
+    }
+
+    @Test void sampledPublicationCreatesASuccessorWithoutAHistoricalLookupOfItsUnpublishedContext() {
+        withBusiness(f -> {
+            var first=f.models().publishInitial(key(0),RING,table("old-sample",null),f.fence());
+            var chains=new MongoSrsChainStore(f.client(),f.database(),SCOPE);
+            chains.requestTables(CHAIN,java.util.Set.of("orders"),f.fence());
+            chains.publishServingTables(CHAIN,7,java.util.Set.of("orders"),f.fence());
+            chains.openEpoch(CHAIN,7,f.fence()).orElseThrow();
+            chains.publishServingTables(CHAIN,8,java.util.Set.of("orders"),f.fence());
+            var nextKey=new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),8,0);
+            assertThatThrownBy(() -> f.models().load(nextKey)).satisfies(MongoSrsModelStoreIT::unavailable);
+            var next=f.models().publishObservedInitial(nextKey,RING,table("new-sample",null),f.fence(),SourceModelComparison.SAMPLED_DOCUMENT);
+            assertThat(next.table().fields()).isEqualTo(table("new-sample",null).fields());
+            var before=models(f.database()).find(new Document("_id",MongoSrsModelStore.key(nextKey))).first();
+            assertThat(f.models().publishObservedInitial(nextKey,RING,table("another-sample",null),f.fence(),
+                    SourceModelComparison.SAMPLED_DOCUMENT)).isEqualTo(next);
+            assertThat(models(f.database()).find(new Document("_id",MongoSrsModelStore.key(nextKey))).first()).isEqualTo(before);
+            assertThat(f.models().load(first.key())).contains(first);
+            assertThatThrownBy(() -> f.models().publishInitial(nextKey,RING,table("declared-change",null),f.fence()))
+                    .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_CONFLICT));
         });
     }
 

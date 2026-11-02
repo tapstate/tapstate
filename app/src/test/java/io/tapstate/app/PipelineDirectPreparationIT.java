@@ -786,8 +786,7 @@ class PipelineDirectPreparationIT {
             });
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var ports=new CopyOnWriteArrayList<NativeDirectSnapshotPort>();var buffer=new SnapshotBuffer(8);
             var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
@@ -891,8 +890,7 @@ class PipelineDirectPreparationIT {
             });
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var ports=new ArrayList<DirectPort>();var buffer=new SnapshotBuffer(8);
             var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
@@ -966,8 +964,7 @@ class PipelineDirectPreparationIT {
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));
             when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> { claims.release(call.getArgument(0)); return null; }).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var member=mock(HazelcastInstance.class); var buffer=new SnapshotBuffer(8); var opened=new CopyOnWriteArrayList<CaptureConfig>();
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
                 var runtime=new NativeSrsCaptureRunUnit(f.business(),f.cache.srs(f.business(),ACTIVE),member);

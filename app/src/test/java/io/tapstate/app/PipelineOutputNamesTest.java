@@ -454,7 +454,7 @@ class PipelineOutputNamesTest {
         Map<String, io.tapstate.spi.sink.TargetTable> bound = new java.util.LinkedHashMap<>();
         var binder = new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public com.hazelcast.function.SupplierEx<? extends io.tapstate.spi.sink.SinkWriter> bind(
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
                     String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
                     io.tapstate.spi.sink.DdlPolicy ddl, io.tapstate.spi.sink.TargetTable target,
                     io.tapstate.core.model.PipelineNode node) {
@@ -462,7 +462,7 @@ class PipelineOutputNamesTest {
             }
 
             @Override
-            public com.hazelcast.function.SupplierEx<? extends io.tapstate.spi.sink.SinkWriter> bind(
+            public com.hazelcast.function.SupplierEx<io.tapstate.spi.sink.SinkWriter> bind(
                     String connector, Map<String, Object> config, io.tapstate.spi.sink.WriteMode mode,
                     io.tapstate.spi.sink.DdlPolicy ddl, Map<String, io.tapstate.spi.sink.TargetTable> targets,
                     io.tapstate.core.model.PipelineNode node) {
