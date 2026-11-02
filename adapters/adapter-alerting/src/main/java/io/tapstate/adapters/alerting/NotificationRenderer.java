@@ -72,9 +72,9 @@ public final class NotificationRenderer {
         if (!valid(facts)) { return new Result(null, Failure.INVALID_FACTS); }
         boolean test = facts.kind() == Kind.CHANNEL_TEST;
         List<Item> items = facts.items().subList(0, Math.min(MAX_ITEMS, facts.items().size()));
-        String severity = test || items.isEmpty() ? "" : "[" + facts.items().stream().map(Item::severity).min(java.util.Comparator.comparingInt(Enum::ordinal)).orElseThrow().name() + "] ";
+        String severity = test || items.isEmpty() ? "" : "[" + word("severity." + wire(facts.items().stream().map(Item::severity).min(java.util.Comparator.comparingInt(Enum::ordinal)).orElseThrow())) + "] ";
         String system = word("kind." + wire(facts.kind())) + " " + severity
-                + (test ? facts.channelName() : cleanTitle(items.getFirst().displayName()));
+                + (test ? facts.channelName() : alarmType(items.getFirst()) + ": " + cleanTitle(items.getFirst().displayName()));
         int available = 256 - count(settings.titlePrefix()) - count(settings.titleSuffix());
         String subject = settings.titlePrefix() + shorten(system, available) + settings.titleSuffix();
         Map<String, Object> root = new LinkedHashMap<>();
@@ -115,11 +115,17 @@ public final class NotificationRenderer {
                 renderedItems.add(value);
                 text.append(word("name")).append(": ").append(shorten(item.displayName(), 256)).append('\n');
                 appendTextRow(text, word("alarm-type"), alarmType(item));
+                appendTextRow(text, word("summary"), explanation(item));
                 appendTextRow(text, word("state"), word("state." + wire(item.state())));
                 appendTextRow(text, word("severity"), word("severity." + wire(item.severity())));
                 if (item.occurredAt() != null) appendTextRow(text, word("occurred"), testTime(item.occurredAt()));
                 if (item.recoveredAt() != null) appendTextRow(text, word("recovered"), testTime(item.recoveredAt()));
-                if (item.reason() != null && !item.reason().isBlank()) appendTextRow(text, word("reason"), shorten(item.reason(), 512));
+                if (duration(item) != null) appendTextRow(text, word("duration"), duration(item));
+                if (item.reason() != null && !item.reason().isBlank()) appendTextRow(text, word(recovery(item) ? "previous-error" : "reason"), readableReason(item));
+                else if (!recovery(item)) text.append(word("error-not-captured")).append('\n');
+                if (!recovery(item)) appendTextRow(text, word("next-steps"), guidance(item));
+                URI resource = resourceUrl(facts, item);
+                if (resource != null) appendTextRow(text, resourceAction(item), resource.toASCIIString());
             }
             root.put("items", renderedItems); root.put("totalItems", facts.totalItems());
             root.put("omittedItems", facts.totalItems() - items.size());
@@ -145,6 +151,7 @@ public final class NotificationRenderer {
                 appendTextRow(text, word("scope"), item.key().scope().authorityId() + "/" + item.key().scope().clusterId());
                 appendTextRow(text, "Alarm type ID", item.key().typeId());
                 appendTextRow(text, "Qualifier", item.key().qualifier());
+                if (item.reason() != null && !item.reason().isBlank()) appendTextRow(text, word("captured-error"), shorten(item.reason(), 512));
                 appendTextRow(text, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
                 if (item.observedAt() != null) appendTextRow(text, word("observed"), item.observedAt().toString());
             }
@@ -181,11 +188,24 @@ public final class NotificationRenderer {
                         .append("<tr><th colspan=\"2\" align=\"left\" style=\"padding:13px 16px;background:#303235;color:#f3f4f5;border-bottom:1px solid #414347;font-size:16px\">")
                         .append(escape(shorten(item.displayName(), 256))).append("</th></tr>");
                 appendHtmlRow(out, word("alarm-type"), alarmType(item));
+                out.append("<tr><td colspan=\"2\" style=\"padding:16px;color:#f3f4f5;font-size:15px;line-height:1.6\">")
+                        .append(escape(explanation(item))).append("</td></tr>");
                 appendHtmlRow(out, word("state"), word("state." + wire(item.state())));
                 appendHtmlRow(out, word("severity"), word("severity." + wire(item.severity())));
                 if (item.occurredAt() != null) appendHtmlRow(out, word("occurred"), testTime(item.occurredAt()));
                 if (item.recoveredAt() != null) appendHtmlRow(out, word("recovered"), testTime(item.recoveredAt()));
-                if (item.reason() != null && !item.reason().isBlank()) appendHtmlRow(out, word("reason"), shorten(item.reason(), 512));
+                if (duration(item) != null) appendHtmlRow(out, word("duration"), duration(item));
+                if (item.reason() != null && !item.reason().isBlank()) appendHtmlRow(out, word(recovery(item) ? "previous-error" : "reason"), readableReason(item));
+                else if (!recovery(item)) out.append("<tr><td colspan=\"2\" style=\"padding:12px 16px;color:#aeb2b8;font-size:13px;line-height:1.6\">")
+                        .append(escape(word("error-not-captured"))).append("</td></tr>");
+                if (!recovery(item)) {
+                    out.append("<tr><td colspan=\"2\" style=\"padding:16px;color:#f3f4f5;font-size:14px;line-height:1.6\"><strong style=\"color:#f3f4f5\">")
+                            .append(escape(word("next-steps"))).append("</strong><div style=\"margin-top:6px;color:#f3f4f5\">")
+                            .append(escape(guidance(item))).append("</div></td></tr>");
+                }
+                URI resource = resourceUrl(facts, item);
+                if (resource != null) out.append("<tr><td colspan=\"2\" style=\"padding:12px 16px 18px\"><a style=\"color:#8ab4f8;text-decoration:underline;font-size:14px\" href=\"")
+                        .append(escape(resource.toASCIIString())).append("\">").append(escape(resourceAction(item))).append("</a></td></tr>");
                 out.append("</table></td></tr>");
             }
             if (facts.totalItems() > items.size()) {
@@ -233,12 +253,46 @@ public final class NotificationRenderer {
             appendHtmlRow(out, word("scope"), item.key().scope().authorityId());
             appendHtmlRow(out, "Alarm type ID", item.key().typeId());
             appendHtmlRow(out, "Qualifier", item.key().qualifier());
+            if (item.reason() != null && !item.reason().isBlank()) appendHtmlRow(out, word("captured-error"), shorten(item.reason(), 512));
             appendHtmlRow(out, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
             if (item.observedAt() != null) appendHtmlRow(out, word("observed"), item.observedAt().toString());
         }
         for (Previous previous : facts.previous()) appendHtmlRow(out, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
         out.append("</table></td></tr>");
     }
+    private static boolean recovery(Item item) { return item.state() == State.RESOLVED; }
+    private String explanation(Item item) {
+        if (recovery(item)) return word("summary.recovered");
+        return words.getProperty("summary." + item.key().typeId(), word("summary.generic"));
+    }
+    private String guidance(Item item) {
+        return words.getProperty("guidance." + item.key().typeId(), word("guidance.generic"));
+    }
+    private String readableReason(Item item) {
+        String original = shorten(item.reason(), 512);
+        String lower = original.toLowerCase(Locale.ROOT);
+        if (lower.contains("connection refused")) return word("error.connection-refused");
+        if (lower.contains("prematurely reached end of stream")) return word("error.connection-closed");
+        if (lower.contains("exception receiving message")) return word("error.response-failed");
+        if (lower.contains("read timed out")) return word("error.read-timeout");
+        return original.replaceFirst("^Reported pipeline failure: ", "")
+                .replaceFirst("^[a-zA-Z_$][a-zA-Z0-9_$.]*(?:Exception|Error):\\s*", "");
+    }
+    private static String duration(Item item) {
+        if (!recovery(item) || item.occurredAt() == null || item.recoveredAt() == null || item.recoveredAt().isBefore(item.occurredAt())) return null;
+        long seconds = java.time.Duration.between(item.occurredAt(), item.recoveredAt()).getSeconds();
+        return (seconds / 3600 > 0 ? seconds / 3600 + "h " : "")
+                + (seconds / 60 > 0 ? seconds % 3600 / 60 + "m " : "") + seconds % 60 + "s";
+    }
+    private URI resourceUrl(Facts facts, Item item) {
+        if (facts.detailsUrl() == null || !List.of("source", "pipeline").contains(item.key().resource().kind())) return null;
+        String id = item.key().resource().id();
+        if (id.equals(".") || id.equals("..")) return null;
+        String encoded = java.net.URLEncoder.encode(id, StandardCharsets.UTF_8).replace("+", "%20");
+        URI link = facts.detailsUrl().resolve("/" + (item.key().resource().kind().equals("source") ? "sources" : "pipelines") + "/" + encoded);
+        return link.toASCIIString().length() <= 2048 ? link : null;
+    }
+    private String resourceAction(Item item) { return word("open." + item.key().resource().kind()); }
     private String alarmType(Item item) {
         String id = item.key().typeId();
         String localized = words.getProperty("alarm-type." + id);

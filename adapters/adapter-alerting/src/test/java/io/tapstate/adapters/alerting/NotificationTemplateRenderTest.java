@@ -22,6 +22,47 @@ class NotificationTemplateRenderTest {
         return new Facts(kind, "delivery-1", 1, T, List.of(item), 1, null,
                 List.of(new Previous("delivery-previous", DeliveryEvidence.Outcome.UNKNOWN)), null, null);
     }
+    @Test void formalSummaryExplainsTheFailureAndProvidesSafeResourceActions() {
+        var key = new AlarmKey(KEY.scope(), new AlarmKey.Resource("source", "orders east&west", "source-1"), "source.connection-failed", "rule");
+        var item = new Item(key, 1L, State.FIRING, AlarmSeverity.MAJOR, "Orders database", "java.net.ConnectException: Connection refused", T, T, null);
+        var snapshot = new NotificationRenderer().render(new Facts(Kind.FAULT, "delivery-1", 1, T, List.of(item), 1,
+                java.net.URI.create("https://example.test/alerts?view=active&key=abc&episode=1"), List.of(), null, null), MessageSettings.empty()).snapshot();
+        assertThat(snapshot.subject()).contains("Source connection failed", "Orders database").doesNotContain("MAJOR", "source.connection-failed");
+        for (String body : List.of(snapshot.html(), snapshot.text())) {
+            assertThat(body).contains("Tapstate could not access this data source", "What to check", "database service is running", "Open data source", "/sources/orders%20east%26west");
+            assertThat(body.indexOf("What to check")).isLessThan(body.indexOf("Technical details"));
+            assertThat(body).doesNotContain("data was lost", "pipeline has stopped");
+        }
+    }
+    @Test void recoveryExplainsWhatWasConfirmedAndShowsElapsedTimeWithoutOldFailureAdvice() {
+        var base = facts(Kind.RECOVERY);
+        var item = new Item(KEY, 1L, State.RESOLVED, AlarmSeverity.MAJOR, "Orders", "Connection refused", T, T, T.plusSeconds(3723));
+        var snapshot = new NotificationRenderer().render(new Facts(base.kind(), "delivery-1", 1, T.plusSeconds(3723), List.of(item), 1,
+                java.net.URI.create("https://example.test/alerts"), List.of(), null, null), MessageSettings.empty()).snapshot();
+        for (String body : List.of(snapshot.html(), snapshot.text())) {
+            assertThat(body).contains("Fresh evidence confirmed recovery", "1h 2m 3s", "Last recorded error", "Open pipeline", "/pipelines/orders");
+            assertThat(body).doesNotContain("What to check", "database service is running");
+        }
+    }
+    @Test void missingDiagnosticsExplainTheLimitWithoutInventingAnExceptionOrImpact() {
+        var base = facts(Kind.FAULT);
+        var item = new Item(KEY, 1L, State.FIRING, AlarmSeverity.MAJOR, "Orders", null, T, null, null);
+        var snapshot = new NotificationRenderer().render(new Facts(base.kind(), "delivery-1", 1, T, List.of(item), 1,
+                null, List.of(), null, null), MessageSettings.empty()).snapshot();
+        for (String body : List.of(snapshot.html(), snapshot.text())) {
+            assertThat(body).contains("The pipeline reported an execution failure", "A detailed error was not captured", "review its current status before restarting");
+            assertThat(body).doesNotContain("Unknown", "Open pipeline", "Duration");
+        }
+    }
+    @Test void resourceActionsStayOnTheConfiguredOriginAndNeverNavigateDotSegments() {
+        for (String id : List.of("..", ".")) {
+            var key = new AlarmKey(KEY.scope(), new AlarmKey.Resource("source", id, "source-1"), "source.connection-failed", "rule");
+            var item = new Item(key, 1L, State.FIRING, AlarmSeverity.MAJOR, "Orders", null, T, null, null);
+            var snapshot = new NotificationRenderer().render(new Facts(Kind.FAULT, "delivery-1", 1, T, List.of(item), 1,
+                    java.net.URI.create("https://example.test/alerts"), List.of(), null, null), MessageSettings.empty()).snapshot();
+            assertThat(snapshot.text()).doesNotContain("Open data source");
+        }
+    }
     @Test void everyBusinessLayoutKeepsMachineFactsAndEscapesLiteralCustomText() {
         var renderer = new NotificationRenderer();
         var settings = new MessageSettings("[prod] ", " (team)", "${secret} <script>\n{{literal}}", "footer & text");
@@ -33,7 +74,7 @@ class NotificationTemplateRenderTest {
             assertThat(snapshot.html()).doesNotContain("<script>", "<img>", "<pre>")
                     .contains("<!doctype html>", "<table", "<th scope=\"row\"", "&lt;script&gt;", "&lt;img&gt;",
                             "${secret}", "{{literal}}", "Technical details", "User supplied footer", "footer &amp; text");
-            assertThat(snapshot.html()).contains("[" + kindDisplay(kind) + "]", "Cluster", "Occurred at", "Reason");
+            assertThat(snapshot.html()).contains("[" + kindDisplay(kind) + "]", "Cluster", "Occurred at", kind == Kind.RECOVERY || kind == Kind.RECOVERY_SUMMARY ? "Last recorded error" : "Reason");
             assertThat(snapshot.html()).contains(">" + stateDisplay(kind) + "</td>", ">Major</td>");
             assertThat(snapshot.text()).contains("State: " + stateDisplay(kind), "Severity: Major");
             assertThat(snapshot.html()).contains(kind == Kind.RECOVERY || kind == Kind.RECOVERY_SUMMARY
@@ -127,14 +168,14 @@ class NotificationTemplateRenderTest {
     }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(AlarmSeverity.class)
-    void humanSeverityLabelsKeepMachineValuesAndSubjectUnchanged(AlarmSeverity severity) {
+    void humanSeverityLabelsKeepMachineValuesAndReadableSubjects(AlarmSeverity severity) {
         var item = new Item(KEY, 1L, State.FIRING, severity, "Orders", "Failed", T, null, null);
         var snapshot = new NotificationRenderer().render(new Facts(Kind.FAULT, "delivery-1", 1, T,
                 List.of(item), 1, null, List.of(), null, null), MessageSettings.empty()).snapshot();
         String human = severity.name().substring(0, 1) + severity.name().substring(1).toLowerCase(java.util.Locale.ROOT);
         assertThat(snapshot.text()).contains("State: Active", "Severity: " + human);
         assertThat(snapshot.html()).contains(">Active</td>", ">" + human + "</td>");
-        assertThat(snapshot.subject()).contains("[" + severity.name() + "]");
+        assertThat(snapshot.subject()).contains("[" + human + "]");
         assertThat(new String(snapshot.webhook(), StandardCharsets.UTF_8)).contains("\"state\":\"firing\"",
                 "\"severity\":\"" + severity.name().toLowerCase(java.util.Locale.ROOT) + "\"");
     }
@@ -219,7 +260,7 @@ class NotificationTemplateRenderTest {
         assertThatThrownBy(() -> new MessageSettings("\ud800", "", "", "")).isInstanceOf(TapstateException.class);
         var snapshot = new NotificationRenderer().render(facts(Kind.FAULT), new MessageSettings("x".repeat(64), "y".repeat(64), "", "")).snapshot();
         assertThat(snapshot.subject().codePointCount(0, snapshot.subject().length())).isLessThanOrEqualTo(256);
-        assertThat(snapshot.subject()).contains("[Alert]", "[MAJOR]");
+        assertThat(snapshot.subject()).contains("[Alert]", "[Major]");
     }
     @Test void oversizedGroupsAreVisibleSummariesAndUnrenderablePayloadsHaveNoSnapshot() {
         var first = facts(Kind.FAULT).items().getFirst();
@@ -255,7 +296,7 @@ class NotificationTemplateRenderTest {
                 List.of(first, second), 2, null, List.of(), null, null), MessageSettings.empty()).snapshot();
         assertThat(snapshot.text()).contains("orders-east", "orders-west");
         assertThat(snapshot.html()).contains("orders-east", "orders-west");
-        assertThat(snapshot.subject()).contains("CRITICAL");
+        assertThat(snapshot.subject()).contains("Critical");
     }
     @Test void fixedTestInitiationTimeIsVisibleInsideTheDecodedEmailBody() {
         var f = new Facts(Kind.CHANNEL_TEST, "test-delivery", 0, T, List.of(), 0, null, List.of(), "test-1", "Email");
