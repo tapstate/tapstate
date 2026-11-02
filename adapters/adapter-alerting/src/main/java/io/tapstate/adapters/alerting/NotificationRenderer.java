@@ -152,7 +152,7 @@ public final class NotificationRenderer {
 
         if (test) {
             out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"padding:14px 16px;border:1px solid #8b702e;background:#3a3322;border-radius:4px\">")
-                    .append("<strong style=\"display:block;margin-bottom:8px\">[TEST] ").append(escape(word("test-summary"))).append("</strong>")
+                    .append("<strong style=\"display:block;margin-bottom:8px;color:#f3f4f5\">[TEST] ").append(escape(word("test-summary"))).append("</strong>")
                     .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
             appendHtmlRow(out, word("test-id"), facts.testId());
             appendHtmlRow(out, "Channel", facts.channelName());
@@ -161,7 +161,7 @@ public final class NotificationRenderer {
         } else {
             for (Item item : items) {
                 out.append("<tr><td style=\"padding:0 28px 20px\"><table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\" style=\"border:1px solid #414347;border-radius:4px;border-collapse:separate\">")
-                        .append("<tr><th colspan=\"2\" align=\"left\" style=\"padding:13px 16px;background:#303235;border-bottom:1px solid #414347;font-size:16px\">")
+                        .append("<tr><th colspan=\"2\" align=\"left\" style=\"padding:13px 16px;background:#303235;color:#f3f4f5;border-bottom:1px solid #414347;font-size:16px\">")
                         .append(escape(shorten(item.displayName(), 256))).append("</th></tr>");
                 appendHtmlRow(out, word("resource"), item.key().resource().kind() + "/" + item.key().resource().id()
                         + " [" + item.key().resource().incarnation() + "]");
@@ -185,7 +185,7 @@ public final class NotificationRenderer {
         }
 
         out.append("<tr><td style=\"padding:0 28px\"><div style=\"border-top:1px solid #414347;padding:16px 0\">")
-                .append("<h2 style=\"margin:0 0 10px;font-size:14px\">Supplemental information</h2>")
+                .append("<h2 style=\"margin:0 0 10px;font-size:14px;color:#f3f4f5\">Supplemental information</h2>")
                 .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
         appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
         appendHtmlRow(out, word("created"), facts.createdAt().toString());
@@ -198,18 +198,18 @@ public final class NotificationRenderer {
         out.append("</table>");
         if (facts.detailsUrl() != null) {
             String href = escape(facts.detailsUrl().toASCIIString());
-            out.append("<div style=\"margin-top:10px\"><a href=\"").append(href).append("\">")
+            out.append("<div style=\"margin-top:10px\"><a style=\"color:#8ab4f8;text-decoration:underline\" href=\"").append(href).append("\">")
                     .append(escape(word("details"))).append("</a></div>");
         }
         if (!settings.messageNote().isEmpty()) {
-            out.append("<div style=\"margin-top:14px\"><strong>").append(escape(word("user-note")))
-                    .append("</strong><div style=\"margin-top:5px;white-space:pre-wrap\">")
+            out.append("<div style=\"margin-top:14px\"><strong style=\"color:#f3f4f5\">").append(escape(word("user-note")))
+                    .append("</strong><div style=\"margin-top:5px;white-space:pre-wrap;color:#f3f4f5\">")
                     .append(escape(settings.messageNote())).append("</div></div>");
         }
         out.append("</div></td></tr>");
         if (!settings.footerText().isEmpty()) {
-            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"border-top:1px solid #414347;padding-top:14px;color:#aeb2b8;font-size:13px\"><strong>")
-                    .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap\">")
+            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"border-top:1px solid #414347;padding-top:14px;color:#aeb2b8;font-size:13px\"><strong style=\"color:#aeb2b8\">")
+                    .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap;color:#aeb2b8\">")
                     .append(escape(settings.footerText())).append("</div></div></td></tr>");
         }
         out.append("</table></td></tr></table></body></html>");
