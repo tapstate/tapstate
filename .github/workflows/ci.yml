@@ -245,8 +245,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: recovery-refusal-process-logs
-          path: ${{ runner.temp }}/test-tmp/**/server.out
-          if-no-files-found: warn
+          path: ${{ runner.temp }}/tapstate-java-tmp/**/server.out
+          if-no-files-found: error
           retention-days: 3
 
   # This stable, non-matrix name is the required check. It admits the union,
