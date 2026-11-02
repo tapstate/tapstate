@@ -78,7 +78,7 @@ final class AlertEvaluationHost {
             AlertRule rule = rule(binding, before);
             if (before != null && !rule.equals(before.snapshot().rule())) {
                 var replaced = AlertLifecycle.replace(before.snapshot(), rule, now);
-                var after = head(binding, before, replaced, ownership, null, null);
+                var after = head(binding, before, replaced, ownership, null, null,input instanceof AlertInput.Operational);
                 if(before.binding().sourceBindingRevision()!=binding.sourceBindingRevision()
                         || !before.snapshot().rule().producerIncarnation().equals(binding.producer()))
                     after=new AlertStateRecord.Head(after.snapshot(),after.deployment(),after.owner(),after.retiredAt(),after.summariesHandedOff(),after.episode(),after.binding(),null);
@@ -101,6 +101,7 @@ final class AlertEvaluationHost {
                 if (input instanceof AlertInput.Conditions c) {
                     condition = AlertConditionGroup.evaluate(c.operator(), c.values()); trace = c.trace();
                 } else if (input instanceof AlertInput.Operational op) {
+                    trace = op.trace();
                     if (original.lastObservedAt() != null && !observed.isAfter(original.lastObservedAt())) return Result.IGNORED;
                     if (observed.isAfter(now) || observed.plus(rule.maxAge()).isBefore(now)) return Result.IGNORED;
                     if (operation == null && original.status() == AlertSnapshot.Status.FIRING) {
@@ -128,7 +129,7 @@ final class AlertEvaluationHost {
                     if (reading.status() != ObservationMetricInput.Status.READY) {
                         if(reading.status()==ObservationMetricInput.Status.BINDING_MISMATCH)return Result.IGNORED;
                         update = AlertLifecycle.discontinuity(original, now);
-                        var outcome = commit(retained, before, head(binding, before, update, ownership, null, null),
+                        var outcome = commit(retained, before, head(binding, before, update, ownership, null, null,input instanceof AlertInput.Operational),
                                 update, null, binding);
                         points.remove(binding.key());
                         if (outcome == AlertStore.Outcome.CONFLICT) continue;
@@ -142,7 +143,7 @@ final class AlertEvaluationHost {
                 update = AlertLifecycle.evaluate(original, signal, now);
             }
             if (update.ignored()) return Result.IGNORED;
-            var after = head(binding, before, update, ownership, signal, trace);
+            var after = head(binding, before, update, ownership, signal, trace,input instanceof AlertInput.Operational);
             after = new AlertStateRecord.Head(after.snapshot(),after.deployment(),after.owner(),after.retiredAt(),
                     after.summariesHandedOff(),after.episode(),after.binding(),operation);
             var outcome = commit(retained, before, after, update, signal, binding);
@@ -267,13 +268,20 @@ final class AlertEvaluationHost {
     }
     private AlertStateRecord.Head head(Binding b, AlertStateRecord.Head before, AlertUpdate update,
             AlertOwnership ownership, AlertSignal signal, AlarmDiagnostics.SafeTrace trace) {
+        return head(b,before,update,ownership,signal,trace,false);
+    }
+    private AlertStateRecord.Head head(Binding b, AlertStateRecord.Head before, AlertUpdate update,
+            AlertOwnership ownership, AlertSignal signal, AlarmDiagnostics.SafeTrace trace,boolean operational) {
         var value = update.snapshot().episode();
         AlertStateRecord.Episode episode = null;
         if (value != null) {
             boolean same = before != null && before.episode() != null && before.episode().value().number() == value.number();
             var original = same ? before.episode().originalBinding() : update.snapshot().rule();
-            var diagnostics = same ? before.episode().diagnostics() : AlertStateRecord.Diagnostics.empty(b.definition().typeId().equals("pipeline.failed"));
-            if (trace != null && signal != null) {
+            var diagnostics = same ? before.episode().diagnostics() : AlertStateRecord.Diagnostics.empty(operational||b.definition().typeId().equals("pipeline.failed"));
+            if (operational && diagnostics.status() == AlertStateRecord.DiagnosticStatus.NOT_APPLICABLE) {
+                diagnostics = AlertStateRecord.Diagnostics.empty(true);
+            }
+            if (trace != null && signal != null && diagnostics.status() != AlertStateRecord.DiagnosticStatus.PRUNED) {
                 var captured = AlarmDiagnostics.attach(update.snapshot(), signal, trace, diagnostics.history());
                 if (captured.isPresent()) diagnostics = AlertStateRecord.Diagnostics.captured(captured.orElseThrow());
             }

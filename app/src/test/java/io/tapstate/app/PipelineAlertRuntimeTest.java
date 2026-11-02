@@ -45,6 +45,20 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+    @Test void anAuthoritativeFailureSummaryIsCapturedWhenTheThrowableIsNoLongerAvailable() {
+        var redactor=new io.tapstate.core.logging.SecretRedactor();redactor.replace("source",List.of("original-source-secret"));
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host),intentStore,
+                (scope,claim)->Optional.of(()->{}),()->{},fixture.clock,new AlertDiagnosticMessages(redactor))) {
+            runtime.tick();drained(runtime);
+            var failure=new ObservationFailure(io.tapstate.runtime.engine.EngineError.JOB_FAILED.code(),
+                    Map.of("pipeline","orders","cause","connection reset password=original-source-secret"));
+            runtime.published(pass("orders"),new Observation("orders",PipelineState.FAILED,Map.of(),Map.of(),Map.of(),failure,T,List.of()),null);
+            drained(runtime);
+            var episode=rows.values().iterator().next().value().episode();
+            assertThat(episode.diagnostics().status()).isEqualTo(AlertStateRecord.DiagnosticStatus.CAPTURED);
+            assertThat(episode.diagnostics().history().latest().trace().text()).contains("connection reset").doesNotContain("original-source-secret");
+        }
+    }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void removedResourceReconciliationReadsOnlyHeadsThatStillNeedRetirement(boolean retired) {

@@ -87,6 +87,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicReference<Services> services=new AtomicReference<>();
     private volatile Instant lastEvaluatedAt;
     private final ConcurrentMap<Work,Instant> inputTimes=new ConcurrentHashMap<>();
+    private final AlertDiagnosticMessages diagnostics;
     private final AtomicReference<List<AlertConfiguration.Rule>> rules = new AtomicReference<>(List.of());
     private record Failure(String code,Map<String,Object> parameters){}
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
@@ -96,6 +97,12 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
 
     PipelineAlertRuntime(Supplier<Services> open, PipelineIntentStore intents,
             BiFunction<PipelineIntentScope, WorkloadClaimFence, Optional<Runnable>> claimProof, Runnable active, Clock clock) {
+        this(open,intents,claimProof,active,clock,null);
+    }
+    PipelineAlertRuntime(Supplier<Services> open, PipelineIntentStore intents,
+            BiFunction<PipelineIntentScope, WorkloadClaimFence, Optional<Runnable>> claimProof, Runnable active, Clock clock,
+            AlertDiagnosticMessages diagnostics) {
+        this.diagnostics = diagnostics;
         this.open = Objects.requireNonNull(open); this.intents = Objects.requireNonNull(intents);
         this.claimProof = Objects.requireNonNull(claimProof); this.active = Objects.requireNonNull(active);
         this.clock = Objects.requireNonNull(clock);
@@ -125,8 +132,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }
         var original = new Observation(observation.pipelineId(), observation.state(), Map.of(), Map.of(), Map.of(),
                 null, observation.observedAt(), observation.facts());
-        var trace = AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
-                ? Optional.of(coded.code().code()) : Optional.empty()).orElse(null);
+        var trace = (diagnostics == null ? AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
+                ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
         var capturedRules = rules.get();
         submit(slot, bytes + 16 * 1024, () -> {
             requireCurrent(slot);
@@ -311,7 +318,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
         }
         var captured=rules.get();
-        submitResource(slot,512,()->{try{
+        int inputSize=512+(input instanceof AlertInput.Operational op&&op.trace()!=null
+                ?op.trace().text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length:0);
+        submitResource(slot,inputSize,()->{try{
             if(resourceSlots.get(resource)!=slot)throw refused("retired-resource");
             active.run();originalGuard.run();var resolved=services.get();
             if(resolved==null)throw refused("storage-not-ready");
@@ -341,6 +350,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             &&head.snapshot().recoverySince()==null
                             &&head.snapshot().quality()==AlertSnapshot.Quality.VALID
                             &&head.snapshot().lastObservedAt()!=null
+                            &&(op.trace()==null||head.episode()!=null&&head.episode().diagnostics().status()!=AlertStateRecord.DiagnosticStatus.NOT_CAPTURED
+                                &&head.episode().diagnostics().status()!=AlertStateRecord.DiagnosticStatus.NOT_APPLICABLE)
                             &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plus(healthyCoalescingWindow(head.snapshot()))))continue;
                 }
                 accept(binding,next,input,shared);

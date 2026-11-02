@@ -30,6 +30,26 @@ class AlertNotificationPlannerIT {
     }
     static void bad(AlertEvaluationHostIT.Fixture f){assertThat(f.evaluator().accept(f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)),1,new AlertInput.Conditions(T,AlertSignal.Condition.BAD,null))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);}
     static List<AlertStore.Stored<AlertIntent.Record>> intents(AlertEvaluationHostIT.Fixture f){return f.store().dueIntents(T.plus(Duration.ofDays(60)),null,100).rows();}
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={0,9000})
+    void formalMailUsesResourceNamesAndTheCapturedEpisodeReasonAndObservationTime(int extraDiagnosticCharacters) {
+        AlertEvaluationHostIT.withFixture(f->{
+            route(f,Duration.ZERO);
+            var trace=new AlarmDiagnostics.SafeTrace("java.net.SocketException: Connection reset"+"x".repeat(extraDiagnosticCharacters),1,true,false);
+            assertThat(f.evaluator().accept(f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)),1,
+                    new AlertInput.Conditions(T,AlertSignal.Condition.BAD,trace))).isEqualTo(AlertEvaluationHost.Result.ACCEPTED);
+            planner(f,"mail-facts").tick();
+            var rows=intents(f);assertThat(rows).isNotEmpty();
+            assertThat(rows.getFirst().value().state().payload()).as("optional diagnostics cannot suppress delivery").isNotNull();
+            String mime=new String(rows.getFirst().value().state().payload().bytes(),java.nio.charset.StandardCharsets.US_ASCII);
+            int type=mime.indexOf("Content-Type: text/plain");int start=mime.indexOf("\r\n\r\n",type)+4;
+            int end=mime.indexOf("\r\n--",start);
+            String plain=new String(java.util.Base64.getMimeDecoder().decode(mime.substring(start,end)),java.nio.charset.StandardCharsets.UTF_8);
+            assertThat(plain.lines().findFirst().orElseThrow()).contains("orders");
+            assertThat(plain).contains("Connection reset","Observed at",T.atOffset(ZoneOffset.UTC).toLocalDate().toString());
+            assertThat(plain).doesNotContain("Reason: Unknown","Observed at: Unknown");
+        });
+    }
     static long settledBaseline(AlertEvaluationHostIT.Fixture f,AlertEvaluationHost.Binding binding,boolean recovered) {
         long sequence=0;
         if(recovered){

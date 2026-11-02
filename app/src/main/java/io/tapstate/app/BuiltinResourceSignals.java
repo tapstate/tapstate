@@ -17,11 +17,17 @@ final class BuiltinResourceSignals {
     private final CacheAuthScope cache;
     private final Runnable active;
     private final Clock clock;
+    private final AlertDiagnosticMessages diagnostics;
     private final Object cacheSampling = new Object();
     private Instant lastHealthyCacheRead, lastHealthyCacheWrite;
     private final Map<AlarmKey.Resource,AlertStore.ResourceEvidence> evidence = new java.util.concurrent.ConcurrentHashMap<>();
     BuiltinResourceSignals(Supplier<PipelineAlertRuntime> runtime,Supplier<StorageBinding> storage,
             CacheAuthScope cache,Runnable active,Clock clock){
+        this(runtime,storage,cache,active,clock,new AlertDiagnosticMessages(new io.tapstate.core.logging.SecretRedactor()));
+    }
+    BuiltinResourceSignals(Supplier<PipelineAlertRuntime> runtime,Supplier<StorageBinding> storage,
+            CacheAuthScope cache,Runnable active,Clock clock,AlertDiagnosticMessages diagnostics){
+        this.diagnostics=Objects.requireNonNull(diagnostics);
         this.runtime=runtime;this.storage=storage;this.cache=cache;this.active=active;this.clock=clock;
     }
     private static final class Connection {
@@ -31,10 +37,10 @@ final class BuiltinResourceSignals {
     private final Map<String,Connection> connections=new java.util.concurrent.ConcurrentHashMap<>();
     SourceOperationObserver source(SourceBindingSnapshot original,Runnable operation){return source(original,"legacy-source",operation,active);}
     SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,Runnable localProof) {
-        return source(original,logical,operation,localProof,new Reports(),true);
+        return source(original,logical,operation,localProof,new Reports(),true,diagnostics.snapshot(original));
     }
     private SourceOperationObserver source(SourceBindingSnapshot original,String logical,Runnable operation,
-            Runnable localProof,Reports reports,boolean root) {
+            Runnable localProof,Reports reports,boolean root,AlertDiagnosticMessages.SourceRedaction redaction) {
         synchronized(reports.monitor){if(reports.closed)return SourceOperationObserver.NONE;}
         var id=original.identity();
         boolean master=storage.get().defaultSourceId().equals(id.sourceId());
@@ -69,10 +75,11 @@ final class BuiltinResourceSignals {
                 }}
                 String domain=digest(base,access);
                 String binding=digest(id.sourceId(),id.incarnation(),Long.toString(id.bindingRevision()),domain);
-                var input=new AlertInput.Operational(clock.instant(),binding,OperationalEvidence.Capability.valueOf(capability.name()),failure==null,domain);
                 Runnable sourceSettled=once(settled),storageSettled=master?once(settled):()->{};
                 boolean submitted=false;
                 try {
+                    var trace=failure==null?null:diagnostics.source(redaction,failure).orElse(null);
+                    var input=new AlertInput.Operational(clock.instant(),binding,OperationalEvidence.Capability.valueOf(capability.name()),failure==null,domain,trace);
                     runtime.get().resourceInput(sourceResource,"source.connection-failed",id.bindingRevision(),binding,operation,local,input,sourceSettled);
                     submitted=true;
                     if(master)runtime.get().resourceInput(storageResource,"cluster.storage-unavailable",0,binding,operation,local,input,storageSettled);
@@ -80,7 +87,7 @@ final class BuiltinResourceSignals {
                     if(!submitted)sourceSettled.run();storageSettled.run();throw unavailable;
                 }
             }
-            @Override public SourceOperationObserver fork(String phase){closeConnection();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof,reports,false);}
+            @Override public SourceOperationObserver fork(String phase){closeConnection();return BuiltinResourceSignals.this.source(original,logical+":"+phase,operation,localProof,reports,false,redaction);}
             @Override public boolean hasPendingReports(){synchronized(reports.monitor){return reports.pending>0;}}
             @Override public void close(){synchronized(reports.monitor){if(root)reports.closed=true;closeConnection();}}
             private void closeConnection(){synchronized(reports.monitor){synchronized(connection){connection.closed=true;if(connection.pending==0)connections.remove(base,connection);}}}
@@ -113,7 +120,8 @@ final class BuiltinResourceSignals {
             String binding=digest(cache.clusterId(),cache.cacheIncarnation(),Long.toString(cache.bindingVersion()),Long.toString(cache.authGeneration()));
             runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),
                     "cluster.storage-unavailable",0,binding,active,new AlertInput.Operational(now,binding,
-                            write?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ,failure==null));
+                            write?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ,failure==null,null,
+                            failure==null?null:diagnostics.pipeline(failure,null).orElse(null)));
             // This records attempted publication only; all failures and the next success remain immediate.
             if(write)lastHealthyCacheWrite=failure==null?now:null;else lastHealthyCacheRead=failure==null?now:null;
         }

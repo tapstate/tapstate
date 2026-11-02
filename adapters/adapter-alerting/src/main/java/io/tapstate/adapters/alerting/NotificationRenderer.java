@@ -57,7 +57,10 @@ public final class NotificationRenderer {
         public boolean successful() { return snapshot != null; }
     }
     private final Properties words;
-    public NotificationRenderer() {
+    private final boolean allowInsecureLoopback;
+    public NotificationRenderer() { this(false); }
+    public NotificationRenderer(boolean allowInsecureLoopback) {
+        this.allowInsecureLoopback = allowInsecureLoopback;
         words = new Properties();
         try (var stream = getClass().getResourceAsStream("/notifications/en.properties")) {
             if (stream == null) { throw new IllegalStateException("missing fixed notification vocabulary"); }
@@ -87,7 +90,6 @@ public final class NotificationRenderer {
         root.put("title", subject);
         root.put("custom", ordered("messageNote", settings.messageNote(), "footerText", settings.footerText()));
         StringBuilder text = new StringBuilder(subject).append('\n').append(word("source")).append('\n');
-        if (!test) { text.append(word("delivery-id")).append(": ").append(facts.deliveryId()).append('\n'); }
         if (test) {
             root.put("testId", facts.testId());
             root.put("channelName", facts.channelName());
@@ -112,18 +114,12 @@ public final class NotificationRenderer {
                 value.put("displayName", shorten(item.displayName(), 256)); value.put("reason", reason);
                 renderedItems.add(value);
                 text.append(word("name")).append(": ").append(shorten(item.displayName(), 256)).append('\n');
-                text.append(word("resource")).append(": ").append(item.key().resource().kind()).append('/')
-                        .append(item.key().resource().id()).append(" [").append(item.key().resource().incarnation()).append("]\n")
-                        .append(word("scope")).append(": ").append(item.key().scope().authorityId()).append('/')
-                        .append(item.key().scope().clusterId()).append('\n')
-                        .append(word("alarm-type")).append(": ").append(item.key().typeId()).append('\n')
-                        .append(word("state")).append(": ").append(wire(item.state())).append('\n')
-                        .append(word("severity")).append(": ").append(wire(item.severity())).append('\n')
-                        .append(word("episode")).append(": ").append(item.episode() == null ? word("not-applicable") : item.episode()).append('\n')
-                        .append(word("occurred")).append(": ").append(item.occurredAt() == null ? word("unknown") : item.occurredAt()).append('\n')
-                        .append(word("observed")).append(": ").append(item.observedAt() == null ? word("unknown") : item.observedAt()).append('\n')
-                        .append(word("reason")).append(": ").append(reason).append('\n');
-                if (item.recoveredAt() != null) { text.append(word("recovered")).append(": ").append(item.recoveredAt()).append('\n'); }
+                appendTextRow(text, word("alarm-type"), alarmType(item));
+                appendTextRow(text, word("state"), word("state." + wire(item.state())));
+                appendTextRow(text, word("severity"), word("severity." + wire(item.severity())));
+                if (item.occurredAt() != null) appendTextRow(text, word("occurred"), testTime(item.occurredAt()));
+                if (item.recoveredAt() != null) appendTextRow(text, word("recovered"), testTime(item.recoveredAt()));
+                if (item.reason() != null && !item.reason().isBlank()) appendTextRow(text, word("reason"), shorten(item.reason(), 512));
             }
             root.put("items", renderedItems); root.put("totalItems", facts.totalItems());
             root.put("omittedItems", facts.totalItems() - items.size());
@@ -131,13 +127,29 @@ public final class NotificationRenderer {
             List<Map<String, Object>> previous = new ArrayList<>();
             for (Previous p : facts.previous()) {
                 previous.add(ordered("deliveryId", p.deliveryId(), "outcome", wire(p.outcome())));
-                text.append(word("previous")).append(": ").append(p.deliveryId()).append(' ').append(wire(p.outcome())).append('\n');
             }
             root.put("previous", previous);
         }
         if (!settings.messageNote().isEmpty()) { text.append(word("user-note")).append(":\n").append(settings.messageNote()).append('\n'); }
         if (facts.detailsUrl() != null) { root.put("detailsUrl", facts.detailsUrl().toASCIIString()); text.append(word("details")).append(": ").append(facts.detailsUrl().toASCIIString()).append('\n'); }
         if (!settings.footerText().isEmpty()) { text.append(word("user-footer")).append(":\n").append(settings.footerText()).append('\n'); }
+        if (!test) {
+            text.append('\n').append(word("technical-details")).append('\n');
+            appendTextRow(text, word("delivery-id"), facts.deliveryId());
+            appendTextRow(text, "Logical sequence", Long.toString(facts.logicalSequence()));
+            appendTextRow(text, word("created"), facts.createdAt().toString());
+            for (Item item : items) {
+                appendTextRow(text, word("name"), shorten(item.displayName(), 256));
+                appendTextRow(text, word("resource"), item.key().resource().kind() + "/" + item.key().resource().id());
+                appendTextRow(text, "Incarnation", item.key().resource().incarnation());
+                appendTextRow(text, word("scope"), item.key().scope().authorityId() + "/" + item.key().scope().clusterId());
+                appendTextRow(text, "Alarm type ID", item.key().typeId());
+                appendTextRow(text, "Qualifier", item.key().qualifier());
+                appendTextRow(text, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
+                if (item.observedAt() != null) appendTextRow(text, word("observed"), item.observedAt().toString());
+            }
+            for (Previous previous : facts.previous()) appendTextRow(text, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
+        }
         String plain = text.toString();
         String html = html(facts, settings, subject, items, test);
         byte[] json = JsonWriter.write(root).getBytes(StandardCharsets.UTF_8);
@@ -150,7 +162,7 @@ public final class NotificationRenderer {
         StringBuilder out = new StringBuilder(2048);
         out.append("<!doctype html><html lang=\"en\"><body style=\"margin:0;padding:24px;background:#1b1c1e;color:#f3f4f5;font-family:Arial,Helvetica,sans-serif\">")
                 .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\"><tr><td align=\"center\">")
-                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"640\" style=\"max-width:100%;background:#262729;border:1px solid #414347;border-radius:8px\">")
+                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"840\" style=\"max-width:100%;background:#262729;border:1px solid #414347;border-radius:8px\">")
                 .append("<tr><td style=\"padding:24px 28px 12px\"><div style=\"font-size:12px;color:#aeb2b8\">")
                 .append(escape(word("source"))).append("</div><h1 style=\"margin:8px 0 0;font-size:22px;line-height:1.35;color:#f3f4f5\">")
                 .append(escape(subject)).append("</h1></td></tr>");
@@ -168,19 +180,12 @@ public final class NotificationRenderer {
                 out.append("<tr><td style=\"padding:0 28px 20px\"><table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\" style=\"border:1px solid #414347;border-radius:4px;border-collapse:separate\">")
                         .append("<tr><th colspan=\"2\" align=\"left\" style=\"padding:13px 16px;background:#303235;color:#f3f4f5;border-bottom:1px solid #414347;font-size:16px\">")
                         .append(escape(shorten(item.displayName(), 256))).append("</th></tr>");
-                appendHtmlRow(out, word("resource"), item.key().resource().kind() + "/" + item.key().resource().id()
-                        + " [" + item.key().resource().incarnation() + "]");
-                appendHtmlRow(out, "Cluster", item.key().scope().clusterId());
-                appendHtmlRow(out, word("scope"), item.key().scope().authorityId());
-                appendHtmlRow(out, word("alarm-type"), item.key().typeId());
-                appendHtmlRow(out, "Qualifier", item.key().qualifier());
-                appendHtmlRow(out, word("state"), item.state().name());
-                appendHtmlRow(out, word("severity"), item.severity().name());
-                appendHtmlRow(out, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
-                appendHtmlRow(out, word("occurred"), item.occurredAt() == null ? word("unknown") : item.occurredAt().toString());
-                appendHtmlRow(out, word("observed"), item.observedAt() == null ? word("unknown") : item.observedAt().toString());
-                if (item.recoveredAt() != null) appendHtmlRow(out, word("recovered"), item.recoveredAt().toString());
-                appendHtmlRow(out, word("reason"), item.reason() == null ? word("unknown") : shorten(item.reason(), 512));
+                appendHtmlRow(out, word("alarm-type"), alarmType(item));
+                appendHtmlRow(out, word("state"), word("state." + wire(item.state())));
+                appendHtmlRow(out, word("severity"), word("severity." + wire(item.severity())));
+                if (item.occurredAt() != null) appendHtmlRow(out, word("occurred"), testTime(item.occurredAt()));
+                if (item.recoveredAt() != null) appendHtmlRow(out, word("recovered"), testTime(item.recoveredAt()));
+                if (item.reason() != null && !item.reason().isBlank()) appendHtmlRow(out, word("reason"), shorten(item.reason(), 512));
                 out.append("</table></td></tr>");
             }
             if (facts.totalItems() > items.size()) {
@@ -195,23 +200,13 @@ public final class NotificationRenderer {
                     .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap;color:#aeb2b8\">")
                     .append(escape(settings.footerText())).append("</div></div></td></tr>");
         }
+        if (!test) appendTechnicalDetails(out, facts, items);
         out.append("</table></td></tr></table></body></html>");
         return out.toString();
     }
     private void appendSupplemental(StringBuilder out, Facts facts, MessageSettings settings, boolean test) {
         if (test && facts.detailsUrl() == null && settings.messageNote().isEmpty()) { return; }
         out.append("<tr><td style=\"padding:0 28px\"><div style=\"border-top:1px solid #414347;padding:16px 0\">");
-        if (!test) {
-            out.append("<h2 style=\"margin:0 0 10px;font-size:14px;color:#f3f4f5\">Supplemental information</h2>")
-                    .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
-            appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
-            appendHtmlRow(out, word("created"), facts.createdAt().toString());
-            appendHtmlRow(out, "Logical sequence", Long.toString(facts.logicalSequence()));
-            for (Previous previous : facts.previous()) {
-                appendHtmlRow(out, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
-            }
-            out.append("</table>");
-        }
         if (facts.detailsUrl() != null) {
             String href = escape(facts.detailsUrl().toASCIIString());
             out.append("<div style=\"margin-top:10px\"><a style=\"color:#8ab4f8;text-decoration:underline\" href=\"").append(href).append("\">")
@@ -224,21 +219,48 @@ public final class NotificationRenderer {
         }
         out.append("</div></td></tr>");
     }
+    private void appendTechnicalDetails(StringBuilder out, Facts facts, List<Item> items) {
+        out.append("<tr><td style=\"padding:0 28px 20px\"><h2 style=\"color:#f3f4f5;font-size:14px\">")
+                .append(escape(word("technical-details"))).append("</h2><table width=\"100%\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\">");
+        appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
+        appendHtmlRow(out, "Logical sequence", Long.toString(facts.logicalSequence()));
+        appendHtmlRow(out, word("created"), facts.createdAt().toString());
+        for (Item item : items) {
+            appendHtmlRow(out, word("name"), shorten(item.displayName(), 256));
+            appendHtmlRow(out, word("resource"), item.key().resource().kind() + "/" + item.key().resource().id());
+            appendHtmlRow(out, "Incarnation", item.key().resource().incarnation());
+            appendHtmlRow(out, "Cluster", item.key().scope().clusterId());
+            appendHtmlRow(out, word("scope"), item.key().scope().authorityId());
+            appendHtmlRow(out, "Alarm type ID", item.key().typeId());
+            appendHtmlRow(out, "Qualifier", item.key().qualifier());
+            appendHtmlRow(out, word("episode"), item.episode() == null ? word("not-applicable") : item.episode().toString());
+            if (item.observedAt() != null) appendHtmlRow(out, word("observed"), item.observedAt().toString());
+        }
+        for (Previous previous : facts.previous()) appendHtmlRow(out, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
+        out.append("</table></td></tr>");
+    }
+    private String alarmType(Item item) {
+        String id = item.key().typeId();
+        String localized = words.getProperty("alarm-type." + id);
+        if (localized != null) return localized;
+        String human = id.replaceAll("[._-]+", " ").trim();
+        return human.isEmpty() ? word("alarm-type") : human.substring(0, 1).toUpperCase(Locale.ROOT) + human.substring(1);
+    }
+    private static void appendTextRow(StringBuilder out, String label, String value) {
+        out.append(label).append(": ").append(value).append('\n');
+    }
     private static void appendHtmlRow(StringBuilder out, String label, String value) {
-        out.append("<tr><th scope=\"row\" align=\"left\" valign=\"top\" style=\"padding:7px 16px;color:#aeb2b8;font-size:13px;font-weight:normal;border-bottom:1px solid #414347\">")
+        out.append("<tr><th scope=\"row\" align=\"left\" valign=\"top\" style=\"width:128px;white-space:nowrap;padding:7px 16px;color:#aeb2b8;font-size:13px;font-weight:normal;border-bottom:1px solid #414347\">")
                 .append(escape(label)).append("</th><td style=\"padding:7px 16px;color:#f3f4f5;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;border-bottom:1px solid #414347\">")
                 .append(escape(value)).append("</td></tr>");
     }
     private static String testTime(Instant value) {
         return TEST_TIME.format(value).replace('T', ' ').replace("Z", " UTC");
     }
-    private static boolean valid(Facts f) {
+    private boolean valid(Facts f) {
         if (f == null || f.kind() == null || !identifier(f.deliveryId()) || f.createdAt() == null
                 || f.items().size() > 100 || f.previous().size() > 32 || f.totalItems() < f.items().size()) { return false; }
-        if (f.detailsUrl() != null && (!"https".equalsIgnoreCase(f.detailsUrl().getScheme())
-                || f.detailsUrl().getHost() == null || f.detailsUrl().getUserInfo() != null
-                || f.detailsUrl().getRawQuery() != null || f.detailsUrl().getRawFragment() != null
-                || f.detailsUrl().toASCIIString().length() > 2048)) { return false; }
+        if (f.detailsUrl() != null && !validDetailsUrl(f.detailsUrl())) return false;
         if (f.kind() == Kind.CHANNEL_TEST) {
             if (!f.items().isEmpty() || f.totalItems() != 0 || !f.previous().isEmpty() || !identifier(f.testId())
                     || f.channelName() == null || count(f.channelName()) > 64 || !f.channelName().matches("[A-Za-z0-9 ._-]+") || f.logicalSequence() != 0) { return false; }
@@ -257,6 +279,22 @@ public final class NotificationRenderer {
             }
         }
         return f.previous().stream().allMatch(p -> identifier(p.deliveryId()) && p.outcome() != null);
+    }
+    private boolean validDetailsUrl(URI url) {
+        if (url.getHost() == null || url.getRawUserInfo() != null || url.getRawFragment() != null
+                || url.toASCIIString().length() > 2048) return false;
+        String host = url.getHost();
+        boolean loopback = host.equalsIgnoreCase("localhost") || host.equals("127.0.0.1") || host.equals("[::1]");
+        if (!"https".equalsIgnoreCase(url.getScheme())
+                && !(allowInsecureLoopback && "http".equalsIgnoreCase(url.getScheme()) && loopback)) return false;
+        String query = url.getRawQuery();
+        if (query == null) return true;
+        if (!"/alerts".equals(url.getRawPath()) || !query.matches("view=(active|history)&key=[A-Za-z0-9_-]{1,1800}&episode=[1-9][0-9]*")) return false;
+        try {
+            return Long.parseLong(query.substring(query.lastIndexOf('=') + 1)) > 0;
+        } catch (NumberFormatException ex) {
+            return false;
+        }
     }
     private static Map<String, Object> ordered(Object... pairs) {
         Map<String, Object> result = new LinkedHashMap<>();

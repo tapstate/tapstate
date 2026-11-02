@@ -12,6 +12,31 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class BuiltinResourceSignalsTest {
+    @Test void classifiedSourceFailuresRetainBoundedRedactedDiagnosticText() {
+        var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
+        var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.fixed(Instant.EPOCH,ZoneOffset.UTC));
+        var identity=new SourceBindingIdentity("erp","e6e8d616-985e-49cc-a0f4-9802897abf95",2);
+        var source=new SourceBindingSnapshot(new SourceResource("erp",null,"test",Map.of("password","original-source-secret"),null,null,null,null),"a".repeat(64),identity);
+        signals.source(source,()->{}).completed(SourceOperationObserver.Capability.STREAM_READ,
+                new java.net.ConnectException("Connection reset password=original-source-secret"));
+        var input=org.mockito.ArgumentCaptor.forClass(AlertInput.class);
+        verify(runtime).resourceInput(any(),eq("source.connection-failed"),eq(2L),anyString(),any(),any(),input.capture(),any());
+        var operation=(AlertInput.Operational)input.getValue();
+        assertThat(operation.trace()).isNotNull();
+        assertThat(operation.trace().text()).contains("Connection reset").doesNotContain("original-source-secret");
+    }
+    @Test void nestedOriginalSourceSecretsAreFrozenBeforeConnectorMutationAndForks() {
+        var runtime=mock(PipelineAlertRuntime.class);var binding=mock(StorageBinding.class);when(binding.defaultSourceId()).thenReturn("other");
+        var signals=new BuiltinResourceSignals(()->runtime,()->binding,new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1),()->{},Clock.fixed(Instant.EPOCH,ZoneOffset.UTC));
+        var nested=new HashMap<String,Object>();nested.put("password","old-private-value");
+        var identity=new SourceBindingIdentity("erp","e6e8d616-985e-49cc-a0f4-9802897abf95",2);
+        var source=new SourceBindingSnapshot(new SourceResource("erp",null,"test",Map.of("options",nested),null,null,null,null),"a".repeat(64),identity);
+        var root=signals.source(source,()->{});nested.put("password","new-value");var phase=root.fork("stream");
+        phase.completed(SourceOperationObserver.Capability.STREAM_READ,new java.net.ConnectException("failed for old-private-value"));
+        var input=org.mockito.ArgumentCaptor.forClass(AlertInput.class);
+        verify(runtime).resourceInput(any(),eq("source.connection-failed"),eq(2L),anyString(),any(),any(),input.capture(),any());
+        assertThat(((AlertInput.Operational)input.getValue()).trace().text()).doesNotContain("old-private-value");
+    }
     @Test void driverFailuresKeepTheirMeaningAcrossAnIsolatedConnectorLoader() throws Exception {
         var urls=new java.net.URL[]{
                 com.mongodb.MongoException.class.getProtectionDomain().getCodeSource().getLocation(),

@@ -418,7 +418,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean BuiltinResourceSignals builtinResourceSignals(NativeBusinessContext owner,
                 org.springframework.beans.factory.ObjectProvider<PipelineAlertRuntime> runtime,Clock clock){
             return new BuiltinResourceSignals(runtime::getObject,owner.original::binding,owner.original.preparation().authScope(),
-                    owner::requireAlertHost,clock);
+                    owner::requireAlertHost,clock,new AlertDiagnosticMessages(owner.parent.getBean(io.tapstate.core.logging.SecretRedactor.class)));
         }
         @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
                 ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
@@ -478,12 +478,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 boolean outbound=AlertChannels.outboundEnabled(owner.parent.getEnvironment().getProperty("tapstate.alerting.outbound-enabled"));
                 var host = new io.tapstate.spi.store.AlertStore.Host(scope,setup,deployment,active,route,target,signals::resourceEvidence,AlertChannels.capabilities(deployment,cloud,outbound));
                 var store = owner.configuration.alerts(host, catalog, clock);
-                var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active);
+                var environment=owner.parent.getEnvironment();
+                var links=cloud.cloud()?AlertMailLinks.none():new AlertMailLinks(environment.getProperty("tapstate.alerting.web-base-url"),
+                        environment.getProperty("tapstate.browser-auth.public-origins"),Boolean.parseBoolean(environment.getProperty("tapstate.browser-auth.allow-insecure-loopback","false")));
+                var planner = new AlertNotificationPlanner(store,clock,evaluatorId+":planning",cloud.cloud()?cloud.baseUrl():null,active,links);
                 var maintenance=new AlertMaintenanceRuntime(store.maintenance().orElseThrow(),clock,active);maintenance.reporting(export);
                 return new PipelineAlertRuntime.Services(store, new AlertEvaluationHost(store, catalog, deployment, clock, evaluatorId, active,retention).withPlanner(planner),catalog,new AlertPlanningRuntime(planner),
                         new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
                                 owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions(),maintenance);
-            }, owner.configuration.intents(), ownership::evaluationProof, active, clock);
+            }, owner.configuration.intents(), ownership::evaluationProof, active, clock,
+                    new AlertDiagnosticMessages(owner.parent.getBean(io.tapstate.core.logging.SecretRedactor.class)));
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
                 PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {

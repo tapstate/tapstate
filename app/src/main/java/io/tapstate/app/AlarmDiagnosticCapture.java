@@ -37,6 +37,10 @@ final class AlarmDiagnosticCapture {
     static Optional<AlarmDiagnostics.SafeTrace> capture(Throwable original, List<String> knownSecrets) {
         return capture(original, knownSecrets, ignored -> Optional.empty());
     }
+    static AlarmDiagnostics.SafeTrace reported(String message) {
+        State state = new State(List.of());
+        return new AlarmDiagnostics.SafeTrace(state.safe(message), 1, state.redacted, state.truncated);
+    }
     private static final class State {
         private final List<String> secrets;
         private final Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());

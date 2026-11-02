@@ -19,7 +19,8 @@ final class AlertNotificationPlanner {
     private final Clock clock;
     private final String worker;
     private final URI cloudOrigin;
-    private final NotificationRenderer renderer = new NotificationRenderer();
+    private final NotificationRenderer renderer;
+    private final AlertMailLinks links;
     private final Runnable active;
     private int offset;
     record Destination(AlertIntent.Route route, AlertIntent.Target target, String channel, String receiver,
@@ -28,6 +29,10 @@ final class AlertNotificationPlanner {
     record Changes(List<AlertStore.IntentChange> intents,List<AlertStore.ScheduleChange> schedules) { }
 
     AlertNotificationPlanner(AlertStore store,Clock clock,String worker,URI cloudOrigin,Runnable active) {
+        this(store,clock,worker,cloudOrigin,active,AlertMailLinks.none());
+    }
+    AlertNotificationPlanner(AlertStore store,Clock clock,String worker,URI cloudOrigin,Runnable active,AlertMailLinks links) {
+        this.links=Objects.requireNonNull(links);this.renderer=new NotificationRenderer(links.allowLoopback());
         this.store=Objects.requireNonNull(store);this.clock=Objects.requireNonNull(clock);this.worker=Objects.requireNonNull(worker);
         this.cloudOrigin=cloudOrigin;this.active=Objects.requireNonNull(active);
     }
@@ -320,8 +325,9 @@ final class AlertNotificationPlanner {
             var destination=new io.tapstate.spi.alerting.NotificationChannel.Destination(alarm.scope(),d.channel(),d.receiver(),d.targetId(),((AlertIntent.SdkTarget)d.target()).clusterBinding());
             bytes=CloudAlertEventWire.encode(cloudOrigin,destination,key,alarm,recoveryMessage?ep.recoveredAt():ep.firedAt(),ep.severity(),alarm.typeId(),recoveryMessage&&recovery!=DeliveryEvidence.RecoveryKind.RECOVERY,member.episode());
         }else{
-            var items=members.stream().map(m->{var ep=episode(view,m).value();return new NotificationRenderer.Item(m.evaluation().key(),m.episode(),
-                    recoveryMessage?NotificationRenderer.State.RESOLVED:NotificationRenderer.State.FIRING,ep.severity(),m.evaluation().key().typeId(),null,ep.firedAt(),null,ep.recoveredAt());}).toList();
+            var items=members.stream().map(m->{var original=episode(view,m);var ep=original.value();return new NotificationRenderer.Item(m.evaluation().key(),m.episode(),
+                    recoveryMessage?NotificationRenderer.State.RESOLVED:NotificationRenderer.State.FIRING,ep.severity(),m.evaluation().key().resource().id(),
+                    reason(original.diagnostics()),ep.firedAt(),observed(view,m,original),ep.recoveredAt());}).toList();
             var kind=recoveryMessage?(recovery==DeliveryEvidence.RecoveryKind.RECOVERY?NotificationRenderer.Kind.RECOVERY:NotificationRenderer.Kind.RECOVERY_SUMMARY)
                     :key.notification().kind()==DeliveryKey.Kind.REMINDER?NotificationRenderer.Kind.REMINDER:NotificationRenderer.Kind.FAULT;
             var prior=new ArrayList<NotificationRenderer.Previous>();
@@ -330,7 +336,7 @@ final class AlertNotificationPlanner {
                 for(var ref:row.value().protectedIntents())if(ref.notification().kind()!=DeliveryKey.Kind.RECOVERY&&view.intents().get(ref).value().frozen().members().stream().anyMatch(m->members.stream().anyMatch(n->n.episodeMember().equals(m.episodeMember()))))outcomes.add(view.intents().get(ref).value().state().summary());
                 if(!outcomes.isEmpty())prior.add(new NotificationRenderer.Previous("previous-summary",DeliveryEvidence.aggregate(outcomes)));
             }
-            var rendered=renderer.render(new NotificationRenderer.Facts(kind,identity.deliveryId(),key.notification().round(),now,items,items.size(),null,prior,null,null),d.messages());
+            var rendered=renderer.render(new NotificationRenderer.Facts(kind,identity.deliveryId(),key.notification().round(),now,items,items.size(),links.details(members,recoveryMessage),prior,null,null),d.messages());
             if(rendered.successful()){
                 if(d.target() instanceof AlertIntent.ReceiverTarget receiver&&receiver.transport() instanceof AlertReceiver.Email email){var mime=EmailMime.freeze(identity.deliveryId(),now,email.from(),d.targetId(),rendered.snapshot());if(mime.successful())bytes=mime.bytes();}
                 else bytes=rendered.snapshot().webhook();
@@ -342,6 +348,26 @@ final class AlertNotificationPlanner {
         if(payload==null)retained=retained.stop(now,now);
         return new AlertIntent.Record(frozen,new AlertIntent.State(AlertOwnership.unclaimed(),0,payload==null,payload==null?AlertIntent.StopReason.RENDER_FAILED:null,
                 payload==null?null:now,0,List.of(),DeliveryEvidence.Outcome.NOT_ATTEMPTED,AlertIntent.Retained.capture(retained),payload,null,null,null,null));
+    }
+    private static Instant observed(AlertStore.Planning view,AlertIntent.Member member,AlertStateRecord.Episode episode) {
+        if(episode.diagnostics().latest()!=null)return episode.diagnostics().latest().observedAt();
+        return view.states().stream().map(AlertStore.Stored::value).filter(head->member.equals(head.binding()))
+                .map(head->head.snapshot().lastObservedAt()).filter(Objects::nonNull).findFirst().orElse(null);
+    }
+    private static String reason(AlertStateRecord.Diagnostics diagnostics) {
+        if(diagnostics.history()==null)return null;
+        for(String raw:diagnostics.history().latest().trace().text().lines().toList()) {
+            String line=raw.strip();if(line.startsWith("at ")||line.isEmpty())continue;
+            if(line.startsWith("Caused by: "))line=line.substring("Caused by: ".length());
+            if(line.startsWith("Suppressed: "))line=line.substring("Suppressed: ".length());
+            int split=line.indexOf(": ");
+            if(split>=0) {
+                String message=line.substring(split+2);
+                if(message.matches("[a-z][a-z0-9-]*\\.[a-z0-9][a-z0-9.-]*"))continue;
+                return message.codePointCount(0,message.length())>512?message.substring(0,message.offsetByCodePoints(0,511))+"…":message;
+            }
+        }
+        return null;
     }
     private static AlertStateRecord.Episode episode(AlertStore.Planning view,AlertIntent.Member m){var value=view.episodes().get(m.episodeMember());if(value==null)throw invalid("missing-episode-evidence");return value;}
     private static DeliveryEvidence.Previous evidence(AlertIntent.Record intent){return new DeliveryEvidence.Previous(intent.state().summary(),intent.frozen().content().renderingFailed(),intent.state().attempts().stream().filter(a->a.endedAt()==null).map(a->a.permit().deadline()).min(Instant::compareTo).orElse(null));}
