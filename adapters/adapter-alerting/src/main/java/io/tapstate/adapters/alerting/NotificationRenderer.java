@@ -162,7 +162,7 @@ public final class NotificationRenderer {
         StringBuilder out = new StringBuilder(2048);
         out.append("<!doctype html><html lang=\"en\"><body style=\"margin:0;padding:24px;background:#1b1c1e;color:#f3f4f5;font-family:Arial,Helvetica,sans-serif\">")
                 .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\"><tr><td align=\"center\">")
-                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"840\" style=\"max-width:100%;background:#262729;border:1px solid #414347;border-radius:8px\">")
+                .append("<table role=\"presentation\" cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"840\" style=\"width:100%;max-width:840px;table-layout:fixed;background:#262729;border:1px solid #414347;border-radius:8px\">")
                 .append("<tr><td style=\"padding:24px 28px 12px\"><div style=\"font-size:12px;color:#aeb2b8\">")
                 .append(escape(word("source"))).append("</div><h1 style=\"margin:8px 0 0;font-size:22px;line-height:1.35;color:#f3f4f5\">")
                 .append(escape(subject)).append("</h1></td></tr>");

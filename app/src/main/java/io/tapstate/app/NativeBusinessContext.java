@@ -415,10 +415,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         @Bean(destroyMethod = "close") MetricsExport metricsExport(MetricsExportProperties properties) {
             return RuntimeConvergenceConfiguration.metricsExportFor(properties);
         }
+        @Bean AlertDiagnosticMessages alertDiagnosticMessages(io.tapstate.core.logging.SecretRedactor redactor) {
+            return new AlertDiagnosticMessages(redactor);
+        }
         @Bean BuiltinResourceSignals builtinResourceSignals(NativeBusinessContext owner,
-                org.springframework.beans.factory.ObjectProvider<PipelineAlertRuntime> runtime,Clock clock){
+                org.springframework.beans.factory.ObjectProvider<PipelineAlertRuntime> runtime,Clock clock,AlertDiagnosticMessages diagnostics){
             return new BuiltinResourceSignals(runtime::getObject,owner.original::binding,owner.original.preparation().authScope(),
-                    owner::requireAlertHost,clock,new AlertDiagnosticMessages(owner.parent.getBean(io.tapstate.core.logging.SecretRedactor.class)));
+                    owner::requireAlertHost,clock,diagnostics);
         }
         @Bean(destroyMethod="close") ClusterNodeAlertSource clusterNodeAlertSource(NativeBusinessContext owner,HazelcastInstance member,
                 ClusterMembershipGate membership,PipelineAlertRuntime runtime,BuiltinResourceSignals signals,Clock clock,
@@ -461,7 +464,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                     :new io.tapstate.core.alerting.AlarmKey.Scope(setup.installationId(),setup.clusterId());
         }
         @Bean(initMethod = "start",destroyMethod = "close") PipelineAlertRuntime pipelineAlertRuntime(NativeBusinessContext owner,
-                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals, MetricsExport export,AlertRetentionSettings retentions) {
+                PipelineActuationOwnership ownership, NodeSessionLease node, CloudRuntimeSettings cloud, Clock clock,BuiltinResourceSignals signals, MetricsExport export,AlertRetentionSettings retentions,AlertDiagnosticMessages diagnostics) {
             var types=owner.parent.getBeanProvider(AlertTypeAssembly.class).getIfAvailable(AlertTypeAssembly::builtin);
             String evaluatorId = java.util.UUID.randomUUID().toString();
             Runnable active=owner::requireAlertHost;
@@ -487,7 +490,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                         new AlertDeliveryRuntime(store,clock,evaluatorId+":delivery",active,new AlertChannels(deployment,cloud,clock,active,cloud.cloud()?scope.authorityId():null,outbound),
                                 owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions(),maintenance);
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock,
-                    new AlertDiagnosticMessages(owner.parent.getBean(io.tapstate.core.logging.SecretRedactor.class)));
+                    diagnostics);
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
                 PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {
