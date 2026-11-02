@@ -29,17 +29,25 @@ final class SourceModelSnapshot {
 
     /** Uses exact retained observations for planning; the public discovery record remains untouched. */
     SourceModelSnapshot withRetainedTables(SourceResource source,Map<String,SourceTable> retained) {
-        var original=models.get(source.id());
-        if(original==null || original.isEmpty() || !original.orElseThrow().connectorId().equals(source.connector())) throw fenced();
-        var record=original.orElseThrow();var tables=new java.util.ArrayList<SourceTable>();
+        if (!models.containsKey(source.id())) throw fenced();
+        var discovery = models.get(source.id()).orElseThrow(this::fenced);
+        if (!discovery.connectorId().equals(source.connector())) throw fenced();
+        var tables = new java.util.ArrayList<SourceTable>();
         var remaining=new LinkedHashMap<>(retained);
-        for(var observed:record.model().tables()) {
+        for (var observed : discovery.model().tables()) {
             var pinned=remaining.remove(observed.name());
             tables.add(pinned==null?observed:new SourceTable(pinned.name(),pinned.fields(),pinned.primaryKey(),pinned.indexes(),observed.approximateRowCount()));
         }
         if(!remaining.isEmpty())throw fenced();
         var copy=new LinkedHashMap<>(models);
-        copy.put(source.id(),Optional.of(new DiscoveredSourceModel(record.connectionId(),record.connectorId(),record.discoveredAt(),new SourceModel(tables))));
+        copy.put(
+                source.id(),
+                Optional.of(
+                        new DiscoveredSourceModel(
+                                discovery.connectionId(),
+                                discovery.connectorId(),
+                                discovery.discoveredAt(),
+                                new SourceModel(tables))));
         return new SourceModelSnapshot(pipeline,copy);
     }
     PipelinePreparationInputs preparationInputs(PipelineIntentScope scope,PipelineResource original,PipelineResource selected,Map<String,SourceResource> sources) {

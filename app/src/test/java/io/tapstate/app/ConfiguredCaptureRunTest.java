@@ -73,7 +73,8 @@ class ConfiguredCaptureRunTest {
         var run=ConfiguredCaptureRun.prepare(ORIGINAL,config,notes,id -> artifact,() -> {});
         when(notes.origin(run.primary())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,config.settings()));
         assertThat(run.modelComparison(config,notes,id -> artifact,() -> {})).isEqualTo(SourceModelComparison.SAMPLED_DOCUMENT);
-        assertThatThrownBy(() -> run.modelComparison(config.at(new PipelineNode("flow","other")),notes,id -> artifact,() -> {}))
+        var otherConfig=config.at(new PipelineNode("flow","other"));
+        assertThatThrownBy(() -> run.modelComparison(otherConfig,notes,id -> artifact,() -> {}))
                 .isInstanceOf(TapstateException.class);
         when(notes.origin(run.primary())).thenReturn(ConnectorNoteOrigin.capture("mongodb",HASH,Map.of("database","changed")));
         assertThatThrownBy(() -> run.modelComparison(config,notes,id -> artifact,() -> {}))

@@ -117,32 +117,46 @@ public final class MongoSrsModelStore implements SrsModelStore {
         requireScope(key);
         if (key.modelVersion() != 0) throw new IllegalArgumentException("an initial model has version zero");
         SourceTable captured = new SourceTable(actual.name(), actual.fields(), actual.primaryKey(), actual.indexes());
-        SrsModel candidate = transaction(session -> {
-            requireBusiness(session);
-            Document chain = requireChain(session, key);
-            var control = contexts.find(session, key);
-            SourceTable proposed = captured;
-            long first;
-            if (control != null) {
-                contexts.requireAnchor(session, chain, control);
-                if (control.publishedVersion() != 0) throw unavailable(key);
-                var retained = loadInSession(session, key).orElseThrow(() -> unavailable(key));
-                first = retained.ddlSequence();
-                if (comparison == SourceModelComparison.SAMPLED_DOCUMENT
-                        && comparison.acceptsObservation(retained.table(), captured)) proposed = retained.table();
-            } else {
-                Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
-                        new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
-                long largest = bounds == null ? -1 : requireBounds(bounds).largestSequence();
-                if (largest >= Long.MAX_VALUE - 1) throw unavailable(key);
-                first = largest + 1;
-            }
-            return new SrsModel(key, ring, proposed, first);
-        });
+        SrsModel candidate =
+                transaction(
+                        session -> {
+                            requireBusiness(session);
+                            Document chain = requireChain(session, key);
+                            var control = contexts.find(session, key);
+                            SourceTable proposed = captured;
+                            long first;
+                            if (control != null) {
+                                contexts.requireAnchor(session, chain, control);
+                                if (control.publishedVersion() != 0) throw unavailable(key);
+                                var retained =
+                                        loadInSession(session, key)
+                                                .orElseThrow(() -> unavailable(key));
+                                first = retained.ddlSequence();
+                                if (comparison == SourceModelComparison.SAMPLED_DOCUMENT
+                                        && comparison.acceptsObservation(
+                                                retained.table(), captured))
+                                    proposed = retained.table();
+                            } else {
+                                first = initialSequence(session, key, ring);
+                            }
+                            return new SrsModel(key, ring, proposed, first);
+                        });
         // A fixed proposal is revalidated by publication under the original live claim and current
         // context/bounds. A racing append or context change refuses it rather than selecting a newer one.
         return publish(candidate, fence);
     }
+
+    private long initialSequence(ClientSession session, SrsModelKey key, String ring) {
+        Document bounds =
+                SystemCollections.SRS_LOG_BOUNDS
+                        .on(database)
+                        .find(session, new Document("_id", MongoSrsLogStore.boundsId(ring)))
+                        .first();
+        long largest = bounds == null ? -1 : requireBounds(bounds).largestSequence();
+        if (largest >= Long.MAX_VALUE - 1) throw unavailable(key);
+        return largest + 1;
+    }
+
     @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) {
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
         return transaction(session -> publishInSession(session, model, fence));

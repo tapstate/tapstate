@@ -44,13 +44,21 @@ record PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> 
         if (original.scope() == null) throw new IllegalArgumentException("capture bindings require a physical Pipeline scope");
         if (!Collections.disjoint(logged.keySet(),direct.keySet()) || !snapshots.isEmpty() && (!logged.isEmpty() || !direct.isEmpty())
                 || snapshots.values().stream().map(SnapshotOnlySource::epoch).distinct().count()>1) throw refused();
-        for (var entry : direct.entrySet()) if (!entry.getKey().equals(entry.getValue().context().sourceId())
-                || !original.equals(entry.getValue().execution())) throw refused();
+        requireDirectBindings(original, direct);
         for (var entry : logged.entrySet()) {
             var run = entry.getValue().run();
             if (!entry.getKey().equals(run.sourceId()) || !original.equals(new ExecutionFence(run.scope(),run.originalClaim()))) throw refused();
         }
     }
+
+    private static void requireDirectBindings(
+            ExecutionFence original, Map<String, DirectSourceRun> direct) {
+        for (var entry : direct.entrySet()) {
+            if (!entry.getKey().equals(entry.getValue().context().sourceId())
+                    || !original.equals(entry.getValue().execution())) throw refused();
+        }
+    }
+
     LoggedSource require(String sourceId,String chain,String table) {
         var source = logged.get(sourceId);
         if (source == null || !source.run().miningChainId().equals(chain) || !source.recoveryAfter().containsKey(table)) throw refused();

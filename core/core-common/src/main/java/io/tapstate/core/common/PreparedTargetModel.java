@@ -31,7 +31,14 @@ public record PreparedTargetModel(String name,List<Field> fields,List<Index> ind
                     if(string!=null){scalar(out,string.bytes());scalar(out,string.fixed());scalar(out,string.doubleBytes());scalar(out,string.defaultValue());scalar(out,string.byteRatio());}
                 }
                 out.writeInt(indexes.size());
-                for(var index:indexes){out.writeInt(index.fields().size());for(String field:index.fields())text(out,field);out.writeBoolean(index.unique());out.writeBoolean(index.constrainsEveryRow());}
+                for (var index : indexes) {
+                    out.writeInt(index.fields().size());
+                    for (String field : index.fields()) {
+                        text(out, field);
+                    }
+                    out.writeBoolean(index.unique());
+                    out.writeBoolean(index.constrainsEveryRow());
+                }
             }
             return bytes.toByteArray();
         } catch(IOException impossible){throw new IllegalStateException(impossible);}
@@ -45,11 +52,34 @@ public record PreparedTargetModel(String name,List<Field> fields,List<Index> ind
         if(canonical.length>1048576)throw new IllegalArgumentException("prepared model exceeds decode bound");
         try(var in=new DataInputStream(new ByteArrayInputStream(canonical))) {
             if(in.readInt()!=1)throw new IllegalArgumentException("unknown prepared model encoding");
-            String name=text(in);var fields=new ArrayList<Field>();
+            String name = text(in);
+            var fields = new ArrayList<Field>();
             for(int count=count(in,13);count>0;count--) {
-                String field=text(in),type=text(in);boolean key=bool(in);String inferred=text(in);
-                NumericType number=bool(in)?new NumericType(integer(text(in)),booleanValue(text(in)),booleanValue(text(in)),booleanValue(text(in)),decimal(text(in)),decimal(text(in)),integer(text(in)),integer(text(in))):null;
-                StringType string=bool(in)?new StringType(longValue(text(in)),booleanValue(text(in)),booleanValue(text(in)),longValue(text(in)),integer(text(in))):null;
+                String field = text(in);
+                String type = text(in);
+                boolean key = bool(in);
+                String inferred = text(in);
+                NumericType number =
+                        bool(in)
+                                ? new NumericType(
+                                        integer(text(in)),
+                                        booleanValue(text(in)).orElse(null),
+                                        booleanValue(text(in)).orElse(null),
+                                        booleanValue(text(in)).orElse(null),
+                                        decimal(text(in)),
+                                        decimal(text(in)),
+                                        integer(text(in)),
+                                        integer(text(in)))
+                                : null;
+                StringType string =
+                        bool(in)
+                                ? new StringType(
+                                        longValue(text(in)),
+                                        booleanValue(text(in)).orElse(null),
+                                        booleanValue(text(in)).orElse(null),
+                                        longValue(text(in)),
+                                        integer(text(in)))
+                                : null;
                 fields.add(new Field(field,type,key,inferred==null?null:TapstateType.valueOf(inferred),number,string));
             }
             var indexes=new ArrayList<Index>();
@@ -63,17 +93,39 @@ public record PreparedTargetModel(String name,List<Field> fields,List<Index> ind
         } catch(IOException|NullPointerException invalid){throw new IllegalArgumentException("unreadable prepared model",invalid);}
     }
     private static int count(DataInputStream in,int minimum)throws IOException {
-        int n=in.readInt();if(n<0 || n>in.available()/minimum)throw new IllegalArgumentException("invalid prepared count");return n;
+        int n = in.readInt();
+        if (n < 0 || n > in.available() / minimum)
+            throw new IllegalArgumentException("invalid prepared count");
+        return n;
     }
-    private static boolean bool(DataInputStream in)throws IOException {int v=in.readUnsignedByte();if(v>1)throw new IllegalArgumentException("invalid prepared boolean");return v==1;}
+
+    private static boolean bool(DataInputStream in) throws IOException {
+        int v = in.readUnsignedByte();
+        if (v > 1) throw new IllegalArgumentException("invalid prepared boolean");
+        return v == 1;
+    }
     private static String text(DataInputStream in)throws IOException {
-        int n=in.readInt();if(n==-1)return null;if(n<0 || n>in.available()/2)throw new IllegalArgumentException("invalid prepared text");
-        var chars=new char[n];for(int i=0;i<n;i++)chars[i]=in.readChar();return new String(chars);
+        int n = in.readInt();
+        if (n == -1) return null;
+        if (n < 0 || n > in.available() / 2)
+            throw new IllegalArgumentException("invalid prepared text");
+        var chars = new char[n];
+        for (int i = 0; i < n; i++) {
+            chars[i] = in.readChar();
+        }
+        return new String(chars);
     }
     private static Integer integer(String v){return v==null?null:Integer.valueOf(v);}
     private static Long longValue(String v){return v==null?null:Long.valueOf(v);}
     private static BigDecimal decimal(String v){return v==null?null:new BigDecimal(v);}
-    private static Boolean booleanValue(String v){if(v==null)return null;if(!v.equals("true")&&!v.equals("false"))throw new IllegalArgumentException("invalid boolean attribute");return Boolean.valueOf(v);}
+
+    private static Optional<Boolean> booleanValue(String v) {
+        if (v == null) return Optional.empty();
+        if (!v.equals("true") && !v.equals("false"))
+            throw new IllegalArgumentException("invalid boolean attribute");
+        return Optional.of(Boolean.valueOf(v));
+    }
+
     private static void scalar(DataOutputStream out,Object value)throws IOException{text(out,value==null?null:value.toString());}
     private static void text(DataOutputStream out,String value)throws IOException{out.writeInt(value==null?-1:value.length());if(value!=null)out.writeChars(value);}
 }

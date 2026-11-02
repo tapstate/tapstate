@@ -11,7 +11,7 @@ class PreparedTargetModelTest {
         var bytes=Base64.getDecoder().decode(GOLDEN);var model=PreparedTargetModel.decode(bytes);
         assertThat(model.canonical()).isEqualTo(bytes);
         assertThat(model.modelHash()).isEqualTo("5aa6dffaa32f309174cace4db6648fc572ea2c4fa34cbde736dcb0e275625e37");
-        assertThat(model.fields().get(0).numericType().minValue().toString()).isEqualTo("-10.00");
+        assertThat(model.fields().get(0).numericType().minValue()).hasToString("-10.00");
         assertThat(model.fields().get(1).name()).isEqualTo("v\ud800\ud83d\ude00");
         assertThat(model.fields().get(1).stringType()).isEqualTo(new StringType(5L,false,true,null,2));
     }

@@ -196,7 +196,7 @@ class MongoSinkPreparationStoreIT {
             store.prepareModels(List.of(original));var upgraded=f.rows().find().first();
             assertThat(upgraded.getInteger("formatVersion")).isEqualTo(2);
             assertThat(store.load(original.input())).isEqualTo(before);
-            for(String field:List.of("_id","input","operationId","revision","phase","originalClaim","result"))assertThat(upgraded.get(field)).isEqualTo(old.get(field));
+            for(String field:List.of("_id","input","operationId","revision","phase","originalClaim","result"))assertThat(upgraded).containsEntry(field,old.get(field));
             assertCode(() -> store.begin(original.input()),IoError.PIPELINE_STATE_REBUILD_REQUIRED);
         });
     }

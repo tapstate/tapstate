@@ -66,7 +66,7 @@ class MongoSampledStringWidthRestartIT {
                 Document checkpoint = chain.get("checkpoint", Document.class);
                 assertThat(checkpoint).as("restart retains the original capture checkpoint").isNotNull();
                 assertThat(checkpoint.getList("tables", Document.class)).singleElement()
-                        .satisfies(at -> assertThat(at.get("model")).isEqualTo(retained.getFirst().get("_id")));
+                        .satisfies(at -> assertThat(at).containsEntry("model",retained.getFirst().get("_id")));
                 assertThat(checkpoint.getString("token")).isNotBlank();
 
                 String longer = "x".repeat(4096);
@@ -89,8 +89,8 @@ class MongoSampledStringWidthRestartIT {
                     field(comparable, "name").get("stringType", Document.class).put("bytes", savedWidth);
                     field(comparable, "name").put("type", savedName.getString("type"));
                     assertThat(comparable.getList("fields", Document.class)).containsExactlyInAnyOrderElementsOf(savedSchema.getList("fields", Document.class));
-                    assertThat(comparable.get("primaryKey")).isEqualTo(savedSchema.get("primaryKey"));
-                    assertThat(comparable.get("indexes")).isEqualTo(savedSchema.get("indexes"));
+                    assertThat(comparable).containsEntry("primaryKey",savedSchema.get("primaryKey"));
+                    assertThat(comparable).containsEntry("indexes",savedSchema.get("indexes"));
                     for (Document model : retained) {
                         assertThat(models.find(new Document("_id", model.get("_id"))).first())
                                 .as("restart has not lost or replaced the retained model").isEqualTo(model);

@@ -72,49 +72,105 @@ public final class SrsSnapshotPreparation implements AutoCloseable {
         Objects.requireNonNull(comparison, "comparison");
         requireOpen();
         var capturedTables = Map.copyOf(actualTables);
-        if (!request.equals(actualRequest) || sampledSeam == null || !new HashSet<>(owed).equals(capturedTables.keySet())) throw unavailable(); var references = new TreeMap<String,SrsModelKey>();
+        if (!request.equals(actualRequest)
+                || sampledSeam == null
+                || !new HashSet<>(owed).equals(capturedTables.keySet())) throw unavailable();
         if (freshFull != null) {
-            var receipt = freshFull.publish(request.snapshotEpoch(), sampledSeam.token(), capturedTables, preparedAt);
-            requireOpen(); var progress = receipt.progress(); var pin = progress.snapshot(); var pending = receipt.chain().pendingFreshFull();
-            if (!progress.context().equals(run.context()) || progress.membershipRevision() != run.membershipRevision()
-                    || progress.revision() != original.revision() + 1 || pin == null || pending == null
-                    || !pending.origin().targetScope().equals(run.scope()) || !pending.origin().sourceId().equals(run.sourceId())
-                    || pin.snapshotEpoch() != request.snapshotEpoch() || !pin.sourcePosition().equals(sampledSeam.token())
-                    || !pin.models().keySet().equals(tableRings.keySet()) || !pin.models().equals(pending.models())
-                    || !progress.ringDoneThrough().equals(progress.cursor().perTableSeq())
-                    || progress.cursor().sinkAcked() != null || !progress.cursor().sinkAckedByTable().isEmpty()
-                    || !progress.cursor().snapshotCompletedTables().isEmpty() || progress.writerRun() != null) throw unavailable();
-            for (var entry : pin.models().entrySet()) {
-                var model = models.require(entry.getValue());
-                // require resolved the receipt's exact immutable body; this comparison is with a source observation.
-                if (!model.ringName().equals(tableRings.get(entry.getKey()))
-                        || !comparison.acceptsObservation(model.table(), structural(capturedTables.get(entry.getKey())))) throw unavailable();
-            }
-            var previous = freshReceipt.compareAndExchange(null, receipt);
-            if (previous != null && !previous.equals(receipt)) throw unavailable();
-            accept(pin); return;
+            prepareFreshFull(sampledSeam, capturedTables, comparison);
+            return;
         }
+
+        var references = new TreeMap<String, SrsModelKey>();
         if (original.snapshot() != null) references.putAll(original.snapshot().models());
         else if (pendingPin != null) references.putAll(pendingPin.models());
-        var missing = new TreeMap<String,String>();
-        for (String table : owed) if (!references.containsKey(table)) missing.put(table,tableRings.get(table));
-        Map<String,SrsModel> candidates = missing.isEmpty() ? Map.of() : Map.copyOf(models.publishedForNewSnapshot(run.miningChainId(),missing).orElseThrow(this::unavailable));
-        for (String table : owed) {
-            requireOpen(); var key = references.get(table);
-            var model = key == null ? candidates.get(table) : models.require(key);
-            SourceTable actual = capturedTables.get(table);
-            if (model == null || !model.key().table().equals(table) || !model.key().miningChainId().equals(run.miningChainId()) || !model.key().cacheIncarnation().equals(run.scope().cacheIncarnation())
-                    || !model.ringName().equals(tableRings.get(table)) || !comparison.acceptsObservation(model.table(), structural(actual))) throw unavailable();
-            references.put(table,model.key());
-        }
+        resolveSnapshotModels(references, capturedTables, comparison);
         if (!references.keySet().containsAll(tableRings.keySet())) throw unavailable();
-        String anchor = request.replayAnchor() == null ? sampledSeam.token() : request.replayAnchor().token();
-        var pin = new SrsSnapshotPin(request.snapshotEpoch(),anchor,references);
+        String anchor =
+                request.replayAnchor() == null
+                        ? sampledSeam.token()
+                        : request.replayAnchor().token();
+        var pin = new SrsSnapshotPin(request.snapshotEpoch(), anchor, references);
         requireOpen();
-        if (!consumers.pinSnapshot(run.context(),run.membershipRevision(),original.revision(),pin,run.originalClaim())) throw unavailable();
+        if (!consumers.pinSnapshot(
+                run.context(),
+                run.membershipRevision(),
+                original.revision(),
+                pin,
+                run.originalClaim())) throw unavailable();
         requireOpen();
         accept(pin);
     }
+
+    private void prepareFreshFull(
+            SourcePosition sampledSeam,
+            Map<String, SourceTable> capturedTables,
+            SourceModelComparison comparison) {
+        var receipt =
+                freshFull.publish(
+                        request.snapshotEpoch(), sampledSeam.token(), capturedTables, preparedAt);
+        requireOpen();
+        var progress = receipt.progress();
+        var pin = progress.snapshot();
+        var pending = receipt.chain().pendingFreshFull();
+        if (!progress.context().equals(run.context())
+                || progress.membershipRevision() != run.membershipRevision()
+                || progress.revision() != original.revision() + 1
+                || pin == null
+                || pending == null
+                || !pending.origin().targetScope().equals(run.scope())
+                || !pending.origin().sourceId().equals(run.sourceId())
+                || pin.snapshotEpoch() != request.snapshotEpoch()
+                || !pin.sourcePosition().equals(sampledSeam.token())
+                || !pin.models().keySet().equals(tableRings.keySet())
+                || !pin.models().equals(pending.models())
+                || !progress.ringDoneThrough().equals(progress.cursor().perTableSeq())
+                || progress.cursor().sinkAcked() != null
+                || !progress.cursor().sinkAckedByTable().isEmpty()
+                || !progress.cursor().snapshotCompletedTables().isEmpty()
+                || progress.writerRun() != null) throw unavailable();
+        for (var entry : pin.models().entrySet()) {
+            var model = models.require(entry.getValue());
+            // require resolved the receipt's exact immutable body; this comparison is with a source
+            // observation.
+            if (!model.ringName().equals(tableRings.get(entry.getKey()))
+                    || !comparison.acceptsObservation(
+                            model.table(), structural(capturedTables.get(entry.getKey()))))
+                throw unavailable();
+        }
+        var previous = freshReceipt.compareAndExchange(null, receipt);
+        if (previous != null && !previous.equals(receipt)) throw unavailable();
+        accept(pin);
+    }
+
+    private void resolveSnapshotModels(
+            Map<String, SrsModelKey> references,
+            Map<String, SourceTable> capturedTables,
+            SourceModelComparison comparison) {
+        var missing = new TreeMap<String, String>();
+        for (String table : owed)
+            if (!references.containsKey(table)) missing.put(table, tableRings.get(table));
+        Map<String, SrsModel> candidates =
+                missing.isEmpty()
+                        ? Map.of()
+                        : Map.copyOf(
+                                models.publishedForNewSnapshot(run.miningChainId(), missing)
+                                        .orElseThrow(this::unavailable));
+        for (String table : owed) {
+            requireOpen();
+            var key = references.get(table);
+            var model = key == null ? candidates.get(table) : models.require(key);
+            SourceTable actual = capturedTables.get(table);
+            if (model == null
+                    || !model.key().table().equals(table)
+                    || !model.key().miningChainId().equals(run.miningChainId())
+                    || !model.key().cacheIncarnation().equals(run.scope().cacheIncarnation())
+                    || !model.ringName().equals(tableRings.get(table))
+                    || !comparison.acceptsObservation(model.table(), structural(actual)))
+                throw unavailable();
+            references.put(table, model.key());
+        }
+    }
+
     private void accept(SrsSnapshotPin pin) {
         requireOpen(); var held = accepted.compareAndExchange(null,pin);
         if (held != null && !held.equals(pin)) throw unavailable();

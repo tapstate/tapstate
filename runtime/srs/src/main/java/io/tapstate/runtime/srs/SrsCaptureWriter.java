@@ -97,23 +97,9 @@ public final class SrsCaptureWriter implements AutoCloseable {
         }
         if (actual.isEmpty() || !opened.servingTables().containsAll(actual.keySet())
                 || (completeSelection && !actual.keySet().equals(opened.servingTables()))) throw unproven();
-        // Resolve every original model before comparing observations or publishing a successor epoch.
-        String mismatch = null;
-        for (var entry : actual.entrySet()) {
-            String table = entry.getKey();
-            SrsTableCheckpoint prior = opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
-            var baseline = opened.pendingFreshFull() == null ? prior == null ? null : prior.model() : opened.pendingFreshFull().models().get(table);
-            if (baseline != null && !comparison.acceptsObservation(models.require(baseline).table(), entry.getValue())) mismatch = table;
-            SrsModel held = published.get(table);
-            if (held != null && !comparison.acceptsObservation(held.table(), entry.getValue())) throw unavailable(table);
-            String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
-            var configuration = member.getConfig().findRingbufferConfig(ring);
-            if (!configuration.getRingbufferStoreConfig().isEnabled()
-                    || !(configuration.getRingbufferStoreConfig().getFactoryImplementation() instanceof SrsLogRingbufferStoreFactory factory)
-                    || !factory.backs(log) || configuration.getInMemoryFormat() != InMemoryFormat.OBJECT) {
-                throw new TapstateException(CaptureError.SRS_NOT_RECOVERABLE, Map.of("chain", opened.miningChainId()), null);
-            }
-        }
+        // Resolve every original model before comparing observations or publishing a successor
+        // epoch.
+        String mismatch = validatePreparedTables(actual, comparison);
         if (mismatch != null) {
             if (completeSelection && opened.pendingFreshFull() == null && published.isEmpty() && opened.checkpoint() != null
                     && opened.checkpoint().tables().keySet().equals(actual.keySet()))
@@ -121,24 +107,76 @@ public final class SrsCaptureWriter implements AutoCloseable {
             throw unavailable(mismatch);
         }
         for (var entry : actual.entrySet()) {
-            String table = entry.getKey();
-            if (published.containsKey(table)) continue;
-            String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
-            var key = new SrsModelKey(opened.miningChainId(), table, scope.cacheIncarnation(), opened.epoch(), 0);
-            // Publication, rather than a historical lookup of an unpublished key, owns context creation/reuse.
-            SrsModel saved = comparison == SourceModelComparison.DECLARED_STRUCTURE
-                    ? models.publishInitial(key, ring, entry.getValue(), fence)
-                    : models.publishObservedInitial(key, ring, entry.getValue(), fence, comparison);
-            if (!saved.key().equals(key) || !saved.ringName().equals(ring)
-                    || !comparison.acceptsObservation(saved.table(), entry.getValue())) throw unavailable(table);
-            requireActive();
-            published.put(table, saved);
-            SrsTableCheckpoint prior = opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
-            long sequence = prior != null && prior.model().equals(key) ? prior.sequence() : saved.ddlSequence() - 1;
-            frontiers.put(table, new SrsTableCheckpoint(key, sequence));
+            if (!published.containsKey(entry.getKey()))
+                publishPreparedTable(entry.getKey(), entry.getValue(), comparison);
         }
         requireActive();
         if (completeSelection && started.get()) streamPrepared = true;
+    }
+
+    private String validatePreparedTables(
+            Map<String, SourceTable> actual, SourceModelComparison comparison) {
+        String mismatch = null;
+        for (var entry : actual.entrySet()) {
+            String table = entry.getKey();
+            var baseline = baselineModel(table);
+            if (baseline != null
+                    && !comparison.acceptsObservation(
+                            models.require(baseline).table(), entry.getValue())) mismatch = table;
+            SrsModel held = published.get(table);
+            if (held != null && !comparison.acceptsObservation(held.table(), entry.getValue()))
+                throw unavailable(table);
+            requireRecoverableRing(table);
+        }
+        return mismatch;
+    }
+
+    private SrsModelKey baselineModel(String table) {
+        if (opened.pendingFreshFull() != null) return opened.pendingFreshFull().models().get(table);
+        SrsTableCheckpoint prior =
+                opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
+        return prior == null ? null : prior.model();
+    }
+
+    private void requireRecoverableRing(String table) {
+        String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
+        var configuration = member.getConfig().findRingbufferConfig(ring);
+        if (!configuration.getRingbufferStoreConfig().isEnabled()
+                || !(configuration.getRingbufferStoreConfig().getFactoryImplementation()
+                        instanceof SrsLogRingbufferStoreFactory factory)
+                || !factory.backs(log)
+                || configuration.getInMemoryFormat() != InMemoryFormat.OBJECT) {
+            throw new TapstateException(
+                    CaptureError.SRS_NOT_RECOVERABLE,
+                    Map.of("chain", opened.miningChainId()),
+                    null);
+        }
+    }
+
+    private void publishPreparedTable(
+            String table, SourceTable actual, SourceModelComparison comparison) {
+        String ring = SrsRingbuffer.ringName(opened.miningChainId(), table);
+        var key =
+                new SrsModelKey(
+                        opened.miningChainId(), table, scope.cacheIncarnation(), opened.epoch(), 0);
+        // Publication, rather than a historical lookup of an unpublished key, owns context
+        // creation/reuse.
+        SrsModel saved =
+                comparison == SourceModelComparison.DECLARED_STRUCTURE
+                        ? models.publishInitial(key, ring, actual, fence)
+                        : models.publishObservedInitial(key, ring, actual, fence, comparison);
+        if (!saved.key().equals(key)
+                || !saved.ringName().equals(ring)
+                || !comparison.acceptsObservation(saved.table(), actual)) throw unavailable(table);
+        requireActive();
+        published.put(table, saved);
+        SrsTableCheckpoint prior =
+                opened.checkpoint() == null ? null : opened.checkpoint().tables().get(table);
+        long sequence =
+                prior != null && prior.model().equals(key)
+                        ? prior.sequence()
+                        : saved.ddlSequence() - 1;
+        frontiers.put(table, new SrsTableCheckpoint(key, sequence));
     }
 
     /** Starts only once; a snapshot preparation receipt cannot replace this CDC session's own callback. */

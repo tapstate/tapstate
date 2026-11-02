@@ -283,7 +283,7 @@ class SrsCaptureWriterTest {
         f.opened = f.state(1, new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "original-cut"), refs));
         var original = Map.copyOf(f.published); var writer = f.writer();
         writer.prepare(f.actual, SourceModelComparison.SAMPLED_DOCUMENT);
-        original.forEach((key, model) -> assertThat(f.published.get(key)).isEqualTo(model));
+        original.forEach((key, model) -> assertThat(f.published).containsEntry(key,model));
         for (String name : f.actual.keySet()) {
             var current = f.published.get(new SrsModelKey(f.chain, name, "cache", 2, 0));
             assertThat(current.table().fields()).isEqualTo(f.actual.get(name).fields());

@@ -12,7 +12,12 @@ public interface SinkPreparationStore {
     /** Original v2 body, before any assessment of a new observation; changed authoring cannot use this shortcut. */
     default Optional<Prepared> retainedModel(Key key,OnFullLoad policy,boolean fullLoad,PipelinePreparationInputs authoring){return Optional.empty();}
     default Map<Key,Prepared> retainedModels(Collection<Key> keys,OnFullLoad policy,boolean fullLoad,PipelinePreparationInputs authoring) {
-        var result=new LinkedHashMap<Key,Prepared>();for(var key:keys)retainedModel(key,policy,fullLoad,authoring).ifPresent(model -> result.put(key,model));return Map.copyOf(result);
+        var result = new LinkedHashMap<Key, Prepared>();
+        for (var key : keys) {
+            retainedModel(key, policy, fullLoad, authoring)
+                    .ifPresent(model -> result.put(key, model));
+        }
+        return Map.copyOf(result);
     }
 
     /** Read-only original model resolution; a legacy candidate must exactly match its recorded hash. */
@@ -37,6 +42,11 @@ public interface SinkPreparationStore {
         @Override public byte[] canonical(){return canonical.clone();}
         @Override public boolean equals(Object other){return other instanceof Prepared p && input.equals(p.input) && Arrays.equals(canonical,p.canonical);}
         @Override public int hashCode(){return 31*input.hashCode()+Arrays.hashCode(canonical);}
+
+        @Override
+        public String toString() {
+            return "Prepared[input=" + input + ", canonical=" + Arrays.toString(canonical) + "]";
+        }
     }
     /** Controlled planning freezes one complete original target roster before a target may be opened. */
     void prepareTargets(List<Input> originalTargets);

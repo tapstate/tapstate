@@ -43,11 +43,9 @@ class SampledTargetPreparationTest {
         var factory=new PdkSinkWriterFactory("mongodb",Map.of(),WriteMode.UPSERT,DdlPolicy.FAIL,
                 Map.of("documents",observed,"declared",sql),NODE,OnFullLoad.APPEND,true);
         var bound=(PdkSinkWriterFactory)binder.scoped(factory,ORIGINAL,plan,() -> {});
-        assertThat(bound.targets().get("documents")).isEqualTo(old);
-        assertThat(bound.targets().get("declared")).isEqualTo(sql);
+        assertThat(bound.targets()).containsEntry("documents",old).containsEntry("declared",sql);
         assertThat(plan.models).containsExactly(original);
-        assertThat(plan.inputs).contains(prepared(sql).input());
-        assertThat(plan.inputs).doesNotContain(prepared(table("customers","varchar(40)")).input());
+        assertThat(plan.inputs).contains(prepared(sql).input()).doesNotContain(prepared(table("customers","varchar(40)")).input());
     }
     @Test void originalBodyIsRestoredBeforeAChangedSampleCanRefuseUnwindIdentity() {
         var store=mock(SinkPreparationStore.class);var plan=plan(store);plan.observeOrigins("rows",Set.of("mongo"));

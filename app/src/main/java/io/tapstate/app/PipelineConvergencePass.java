@@ -181,7 +181,9 @@ final class PipelineConvergencePass {
         var fixed=guardOriginal(original);fixed.run();return views.sinkPreparations(scope(),original,fixed);
     }
     void prepareSinkModels(WorkloadClaimFence original,java.util.List<io.tapstate.spi.store.SinkPreparationStore.Prepared> models) {
-        var captured=java.util.List.copyOf(models);var fixed=guardOriginal(original);fixed.run();
+        var captured = java.util.List.copyOf(models);
+        var fixed = guardOriginal(original);
+        fixed.run();
         sinkPreparations(original).prepareModels(captured);fixed.run();
     }
     void prepareSinkModels(WorkloadClaimFence original,java.util.List<io.tapstate.spi.store.SinkPreparationStore.Input> inputs,

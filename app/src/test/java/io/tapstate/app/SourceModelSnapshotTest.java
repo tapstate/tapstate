@@ -33,8 +33,8 @@ class SourceModelSnapshotTest {
         assertThat(planning.model(source).tables()).containsExactly(pinned);
         assertThat(captured.model(source)).isEqualTo(current.model());
         assertThat(store.schemas().get("src")).contains(current);
-        assertThatThrownBy(() -> captured.withRetainedTables(source,Map.of("missing-table",
-                new SourceTable("missing-table",List.of(),List.of(),List.of())))).isInstanceOf(TapstateException.class);
+        var missing=Map.of("missing-table",new SourceTable("missing-table",List.of(),List.of(),List.of()));
+        assertThatThrownBy(() -> captured.withRetainedTables(source,missing)).isInstanceOf(TapstateException.class);
     }
 
     @Test void absentMismatchedAndDiscoveredEmptyModelsKeepTheirDistinctMeanings() {
