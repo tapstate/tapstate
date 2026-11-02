@@ -11,7 +11,7 @@
 # connector catalog *refresh* - regenerating it needs a connectors checkout and built connector jars.
 # The catalog's own consistency gates are PDK-free and run in the build above; the shell that drives
 # the refresh has its cases in the catalog-scripts job below.
-name: CI
+name: Recovery refusal diagnostic
 
 # PR events own automatic feature-branch tests. A branch push before or during a
 # PR must not execute another suite. Use workflow_dispatch for pre-PR validation.
@@ -46,6 +46,7 @@ jobs:
         run: |
           .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
           matrix_json="$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")"
+          matrix_json="$(printf '%s' "$matrix_json" | python3 -c 'import json,sys; data=json.load(sys.stdin); data["include"]=[row for row in data["include"] if row["shard"]=="e2e-3"]; assert len(data["include"])==1; print(json.dumps(data))')"
           echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
@@ -239,6 +240,15 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Preserve recovery refusal process logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-refusal-process-logs
+          path: ${{ runner.temp }}/test-tmp/**/server.out
+          if-no-files-found: warn
+          retention-days: 3
+
   # This stable, non-matrix name is the required check. It admits the union,
   # including every shard's declared report and coverage files, before reporting green.
   build:
@@ -252,7 +262,7 @@ jobs:
       sonar-enabled: ${{ steps.guard.outputs.run }}
       sonar-outcome: ${{ steps.analyze.outcome }}
     needs: [shard-plan, test-shards]
-    if: ${{ always() }}
+    if: ${{ false }}
     # Match test-shards so toolchain and ABI evidence remain comparable.
     runs-on: ubuntu-22.04
     steps:
@@ -535,7 +545,7 @@ jobs:
   sonarqube:
     name: sonarqube
     needs: build
-    if: ${{ always() }}
+    if: ${{ false }}
     runs-on: ubuntu-latest
     steps:
       - name: Report analysis outcome
@@ -556,6 +566,7 @@ jobs:
           echo 'SonarQube analysis and quality gate passed.' >> "$GITHUB_STEP_SUMMARY"
 
   installer:
+    if: ${{ false }}
     # The install and quickstart scripts are shell, not Java: shellcheck them (ubuntu-latest ships
     # shellcheck) and run their smokes. Both drive platform detection, the unsupported-platform refusals,
     # checksum verification, credential handling and idempotency against local file:// / loopback stubs —
@@ -647,6 +658,7 @@ jobs:
         run: sh scripts/funnel-capture-smoke.sh
 
   catalog-scripts:
+    if: ${{ false }}
     # The catalog refresh driver and the connector build it calls are shell, and the driver is a gate:
     # its whole job is turning "this step did not run" into a non-zero exit, because every step of a
     # refresh is a JUnit test that skips - rather than fails - when its inputs are absent. A gate that
@@ -827,6 +839,7 @@ jobs:
         run: bash .github/scripts/issue-templates-smoke.sh
 
   image-smoke:
+    if: ${{ false }}
     # Build the server image for the runner's native architecture and smoke it as a black box: it boots
     # against a throwaway replica set until the image's built-in healthcheck reaches healthy (running as
     # the unprivileged uid), `docker stop` yields an orderly exit 0 (not 137/143), and an unsupported

@@ -190,6 +190,9 @@ final class ExecutionAuthorization implements AutoCloseable {
         }
         Entry authorized = authorizedEntry(fence);
         if (authorized == null) {
+            System.err.println("DIAG_AUTH_DENIED fence=" + fence + " entry=" + entries.get(ReadKey.of(fence))
+                    + " nextRead=" + nextReadNanos.get(ReadKey.of(fence)) + " now=" + nanoTime.getAsLong()
+                    + " business=" + businessScope + " closed=" + closed.get());
             throw new TapstateException(
                     EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
         }
@@ -373,6 +376,8 @@ final class ExecutionAuthorization implements AutoCloseable {
         try {
             current = readStore(key);
         } catch (RuntimeException unreachable) {
+            System.err.println("DIAG_AUTH_READ_REFUSED key=" + key + " type=" + unreachable.getClass().getName()
+                    + " code=" + (unreachable instanceof TapstateException coded ? coded.code().code() : "uncoded"));
             nextReadNanos.put(key, startedAt + refreshIntervalNanos);
             entries.remove(key);
             return null;
@@ -388,6 +393,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             nextReadNanos.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
         }
         if (current.isEmpty()) {
+            System.err.println("DIAG_AUTH_EMPTY key=" + key);
             entries.remove(key);
             return null;
         }
@@ -398,6 +404,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         Duration leaseRemaining = current.get().leaseRemaining();
         long held = leaseRemaining.compareTo(window) < 0 ? leaseRemaining.toNanos() : windowNanos;
         if (held <= 0) {
+            System.err.println("DIAG_AUTH_LEASE_ENDED key=" + key + " reading=" + current.get());
             // Nobody owns this run any more, whoever may own it next. Dropping the entry is what refuses
             // the batch: a reading that was already out of date when it arrived is not a reading.
             entries.remove(key);
