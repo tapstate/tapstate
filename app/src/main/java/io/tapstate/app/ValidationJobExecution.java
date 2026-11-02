@@ -83,7 +83,7 @@ final class ValidationJobExecution implements ValidationRunLifecycle.Execution {
     @Override public ValidationRunLifecycle.Progress progress() {
         boolean businessComplete=work.businessComplete();boolean jobExited=originalJobExited();boolean readersReleased=work.readersReleased();
         // Reader exit may publish its last cleanup failure; sample the diagnosis after those physical facts.
-        var reported=work.failure();if(reported!=null)failure.record(reported);
+        var reported=work.failure();if(reported!=null){failure.record(reported);ValidationFailureLatch.addContext(failure.get(),reported);}
         return new ValidationRunLifecycle.Progress(businessComplete&&failure.get()==null,jobExited&&processors.processorsExited(),readersReleased,failure.get());
     }
     boolean submissionReturned(){return submissionReturned;}

@@ -509,10 +509,16 @@ class NativeValidationStartCoordinatorTest {
             });
             try(var a=new NativeValidationStartCoordinator(routing.a,configuration,routing.left,resourcesA,process,()->{});
                     var b=new NativeValidationStartCoordinator(routing.b,configuration,routing.right,resourcesB,process,()->{})){
+                // This case observes foreground forwarding and its returned allocations. Passive
+                // maintenance has separate coverage and can otherwise both satisfy STATUS and
+                // occupy the process budget between the foreground receipt and its assertion.
+                for(var coordinator:List.of(a,b))((java.util.concurrent.ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(coordinator,"stops")).cancel(false);
+                ((java.util.concurrent.ScheduledThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(process,"controlTicks")).submit(()->{}).get(5,TimeUnit.SECONDS);
                 var op=operation(a.context());
                 try(var response=b.start(op)){assertThat(response.value().outcome()).isIn(ValidationOperation.Outcome.PENDING,ValidationOperation.Outcome.ACCEPTED);}
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->activated.get()==1&&resourcesA.snapshot().processReserved().bytes()==4L*1024*1024);
                 int reservations=routing.calls.values().stream().mapToInt(AtomicInteger::get).sum();assertThat(reservations).isOne();
+                assertThat(statuses).as("Only the explicit forwarded read may request STATUS in this case").hasValue(0);
                 try(var response=b.read(op)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.ACCEPTED);}
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->statuses.get()>0&&resourcesA.snapshot().processReserved().bytes()==4L*1024*1024);
                 assertThat(activated).hasValue(1);assertThat(routing.calls.values().stream().mapToInt(AtomicInteger::get).sum()).isOne();

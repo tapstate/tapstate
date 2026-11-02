@@ -108,6 +108,32 @@ class ValidationJobExecutionTest {
             await(()->execution.progress().processorsExited());execution.releaseFactories();
         }
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    @Timeout(35) void aFailedOriginalJobRetainsTheLastReaderCleanupDiagnosis(boolean fatal)throws Exception {
+        try(var fixture=new Fixture()) {
+            var published=new AtomicBoolean();
+            var primary=new io.tapstate.core.common.TapstateException(ValidationError.OWNER_NOT_AUTHORIZED,Map.of("pipeline","flow"),null);
+            Throwable cleanup=fatal?new AssertionError("Late original reader cleanup"):
+                    new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","late-original-reader-cleanup"),null);
+            var state=new State(){
+                @Override public boolean readersReleased(){if(readers.get())published.set(true);return readers.get();}
+                @Override public Throwable failure(){return published.get()?cleanup:null;}
+            };
+            state.delayReceipt=true;state.callbackFailure=primary;var execution=fixture.execution(state);
+            try {
+                execution.start();assertThat(state.callbackEntered.await(8,TimeUnit.SECONDS)).isTrue();state.callbackRelease.countDown();
+                assertThat(state.originalJobEnded.await(8,TimeUnit.SECONDS)).isTrue();state.delayedReceipt.completeExceptionally(primary);
+                var before=execution.progress();assertThat(before.failure()).isSameAs(primary);assertThat(before.readersReleased()).isFalse();
+                assertThat(published).isFalse();state.readers.set(true);
+                var after=execution.progress();assertThat(after.readersReleased()).isTrue();assertThat(after.businessComplete()).isFalse();
+                assertThat(after.failure()).isSameAs(fatal?cleanup:primary);
+                assertThat(after.failure().getSuppressed()).containsExactly(fatal?primary:cleanup);
+                for(int index=0;index<20;index++)assertThat(execution.progress().failure().getSuppressed()).hasSize(1);
+                await(()->execution.progress().processorsExited());execution.releaseFactories();
+            }finally{state.readers.set(true);state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new CancellationException("Fixture cleanup"));}
+        }
+    }
     @Test @Timeout(35) void localStopBeforeGraphAuthorizationCreatesNoJobOrFailure()throws Exception {
         try(var fixture=new Fixture()) {
             var state=new State();state.readers.set(true);var execution=fixture.execution(state);

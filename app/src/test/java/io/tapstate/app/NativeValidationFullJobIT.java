@@ -311,6 +311,40 @@ class NativeValidationFullJobIT {
         }finally{state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
     }
 
+    @Test void aFailedOriginalJobMirrorsItsLastReaderCleanupWithoutReplacingTheFirstDiagnosis()throws Exception {
+        var published=new AtomicBoolean();
+        var primary=new io.tapstate.core.common.TapstateException(ValidationError.OWNER_NOT_AUTHORIZED,Map.of("pipeline","flow"),null);
+        var cleanup=new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","last-reader-after-owner-failure"),null);
+        var state=new ValidationJobExecutionTest.State(){
+            @Override public boolean readersReleased(){if(readers.get())published.set(true);return readers.get();}
+            @Override public Throwable failure(){return published.get()?cleanup:null;}
+        };
+        state.delayReceipt=true;state.callbackFailure=primary;ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            var execution=new AtomicReference<ValidationJobExecution>();
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){var value=ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);execution.set(value);return value;}
+                });
+                assertThat(state.callbackEntered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->original.cancelled.get());state.callbackRelease.countDown();
+                assertThat(state.originalJobEnded.await(8,TimeUnit.SECONDS)).isTrue();await(()->state.exited.get());
+                state.delayedReceipt.completeExceptionally(primary);await(()->execution.get().progress().processorsExited());
+                assertThat(execution.get().progress().failure()).isSameAs(primary);assertThat(execution.get().progress().readersReleased()).isFalse();assertThat(published).isFalse();
+                var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+                assertThat(access.reports().find(reference).orElseThrow().terminal()).as("The last reader has not released its original resources").isNull();
+                state.readers.set(true);
+                await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+                await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+                var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
+                assertThat(failure.code()).isEqualTo(ValidationError.OWNER_NOT_AUTHORIZED.code());assertThat(failure.params()).containsEntry("pipeline","flow");
+                assertThat(failure.technical()).contains("validation.owner-not-authorized","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
+            }finally{state.readers.set(true);state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));}
+        }finally{if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
     @Test void stopDuringGraphAuthorizationCreatesNoJobAndMirrorsNoExecutionFailure()throws Exception {
         var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);var paused=new AtomicBoolean();
         var state=new ValidationJobExecutionTest.State();state.readers.set(true);ValidationRunIdentity identity=null;
