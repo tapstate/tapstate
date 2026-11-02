@@ -100,7 +100,7 @@ class NativeValidationReportHistoryIT {
                 assertThat(kept.endedAt()).isNotNull();assertThat(f.member.getJet().getJobs()).isEmpty();
                 assertThat(f.raw.getDatabase(f.cacheName).getCollection("validation_runs").countDocuments(new Document("_id.kind","run"))).isEqualTo(3);
                 assertThat(access.claims().read(ValidationClaims.key("cluster","flow")).orElseThrow().leased()).isFalse();
-                var next=replacement.reserve(new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,4,"FULL",UUID.randomUUID(),UUID.randomUUID().toString()));
+                var next=ownerControl(replacement,()->replacement.reserve(new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,4,"FULL",UUID.randomUUID(),UUID.randomUUID().toString())));
                 assertThat(next.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
                 assertThat(access.control().snapshot(next.owner()).retainedRuns()).isOne();
                 assertThat(access.control().snapshot(next.owner()).countingGeneration()).isEqualTo(3);
@@ -146,7 +146,7 @@ class NativeValidationReportHistoryIT {
             var accepted=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
             await(()->accepted.get()!=null||f.owners.control("flow",()->accepted.set(f.owners.reserve(request))));
             assertThat(accepted.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
-            var start=f.owners.original(request,accepted.get().owner());
+            var start=ownerControl(f.owners,()->f.owners.original(request,accepted.get().owner()));
             var committed=new java.util.concurrent.atomic.AtomicBoolean();var replyAllowed=new java.util.concurrent.atomic.AtomicBoolean();var installed=new java.util.concurrent.atomic.AtomicBoolean();
             await(()->installed.get()||f.owners.control("flow",()->{
                 runs.start(start,new ValidationRunLifecycle.Activation(){
@@ -169,7 +169,7 @@ class NativeValidationReportHistoryIT {
             await(()->committed.get()&&runs.read(start.run()).controlUnknown());
             runs.stop(first.identity());
             await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return !actors.containsKey(first.identity());});
-            var reservation=f.owners.take(start);var control=reservation.access().control();
+            var reservation=ownerControl(f.owners,()->f.owners.take(start));var control=reservation.access().control();
             var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
             var reference=new ValidationReports.Reference("flow",sibling.taskId(),ValidationMode.FULL,start.run().runId(),sibling.generation(),1);
             replyAllowed.set(true);
@@ -192,7 +192,7 @@ class NativeValidationReportHistoryIT {
             var accepted=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
             await(()->accepted.get()!=null||f.owners.control("flow",()->accepted.set(f.owners.reserve(request))));
             assertThat(accepted.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
-            var pending=f.owners.take(f.owners.original(request,accepted.get().owner()));
+            var pending=ownerControl(f.owners,()->f.owners.take(f.owners.original(request,accepted.get().owner())));
             runs.stop(first.identity());
             await(()->{var actors=(Map<?,?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"runs");return actors.isEmpty();});
             assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(2);
@@ -205,15 +205,23 @@ class NativeValidationReportHistoryIT {
 
     private static ValidationControlStore.Run waiting(NativeValidationOwnerReservationsIT.Fixture f,NativeValidationRuns runs,
             ValidationReportAdmission.Task task,long revision,ValidationMethod method)throws Exception{
-        var request=new ValidationOwnerRouter.Request("flow",task.taskId(),task.generation(),revision,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
-        var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
-        var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,method);
-        var identity=new ValidationRunIdentity(accepted.owner(),task.taskId(),request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
-        var start=new ValidationReportAdmission.Start(task,revision,1,request.command().toString(),identity);var reservation=f.owners.take(start);
-        var original=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);
-        runs.start(start,new ValidationRunLifecycle.Activation(){public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD;}
-            public ValidationRunLifecycle.Execution create(){throw new AssertionError("waiting cannot start a Job");}});
-        await(()->runs.read(identity).waiting());return original;
+        var original=ownerControl(f.owners,()->{
+            var request=new ValidationOwnerRouter.Request("flow",task.taskId(),task.generation(),revision,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,method);
+            var identity=new ValidationRunIdentity(accepted.owner(),task.taskId(),request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(task,revision,1,request.command().toString(),identity);var reservation=f.owners.take(start);
+            var run=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);
+            runs.start(start,new ValidationRunLifecycle.Activation(){public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.WAITING_FOR_INITIAL_LOAD;}
+                public ValidationRunLifecycle.Execution create(){throw new AssertionError("waiting cannot start a Job");}});
+            return run;
+        });
+        await(()->runs.read(original.identity()).waiting());return original;
+    }
+    private static <T> T ownerControl(NativeValidationOwnerReservations owners,java.util.function.Supplier<T> action)throws Exception{
+        var result=new java.util.concurrent.atomic.AtomicReference<T>();
+        await(()->result.get()!=null||owners.control("flow",()->result.set(Objects.requireNonNull(action.get()))));
+        return result.get();
     }
     private static void await(java.util.function.BooleanSupplier condition)throws Exception{
         long until=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(15);
