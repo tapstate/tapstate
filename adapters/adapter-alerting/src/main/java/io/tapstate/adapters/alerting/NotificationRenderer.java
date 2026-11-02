@@ -10,6 +10,8 @@ import java.io.InputStreamReader;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -23,6 +25,7 @@ public final class NotificationRenderer {
     public static final int TEMPLATE_VERSION = 1;
     public static final int WEBHOOK_LIMIT = 64 * 1024;
     public static final int MAX_ITEMS = 20;
+    private static final DateTimeFormatter TEST_TIME = new DateTimeFormatterBuilder().appendInstant(0).toFormatter(Locale.ROOT);
     public enum Kind { FAULT, REMINDER, RECOVERY, RECOVERY_SUMMARY, EVENT, CHANNEL_TEST }
     public enum State { FIRING, RESOLVED, EVENT }
     public enum Failure { INVALID_FACTS, PAYLOAD_BUDGET }
@@ -84,13 +87,15 @@ public final class NotificationRenderer {
         root.put("title", subject);
         root.put("custom", ordered("messageNote", settings.messageNote(), "footerText", settings.footerText()));
         StringBuilder text = new StringBuilder(subject).append('\n').append(word("source")).append('\n');
-        text.append(word("delivery-id")).append(": ").append(facts.deliveryId()).append('\n');
+        if (!test) { text.append(word("delivery-id")).append(": ").append(facts.deliveryId()).append('\n'); }
         if (test) {
             root.put("testId", facts.testId());
             root.put("channelName", facts.channelName());
             root.put("summary", word("test-summary"));
-            text.append(word("created")).append(": ").append(facts.createdAt()).append('\n');
-            text.append(word("test-summary")).append('\n').append(word("test-id")).append(": ").append(facts.testId()).append('\n');
+            text.append(word("test-summary")).append('\n');
+            text.append("Channel: ").append(facts.channelName()).append('\n');
+            text.append(word("created")).append(": ").append(testTime(facts.createdAt())).append('\n');
+            text.append(word("test-save-note")).append('\n');
         } else {
             List<Map<String, Object>> renderedItems = new ArrayList<>();
             for (Item item : items) {
@@ -154,10 +159,10 @@ public final class NotificationRenderer {
             out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"padding:14px 16px;border:1px solid #8b702e;background:#3a3322;border-radius:4px\">")
                     .append("<strong style=\"display:block;margin-bottom:8px;color:#f3f4f5\">[TEST] ").append(escape(word("test-summary"))).append("</strong>")
                     .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
-            appendHtmlRow(out, word("test-id"), facts.testId());
             appendHtmlRow(out, "Channel", facts.channelName());
-            appendHtmlRow(out, word("created"), facts.createdAt().toString());
-            out.append("</table></div></td></tr>");
+            appendHtmlRow(out, word("created"), testTime(facts.createdAt()));
+            out.append("</table><p style=\"margin:12px 0 0;color:#f3f4f5;font-size:13px;line-height:1.5\">")
+                    .append(escape(word("test-save-note"))).append("</p></div></td></tr>");
         } else {
             for (Item item : items) {
                 out.append("<tr><td style=\"padding:0 28px 20px\"><table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\" style=\"border:1px solid #414347;border-radius:4px;border-collapse:separate\">")
@@ -184,18 +189,29 @@ public final class NotificationRenderer {
             }
         }
 
-        out.append("<tr><td style=\"padding:0 28px\"><div style=\"border-top:1px solid #414347;padding:16px 0\">")
-                .append("<h2 style=\"margin:0 0 10px;font-size:14px;color:#f3f4f5\">Supplemental information</h2>")
-                .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
-        appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
-        appendHtmlRow(out, word("created"), facts.createdAt().toString());
-        appendHtmlRow(out, "Logical sequence", Long.toString(facts.logicalSequence()));
+        appendSupplemental(out, facts, settings, test);
+        if (!settings.footerText().isEmpty()) {
+            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"border-top:1px solid #414347;padding-top:14px;color:#aeb2b8;font-size:13px\"><strong style=\"color:#aeb2b8\">")
+                    .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap;color:#aeb2b8\">")
+                    .append(escape(settings.footerText())).append("</div></div></td></tr>");
+        }
+        out.append("</table></td></tr></table></body></html>");
+        return out.toString();
+    }
+    private void appendSupplemental(StringBuilder out, Facts facts, MessageSettings settings, boolean test) {
+        if (test && facts.detailsUrl() == null && settings.messageNote().isEmpty()) { return; }
+        out.append("<tr><td style=\"padding:0 28px\"><div style=\"border-top:1px solid #414347;padding:16px 0\">");
         if (!test) {
+            out.append("<h2 style=\"margin:0 0 10px;font-size:14px;color:#f3f4f5\">Supplemental information</h2>")
+                    .append("<table cellspacing=\"0\" cellpadding=\"0\" border=\"0\" width=\"100%\">");
+            appendHtmlRow(out, word("delivery-id"), facts.deliveryId());
+            appendHtmlRow(out, word("created"), facts.createdAt().toString());
+            appendHtmlRow(out, "Logical sequence", Long.toString(facts.logicalSequence()));
             for (Previous previous : facts.previous()) {
                 appendHtmlRow(out, word("previous"), previous.deliveryId() + " " + wire(previous.outcome()));
             }
+            out.append("</table>");
         }
-        out.append("</table>");
         if (facts.detailsUrl() != null) {
             String href = escape(facts.detailsUrl().toASCIIString());
             out.append("<div style=\"margin-top:10px\"><a style=\"color:#8ab4f8;text-decoration:underline\" href=\"").append(href).append("\">")
@@ -207,18 +223,14 @@ public final class NotificationRenderer {
                     .append(escape(settings.messageNote())).append("</div></div>");
         }
         out.append("</div></td></tr>");
-        if (!settings.footerText().isEmpty()) {
-            out.append("<tr><td style=\"padding:0 28px 20px\"><div style=\"border-top:1px solid #414347;padding-top:14px;color:#aeb2b8;font-size:13px\"><strong style=\"color:#aeb2b8\">")
-                    .append(escape(word("user-footer"))).append("</strong><div style=\"margin-top:5px;white-space:pre-wrap;color:#aeb2b8\">")
-                    .append(escape(settings.footerText())).append("</div></div></td></tr>");
-        }
-        out.append("</table></td></tr></table></body></html>");
-        return out.toString();
     }
     private static void appendHtmlRow(StringBuilder out, String label, String value) {
         out.append("<tr><th scope=\"row\" align=\"left\" valign=\"top\" style=\"padding:7px 16px;color:#aeb2b8;font-size:13px;font-weight:normal;border-bottom:1px solid #414347\">")
                 .append(escape(label)).append("</th><td style=\"padding:7px 16px;color:#f3f4f5;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere;border-bottom:1px solid #414347\">")
                 .append(escape(value)).append("</td></tr>");
+    }
+    private static String testTime(Instant value) {
+        return TEST_TIME.format(value).replace('T', ' ').replace("Z", " UTC");
     }
     private static boolean valid(Facts f) {
         if (f == null || f.kind() == null || !identifier(f.deliveryId()) || f.createdAt() == null

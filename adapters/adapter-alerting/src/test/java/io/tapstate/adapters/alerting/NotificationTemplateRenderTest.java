@@ -90,7 +90,34 @@ class NotificationTemplateRenderTest {
         assertThat(json).contains("\"purpose\":\"channel-test\"", "\"isTest\":true", "test-1").doesNotContain("episode", "resource", "firing", "readAt");
         assertThat(snapshot.text()).contains("does not represent a real fault");
         assertThat(snapshot.html()).contains("[TEST]", "This is a notification configuration test. It does not represent a real fault.",
-                "Test ID", "test-1", "Channel", "Email", "Initiated at").doesNotContain("<pre>");
+                "Channel", "Email", "Initiated at").doesNotContain("<pre>", "Test ID", "test-1");
+    }
+    @Test void testMailExplainsTheTestWithoutInternalIdentifiersWhileWebhookRetainsThem() {
+        var facts = new Facts(Kind.CHANNEL_TEST, "internal-delivery-42", 0, T, List.of(), 0,
+                null, List.of(), "internal-test-17", "Email");
+        var snapshot = new NotificationRenderer().render(facts, MessageSettings.empty()).snapshot();
+        for (String body : List.of(snapshot.text(), snapshot.html())) {
+            assertThat(body).doesNotContain("internal-delivery-42", "internal-test-17", "Test ID", "Delivery ID",
+                    "Logical sequence", "Supplemental information");
+            assertThat(body).contains("[TEST]", "does not represent a real fault", "Email", "2026-10-21 00:00:00 UTC",
+                    "This test does not save your receiver settings.");
+        }
+        String webhook = new String(snapshot.webhook(), StandardCharsets.UTF_8);
+        assertThat(webhook).contains("internal-delivery-42", "internal-test-17", "\"isTest\":true", "\"logicalSequence\":0");
+    }
+    @Test void humanTestTimesKeepWirePrecisionAndSupportTheInstantRange() {
+        for (Instant time : List.of(T.plusNanos(123456789), Instant.MIN, Instant.MAX)) {
+            var facts = new Facts(Kind.CHANNEL_TEST, "test-delivery", 0, time, List.of(), 0,
+                    null, List.of(), "test-1", "Email");
+            var result = new NotificationRenderer().render(facts, MessageSettings.empty());
+            assertThat(result.successful()).isTrue();
+            assertThat(result.snapshot().html()).contains("UTC");
+            var wire = (java.util.Map<?, ?>) JsonReader.parse(new String(result.snapshot().webhook(), StandardCharsets.UTF_8));
+            assertThat(wire.get("createdAt")).isEqualTo(time.toString());
+            if (time.equals(T.plusNanos(123456789))) {
+                assertThat(result.snapshot().text()).contains("2026-10-21 00:00:00 UTC");
+            }
+        }
     }
     @Test void codePointLimitsAndHeaderInjectionAreValidatedBeforeRendering() {
         String point = new String(Character.toChars(0x1f600));
@@ -146,7 +173,7 @@ class NotificationTemplateRenderTest {
         String mime = new String(frozen.bytes(), StandardCharsets.US_ASCII);
         String part = mime.split("Content-Transfer-Encoding: base64\r\n\r\n", -1)[1].split("\r\n--", -1)[0];
         String text = new String(java.util.Base64.getMimeDecoder().decode(part), StandardCharsets.UTF_8);
-        assertThat(text).contains("test-1", "Email", T.toString());
+        assertThat(text).contains("Email", "2026-10-21 00:00:00 UTC").doesNotContain("test-1", "Test ID", "Delivery ID");
     }
     @Test void completeVersionOneWireContractsMatchReviewedBusinessAndTestGoldens() throws Exception {
         var renderer = new NotificationRenderer();
