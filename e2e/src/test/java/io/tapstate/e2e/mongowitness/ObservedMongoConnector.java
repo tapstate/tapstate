@@ -14,6 +14,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.nio.file.Files;
+import java.nio.file.StandardWatchEventKinds;
+import java.util.concurrent.TimeUnit;
 import java.util.List;
 import java.util.function.Consumer;
 
@@ -54,11 +57,30 @@ public final class ObservedMongoConnector implements TapConnector {
                 String start = "START " + offset;
                 appendTailObservation(tail, start);
                 try {
+                    // An opt-in fixture barrier pins cursor selection before source backlog forwarding.
+                    awaitTailRelease(witness.resolveSibling(witness.getFileName() + ".hold-tail"));
                     stream.streamRead(context, tables, offset, size, consumer);
                 } finally {
                     appendTailObservation(tail, "END");
                 }
             });
+        }
+    }
+
+    private static void awaitTailRelease(Path hold) throws IOException, InterruptedException {
+        if (!Files.exists(hold)) return;
+        try (var changes = hold.getFileSystem().newWatchService()) {
+            hold.toAbsolutePath().getParent().register(changes, StandardWatchEventKinds.ENTRY_DELETE);
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(90);
+            while (Files.exists(hold)) {
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0) throw new AssertionError("tail fixture barrier was not released");
+                var changed = changes.poll(remaining, TimeUnit.NANOSECONDS);
+                if (changed != null) {
+                    changed.pollEvents();
+                    if (!changed.reset() && Files.exists(hold)) throw new AssertionError("tail fixture directory disappeared");
+                }
+            }
         }
     }
 

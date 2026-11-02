@@ -303,6 +303,107 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aSupersededLocalExecutionCannotRetainItsPhysicalReader() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
+            var authorized = new AtomicBoolean(true);
+            when(f.authorization.authorized(ORIGINAL)).thenAnswer(call -> authorized.get());
+            when(f.authorization.require(ORIGINAL)).thenAnswer(call -> {
+                if (!authorized.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                return PIPELINE;
+            });
+            var held = ownedShared(f);
+            var retentionEntered = new CountDownLatch(1);
+            var resumeRetention = new CountDownLatch(1);
+            var readerClosed = new CountDownLatch(1);
+            doAnswer(call -> { readerClosed.countDown(); return null; }).when(held.tail()).close();
+            f.coordinator.runOnlyWhileDriving(id -> {
+                assertThat(id).isEqualTo("flow");
+                retentionEntered.countDown();
+                try {
+                    resumeRetention.await();
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(interrupted);
+                }
+                return true;
+            });
+            try {
+                assertThat(retentionEntered.await(3, TimeUnit.SECONDS))
+                        .as("the live local capture reaches its retention decision").isTrue();
+                verify(held.tail(), never()).close();
+                authorized.set(false);
+                assertThat(f.authorization.authorized(ORIGINAL)).isFalse();
+                resumeRetention.countDown();
+                assertThat(readerClosed.await(3, TimeUnit.SECONDS))
+                        .as("the superseded original execution releases its physical reader despite a locally driving same-name pipeline")
+                        .isTrue();
+                verify(f.ownership, timeout(3000).atLeastOnce()).release(held.claim());
+                verify(f.notes, never()).clear(any(), anyBoolean());
+            } finally {
+                resumeRetention.countDown();
+            }
+        }
+    }
+
+    @Test void anAuthorizedLocalExecutionRetainsItsPhysicalReader() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
+            var held = ownedShared(f);
+            var renewed = new CountDownLatch(2);
+            doAnswer(call -> {
+                renewed.countDown();
+                return Optional.of(call.getArgument(0));
+            }).when(f.ownership).renew(held.claim());
+            assertThat(renewed.await(3, TimeUnit.SECONDS)).isTrue();
+            verify(f.authorization, atLeast(2)).authorized(ORIGINAL);
+            verify(held.tail(), never()).close();
+            verify(f.ownership, never()).release(held.claim());
+        }
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.EnumSource(value = PipelineState.class, names = {"RUNNING", "PAUSED"})
+    void anAuthorizedPeerRetainsThePhysicalReaderAfterTheLocalExecutionIsSuperseded(PipelineState state) throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
+            var held = ownedShared(f);
+            var peerScope = new PipelineIntentScope("cluster", 1, "cache", "peer", 11);
+            var peerClaim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "peer"),
+                    new WorkloadOwner("peer-node", "peer-boot"), 5, 6, 1);
+            var peer = new ExecutionFence(peerScope, peerClaim);
+            var context = new SrsConsumerContext(new SrsConsumerKey(held.chain(), "peer", "input"), 11);
+            var membership = new SrsConsumerMembership(context, 1, false, Set.of("orders"), peerClaim);
+            var consumers = f.sources.srs(BUSINESS, () -> {}).consumers();
+            var members = new ArrayList<>(consumers.attached(held.chain()).consumers());
+            members.add(membership);
+            when(consumers.attached(held.chain())).thenReturn(new SrsConsumerTopology(BUSINESS, held.chain(), 2, members));
+            var states = new InMemoryStorePort().state();
+            states.create("peer", StateJson.of(state), Instant.EPOCH);
+            when(f.pipelines.pipelineStates(peerScope)).thenReturn(states);
+            var peerAuthorized = new AtomicBoolean(true);
+            var peerChecked = new AtomicBoolean();
+            when(f.authorization.authorized(peer)).thenAnswer(call -> {
+                peerChecked.set(true);
+                return peerAuthorized.get();
+            });
+            var renewed = new CountDownLatch(2);
+            doAnswer(call -> {
+                if (peerChecked.get()) renewed.countDown();
+                return Optional.of(call.getArgument(0));
+            }).when(f.ownership).renew(held.claim());
+            var readerClosed = new CountDownLatch(1);
+            doAnswer(call -> { readerClosed.countDown(); return null; }).when(held.tail()).close();
+            when(f.authorization.authorized(ORIGINAL)).thenReturn(false);
+            assertThat(renewed.await(3, TimeUnit.SECONDS)).isTrue();
+            verify(f.authorization, atLeast(2)).authorized(peer);
+            verify(f.pipelines, atLeast(2)).pipelineStates(peerScope);
+            verify(held.tail(), never()).close();
+            verify(f.ownership, never()).release(held.claim());
+            peerAuthorized.set(false);
+            assertThat(readerClosed.await(3, TimeUnit.SECONDS)).isTrue();
+            verify(f.ownership, timeout(3000).atLeastOnce()).release(held.claim());
+            verify(f.notes, never()).clear(any(), anyBoolean());
+        }
+    }
+
     @Test void unavailableRetentionRetriesWithoutEndingTheOriginalCapture() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var held = ownedShared(f);
@@ -667,6 +768,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(snapshots.advanceOrder(anyLong(),anyLong(),anyMap())).thenReturn(1L);
             when(snapshots.count(anyString(),anyString(),anyLong())).thenReturn(OptionalLong.of(1));
             when(authorization.require(any())).thenReturn(PIPELINE);
+            when(authorization.authorized(ORIGINAL)).thenReturn(true);
             when(authorization.requireCapture(any(),any())).thenAnswer(call -> call.getArgument(1));
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true,capture));
             when(ownership.renew(any())).thenAnswer(call -> Optional.of(call.getArgument(0)));
