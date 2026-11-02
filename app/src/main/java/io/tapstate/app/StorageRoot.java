@@ -45,7 +45,7 @@ final class StorageRoot implements AutoCloseable {
     private java.util.concurrent.ExecutorService recoveryWorker;
     private final Object activationLock = new Object();
     private java.util.concurrent.ExecutorService activationWorker;
-    private volatile java.util.concurrent.CompletableFuture<Void> pendingActivation;
+    private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pendingActivation = new java.util.concurrent.atomic.AtomicReference<>();
     private volatile boolean activationStoragePrepared;
     private boolean initialSourceTestPending;
     private volatile boolean activationFailed;
@@ -189,7 +189,7 @@ final class StorageRoot implements AutoCloseable {
         retainedAssembly = Objects.requireNonNull(assembly);
     }
 
-    boolean initialActivationPending() { var current = pendingActivation; return current != null && !current.isDone(); }
+    boolean initialActivationPending() { var current = pendingActivation.get(); return current != null && !current.isDone(); }
     boolean initialActivationCanRetry() { return activationStoragePrepared || originalSetupCreationAvailable(); }
     boolean completedInstallationActivationAllowed() {
         requireOpen();
@@ -214,8 +214,8 @@ final class StorageRoot implements AutoCloseable {
             if (activationWorker == null) activationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
                 var thread = new Thread(task, "tapstate-initial-cache-activation"); thread.setDaemon(true); return thread;
             });
-            pendingActivation = new java.util.concurrent.CompletableFuture<>();
-            var completion = pendingActivation;
+            var completion = new java.util.concurrent.CompletableFuture<Void>();
+            pendingActivation.set(completion);
             try {
                 activationWorker.execute(() -> {
                     try { continuation.run(); completion.complete(null); }
@@ -890,7 +890,8 @@ final class StorageRoot implements AutoCloseable {
             if (authenticationWorker != null) authenticationWorker.shutdownNow();
         }
         synchronized (activationLock) {
-            if (pendingActivation != null) pendingActivation.completeExceptionally(StorageRuntime.unavailable());
+            var activation = pendingActivation.get();
+            if (activation != null) activation.completeExceptionally(StorageRuntime.unavailable());
             if (activationWorker != null) activationWorker.shutdownNow();
         }
         synchronized (this) {

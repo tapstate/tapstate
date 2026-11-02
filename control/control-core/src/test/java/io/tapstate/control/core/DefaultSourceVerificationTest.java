@@ -62,6 +62,74 @@ class DefaultSourceVerificationTest {
         void test(ConnectionTestResult.Outcome outcome) { service(ignored -> result(outcome)).test("views", "mongodb", current.get().config(), "admin"); }
     }
 
+    @Test void reportVisibilityTracksAllTerminalStatesAndSuppressesInflightOrUnknownResults() {
+        var f = new Fixture();
+        assertThat(f.verification.canReadReport("other")).isTrue();
+        assertThat(f.verification.canReadReport("views")).isFalse();
+        f.test(ConnectionTestResult.Outcome.PASSED);
+        assertThat(f.verification.canReadReport("views")).isTrue();
+        f.test(ConnectionTestResult.Outcome.FAILED);
+        assertThat(f.verification.canReadReport("views")).isTrue();
+        f.clock.now += 600_000;
+        assertThat(f.verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.EXPIRED);
+        assertThat(f.verification.canReadReport("views")).isTrue();
+        var config = new ConnectionConfig("views", "mongodb", f.current.get().config());
+        try (var attempt = f.verification.begin(config)) {
+            assertThat(attempt.deadlineNanos()).isPresent();
+            assertThat(f.verification.canReadReport("views")).isFalse();
+        }
+        assertThat(f.verification.canReadReport("views")).isFalse();
+    }
+
+    @Test void aReservedSourceCannotExposeAReportWhenItsDefinitionCannotBeRead() {
+        var f = new Fixture(); f.test(ConnectionTestResult.Outcome.PASSED);
+        var identity = new DefaultSourceVerification.Execution(new WorkloadOwner("node", UUID.randomUUID().toString()), 1);
+        var unavailable = new DefaultSourceVerification(() -> {
+            throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+        }, f.results, f.clock, "views", () -> identity, identity::equals, ignored -> false, Duration.ofSeconds(60));
+        assertThat(unavailable.managesId("views")).isTrue();
+        assertThat(unavailable.canReadReport("views")).isFalse();
+        assertThat(unavailable.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.UNKNOWN);
+        assertThat(f.results.find("views")).isPresent();
+    }
+
+    @Test void aDepartedNodeCannotKeepCertifyingItsLastPersistedReport() {
+        var f = new Fixture(); var live = new AtomicBoolean(true);
+        var identity = new DefaultSourceVerification.Execution(new WorkloadOwner("node", UUID.randomUUID().toString()), 1);
+        var verification = new DefaultSourceVerification(() -> Optional.of(f.current.get()), f.results, f.clock,
+                "views", () -> identity, observed -> live.get() && observed.equals(identity), ignored -> false, Duration.ofSeconds(60));
+        var service = new ConnectionTestService(ignored -> f.result(ConnectionTestResult.Outcome.PASSED), f.results,
+                new AuditGate(f.audit::add, f.clock), null, new SourceConnectionResolver(f.artifacts), verification);
+        service.test("views", "mongodb", f.current.get().config(), "admin");
+        assertThat(verification.canReadReport("views")).isTrue();
+        live.set(false);
+        assertThat(verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.UNKNOWN);
+        assertThat(verification.canReadReport("views")).isFalse();
+        assertThat(f.results.find("views")).isPresent();
+    }
+
+    @Test void lateFailureRequiresConfirmedTimeoutCleanupBeforeItCanBecomeFailed() {
+        for (boolean released : new boolean[]{false, true}) {
+            var f = new Fixture();
+            var identity = new DefaultSourceVerification.Execution(new WorkloadOwner("node", UUID.randomUUID().toString()), 1);
+            var verification = new DefaultSourceVerification(() -> Optional.of(f.current.get()), f.results, f.clock,
+                    "views", () -> identity, identity::equals, ignored -> released, Duration.ofSeconds(60));
+            var service = new ConnectionTestService(ignored -> {
+                f.clock.now += 60_001; return f.result(ConnectionTestResult.Outcome.FAILED);
+            }, f.results, new AuditGate(f.audit::add, f.clock), null, new SourceConnectionResolver(f.artifacts), verification);
+            var saved = f.current.get().config();
+            if (released) {
+                service.test("views", "mongodb", saved, "admin");
+                assertThat(verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.FAILED);
+                assertThat(verification.canReadReport("views")).isTrue();
+            } else {
+                assertThatThrownBy(() -> service.test("views", "mongodb", saved, "admin")).isInstanceOf(TapstateException.class);
+                assertThat(verification.snapshot().status()).isEqualTo(DefaultSourceVerification.Status.UNKNOWN);
+                assertThat(verification.canReadReport("views")).isFalse();
+            }
+        }
+    }
+
     @Test void aCompletedFormalTestPublishesItsExactTimeWithoutExposingConfiguration() {
         var f = new Fixture(); f.test(ConnectionTestResult.Outcome.PASSED);
         var status = f.verification.snapshot();

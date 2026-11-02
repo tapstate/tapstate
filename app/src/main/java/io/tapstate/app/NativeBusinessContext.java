@@ -46,7 +46,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private RetiredPipelinePayloadCleanup payloadCleanup;
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
-    private volatile Thread initialTestCaller;
+    private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
 
     NativeBusinessContext(StorageRoot root, StorageRuntime.Bound original, ConfigurableApplicationContext parent) {
         this.root = root; this.original = original; this.parent = parent;
@@ -135,7 +135,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 throw defect;
             }
         }, "tapstate-initial-default-source-test");
-        caller.setDaemon(true); initialTestCaller = caller; caller.start();
+        caller.setDaemon(true); initialTestCaller.set(caller); caller.start();
     }
     boolean canTestDefaultSource() {
         if (!active.get()) return false;
@@ -237,7 +237,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     @Override public synchronized void close() {
         active.set(false); handlers = List.of();
-        var initial = initialTestCaller; if (initial != null) initial.interrupt();
+        var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
         try { if (payloadCleanup != null) { payloadCleanup.close(); payloadCleanup = null; } }

@@ -69,6 +69,42 @@ class OnPremInstallationTest {
         assertThatThrownBy(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void firstAdministratorReadinessRequiresTheCompletedLocalHandoffAndActualBusiness() {
+        var files = InstallationFiles.initialize(directory.resolve("ready-handoff"));
+        InstallationCommand.authorize(files, new MongoProperties(), Clock.systemUTC());
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, "a".repeat(64)));
+        var scope = files.stage().scope();
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        var configuration = mock(MongoConfigurationDomain.class); var states = mock(StorageSetupStateStore.class);
+        var phase = new java.util.concurrent.atomic.AtomicReference<>(StorageSetupStateStore.Phase.STORAGE_BOUND);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
+        when(runtime.configuration()).thenReturn(Optional.of(configuration)); when(configuration.setupStates()).thenReturn(states);
+        when(states.guardedBy(any())).thenReturn(states);
+        when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(scope, phase.get(), 1));
+        when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY); when(runtime.businessStarted()).thenReturn(true);
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            assertThatThrownBy(installation::afterNormalStartup).isInstanceOf(TapstateException.class);
+            assertThat(files.capability()).isPresent();
+            phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+            assertThatThrownBy(installation::afterNormalStartup).isInstanceOf(TapstateException.class);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+            when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(installation.firstAdministratorReady()).as("ready business alone cannot skip SETUP cleanup").isFalse();
+            var observed = new java.util.concurrent.atomic.AtomicBoolean();
+            installation.onStartupCompleted(() -> {
+                assertThat(installation.firstAdministratorReady()).isTrue();
+                assertThat(files.capability()).isEmpty(); observed.set(true);
+            });
+            installation.afterNormalStartup();
+            assertThat(observed).isTrue(); assertThat(installation.firstAdministratorReady()).isTrue();
+            when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+            when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY); when(runtime.businessStarted()).thenReturn(false);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+        }
+    }
+
     @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
         var files = InstallationFiles.initialize(directory.resolve("reopen"));
         var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);

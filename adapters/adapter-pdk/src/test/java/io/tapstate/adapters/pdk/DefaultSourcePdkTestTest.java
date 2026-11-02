@@ -30,6 +30,27 @@ class DefaultSourcePdkTestTest {
         while (!executor.available() && System.nanoTime() < end) Thread.sleep(1);
         assertThat(executor.available()).isTrue();
     }
+    @Test void anInterruptedObserverStillReceivesAnAlreadyPublishedProgrammingDefect() throws Exception {
+        var observer = Thread.currentThread(); var release = new CountDownLatch(1);
+        var observed = new java.util.concurrent.atomic.AtomicReference<Throwable>();
+        var defect = new NullPointerException("published before observer interruption");
+        try (var executor = new DefaultSourcePdkTest(Clock.systemUTC(), Duration.ofSeconds(2), Duration.ofMillis(100))) {
+            var call = new DefaultSourcePdkTest.Call() {
+                @Override public ConnectionTestResult run() {
+                    observed.set(defect); observer.interrupt(); await(release); throw defect;
+                }
+                @Override public void cancel() { release.countDown(); }
+                @Override public boolean resourcesReleased() { return true; }
+                @Override public Throwable observedFailure() { return observed.get(); }
+            };
+            try {
+                assertThatThrownBy(() -> executor.test(CONFIG, call)).isSameAs(defect);
+                assertThat(Thread.currentThread().isInterrupted()).isTrue();
+            } finally { Thread.interrupted(); release.countDown(); }
+            awaitAvailable(executor);
+        } finally { Thread.interrupted(); release.countDown(); }
+    }
+
     @Test void completedTestReturnsItsReportAndReleasesTheOneSlot() {
         try (var executor = executor()) {
             var result = executor.test(CONFIG, new DefaultSourcePdkTest.Call() {

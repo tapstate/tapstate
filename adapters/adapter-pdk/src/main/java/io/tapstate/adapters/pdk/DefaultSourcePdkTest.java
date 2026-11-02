@@ -46,33 +46,43 @@ final class DefaultSourcePdkTest implements AutoCloseable {
         flight.worker.start();
         try {
             boolean finished = flight.exited.await(Math.max(0, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
-            if (!finished) {
-                flight.cancel();
-                flight.cleanupFinished.await(Math.max(0, flight.cleanupDeadline - System.nanoTime()), TimeUnit.NANOSECONDS);
-                long remaining = flight.cleanupDeadline - System.nanoTime();
-                if (remaining > 0) flight.exited.await(remaining, TimeUnit.NANOSECONDS);
-                rethrowDefect(flight.call.observedFailure());
-                rethrowDefect(flight.cleanupFailure);
-                rethrowDefect(flight.failure);
-                if (!flight.released()) throw timeout(config);
-                return failed(config, ConnectorError.TEST_TIMEOUT.code());
-            }
-            rethrowDefect(flight.call.observedFailure());
-            rethrowDefect(flight.cleanupFailure);
-            rethrowDefect(flight.failure);
-            if (flight.cancelling || flight.interrupted || !flight.released()) throw timeout(config);
-            if (flight.failure != null) {
-                if (flight.failure instanceof TapstateException coded && coded.code().code().startsWith("connector.")
-                        && !(coded.getCause() instanceof InterruptedException))
-                    return failed(config, coded.code().code());
-                if (flight.failure instanceof RuntimeException runtime) throw runtime;
-                if (flight.failure instanceof Error error) throw error;
-                throw new IllegalStateException("unexpected default test failure", flight.failure);
-            }
-            return flight.result;
+            return finished ? completed(config, flight) : timedOut(config, flight);
         } catch (InterruptedException interrupted) {
-            flight.cancel(); Thread.currentThread().interrupt(); throw timeout(config);
+            flight.cancel(); Thread.currentThread().interrupt();
+            rethrowObservedDefects(flight);
+            throw timeout(config);
         } finally { flight.returned = true; flight.release(); }
+    }
+    private ConnectionTestResult timedOut(ConnectionConfig config, Flight flight) throws InterruptedException {
+        flight.cancel();
+        boolean cleanupExited = flight.cleanupFinished.await(
+                Math.max(0, flight.cleanupDeadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        boolean workerExited = flight.exited.await(
+                Math.max(0, flight.cleanupDeadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+        rethrowObservedDefects(flight);
+        boolean exitsObserved = (cleanupExited || flight.cleanupFinished.getCount() == 0)
+                && (workerExited || flight.exited.getCount() == 0);
+        if (!exitsObserved || !flight.released()) throw timeout(config);
+        return failed(config, ConnectorError.TEST_TIMEOUT.code());
+    }
+    private ConnectionTestResult completed(ConnectionConfig config, Flight flight) {
+        rethrowObservedDefects(flight);
+        if (flight.cancelling || flight.interrupted || !flight.released()) throw timeout(config);
+        var failure = flight.failure.get();
+        if (failure != null) {
+            if (failure instanceof TapstateException coded && coded.code().code().startsWith("connector.")
+                    && !(coded.getCause() instanceof InterruptedException))
+                return failed(config, coded.code().code());
+            if (failure instanceof RuntimeException runtime) throw runtime;
+            if (failure instanceof Error error) throw error;
+            throw new IllegalStateException("unexpected default test failure", failure);
+        }
+        return flight.result.get();
+    }
+    private static void rethrowObservedDefects(Flight flight) {
+        rethrowDefect(flight.call.observedFailure());
+        rethrowDefect(flight.cleanupFailure.get());
+        rethrowDefect(flight.failure.get());
     }
     private static void rethrowDefect(Throwable failure) {
         if (failure instanceof Error error) throw error;
@@ -98,9 +108,9 @@ final class DefaultSourcePdkTest implements AutoCloseable {
         private final Call call;
         private final CountDownLatch exited = new CountDownLatch(1);
         private final CountDownLatch cleanupFinished = new CountDownLatch(1);
-        private volatile ConnectionTestResult result;
-        private volatile Throwable failure;
-        private volatile Throwable cleanupFailure;
+        private final AtomicReference<ConnectionTestResult> result = new AtomicReference<>();
+        private final AtomicReference<Throwable> failure = new AtomicReference<>();
+        private final AtomicReference<Throwable> cleanupFailure = new AtomicReference<>();
         private volatile boolean returned;
         private volatile boolean interrupted;
         private volatile boolean cancelling;
@@ -109,8 +119,8 @@ final class DefaultSourcePdkTest implements AutoCloseable {
         Flight(Call call) {
             this.call = call;
             worker = new Thread(() -> {
-                try { result = call.run(); }
-                catch (RuntimeException | Error failed) { failure = failed; }
+                try { result.set(call.run()); }
+                catch (RuntimeException | Error failed) { failure.set(failed); }
                 finally { interrupted = Thread.currentThread().isInterrupted(); exited.countDown(); release(); }
             }, "tapstate-default-source-test");
             worker.setDaemon(true);
@@ -122,14 +132,14 @@ final class DefaultSourcePdkTest implements AutoCloseable {
             worker.interrupt();
             var cleanup = new Thread(() -> {
                 try { call.cancel(); }
-                catch (RuntimeException | Error failed) { cleanupFailure = failed; }
+                catch (RuntimeException | Error failed) { cleanupFailure.set(failed); }
                 finally { cleanupFinished.countDown(); release(); }
             }, "tapstate-default-source-test-cleanup");
             cleanup.setDaemon(true); cleanup.start();
         }
         boolean released() {
             return exited.getCount() == 0 && (!cancelling || cleanupFinished.getCount() == 0)
-                    && cleanupFailure == null && call.resourcesReleased();
+                    && cleanupFailure.get() == null && call.resourcesReleased();
         }
         void release() { if (returned && released()) current.compareAndSet(this, null); }
     }

@@ -1348,6 +1348,21 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CodeOnlyTest", connectionTestSource("CodeOnlyTest", body));
     }
 
+    static Path testSettingsEcho(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.TestSettingsEcho", connectionTestSource("TestSettingsEcho",
+                "s.accept(new TestItem(\"URI\", TestItem.RESULT_SUCCESSFULLY, (String)c.getConnectionConfig().get(\"uri\"))); return ConnectionOptions.create();"));
+    }
+
+    static Path excessiveDiagnosticTest(Path dir, String kind) {
+        String body = switch (kind) {
+            case "items" -> "for(int i=0;i<1025;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY));";
+            case "sum" -> "for(int i=0;i<3;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(50000)));";
+            case "parameters" -> "TapTestItemException e=new TapTestItemException(); String[] values=new String[1025]; java.util.Arrays.fill(values, \"x\"); e.setDynamicDescriptionParameters(values); s.accept(new TestItem(\"Check\",e,TestItem.RESULT_FAILED));";
+            default -> throw new IllegalArgumentException("unsupported diagnostic fixture");
+        };
+        return SyntheticJar.compileToJar(dir, "synthetic.ExcessiveDiagnostic", connectionTestSource("ExcessiveDiagnostic", body + "return ConnectionOptions.create();"));
+    }
+
     static Path oversizedTestReport(Path dir) {
         return SyntheticJar.compileToJar(dir, "synthetic.OversizedReport", connectionTestSource("OversizedReport",
                 "s.accept(new TestItem(\"Connection\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(200000))); return ConnectionOptions.create();"));

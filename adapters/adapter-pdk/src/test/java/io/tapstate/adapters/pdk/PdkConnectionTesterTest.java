@@ -119,6 +119,56 @@ class PdkConnectionTesterTest {
                 });
     }
 
+    @Test void aClosedTesterRefusesDefaultWorkBeforeResolvingAnotherConnector() {
+        var resolves = new java.util.concurrent.atomic.AtomicInteger();
+        var tester = new PdkConnectionTester(ignored -> { resolves.incrementAndGet(); throw new AssertionError("must not resolve"); }, Clock.systemUTC(), ignored -> true);
+        tester.close(); long deadline = System.nanoTime() + java.time.Duration.ofSeconds(1).toNanos();
+        assertThatThrownBy(() -> tester.testDefault(config(), deadline)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ConnectorError.INSTANCES_BUSY));
+        assertThat(tester.defaultTestAvailable()).isFalse(); assertThat(resolves).hasValue(0);
+    }
+
+    @Test void anUnmanagedConnectionKeepsItsOrdinaryTestEvenThroughTheDefaultPort(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.passingTest(dir)), "synthetic.PassingTest", "2.0.8", null);
+        try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> false)) {
+            long expiredDefaultDeadline = System.nanoTime() - 1;
+            assertThat(tester.testDefault(config(), expiredDefaultDeadline).outcome()).isEqualTo(Outcome.PASSED);
+            assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
+    @Test void theRealDefaultDrivePreservesStrongerLimitsAndDoesNotRepairMalformedOptions(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.testSettingsEcho(dir)), "synthetic.TestSettingsEcho", "2.0.8", null);
+        String original = "mongodb://host/views?serverSelectionTimeoutMS=7&connectTimeoutMS=0&socketTimeoutMS=bad&retryWrites=false";
+        var config = new ConnectionConfig("views", "mongodb", Map.of("uri", original));
+        try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {
+            long deadline = System.nanoTime() + java.time.Duration.ofSeconds(10).toNanos();
+            var report = tester.testDefault(config, deadline);
+            String echoed = report.items().getFirst().message();
+            assertThat(echoed).contains("serverselectiontimeoutms=7", "socketTimeoutMS=bad", "retryWrites=false");
+            var options = java.util.Arrays.stream(echoed.substring(echoed.indexOf('?') + 1).split("&"))
+                    .map(value -> value.split("=", 2)).collect(java.util.stream.Collectors.toMap(value -> value[0].toLowerCase(java.util.Locale.ROOT), value -> value[1]));
+            assertThat(Long.parseLong(options.get("connecttimeoutms"))).isBetween(1L, 10_000L);
+            assertThat(config.settings()).containsEntry("uri", original);
+            var noPath = new ConnectionConfig("views", "mongodb", Map.of("uri", "mongodb://host"));
+            var normalized = tester.testDefault(noPath, System.nanoTime() + java.time.Duration.ofSeconds(10).toNanos());
+            assertThat(normalized.items().getFirst().message()).startsWith("mongodb://host/?")
+                    .contains("serverselectiontimeoutms=", "connecttimeoutms=", "sockettimeoutms=");
+        }
+    }
+
+    @Test void excessiveDiagnosticCountsAndAccumulatedTextStopTheOwnedDefaultDrive(@TempDir Path dir) {
+        for (String kind : List.of("items", "sum", "parameters")) {
+            var ref = new ConnectorRef(List.of(Synthetic.excessiveDiagnosticTest(dir.resolve(kind), kind)), "synthetic.ExcessiveDiagnostic", "2.0.8", null);
+            try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {
+                long deadline = System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos();
+                assertThatThrownBy(() -> tester.testDefault(config(), deadline)).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(io.tapstate.spi.store.IoError.DOCUMENT_TOO_LARGE));
+                assertThat(tester.defaultTestAvailable()).isTrue();
+            }
+        }
+    }
+
     @Test void anEmptyManagedTestCannotCertifyAConnection(@TempDir Path dir) {
         var ref = new ConnectorRef(List.of(Synthetic.emptyTestReport(dir)), "synthetic.EmptyTestReport", "2.0.8", null);
         try (var tester = new PdkConnectionTester(ignored -> ref, Clock.systemUTC(), ignored -> true)) {

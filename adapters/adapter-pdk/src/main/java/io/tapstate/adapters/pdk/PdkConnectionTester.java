@@ -32,6 +32,8 @@ import java.util.function.Consumer;
  */
 public final class PdkConnectionTester implements ConnectionTester, AutoCloseable {
 
+    private static final String CONNECTOR_PARAM = "connector";
+    private static final String TIMEOUT_PARAM = "timeout";
     private final ConnectorProvisioner provisioner;
     private final Clock clock;
     private final java.util.function.Predicate<ConnectionConfig> managed;
@@ -79,7 +81,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         return testOrdinary(config);
     }
     @Override public ConnectionTestResult testDefault(ConnectionConfig config, long deadlineNanos) {
-        if (closed) throw new TapstateException(ConnectorError.INSTANCES_BUSY, Map.of("connector", config.connectorId(), "timeout", "0s"), null);
+        if (closed) throw new TapstateException(ConnectorError.INSTANCES_BUSY, Map.of(CONNECTOR_PARAM, config.connectorId(), TIMEOUT_PARAM, "0s"), null);
         if (!managed.test(config)) return testOrdinary(config);
         return defaults.test(config, new DefaultCall(config, deadlineNanos), deadlineNanos);
     }
@@ -119,93 +121,111 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         } catch (TapTestItemException diagnostic) {
             if (strict) { sink.accept(new TestItem("Connection", diagnostic, TestItem.RESULT_FAILED)); return; }
             throw new TapstateException(ConnectorError.TEST_FAILED,
-                    Map.of("connector", connector.connectorId(), "detail", detail(diagnostic)), diagnostic);
+                    Map.of(CONNECTOR_PARAM, connector.connectorId(), "detail", detail(diagnostic)), diagnostic);
         } catch (Throwable t) {
             if (strict && t instanceof RuntimeException runtime) throw runtime;
             if (strict && t instanceof Error error) throw error;
             if (t instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new TapstateException(ConnectorError.TEST_FAILED,
-                    Map.of("connector", connector.connectorId(), "detail", detail(t)), t);
+                    Map.of(CONNECTOR_PARAM, connector.connectorId(), "detail", detail(t)), t);
         }
     }
 
     private final class DefaultCall implements DefaultSourcePdkTest.Call {
         private final ConnectionConfig config;
         private final java.util.concurrent.atomic.AtomicBoolean closeClaimed = new java.util.concurrent.atomic.AtomicBoolean();
-        private volatile PdkConnector connector;
+        private final java.util.concurrent.atomic.AtomicReference<PdkConnector> connector = new java.util.concurrent.atomic.AtomicReference<>();
         private volatile boolean cancelled;
         private volatile boolean released;
         private volatile boolean cleanupUncertain;
         // Publishes the original defect before owned cleanup can block.
-        @SuppressWarnings("java:S3077")
-        private volatile Throwable observedFailure;
+        private final java.util.concurrent.atomic.AtomicReference<Throwable> observedFailure = new java.util.concurrent.atomic.AtomicReference<>();
         private final long deadlineNanos;
         DefaultCall(ConnectionConfig config, long deadlineNanos) { this.config = config; this.deadlineNanos = deadlineNanos; }
         @Override public ConnectionTestResult run() {
+            ConnectionTestResult result = null;
+            Throwable failure = null;
             try {
-                if (deadlineNanos - System.nanoTime() <= 0) throw new TapstateException(ConnectorError.TEST_TIMEOUT,
-                        Map.of("connector", config.connectorId(), "timeout", defaultBudget.toString()), null);
-                var ref = provisioner.resolveDefaultTest(config.connectorId());
-                long remaining = deadlineNanos - System.nanoTime();
-                if (remaining <= 0 || cancelled) throw new TapstateException(ConnectorError.TEST_TIMEOUT,
-                        Map.of("connector", config.connectorId(), "timeout", defaultBudget.toString()), null);
-                connector = PdkConnector.openDefaultTest(config.connectorId(), ref, defaultSettings(config, remaining));
-                if (cancelled || Thread.currentThread().isInterrupted())
-                    throw new TapstateException(ConnectorError.TEST_TIMEOUT, Map.of("connector", config.connectorId(), "timeout", "cancelled"), null);
-                var raw = new ArrayList<TestItem>();
-                long[] diagnosticCharacters = {0};
-                drive(connector, item -> {
-                    if (raw.size() >= 1024) throw resultTooLarge(config.id());
-                    var failure = item.getTapTestItemException();
-                    countDiagnostic(config.id(), diagnosticCharacters, item.getItem(), item.getInformation(),
-                            failure == null ? null : failure.getMessage(), failure == null ? null : failure.getReason(),
-                            failure == null ? null : failure.getSolution(), failure == null ? null : failure.getErrorCode());
-                    if (failure != null && failure.getDynamicDescriptionParameters() != null) {
-                        int count = 0;
-                        for (String parameter : failure.getDynamicDescriptionParameters()) {
-                            if (++count > 1024) throw resultTooLarge(config.id());
-                            countDiagnostic(config.id(), diagnosticCharacters, parameter);
-                        }
-                    }
-                    raw.add(item);
-                }, true);
-                var items = translate(raw);
-                if (items.isEmpty()) throw new IllegalStateException("default Source connector returned no connection checks");
-                return new ConnectionTestResult(config.id(), config.connectorId(), anyFailed(items) ? Outcome.FAILED : Outcome.PASSED,
-                        items, clock.millis());
-            } catch (RuntimeException | Error failure) {
-                observedFailure = failure;
-                if (failure instanceof TapstateException coded && coded.code() == ConnectorError.TLS_MATERIAL_CLEANUP_FAILED) cleanupUncertain = true;
-                throw failure;
-            } finally {
-                try {
-                    if (connector == null) released = !cleanupUncertain;
-                    else closeOwned();
-                } catch (RuntimeException | Error cleanup) {
-                    var original = observedFailure;
-                    if (original != null && original != cleanup) {
-                        if (original instanceof TapstateException && !(cleanup instanceof TapstateException)) {
-                            cleanup.addSuppressed(original); observedFailure = cleanup; throw cleanup;
-                        }
-                        original.addSuppressed(cleanup);
-                    } else { observedFailure = cleanup; throw cleanup; }
+                result = runOwnedTest();
+            } catch (RuntimeException | Error original) {
+                observedFailure.set(original);
+                if (original instanceof TapstateException coded && coded.code() == ConnectorError.TLS_MATERIAL_CLEANUP_FAILED)
+                    cleanupUncertain = true;
+                failure = original;
+            }
+            var selected = closeAndSelectFailure(failure);
+            if (selected instanceof RuntimeException runtime) throw runtime;
+            if (selected instanceof Error error) throw error;
+            return result;
+        }
+        private ConnectionTestResult runOwnedTest() {
+            if (deadlineNanos - System.nanoTime() <= 0) throw new TapstateException(ConnectorError.TEST_TIMEOUT,
+                    Map.of(CONNECTOR_PARAM, config.connectorId(), TIMEOUT_PARAM, defaultBudget.toString()), null);
+            var ref = provisioner.resolveDefaultTest(config.connectorId());
+            long remaining = deadlineNanos - System.nanoTime();
+            if (remaining <= 0 || cancelled) throw new TapstateException(ConnectorError.TEST_TIMEOUT,
+                    Map.of(CONNECTOR_PARAM, config.connectorId(), TIMEOUT_PARAM, defaultBudget.toString()), null);
+            var owned = PdkConnector.openDefaultTest(config.connectorId(), ref, defaultSettings(config, remaining));
+            connector.set(owned);
+            if (cancelled || Thread.currentThread().isInterrupted())
+                throw new TapstateException(ConnectorError.TEST_TIMEOUT, Map.of(CONNECTOR_PARAM, config.connectorId(), TIMEOUT_PARAM, "cancelled"), null);
+            var raw = new ArrayList<TestItem>();
+            long[] diagnosticCharacters = {0};
+            drive(owned, item -> collectDiagnostic(raw, diagnosticCharacters, item), true);
+            var items = translate(raw);
+            if (items.isEmpty()) throw new IllegalStateException("default Source connector returned no connection checks");
+            return new ConnectionTestResult(config.id(), config.connectorId(), anyFailed(items) ? Outcome.FAILED : Outcome.PASSED,
+                    items, clock.millis());
+        }
+        private void collectDiagnostic(List<TestItem> raw, long[] diagnosticCharacters, TestItem item) {
+            if (raw.size() >= 1024) throw resultTooLarge(config.id());
+            var failure = item.getTapTestItemException();
+            countDiagnostic(config.id(), diagnosticCharacters, item.getItem(), item.getInformation(),
+                    failure == null ? null : failure.getMessage(), failure == null ? null : failure.getReason(),
+                    failure == null ? null : failure.getSolution(), failure == null ? null : failure.getErrorCode());
+            if (failure != null && failure.getDynamicDescriptionParameters() != null) {
+                int count = 0;
+                for (String parameter : failure.getDynamicDescriptionParameters()) {
+                    if (++count > 1024) throw resultTooLarge(config.id());
+                    countDiagnostic(config.id(), diagnosticCharacters, parameter);
                 }
             }
+            raw.add(item);
+        }
+        private Throwable closeAndSelectFailure(Throwable original) {
+            try {
+                if (connector.get() == null) released = !cleanupUncertain;
+                else closeOwned();
+            } catch (RuntimeException | Error cleanup) {
+                var selected = selectDefaultFailure(original, cleanup);
+                observedFailure.set(selected); return selected;
+            }
+            return original;
         }
         @Override public void cancel() {
             cancelled = true;
-            var owned = connector;
+            var owned = connector.get();
             if (owned == null) return;
             // connectionTest owns its connection lifecycle; stop is not valid before connector init.
             try { owned.cancelDrive(); }
             finally { closeOwned(); }
         }
         private void closeOwned() {
-            if (closeClaimed.compareAndSet(false, true)) { connector.closeDefaultTest(); released = true; }
+            var owned = connector.get();
+            if (owned != null && closeClaimed.compareAndSet(false, true)) { owned.closeDefaultTest(); released = true; }
         }
         @Override public boolean resourcesReleased() { return released; }
-        @Override public Throwable observedFailure() { return observedFailure; }
+        @Override public Throwable observedFailure() { return observedFailure.get(); }
         @Override public Object owner() { return PdkConnectionTester.this; }
+    }
+
+    /** Preserve both failures while keeping a cleanup defect visible over a controlled connector failure. */
+    static Throwable selectDefaultFailure(Throwable original, Throwable cleanup) {
+        if (original == null || original == cleanup) return cleanup;
+        if (original instanceof TapstateException && !(cleanup instanceof TapstateException)) {
+            cleanup.addSuppressed(original); return cleanup;
+        }
+        original.addSuppressed(cleanup); return original;
     }
 
     private static void countDiagnostic(String id, long[] count, String... values) {
