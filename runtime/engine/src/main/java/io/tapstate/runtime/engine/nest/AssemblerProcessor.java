@@ -628,6 +628,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
     }
 
+    // Read-ahead belongs to one process call; null values represent confirmed absent keys.
+    private final Map<Object, RootAssembly> prefetchedRoots = new LinkedHashMap<>();
+
     private void processRecording(int ordinal, Inbox inbox) {
         if (!flush()) {
             return;
@@ -636,8 +639,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         Map<Object, Touched> touched = new LinkedHashMap<>();
         boolean snapshotWaves = canUseSnapshotWaves(edge);
         boolean childSnapshotWaves = canUseChildSnapshotWaves(edge);
+        boolean rootReadAhead = canPrefetchRootReads(edge);
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
+                if (rootReadAhead && prefetchedRoots.isEmpty()) {
+                    rootReadAhead = prefetchRootReads(inbox, touched);
+                }
                 if (childSnapshotWaves && touched.isEmpty()) {
                     if (processChildSnapshotWave(edge, inbox)) {
                         if (!flush()) return;
@@ -653,6 +660,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 }
             }
         } finally {
+            // Never carry unused state across another edge, an idle callback, or a failed drain.
+            prefetchedRoots.clear();
             settle(touched);
         }
         // Here as well as on the idle path, because a vertex fed steadily on one key never reaches the idle
@@ -678,6 +687,54 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return vertex.pathId().isEmpty() && !slots.isEmpty()
                 && slots.stream().allMatch(slot -> slot.isReference()
                         && slot.as() == io.tapstate.core.model.EmbedAs.OBJECT && slot.children().isEmpty());
+    }
+
+    private boolean canPrefetchRootReads(NestInbound edge) {
+        return vertex.pathId().isEmpty() && edge.pathId().isEmpty() && !edge.isCascade()
+                && !edge.carriesTouches() && !edge.carriesDepartures() && !edge.tracksKeyChanges()
+                && slots.stream().anyMatch(slot -> !slot.isReference()
+                        && slot.as() == io.tapstate.core.model.EmbedAs.ARRAY);
+    }
+
+    /** Prefetch only; the ordinary drain still owns every mutation, write, and output. */
+    private boolean prefetchRootReads(Inbox inbox, Map<Object, Touched> touched) {
+        Set<Object> keys = new LinkedHashSet<>();
+        long inputBytes = 0;
+        int examined = 0;
+        for (Object item : inbox) {
+            if (++examined > DrainFolding.MAX_KEYS_HELD
+                    || !(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
+                    || (event.after() == null && event.before() == null)) break;
+            Object key;
+            try {
+                key = NestKeys.valuesOf(NestKeys.rowOf(event), vertex.partitionKey(), vertex.mapName());
+            } catch (TapstateException invalidRow) {
+                // Report a malformed row only when ordinary processing reaches it.
+                break;
+            }
+            long weight = PayloadBytes.of(event);
+            if (weight > RootWrites.BYTES - inputBytes) break;
+            inputBytes += weight;
+            if (touched.containsKey(key) || recentReferenceStates.get(key) == ReferenceState.ABSENT) continue;
+            if (!keys.add(key) || keys.size() == RootWrites.KEYS) break;
+        }
+        if (keys.size() < 2) return false;
+        Map<Object, RootAssembly> loaded = store.loadAll(keys);
+        long retainedBytes = 0;
+        boolean withinBudget = true;
+        for (Object key : keys) {
+            RootAssembly state = loaded.get(key);
+            long weight = state == null ? 0 : StateWaveSize.of(state);
+            if (weight > RootWrites.BYTES - retainedBytes) {
+                // A loadAll response is key-bounded, not byte-streamed. Retain only bounded state,
+                // and avoid repeatedly probing wide assemblies during the remainder of this drain.
+                withinBudget = false;
+                continue;
+            }
+            prefetchedRoots.put(key, state);
+            retainedBytes += weight;
+        }
+        return withinBudget;
     }
 
     private boolean canUseChildSnapshotWaves(NestInbound edge) {
@@ -1930,7 +1987,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     private Touched touched(Object key, Map<Object, Touched> touched) {
         ReferenceState known = recentReferenceStates.remove(key);
         return touched.computeIfAbsent(key, k -> {
-            RootAssembly held = known == ReferenceState.ABSENT ? null : store.load(k);
+            RootAssembly held = prefetchedRoots.containsKey(k) ? prefetchedRoots.remove(k)
+                    : known == ReferenceState.ABSENT ? null : store.load(k);
             // Whether anything was there is carried to the write at the end of the drain rather than worked
             // out again there. Only the read can answer it - a write that asked would be the very fetch the
             // answer exists to save - and by then the state to be written is there either way, so the two

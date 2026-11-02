@@ -50,6 +50,194 @@ class RootStateWriteBatchingTest {
         assertArrayDocuments(f.drain(), 32);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayRootReadsPrefetchExistingStatesWithoutBatchingWrites(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        f.assembler.process(1, lineRows(32));
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.roots.singleWrites = 0;
+        f.roots.batches.clear();
+        f.feed(32, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.singleWrites).isEqualTo(32);
+        assertThat(f.roots.batches).isEmpty();
+        assertArrayDocuments(f.drain(), 32);
+    }
+
+    @Test void rootPrefetchFailureKeepsEveryInputAndMakesNoWrites() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(16));
+        f.roots.singleWrites = 0;
+        f.roots.batches.clear();
+        f.roots.failReadBatch = true;
+        TestInbox inbox = f.inbox(16, false);
+        assertThatThrownBy(() -> f.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state read batch failed");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.drain()).isEmpty();
+        f.roots.failReadBatch = false;
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertArrayDocuments(f.drain(), 16);
+    }
+
+    @Test void prefetchedArrayRootsKeepRepeatedVersionsOnAppend() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.read(3, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        List<Envelope> documents = f.drain();
+        assertThat(documents).extracting(e -> e.after().get("version")).containsExactly(0, 1, 99);
+        assertThat(documents).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).hasSize(2));
+    }
+
+    @Test void prefetchedArrayRootsKeepSameDrainFoldingBeyondTheReadAhead() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), true);
+        f.assembler.process(1, lineRows(32));
+        f.roots.singleWrites = 0;
+        TestInbox inbox = f.inbox(32, false);
+        inbox.add(Envelope.read(99, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        List<Envelope> documents = f.drain();
+        assertThat(documents).hasSize(32);
+        assertThat(documents.getFirst().after()).containsEntry("order_id", 0).containsEntry("version", 99);
+        assertThat(f.roots.singleWrites).isEqualTo(32);
+    }
+
+    @Test void rootReadAheadStopsBeforeCdcAndDoesNotCacheItsKey() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(4));
+        f.roots.batchReadKeys.clear();
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.insert(3, "order", row("order_id", 2, "cust_ref", "C1"), null).withOrder(at(3)));
+        inbox.add(Envelope.read(4, "order", row("order_id", 3, "cust_ref", "C1"), null).withOrder(at(4)));
+        f.assembler.process(0, inbox);
+        assertThat(f.roots.batchReadKeys).containsExactly(List.of(List.of(0), List.of(1)));
+        assertArrayDocuments(f.drain(), 4);
+    }
+
+    @Test void absentArrayRootsAreNotFetchedAgainAfterPrefetch() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.feed(32, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(2);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> assertThat(keys).hasSize(16));
+        assertThat(f.roots.singleWrites).isEqualTo(32);
+        assertThat(f.drain()).hasSize(32).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).isEmpty());
+    }
+
+    @Test void unusedRootReadAheadIsDiscardedWhenOutputBlocks() throws Exception {
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.everyChange(), 1, new RecordingStore(), false, NestClock.SYSTEM);
+        f.assembler.process(1, lineRows(4));
+        TestInbox inbox = f.inbox(4, false);
+        f.assembler.process(0, inbox);
+        assertThat(inbox.size()).isEqualTo(2);
+        List<Envelope> documents = new ArrayList<>(f.drain());
+        f.assembler.tryProcess();
+        documents.addAll(f.drain());
+        TestInbox changedChild = new TestInbox();
+        changedChild.add(Envelope.read(100, "item", row("item_id", 5L, "order_id", 2, "line_no", 1, "value", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(1, changedChild);
+        assertThat(changedChild).isEmpty();
+        for (int attempt = 0; attempt < 8; attempt++) {
+            f.assembler.process(0, inbox);
+            documents.addAll(f.drain());
+        }
+        assertThat(inbox).isEmpty();
+        assertThat(documents).hasSize(4).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        Envelope changed = documents.stream().filter(e -> e.after().get("order_id").equals(2)).findFirst().orElseThrow();
+        assertThat((List<?>) changed.after().get("lines")).anySatisfy(line ->
+                assertThat(((Map<?, ?>) line).get("value")).isEqualTo(99));
+    }
+
+    @Test void wideRootStateStopsFurtherReadAheadProbesInTheDrain() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        for (int id = 0; id < 4; id++) {
+            TestInbox line = new TestInbox();
+            line.add(Envelope.read(id, "item", row("item_id", id, "order_id", id, "line_no", 1, "wide", wide), null)
+                    .withOrder(at(id + 1)));
+            f.assembler.process(1, line);
+        }
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.feed(4, false);
+        assertThat(f.roots.batchReads).isEqualTo(1);
+        // Only one complete 5 MiB assembly fits the retained 8 MiB prefetch budget.
+        assertThat(f.roots.singleReads).isEqualTo(3);
+        assertThat(f.drain()).hasSize(4).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).hasSize(1));
+    }
+
+    @Test void rootReadAheadDoesNotReportALaterMissingRowBeforeEarlierRows() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        f.roots.singleWrites = 0;
+        TestInbox inbox = f.inbox(2, false);
+        inbox.add(Envelope.read(3, "order", null, null).withOrder(at(3)));
+        assertThatThrownBy(() -> f.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class);
+        assertThat(inbox.size()).isEqualTo(1);
+        assertThat(f.roots.singleWrites).isEqualTo(2);
+        assertArrayDocuments(f.drain(), 2);
+    }
+
+    @Test void rootReadAheadPreservesTheExistingFoldingDrainLimit() throws Exception {
+        int count = DrainFolding.MAX_KEYS_HELD * 2 + 1;
+        Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.within(0), count * 2,
+                new RecordingStore(), false, NestClock.SYSTEM);
+        f.feed(count, false);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> assertThat(keys.size()).isLessThanOrEqualTo(16));
+        assertThat(f.roots.singleWrites).isEqualTo(count);
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.drain()).hasSize(count).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+    }
+
+    @Test void wideRootInputsUseOrdinaryReadsRatherThanExceedingTheInputBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        String wide = "x".repeat(5 * 1024 * 1024);
+        TestInbox inbox = new TestInbox();
+        for (int id = 0; id < 2; id++) inbox.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "wide", wide), null).withOrder(at(id + 1)));
+        f.assembler.process(0, inbox);
+        assertThat(f.roots.batchReads).isZero();
+        assertThat(f.roots.singleReads).isEqualTo(2);
+        assertThat(f.drain()).hasSize(2);
+    }
+
+    @Test void prefetchedPersistedRootsStillRejectAnOlderSourceEpoch() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        f.assembler.process(1, lineRows(2));
+        TestInbox current = new TestInbox();
+        var newer = new io.tapstate.core.event.SourceOrder(2, 1);
+        for (int id = 0; id < 2; id++) current.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "version", 42), null)
+                .withPositions(Map.of("order", new ChainPosition(newer, "newest-" + id))));
+        f.assembler.process(0, current);
+        assertThat(f.drain()).hasSize(2).allSatisfy(document -> {
+            int id = (Integer) document.after().get("order_id");
+            assertThat(document.positions()).containsEntry("order", new ChainPosition(newer, "newest-" + id));
+        });
+        f.roots.singleReads = 0;
+        f.roots.batchReads = 0;
+        f.feed(2, false);
+        assertThat(f.roots.batchReads).isEqualTo(1);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.drain()).hasSize(2).allSatisfy(document -> {
+            assertThat(document.after()).containsEntry("version", 42);
+            // Already delivered positions are not reintroduced by an older replay.
+            assertThat(document.positions()).doesNotContainKey("order");
+        });
+    }
+
     @Test void partialChildWaveFailureKeepsInputsAndReplaysEveryLine() throws Exception {
         var durable = new RecordingStore(); durable.failuresLeft = 1;
         Fixture failed = arrayFixture(durable, false);
@@ -506,6 +694,8 @@ class RootStateWriteBatchingTest {
     private static final class RecordingStore implements NestStore<RootAssembly> {
         final Map<Object, byte[]> durable = new LinkedHashMap<>();
         final List<Integer> batches = new ArrayList<>();
+        final List<List<Object>> batchReadKeys = new ArrayList<>();
+        boolean failReadBatch;
         int singleWrites;
         int singleReads;
         int batchReads;
@@ -514,6 +704,8 @@ class RootStateWriteBatchingTest {
         @Override public RootAssembly load(Object key) { singleReads++; return read(key); }
         @Override public Map<Object, RootAssembly> loadAll(java.util.Collection<Object> keys) {
             batchReads++;
+            batchReadKeys.add(new ArrayList<>(keys));
+            if (failReadBatch) throw new IllegalStateException("state read batch failed");
             Map<Object, RootAssembly> result = new LinkedHashMap<>();
             for (Object key : keys) { RootAssembly value = read(key); if (value != null) result.put(key, value); }
             return result;
