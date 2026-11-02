@@ -73,7 +73,8 @@ public enum IoError implements TapstateErrorCode {
      * consumer whose retained state must be cleared before a full resync or an explicitly accepted new
      * incremental baseline.
      */
-    SINK_WRITER_PROGRESS_AMBIGUOUS("io.sink-writer-progress-ambiguous", Set.of("pipeline")),
+    SINK_WRITER_PROGRESS_AMBIGUOUS(
+            "io.sink-writer-progress-ambiguous", Set.of(Parameters.PIPELINE)),
 
     /** A note command lost its captured key revision and must not overwrite the current value. */
     NOTE_WRITE_CONFLICT("io.note-write-conflict", Set.of()),
@@ -91,7 +92,8 @@ public enum IoError implements TapstateErrorCode {
     PIPELINE_INTENT_FENCED("io.pipeline-intent-fenced", Set.of()),
 
     /** Issued first-state authority has incomplete or inconsistent CACHE history; no counters may be recreated. */
-    PIPELINE_STATE_REBUILD_REQUIRED("io.pipeline-state-rebuild-required", Set.of("pipeline")),
+    PIPELINE_STATE_REBUILD_REQUIRED(
+            "io.pipeline-state-rebuild-required", Set.of(Parameters.PIPELINE)),
 
     /** Missing canonical capture history requires explicitly confirmed Cluster cache recovery. */
     CAPTURE_STATE_REBUILD_REQUIRED("io.capture-state-rebuild-required", Set.of("capture")),
@@ -112,10 +114,11 @@ public enum IoError implements TapstateErrorCode {
     SRS_MODEL_UNAVAILABLE("io.srs-model-unavailable", Set.of("chain", "table", "version")),
 
     /** Required retained models cannot safely fit in the existing chain history budget. */
-    SRS_MODEL_CAPACITY("io.srs-model-capacity", Set.of("chain", "bytes")),
+    SRS_MODEL_CAPACITY("io.srs-model-capacity", Set.of("chain", Parameters.BYTES)),
 
     /** A pending full baseline exceeds its bounded control-record budget. */
-    SRS_FULL_PREPARATION_CAPACITY("io.srs-full-preparation-capacity", Set.of("chain", "bytes")),
+    SRS_FULL_PREPARATION_CAPACITY(
+            "io.srs-full-preparation-capacity", Set.of("chain", Parameters.BYTES)),
 
     /** The original explicit full preparation or its exact baseline cannot be proved. */
     SRS_FULL_PREPARATION_UNPROVEN("io.srs-full-preparation-unproven", Set.of("chain")),
@@ -136,16 +139,18 @@ public enum IoError implements TapstateErrorCode {
     NOTE_SCOPE_UNAVAILABLE("io.note-scope-unavailable", Set.of()),
 
     /** Legacy pipeline-level progress cannot establish this source node's confirmed recovery cursor. */
-    SRS_PROGRESS_UNPROVEN("io.srs-progress-unproven", Set.of("pipeline")),
+    SRS_PROGRESS_UNPROVEN("io.srs-progress-unproven", Set.of(Parameters.PIPELINE)),
 
     /** The private direct source cannot prove the retained progress and ordered pending batches. */
     DIRECT_CHANNEL_UNAVAILABLE("io.direct-channel-unavailable", Set.of("channel")),
 
     /** The requested private source/read contract cannot reuse the prepared physical state. */
-    PIPELINE_CAPTURE_IDENTITY_UNPROVEN("io.pipeline-capture-identity-unproven", Set.of("pipeline")),
+    PIPELINE_CAPTURE_IDENTITY_UNPROVEN(
+            "io.pipeline-capture-identity-unproven", Set.of(Parameters.PIPELINE)),
 
     /** Added tables cannot join an already prepared Pipeline while its prior state is retained. */
-    PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED("io.pipeline-table-selection-rebuild-required", Set.of("pipeline", "tables")),
+    PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED(
+            "io.pipeline-table-selection-rebuild-required", Set.of(Parameters.PIPELINE, "tables")),
 
     /** A configuration import cannot satisfy its original scope, input or publication conditions. */
     CONFIGURATION_IMPORT_REFUSED("io.configuration-import-refused", Set.of("reason")),
@@ -164,8 +169,20 @@ public enum IoError implements TapstateErrorCode {
      */
     DOCUMENT_TOO_LARGE("io.document-too-large", Set.of("id")),
 
+    /** Original prepared target bodies must fit their row and complete-scope budgets. */
+    SINK_MODEL_CAPACITY(
+            "io.sink-model-capacity",
+            Set.of(Parameters.PIPELINE, "target", Parameters.BYTES, "limit")),
+
     /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
     CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt"));
+
+    private static final class Parameters {
+        private static final String PIPELINE = "pipeline";
+        private static final String BYTES = "bytes";
+
+        private Parameters() {}
+    }
 
     private final String code;
     private final Set<String> placeholders;
