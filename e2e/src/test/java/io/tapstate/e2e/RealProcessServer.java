@@ -874,6 +874,13 @@ final class RealProcessServer implements ServerHandle {
 
     private static Path workingDirectory() {
         try {
+            // An explicit evidence root avoids a JVM default cached before test properties are applied.
+            String configured = System.getProperty("tapstate.e2e.process-log-root");
+            if (configured != null && !configured.isBlank()) {
+                Path root = Path.of(configured).toAbsolutePath().normalize();
+                Files.createDirectories(root);
+                return Files.createTempDirectory(root, "tapstate-e2e-server");
+            }
             // Its own directory, so the log the server writes under its working directory is this run's.
             return Files.createTempDirectory("tapstate-e2e-server");
         } catch (IOException e) {

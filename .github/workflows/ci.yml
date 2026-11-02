@@ -165,6 +165,7 @@ jobs:
           MAVEN_ARGS: >-
             -Dapi.version=1.44
             -Dtapstate.it.jvmArgs=-Djava.io.tmpdir=${{ runner.temp }}/test-tmp
+            -Dtapstate.e2e.process-log-root=${{ runner.temp }}/recovery-process-logs
           SHARD: ${{ matrix.shard }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -245,7 +246,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: recovery-refusal-process-logs
-          path: ${{ runner.temp }}/tapstate-java-tmp/**/server.out
+          path: ${{ runner.temp }}/recovery-process-logs/**/server.out
           if-no-files-found: error
           retention-days: 3
 
