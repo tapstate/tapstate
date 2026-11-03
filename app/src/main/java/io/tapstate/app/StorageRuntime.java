@@ -22,6 +22,8 @@ final class StorageRuntime implements AutoCloseable {
         default void awaitAvailability() {}
         /** Called after original first-setup readiness; hands off without waiting for the probe. */
         default void afterInitialReady() {}
+        /** Only the main application close event invokes this before invalidating original runtime proofs. */
+        default void beforeOrderlyClose() {}
         @Override void close();
     }
     private final MongoConfigurationDomain configuration;

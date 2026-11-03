@@ -14,6 +14,7 @@ class ControlOperationsTest {
     void registersExactlyTheL1OperationSet() {
         assertThat(registry.ids())
                 .containsExactlyInAnyOrder(
+                        "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
                         "storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status",
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
@@ -225,8 +226,10 @@ class ControlOperationsTest {
         // dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(85);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id())).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
+        assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
+                assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
         assertThat(registry.resolve("source.reveal-config").exposure()).isEmpty();
         assertThat(registry.resolve("cluster.context").exposure())
                 .containsEntry(Frontend.REST, Maturity.CURRENT).doesNotContainKey(Frontend.CLI);
@@ -273,6 +276,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "alert.rule-preview", "alert.route-preview", "alert.catalog", "alert.resources", "alert.center", "alert.detail", "alert.deliveries", "alert.health", "alert.configuration.list", "alert.configuration.save", "alert.configuration.retire", "alert.preview", "alert.test", "alert.test-result", "alert.retry",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
                         "sample-source.list", "sample-source.install", "state-store.connect",

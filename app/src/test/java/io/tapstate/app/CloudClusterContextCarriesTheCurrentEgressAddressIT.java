@@ -32,7 +32,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -92,6 +92,9 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .doesNotContain(JWT);
                 String cookie = setCookie.substring(0, setCookie.indexOf(';'));
 
+                // Managed monitoring can resolve the same machine scope before the browser context request.
+                context.getBean(CloudSdkBridge.class).alertScope();
+
                 HttpResponse<String> response = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
                         .timeout(Duration.ofSeconds(10)).header("Cookie", cookie).GET().build(),
                         HttpResponse.BodyHandlers.ofString());
@@ -113,7 +116,20 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
-                // The production provider retains recent observations; advance beyond its stale budget.
+                // Fail the provider explicitly after the successful context lookup, independent of
+                // machine-scope reads made by managed monitoring during startup.
+                context.getBean(AddressAvailability.class).available.set(false);
+                context.getBean(ContextClock.class).advance(CachedCloudClusterEgressAddressProvider.REFRESH_INTERVAL.plusSeconds(1));
+                HttpResponse<String> retainedResponse = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", cookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(retainedResponse.statusCode()).isEqualTo(200);
+                Map<String, Object> retainedBody = new HashMap<>();
+                ((Map<?, ?>) JsonReader.parse(retainedResponse.body())).forEach((key, value) -> retainedBody.put((String) key, value));
+                assertThat(retainedBody)
+                        .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
+                        .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus());
+                // The same failed provider must stop supplying the retained address after its stale budget.
                 context.getBean(ContextClock.class).advance(CachedCloudClusterEgressAddressProvider.MAX_STALE_AGE.plusSeconds(1));
                 HttpResponse<String> noAddressLogin = client.send(HttpRequest.newBuilder(
                                 base.resolve("/auth/exchange?code=controlled-code-without-egress"))
@@ -147,8 +163,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
     static class ControlledCloudAuthentication {
         @Bean
         @Primary
-        CloudSdkBridge controlledAuthentication(CloudRuntimeSettings settings, ContextClock clock) {
-            AtomicInteger addressReads = new AtomicInteger();
+        CloudSdkBridge controlledAuthentication(CloudRuntimeSettings settings, ContextClock clock, AddressAvailability addresses) {
             return new CloudSdkBridge(settings, new CloudSdkBridge.SdkRuntime() {
                 @Override public CloudSdkBridge.ExchangeResult exchange(String code) {
                     var selected = switch (code) {
@@ -167,7 +182,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                             clock.instant().plusSeconds(300), CLOUD_URL, "127.0.0.1", List.of("workload:write"));
                 }
                 @Override public ClusterEgressAddress currentEgressAddress() {
-                    if (addressReads.getAndIncrement() == 0)
+                    if (addresses.available.get())
                         return new ClusterEgressAddress(ORGANIZATION, CLUSTER, CURRENT_ADDRESS.ec2PublicIp(),
                                 CURRENT_ADDRESS.egressAddressStatus());
                     throw new CloudSdkBridge.ProviderFailure();
@@ -182,6 +197,11 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
         }
 
         @Bean @Primary ContextClock contextClock() { return new ContextClock(); }
+        @Bean AddressAvailability addressAvailability() { return new AddressAvailability(); }
+    }
+
+    static final class AddressAvailability {
+        final AtomicBoolean available = new AtomicBoolean(true);
     }
 
     static final class ContextClock extends Clock {

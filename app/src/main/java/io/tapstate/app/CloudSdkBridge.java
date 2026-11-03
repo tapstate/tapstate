@@ -158,6 +158,16 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         }
     }
 
+    /** Machine-token-authenticated Cluster context, independent of every user session and display label. */
+    Optional<io.tapstate.core.alerting.AlarmKey.Scope> alertScope() {
+        try {
+            ClusterEgressAddress original = sdk.currentEgressAddress();
+            if (original == null || !settings.clusterId().equals(original.clusterId())
+                    || !text(original.organizationId()) || DEPLOYMENT_ORGANIZATION.equals(original.organizationId())) return Optional.empty();
+            return Optional.of(new io.tapstate.core.alerting.AlarmKey.Scope(original.organizationId(), original.clusterId()));
+        } catch (ProviderFailure unavailable) { return Optional.empty(); }
+    }
+
     private boolean deploymentMatches(CloudSessionIdentity deployment) {
         return deployment != null
                 && settings.baseUrl().toString().equals(deployment.issuer())

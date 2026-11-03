@@ -59,7 +59,7 @@ class SampledTargetPreparationTest {
         when(store.resolveModels(anyList(),eq(AUTHORING))).thenAnswer(call -> call.getArgument(0));
         var notes=mock(RequiredNoteStore.class);ConnectorProvisioner connectors=id -> {throw new AssertionError("not a plugin test");};
         var run=mock(ConfiguredSinkRun.class);when(run.node()).thenReturn(NODE);when(run.purpose()).thenReturn(PipelineNode.Purpose.SYNC);
-        when(run.assessTargets(any(),anyMap(),eq(notes),eq(connectors),any())).thenAnswer(call -> {
+        when(run.assessTargets(any(),anyMap(),eq(notes),eq(connectors),any(),same(io.tapstate.spi.capture.SourceOperationObserver.NONE))).thenAnswer(call -> {
             Map<String,TargetTable> targets=call.getArgument(1);assertThat(targets).containsEntry("rows",logical);
             return Map.of("rows",new TargetIdentityPlan(TargetIdentityPlan.AUTOMATIC,"generated-target-identity",physical,"_id","source_id",List.of("source_id","items.id"),false,true));
         });
@@ -69,7 +69,7 @@ class SampledTargetPreparationTest {
             var bound=(PdkSinkWriterFactory)new StoreBackedDagSource.PdkSinkWriterBinder(notes,connectors).scoped(factory,ORIGINAL,plan,() -> {});
             assertThat(bound.targets()).containsEntry("rows",logical);assertThat(plan.models).containsExactly(original);
             var order=inOrder(store,run);order.verify(store).retainedModels(anyCollection(),any(),anyBoolean(),eq(AUTHORING));
-            order.verify(run).assessTargets(any(),anyMap(),eq(notes),eq(connectors),any());
+            order.verify(run).assessTargets(any(),anyMap(),eq(notes),eq(connectors),any(),same(io.tapstate.spi.capture.SourceOperationObserver.NONE));
         }
     }
 }

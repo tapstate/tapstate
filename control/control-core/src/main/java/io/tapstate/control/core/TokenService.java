@@ -88,6 +88,21 @@ public final class TokenService {
      * unauthenticatable token is simply absent, mirroring {@link TokenSigner#verify}.
      */
     public Optional<VerifiedToken> authenticate(String presented) {
+        return authenticateBound(presented).map(Authenticated::identity);
+    }
+
+    public record Authenticated(VerifiedToken identity, String configurationBinding) {
+        public Authenticated {
+            Objects.requireNonNull(identity, "identity");
+            if (configurationBinding == null || !configurationBinding.matches("[a-f0-9]{64}")) {
+                throw new IllegalArgumentException("authenticated token record binding required");
+            }
+        }
+        @Override public String toString() { return "AuthenticatedMachineToken[verified]"; }
+    }
+
+    /** Identity and record binding come from the same verified read, never a second lookup by id. */
+    public Optional<Authenticated> authenticateBound(String presented) {
         if (!isMachineToken(presented)) {
             return Optional.empty();
         }
@@ -107,7 +122,7 @@ public final class TokenService {
         if (record.revoked() || !secrets.matches(secret, record.secretHash())) {
             return Optional.empty();
         }
-        return Optional.of(new VerifiedToken(record.tokenId(), scopeOf(record.scope())));
+        return Optional.of(new Authenticated(new VerifiedToken(record.tokenId(), scopeOf(record.scope())), record.authenticationBinding()));
     }
 
     /** All issued tokens as safe, secret-free descriptors, for the {@code token.list} operation. */

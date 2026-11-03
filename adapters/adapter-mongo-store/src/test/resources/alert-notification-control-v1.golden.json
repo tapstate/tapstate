@@ -1,0 +1,16 @@
+{
+  "quota": {
+    "_id": {"authorityId": "org-a", "clusterId": "cluster-a", "minute": "2026-10-27T00:00:00Z"},
+    "formatVersion": 1,
+    "recordRevision": {"$numberLong": "7"},
+    "cleanupAt": {"$date": "2026-10-27T01:01:00Z"},
+    "body": {"actors": [{"actor": "actor-a", "accepted": 1}, {"actor": "actor-b", "accepted": 2}]}
+  },
+  "limit": {
+    "_id": {"authorityId": "org-a", "clusterId": "cluster-a", "channelType": "webhook", "semanticTargetId": "target-a", "authenticationIdentity": "auth-a"},
+    "formatVersion": 1,
+    "recordRevision": {"$numberLong": "3"},
+    "cleanupAt": {"$date": "2026-10-27T01:00:01.001Z"},
+    "body": {"notBefore": "2026-10-27T00:00:01.000000001Z"}
+  }
+}
