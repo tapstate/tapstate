@@ -137,7 +137,7 @@ class JoinViewTargetTest {
     private static StoreBackedDagSource.SinkWriterBinder discarding() {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;

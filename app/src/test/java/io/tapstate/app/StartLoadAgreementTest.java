@@ -293,13 +293,13 @@ class StartLoadAgreementTest {
         Map<String, TargetTable> targets;
 
         @Override
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
             throw new AssertionError("the complete sink policy must reach the binder");
         }
 
         @Override
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node,
                 OnFullLoad policy, boolean fullLoad) {
             this.fullLoad = fullLoad;
