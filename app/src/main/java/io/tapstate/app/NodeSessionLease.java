@@ -170,8 +170,6 @@ final class NodeSessionLease implements AutoCloseable {
     }
 
     /** A non-blocking local predicate; an observed expiry is irreversible even if shutdown blocks. */
-    boolean isCurrent() { return active(); }
-
     boolean active() {
         if (closed.get()) return false;
         if (nanoTime.getAsLong() - provenUntil >= 0) {
@@ -182,6 +180,9 @@ final class NodeSessionLease implements AutoCloseable {
         }
         return !closed.get();
     }
+
+    /** The startup listener shares the same irreversible local proof as runtime admission. */
+    boolean isCurrent() { return active(); }
 
     private void loseALapsedSession() {
         if (nanoTime.getAsLong() - provenUntil >= 0) {

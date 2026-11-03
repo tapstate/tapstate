@@ -32,6 +32,9 @@ class StorageControlController {
     @Verb("storage.setup.commit")
     @PostMapping("/storage/setup/commit")
     ResponseEntity<Map<String,Object>> storage_setup_commit(HttpServletRequest request) throws IOException { return invoke("storage.setup.commit", request); }
+    @Verb("storage.setup.activate")
+    @PostMapping("/storage/setup/activate")
+    ResponseEntity<Map<String,Object>> storage_setup_activate(HttpServletRequest request) throws IOException { return invoke("storage.setup.activate", request); }
     @Verb("storage.setup.status")
     @PostMapping("/storage/setup/status")
     ResponseEntity<Map<String,Object>> storage_setup_status(HttpServletRequest request) throws IOException { return invoke("storage.setup.status", request); }

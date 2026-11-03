@@ -38,6 +38,13 @@ class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
+    @Test void defaultSourceTimeoutAndBusyAreExplicitRetryDiagnostics() {
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.test-timeout"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.instances-busy"))).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        var busy = new TapstateException(new StubCode("connector.instances-busy"), Map.of("connector", "mongodb", "timeout", "0s"), null);
+        assertThat(handler.handle(new UnavailableCodedException(busy)).getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
     @Test void dispatcherQuotaSanitizationReachesTheHttpResponseWithoutPrivateMetadata() {
         var scope = new io.tapstate.spi.store.StorageSetupScope("cluster", "installation", "setup", 1);
         var caller = io.tapstate.control.core.StorageControlAccess.ordinary(io.tapstate.spi.store.StorageBinding.Mode.OP, scope,

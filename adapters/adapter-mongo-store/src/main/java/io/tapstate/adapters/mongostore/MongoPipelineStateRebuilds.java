@@ -63,7 +63,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             long fence = mapping.getLong("noteWriteFence");
             if (fence >= Long.MAX_VALUE - 2 || ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database)) >= Long.MAX_VALUE - 2) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", state.pipelineId()).append("stateGeneration", state.stateGeneration()).append("phase", "ACTIVE")
                             .append("noteWriteFence", fence).append("cachePreparation", mapping.get("cachePreparation")),
@@ -124,7 +124,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var result = new PipelinePreparation(target.pipelineId(), target.stateGeneration(), PipelinePreparation.Phase.COMPLETE,
                     target, pending.id, receipt.issuerNode());
             long writeFence = mapping.getLong("noteWriteFence"); if (writeFence >= Long.MAX_VALUE - 1) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             long intentRevision = intents.completeRebuild(session, pending.request.intent(), target);
             var annex = encode(pending).append("result", new Document("phase", "COMPLETE").append("checkpointEpoch", receipt.checkpointEpoch()).append("intentRevision", intentRevision));
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,

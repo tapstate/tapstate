@@ -53,7 +53,29 @@ class SingleNodeOwnershipWiringTest {
         }
     }
 
-    private static Fixture fixture() {
+    @Test void anUnboundNodeSessionCannotAcquireCaptureOrPipelineClaims() {
+        var f = fixture(false);
+        var claims = new ClusterWorkloadClaims(f.claims(), f.gate());
+        assertThat(CONFIGURATION.captureOwnership(f.member(), f.properties(), f.gate(), claims)
+                .acquire(new CaptureId("capture-a")).acquired()).isFalse();
+        assertThat(CONFIGURATION.pipelineActuationOwnership(f.member(), f.properties(), f.gate(), claims)
+                .permit("orders").granted()).isFalse();
+        assertThat(f.claims().read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a"))).isEmpty();
+        assertThat(f.claims().read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders"))).isEmpty();
+    }
+
+    @Test void aReleasedOriginalNodeSessionCannotAdmitAnotherCapture() {
+        var f = fixture();
+        var original = (io.tapstate.spi.store.WorkloadClaim) f.member().getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
+        assertThat(f.claims().release(original)).isTrue();
+        assertThat(CONFIGURATION.captureOwnership(f.member(), f.properties(), f.gate(), new ClusterWorkloadClaims(f.claims(), f.gate()))
+                .acquire(new CaptureId("capture-a")).acquired()).isFalse();
+        assertThat(f.claims().read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.CAPTURE, "capture-a"))).isEmpty();
+    }
+
+    private static Fixture fixture() { return fixture(true); }
+
+    private static Fixture fixture(boolean bound) {
         var properties = new ClusterProperties(); properties.setId("cluster-a"); properties.setNodeId(OWNER.nodeId());
         var claims = new InMemoryWorkloadClaimStore();
         var node = claims.acquire(new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, OWNER.nodeId()),
@@ -62,6 +84,8 @@ class SingleNodeOwnershipWiringTest {
         context.put(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY, node); when(member.getUserContext()).thenReturn(context);
         var lifecycle = mock(com.hazelcast.core.LifecycleService.class); when(lifecycle.isRunning()).thenReturn(true); when(member.getLifecycleService()).thenReturn(lifecycle);
         var gate = new ClusterMembershipGate(properties); gate.install(new ClusterMembership("cluster-a", 1, Set.of(OWNER.nodeId())));
+        if (bound) gate.observeNodeSession(() -> claims.read(node.key())
+                .filter(reading -> reading.leased() && reading.claim().equals(node)).isPresent());
         gate.canCommit(Set.of(OWNER.nodeId()));
         return new Fixture(properties, claims, member, gate);
     }

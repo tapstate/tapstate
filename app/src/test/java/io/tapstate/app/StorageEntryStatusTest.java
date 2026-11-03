@@ -25,14 +25,15 @@ class StorageEntryStatusTest {
         when(runtime.requireConfiguration()).thenReturn(configuration);
         when(configuration.setupStates()).thenReturn(states);
         when(installations.getIfAvailable()).thenReturn(installation);
+        when(installation.firstAdministratorReady()).thenAnswer(ignored -> runtime.businessStarted());
         return new StorageRootConfiguration().storageEntryStatus(root, installations);
     }
-    @Test void completedSetupRequiresRestartEvenWhileTheRootWaitsInSetupPhase() {
+    @Test void completedSetupWithoutALiveRuntimeDoesNotRequestRestartOrOpenFirstAdmin() {
         var reader = reader();
         when(root.phase()).thenReturn(StorageRoot.Phase.SETUP_REQUIRED);
         when(states.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.COMPLETE, 1));
         when(installation.normalStartupAllowed()).thenReturn(false);
-        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.RESTART_REQUIRED);
+        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
         verify(runtime, never()).loadBound();
     }
     @Test void unreadableRetainedSetupCannotBeAdvertisedAsAnEmptyInstallation() {
@@ -67,7 +68,7 @@ class StorageEntryStatusTest {
         assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
         when(files.stage()).thenReturn(new InstallationFiles.Stage(scope, InstallationFiles.Handoff.RESTART_REQUIRED,
                 "a".repeat(64), "http://127.0.0.1:8081"));
-        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.UNAVAILABLE);
+        assertThat(reader.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
         verify(runtime, never()).loadBound();
     }
 }

@@ -149,6 +149,7 @@ final class StoreBackedDagSource implements DagSource {
     }
     private final CapturedStartGuard capturedStartGuard;
     private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
+    private final java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts;
 
     StoreBackedDagSource(StorePort storePort) {
         this(storePort, assembledSinkWriterBinder());
@@ -253,7 +254,7 @@ final class StoreBackedDagSource implements DagSource {
         if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
-                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads);
+                requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
         captured.validateStart(pipelineId);
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
@@ -428,6 +429,16 @@ final class StoreBackedDagSource implements DagSource {
             boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
             io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
             java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard) {
+        this(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,requireMarkedStore,members,
+                parallelismBudget,modelRecords,modelInputs,boundedLoads,capturedStartGuard,(fence,ack) -> ack);
+    }
+    private StoreBackedDagSource(StorePort storePort,SinkWriterBinder sinkWriterBinder,NestSettings nestSettings,
+            StoreReachability storeReachability,SourcePlacement sourcePlacement,ArtifactStore artifactStore,
+            boolean requireMarkedStore,Supplier<List<String>> members,ParallelismBudget parallelismBudget,
+            io.tapstate.spi.store.DerivedSchemaStore modelRecords,Function<SourceResource,SourceModel> modelInputs,
+            java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads,CapturedStartGuard capturedStartGuard,
+            java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> initialReceipts) {
+        this.initialReceipts=Objects.requireNonNull(initialReceipts);
         this.capturedStartGuard=Objects.requireNonNull(capturedStartGuard);
         this.boundedLoads=Objects.requireNonNull(boundedLoads);
         this.modelInputs = Objects.requireNonNull(modelInputs,"modelInputs");
@@ -445,6 +456,10 @@ final class StoreBackedDagSource implements DagSource {
         this.requireMarkedStore = requireMarkedStore;
         this.members = Objects.requireNonNull(members, "members");
         this.parallelismBudget = Objects.requireNonNull(parallelismBudget, "parallelismBudget");
+    }
+    StoreBackedDagSource observedInitialLoads(java.util.function.BiFunction<ExecutionFence,SinkAckFactory,SinkAckFactory> receipts) {
+        return new StoreBackedDagSource(storePort,sinkWriterBinder,nestSettings,storeReachability,sourcePlacement,artifactStore,
+                requireMarkedStore,members,parallelismBudget,modelRecords,modelInputs,boundedLoads,capturedStartGuard,Objects.requireNonNull(receipts));
     }
 
     /** A read-only source compiled over candidate resources for one isolated preview. */
@@ -840,14 +855,16 @@ final class StoreBackedDagSource implements DagSource {
                                             scopedDirect,
                                             targetPreparations),
                                     FencedSinkAckFactory.heldTo(
-                                            topologySinkAck(
-                                                    pipeline,
-                                                    pipelineId,
+                                            initialReceipts.apply(
                                                     fence,
-                                                    scopedSources,
-                                                    scopedDirect,
-                                                    runSources,
-                                                    capturedSources),
+                                                    topologySinkAck(
+                                                            pipeline,
+                                                            pipelineId,
+                                                            fence,
+                                                            scopedSources,
+                                                            scopedDirect,
+                                                            runSources,
+                                                            capturedSources)),
                                             fence),
                                     frontier,
                                     shape,

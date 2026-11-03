@@ -146,6 +146,16 @@ final class PdkConnector implements AutoCloseable {
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false);
+    }
+
+    static PdkConnector openDefaultTest(String connectorId, ConnectorRef ref, Map<String,Object> settings) {
+        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true);
+    }
+
+    private static PdkConnector open(String connectorId, ConnectorRef ref, Map<String,Object> settings,
+            PipelineNode node, KeyedStateStore stateStore, SharedNotes notes, ConnectorNoteScopes noteScopes,
+            PipelineNode.Purpose purpose, boolean strictDefaultTest) {
         java.util.Objects.requireNonNull(purpose, "purpose");
         if (notes != null && purpose != PipelineNode.Purpose.CAPTURE) {
             throw new IllegalArgumentException("shared notes require capture purpose");
@@ -206,6 +216,10 @@ final class PdkConnector implements AutoCloseable {
             PdkJsonProvider.prepareRuntime();
             loader = ConnectorClassLoader.shared(ref.classpath());
         } catch (RuntimeException | LinkageError e) {
+            if (strictDefaultTest) {
+                if (e instanceof RuntimeException runtime) throw runtime;
+                throw (LinkageError)e;
+            }
             throw loadFailed(connectorId, e);
         }
         boolean opened = false;
@@ -214,7 +228,7 @@ final class PdkConnector implements AutoCloseable {
             material = ConnectorTrustMaterial.open(connectorId, effectiveSettings);
             effectiveSettings = material.settings();
             driveGuard.run();
-            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className());
+            Class<? extends TapConnector> connectorClass = loadConnectorClass(connectorId, loader, ref.className(), strictDefaultTest);
             ClassLoader restore = Thread.currentThread().getContextClassLoader();
             TapConnector connector;
             ConnectorFunctions functions = new ConnectorFunctions();
@@ -231,6 +245,11 @@ final class PdkConnector implements AutoCloseable {
                 connector = connectorClass.getDeclaredConstructor().newInstance();
                 connector.registerCapabilities(functions, codecs);
             } catch (ReflectiveOperationException | RuntimeException | LinkageError e) {
+                if (strictDefaultTest) {
+                    Throwable original = e instanceof java.lang.reflect.InvocationTargetException invocation ? invocation.getCause() : e;
+                    if (original instanceof RuntimeException runtime) throw runtime;
+                    if (original instanceof Error error) throw error;
+                }
                 // A connector that will not construct, register, or link (e.g. a missing bundled
                 // dependency surfacing as NoClassDefFoundError, or a throwing static initializer) is a
                 // diagnosable load failure, not a bare crash. A VM error (out of memory) is not a
@@ -333,13 +352,15 @@ final class PdkConnector implements AutoCloseable {
     }
 
     private static Class<? extends TapConnector> loadConnectorClass(
-            String connectorId, ConnectorClassLoader loader, String className) {
+            String connectorId, ConnectorClassLoader loader, String className, boolean strictDefaultTest) {
         try {
             return loader.loadConnectorClass(className);
         } catch (ClassNotFoundException | IllegalStateException e) {
+            if (strictDefaultTest && e instanceof IllegalStateException programmer) throw programmer;
             throw new TapstateException(ConnectorError.CLASS_NOT_FOUND,
                     Map.of("connector", connectorId, "class", className), e);
         } catch (LinkageError e) {
+            if (strictDefaultTest) throw e;
             // The class is present but does not link (a missing referenced type): a load failure, not
             // an absent class.
             throw loadFailed(connectorId, e);
@@ -557,6 +578,12 @@ final class PdkConnector implements AutoCloseable {
         closeNotes.run();
         closeQuietly(loader);
         trust.close();
+    }
+
+    void closeDefaultTest() {
+        closeNotes.run();
+        try { loader.close(); }
+        finally { trust.close(); }
     }
 
     private static void closeQuietly(ConnectorClassLoader loader) {

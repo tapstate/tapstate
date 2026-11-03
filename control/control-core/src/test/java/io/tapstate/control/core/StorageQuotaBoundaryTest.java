@@ -94,7 +94,7 @@ class StorageQuotaBoundaryTest {
         var candidate = StorageSetupServiceTest.CANDIDATE;
         return Map.of("operationId", StorageSetupServiceTest.SCOPE.operationId(), "generation", 1,
                 "candidate", Map.of("configuration", connection(candidate.configuration()), "cache", connection(candidate.cache()), "master", connection(candidate.master())),
-                "testStamps", Map.of("CONFIG", stamps.get(StorageSetupService.Layer.CONFIG), "CACHE", stamps.get(StorageSetupService.Layer.CACHE), "MASTER", stamps.get(StorageSetupService.Layer.MASTER)));
+                "testStamps", Map.of("CACHE", stamps.get(StorageSetupService.Layer.CACHE)));
     }
     private static Map<String,Object> connection(StorageBinding.Connection value) {
         return Map.of("kind", value.kind().name(), "uri", value.uri(), "database", value.database());

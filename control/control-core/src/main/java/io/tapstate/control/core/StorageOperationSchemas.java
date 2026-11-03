@@ -10,6 +10,7 @@ final class StorageOperationSchemas {
     static final Map<String,String> STEMS = Map.ofEntries(
             Map.entry("storage.status", "StorageStatus"), Map.entry("storage.test", "StorageTest"),
             Map.entry("storage.setup.commit", "StorageSetupCommit"), Map.entry("storage.setup.status", "StorageSetupStatus"),
+            Map.entry("storage.setup.activate", "StorageSetupActivate"),
             Map.entry("storage.recovery.plan", "StorageRecoveryPlan"), Map.entry("storage.recovery.confirm", "StorageRecoveryConfirm"),
             Map.entry("storage.recovery.status", "StorageRecoveryStatus"),
             Map.entry("configuration.export", "ConfigurationExport"),
@@ -21,17 +22,19 @@ final class StorageOperationSchemas {
                 "uri", text(), "database", text(), "caPem", text()));
         var candidate = object(List.of("cache", "master"), Map.of(
                 "configuration", connection, "cache", connection, "master", connection));
-        var stamps = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", text(), "CACHE", text(), "MASTER", text()));
+        var stamps = object(List.of("CACHE"), Map.of("CACHE", text()));
         var transfer = Map.<String,Object>of("type", "string", "minLength", 1,
                 "description", "Opaque versioned encrypted transfer package; plaintext definitions are not accepted.");
         var transferKey = Map.<String,Object>of("type", "string", "minLength", 43, "maxLength", 43, "pattern", "^[A-Za-z0-9_-]{43}$",
                 "description", "Caller-supplied unpadded base64url encoding of an independent 32-byte key; never stored or returned.");
         defs.put("StorageStatusRequest", object(List.of(), Map.of()));
         defs.put("StorageTestRequest", object(List.of("operationId", "generation", "candidate", "layer"), Map.of(
-                "operationId", text(), "generation", positive(), "candidate", candidate, "layer", choice("CONFIG", "CACHE", "MASTER"))));
+                "operationId", text(), "generation", positive(), "candidate", candidate, "layer", choice("CACHE"))));
         defs.put("StorageSetupCommitRequest", object(List.of("operationId", "generation", "candidate", "testStamps"), Map.of(
                 "operationId", text(), "generation", positive(), "candidate", candidate, "testStamps", stamps)));
         defs.put("StorageSetupStatusRequest", operation());
+        defs.put("StorageSetupActivateRequest", object(List.of("operationId", "generation", "bindingVersion"),
+                Map.of("operationId", text(), "generation", positive(), "bindingVersion", positive())));
         defs.put("StorageRecoveryPlanRequest", object(List.of("scope", "pipelineIds"), Map.of(
                 "scope", choice("PIPELINE", "CLUSTER"), "pipelineIds", Map.of("type", "array", "items", text(), "maxItems", 64), "operationId", text(), "previousOperationId", text())));
         defs.put("StorageRecoveryConfirmRequest", object(List.of("operationId", "planHash", "controlRevision", "confirmed"), Map.of(
@@ -50,15 +53,16 @@ final class StorageOperationSchemas {
         defs.put("ConfigurationImportStatusRequest", object(List.of("importId"), Map.of("importId", text())));
         var setupStatus = object(List.of("mode", "clusterId", "operationId", "generation", "setupPhase", "bindingVersion"), Map.of(
                 "mode", choice("CLOUD", "OP"), "clusterId", text(), "operationId", text(), "generation", positive(),
-                "setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"), "bindingVersion", Map.of("type", "integer", "minimum", 0)));
+                "setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"), "bindingVersion", Map.of("type", "integer", "minimum", 0), "defaultSourceId", Map.of("anyOf", List.of(text(), Map.of("type", "null")))));
         defs.put("StorageSetupCommitResult", setupStatus); defs.put("StorageSetupStatusResult", setupStatus);
+        defs.put("StorageSetupActivateResult", setupStatus);
         defs.put("StorageTestResult", object(List.of("layer", "testStamp", "expiresAt", "checks"), Map.of(
-                "layer", choice("CONFIG", "CACHE", "MASTER"), "testStamp", text(), "expiresAt", text(),
+                "layer", choice("CACHE"), "testStamp", text(), "expiresAt", text(),
                 "checks", Map.of("type", "array", "items", text()))));
         var health = object(List.of("CONFIG", "CACHE", "MASTER"), Map.of("CONFIG", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY"),
                 "CACHE", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY"), "MASTER", choice("UNKNOWN", "AVAILABLE", "UNAVAILABLE", "AUTH_READY")));
         var snapshot = new LinkedHashMap<String,Object>();
-        snapshot.put("mode", choice("CLOUD", "OP")); snapshot.put("clusterId", text()); snapshot.put("operationId", text());
+        snapshot.put("defaultSourceId", Map.of("anyOf", List.of(text(), Map.of("type", "null")))); snapshot.put("mode", choice("CLOUD", "OP")); snapshot.put("clusterId", text()); snapshot.put("operationId", text());
         snapshot.put("setupGeneration", positive()); snapshot.put("bindingVersion", nonnegative()); snapshot.put("authGeneration", nonnegative()); snapshot.put("stateVersion", nonnegative());
         snapshot.put("setupPhase", choice("LOCAL_SETUP", "CONFIG_PREPARED", "STORAGE_BOUND", "COMPLETE"));
         snapshot.put("businessPhase", choice("NOT_CONFIGURED", "PREPARING", "RESTART_REQUIRED", "FIRST_ADMIN_REQUIRED", "AUTH_READY", "READY", "UNAVAILABLE", "AWAITING_REBUILD_CONFIRMATION", "RECOVERING", "CLEANUP_REQUIRED"));

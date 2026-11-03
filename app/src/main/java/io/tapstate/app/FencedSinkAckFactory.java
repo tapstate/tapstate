@@ -53,6 +53,12 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
         delegate.beginRun(coordinator, writersByChain, ExecutionAuthorization.of(coordinator).require(fence));
     }
+    @Override public void beginRun(HazelcastInstance coordinator, RunWriters writers) {
+        delegate.beginRun(coordinator, writers, ExecutionAuthorization.of(coordinator).require(fence));
+    }
+    @Override public void beginRun(HazelcastInstance coordinator, ExecutionWriters execution) {
+        delegate.beginRun(coordinator, execution, ExecutionAuthorization.of(coordinator).require(fence));
+    }
 
     /**
      * Where the loads stand, read as the wrapped factory reads it. Reading moves nothing, and what it reads
@@ -93,6 +99,10 @@ final class FencedSinkAckFactory implements SinkAckFactory {
         @Override
         public void bounded(String chain, SourceOrder through) {
             ack.bounded(chain, through, authorization.require(fence));
+        }
+        @Override public void started(long jobId, long executionId) {
+            try { ack.started(jobId, executionId); }
+            catch (RuntimeException failedObservation) { System.getLogger(FencedSinkAckFactory.class.getName()).log(System.Logger.Level.WARNING, "writer initialization observation failed", failedObservation); }
         }
 
         @Override

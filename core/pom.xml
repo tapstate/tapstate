@@ -37,6 +37,7 @@
     <module>core-alerting</module>
     <!-- the standard event envelope: the change-event currency of the capture/transform/sink ports -->
     <module>core-event</module>
+    <module>core-validation</module>
     <!-- node-local in-process log tail: the sink the runtime appends to and a control read face tails -->
     <module>core-logging</module>
   </modules>

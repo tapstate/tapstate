@@ -92,10 +92,30 @@ class ClusterMembershipGateTest {
     }
 
     private static ClusterMembershipGate productionGate() {
+        ClusterMembershipGate gate = unboundProductionGate();
+        gate.observeNodeSession(() -> true);
+        return gate;
+    }
+
+    private static ClusterMembershipGate unboundProductionGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         properties.setBootstrapMinMembers(3);
         return new ClusterMembershipGate(properties);
+    }
+
+    @Test
+    void aCommittedMajorityCannotAdmitWorkBeforeItsLocalSessionIsBound() {
+        ClusterMembershipGate gate = unboundProductionGate();
+        gate.install(new ClusterMembership("cluster-a", 1, Set.of("a", "b", "c")));
+        assertThat(gate.apply(List.of(member("a"), member("b")))).isFalse();
+        assertThat(gate.businessEligible()).isFalse();
+        assertThat(gate.canCommit(Set.of("a", "b"))).isFalse();
+
+        gate.observeNodeSession(() -> true);
+        assertThat(gate.apply(List.of(member("a"), member("b")))).isTrue();
+        assertThat(gate.businessEligible()).isTrue();
+        assertThat(gate.canCommit(Set.of("a", "b"))).isTrue();
     }
 
     @Test

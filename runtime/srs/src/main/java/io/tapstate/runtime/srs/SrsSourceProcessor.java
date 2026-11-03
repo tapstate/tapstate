@@ -119,6 +119,11 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
     // instance has already taken some of it -- a job restarted mid-load -- cannot vouch for the rows that
     // instance took and never emitted, so it promises nothing about the load and leaves the table owed.
     private boolean vouchesForSnapshot = true;
+    private String initialMode = "UNPROVEN";
+    private SourceInitialLoadObserver initialObserver;
+    private long observedJob, observedExecution;
+    private int observedIndex;
+    private boolean completedInput;
     // What this source's changes wait for, when a sink it reaches spreads loads over several writers, and where
     // those loads stand; null for a source whose changes leave as soon as they are read.
     private List<AwaitedLoad> awaited;
@@ -179,6 +184,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             // of an empty load would never be, the table would never read as written, and a sink that holds a
             // table's changes until its load has landed at every writer would hold them for good.
             snapshotBoundDue = load.declared() && vouchesForSnapshot;
+            initialMode = load.declared() ? vouchesForSnapshot ? "SNAPSHOT" : "UNPROVEN" : bounded ? "UNPROVEN" : "NO_INITIAL_LOAD";
         }
         if (awaited != null) {
             holding = true;
@@ -206,6 +212,17 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
                 throw new TapstateException(CaptureError.RECOVERY_LOG_GAP,Map.of("ring",ringName,"sequence",recovery.getAsLong(),
                         "reason","the original saved recovery floor moved backwards"),null);
             confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
+        }
+        Object observer = context.hazelcastInstance().getUserContext().get(SourceInitialLoadObserver.USER_CONTEXT_KEY);
+        if (observer instanceof SourceInitialLoadObserver receipt) {
+            try {
+                receipt.started(context.hazelcastInstance(), context.jobConfig().getArgument(io.tapstate.runtime.engine.Engine.RUN_IDENTITY_ARGUMENT),
+                        context.jobId(), context.executionId(), src, context.globalProcessorIndex(), initialMode, epoch);
+                initialObserver = receipt; observedJob = context.jobId(); observedExecution = context.executionId(); observedIndex = context.globalProcessorIndex();
+            } catch (RuntimeException failedObservation) {
+                // Side-observation failure never changes normal source consumption or ACK semantics.
+                System.getLogger(SrsSourceProcessor.class.getName()).log(System.Logger.Level.WARNING, "initial-load observation failed", failedObservation);
+            }
         }
     }
 
@@ -279,9 +296,15 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         }
         // Only an explicitly bounded read ends. A direct CDC source also has no ring reader and can
         // remain quiet indefinitely. A missing or partially consumed declaration is not proof of EOF.
-        return bounded && buffered != null && buffered.snapshotState(pipelineId, ringName).declared()
+        completedInput = bounded && buffered != null && buffered.snapshotState(pipelineId, ringName).declared()
                 && vouchesForSnapshot && !awaitingSnapshot && !snapshotBoundDue
                 && pending.isEmpty() && held.isEmpty() && unannounced == null;
+        return completedInput;
+    }
+    @Override public void close() {
+        var observer = initialObserver; initialObserver = null;
+        if (observer != null) try { observer.ended(observedJob, observedExecution, src, observedIndex, completedInput); }
+        catch (RuntimeException failedObservation) { System.getLogger(SrsSourceProcessor.class.getName()).log(System.Logger.Level.WARNING, "initial-load end observation failed", failedObservation); }
     }
 
     /**

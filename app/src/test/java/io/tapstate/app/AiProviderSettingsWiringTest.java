@@ -53,6 +53,36 @@ class AiProviderSettingsWiringTest {
         assertThat(service).isNotNull();
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void theOptionalProviderBackendIsResolvedAfterAllBeanDefinitionsAreRegistered(boolean backendAvailable) {
+        var beans = new org.springframework.beans.factory.support.DefaultListableBeanFactory();
+        beans.registerSingleton("factory", new ControlPlaneConfiguration());
+        beans.registerSingleton("audit", new AuditGate(record -> {}, Clock.systemUTC()));
+        var service = new org.springframework.beans.factory.support.RootBeanDefinition(AiProviderService.class);
+        service.setFactoryBeanName("factory");
+        service.setFactoryMethodName("aiProviderService");
+        service.setAutowireMode(org.springframework.beans.factory.support.AbstractBeanDefinition.AUTOWIRE_CONSTRUCTOR);
+        beans.registerBeanDefinition("providerService", service);
+        var settings = new AiProviderSettingsStore.Settings("openai-compatible", "https://provider.example/v1", "model", "key");
+        if (backendAvailable) beans.registerBeanDefinition("settings", new org.springframework.beans.factory.support.RootBeanDefinition(
+                AiProviderSettingsStore.class, () -> new AiProviderSettingsStore() {
+                    @Override public java.util.Optional<Settings> get(String owner) {
+                        assertThat(owner).isEqualTo("original-owner");
+                        return java.util.Optional.of(settings);
+                    }
+                    @Override public void put(String owner, Settings value) { throw new AssertionError("unexpected put"); }
+                    @Override public void delete(String owner) { throw new AssertionError("unexpected delete"); }
+                }));
+        try {
+            var resolved = beans.getBeanProvider(AiProviderService.class).getIfAvailable();
+            if (backendAvailable) assertThat(resolved.get("original-owner").orElseThrow().apiKey()).isEqualTo("key");
+            else assertThat(resolved).isNull();
+        } finally {
+            beans.destroySingletons();
+        }
+    }
+
     private static void set(Object target, String fieldName, Object value) throws Exception {
         var field = MongoConnection.class.getDeclaredField(fieldName);
         field.setAccessible(true);

@@ -128,6 +128,10 @@ def check(workflows, contexts, inputs):
         'any shard assigned the Cloud context test must prepare its pinned inputs'
     assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
     assert 'TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release' in shards
+    assert 'if [[ "$SHARD" == app-* ]]; then' in execute[1], 'App PDK inputs must stay in their selected Maven verify step'
+    assert 'for connector in mongodb mysql postgres; do' in execute[1], 'all direct-validation connector inputs are required'
+    assert 'test -f "$connector_jar"' in execute[1], 'missing real connector inputs must fail before tests'
+    assert '-Dtapstate.pdk.it.$connector-jar=$connector_jar' in execute[1], 'real PDK paths must reach the original Maven forks'
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)
@@ -228,6 +232,10 @@ for original, replacement in [
     (MAVEN_ARGS, '          MAVEN_ARGS: "-Dapi.version=1.44"'),
     (MAVEN_ARGS, MAVEN_ARGS.replace('${{ runner.temp }}/test-tmp', '/tmp')),
     ('mkdir -p "$RUNNER_TEMP/test-tmp"', 'echo missing-test-tmp'),
+    ('if [[ "$SHARD" == app-* ]]; then', 'if false; then'),
+    ('for connector in mongodb mysql postgres; do', 'for connector in mongodb mysql; do'),
+    ('test -f "$connector_jar"', 'true'),
+    ('-Dtapstate.pdk.it.$connector-jar=$connector_jar', '-Dtapstate.pdk.it.unrelated-jar=$connector_jar'),
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),

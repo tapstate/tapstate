@@ -24,6 +24,36 @@ class InstallationSetupStatesTest {
         assertThatThrownBy(() -> states.rotate(next.scope(), StorageSetupStateStore.Purpose.FIRST_ADMIN)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void completedSetupRenewalKeepsSetupPurposeAndRestrictsItToTheOriginalActivation() {
+        var files = InstallationFiles.initialize(temporary.resolve("limited-activation"));
+        var initial = files.stage().scope();
+        var next = new io.tapstate.spi.store.StorageSetupScope(initial.clusterId(), initial.installationId(), initial.operationId(), initial.generation() + 1);
+        var physical = mock(StorageSetupStateStore.class); var permitted = new java.util.concurrent.atomic.AtomicBoolean(true);
+        when(physical.guardedBy(any())).thenReturn(physical);
+        when(physical.load()).thenReturn(new StorageSetupStateStore.Status(initial, StorageSetupStateStore.Phase.COMPLETE, 1));
+        when(physical.rotate(initial, StorageSetupStateStore.Purpose.FIRST_ADMIN)).thenAnswer(ignored -> {
+            when(physical.load()).thenReturn(new StorageSetupStateStore.Status(next, StorageSetupStateStore.Phase.COMPLETE, 1));
+            return new StorageSetupStateStore.Status(next, StorageSetupStateStore.Phase.COMPLETE, 1);
+        });
+        var states = new InstallationSetupStates(files, () -> Optional.of(physical), permitted::get);
+        var capabilities = new io.tapstate.control.core.SetupCapabilityService(states, java.time.Clock.systemUTC(), () -> {}, () -> {},
+                () -> { throw new AssertionError("limited activation must not mint first-admin authority"); });
+        var issued = capabilities.issue(initial, StorageSetupStateStore.Purpose.SETUP);
+        assertThat(issued.purpose()).isEqualTo(StorageSetupStateStore.Purpose.SETUP);
+        var permission = capabilities.authorize(issued.token(), next, StorageSetupStateStore.Purpose.SETUP);
+        assertThat(permission.limitedActivation()).isTrue();
+        var caller = io.tapstate.control.core.StorageControlAccess.management(permission);
+        for (var operation : java.util.List.of(io.tapstate.control.core.ControlOperations.STORAGE_STATUS,
+                io.tapstate.control.core.ControlOperations.STORAGE_SETUP_STATUS, io.tapstate.control.core.ControlOperations.STORAGE_SETUP_ACTIVATE))
+            assertThatCode(() -> caller.require(operation)).doesNotThrowAnyException();
+        for (var operation : java.util.List.of(io.tapstate.control.core.ControlOperations.STORAGE_TEST,
+                io.tapstate.control.core.ControlOperations.STORAGE_SETUP_COMMIT, io.tapstate.control.core.ControlOperations.STORAGE_RECOVERY_PLAN))
+            assertThatThrownBy(() -> caller.require(operation)).isInstanceOf(TapstateException.class);
+        permitted.set(false);
+        assertThatThrownBy(permission::run).isInstanceOf(TapstateException.class);
+        verify(physical, never()).rotate(any(), eq(StorageSetupStateStore.Purpose.SETUP));
+    }
+
     @Test void missingConfigurationAfterCreationStartsDoesNotRestoreLocalAuthority() {
         var files = InstallationFiles.initialize(temporary.resolve("installation"));
         var scope = files.stage().scope();
@@ -71,6 +101,7 @@ class InstallationSetupStatesTest {
                 assertThat(executor.submit(files::stage).get(2, java.util.concurrent.TimeUnit.SECONDS).scope()).isEqualTo(scope);
                 return null;
             }).when(configuration).requireCurrent(scope, StorageSetupStateStore.Purpose.SETUP);
+            when(configuration.load()).thenReturn(new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.CONFIG_PREPARED, 0));
             var states = new InstallationSetupStates(files, () -> Optional.of(configuration));
             states.requireCurrent(scope, StorageSetupStateStore.Purpose.SETUP);
         }

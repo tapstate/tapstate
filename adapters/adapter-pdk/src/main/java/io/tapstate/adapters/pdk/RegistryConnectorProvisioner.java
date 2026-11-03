@@ -58,6 +58,10 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         return materialize(connectorId, resolveRegistration(connectorId), false);
     }
 
+    @Override public ConnectorRef resolveDefaultTest(String connectorId) {
+        return materialize(connectorId, resolveRegistration(connectorId), false, true);
+    }
+
     @Override
     public ConnectorRef resolve(String connectorId, String contentHash) {
         if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {
@@ -72,6 +76,9 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     }
 
     private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash) {
+        return materialize(connectorId, registration, retainedHash, false);
+    }
+    private ConnectorRef materialize(String connectorId, ConnectorRegistration registration, boolean retainedHash, boolean defaultTest) {
         Path staged = stage(connectorId, registration.contentHash());
         if (seedDir != null) {
             // Local bytes grant no authority: recheck the original selector after staging.
@@ -81,7 +88,7 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
             if (current.size() != 1 || !current.getFirst().equals(registration))
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
-        IntrospectedConnector introspected = introspector.introspect(List.of(staged));
+        IntrospectedConnector introspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
         boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();
         return new ConnectorRef(List.of(staged), introspected.className(), introspected.pdkApiVersion(), null,
                 introspected.spec(), registration.contentHash(), shareSafe);

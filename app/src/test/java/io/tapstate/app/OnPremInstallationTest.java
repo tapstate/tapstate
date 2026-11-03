@@ -42,6 +42,72 @@ class OnPremInstallationTest {
         }
     }
 
+    @Test void completedInitialRecoveryUsesItsExactReceiptInsteadOfMintingOriginalCreationAuthority() {
+        var configuration = mock(MongoConfigurationDomain.class);
+        var commands = mock(io.tapstate.spi.store.StorageRecoveryCommands.class);
+        var scope = new io.tapstate.spi.store.CacheAuthScope("cluster", 1, StorageBinding.Mode.OP, "cache", 1);
+        var preparation = new io.tapstate.spi.store.CachePreparation("setup", scope);
+        var source = new io.tapstate.core.model.SourceResource("views", null, "mongodb", java.util.Map.of("uri", "mongodb://host/views"), null, null, null, null);
+        var completed = mock(io.tapstate.spi.store.StorageRecoveryCommands.Plan.class);
+        var manifest = new io.tapstate.spi.store.StorageRecoveryCommands.Manifest(
+                new io.tapstate.spi.store.StorageRecoveryCommands.Selection(io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER, java.util.Set.of()),
+                java.util.Set.of(), java.util.Map.of("views", io.tapstate.core.model.canonical.CanonicalHash.of(source)), "a".repeat(64), 1);
+        when(configuration.recoveryCommands()).thenReturn(commands);
+        when(commands.current(scope)).thenReturn(Optional.of(completed));
+        when(completed.originalScope()).thenReturn(scope); when(completed.operationId()).thenReturn("recovery");
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE);
+        when(completed.manifest()).thenReturn(manifest);
+        when(commands.find(scope, "recovery")).thenReturn(Optional.of(completed));
+        when(configuration.initialOpRecoverySource(scope, true)).thenReturn(source);
+        doThrow(StorageRuntime.unavailable()).when(configuration).requireOriginalInitialPreparation(preparation);
+        assertThatCode(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).doesNotThrowAnyException();
+        verify(configuration, never()).requireOriginalInitialPreparation(preparation);
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.RUNNING);
+        assertThatThrownBy(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).isInstanceOf(TapstateException.class);
+        when(completed.phase()).thenReturn(io.tapstate.spi.store.StorageRecoveryCommands.Phase.COMPLETE);
+        when(commands.find(scope, "recovery")).thenReturn(Optional.empty());
+        assertThatThrownBy(() -> OnPremInstallation.requireActivationPreparation(configuration, preparation)).isInstanceOf(TapstateException.class);
+    }
+
+    @Test void firstAdministratorReadinessRequiresTheCompletedLocalHandoffAndActualBusiness() {
+        var files = InstallationFiles.initialize(directory.resolve("ready-handoff"));
+        InstallationCommand.authorize(files, new MongoProperties(), Clock.systemUTC());
+        files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, "a".repeat(64)));
+        var scope = files.stage().scope();
+        var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);
+        var configuration = mock(MongoConfigurationDomain.class); var states = mock(StorageSetupStateStore.class);
+        var phase = new java.util.concurrent.atomic.AtomicReference<>(StorageSetupStateStore.Phase.STORAGE_BOUND);
+        when(root.mode()).thenReturn(StorageBinding.Mode.OP); when(root.runtime()).thenReturn(runtime);
+        when(runtime.configuration()).thenReturn(Optional.of(configuration)); when(configuration.setupStates()).thenReturn(states);
+        when(states.guardedBy(any())).thenReturn(states);
+        when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(scope, phase.get(), 1));
+        when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY); when(runtime.businessStarted()).thenReturn(true);
+        try (var installation = new OnPremInstallation(root, files, new MongoProperties(), mock(StorageSetupService.DefaultTarget.class), Clock.systemUTC())) {
+            assertThatThrownBy(installation::afterNormalStartup).isInstanceOf(TapstateException.class);
+            assertThat(files.capability()).isPresent();
+            phase.set(StorageSetupStateStore.Phase.COMPLETE);
+            when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+            assertThatThrownBy(installation::afterNormalStartup).isInstanceOf(TapstateException.class);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+            when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(installation.firstAdministratorReady()).as("ready business alone cannot skip SETUP cleanup").isFalse();
+            var observed = new java.util.concurrent.atomic.AtomicBoolean();
+            installation.onStartupCompleted(() -> {
+                assertThat(installation.firstAdministratorReady()).isTrue();
+                assertThat(files.capability()).isEmpty(); observed.set(true);
+            });
+            installation.afterNormalStartup();
+            assertThat(observed).as("local file completion precedes post-publication delivery").isFalse();
+            assertThat(installation.firstAdministratorReady()).isTrue();
+            installation.afterReadyPublished();
+            assertThat(observed).isTrue(); assertThat(installation.firstAdministratorReady()).isTrue();
+            when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+            when(root.phase()).thenReturn(StorageRoot.Phase.BUSINESS_READY); when(runtime.businessStarted()).thenReturn(false);
+            assertThat(installation.firstAdministratorReady()).isFalse();
+        }
+    }
+
     @Test void managementOverviewCanBeReopenedButArbitraryRoutesRemainClosed() throws Exception {
         var files = InstallationFiles.initialize(directory.resolve("reopen"));
         var root = mock(StorageRoot.class); var runtime = mock(StorageRuntime.class);

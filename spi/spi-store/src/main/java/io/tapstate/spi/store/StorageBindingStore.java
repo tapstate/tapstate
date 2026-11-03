@@ -37,6 +37,7 @@ public interface StorageBindingStore {
      * Submission checks run on every CONFIG transaction callback, but never become the first-cache
      * invocation's lifetime. guardedBy supplies the operation owner's lifetime separately. A confirmed
      * winner is returned without post-commit submission checks that could discard its invocation.
+     * That operation lifetime is a pure, nonblocking local guard, also used by native CACHE retries.
      */
     default StorageBindingCommit commitWithFirstCache(StorageSetupScope expected, StorageBinding.Mode mode,
             StorageBinding.Connection cache, SourceResource defaultSource, Runnable requireCommit) {
