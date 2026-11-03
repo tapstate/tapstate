@@ -7,7 +7,7 @@ import java.util.Set;
 /** Storage operation routes shared by connected clients; secrets occur only in POST bodies. */
 public final class StorageControlClient {
     private StorageControlClient() {}
-    public static final Set<String> OPERATIONS = Set.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status",
+    public static final Set<String> OPERATIONS = Set.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status", "storage.setup.activate",
             "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status", "configuration.export", "configuration.import.preflight",
             "configuration.import.commit", "configuration.import.status");
     public static String path(String operation) {

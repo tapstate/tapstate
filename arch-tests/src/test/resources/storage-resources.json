@@ -925,6 +925,27 @@
         "Known missing or corrupt rows/bodies, unknown formats, unmatched legacy candidates, broken closure, changed authoring or lost fences refuse. No latest-model guess, automatic full, state clearing, target widening or replacement source model is authorized. Runtime expression, conversion, key and connector-write/error/settlement rules remain.",
         "No new collection, cross-database transaction, migration scheduler or rolling mixed-version compatibility is introduced. New readers accept strict v1/v2 variants; old writers are excluded through the existing controlled same-version upgrade/restart boundary before v2 writes. Cleanup remains original scope retirement; bodies do not accumulate per restart."
       ]
+    },
+    "default-source-test": {
+      "goal": "Expose only the latest diagnostic for the original immutable default Source; missing or uncertain execution is UNKNOWN and grants no setup, authentication or business admission.",
+      "entry": "After initial business readiness, submit one initial test on the accepting available node. Subsequent attempts require an explicit authorized test of the same saved Source. Reads and restart never execute, resume, enqueue or transfer a test.",
+      "prerequisites": [
+        "Trusted original CONFIG binding and immutable default Source with its existing canonical hash; original CACHE business scope is admitted. No new source version pointer or saved credentials are introduced.",
+        "Managed default Source diagnostics use formatVersion 2 in the existing per-connection row: original source hash, random latest attemptId, original node/session identity, acceptedAt, deadlineAt, CHECKING/PASSED/FAILED/UNKNOWN state, optional finishedAt and redacted terminal report. Existing ordinary Source reports retain their current layout.",
+        "A missing row, an unbound legacy default report without an attempt, inactive or unverifiable execution session, expired unfinished attempt, internal defect or uncertain result write projects UNKNOWN without starting work. A verifiable live attempt projects CHECKING only before its deadline. Unreadable data remains a coded diagnostic, never PASSED.",
+        "Only a confirmed PASSED or FAILED terminal report of the current attempt may be returned through the existing final-report endpoint. PASSED/FAILED keep the existing ten-minute display lifetime; CHECKING/UNKNOWN have no fabricated completion time.",
+        "The executor uses a default sixty-second total test deadline and at most five seconds of cleanup observation. A terminal failure is FAILED only when resource exit is confirmed; uncertain exit is UNKNOWN. Physical local slots remain occupied until actual exit, regardless of persisted attempt state."
+      ]
+    },
+    "installation-files-cache-activation": {
+      "goal": "Resume the original installation and immutable Configuration handoff without requiring a process restart for an intact first CACHE activation.",
+      "entry": "Original installation management entry and existing installation --authorize operation. Same-process activation reuses the saved original operation, generation and binding; after an actual restart, verify the same original files and CONFIG facts before any activation.",
+      "prerequisites": [
+        "Existing file layout, owner lock, restrictive permissions, atomic replacement/fsync, original installation/operation, Configuration URI/CA and capability generation remain unchanged. No new installation file, phase enum or setup authority is introduced.",
+        "RESTART_REQUIRED and RESTARTED are recognized legacy handoff values, not prerequisites for first-admin creation. Actual CONFIG/CACHE and business readiness plus the original first-admin PENDING fact determine entry; default Source network tests never supply readiness or authority.",
+        "Intact original binding and original CACHE preparation are required. Missing, partial, conflicting or unverifiable initial facts do not mint creation rights, overwrite a candidate, clear data or bypass existing recovery confirmation.",
+        "SETUP authority before readiness is restricted to the original status/activation operation. Actual readiness retires SETUP and permits the existing separate FIRST_ADMIN authorization only while the original first-admin fact is PENDING. Strict-mode renewal advances only the original authorization generation."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1131,6 +1152,10 @@
     "native-ai-config-v1": {
       "atomicDomain": "CONFIG",
       "fencing": "Each replace/delete uses the original CONFIG client/session to verify Cluster identity/schema, advance the existing configuration version and fence the same original persisted key before the single owner row mutation. Strict current-row decoding refuses corruption rather than repairing it. Existing audit-first and replacement semantics remain. The same captured authenticated Cloud context supplies organization/Cluster and is checked before and after the operation. Provider network calls and CACHE are outside this CONFIG transaction."
+    },
+    "default-source-test": {
+      "atomicDomain": "CACHE",
+      "fencing": "Use the original CACHE client/session, original business identity admission/retirement fence and exact existing Source identity. One atomic replacement publishes the newest accepted attempt by connection id; only that exact attemptId/sourceHash in CHECKING can publish its terminal state. A terminal state is irreversible for its attempt; late timeout, completion or cleanup cannot overwrite it or a newer attempt. Recheck the absolute deadline at terminal publication and refuse late success. This is latest-result fencing, not a distributed scheduler or physical-execution lock. CONFIG facts and CACHE diagnostics are never described as one transaction."
     }
   },
   "resources": [
@@ -2984,26 +3009,28 @@
     },
     {
       "id": "mongo.cache.connection_test_results",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "connection_test_results"
       ],
-      "responsibility": "Bounded latest connection diagnostics; not submission authority.",
+      "responsibility": "Latest bounded connection diagnostics only. Managed immutable default Source rows additionally hold their latest attempt and terminal state; neither diagnostics nor attempt presence grants submission or execution authority.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectionTestResultStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectionTestResultStore"
       ],
-      "recovery": "derived-cache",
-      "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "default-source-test",
+      "consistency": "default-source-test",
+      "growth": "One latest row per connection, using the existing _id index and original CACHE scope; no attempt history, new collection, scheduler, heartbeat or persistent jobs queue. Each managed-default format-2 row, including redacted report, is bounded to 1 MiB; reject or safely bound diagnostics before publication, never claim PASSED when publication is uncertain. Ordinary Source behavior and existing limits are unchanged.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "control/control-core/src/test/java/io/tapstate/control/core/DefaultSourceVerificationTest.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheMetadataStoresIT.java"
       ]
     },
     {
@@ -3375,7 +3402,7 @@
     {
       "id": "local.installation",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "FILE_SET",
       "layer": "CONFIG",
       "database": "LOCAL",
@@ -3393,7 +3420,7 @@
       "readers": [
         "io.tapstate.app.InstallationFiles"
       ],
-      "recovery": "installation-files",
+      "recovery": "installation-files-cache-activation",
       "consistency": "installation",
       "growth": "A bounded directory per installation; capabilities expire and are replaced for the same scope.",
       "evidence": [

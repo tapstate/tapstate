@@ -48,11 +48,15 @@ public final class SetupCapabilityService {
         private final StorageSetupScope scope;
         private final StorageSetupStateStore.Purpose purpose;
         private final Runnable active;
-        private Permission(StorageSetupScope scope, StorageSetupStateStore.Purpose purpose, Runnable active) {
-            this.scope = scope; this.purpose = purpose; this.active = active;
+        private final boolean limitedActivation;
+        private final boolean boundSetup;
+        private Permission(StorageSetupScope scope, StorageSetupStateStore.Purpose purpose, Runnable active, boolean limitedActivation, boolean boundSetup) {
+            this.scope = scope; this.purpose = purpose; this.active = active; this.limitedActivation = limitedActivation; this.boundSetup = boundSetup;
         }
         public StorageSetupScope scope() { return scope; }
         public StorageSetupStateStore.Purpose purpose() { return purpose; }
+        public boolean limitedActivation() { return limitedActivation; }
+        public boolean boundSetup() { return boundSetup; }
         @Override public void run() { active.run(); }
         @Override public String toString() { return "SetupPermission[redacted]"; }
     }
@@ -106,7 +110,8 @@ public final class SetupCapabilityService {
             if (current != captured || !captured.issued().expiresAt().isAfter(clock.instant())) throw refused();
         };
         active.run();
-        return new Permission(expected, purpose, active);
+        return new Permission(expected, purpose, active, limitedActivation(purpose),
+                purpose == StorageSetupStateStore.Purpose.SETUP && states.load().bindingVersion() > 0);
     }
 
     /** Local installation mode uses the deployment process and dedicated listener instead of a copied secret. */
@@ -121,7 +126,12 @@ public final class SetupCapabilityService {
             states.requireCurrent(expected, purpose);
             if (localRevision != revision) throw refused();
         };
-        active.run(); return new Permission(expected, purpose, active);
+        active.run(); return new Permission(expected, purpose, active, limitedActivation(purpose),
+                purpose == StorageSetupStateStore.Purpose.SETUP && states.load().bindingVersion() > 0);
+    }
+
+    private boolean limitedActivation(StorageSetupStateStore.Purpose purpose) {
+        return purpose == StorageSetupStateStore.Purpose.SETUP && states.load().phase() == StorageSetupStateStore.Phase.COMPLETE;
     }
 
     /** Phase completion is durable; clearing local material never reopens its authority. */

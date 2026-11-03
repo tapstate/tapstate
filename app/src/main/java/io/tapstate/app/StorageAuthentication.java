@@ -212,11 +212,12 @@ final class StorageAuthentication implements AutoCloseable {
         }
         Optional<CredentialAuthentication> authenticate(String credential) {
             requireActive();
-            var verified = managed.authenticate(credential);
+            var verified = managed.authenticateWithContext(credential);
             if (verified.isEmpty()) return Optional.empty();
-            var organization = managed.clusterContext(credential).map(CloudSessionContext::organizationId);
+            var session = verified.orElseThrow();
+            var organization = Optional.ofNullable(session.clusterContext().organizationId());
             if (organization.isEmpty()) return Optional.empty();
-            var identity = verified.orElseThrow(); requireActive();
+            var identity = session.identity(); requireActive();
             return Optional.of(new CredentialAuthentication(identity, Optional.empty(), organization, () -> {
                 requireActive();
                 if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();

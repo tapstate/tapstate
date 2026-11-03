@@ -28,6 +28,7 @@ import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.BootstrapService;
 import io.tapstate.control.core.ConnectionTestResultQueryService;
 import io.tapstate.control.core.ConnectionTestService;
+import io.tapstate.control.core.DefaultSourceVerification;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ClusterPipelineTopologyService;
@@ -604,8 +605,14 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock) {
-        return new PdkConnectionTester(provisioner, clock);
+    ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock,
+            org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification,
+            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots) {
+        java.util.function.Predicate<io.tapstate.spi.store.ConnectionConfig> managed = config -> {
+            var current = verification.getIfAvailable(); return current != null && current.manages(config);
+        };
+        var slot = slots.getIfAvailable();
+        return slot == null ? new PdkConnectionTester(provisioner, clock, managed) : new PdkConnectionTester(provisioner, clock, managed, slot);
     }
 
     @Bean
@@ -622,14 +629,26 @@ class ControlPlaneConfiguration {
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
-            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers) {
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
-                observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE));
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester) {
+        var observer = observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE);
+        var guarded = new ConnectionTestService.Observer() {
+            @Override public boolean manages(io.tapstate.spi.store.ConnectionConfig config) { return observer.manages(config); }
+            @Override public ConnectionTestService.Attempt begin(io.tapstate.spi.store.ConnectionConfig config) {
+                if (observer.manages(config) && tester instanceof PdkConnectionTester pdk && !pdk.defaultTestAvailable())
+                    throw new io.tapstate.core.common.TapstateException(io.tapstate.adapters.pdk.ConnectorError.INSTANCES_BUSY,
+                            java.util.Map.of("connector", config.connectorId(), "timeout", "0s"), null);
+                return observer.begin(config);
+            }
+        };
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections, guarded);
     }
 
     @Bean
-    ConnectionTestResultQueryService connectionTestResultQueryService(ConnectionTestResultStore resultStore) {
-        return new ConnectionTestResultQueryService(resultStore);
+    ConnectionTestResultQueryService connectionTestResultQueryService(ConnectionTestResultStore resultStore,
+            org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification) {
+        return new ConnectionTestResultQueryService(resultStore, id -> {
+            var current = verification.getIfAvailable(); return current == null || current.canReadReport(id);
+        });
     }
 
     // The schema-discovery half of the connection plane: the same provisioner feeds the PDK discoverer,

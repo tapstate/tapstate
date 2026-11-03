@@ -63,6 +63,16 @@ class StorageControlDispatcherTest {
         out.put("configuration", connection(value.configuration())); out.put("cache",connection(value.cache())); out.put("master",connection(value.master())); return out;
     }
     private static Map<String,Object> connection(StorageBinding.Connection value) { return Map.of("kind",value.kind().name(),"uri",value.uri(),"database",value.database()); }
+    @Test void defaultSourceIdIsAbsentUntilTheOriginalBindingExists() {
+        var f = new Fixture(); var old = f.snapshot;
+        f.snapshot = new StorageControlDispatcher.Snapshot(old.mode(), old.clusterId(), old.operationId(), old.setupGeneration(),
+                0, 0, 0, "LOCAL_SETUP", StorageControlDispatcher.BusinessPhase.NOT_CONFIGURED, old.health(), List.of("storage.status"), false);
+        var unbound = f.dispatcher().dispatch("storage.status", f.owner(), Map.of());
+        assertThat(unbound).containsKey("defaultSourceId"); assertThat(unbound.get("defaultSourceId")).isNull();
+        f.snapshot = old;
+        assertThat(f.dispatcher().dispatch("storage.status", f.owner(), Map.of())).containsEntry("defaultSourceId", "views");
+    }
+
     @Test void statusEnclosesTheEntireProjectionInTwoOriginalAuthorizationChecks() {
         var f = new Fixture(); var checks = new AtomicInteger();
         var caller = StorageControlAccess.ordinary(StorageBinding.Mode.OP, SCOPE,
@@ -149,9 +159,21 @@ class StorageControlDispatcherTest {
         assertThat(JsonWriter.write(result)).doesNotContain("sentinel-secret", "mongodb://");
     }
 
+    @Test void rejectsLegacySetupTestsAndStampShapeWithoutRunningTheTarget() {
+        var f = new Fixture(); var dispatcher = f.dispatcher(); var access = f.owner();
+        for (var layer : List.of("CONFIG", "MASTER")) {
+            assertMalformed(() -> dispatcher.dispatch("storage.test", access, Map.of("operationId", SCOPE.operationId(),
+                    "generation", 1, "candidate", candidate(), "layer", layer)));
+        }
+        assertMalformed(() -> dispatcher.dispatch("storage.setup.commit", access, Map.of("operationId", SCOPE.operationId(),
+                "generation", 1, "candidate", candidate(), "testStamps", Map.of("CONFIG", "a", "CACHE", "b", "MASTER", "c"))));
+        assertThat(f.setup.target.tests).isZero();
+        assertThat(f.setup.binding.inserts).isZero();
+    }
+
     @Test void setupTestsCommitAndOriginalQueryUseTheSameServicesWithoutExposingConnections() {
         var f = new Fixture(); var dispatcher = f.dispatcher(); var access = f.owner(); var proofs = new LinkedHashMap<String,Object>();
-        for (var layer : StorageSetupService.Layer.values()) {
+        for (var layer : List.of(StorageSetupService.Layer.CACHE)) {
             var result = dispatcher.dispatch("storage.test",access,Map.of("operationId",SCOPE.operationId(),"generation",1,"candidate",candidate(),"layer",layer.name()));
             assertThat(JsonWriter.write(result)).doesNotContain("sentinel-secret", "mongodb://"); proofs.put(layer.name(),result.get("testStamp"));
         }
@@ -177,7 +199,7 @@ class StorageControlDispatcherTest {
         var f = new Fixture();
         f.setup.continuation = committed -> f.setup.states.state = new StorageSetupStateStore.Status(SCOPE, StorageSetupStateStore.Phase.COMPLETE, 1);
         var dispatcher = f.dispatcher(); var access = f.owner(); var proofs = new LinkedHashMap<String,Object>();
-        for (var layer : StorageSetupService.Layer.values()) {
+        for (var layer : List.of(StorageSetupService.Layer.CACHE)) {
             var result = dispatcher.dispatch("storage.test", access, Map.of("operationId", SCOPE.operationId(), "generation", 1,
                     "candidate", candidate(), "layer", layer.name()));
             proofs.put(layer.name(), result.get("testStamp"));

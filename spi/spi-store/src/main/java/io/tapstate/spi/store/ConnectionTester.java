@@ -17,4 +17,7 @@ public interface ConnectionTester extends ExecutionPort {
 
     /** Tests {@code config} by driving its connector and returns the normalized result. */
     ConnectionTestResult test(ConnectionConfig config);
+
+    /** The default Source carries its accepting node's monotonic deadline through the same test action. */
+    default ConnectionTestResult testDefault(ConnectionConfig config, long deadlineNanos) { return test(config); }
 }

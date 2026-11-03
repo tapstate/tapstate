@@ -37,6 +37,20 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RegistryConnectorProvisionerTest {
 
+    @Test void managedTestResolutionPreservesLinkageDefectsThroughTheRealRegistry(@TempDir Path dir) throws IOException {
+        var registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, Files.readAllBytes(Synthetic.connectorMissingItsSuperclass(dir.resolve("jar"))));
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"));
+        assertThatThrownBy(() -> provisioner.resolve("orders")).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> provisioner.resolveDefaultTest("orders")).isInstanceOf(LinkageError.class);
+        try (var tester = new PdkConnectionTester(provisioner, java.time.Clock.systemUTC(), ignored -> true)) {
+            assertThatThrownBy(() -> tester.testDefault(new io.tapstate.spi.store.ConnectionConfig("views", "orders", Map.of()),
+                    System.nanoTime() + java.time.Duration.ofSeconds(5).toNanos()))
+                    .isInstanceOf(LinkageError.class);
+            assertThat(tester.defaultTestAvailable()).isTrue();
+        }
+    }
+
     @Test
     void stagesTheRegisteredHashFromTheReleaseSeedWithoutDownloadingIt(@TempDir Path dir) throws IOException {
         Path seeds = Files.createDirectories(dir.resolve("connectors"));

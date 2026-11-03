@@ -62,14 +62,16 @@ public final class StorageControlAccess {
         active.run();
         if (permission != null) {
             boolean status = operation.id().equals("storage.status") || operation.id().equals("storage.setup.status");
-            boolean setupWrite = operation.id().equals("storage.test") || operation.id().equals("storage.setup.commit");
+            if (permission.boundSetup() && operation.id().equals("storage.test")) throw forbidden(operation, Scope.ADMIN);
+            if (permission.limitedActivation() && !status && !operation.id().equals("storage.setup.activate")) throw forbidden(operation, Scope.ADMIN);
+            boolean setupWrite = operation.id().equals("storage.test") || operation.id().equals("storage.setup.commit") || operation.id().equals("storage.setup.activate");
             boolean initialRecovery = initialInstallationRecovery() && java.util.Set.of("storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status").contains(operation.id());
             if (!status && !initialRecovery && !(setupWrite && permission.purpose() == StorageSetupStateStore.Purpose.SETUP)) throw forbidden(operation, Scope.ADMIN);
             return;
         }
         Scope required = mode == StorageBinding.Mode.OP ? Scope.ADMIN : operation.scope();
         if (!principal.permits(required)) throw forbidden(operation, required);
-        if (mode == StorageBinding.Mode.OP && (operation.id().equals("storage.test") || operation.id().equals("storage.setup.commit")))
+        if (mode == StorageBinding.Mode.OP && (operation.id().equals("storage.test") || operation.id().equals("storage.setup.commit") || operation.id().equals("storage.setup.activate")))
             throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, Map.of(), null);
     }
     public Runnable guard(Operation operation) { return () -> require(operation); }

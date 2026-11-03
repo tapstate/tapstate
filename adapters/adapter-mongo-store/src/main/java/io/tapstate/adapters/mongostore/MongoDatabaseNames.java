@@ -9,7 +9,7 @@ public final class MongoDatabaseNames {
     /** Returns an explicit URI database without letting driver diagnostics expose credentials. */
     public static String fromUri(String uri) {
         try {
-            String database = new com.mongodb.ConnectionString(uri).getDatabase();
+            String database = MongoStorageConnectionInput.syntaxOnly(uri).getDatabase();
             if (database == null || database.isBlank() || !isValid(database)) throw new IllegalArgumentException();
             return database;
         } catch (IllegalArgumentException invalid) {
