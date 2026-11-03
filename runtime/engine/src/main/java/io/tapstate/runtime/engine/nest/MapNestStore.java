@@ -203,7 +203,9 @@ final class MapNestStore<S> implements NestStore<S> {
         snapshot.keySet().forEach(ignored -> countWrite());
         // ADD-only union is idempotent across a partial protected retry. The lookup owns these keys
         // and cannot handle a later removal while this synchronous operation is still in progress.
-        map.executeOnKeys(snapshot.keySet(), new GrownBatch<>(snapshot));
+        Map<Object, EntryProcessor<Object, S, Void>> mutations = new LinkedHashMap<>();
+        snapshot.forEach((key, elements) -> mutations.put(key, new GrownBatch<>(Map.of(key, elements))));
+        map.executeOnKeys(mutations);
         publishReading();
     }
 

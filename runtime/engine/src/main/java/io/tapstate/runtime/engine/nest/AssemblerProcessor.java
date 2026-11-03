@@ -640,11 +640,15 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         boolean snapshotWaves = canUseSnapshotWaves(edge);
         boolean childSnapshotWaves = canUseChildSnapshotWaves(edge);
         boolean rootReadAhead = canPrefetchRootReads(edge);
-        boolean ownedRootWaves = rootReadAhead && slots.stream().allMatch(slot -> slot.children().isEmpty()
-                && (slot.isReference() ? slot.as() == io.tapstate.core.model.EmbedAs.OBJECT
-                        : slot.as() == io.tapstate.core.model.EmbedAs.ARRAY));
+        boolean guardedTouchReadAhead = edge.carriesTouches() && vertex.pathId().isEmpty();
+        boolean ownedChildSnapshotWrites = childSnapshotWaves && sending.foldingAllowed()
+                && hasDirectOwnedSnapshotShape() && containsOnlyReads(inbox);
+        boolean ownedRootWaves = rootReadAhead && hasDirectOwnedSnapshotShape();
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
+                if (guardedTouchReadAhead && prefetchedRoots.isEmpty()) {
+                    guardedTouchReadAhead = prefetchGuardedTouches(inbox, touched);
+                }
                 if (rootReadAhead && prefetchedRoots.isEmpty()) {
                     rootReadAhead = prefetchRootReads(inbox, touched);
                 }
@@ -665,14 +669,14 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 }
                 if (snapshotWaves && !snapshotRootsHaveHistory && touched.isEmpty() && processFreshSnapshotWave(inbox)) {
                     if (!flush()) return;
-                } else if (!processArrival(edge, item, inbox, touched)) {
+                } else if (!processArrival(edge, item, inbox, touched, ownedChildSnapshotWrites)) {
                     return;
                 }
             }
         } finally {
             // Never carry unused state across another edge, an idle callback, or a failed drain.
             prefetchedRoots.clear();
-            settle(touched);
+            settle(touched, false, false, null, ownedChildSnapshotWrites);
         }
         // Here as well as on the idle path, because a vertex fed steadily on one key never reaches the idle
         // path at all - and the document whose window ran out while that was going on is the one nothing
@@ -681,14 +685,58 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         sendWhatWindowsHaveRunOutOn();
     }
 
-    private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched) {
+    private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched,
+            boolean ownedSnapshot) {
         handle(edge, item, touched);
         inbox.remove();
         // Append settles each version; folding keeps at most one bounded drain of distinct roots.
         if (!sending.foldingAllowed() || touched.size() >= DrainFolding.MAX_KEYS_HELD) {
-            settle(touched);
+            settle(touched, false, false, null, ownedSnapshot);
             touched.clear();
             return flush();
+        }
+        return true;
+    }
+
+    private boolean hasDirectOwnedSnapshotShape() {
+        return slots.stream().allMatch(slot -> slot.children().isEmpty()
+                && (slot.isReference() ? slot.as() == io.tapstate.core.model.EmbedAs.OBJECT
+                        : slot.as() == io.tapstate.core.model.EmbedAs.ARRAY));
+    }
+
+    /** Only a pure snapshot drain may group ordinary child settlements; append retains every version. */
+    private boolean containsOnlyReads(Inbox inbox) {
+        for (Object item : inbox) {
+            if (!(item instanceof Envelope row) || row.op() != io.tapstate.core.event.Op.READ) return false;
+        }
+        return true;
+    }
+
+    /** Read ahead only for validation-only reference words, never ordinary reference changes. */
+    private boolean prefetchGuardedTouches(Inbox inbox, Map<Object, Touched> touched) {
+        Set<Object> keys = new LinkedHashSet<>();
+        long inputBytes = 0;
+        int examined = 0;
+        for (Object item : inbox) {
+            if (++examined > DrainFolding.MAX_KEYS_HELD || !(item instanceof NestTouch word)
+                    || !(word.onlyIfWaiting() || word.firstFiling())) break;
+            if (waiting.contains(word.key()) || touched.containsKey(word.key())
+                    || recentReferenceStates.containsKey(word.key())) continue;
+            long bytes = StateWaveSize.of(word);
+            if (bytes > RootWrites.BYTES - inputBytes) break;
+            inputBytes += bytes;
+            keys.add(word.key());
+            if (keys.size() == RootWrites.KEYS) break;
+        }
+        if (keys.size() < 2) return false;
+        Map<Object, RootAssembly> loaded = store.loadAll(keys);
+        long retained = 0;
+        for (Object key : keys) {
+            RootAssembly state = loaded.get(key);
+            long size = state == null ? 0 : StateWaveSize.of(state);
+            if (size > RootWrites.BYTES - retained) return false;
+            prefetchedRoots.put(key, state);
+            retained += size;
         }
         return true;
     }
@@ -1129,7 +1177,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                     }
                     return;
                 }
-                RootAssembly assembly = inDrain == null ? store.load(word.key()) : inDrain.assembly;
+                RootAssembly assembly = inDrain != null ? inDrain.assembly
+                        : prefetchedRoots.containsKey(word.key()) ? prefetchedRoots.remove(word.key())
+                                : store.load(word.key());
                 if (assembly == null) {
                     rememberReferenceState(word.key(), ReferenceState.ABSENT);
                 }
@@ -1194,6 +1244,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         Touched document = touched(key, touched);
         document.ts = event.ts();
+        document.inputBytes = Math.max(0, document.inputBytes) + PayloadBytes.of(event);
         settle(key, document, edge.carriesDepartures()
                 ? new NestElement(ref, null, order, event.positions(), from, true)
                 : new NestElement(ref, NestKeys.isDeletion(event) ? null : row, order,

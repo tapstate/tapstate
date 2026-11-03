@@ -20,6 +20,7 @@ import java.util.Set;
 /** One cache client owner, with authentication preparation independent from business-domain assembly. */
 public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineStoreViews, io.tapstate.spi.store.SrsStoreViews, AutoCloseable {
     private final MongoConnection connection;
+    private final MongoPipelineWrites pipelineWrites = new MongoPipelineWrites();
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
     private final Duration rateRetention;
@@ -470,7 +471,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
+        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases, pipelineWrites);
     }
 
     /**

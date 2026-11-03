@@ -17,6 +17,37 @@ import static org.mockito.Mockito.*;
 
 /** Counts the actual validation calls without substituting the scoped operator implementation. */
 class MongoOperatorValidationCostTest {
+    @Test void operatorAttemptsReadCollectionDescriptionsOnceWithoutCachingTheNextTransaction() {
+        var f = new Fixture();
+        f.store.load(f.at.mapName(), "one");
+        assertThat(f.descriptionReads).isEqualTo(1);
+        f.store.load(f.at.mapName(), "two");
+        assertThat(f.descriptionReads).isEqualTo(2);
+        assertThat(f.indexReads).containsEntry("pipeline_state", 2).containsEntry("nest_state", 2)
+                .containsEntry("nest_shapes", 2).containsEntry("operator_cleanup", 2);
+    }
+
+    @Test void retriesReadFreshCollectionDescriptionsAndStillCheckEveryIndex() {
+        var f = new Fixture(); f.attempts = 2;
+        f.store.load(f.at.mapName(), "one");
+        assertThat(f.descriptionReads).isEqualTo(2);
+        assertThat(f.indexReads).containsEntry("nest_state", 2).containsEntry("operator_cleanup", 2);
+    }
+
+    @Test void collectionRemovalBetweenTransactionsIsNotHiddenByDescriptionReuse() {
+        var f = new Fixture(); f.store.load(f.at.mapName(), "one");
+        f.missingCollection = "nest_state";
+        assertThatThrownBy(() -> f.store.load(f.at.mapName(), "two"))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+    }
+
+    @Test void aRetryCannotReuseACollectionDescriptionFromTheFailedAttempt() {
+        var f = new Fixture(); f.attempts = 2; f.afterAttempt = () -> f.missingCollection = "nest_shapes";
+        assertThatThrownBy(() -> f.store.load(f.at.mapName(), "one"))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        assertThat(f.descriptionReads).isEqualTo(2);
+    }
+
     @Test void aBatchReadsItsClaimAndInventoryOncePerAttempt() {
         var f = new Fixture();
         assertThat(f.store.loadAll(f.at.mapName(), List.of("one", "two"))).isEmpty();
@@ -71,8 +102,10 @@ class MongoOperatorValidationCostTest {
                 "nest", "root", "state");
         final MongoCacheOperatorStateStore store;
         int attempts = 1;
+        int descriptionReads;
         Runnable afterAttempt = () -> {};
         String missingIndex;
+        String missingCollection;
 
         @SuppressWarnings("unchecked")
         Fixture() {
@@ -99,8 +132,10 @@ class MongoOperatorValidationCostTest {
             when(db.getName()).thenReturn("cache-db");
             when(db.getCollection(anyString())).thenAnswer(call -> collections.computeIfAbsent(call.getArgument(0), this::collection));
             when(db.listCollections()).thenAnswer(call -> {
+                descriptionReads++;
                 ListCollectionsIterable<Document> result = mock(ListCollectionsIterable.class);
                 var descriptions = Arrays.stream(SystemCollections.values()).flatMap(t -> t.physicalNames().stream()).distinct()
+                        .filter(n -> !n.equals(missingCollection))
                         .map(n -> new Document("name", n).append("type", "collection")).toList();
                 when(result.iterator()).thenAnswer(ignored -> cursor(descriptions));
                 when(result.filter(any(Bson.class))).thenAnswer(filtered -> {

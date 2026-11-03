@@ -32,17 +32,17 @@ class LookupRowsBatchingTest {
     void snapshotRegistrationsUseAcknowledgedBoundedUnionsBeforeOrderedTouches() throws Exception {
         CountingStore<Map<String, Object>> rows = new CountingStore<>();
         CountingStore<Set<Object>> refs = new CountingStore<>();
-        TestOutbox outbox = new TestOutbox(128);
-        for (int i = 0; i < 32; i++) rows.save(List.of(i), row("customer_id", i));
+        TestOutbox outbox = new TestOutbox(1024);
+        for (int i = 0; i < 512; i++) rows.save(List.of(i), row("customer_id", i));
         LookupProcessor processor = processor(rows, refs, outbox);
-        TestInbox inbox = snapshotOrders(32);
+        TestInbox inbox = snapshotOrders(512);
         processor.process(LookupProcessor.REGISTRATIONS, inbox);
         assertThat(inbox).isEmpty();
-        assertThat(refs.growthBatches).containsExactly(16, 16);
-        assertThat(refs.count()).isEqualTo(32);
+        assertThat(refs.growthBatches).containsExactly(256, 256);
+        assertThat(refs.count()).isEqualTo(512);
         assertThat(outbox.queue(0)).filteredOn(NestTouch.class::isInstance)
                 .extracting(item -> ((NestTouch) item).key())
-                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 32).mapToObj(i -> List.of((Object) (long) i)).toList());
+                .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 512).mapToObj(i -> List.of((Object) (long) i)).toList());
     }
 
     @Test
@@ -72,13 +72,13 @@ class LookupRowsBatchingTest {
         CountingStore<Map<String, Object>> rows = new CountingStore<>();
         CountingStore<Set<Object>> refs = new CountingStore<>();
         TestOutbox outbox = new TestOutbox(1);
-        for (int i = 0; i < 32; i++) rows.save(List.of(i), row("customer_id", i));
+        for (int i = 0; i < 512; i++) rows.save(List.of(i), row("customer_id", i));
         LookupProcessor processor = processor(rows, refs, outbox);
-        TestInbox inbox = snapshotOrders(32);
+        TestInbox inbox = snapshotOrders(512);
         processor.process(LookupProcessor.REGISTRATIONS, inbox);
-        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(inbox.size()).isEqualTo(256);
         List<NestTouch> touches = new ArrayList<>();
-        for (int turn = 0; turn < 64; turn++) {
+        for (int turn = 0; turn < 600; turn++) {
             outbox.queue(0).stream().map(NestTouch.class::cast).forEach(touches::add);
             outbox.queue(0).clear();
             if (inbox.isEmpty()) processor.tryProcess();
@@ -86,9 +86,9 @@ class LookupRowsBatchingTest {
         }
         outbox.queue(0).stream().map(NestTouch.class::cast).forEach(touches::add);
         assertThat(inbox).isEmpty();
-        assertThat(refs.growthBatches).containsExactly(16, 16);
-        assertThat(touches).hasSize(32);
-        for (int i = 0; i < 32; i++) {
+        assertThat(refs.growthBatches).containsExactly(256, 256);
+        assertThat(touches).hasSize(512);
+        for (int i = 0; i < 512; i++) {
             NestTouch touch = touches.get(i);
             assertThat(touch.key()).isEqualTo(List.of((long) i));
             assertThat(touch.onlyIfWaiting()).isTrue();

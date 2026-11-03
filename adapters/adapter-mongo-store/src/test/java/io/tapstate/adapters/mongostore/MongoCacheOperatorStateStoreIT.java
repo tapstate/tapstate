@@ -36,13 +36,70 @@ class MongoCacheOperatorStateStoreIT {
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void leaseRenewalDoesNotWaitForALocalNestWriterBlockedBeforeItsFence() {
+        withFixture(f -> {
+            var paused = new CountDownLatch(1); var resume = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("listCollections") && once.compareAndSet(false, true)) {
+                    paused.countDown(); await(resume);
+                }
+            }};
+            var field = MongoCacheDomain.class.getDeclaredField("pipelineWrites"); field.setAccessible(true);
+            var admission = (MongoPipelineWrites) field.get(f.domain);
+            try (var client = observed(listener); var workers = Executors.newFixedThreadPool(2)) {
+                var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,
+                        client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE,
+                        MongoRateHistoryStore.DEFAULT_RETENTION, null, admission), at);
+                var write = workers.submit(() -> writer.save(at.mapName(), "key", new byte[]{4}));
+                try {
+                    assertThat(paused.await(5, TimeUnit.SECONDS)).isTrue();
+                    var renewed = workers.submit(() -> f.domain.workloadClaims(BUSINESS).renew(f.claim, Duration.ofMinutes(6)));
+                    assertThat(renewed.get(5, TimeUnit.SECONDS)).isPresent();
+                } finally { resume.countDown(); }
+                write.get(15, TimeUnit.SECONDS);
+                assertThat(writer.load(at.mapName(), "key")).hasValue(new byte[]{4});
+            }
+        });
+    }
+
+    @Test void aQueuedNestWriterCannotAdoptANewExecutionAfterClaimTurnover() {
+        withFixture(f -> {
+            var paused = new CountDownLatch(1); var resume = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("listCollections") && once.compareAndSet(false, true)) {
+                    paused.countDown(); await(resume);
+                }
+            }};
+            var field = MongoCacheDomain.class.getDeclaredField("pipelineWrites"); field.setAccessible(true);
+            var admission = (MongoPipelineWrites) field.get(f.domain);
+            try (var client = observed(listener); var workers = Executors.newFixedThreadPool(2)) {
+                var at = f.at(OperatorPlacement.Resource.NEST_STATE);
+                var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,
+                        client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE,
+                        MongoRateHistoryStore.DEFAULT_RETENTION, null, admission), at);
+                var first = workers.submit(() -> writer.save(at.mapName(), "old-one", new byte[]{1}));
+                assertThat(paused.await(5, TimeUnit.SECONDS)).isTrue();
+                var second = workers.submit(() -> writer.save(at.mapName(), "old-two", new byte[]{2}));
+                try { f.domain.workloadClaims(BUSINESS).advanceExecution(f.claim, 1, Set.of(OWNER.nodeId())).orElseThrow(); }
+                finally { resume.countDown(); }
+                for (var future : List.of(first, second)) assertThatThrownBy(() -> future.get(15, TimeUnit.SECONDS))
+                        .hasCauseInstanceOf(TapstateException.class)
+                        .satisfies(error -> assertThat(((TapstateException) error.getCause()).code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(SystemCollections.CACHE_NEST_STATE.on(f.database).countDocuments()).isZero();
+            }
+        });
+    }
+
     @Test void batchReadsValidateClaimAndInventoryOnceInTheActualTransaction() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE);
             f.writer(at).save(at.mapName(), "one", new byte[]{1});
             Map<String, Integer> finds = new LinkedHashMap<>();
             Map<String, Integer> indexes = new LinkedHashMap<>();
+            var descriptions = new java.util.concurrent.atomic.AtomicInteger();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
+                if (event.getCommandName().equals("listCollections")) descriptions.incrementAndGet();
                 if (!event.getDatabaseName().equals(f.database.getName())) return;
                 String command = event.getCommandName();
                 if (command.equals("find")) finds.merge(event.getCommand().getString("find").getValue(), 1, Integer::sum);
@@ -55,6 +112,7 @@ class MongoCacheOperatorStateStoreIT {
             }
             assertThat(finds).containsEntry("workload_claims", 1).containsEntry("operator_cleanup", 1).containsEntry("nest_state", 1);
             assertThat(indexes).containsEntry("operator_cleanup", 1);
+            assertThat(descriptions).hasValue(1);
         });
     }
 
