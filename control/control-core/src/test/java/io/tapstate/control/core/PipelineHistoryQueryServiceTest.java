@@ -90,6 +90,33 @@ class PipelineHistoryQueryServiceTest {
     }
 
     @Test
+    void aRunThatHasDeliveredNothingYetReadsAsZeroRatherThanUnmeasured() {
+        RecordingHistory history = new RecordingHistory();
+        Instant first = Instant.parse("2026-09-21T09:59:00Z");
+        for (int minute = 0; minute <= 11; minute++) {
+            history.add(new RateSample("orders", first.plus(Duration.ofMinutes(minute)),
+                    Map.of("recordCount", 0L), Map.of(), null));
+        }
+        PipelineHistoryQueryService service = service(history, 1024, 25_000);
+
+        for (HistoryResolution resolution : List.of(HistoryResolution.RAW, HistoryResolution.PT5M)) {
+            PipelineMetricsHistory idle = service.query(query("2026-09-21T10:00:00Z", "2026-09-21T10:10:00Z",
+                    resolution, 100, List.of("orders"), null));
+
+            List<PipelineMetricsHistory.Point> measured = points(idle).stream()
+                    .filter(point -> point.intervalStart().isBefore(point.intervalEnd())).toList();
+            assertThat(measured).as("%s points", resolution).isNotEmpty().allSatisfy(point -> {
+                assertThat(point.recordsOut().delta()).isEqualByComparingTo("0");
+                assertThat(point.recordsOut().averageRate()).isEqualByComparingTo("0");
+                assertThat(point.bytesOut().delta()).isEqualByComparingTo("0");
+            });
+            assertThat(idle.unavailable()).as("%s unavailable", resolution)
+                    .extracting(PipelineMetricsHistory.Unavailable::metric)
+                    .doesNotContain(HistoryAggregator.RECORDS_OUT, HistoryAggregator.BYTES_OUT);
+        }
+    }
+
+    @Test
     void aggregateIsIdenticalAcrossRawBatchesAndReportsBoundedCost() {
         RecordingHistory byTwo = oneHourOfSamples();
         RecordingHistory bySeven = oneHourOfSamples();
