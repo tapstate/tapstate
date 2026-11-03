@@ -204,7 +204,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline);
         if (engine.isLost()) { var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost; }
         Optional<Throwable> failure = run != null && isCurrentRun() ? run.failure() : Optional.empty(); require();
-        if (failure.isPresent() || capture == null) return failure;
+        // An earlier capture stays bound for cleanup, not for the current run's failure diagnosis.
+        if (failure.isPresent() || capture == null || !isCurrentRun()) return failure;
         var captured = capture.captureFailure(id()); require(); return captured;
     }
     @Override public synchronized Optional<Throwable> lost(String pipeline) {
