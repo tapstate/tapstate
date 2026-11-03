@@ -289,6 +289,7 @@ io.required-dead-letter-conflict
 io.required-dead-letter-fenced
 io.schema-read-contention
 io.schema-write-contention
+io.sink-model-capacity
 io.sink-writer-progress-ambiguous
 io.srs-checkpoint-unproven
 io.srs-consumer-unavailable

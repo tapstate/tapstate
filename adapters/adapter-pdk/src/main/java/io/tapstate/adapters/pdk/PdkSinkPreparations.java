@@ -7,12 +7,6 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.SinkPreparationStore;
 import io.tapstate.core.common.TapstateException;
-import java.io.ByteArrayOutputStream;
-import java.io.DataOutputStream;
-import java.io.IOException;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.HexFormat;
 import java.util.Map;
 import java.util.Objects;
 
@@ -58,27 +52,21 @@ public final class PdkSinkPreparations {
         return new SinkPreparationStore.Input(new SinkPreparationStore.Key(scope,purpose,node.nodeId(),target.name()),modelHash(target),
                 io.tapstate.core.model.OnFullLoad.valueOf(policy.name()),fullLoad);
     }
-    /** Explicit ordered structure, including nullable type attributes; strings retain every UTF-16 code unit. */
-    public static String modelHash(TargetTable target) {
-        Objects.requireNonNull(target,"target");
-        try {
-            var bytes=new ByteArrayOutputStream();
-            try(var out=new DataOutputStream(bytes)) {
-                out.writeInt(1);text(out,target.name());out.writeInt(target.fields().size());
-                for(var field:target.fields()) {
-                    text(out,field.name());text(out,field.type());out.writeBoolean(field.primaryKey());
-                    text(out,field.inferredType()==null?null:field.inferredType().name());
-                    var numeric=field.numericType();out.writeBoolean(numeric!=null);
-                    if(numeric!=null){scalar(out,numeric.bit());scalar(out,numeric.fixed());scalar(out,numeric.unsigned());scalar(out,numeric.zerofill());scalar(out,numeric.minValue());scalar(out,numeric.maxValue());scalar(out,numeric.precision());scalar(out,numeric.scale());}
-                    var string=field.stringType();out.writeBoolean(string!=null);
-                    if(string!=null){scalar(out,string.bytes());scalar(out,string.fixed());scalar(out,string.doubleBytes());scalar(out,string.defaultValue());scalar(out,string.byteRatio());}
-                }
-                out.writeInt(target.indexes().size());
-                for(var index:target.indexes()){out.writeInt(index.fields().size());for(String field:index.fields())text(out,field);out.writeBoolean(index.unique());out.writeBoolean(index.constrainsEveryRow());}
-            }
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray()));
-        } catch(IOException|NoSuchAlgorithmException impossible){throw new IllegalStateException(impossible);}
+    /** The original encoding and hash are shared with storage without an adapter dependency. */
+    public static io.tapstate.core.common.PreparedTargetModel model(TargetTable target) {
+        return new io.tapstate.core.common.PreparedTargetModel(target.name(),target.fields().stream().map(field ->
+                new io.tapstate.core.common.PreparedTargetModel.Field(field.name(),field.type(),field.primaryKey(),field.inferredType(),field.numericType(),field.stringType())).toList(),
+                target.indexes().stream().map(index -> new io.tapstate.core.common.PreparedTargetModel.Index(index.fields(),index.unique(),index.constrainsEveryRow())).toList());
     }
-    private static void scalar(DataOutputStream out,Object value)throws IOException{text(out,value==null?null:value.toString());}
-    private static void text(DataOutputStream out,String value)throws IOException{out.writeInt(value==null?-1:value.length());if(value!=null)out.writeChars(value);}
+    public static String modelHash(TargetTable target) { return model(target).modelHash(); }
+    public static TargetTable target(byte[] canonical,io.tapstate.spi.sink.UnwindIdentity identity) {
+        var model=io.tapstate.core.common.PreparedTargetModel.decode(canonical);
+        return new TargetTable(model.name(),model.fields().stream().map(field -> new io.tapstate.spi.sink.TargetField(
+                field.name(),field.type(),field.primaryKey(),field.inferredType(),field.numericType(),field.stringType())).toList(),
+                model.indexes().stream().map(index -> new io.tapstate.spi.sink.TargetIndex(index.fields(),index.unique(),index.constrainsEveryRow())).toList(),identity);
+    }
+    public static SinkPreparationStore.Prepared prepared(PipelineIntentScope scope,PipelineNode node,PipelineNode.Purpose purpose,
+            OnFullLoad policy,boolean fullLoad,TargetTable target) {
+        return new SinkPreparationStore.Prepared(input(scope,node,purpose,policy,fullLoad,target),model(target).canonical());
+    }
 }

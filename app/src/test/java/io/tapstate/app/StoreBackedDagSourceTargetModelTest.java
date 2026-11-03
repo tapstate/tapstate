@@ -897,7 +897,7 @@ class StoreBackedDagSourceTargetModelTest {
             List<Map<String, TargetTable>> bound) {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
+            public SupplierEx<SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     io.tapstate.spi.sink.WriteMode writeMode, io.tapstate.spi.sink.DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 bound.add(target == null ? Map.of() : Map.of(target.name(), target));
@@ -905,7 +905,7 @@ class StoreBackedDagSourceTargetModelTest {
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
+            public SupplierEx<SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     io.tapstate.spi.sink.WriteMode writeMode, io.tapstate.spi.sink.DdlPolicy ddl,
                     Map<String, TargetTable> targets, PipelineNode node) {
                 bound.add(targets);
@@ -924,7 +924,7 @@ class StoreBackedDagSourceTargetModelTest {
     private static StoreBackedDagSource.SinkWriterBinder capturingMapBinder(Map<String, TargetTable> bound) {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(
+            public SupplierEx<SinkWriter> bind(
                     String connectorId, Map<String, Object> settings, io.tapstate.spi.sink.WriteMode writeMode,
                     io.tapstate.spi.sink.DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 if (target != null) {
@@ -934,7 +934,7 @@ class StoreBackedDagSourceTargetModelTest {
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(
+            public SupplierEx<SinkWriter> bind(
                     String connectorId, Map<String, Object> settings, io.tapstate.spi.sink.WriteMode writeMode,
                     io.tapstate.spi.sink.DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.putAll(targets);

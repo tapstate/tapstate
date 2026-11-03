@@ -65,5 +65,22 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
         };
         return PdkCapturePort.withRequiredNotes(exact,null,scopes);
     }
+
+    /** Current discovery cannot grant a source policy without the original configuration and artifact. */
+    SourceModelComparison modelComparison(CaptureConfig config, RequiredNoteStore notes,
+            ConnectorProvisioner provisioner, Runnable requireRun) {
+        requireRun.run();
+        if (!node.equals(config.node()) || !connectorId.equals(config.connectorId())
+                || (config.sharedNotes()==null
+                        ? !primary.owner().hasPurpose(PipelineNode.Purpose.CAPTURE)
+                        : primary.owner().kind()!=RequiredNoteOwner.Kind.CHAIN
+                                || !primary.owner().ownerId().equals(config.sharedNotes().sharedBy()))) throw unavailable();
+        var artifact = provisioner.resolve(connectorId, artifactHash);
+        if (!artifactHash.equals(artifact.contentHash())) throw unavailable();
+        var expected = ConnectorNoteOrigin.capture(connectorId, artifactHash, config.settings());
+        if (!expected.equals(notes.guardedBy(requireRun).origin(primary))) throw unavailable();
+        requireRun.run();
+        return PdkSourceModelComparison.forVerifiedArtifact(connectorId, artifact);
+    }
     private static TapstateException unavailable() { return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null); }
 }

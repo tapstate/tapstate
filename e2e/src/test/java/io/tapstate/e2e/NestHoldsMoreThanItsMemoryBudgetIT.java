@@ -96,7 +96,8 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
             String targetUri = SharedMongo.replicaSetUrl("budget_target_" + suffix);
 
             try (PreparedNativeStore storage = PreparedNativeStore.create(); ServerHandle server = tier.launch(storage);
-                    MongoEndpoints mongo = new MongoEndpoints()) {
+                    MongoEndpoints mongo = new MongoEndpoints();
+                    var backing = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
 
@@ -134,7 +135,8 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         .as("nor a reason to count an error")
                         .contains(0L);
                 assertLayerBehindMemoryWasRead(control);
-                assertOnlyTheBudgetIsHeldInMemory(control);
+                assertOnlyTheBudgetIsHeldInMemory(control, backing.getDatabase(storage.cacheDatabase()),
+                        NativePipelineScopes.current(storage, pipelineId));
             }
         }
     }
@@ -189,17 +191,27 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
      * <p>Read as the entries beside what the layer behind them holds, because either alone is satisfied by
      * a run that lost data: nothing resident and nothing stored is a pipeline that assembled nothing.
      */
-    private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control) {
+    private void assertOnlyTheBudgetIsHeldInMemory(ControlPlane control,
+            com.mongodb.client.MongoDatabase backing, io.tapstate.spi.store.PipelineIntentScope scope) {
         // Read once the two have stopped moving, not once. The metrics face publishes on its own cadence
         // and these climb as the run fills, so a single read lands somewhere on the way up - and a number
         // on the way up is under the bound below whether or not anything was ever evicted. Measured: read
         // that way, one of the two tiers passed a run in which every entry was resident.
+        // Native stores are scoped per pipeline; the legacy global stored-count metric is absent.
+        // Count only this run's root STATE placement, never child, parking, lookup or reference rows.
+        Document roots = new Document("_id.placement.scope", NativePipelineScopes.document(scope))
+                .append("_id.placement.database", backing.getName())
+                .append("_id.placement.resource", "NEST_STATE")
+                .append("_id.placement.stepId", encoded("order_doc"))
+                .append("_id.placement.pathId", encoded("[]"))
+                .append("_id.placement.namespace", encoded("state"));
         long[] settled = {-1L, -1L};
         long[] unchangedSince = {System.nanoTime()};
         Await.until("the state readings to stop moving for " + STILL, TIMEOUT,
                 () -> {
                     long entries = control.metricTotal(pipelineId, "nestStateEntries.").orElse(0L);
-                    long behind = control.metricTotal(pipelineId, "nestStateStored.").orElse(0L);
+                    long behind = io.tapstate.adapters.mongostore.SystemCollections.CACHE_NEST_STATE
+                            .on(backing).countDocuments(roots);
                     if (entries != settled[0] || behind != settled[1]) {
                         settled[0] = entries;
                         settled[1] = behind;
@@ -236,6 +248,11 @@ class NestHoldsMoreThanItsMemoryBudgetIT {
                         + "a budget that was applied.%n  metrics: %s",
                         ROOTS, MEMORY_BUDGET, control.metrics(pipelineId))
                 .isPositive();
+    }
+
+    private static String encoded(String value) {
+        return java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(value.getBytes(java.nio.charset.StandardCharsets.UTF_16BE));
     }
 
     private static List<Document> await(
