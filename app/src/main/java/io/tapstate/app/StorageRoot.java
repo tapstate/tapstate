@@ -46,6 +46,9 @@ final class StorageRoot implements AutoCloseable {
     private final Object activationLock = new Object();
     private java.util.concurrent.ExecutorService activationWorker;
     private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pendingActivation = new java.util.concurrent.atomic.AtomicReference<>();
+    private record InstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete) {}
+    private final java.util.concurrent.atomic.AtomicReference<InstallationCompletion> installationCompletion = new java.util.concurrent.atomic.AtomicReference<>();
+    private volatile boolean installationCompletionRegistered;
     private volatile boolean activationStoragePrepared;
     private boolean initialSourceTestPending;
     private volatile boolean activationFailed;
@@ -190,15 +193,76 @@ final class StorageRoot implements AutoCloseable {
     }
 
     boolean initialActivationPending() { var current = pendingActivation.get(); return current != null && !current.isDone(); }
-    boolean initialActivationCanRetry() { return activationStoragePrepared || originalSetupCreationAvailable(); }
+    boolean initialActivationCanRetry() {
+        return activationStoragePrepared || originalSetupCreationAvailable()
+                || installationCompletionPending() && runtime.businessStarted();
+    }
+    void retainInstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete) {
+        synchronized (activationLock) {
+            requireOpen();
+            if (cloud.cloud() || !installationCompletion.compareAndSet(null,
+                    new InstallationCompletion(Objects.requireNonNull(pending), Objects.requireNonNull(complete))))
+                throw new IllegalStateException("installation completion already registered");
+            installationCompletionRegistered = true;
+        }
+    }
+    private boolean installationCompletionPending() {
+        return installationCompletionRegistered && installationCompletion.get().pending().getAsBoolean();
+    }
     boolean completedInstallationActivationAllowed() {
         requireOpen();
-        if (runtime.cleanupRequired() || runtime.businessStarted()) return false;
+        if (runtime.cleanupRequired()) return false;
         var configuration = runtime.requireConfiguration();
         var preparation = configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
-        if (preparation.authScope().mode() != StorageBinding.Mode.OP || preparation.authScope().authGeneration() != 1) return false;
+        if (preparation.authScope().mode() != StorageBinding.Mode.OP) return false;
+        if (runtime.businessStarted()) {
+            if (!installationCompletionPending()) return false;
+            requirePublishedBusinessOwner(null);
+        } else if (preparation.authScope().authGeneration() != 1) return false;
         OnPremInstallation.requireActivationPreparation(configuration, preparation);
         return true;
+    }
+
+    private StorageRuntime.Bound requirePublishedBusinessOwner(StorageBindingCommit expected) {
+        requireOpen();
+        var selected = runtime;
+        if (selected.cleanupRequired()) throw StorageRuntime.unavailable();
+        var original = selected.boundForObservation().orElseThrow(StorageRuntime::unavailable);
+        var binding = original.binding(); var preparation = original.preparation();
+        if (expected != null && (!expected.binding().equals(binding) || !expected.preparation().equals(preparation)))
+            throw StorageRuntime.unavailable();
+        var configuration = selected.requireConfiguration();
+        if (!configuration.bindings().load().filter(binding::equals).isPresent()
+                || !configuration.bindings().cachePreparation().filter(preparation::equals).isPresent())
+            throw StorageRuntime.unavailable();
+        original.verifyAuthentication(); original.verifyBusiness();
+        if (cloud.cloud()) authentication.managed(); else authentication.local();
+        if (runtime != selected || selected.boundForObservation().orElseThrow(StorageRuntime::unavailable) != original)
+            throw StorageRuntime.unavailable();
+        return original;
+    }
+
+    private synchronized void completeInstallationIfReady(StorageBindingCommit expected) {
+        if (!installationCompletionPending() || !runtime.businessStarted()) return;
+        var original = requirePublishedBusinessOwner(expected); var scope = original.binding().setup();
+        phase = Phase.BUSINESS_READY;
+        initializationProgress.begin(scope, 2, true);
+        initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+        initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+        try {
+            installationCompletion.get().complete().run();
+            activationFailed = false;
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+        } catch (RuntimeException | Error failure) {
+            activationFailed = true; initializationProgress.failed(scope, failure); throw failure;
+        }
+    }
+
+    private void completeRetainedInstallation() {
+        try { completeInstallationIfReady(null); }
+        catch (TapstateException unavailable) {
+            LOG.warn("Retained installation completion failed [{}]", unavailable.code().code());
+        }
     }
 
     /** One original setup handoff; HTTP callers and their capabilities do not own its lifetime. */
@@ -209,7 +273,8 @@ final class StorageRoot implements AutoCloseable {
             if (setupInvocation != null && (!setupInvocation.binding().equals(committed.binding())
                     || !setupInvocation.preparation().equals(committed.preparation()))) throw StorageRuntime.unavailable();
             setupInvocation = committed;
-            if (phase == Phase.BUSINESS_READY && runtime.businessStarted() || initialActivationPending()) return;
+            if (phase == Phase.BUSINESS_READY && runtime.businessStarted() && !installationCompletionPending()
+                    || initialActivationPending()) return;
             activationFailed = false;
             if (activationWorker == null) activationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
                 var thread = new Thread(task, "tapstate-initial-cache-activation"); thread.setDaemon(true); return thread;
@@ -218,7 +283,13 @@ final class StorageRoot implements AutoCloseable {
             pendingActivation.set(completion);
             try {
                 activationWorker.execute(() -> {
-                    try { continuation.run(); completion.complete(null); }
+                    try {
+                        if (installationCompletionPending() && runtime.business().isPresent()) {
+                            if (!runtime.businessStarted()) throw StorageRuntime.unavailable();
+                        } else continuation.run();
+                        completeInstallationIfReady(committed);
+                        completion.complete(null);
+                    }
                     catch (RuntimeException | Error failure) {
                         activationFailed = true;
                         initializationProgress.failed(committed.binding().setup(), failure);
@@ -288,7 +359,8 @@ final class StorageRoot implements AutoCloseable {
                 initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
             }
             phase = Phase.BUSINESS_READY;
-            if (tracked) initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            if (tracked && !installationCompletionPending())
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
             if (initialSourceTestPending) {
                 initialSourceTestPending = false;
                 try { runtime.businessForLiveness().orElseThrow(StorageRuntime::unavailable).afterInitialReady(); }
@@ -398,6 +470,7 @@ final class StorageRoot implements AutoCloseable {
             LOG.warn("Retained storage startup failed [{}]", unavailable.code().code());
             if (phase != Phase.AUTH_READY) phase = Phase.CACHE_UNAVAILABLE;
         }
+        completeRetainedInstallation();
     }
 
     LocalAuthenticationContext localAuthentication() {
@@ -731,6 +804,7 @@ final class StorageRoot implements AutoCloseable {
         original.verifyBusiness();local.run();
         runtime.startRecoveredBusiness(original,retainedAssembly,running,() -> commands.guardedBy(local).complete(running));
         phase=Phase.BUSINESS_READY;
+        completeRetainedInstallation();
     }
 
     private void runInitialRecovery(StorageRecoveryCommands.Plan requested) {
@@ -758,6 +832,7 @@ final class StorageRoot implements AutoCloseable {
         configuration.bindings().guardedBy(active).complete(original.binding().setup());
         runtime.startRecoveredBusiness(original, retainedAssembly, running, () -> commands.complete(running));
         phase = Phase.BUSINESS_READY;
+        completeRetainedInstallation();
     }
 
     private static StorageBinding.Connection master(SourceResource source) {
@@ -767,7 +842,14 @@ final class StorageRoot implements AutoCloseable {
     }
 
     private void resumeRetainedBusiness() {
-        if (retainedAssembly == null || runtime.cleanupRequired() || runtime.business().isPresent()) return;
+        if (runtime.cleanupRequired()) return;
+        if (runtime.business().isPresent()) {
+            if (phase != Phase.BUSINESS_READY && runtime.businessStarted()) {
+                requirePublishedBusinessOwner(null); phase = Phase.BUSINESS_READY;
+            }
+            completeRetainedInstallation(); return;
+        }
+        if (retainedAssembly == null) return;
         if (runtime.requireConfiguration().setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE) return;
         try {
             var original = runtime.current().orElseThrow(StorageRuntime::unavailable);
@@ -776,7 +858,9 @@ final class StorageRoot implements AutoCloseable {
         } catch (TapstateException unavailable) {
             // Formal login remains usable while a missing or failed business domain stays gated.
             phase = Phase.AUTH_READY;
+            return;
         }
+        completeRetainedInstallation();
     }
 
     private void restoreAuthentication() {

@@ -215,10 +215,6 @@ class StorageRootConfiguration {
             if (factory == null) throw StorageRuntime.unavailable();
             return factory.create(original);
         }, targets::getObject);
-            if (installation != null) {
-                try { installation.afterNormalStartup(); }
-                catch (io.tapstate.core.common.TapstateException unavailable) { /* Keep diagnostics available without reopening installation. */ }
-            }
         };
     }
 }

@@ -73,6 +73,26 @@ class CloudStorageContinuationTest {
         @Override public void close() { try { root.close(); } finally { caches.close(); configurations.close(); } }
     }
 
+    @Test void authenticationRecoveryRepublishesTheSameAvailableCloudBusinessWithoutReassembly() {
+        try (var f = new Fixture()) {
+            var available = new java.util.concurrent.atomic.AtomicBoolean(true); var business = f.business();
+            when(business.available()).thenAnswer(ignored -> available.get()); f.continueWith(business);
+            var candidate = mock(MongoCacheDomain.class);
+            f.caches.when(() -> MongoCacheDomain.connect(any(), any(), anyString(), any(), any())).thenReturn(candidate);
+            available.set(false);
+            doThrow(StorageRuntime.unavailable()).doThrow(StorageRuntime.unavailable()).doNothing().when(f.configuration)
+                    .requireAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            f.root.managedAuthentication();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.AUTH_READY);
+            available.set(true); f.root.managedAuthentication();
+            assertThat(f.root.phase()).isEqualTo(StorageRoot.Phase.BUSINESS_READY);
+            assertThat(f.root.runtime().business()).contains(business);
+            verify(business).start(); verify(business).afterInitialReady(); verify(candidate).close();
+            verify(f.cache).prepareFirstAuth(f.grant); verify(f.cache).prepareInitialBusiness(eq(PREPARATION), any());
+            verify(f.target, never()).test(any(), any(), any());
+        }
+    }
+
     @Test void initialActivationNeverCallsTheDefaultTargetBeforeBusinessReadiness() {
         try (var f = new Fixture()) {
             doThrow(new AssertionError("default target must run only after readiness")).when(f.target).test(any(), any(), any());

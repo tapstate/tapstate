@@ -68,13 +68,14 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                 new MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()), target, root::configurationEndpoint,
                 new AuditGate(record -> root.runtime().requireConfiguration().audit().record(record), clock), clock, root::requireActive,
                 this::continueSetup, root::coordinateSetup, this::prepareConfiguration, root.initializationProgress());
+        root.retainInstallationCompletion(() -> !installationReady, this::afterNormalStartup);
     }
 
     InstallationFiles files() { return files; }
     StorageSetupService setups() { return setups; }
     boolean normalStartupAllowed() { return states.load().phase() == StorageSetupStateStore.Phase.COMPLETE; }
     boolean firstAdministratorReady() {
-        return installationReady && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
+        return !closed && installationReady && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
     }
 
     void attach(Connector connector) {
@@ -132,8 +133,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         requireManagementRequest(request);
         if (!credentialRequired) {
             var state = states.load();
-            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE && root.phase() == StorageRoot.Phase.BUSINESS_READY
-                    && root.runtime().businessStarted()
+            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE && firstAdministratorReady()
                     ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
             return capabilities.authorizeLocal(state.scope(), purpose);
         }
@@ -207,14 +207,15 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     }
 
     private void continueSetup(StorageBindingCommit committed) {
-        root.handoffActivation(committed, () -> {
-            root.continueOnPremSetup(committed, target);
-            afterNormalStartup();
-        });
+        root.handoffActivation(committed, () -> root.continueOnPremSetup(committed, target));
     }
-    void afterNormalStartup() {
+    synchronized void afterNormalStartup() {
+        if (closed) throw StorageRuntime.unavailable();
+        root.requireActive();
+        if (installationReady) return;
         var status = states.load();
-        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY) throw StorageRuntime.unavailable();
+        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY
+                || !root.runtime().businessStarted()) throw StorageRuntime.unavailable();
         files.locked(() -> {
             var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash()));
             if (files.capability().filter(value -> value.purpose() == StorageSetupStateStore.Purpose.SETUP).isPresent()) files.removeCapability();
@@ -327,7 +328,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (state.phase() != StorageSetupStateStore.Phase.LOCAL_SETUP) {
             var original = root.snapshot(caller, active);
             boolean complete = state.phase() == StorageSetupStateStore.Phase.COMPLETE;
-            boolean ready = complete && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
+            boolean ready = complete && firstAdministratorReady();
             if (caller.initialInstallationRecovery() && !root.initialActivationPending() && !root.initialActivationCanRetry()) {
                 var current = root.runtime().requireConfiguration().recoveryCommands().guardedBy(active).current(caller.cache());
                 return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), current.map(StorageRecoveryCommands.Plan::operationId).orElse(state.scope().operationId()),
@@ -335,9 +336,12 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                         StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION, original.health(),
                         List.of("storage.status", "storage.setup.status", "storage.test", "storage.setup.commit", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status"), false);
             }
+            var businessPhase = original.businessPhase();
+            if (ready) businessPhase = StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED;
+            else if (complete && root.runtime().businessStarted()) businessPhase = StorageControlDispatcher.BusinessPhase.AUTH_READY;
             return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), state.scope().operationId(),
                     original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
-                    ready ? StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED : original.businessPhase(),
+                    businessPhase,
                     original.health(), ready ? List.of("storage.status", "storage.setup.status", "first-admin")
                             : original.bindingVersion() > 0 ? List.of("storage.status", "storage.setup.status", "storage.setup.activate")
                             : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), false,
@@ -369,5 +373,5 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (!(attributes instanceof org.springframework.web.context.request.ServletRequestAttributes servlet)) throw InstallationFiles.refused();
         return servlet.getRequest();
     }
-    @Override public void close() { closed = true; capabilities.close(); }
+    @Override public synchronized void close() { closed = true; capabilities.close(); }
 }

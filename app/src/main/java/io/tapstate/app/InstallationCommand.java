@@ -93,7 +93,7 @@ final class InstallationCommand {
         if (configuration == null || isLiveFirstAdministratorEntry(files)) return false;
         var binding = configuration.bindings().load().orElseThrow(InstallationFiles::refused);
         var preparation = configuration.bindings().cachePreparation().orElseThrow(InstallationFiles::refused);
-        if (binding.mode() != StorageBinding.Mode.OP || preparation.authScope().authGeneration() != 1) return false;
+        if (binding.mode() != StorageBinding.Mode.OP) return false;
         InstallationSetupStates.requireOriginal(files.stage().scope(), binding.setup());
         OnPremInstallation.requireActivationPreparation(configuration, preparation);
         return true;
