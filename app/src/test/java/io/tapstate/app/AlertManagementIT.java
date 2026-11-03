@@ -225,7 +225,9 @@ class AlertManagementIT {
     @Test void requestsCannotChooseScopeAndPreviewUsesTheRealEscapingRendererWithoutSending(){
         AlertEvaluationHostIT.withFixture(f->{var s=service(f);assertThatThrownBy(()->call(s,"center",map("authorityId","other"))).isInstanceOf(TapstateException.class);
             var p=call(s,"preview",map("kind","FAULT","channel","email","messages",messages(new MessageSettings("<script>","","<b>literal</b>",""))));
-            assertThat(text(p,"html")).contains("&lt;script&gt;","&lt;b&gt;").doesNotContain("<script>","<b>literal</b>");assertThat(f.store().dueIntents(T.plusSeconds(300),null,100).rows()).isEmpty();
+            assertThat(p.get("html")).isInstanceOfSatisfying(String.class,html->assertThat(html)
+                    .contains("&lt;script&gt;","&lt;b&gt;").doesNotContain("<script>","<b>literal</b>"));
+            assertThat(f.store().dueIntents(T.plusSeconds(300),null,100).rows()).isEmpty();
         });
     }
     @Test void currentEpisodeLinksRetainLiveQualityAndOriginalThresholds(){

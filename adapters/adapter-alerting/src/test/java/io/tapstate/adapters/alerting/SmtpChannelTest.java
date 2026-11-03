@@ -69,7 +69,8 @@ class SmtpChannelTest {
         try (Fixture fixture = new Fixture(true, Behavior.NORMAL);
                 SmtpChannel channel = channel(fixture, SmtpChannel.Encryption.IMPLICIT_TLS, SmtpChannel.Authentication.PLAIN, tls.client, "localhost")) {
             Instant at = Instant.now();
-            var facts = new NotificationRenderer.Facts(NotificationRenderer.Kind.CHANNEL_TEST, "test-delivery", 0, at, List.of(), 0, null, List.of(), "test-1", "Email");
+            Instant initiated = Instant.parse("2026-10-21T06:07:08Z");
+            var facts = new NotificationRenderer.Facts(NotificationRenderer.Kind.CHANNEL_TEST, "test-delivery", 0, initiated, List.of(), 0, null, List.of(), "test-1", "Email");
             var rendered = new NotificationRenderer().render(facts, MessageSettings.empty()).snapshot();
             byte[] data = EmailMime.freeze("test-delivery", at, FROM, TO, rendered).bytes();
             Request request = Request.channelTest(new Destination(SCOPE, "email", "receiver", "mailbox", "binding-1"),
@@ -78,7 +79,9 @@ class SmtpChannelTest {
             assertThat(fixture.data.get()).isEqualTo(new String(data, StandardCharsets.US_ASCII));
             String part = fixture.data.get().split("Content-Transfer-Encoding: base64\r\n\r\n", -1)[1].split("\r\n--", -1)[0];
             String visible = new String(java.util.Base64.getMimeDecoder().decode(part), StandardCharsets.UTF_8);
-            assertThat(visible).contains("[TEST]", "test-1", at.toString()).doesNotContain("Episode:", "pipeline.failed");
+            assertThat(visible).contains("[TEST] Email", "Channel: Email", "Initiated at: 2026-10-21 06:07:08 UTC",
+                    "It does not represent a real fault.", "Save any changes in Tapstate separately.")
+                    .doesNotContain("test-1", "test-delivery", "Episode:", "pipeline.failed");
             assertThat(fixture.authBeforeTls).hasValue(0); assertThat(fixture.calls).hasValue(1);
         }
     }
