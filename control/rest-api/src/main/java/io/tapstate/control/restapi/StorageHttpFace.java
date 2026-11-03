@@ -29,13 +29,15 @@ public class StorageHttpFace {
     }
 
     @Bean
-    HandlerMapping admittedRuntimeHandlers(ObjectProvider<RuntimeHttpHandlers> runtimes, ApiSecurityErrorWriter errors) {
+    HandlerMapping admittedRuntimeHandlers(ObjectProvider<RuntimeHttpHandlers> runtimes, ApiSecurityErrorWriter errors,
+            io.tapstate.control.core.OperationRegistry operations) {
+        var declared = new RuntimeRouteMappings(operations);
         var mapping = new AbstractHandlerMapping() {
             @Override protected Object getHandlerInternal(HttpServletRequest request) throws Exception {
                 var runtime = runtimes.getIfAvailable();
                 var handler = runtime == null ? null : runtime.handlerFor(request);
                 if (handler != null) return handler;
-                if (request.getRequestURI().startsWith(request.getContextPath() + "/api/"))
+                if (request.getRequestURI().startsWith(request.getContextPath() + "/api/") && declared.matches(request))
                     return (HttpRequestHandler)(input, output) -> errors.write(output, ControlError.STORAGE_UNAVAILABLE, Map.of());
                 return null;
             }
