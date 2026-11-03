@@ -725,11 +725,14 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             long weight = PayloadBytes.of(event);
             if (weight > RootWrites.BYTES - inputBytes) break;
             inputBytes += weight;
-            if (touched.containsKey(key) || recentReferenceStates.get(key) == ReferenceState.ABSENT) continue;
+            if (touched.containsKey(key)) continue;
             if (!keys.add(key) || keys.size() == RootWrites.KEYS) break;
         }
         if (keys.size() < 2) return false;
-        Map<Object, RootAssembly> loaded = store.loadAll(keys);
+        // Known absence still admits a root to the wave; only unknown keys need backend reads.
+        Set<Object> unknown = new LinkedHashSet<>(keys);
+        unknown.removeIf(key -> recentReferenceStates.get(key) == ReferenceState.ABSENT);
+        Map<Object, RootAssembly> loaded = unknown.isEmpty() ? Map.of() : store.loadAll(unknown);
         long retainedBytes = 0;
         boolean withinBudget = true;
         for (Object key : keys) {

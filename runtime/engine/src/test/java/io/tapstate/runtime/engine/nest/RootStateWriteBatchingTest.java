@@ -67,6 +67,136 @@ class RootStateWriteBatchingTest {
         assertArrayDocuments(f.drain(), 32);
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "false,1", "true,1", "false,15", "true,15",
+            "false,16", "true,16", "false,64", "true,64"})
+    void knownAbsentRootsRemainInTheBoundedWriteWave(boolean folding, int absentCount) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        wakeAbsent(f, absentCount);
+        f.roots.singleReads = 0;
+        f.feed(64, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isEqualTo(4 - absentCount / 16);
+        assertThat(f.roots.batchReadKeys).allSatisfy(keys -> {
+            assertThat(keys.size()).isLessThanOrEqualTo(16);
+            assertThat(keys).allSatisfy(key -> assertThat((Integer) ((List<?>) key).getFirst())
+                    .isGreaterThanOrEqualTo(absentCount));
+        });
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16, 16, 16, 16);
+        assertEmptyArrayDocuments(f.drain(), 64);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsenceAndExistingChildStateShareOneWave(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        TestInbox children = new TestInbox();
+        for (Object item : lineRows(16)) {
+            if ((Integer) ((Envelope) item).after().get("order_id") % 2 == 1) children.add(item);
+        }
+        f.assembler.process(1, children);
+        TestInbox wakes = new TestInbox();
+        for (int id = 0; id < 16; id += 2) wakes.add(new NestTouch(List.of(id), 0, Map.of(), true, false));
+        f.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(), wakes);
+        f.roots.singleReads = 0; f.roots.batchReadKeys.clear();
+        f.roots.singleWrites = 0; f.roots.batches.clear();
+        f.feed(16, false);
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReadKeys).hasSize(1).first().asList().hasSize(8);
+        assertThat(f.roots.singleWrites).isZero();
+        assertThat(f.roots.batches).containsExactly(16);
+        assertThat(f.drain()).hasSize(16).allSatisfy(document -> {
+            int id = (Integer) document.after().get("order_id");
+            assertThat((List<?>) document.after().get("lines")).hasSize(id % 2 == 1 ? 2 : 0);
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+        });
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsentWaveFailureRetainsInputsAndReplaysBeforeTheWatermark(boolean folding) throws Exception {
+        RecordingStore durable = new RecordingStore();
+        var policy = folding ? NestSendPolicy.within(0) : NestSendPolicy.everyChange();
+        Fixture failed = new Fixture(ARRAY_TREE, policy, 128, durable, true, NestClock.SYSTEM);
+        wakeAbsent(failed, 16);
+        durable.failuresLeft = 1;
+        TestInbox inbox = failed.inbox(16, false);
+        assertThatThrownBy(() -> failed.assembler.process(0, inbox))
+                .isInstanceOf(IllegalStateException.class).hasMessage("state batch failed");
+        assertThat(inbox.size()).isEqualTo(16);
+        assertThat(failed.drainRaw()).isEmpty();
+        Fixture replay = new Fixture(ARRAY_TREE, policy, 1, durable, true, NestClock.SYSTEM);
+        replay.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        Watermark frontier = new Watermark(FrontierOrders.pack("order", at(16)), replay.axes.axisOf("order"));
+        List<Envelope> documents = new ArrayList<>();
+        boolean accepted = false;
+        for (int attempt = 0; attempt < 20 && !accepted; attempt++) {
+            List<Object> downstream = replay.drainRaw();
+            assertThat(downstream).noneMatch(Watermark.class::isInstance);
+            downstream.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+            accepted = replay.assembler.tryProcessWatermark(0, frontier);
+        }
+        assertThat(accepted).isTrue();
+        List<Object> last = replay.drainRaw();
+        assertThat(last.getLast()).isEqualTo(frontier);
+        last.stream().filter(Envelope.class::isInstance).map(Envelope.class::cast).forEach(documents::add);
+        assertEmptyArrayDocuments(documents, 16);
+    }
+
+    @Test void knownAbsentInputsStillRespectTheWaveByteBudget() throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), false);
+        wakeAbsent(f, 2);
+        f.roots.singleReads = 0;
+        String wide = "x".repeat(5 * 1024 * 1024);
+        TestInbox inbox = new TestInbox();
+        for (int id = 0; id < 2; id++) inbox.add(Envelope.read(id, "order",
+                row("order_id", id, "cust_ref", "C1", "wide", wide), null).withOrder(at(id + 1)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        assertThat(f.roots.singleReads).isZero();
+        assertThat(f.roots.batchReads).isZero();
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.roots.singleWrites).isEqualTo(2);
+        assertThat(f.drain()).hasSize(2);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void knownAbsenceDoesNotChangeRepeatedRootVersionSemantics(boolean folding) throws Exception {
+        Fixture f = arrayFixture(new RecordingStore(), folding);
+        wakeAbsent(f, 1);
+        TestInbox inbox = f.inbox(32, false);
+        inbox.add(Envelope.read(99, "order", row("order_id", 0, "cust_ref", "C1", "version", 99), null)
+                .withOrder(at(100)));
+        f.assembler.process(0, inbox);
+        assertThat(inbox).isEmpty();
+        List<Envelope> documents = f.drain();
+        assertThat(documents).hasSize(folding ? 32 : 33);
+        assertThat(documents.stream().filter(e -> e.after().get("order_id").equals(0))
+                .map(e -> e.after().get("version")).toList())
+                .containsExactlyElementsOf(folding ? List.of(99) : List.of(0, 99));
+    }
+
+    private static void wakeAbsent(Fixture f, int count) {
+        TestInbox wakes = new TestInbox();
+        for (int id = 0; id < count; id++) wakes.add(new NestTouch(List.of(id), 0, Map.of(), false, true));
+        f.assembler.process(ARRAY_TREE.lookups().getFirst().touchOrdinal(), wakes);
+        assertThat(wakes).isEmpty();
+        assertThat(f.drainRaw()).isEmpty();
+    }
+
+    private static void assertEmptyArrayDocuments(List<Envelope> documents, int count) {
+        assertThat(documents).hasSize(count);
+        assertThat(documents).extracting(e -> e.after().get("order_id")).doesNotHaveDuplicates();
+        assertThat(documents).allSatisfy(document -> {
+            assertThat((List<?>) document.after().get("lines")).isEmpty();
+            assertThat(document.after()).containsEntry("customer", row("customer_id", "C1", "name", "Ada"));
+        });
+    }
+
     @Test void rootPrefetchFailureKeepsEveryInputAndMakesNoWrites() throws Exception {
         Fixture f = arrayFixture(new RecordingStore(), false);
         f.assembler.process(1, lineRows(16));
@@ -135,9 +265,12 @@ class RootStateWriteBatchingTest {
         assertThat(f.drain()).hasSize(32).allSatisfy(e -> assertThat((List<?>) e.after().get("lines")).isEmpty());
     }
 
-    @Test void arrayRootBackpressureKeepsTheNextWaveFresh() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void arrayRootBackpressureKeepsTheNextWaveFresh(boolean knownAbsent) throws Exception {
         Fixture f = new Fixture(ARRAY_TREE, NestSendPolicy.everyChange(), 1, new RecordingStore(), false, NestClock.SYSTEM);
-        f.assembler.process(1, lineRows(32));
+        if (knownAbsent) wakeAbsent(f, 32);
+        else f.assembler.process(1, lineRows(32));
         f.roots.batches.clear();
         TestInbox inbox = f.inbox(32, false);
         f.assembler.process(0, inbox);
