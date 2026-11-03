@@ -134,13 +134,13 @@ class AViewWritesWithItsDeclaredSettingsTest {
         Map<String, Object> settings;
 
         @Override
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
             throw new AssertionError("a view sink must be bound with its full-load policy");
         }
 
         @Override
-        public SupplierEx<? extends SinkWriter> bind(String connector, Map<String, Object> settings,
+        public SupplierEx<SinkWriter> bind(String connector, Map<String, Object> settings,
                 WriteMode mode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node,
                 OnFullLoad policy, boolean fullLoad) {
             this.mode = mode;

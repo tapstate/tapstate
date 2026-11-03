@@ -67,6 +67,19 @@ final class NativePipelineRecovery {
         return views.pipelineObservations(summary.targetScope()).read(id).map(io.tapstate.core.lifecycle.Observation::failure)
                 .map(io.tapstate.core.lifecycle.ObservationFailure::code).orElse(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE.code());
     }
+    StoreBackedDagSource.CapturedStartGuard capturedStartGuard() {
+        return new StoreBackedDagSource.CapturedStartGuard() {
+            @Override public Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
+                return inspectCaptured(pass,snapshot,models);
+            }
+            @Override public SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
+                requireAvailable();pass.requirePipeline(pass.scope().pipelineId());
+                var retained=captures.retainedPlanningModels(pass,snapshot,models);
+                requireAvailable();return retained;
+            }
+        };
+    }
+
     Map<String,String> inspectCaptured(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot snapshot,SourceModelSnapshot models) {
         requireAvailable();String id=pass.scope().pipelineId();pass.requirePipeline(id);
         var authored=StoredArtifacts.requirePipeline(snapshot,id);
