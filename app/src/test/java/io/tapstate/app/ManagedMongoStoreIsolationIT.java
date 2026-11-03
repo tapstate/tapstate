@@ -1434,7 +1434,17 @@ class ManagedMongoStoreIsolationIT {
                     publish.countDown();
                     assertThat(response.finished.await(60,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
                     assertThat(response.failure.get()).as("the original HTTP reply meets an actually reset client socket").isNotNull();
-                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
+                    try {
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(() -> {
+                            var progress = root.initializationProgress().snapshot(original).orElseThrow();
+                            if (progress.state() == io.tapstate.control.core.StorageInitializationProgress.State.FAILED)
+                                throw new AssertionError("Initial CACHE activation failed: " + progress);
+                            return !root.initialActivationPending() && root.runtime().businessStarted();
+                        });
+                    } catch (org.awaitility.core.ConditionTimeoutException timeout) {
+                        throw new AssertionError("Initial CACHE activation did not finish within 60 seconds; progress="
+                                + root.initializationProgress().snapshot(original), timeout);
+                    }
                     assertThat(root.runtime().business()).contains(ownerRef.get());
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                     assertCloudStatus(application,temporary,401);
