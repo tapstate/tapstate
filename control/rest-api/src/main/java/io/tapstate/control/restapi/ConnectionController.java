@@ -54,7 +54,11 @@ class ConnectionController {
                 MalformedRequest.require(request, "the request must carry a connection to test");
         MalformedRequest.requireText(body.id(), "a connection `id` is required");
         MalformedRequest.requireText(body.connectorId(), "a `connectorId` is required");
-        return testService.test(body.id(), body.connectorId(), body.settings(), AuthenticatedCaller.subject());
+        try { return testService.test(body.id(), body.connectorId(), body.settings(), AuthenticatedCaller.subject()); }
+        catch (io.tapstate.core.common.TapstateException failure) {
+            if ("connector.instances-busy".equals(failure.code().code())) throw new UnavailableCodedException(failure);
+            throw failure;
+        }
     }
 
     @Verb("connection.test-result")

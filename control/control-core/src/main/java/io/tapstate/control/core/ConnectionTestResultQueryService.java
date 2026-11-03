@@ -19,9 +19,13 @@ import java.util.Optional;
 public final class ConnectionTestResultQueryService {
 
     private final ConnectionTestResultStore store;
+    private final java.util.function.Predicate<String> readable;
 
     public ConnectionTestResultQueryService(ConnectionTestResultStore store) {
-        this.store = Objects.requireNonNull(store, "store");
+        this(store, ignored -> true);
+    }
+    public ConnectionTestResultQueryService(ConnectionTestResultStore store, java.util.function.Predicate<String> readable) {
+        this.store = Objects.requireNonNull(store, "store"); this.readable = Objects.requireNonNull(readable);
     }
 
     /**
@@ -30,6 +34,7 @@ public final class ConnectionTestResultQueryService {
      */
     public Optional<ConnectionTestReport> find(String connectionId) {
         Objects.requireNonNull(connectionId, "connectionId");
+        if (!readable.test(connectionId)) return Optional.empty();
         return store.find(connectionId)
                 .map(ConnectionTestResultRedactor::hideUntrustedDiagnostics)
                 .map(ConnectionTestReport::from);

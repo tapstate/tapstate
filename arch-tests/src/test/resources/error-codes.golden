@@ -192,6 +192,7 @@ connector.state-value-unsupported
 connector.target-identity-check-failed
 connector.target-identity-conflict
 connector.test-failed
+connector.test-timeout
 connector.tls-material-cleanup-failed
 connector.tls-trust-invalid
 connector.write-failed

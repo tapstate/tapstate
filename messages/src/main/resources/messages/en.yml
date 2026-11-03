@@ -757,6 +757,9 @@ connector.release-failed:
 connector.discover-failed:
   message: "Connector '{connector}' could not discover its schema: {detail}."
   solution: "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."
+connector.test-timeout:
+  message: "Testing '{connector}' exceeded {timeout}; inspect its current result before an explicit retry."
+  solution: "Check the target and retry explicitly when the original test resources have ended."
 connector.test-failed:
   message: "Connector '{connector}' could not complete its connection test: {detail}."
   solution: "The connector failed while testing; check the connection settings and that the target is reachable."

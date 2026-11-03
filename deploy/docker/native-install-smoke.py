@@ -130,32 +130,31 @@ def install(args):
         database = "image_smoke_" + layer
         candidate[layer] = {"kind": "MONGODB", "uri": args.mongo.format(database=database), "database": database}
     original = {"operationId": capability["operationId"], "generation": capability["generation"], "candidate": candidate}
+    original_process = command("docker", "inspect", "-f", "{{.State.Pid}} {{.State.StartedAt}} {{.RestartCount}}", args.server).strip()
     stamps = {}
-    for layer in ("CONFIG", "CACHE", "MASTER"):
+    for layer in ("CACHE",):
         tested = request(args.server, "/api/storage/test", {**original, "layer": layer}, stage, capability,
                 label="test-" + layer)
         stamps[layer] = tested["testStamp"]
     committed = request(args.server, "/api/storage/setup/commit", {**original, "testStamps": stamps}, stage, capability)
-    if committed["setupPhase"] != "COMPLETE":
-        raise RuntimeError("the original three-store setup did not complete")
-    await_entry(args.server, "RESTART_REQUIRED")
-    command("docker", "stop", "--time", "30", args.server)
-    if command("docker", "inspect", "-f", "{{.State.ExitCode}}", args.server).strip() != b"0":
-        raise RuntimeError("the setup process did not exit orderly before replacement")
-    command("docker", "start", args.server)
+    if committed["setupPhase"] not in ("STORAGE_BOUND", "COMPLETE"):
+        raise RuntimeError("the original CACHE setup was not saved")
     await_entry(args.server, "FIRST_ADMIN_REQUIRED")
+    current_process = command("docker", "inspect", "-f", "{{.State.Pid}} {{.State.StartedAt}} {{.RestartCount}}", args.server).strip()
+    if current_process != original_process:
+        raise RuntimeError("the original setup process was restarted before first administrator entry")
     command("docker", "exec", args.server, "java", "-jar", JAR,
             "installation", "--authorize", f"--tapstate.installation.directory={DIRECTORY}")
     stage = document(args.server, "stage")
     capability = document(args.server, "capability")
     if capability["purpose"] != "FIRST_ADMIN":
-        raise RuntimeError("the restarted installation did not issue a FIRST_ADMIN capability")
+        raise RuntimeError("the activated installation did not issue a FIRST_ADMIN capability")
     created = request(args.server, "/installation/first-admin",
             {"username": args.username, "password": args.password}, stage, capability)
     if created["phase"] != "COMPLETE":
         raise RuntimeError("the first administrator was not created")
     await_entry(args.server, "LOGIN")
-    print("Verified three-store setup, orderly restart, first administrator and normal login entry")
+    print("Verified CACHE-only setup in the original process, first administrator and normal login entry")
 
 
 def main():

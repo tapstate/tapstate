@@ -115,10 +115,14 @@ public final class StorageControlDispatcher {
             }
             case "storage.setup.commit" -> {
                 input.only("operationId", "generation", "candidate", "testStamps"); setupScope(input, caller);
-                var stamps = input.child("testStamps"); stamps.only("CONFIG", "CACHE", "MASTER");
+                var stamps = input.child("testStamps"); stamps.only("CACHE");
                 Map<StorageSetupService.Layer,String> proofs = new EnumMap<>(StorageSetupService.Layer.class);
-                for (var layer : StorageSetupService.Layer.values()) proofs.put(layer, stamps.text(layer.name()));
+                proofs.put(StorageSetupService.Layer.CACHE, stamps.text("CACHE"));
                 yield setup(available(setups).commit(caller.subject(), caller.setup(), active, candidate(input.child("candidate")), proofs));
+            }
+            case "storage.setup.activate" -> {
+                input.only("operationId", "generation", "bindingVersion"); setupScope(input, caller);
+                yield setup(available(setups).activate(caller.subject(), caller.setup(), active, input.number("bindingVersion", 1)));
             }
             case "storage.setup.status" -> {
                 input.only("operationId"); originalSetup(input, caller); yield setup(available(setups).status(caller.setup(), active));
@@ -198,7 +202,8 @@ public final class StorageControlDispatcher {
         return new ConfigurationImportService.Submission(input.text("transfer", 8 * 1024 * 1024), input.text("transferKey", 4096), values);
     }
     private static Map<String,Object> snapshot(Snapshot value) {
-        var out = new LinkedHashMap<String,Object>(); out.put("mode", value.mode().name()); out.put("clusterId", value.clusterId());
+        var out = new LinkedHashMap<String,Object>(); out.put("mode", value.mode().name());
+        out.put("defaultSourceId", value.bindingVersion() > 0 ? io.tapstate.spi.store.StorageBinding.defaultSourceId(value.mode()) : null); out.put("clusterId", value.clusterId());
         out.put("operationId", value.operationId()); out.put("setupGeneration", value.setupGeneration()); out.put("bindingVersion", value.bindingVersion());
         out.put("authGeneration", value.authGeneration()); out.put("stateVersion", value.stateVersion()); out.put("setupPhase", value.setupPhase());
         out.put("businessPhase", value.businessPhase().name()); var health = new LinkedHashMap<String,Object>();
@@ -226,8 +231,11 @@ public final class StorageControlDispatcher {
         return out;
     }
     private static Map<String,Object> setup(StorageSetupService.Status value) {
-        return Map.of("mode", value.mode().name(), "clusterId", value.clusterId(), "operationId", value.operationId(), "generation", value.generation(),
-                "setupPhase", value.setupPhase().name(), "bindingVersion", value.bindingVersion());
+        var out = new LinkedHashMap<String,Object>();
+        out.put("mode", value.mode().name()); out.put("clusterId", value.clusterId()); out.put("operationId", value.operationId());
+        out.put("generation", value.generation()); out.put("setupPhase", value.setupPhase().name()); out.put("bindingVersion", value.bindingVersion());
+        out.put("defaultSourceId", value.bindingVersion() > 0 ? io.tapstate.spi.store.StorageBinding.defaultSourceId(value.mode()) : null);
+        return out;
     }
     private Map<String,Object> recovery(StorageRecoveryCommands.Plan plan) {
         var out = new LinkedHashMap<String,Object>(); out.put("operationId", plan.operationId()); out.put("previousOperationId", plan.previousOperationId());

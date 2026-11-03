@@ -242,7 +242,7 @@ class ManagedMongoStoreIsolationIT {
         return client.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
     }
 
-    @Test void opInstallationRestartsCreatesItsFirstAdministratorAndCopiesRealSourceValues() throws Exception {
+    @Test void opCacheOnlySetupKeepsItsPidCreatesFirstAdministratorAndCopiesRealSourceValues() throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configDb = "op_config_" + suffix, cacheDb = "op_cache_" + suffix, masterDb = "op_master_" + suffix, sourceDb = "op_source_" + suffix;
         String user = "op_" + suffix;
@@ -263,7 +263,7 @@ class ManagedMongoStoreIsolationIT {
                         "cache", Map.of("kind", "MONGODB", "uri", uri(user, cacheDb), "database", cacheDb),
                         "master", Map.of("kind", "MONGODB", "uri", uri(user, masterDb), "database", masterDb));
                 var stamps = new java.util.LinkedHashMap<String,Object>();
-                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                     var tested = management.post().uri("/api/storage/test").body(Map.of("operationId", setup.scope().operationId(),
                             "generation", setup.scope().generation(), "candidate", candidate, "layer", layer.name())).retrieve().body(Map.class);
                     stamps.put(layer.name(), tested.get("testStamp"));
@@ -271,14 +271,17 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(files.configurationUri()).isEmpty();
                 var committed = management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
                         "generation", setup.scope().generation(), "candidate", candidate, "testStamps", stamps)).retrieve().body(Map.class);
-                assertThat(committed.get("setupPhase")).isEqualTo("COMPLETE");
+                assertThat(committed.get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    assertThat(process.process.isAlive()).isTrue();
+                    assertThat(process.process.pid()).isEqualTo(initialPid);
+                    assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
+                            .containsEntry("entry", "FIRST_ADMIN_REQUIRED");
+                });
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.CONFIGURED);
                 assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
                 assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
-                assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
-                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "RESTART_REQUIRED", "management", false));
-                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
-                assertThat(files.capability()).isEmpty();
                 assertThat(files.configurationUri()).contains(uri(user, configDb));
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
@@ -290,14 +293,7 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(rule.getString("deployment")).isEqualTo("ON_PREM");
                     assertThat(rule.get("body", Document.class)).containsEntry("enabled", true);
                 }
-                assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isZero();
-            }
-            String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
-            try (var process = installationProcess(files, setupSeeds, "restarted")) {
-                assertThat(process.process.pid()).isNotEqualTo(initialPid);
-                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTARTED);
-                assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class))
-                        .containsExactlyInAnyOrderEntriesOf(Map.of("mode", "OP", "entry", "FIRST_ADMIN_REQUIRED", "management", false));
+                String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
                 var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 assertThat(firstAdmin.purpose()).isEqualTo(io.tapstate.spi.store.StorageSetupStateStore.Purpose.FIRST_ADMIN);
                 var created = process.management(files, firstAdmin.token()).post().uri("/installation/first-admin")
@@ -319,6 +315,12 @@ class ManagedMongoStoreIsolationIT {
                 var admitted = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
                 assertThat(((List<?>)admitted.get("allowedActions")).containsAll(List.of("configuration.export", "configuration.import.preflight",
                         "configuration.import.commit", "configuration.import.status"))).isTrue();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(70)).untilAsserted(() -> {
+                    var current = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                    assertThat(((Map<?,?>)current.get("applicationDataVerification")).get("status")).isEqualTo("PASSED");
+                });
+                assertThat(admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "views")).first()
+                        .getInteger("formatVersion")).isEqualTo(2);
                 Map<String,Object> settings = Map.of("isUri", true, "uri", uri(user, sourceDb));
                 client.post().uri("/api/sources").body(Map.of("id", "input", "connector", "mongodb", "config", settings,
                         "mode", "snapshot", "tables", List.of(Map.of("type", "literal", "name", "orders")))).retrieve().toBodilessEntity();
@@ -352,6 +354,55 @@ class ManagedMongoStoreIsolationIT {
         }
     }
 
+    @Test void anUnreachableDefaultTargetDoesNotBlockTheOriginalOpProcessOrLogin() throws Exception {
+        String suffix = UUID.randomUUID().toString().replace("-", "");
+        String config = "unreachable_config_" + suffix, cache = "unreachable_cache_" + suffix, target = "unreachable_views_" + suffix;
+        String user = "unreachable_" + suffix;
+        var files = InstallationFiles.initialize(work.resolve("unreachable-installation"));
+        var setup = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+        Path seeds = Files.createDirectory(work.resolve("unreachable-seeds"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar"), seeds.resolve("mongodb-connector.jar"));
+        try (var admin = MongoClients.create(uri("root", "admin"))) {
+            createUser(admin, user, List.of(config, cache));
+            try (var process = installationProcess(files, seeds, "unreachable")) {
+                long pid = process.process.pid();
+                var management = process.management(files, setup.token());
+                var candidate = Map.of("configuration", Map.of("kind", "MONGODB", "uri", uri(user, config), "database", config),
+                        "cache", Map.of("kind", "MONGODB", "uri", uri(user, cache), "database", cache),
+                        "master", Map.of("kind", "MONGODB", "uri", "mongodb://127.0.0.1:1/" + target
+                                + "?serverSelectionTimeoutMS=100&connectTimeoutMS=100&socketTimeoutMS=100", "database", target));
+                var tested = management.post().uri("/api/storage/test").body(Map.of("operationId", setup.scope().operationId(),
+                        "generation", setup.scope().generation(), "candidate", candidate, "layer", "CACHE")).retrieve().body(Map.class);
+                management.post().uri("/api/storage/setup/commit").body(Map.of("operationId", setup.scope().operationId(),
+                        "generation", setup.scope().generation(), "candidate", candidate,
+                        "testStamps", Map.of("CACHE", tested.get("testStamp")))).retrieve().toBodilessEntity();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    assertThat(process.process.isAlive()).isTrue(); assertThat(process.process.pid()).isEqualTo(pid);
+                    assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class)).containsEntry("entry", "FIRST_ADMIN_REQUIRED");
+                });
+                var first = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
+                process.management(files, first.token()).post().uri("/installation/first-admin")
+                        .body(Map.of("username", "admin", "password", "unreachable-target-password")).retrieve().toBodilessEntity();
+                var publicClient = process.publicClient();
+                var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "unreachable-target-password", "createSession", false))
+                        .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
+                var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(70)).untilAsserted(() -> {
+                    var snapshot = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                    assertThat(snapshot).containsEntry("businessPhase", "READY");
+                    assertThat(snapshot.get("applicationDataVerification")).isInstanceOf(Map.class);
+                    assertThat(((Map<?,?>)snapshot.get("applicationDataVerification")).get("status")).isIn("FAILED", "UNKNOWN");
+                });
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                    var row = admin.getDatabase(cache).getCollection("connection_test_results").find(new Document("_id", "views")).first();
+                    assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
+                });
+                assertThat(process.process.pid()).isEqualTo(pid);
+                assertThat(admin.getDatabase(config).getCollection("sources").countDocuments()).isEqualTo(1);
+            }
+        }
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"intent", "uri", "configuration", "birth", "complete"})
     void opRetainedInstallationBoundariesResumeTheOriginalOperation(String boundary) throws Exception {
@@ -378,7 +429,7 @@ class ManagedMongoStoreIsolationIT {
                             "cache", Map.of("kind", "MONGODB", "uri", uri(user, cache), "database", cache),
                             "master", Map.of("kind", "MONGODB", "uri", uri(user, master), "database", master));
                     var stamps = new java.util.LinkedHashMap<String,Object>();
-                    for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                    for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                         var tested = management.post().uri("/api/storage/test").body(Map.of("operationId", renewed.scope().operationId(), "generation", renewed.scope().generation(),
                                 "candidate", candidate, "layer", layer.name())).retrieve().body(Map.class);
                         stamps.put(layer.name(), tested.get("testStamp"));
@@ -387,7 +438,10 @@ class ManagedMongoStoreIsolationIT {
                             "candidate", candidate, "testStamps", stamps)).retrieve().toBodilessEntity();
                 }
                 assertThat(files.stage().scope().operationId()).isEqualTo(original.scope().operationId());
-                assertThat(files.stage().handoff()).isEqualTo(boundary.equals("complete") ? InstallationFiles.Handoff.RESTARTED : InstallationFiles.Handoff.RESTART_REQUIRED);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class)).containsEntry("entry", "FIRST_ADMIN_REQUIRED");
+                });
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.CONFIGURED);
                 var database = admin.getDatabase(config);
                 assertThat(database.getCollection("storage_setup").find().first().getString("phase")).isEqualTo("COMPLETE");
                 assertThat(database.getCollection("storage_binding").countDocuments()).isOne();
@@ -492,7 +546,7 @@ class ManagedMongoStoreIsolationIT {
 
     @ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
-    void lostInitialOpCreationRequiresOwnerConfirmationAndAControlledRestart(boolean runningWithoutIdentity) throws Exception {
+    void lostInitialOpCreationRequiresOwnerConfirmationAndActivatesTheSameProcess(boolean runningWithoutIdentity) throws Exception {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String config = "recover_config_" + suffix, cache = "recover_cache_" + suffix, master = "recover_master_" + suffix, user = "recover_" + suffix;
         var files = InstallationFiles.initialize(work.resolve("lost-installation"));
@@ -521,8 +575,10 @@ class ManagedMongoStoreIsolationIT {
             try (var process = installationProcess(files, seeds, "lost")) {
                 firstPid = process.process.pid(); var management = process.management(files, setup.token());
                 assertThat(admin.getDatabase(cache).listCollectionNames().into(new ArrayList<>())).isEmpty();
-                var initial = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
-                assertThat(initial.get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).untilAsserted(() -> {
+                    var initial = management.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
+                    assertThat(initial.get("businessPhase")).isEqualTo("AWAITING_REBUILD_CONFIRMATION");
+                });
                 assertThatThrownBy(() -> process.publicClient().post().uri("/api/storage/recovery/plan")
                         .header(OnPremInstallation.CAPABILITY_HEADER, setup.token()).body(Map.of("scope", "CLUSTER", "pipelineIds", List.of()))
                         .retrieve().toBodilessEntity()).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
@@ -540,7 +596,11 @@ class ManagedMongoStoreIsolationIT {
                 confirm.put("confirmed", true);
                 var completed = management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().body(Map.class);
                 assertThat(completed.get("phase")).isEqualTo("COMPLETE");
-                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTART_REQUIRED);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> {
+                    assertThat(process.process.isAlive()).isTrue(); assertThat(process.process.pid()).isEqualTo(firstPid);
+                    assertThat(process.publicClient().get().uri("/auth/storage-entry").retrieve().body(Map.class)).containsEntry("entry", "FIRST_ADMIN_REQUIRED");
+                });
+                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.CONFIGURED);
                 assertComposedConfiguration(admin.getDatabase(config), admin.getDatabase(cache), (String) planned.get("operationId"));
                 assertThat(admin.getDatabase(cache).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cache).listCollectionNames()).contains("validation_runs");
@@ -549,14 +609,11 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(identity.getString("authPreparationId")).isEqualTo(planned.get("operationId"));
                 assertThat(identity.getString("businessPreparationId")).isEqualTo(planned.get("operationId"));
                 assertThat(identity.getLong("authGeneration")).isEqualTo(1L);
-                assertThat(admin.getDatabase(cache).getCollection("workload_claims").countDocuments()).isZero();
+                assertThat(admin.getDatabase(cache).getCollection("workload_claims").countDocuments()).isPositive();
                 assertThat(admin.getDatabase(config).getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
                 assertThatThrownBy(() -> management.post().uri("/api/storage/recovery/confirm").body(confirm).retrieve().toBodilessEntity())
                         .isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
-            }
-            try (var process = installationProcess(files, seeds, "recovered")) {
-                assertThat(process.process.pid()).isNotEqualTo(firstPid);
-                assertThat(files.stage().handoff()).isEqualTo(InstallationFiles.Handoff.RESTARTED);
+                assertThat(process.process.pid()).isEqualTo(firstPid);
                 var firstAdmin = InstallationCommand.authorize(files, new MongoProperties(), java.time.Clock.systemUTC());
                 process.management(files, firstAdmin.token()).post().uri("/installation/first-admin")
                         .body(Map.of("username", "admin", "password", "recovered-admin-password")).retrieve().toBodilessEntity();
@@ -1373,7 +1430,7 @@ class ManagedMongoStoreIsolationIT {
                 var candidate=Map.of("cache",Map.of("kind","ATLAS","uri",uri(customerUser,cacheDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",cacheDb,"caPem",TLS.ca()),
                         "master",Map.of("kind","ATLAS","uri",uri(customerUser,masterDb)+"&tls=true&authMechanism=SCRAM-SHA-256","database",masterDb,"caPem",TLS.ca()));
                 var stamps=new LinkedHashMap<String,Object>();
-                for (var layer:io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                for (var layer:List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                     var tested=cloudPost(application,temporary,"/api/storage/test",Map.of("operationId",original.operationId(),"generation",original.generation(),
                             "candidate",candidate,"layer",layer.name())); stamps.put(layer.name(),tested.get("testStamp"));
                 }
@@ -1391,12 +1448,23 @@ class ManagedMongoStoreIsolationIT {
                         assertThat(assemblies.get()).isEqualTo(1);
                         assertThat(admin.getDatabase(configDb).getCollection("storage_setup").find().first()).containsEntry("phase","COMPLETE");
                     }
+                    response.clientDisconnected.countDown();
                     var child=childRef.get(); var member=child.getBean(com.hazelcast.core.HazelcastInstance.class);
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                     publish.countDown();
                     assertThat(response.finished.await(60,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
                     assertThat(response.failure.get()).as("the original HTTP reply meets an actually reset client socket").isNotNull();
-                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(root.runtime()::businessStarted);
+                    try {
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(() -> {
+                            var progress = root.initializationProgress().snapshot(original).orElseThrow();
+                            if (progress.state() == io.tapstate.control.core.StorageInitializationProgress.State.FAILED)
+                                throw new AssertionError("Initial CACHE activation failed: " + progress);
+                            return !root.initialActivationPending() && root.runtime().businessStarted();
+                        });
+                    } catch (org.awaitility.core.ConditionTimeoutException timeout) {
+                        throw new AssertionError("Initial CACHE activation did not finish within 60 seconds; progress="
+                                + root.initializationProgress().snapshot(original), timeout);
+                    }
                     assertThat(root.runtime().business()).contains(ownerRef.get());
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
                     assertCloudStatus(application,temporary,401);
@@ -1408,14 +1476,19 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(sources).contains("atlas-store").doesNotContain(PASSWORD,"BEGIN CERTIFICATE");
                     assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                     assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
-                    assertThat(Files.readAllLines(trace)).hasSize(2);
-                } finally { publish.countDown(); }
-            } finally { publish.countDown(); }
+                    assertThat(trace).doesNotExist();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                    var row = admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "atlas-store")).first();
+                    assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
+                });
+                } finally { response.clientDisconnected.countDown(); publish.countDown(); }
+            } finally { response.clientDisconnected.countDown(); publish.countDown(); }
         }
     }
 
     private static final class DisconnectedResponse implements jakarta.servlet.Filter {
         final java.util.concurrent.CountDownLatch finished=new java.util.concurrent.CountDownLatch(1);
+        final java.util.concurrent.CountDownLatch clientDisconnected=new java.util.concurrent.CountDownLatch(1);
         final AtomicReference<java.io.IOException> failure=new AtomicReference<>();
         private final java.util.concurrent.atomic.AtomicBoolean first=new java.util.concurrent.atomic.AtomicBoolean(true);
         @Override public void doFilter(jakarta.servlet.ServletRequest request,jakarta.servlet.ServletResponse response,jakarta.servlet.FilterChain chain)
@@ -1429,16 +1502,24 @@ class ManagedMongoStoreIsolationIT {
                     observed=new jakarta.servlet.ServletOutputStream() {
                         @Override public boolean isReady() { return output.isReady(); }
                         @Override public void setWriteListener(jakarta.servlet.WriteListener listener) { output.setWriteListener(listener); }
-                        @Override public void write(int value) throws java.io.IOException { try { output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
-                        @Override public void flush() throws java.io.IOException { try { output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void write(int value) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void write(byte[] value,int offset,int length) throws java.io.IOException { try { awaitClientDisconnect(); output.write(value,offset,length); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
+                        @Override public void flush() throws java.io.IOException { try { awaitClientDisconnect(); output.flush(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
                         @Override public void close() throws java.io.IOException { try { output.close(); } catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; } }
                     }; return observed;
                 }
             };
-            try { chain.doFilter(request,wrapped); wrapped.flushBuffer(); }
+            try { chain.doFilter(request,wrapped); awaitClientDisconnect(); wrapped.flushBuffer(); }
             catch (java.io.IOException error) { failure.compareAndSet(null,error); throw error; }
             finally { finished.countDown(); }
+        }
+        private void awaitClientDisconnect() throws java.io.IOException {
+            try {
+                if (!clientDisconnected.await(60, java.util.concurrent.TimeUnit.SECONDS))
+                    throw new AssertionError("the test did not disconnect its HTTP client");
+            } catch (InterruptedException failure) {
+                Thread.currentThread().interrupt(); throw new java.io.IOException(failure);
+            }
         }
     }
 
@@ -1489,7 +1570,7 @@ class ManagedMongoStoreIsolationIT {
                 var candidate = Map.of("cache", Map.of("kind", "ATLAS", "uri", cacheUri, "database", cacheDb, "caPem", TLS.ca()),
                         "master", Map.of("kind", "ATLAS", "uri", masterUri, "database", masterDb, "caPem", TLS.ca()));
                 var stamps = new java.util.LinkedHashMap<String,Object>();
-                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values()) {
+                for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE)) {
                     var tested = cloudPost(application, temporary, "/api/storage/test", Map.of("operationId", original.operationId(),
                             "generation", original.generation(), "candidate", candidate, "layer", layer.name()));
                     stamps.put(layer.name(), tested.get("testStamp"));
@@ -1497,10 +1578,11 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                 var request = Map.<String,Object>of("operationId", original.operationId(), "generation", original.generation(),
                         "candidate", candidate, "testStamps", stamps);
-                if (failAfterCompletion) assertThatThrownBy(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request))
-                        .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                failure -> assertThat(failure.getStatusCode().value()).withFailMessage("%s; injected at %s",
-                                        failure.getResponseBodyAsString(), injected.get() == null ? "never" : java.util.Arrays.toString(injected.get().getStackTrace())).isEqualTo(503));
+                if (failAfterCompletion) {
+                    var accepted = cloudPost(application, temporary, "/api/storage/setup/commit", request);
+                    assertThat(accepted.get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(20)).until(() -> injected.get() != null && !root.initialActivationPending());
+                }
                 else try (var callers = java.util.concurrent.Executors.newFixedThreadPool(2)) {
                     var commit = callers.submit(() -> cloudPost(application, temporary, "/api/storage/setup/commit", request));
                     try {
@@ -1513,7 +1595,8 @@ class ManagedMongoStoreIsolationIT {
                         whileCommitting.requireActive().run();
                         assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                         deliverGrant.countDown();
-                        assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS)).containsEntry("setupPhase", "COMPLETE");
+                        assertThat(commit.get(60, java.util.concurrent.TimeUnit.SECONDS).get("setupPhase")).isIn("STORAGE_BOUND", "COMPLETE");
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(60)).until(root.runtime()::businessStarted);
                         assertThatThrownBy(() -> whileCommitting.requireActive().run()).isInstanceOf(TapstateException.class);
                         root.managedAuthentication().requireActive().run();
                         assertThat(root.runtime().current().orElseThrow().preparation().authScope().authGeneration()).isEqualTo(1);
@@ -1537,7 +1620,11 @@ class ManagedMongoStoreIsolationIT {
                 var saved = (SourceResource)configuration.artifacts().get("atlas-store").orElseThrow();
                 assertThat(saved.config()).containsEntry("tlsCaPem", TLS.ca());
                 assertThat(root.runtime().current().orElseThrow().binding().cache().caPem()).isEqualTo(TLS.ca());
-                assertThat(Files.readAllLines(trace)).hasSize(2);
+                assertThat(trace).doesNotExist();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> {
+                    var row = admin.getDatabase(cacheDb).getCollection("connection_test_results").find(new Document("_id", "atlas-store")).first();
+                    assertThat(row).isNotNull(); assertThat(row.getInteger("formatVersion")).isEqualTo(2);
+                });
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("storage_binding").countDocuments()).isOne();
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
@@ -2236,9 +2323,9 @@ class ManagedMongoStoreIsolationIT {
                         domain.bindings(), domain.setupStates(), probe, target, () -> java.util.Optional.of(config), audit, clock, () -> {});
                 var stamps = new java.util.EnumMap<io.tapstate.control.core.StorageSetupService.Layer, String>(
                         io.tapstate.control.core.StorageSetupService.Layer.class);
-                for (var layer : io.tapstate.control.core.StorageSetupService.Layer.values())
+                for (var layer : List.of(io.tapstate.control.core.StorageSetupService.Layer.CACHE))
                     stamps.put(layer, service.test(issued.scope(), permission, candidate, layer).testStamp());
-                assertThat(targetTests).hasValue(1);
+                assertThat(targetTests).as("the CACHE proof does not execute the default Source test").hasValue(0);
                 allowedAudit.set(false);
                 assertThatThrownBy(() -> service.commit("owner", issued.scope(), permission, candidate, stamps))
                         .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
@@ -2282,6 +2369,7 @@ class ManagedMongoStoreIsolationIT {
                             .isInstanceOf(TapstateException.class);
                     assertThat(reopened.users().find("another")).isEmpty();
                 }
+                assertThat(targetTests).as("commit and reopen retain the binding without testing MASTER").hasValue(0);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                 assertThat(admin.getDatabase(masterDb).listCollectionNames().into(new ArrayList<>())).isEmpty();
                 assertThat(SystemCollections.AUDIT.on(admin.getDatabase(configDb)).find().into(new ArrayList<>()).toString())
