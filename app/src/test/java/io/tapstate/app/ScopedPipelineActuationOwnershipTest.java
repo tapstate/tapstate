@@ -36,6 +36,19 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ScopedPipelineActuationOwnershipTest {
+    @Test void evaluationProofIsPureAndExpiresWithoutAnotherStoreRead() {
+        var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
+        var guard=owner.evaluationProof(FIRST,expected).orElseThrow();int before=reads.get();
+        guard.run();guard.run();assertThat(reads).hasValue(before);
+        nanos.addAndGet(TTL.toNanos());
+        assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
+    }
+    @Test void anExecutionAdvanceInvalidatesTheCapturedPureEvaluationProof() {
+        var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
+        var guard=owner.evaluationProof(FIRST,expected).orElseThrow();
+        owner.beginExecution(FIRST,expected);int before=reads.get();
+        assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
+    }
     private static final CacheBusinessScope BUSINESS = new CacheBusinessScope("cluster-a", 3, "cache-a");
     private static final PipelineIntentScope FIRST = scope(1);
     private static final Duration TTL = Duration.ofSeconds(30);

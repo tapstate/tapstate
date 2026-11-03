@@ -4,10 +4,12 @@ import importlib.util
 import hashlib
 import io
 import json
+import os
 from contextlib import redirect_stdout
 from pathlib import Path
 import shutil
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -201,6 +203,24 @@ class SourceIdentityTests(unittest.TestCase):
             inventory, _ = self.inventory(root,
                 '@ParameterizedTest @ValueSource(strings={"a"}) void enabled(String value) {}')
             self.assertFalse(self.observe(root, inventory, 'enabled(String)[1]')['complete'])
+
+    def test_disabled_tempdir_case_is_a_skip_only_for_its_exact_source_signature(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inventory, inv = self.inventory(root,
+                '@Disabled("temporary isolation under issue 911") @Test void isolated(@TempDir Path directory) {}',
+                preamble='import java.nio.file.Path; import org.junit.jupiter.api.io.TempDir;')
+            self.assertTrue(inv['complete'], inv['unresolved'])
+            self.assertEqual(inv['methods'][0]['mapping'], 'disabled-method')
+            observed = self.observe(root, inventory, 'isolated(Path)')
+            self.assertTrue(observed['complete'], observed['unresolved'])
+            self.assertEqual([case['status'] for case in observed['cases']], ['skipped'])
+            for name, skipped, markers in [('isolated(Path)', False, ''),
+                                           ('isolated(String)', True, ''),
+                                           ('isolated(Path)', True, 'tapstate.ci-case={}\n')]:
+                with self.subTest(name=name, skipped=skipped, markers=markers):
+                    rejected = self.observe(root, inventory, name, skipped=skipped, markers=markers)
+                    self.assertFalse(rejected['complete'], rejected['unresolved'])
 
     def test_disabled_text_in_metadata_does_not_disable_an_enabled_template(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -938,6 +958,57 @@ class SourceIdentityTests(unittest.TestCase):
             for _ in range(2):
                 with self.assertRaisesRegex(ValueError, 'ambiguous'):
                     third.named('sample.Marker')
+
+
+class HundredTableDiagnosticEntryTests(unittest.TestCase):
+    def test_manual_entry_selects_one_case_and_rejects_skipped_or_stale_success(self):
+        classname = 'io.tapstate.e2e.AHundredTablesShareTheSinksWritersIT'
+        method = 'aHundredTablesAreWrittenByTheSinksFourWritersOneTableABatch'
+        for mode in ('executed', 'skipped', 'stale', 'wrong-method', 'failed'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                script = root / '.github/scripts/hundred-table-diagnostic.sh'
+                script.parent.mkdir(parents=True)
+                shutil.copy2(HERE / script.name, script)
+                binary = root / 'bin'
+                binary.mkdir()
+                docker = binary / 'docker'
+                docker.write_text('#!/usr/bin/env bash\n[ "$1" = info ]\n')
+                docker.chmod(0o755)
+                maven = binary / 'mvn'
+                maven.write_text('''#!/usr/bin/env python3
+import json, os, pathlib, sys
+import xml.etree.ElementTree as ET
+root = pathlib.Path.cwd()
+(root / 'arguments.json').write_text(json.dumps(sys.argv[1:]))
+mode = os.environ['HUNDRED_TABLE_REPORT_MODE']
+if mode == 'stale':
+    raise SystemExit(0)
+classname = 'io.tapstate.e2e.AHundredTablesShareTheSinksWritersIT'
+method = 'aHundredTablesAreWrittenByTheSinksFourWritersOneTableABatch'
+suite = ET.Element('testsuite', tests='1', failures=str(int(mode == 'failed')),
+                   errors='0', skipped=str(int(mode == 'skipped')))
+case = ET.SubElement(suite, 'testcase', classname=classname,
+                     name=(method if mode != 'wrong-method' else 'other') + '(Path)')
+if mode in ('skipped', 'failed'):
+    ET.SubElement(case, 'skipped' if mode == 'skipped' else 'failure')
+report = root / ('e2e/target/failsafe-reports/TEST-' + classname + '.xml')
+report.parent.mkdir(parents=True, exist_ok=True)
+report.write_bytes(ET.tostring(suite))
+''')
+                maven.chmod(0o755)
+                report = root / ('e2e/target/failsafe-reports/TEST-' + classname + '.xml')
+                report.parent.mkdir(parents=True)
+                report.write_text('<testsuite tests="1" failures="0" errors="0" skipped="0"/>')
+                environment = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
+                                   HUNDRED_TABLE_REPORT_MODE=mode)
+                result = subprocess.run(['bash', str(script)], env=environment, capture_output=True, text=True)
+                self.assertEqual(result.returncode == 0, mode == 'executed', result.stdout + result.stderr)
+                arguments = json.loads((root / 'arguments.json').read_text())
+                self.assertEqual([arg for arg in arguments if arg.startswith('-Dit.test=')],
+                                 ['-Dit.test=' + classname + '#' + method])
+                self.assertIn('-Djunit.jupiter.conditions.deactivate=org.junit.jupiter.engine.extension.DisabledCondition', arguments)
+                self.assertEqual(arguments[-1], 'verify')
 
 
 class LiveReadbackTests(unittest.TestCase):

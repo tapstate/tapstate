@@ -132,11 +132,18 @@ final class PdkSinkWriter implements SinkWriter {
             Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
             io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts,
             Map<String,TargetIdentityPlan> plannedIdentities) {
+        this(connector,write,config,targets,stateStore,preparedAhead,letGo,purpose,receipts,plannedIdentities,io.tapstate.spi.capture.SourceOperationObserver.NONE);
+    }
+    PdkSinkWriter(PdkConnector connector,WriteRecordFunction write,SinkConfig config,
+            Map<String,TargetTable> targets,KeyedStateStore stateStore,boolean preparedAhead,Runnable letGo,
+            io.tapstate.core.model.PipelineNode.Purpose purpose,PdkSinkPreparations receipts,
+            Map<String,TargetIdentityPlan> plannedIdentities,io.tapstate.spi.capture.SourceOperationObserver observer) {
         this(connector, write, config.writeMode(), config.ddl(), targets,
                 new PdkTargetPreparation(connector.connectorId(), connector.context(), connector.functions(),
                         config.onFullLoad(), config.fullLoad(), config.node(), stateStore, preparedAhead, purpose, connector::requireActive,receipts), letGo);
+        withOperationObserver(observer);
         identityConfig = config;
-        identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets);
+        identities = PdkTargetIdentityPlanner.assess(connector, config, this.targets,observer);
         identities.values().forEach(TargetIdentityProjection::requireUsable);
         PdkTargetIdentityPlanner.requireSame(config, plannedIdentities, identities);
     }
@@ -169,7 +176,7 @@ final class PdkSinkWriter implements SinkWriter {
                 preparation.prepare(target, tableModel(entry.getKey(), target));
             }
             if (identityConfig != null) {
-                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities);
+                PdkTargetIdentityPlanner.verifyPrepared(connector, identityConfig, targets, identities,operationObserver);
                 identityPrepared = true;
             }
             return null;
@@ -189,6 +196,12 @@ final class PdkSinkWriter implements SinkWriter {
         return connector;
     }
 
+    private io.tapstate.spi.capture.SourceOperationObserver operationObserver=io.tapstate.spi.capture.SourceOperationObserver.NONE;
+    PdkSinkWriter withOperationObserver(io.tapstate.spi.capture.SourceOperationObserver observer){operationObserver=java.util.Objects.requireNonNull(observer);preparation.withOperationObserver(observer);return this;}
+    private void operation(String table,Throwable failure){
+        try{operationObserver.completed(table,io.tapstate.spi.capture.SourceOperationObserver.Capability.TARGET_WRITE,failure);}
+        catch(RuntimeException unavailable){org.slf4j.LoggerFactory.getLogger(getClass()).warn("Target operation collection is degraded");}
+    }
     @Override
     public CompletionStage<WriteResult> write(List<Envelope> records) {
         synchronized (lifecycle) {
@@ -301,8 +314,10 @@ final class PdkSinkWriter implements SinkWriter {
             // The frozen PDK API stores alternatives by the current thread name.
             writeAlternatives.forEach(connector.context().getConnectorCapabilities()::alternative);
             connector.requireActive();
-            write.writeRecord(connector.context(), rows, table,
-                    result -> accepted[0] += accepted(result));
+            try {write.writeRecord(connector.context(), rows, table,
+                    result -> accepted[0] += accepted(result));}
+            catch(Throwable failure){operation(table.getId(),failure);throw failure;}
+            operation(table.getId(),null);
         }
         return new WriteResult(accepted[0]);
     }
@@ -339,6 +354,7 @@ final class PdkSinkWriter implements SinkWriter {
 
     @Override
     public void close() {
+        operationObserver.close();
         if (Thread.currentThread() == writeThread && delivering) {
             throw new IllegalStateException("a target callback cannot close its active writer");
         }

@@ -500,6 +500,24 @@ class ExecutionAuthorizationTest {
     }
 
     @Test
+    void writerSlotsSurviveOriginalRunFencingAndTargetPreparationWrapping() throws Exception {
+        var fence=submittedRun();var opened=new ArrayList<String>();
+        class IndexedPreparing implements io.tapstate.runtime.engine.IndexedSinkWriterFactory,PreparesTargets {
+            public SinkWriter getEx(){throw new AssertionError("the stable writer coordinates were discarded");}
+            public SinkWriter forWriter(int member,int local){opened.add(member+":"+local);return new CountingWriter();}
+            public void prepareTargets(HazelcastInstance member){}
+        }
+        try(var authorization=guard(claims);var hazelcast=org.mockito.Mockito.mockStatic(com.hazelcast.core.Hazelcast.class)) {
+            var member=mock(HazelcastInstance.class);when(member.getUserContext()).thenReturn(new ConcurrentHashMap<>(Map.of(ExecutionAuthorization.USER_CONTEXT_KEY,authorization)));
+            hazelcast.when(com.hazelcast.core.Hazelcast::getAllHazelcastInstances).thenReturn(Set.of(member));
+            var wrapped=FencedSinkWriterFactory.heldTo(new IndexedPreparing(),fence);
+            assertThat(wrapped).isInstanceOf(io.tapstate.runtime.engine.IndexedSinkWriterFactory.class).isInstanceOf(PreparesTargets.class);
+            try(var writer=((io.tapstate.runtime.engine.IndexedSinkWriterFactory)wrapped).forWriter(2,3)){writer.write(List.of());}
+            assertThat(opened).containsExactly("2:3");
+        }
+    }
+
+    @Test
     void aCurrentRunOpensAndUsesItsSinkWriter() throws Exception {
         ExecutionFence fence = submittedRun();
         CountingWriter target = new CountingWriter();

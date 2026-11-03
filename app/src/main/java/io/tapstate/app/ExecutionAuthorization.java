@@ -215,6 +215,13 @@ final class ExecutionAuthorization implements AutoCloseable {
                 || nanoTime.getAsLong() - published.deadlineNanos() >= 0 || !original.equals(published.claim())) throw captureRefused();
         return published.claim();
     }
+    /** Rechecks one already-published physical capture claim, without refreshing the store. */
+    WorkloadClaimFence requireCaptureLocal(CacheBusinessScope originalScope,WorkloadClaimFence original) {
+        var entry=entries.get(new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE));
+        if(!fenced || !Objects.equals(businessScope,originalScope) || closed.get() || !nodeActive.getAsBoolean()
+                || entry==null || nanoTime.getAsLong()-entry.deadlineNanos()>=0 || !original.equals(entry.claim()))throw captureRefused();
+        return entry.claim();
+    }
     private static TapstateException captureRefused() {
         return new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
     }
