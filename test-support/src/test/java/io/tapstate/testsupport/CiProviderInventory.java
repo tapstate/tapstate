@@ -24,6 +24,7 @@ import org.junit.jupiter.params.provider.Arguments;
 public final class CiProviderInventory {
     private static final int MAX_CASES = 4096;
     private static final Map<String, List<String>> PROVIDERS = Map.ofEntries(
+            Map.entry("io.tapstate.adapters.mongostore.MongoValidationIndependentPreparationIT", List.of("damagedControlFields")),
             Map.entry("io.tapstate.app.ServerTimeZoneTest", List.of("scenarios")),
             Map.entry("io.tapstate.core.dsl.CanonicalRoundTripTest", List.of("canonicalResources")),
             Map.entry("io.tapstate.core.dsl.CorpusSemanticGateTest", List.of("validScenarios", "invalidCases")),

@@ -232,6 +232,28 @@ class SrsCaptureWriterTest {
         }
     }
 
+    @Test void nativePhysicalTailObservesOriginalEventsWithoutChangingDurablePublication() {
+        var f = new Fixture(); f.actual.keySet().forEach(name -> SHARED_LOG.stores.put(f.ring(name), f.log));
+        var observer = new RecordingCaptureObservation(); var callback = new AtomicReference<CaptureListener>();
+        var config = f.config().at(new io.tapstate.core.model.PipelineNode("flow", "input"));
+        try (var unit = new NativeSrsCaptureRunUnit(SCOPE, new SrsStores(f.chains, f.models, SHARED_LOG, unusedConsumers), member, observer)) {
+            var tail = unit.startTail(SCOPE, f.opened, FENCE, config, CaptureStart.present(),
+                    writer -> f.port(writer, callback, true), () -> {});
+            assertThat(observer.contexts).singleElement().satisfies(context -> {
+                assertThat(context.captureId()).isEqualTo("capture"); assertThat(context.chainId()).isEqualTo(f.chain);
+                assertThat(context.sourceId()).isEqualTo("input"); assertThat(context.pipelineId()).isEqualTo("flow");
+                assertThat(context.fence()).isEqualTo(FENCE); assertThat(context.epoch()).isEqualTo(2);
+            });
+            var original = Envelope.insert(1, "orders", Map.of("id", 11), null);
+            callback.get().onBatch(List.of(original), Optional.of(new SourcePosition("observed")));
+            assertThat(observer.events).containsExactly(original);
+            assertThat(f.saved.getLast().position().token()).isEqualTo("observed");
+            var failure = new IllegalStateException("source failed"); callback.get().onError(failure);
+            assertThat(observer.failures).containsExactly(failure); assertThat(tail.health().failure()).contains(failure);
+            tail.close(); tail.close(); assertThat(observer.retirements).hasValue(1);
+        }
+    }
+
     @Test void explicitResumeUsesTheRequestedTokenAndPublishesOnlyTheNewActualCheckpoint() {
         var f = new Fixture(); var previous = new LinkedHashMap<String,SrsTableCheckpoint>();
         for (String table : f.actual.keySet()) {

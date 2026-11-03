@@ -252,6 +252,27 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             return loadInSession(session,preparation);
         });
     }
+    @Override public Control control(CapturePreparation original,String table){
+        Objects.requireNonNull(original);requireScope(original);
+        if(table==null||table.isBlank()||table.length()>512)throw history(original);
+        return transaction(()->{},session->{
+            var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,original.captureId());var projection=MongoValidationMetadata.claimProjection("capturePreparation");
+            var row=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),projection,64*1024);
+            if(row==null||!original.equals(requirePreparation(row,key,scope)))throw history(original);
+            var claim=WorkloadClaimFence.from(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row));
+            if(original.mode()!=CapturePreparation.Mode.SHARED_SRS)return new Control(original,claim,0,false);
+            new MongoCacheMetadataStructure(database,retention).verifySrs();
+            var header=new Document("formatVersion",1).append("cacheIncarnation",1).append("captureId",1).append("captureFence",1).append("epoch",1).append("recoveryControl",1)
+                    .append("tablesType",new Document("$type","$servingTables"))
+                    .append("serves",new Document("$in",List.of(new Document("$literal",table),new Document("$ifNull",List.of("$servingTables",List.of())))));
+            var chain=MongoValidationMetadata.read(session,SystemCollections.SRS_CHAINS.on(database),new Document("_id",original.chainId()),header,64*1024);
+            if(chain==null||!Integer.valueOf(1).equals(chain.get("formatVersion"))||!scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))
+                    ||!original.captureId().equals(chain.get("captureId"))||chain.containsKey("recoveryControl")||!"array".equals(chain.get("tablesType"))
+                    ||!(chain.get("epoch") instanceof Long epoch)||epoch<0||epoch==Long.MAX_VALUE||!(chain.get("serves") instanceof Boolean serves)
+                    ||!claim.equals(WorkloadClaimDocuments.readCapture(chain.get("captureFence",Document.class))))throw history(original);
+            return new Control(original,claim,epoch,serves);
+        });
+    }
     @Override public CaptureCacheState load(CapturePreparation original){Objects.requireNonNull(original,"original");requireScope(original);return transaction(() -> {},session -> loadInSession(session,original));}
     private CaptureCacheState loadInSession(ClientSession session,CapturePreparation original) {
         var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,original.captureId());

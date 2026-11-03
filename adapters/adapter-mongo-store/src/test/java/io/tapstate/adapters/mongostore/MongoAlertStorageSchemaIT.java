@@ -76,9 +76,9 @@ class MongoAlertStorageSchemaIT {
 
     @Test void firstInstallationPublishesTheWholeFeatureWithoutChangingTheGlobalConfigVersion() {
         withConfiguration(false, fixture -> {
-            assertThat(fixture.domain().schemaVersion()).isEqualTo(MongoConfigurationDomain.SCHEMA_VERSION);
+            assertThat(fixture.domain().schemaVersion()).isEqualTo(2);
             assertThat(fixture.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION);
-            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(MongoConfigurationDomain.SCHEMA_VERSION);
+            assertThat(schema(fixture).getInteger("installedVersion")).isEqualTo(2);
             assertThat(schema(fixture).get(MongoAlertStorageSchema.FIELD, Document.class).getString("operationId"))
                     .isEqualTo("setup-a");
             assertAllTables(fixture);
@@ -357,7 +357,7 @@ class MongoAlertStorageSchemaIT {
                 var store = new MongoAlertConfigurationStore(f.database(), AlertConfigurationFixtures.SCOPE,
                         io.tapstate.core.alerting.BuiltinAlarmTypes.catalog(), () -> {});
                 transaction(f, s -> {
-                    ConfigurationVersion.advance(s, versions(f));
+                    ConfigurationVersion.advance(s, versions(f), f.database());
                     return store.stage(s, null, AlertConfigurationFixtures.silence());
                 });
                 changed.countDown(); assertThat(permission.get(15, TimeUnit.SECONDS)).isFalse();

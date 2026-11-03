@@ -54,7 +54,7 @@ final class MongoSourceIdentityPreparation {
                         .projection(new Document("_id", 0).append("present", new Document("$literal", true))).limit(1).first() != null) {
                     throw MongoSourceIdentitySchema.unreadable("unmarked-headers");
                 }
-                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), database);
                 var initial = new MongoSourceIdentitySchema.State(MongoSourceIdentitySchema.Phase.PREPARING,
                         operationId, clusterId, cipher.activeKeyId(), null, 0);
                 if (SystemCollections.SCHEMA_MIGRATIONS.on(database).updateOne(session,
@@ -115,7 +115,7 @@ final class MongoSourceIdentityPreparation {
         if (row == null || !id.equals(row.get("_id"))) { return state; }
         if (!"source".equals(row.get("kind")) || !expectedHash.equals(row.get("contentHash"))
                 || row.containsKey(MongoSourceIdentitySchema.FIELD)) { throw MongoSourceIdentitySchema.unreadable("source-fence"); }
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), database);
         if (sources.updateOne(session, new Document("_id", id).append("contentHash", expectedHash)
                         .append(MongoSourceIdentitySchema.FIELD, new Document("$exists", false)),
                 new Document("$set", new Document(MongoSourceIdentitySchema.FIELD, MongoSourceIdentity.encode(candidate))))
@@ -134,7 +134,7 @@ final class MongoSourceIdentityPreparation {
         if (reads.source(session, filter, new Document("_id", 0).append("present", new Document("$literal", true))) != null) {
             return state;
         }
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), database);
         var next = new MongoSourceIdentitySchema.State(MongoSourceIdentitySchema.Phase.READY, state.operationId(),
                 state.clusterId(), state.keyId(), state.lastSourceIncarnation(), state.preparedCount());
         replace(session, state, next);

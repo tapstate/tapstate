@@ -91,98 +91,108 @@ class ADeferredStartOutlivesThePreviousFailedJobIT {
                 properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
                 ClusterMembershipGate gate = new ClusterMembershipGate(properties);
                 gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
-                assertThat(gate.canCommit(Set.of("node-a", "node-b", "node-c"))).isTrue();
+                assertThat(gate.canCommit(Set.of("node-a", "node-b", "node-c"))).isFalse();
                 WorkloadOwner driverOwner = new WorkloadOwner("node-c", "boot-node-c");
-                ClusterWorkloadClaims claims = new ClusterWorkloadClaims(store.workloadClaims(), gate);
-                CaptureOwnership captureOwnership = new CaptureOwnership(
-                        "cluster-a", driverOwner, gate, claims, LEASE);
-                PipelineActuationOwnership ownership = new PipelineActuationOwnership(
-                        "cluster-a", driverOwner, gate, claims, LEASE, Duration.ofSeconds(30));
-                SrsCoordinator srs = new SrsCoordinator(store.meta());
-                AtomicInteger attachments = new AtomicInteger();
-                CaptureAttacher attacher = (spec, handoff, startTail) -> {
-                    assertThat(startTail).as("the remote member keeps the capture claim").isFalse();
-                    attachments.incrementAndGet();
-                    srs.joinSource(spec.sourceId(), spec.miningChainId(), spec.config().streams());
-                    srs.attachConsumer(spec.miningChainId(), spec.consumerId());
-                    return new CaptureRun(Optional.of(spec.miningChainId()), true, 0L,
-                            Optional.empty(), Optional.of(() -> { }), new CaptureHealth());
-                };
-                StoreBackedPipelineCaptureCoordinator captures = new StoreBackedPipelineCaptureCoordinator(
-                        store, attacher, srs, new SnapshotBuffer(), captureOwnership, Duration.ofHours(1));
-                AtomicBoolean failCurrentRun = new AtomicBoolean();
-                HazelcastInstance member = member(failCurrentRun);
-                Engine engine = new Engine(member);
-                EngineLifecycleActuator actuator = new EngineLifecycleActuator(engine, new RunningDagSource(),
-                        captures, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()),
-                        ownership);
-                try {
-                    Clock clock = Clock.systemUTC();
-                    PipelineLifecycleService lifecycle = new PipelineLifecycleService(
-                            new ArtifactQueryService(store.artifacts()), store.desired(),
-                            new AuditGate(record -> { }, clock),
-                            store.state()::read);
-                    ConvergenceDriver driver = new ConvergenceDriver(
-                            new PipelineConverger(store.desired(), store.state(), actuator, clock), store.desired(),
-                            new ObservationPublisher(store.state(), store.observations()), gate::businessEligible,
+                long sessionAskedAt = System.nanoTime();
+                var nodeAttempt = store.workloadClaims().acquire(new WorkloadClaimKey(
+                        "cluster-a", WorkloadClaimType.NODE_SESSION, driverOwner.nodeId()), driverOwner, 0, LEASE);
+                assertThat(nodeAttempt.acquired()).isTrue();
+                try (var driverSession = new NodeSessionLease(store.workloadClaims(), nodeAttempt.claim(),
+                        sessionAskedAt, LEASE, Duration.ofSeconds(30), () -> {})) {
+                    gate.observeNodeSession(driverSession::active);
+                    assertThat(gate.canCommit(Set.of("node-a", "node-b", "node-c"))).isTrue();
+                    ClusterWorkloadClaims claims = new ClusterWorkloadClaims(store.workloadClaims(), gate);
+                    CaptureOwnership captureOwnership = new CaptureOwnership(
+                            "cluster-a", driverOwner, gate, claims, LEASE);
+                    PipelineActuationOwnership ownership = new PipelineActuationOwnership(
+                            "cluster-a", driverOwner, gate, claims, LEASE, Duration.ofSeconds(30));
+                    SrsCoordinator srs = new SrsCoordinator(store.meta());
+                    AtomicInteger attachments = new AtomicInteger();
+                    CaptureAttacher attacher = (spec, handoff, startTail) -> {
+                        assertThat(startTail).as("the remote member keeps the capture claim").isFalse();
+                        attachments.incrementAndGet();
+                        srs.joinSource(spec.sourceId(), spec.miningChainId(), spec.config().streams());
+                        srs.attachConsumer(spec.miningChainId(), spec.consumerId());
+                        return new CaptureRun(Optional.of(spec.miningChainId()), true, 0L,
+                                Optional.empty(), Optional.of(() -> { }), new CaptureHealth());
+                    };
+                    StoreBackedPipelineCaptureCoordinator captures = new StoreBackedPipelineCaptureCoordinator(
+                            store, attacher, srs, new SnapshotBuffer(), captureOwnership, Duration.ofHours(1));
+                    AtomicBoolean failCurrentRun = new AtomicBoolean();
+                    HazelcastInstance member = member(failCurrentRun);
+                    Engine engine = new Engine(member);
+                    EngineLifecycleActuator actuator = new EngineLifecycleActuator(engine, new RunningDagSource(),
+                            captures, new NestStateTeardown(member, store.keyedState(), store.nestDeadLetters()),
                             ownership);
-                    DAG oldDag = new DAG();
-                    oldDag.newVertex("serve.sync_1", ProcessorMetaSupplier.forceTotalParallelismOne(
-                            ProcessorSupplier.of(() -> {
-                                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
-                                        Map.of("pipeline", PIPELINE), null);
-                            })));
-                    engine.submit(PIPELINE, oldDag);
-                    Job previous = member.getJet().getJob(PIPELINE);
-                    await(previous, JobStatus.FAILED);
-                    store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING),
-                            clock.instant());
-                    lifecycle.start("e2e", PIPELINE);
-                    driver.reconcile();
-                    assertThat(store.observations().read(PIPELINE).orElseThrow().state())
-                            .isEqualTo(PipelineState.FAILED);
-
-                    lifecycle.stop("e2e", PIPELINE, false);
-                    driver.reconcile();
-                    lifecycle.start("e2e", PIPELINE);
-                    driver.reconcile();
-                    for (int pass = 0; pass < 3; pass++) {
+                    try {
+                        Clock clock = Clock.systemUTC();
+                        PipelineLifecycleService lifecycle = new PipelineLifecycleService(
+                                new ArtifactQueryService(store.artifacts()), store.desired(),
+                                new AuditGate(record -> { }, clock),
+                                store.state()::read);
+                        ConvergenceDriver driver = new ConvergenceDriver(
+                                new PipelineConverger(store.desired(), store.state(), actuator, clock), store.desired(),
+                                new ObservationPublisher(store.state(), store.observations()), gate::businessEligible,
+                                ownership);
+                        DAG oldDag = new DAG();
+                        oldDag.newVertex("serve.sync_1", ProcessorMetaSupplier.forceTotalParallelismOne(
+                                ProcessorSupplier.of(() -> {
+                                    throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,
+                                            Map.of("pipeline", PIPELINE), null);
+                                })));
+                        engine.submit(PIPELINE, oldDag);
+                        Job previous = member.getJet().getJob(PIPELINE);
+                        await(previous, JobStatus.FAILED);
+                        store.state().create(PIPELINE, StateJson.of(PipelineState.RUNNING),
+                                clock.instant());
+                        lifecycle.start("e2e", PIPELINE);
                         driver.reconcile();
                         assertThat(store.observations().read(PIPELINE).orElseThrow().state())
-                                .as("each pass keeps waiting without failing the unsubmitted run")
-                                .isEqualTo(PipelineState.RUNNING);
-                        assertThat(store.observations().read(PIPELINE).orElseThrow().failure()).isNull();
-                        assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(previous.getId());
-                        assertThat(attachments).hasValue(0);
-                    }
+                                .isEqualTo(PipelineState.FAILED);
 
-                    if (!ringAlreadyOpen) {
-                        store.meta().create(chain.value(), null);
-                        store.meta().openEpoch(chain.value());
-                    }
-                    store.meta().requestCaptureTables(chain.value(), List.of("orders"));
-                    store.meta().publishCaptureTables(chain.value(),
-                            store.meta().read(chain.value()).orElseThrow().epoch(), List.of("orders"));
-                    driver.reconcile();
-                    Job submitted = member.getJet().getJob(PIPELINE);
-                    assertThat(submitted.getId()).as("readiness lets the restart submit its own job")
-                            .isNotEqualTo(previous.getId());
-                    await(submitted, JobStatus.RUNNING);
-                    assertThat(attachments).hasValue(1);
+                        lifecycle.stop("e2e", PIPELINE, false);
+                        driver.reconcile();
+                        lifecycle.start("e2e", PIPELINE);
+                        driver.reconcile();
+                        for (int pass = 0; pass < 3; pass++) {
+                            driver.reconcile();
+                            assertThat(store.observations().read(PIPELINE).orElseThrow().state())
+                                    .as("each pass keeps waiting without failing the unsubmitted run")
+                                    .isEqualTo(PipelineState.RUNNING);
+                            assertThat(store.observations().read(PIPELINE).orElseThrow().failure()).isNull();
+                            assertThat(member.getJet().getJob(PIPELINE).getId()).isEqualTo(previous.getId());
+                            assertThat(attachments).hasValue(0);
+                        }
 
-                    failCurrentRun.set(true);
-                    await(submitted, JobStatus.FAILED);
-                    driver.reconcile();
-                    assertThat(store.observations().read(PIPELINE).orElseThrow().state())
-                            .as("a submitted job's failure is still observed after a capture wait")
-                            .isEqualTo(PipelineState.FAILED);
-                    assertThat(store.observations().read(PIPELINE).orElseThrow().failure().code())
-                            .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED.code());
-                } finally {
-                    actuator.stop(PIPELINE, false);
-                    captures.close();
-                    member.shutdown();
+                        if (!ringAlreadyOpen) {
+                            store.meta().create(chain.value(), null);
+                            store.meta().openEpoch(chain.value());
+                        }
+                        store.meta().requestCaptureTables(chain.value(), List.of("orders"));
+                        store.meta().publishCaptureTables(chain.value(),
+                                store.meta().read(chain.value()).orElseThrow().epoch(), List.of("orders"));
+                        driver.reconcile();
+                        Job submitted = member.getJet().getJob(PIPELINE);
+                        assertThat(submitted.getId()).as("readiness lets the restart submit its own job")
+                                .isNotEqualTo(previous.getId());
+                        await(submitted, JobStatus.RUNNING);
+                        assertThat(attachments).hasValue(1);
+
+                        failCurrentRun.set(true);
+                        await(submitted, JobStatus.FAILED);
+                        driver.reconcile();
+                        assertThat(store.observations().read(PIPELINE).orElseThrow().state())
+                                .as("a submitted job's failure is still observed after a capture wait")
+                                .isEqualTo(PipelineState.FAILED);
+                        assertThat(store.observations().read(PIPELINE).orElseThrow().failure().code())
+                                .isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED.code());
+                    } finally {
+                        actuator.stop(PIPELINE, false);
+                        captures.close();
+                        member.shutdown();
+                    }
                 }
+                assertThat(gate.businessEligible()).isFalse();
             }
         }
     }

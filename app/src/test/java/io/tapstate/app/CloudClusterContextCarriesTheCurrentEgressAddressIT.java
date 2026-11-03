@@ -49,7 +49,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
     private static final String JTI_WITHOUT_ADDRESS = "context-no-address-jti";
     private static final CloudSessionContext LOGIN_CONTEXT = new CloudSessionContext(
             ORGANIZATION, CLUSTER, "Workspace organization", "Workspace cluster", "workspace-region",
-            "198.51.100.1", "DYNAMIC");
+            "198.51.100.1", "DYNAMIC", "untrusted@example.test");
     private static final CloudClusterEgressAddress CURRENT_ADDRESS = new CloudClusterEgressAddress(
             ORGANIZATION, CLUSTER, "203.0.113.42", "STABLE");
     private static final CloudSessionContext LOGIN_CONTEXT_WITHOUT_ADDRESS = new CloudSessionContext(
@@ -110,11 +110,20 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                         .containsEntry("organizationName", "Workspace organization")
                         .containsEntry("clusterName", "Workspace cluster")
                         .containsEntry("region", "workspace-region")
+                        .containsEntry("userEmail", "user@example.test")
                         .containsEntry("ec2PublicIp", CURRENT_ADDRESS.ec2PublicIp())
                         .containsEntry("egressAddressStatus", CURRENT_ADDRESS.egressAddressStatus())
                         .containsKey("clusterState")
                         .containsEntry("clusterState", null);
                 assertThat(response.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
+                HttpResponse<String> currentUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", cookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(currentUser.statusCode()).isEqualTo(200);
+                Map<?, ?> currentUserBody = (Map<?, ?>) JsonReader.parse(currentUser.body());
+                assertThat(currentUserBody.get("email")).isEqualTo("user@example.test");
+                assertThat(currentUserBody.get("username")).isNull();
+                assertThat(currentUser.body()).doesNotContain(JWT, cookie, "controlled-machine-token");
 
                 // Fail the provider explicitly after the successful context lookup, independent of
                 // machine-scope reads made by managed monitoring during startup.
@@ -147,15 +156,21 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                 noAddressParsed.forEach((key, value) -> noAddressBody.put((String) key, value));
                 assertThat(noAddressBody)
                         .containsEntry("ec2PublicIp", null)
-                        .containsEntry("egressAddressStatus", null);
+                        .containsEntry("egressAddressStatus", null)
+                        .containsEntry("userEmail", null);
                 assertThat(noAddressResponse.body())
                         .doesNotContain(JWT_WITHOUT_ADDRESS, noAddressCookie, "controlled-machine-token");
+                HttpResponse<String> noEmailUser = client.send(HttpRequest.newBuilder(base.resolve("/api/auth/me"))
+                        .timeout(Duration.ofSeconds(10)).header("Cookie", noAddressCookie).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(noEmailUser.statusCode()).isEqualTo(200);
+                assertThat(((Map<?, ?>) JsonReader.parse(noEmailUser.body())).get("email")).isNull();
 
                 HttpResponse<String> anonymous = client.send(HttpRequest.newBuilder(base.resolve("/api/cluster/context"))
                         .timeout(Duration.ofSeconds(10)).GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(anonymous.statusCode()).isEqualTo(401);
                 assertThat(anonymous.body()).doesNotContain(
-                        LOGIN_CONTEXT.ec2PublicIp(), JWT, JWT_WITHOUT_ADDRESS);
+                        LOGIN_CONTEXT.ec2PublicIp(), "user@example.test", JWT, JWT_WITHOUT_ADDRESS);
         }
     }
 
@@ -179,7 +194,7 @@ class CloudClusterContextCarriesTheCurrentEgressAddressIT {
                     String jti = JWT.equals(jwt) ? JTI : JWT_WITHOUT_ADDRESS.equals(jwt) ? JTI_WITHOUT_ADDRESS : null;
                     if (jti == null) throw new CloudSdkBridge.ProviderFailure();
                     return new CloudSdkBridge.VerifiedClaims("context-user", ORGANIZATION, CLUSTER, jti,
-                            clock.instant().plusSeconds(300), CLOUD_URL, "127.0.0.1", List.of("workload:write"));
+                            clock.instant().plusSeconds(300), CLOUD_URL, "127.0.0.1", List.of("workload:write"), JWT.equals(jwt) ? "user@example.test" : null);
                 }
                 @Override public ClusterEgressAddress currentEgressAddress() {
                     if (addresses.available.get())

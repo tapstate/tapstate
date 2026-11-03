@@ -95,7 +95,7 @@ final class MongoAlertCoordinator implements AlertStore {
             currentHost(session);if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
             if(write){
                 if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
-                if(authoring)ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(db));
+                if(authoring)ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(db), db);
                 else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
             }
             T result=action.apply(session);host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;

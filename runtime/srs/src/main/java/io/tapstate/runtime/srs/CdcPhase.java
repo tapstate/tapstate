@@ -148,6 +148,13 @@ public final class CdcPhase {
             CaptureStart start,
             Map<String, TableRoute> routes,
             CaptureHealth health) {
+        return run(port, config, start, routes, health, CaptureObservation.none());
+    }
+
+    /** Installs an optional observer on this physical opening without changing the source port. */
+    public static Subscription run(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Objects.requireNonNull(port, "port");
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(start, "start");
@@ -157,8 +164,9 @@ public final class CdcPhase {
         // The last position actually persisted, for the life of this subscription. It is what lets a run
         // that resolves the same frontier as the one before it write nothing: see writeBatch.
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(
-                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)));
+        return observation.start(health.recording(
+                (events, position) -> writeBatch(events, position, routeSnapshot::get, lastWritten)),
+                listener -> port.cdc(config, start, listener));
     }
 
     /**
@@ -190,11 +198,18 @@ public final class CdcPhase {
      */
     public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
             Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder) {
+        return runDurable(port, config, start, routes, health, batchOrder, CaptureObservation.none());
+    }
+
+    /** The observer sits outside health recording, so source errors reach both components. */
+    public static Subscription runDurable(CapturePort port, CaptureConfig config, CaptureStart start,
+            Map<String, TableRoute> routes, CaptureHealth health, AtomicLong batchOrder, CaptureObservation observation) {
+        Objects.requireNonNull(observation, "observation");
         Map<String, TableRoute> selected = Map.copyOf(routes);
         List<String> servedTables = List.copyOf(selected.keySet());
         CdcChain physical = selected.values().iterator().next().chain();
         AtomicReference<ChainPosition> lastWritten = new AtomicReference<>();
-        return port.cdc(config, start, health.recording(new CaptureStartedListener() {
+        return observation.start(health.recording(new CaptureStartedListener() {
             @Override
             public void onStart(SourcePosition position) {
                 if (physical.meta().read(physical.miningChainId()).orElseThrow().sourceRead() == null) {
@@ -212,7 +227,7 @@ public final class CdcPhase {
                                 new SourceOrder(physical.epoch(), batchOrder.incrementAndGet()), token.token()),
                         servedTables));
             }
-        }));
+        }), listener -> port.cdc(config, start, listener));
     }
 
     /**

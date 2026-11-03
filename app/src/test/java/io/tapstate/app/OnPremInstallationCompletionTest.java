@@ -60,6 +60,11 @@ class OnPremInstallationCompletionTest {
                     Clock.systemUTC().instant().plusSeconds(300), "a".repeat(43)));
             when(configuration.bindings()).thenReturn(bindings); when(configuration.setupStates()).thenReturn(states);
             when(configuration.databaseName()).thenReturn("config"); when(configuration.recoveryCommands()).thenReturn(mock(StorageRecoveryCommands.class));
+            when(configuration.prepareInitialValidationSchema(eq(preparation), same(cache), any()))
+                    .thenAnswer(call -> {
+                        call.<Runnable>getArgument(2).run();
+                        return new MongoConfigurationDomain.ValidationSchemaStatus("original-validation", true, 0);
+                    });
             when(configuration.users()).thenReturn(mock(UserStore.class)); when(configuration.tokens()).thenReturn(mock(TokenStore.class));
             when(configuration.clusterIdentity()).thenReturn(mock(ClusterIdentityStore.class));
             when(configuration.audit()).thenReturn(mock(AuditStore.class));
@@ -218,7 +223,7 @@ class OnPremInstallationCompletionTest {
             f.management(() -> { f.installation.caller(f.request).require(ControlOperations.STORAGE_STATUS); return null; });
             verify(issuer.issuer).close(); verify(issuer.validation).close(); verify(f.configuration, never()).close(); verify(f.cache, never()).close();
             verify(f.business).start(); verify(f.business, never()).afterInitialReady();
-            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any());
         }
     }
 
@@ -259,7 +264,7 @@ class OnPremInstallationCompletionTest {
             assertThat(issuer.bridge.observedProgress).containsOnly("COMPLETE");
             verify(f.business).start(); verify(f.business, never()).afterInitialReady();
             verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).resumeInitialAuth(eq(f.preparation), any());
-            verify(f.cache).prepareInitialBusiness(eq(f.preparation), any()); verify(f.target, never()).test(any(), any(), any());
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any()); verify(f.target, never()).test(any(), any(), any());
         }
     }
 
@@ -280,7 +285,7 @@ class OnPremInstallationCompletionTest {
             assertThat(renewed.token()).isNotEqualTo(expired.token());
             f.root.localAuthentication();
             assertThat(f.files.capability()).contains(renewed); assertThat(f.currentScope.get()).isEqualTo(renewed.scope());
-            verify(f.business).start(); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+            verify(f.business).start(); verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any());
         }
     }
 
@@ -318,7 +323,7 @@ class OnPremInstallationCompletionTest {
             });
             verify(f.business).start(); verify(f.business, never()).afterInitialReady();
             verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).resumeInitialAuth(eq(f.preparation), any());
-            verify(f.cache).prepareInitialBusiness(eq(f.preparation), any()); verify(f.target, never()).test(any(), any(), any());
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any()); verify(f.target, never()).test(any(), any(), any());
         }
     }
 
@@ -335,7 +340,7 @@ class OnPremInstallationCompletionTest {
             assertThat(f.entry.read().entry()).isEqualTo(StorageEntryStatus.Entry.FIRST_ADMIN_REQUIRED);
             assertThat(f.files.capability()).isEmpty(); assertThat(f.completions).hasValue(1);
             verify(f.business).start(); verify(f.business, never()).afterInitialReady();
-            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any());
         }
     }
 
@@ -355,7 +360,7 @@ class OnPremInstallationCompletionTest {
                 assertThatThrownBy(() -> caller.require(ControlOperations.STORAGE_SETUP_ACTIVATE)).isInstanceOf(TapstateException.class);
                 return null;
             });
-            verify(f.business).start(); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+            verify(f.business).start(); verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any());
         }
     }
 
@@ -389,7 +394,7 @@ class OnPremInstallationCompletionTest {
                 return null;
             }); f.settle();
             assertThat(f.installation.firstAdministratorReady()).isTrue(); assertThat(f.completions).hasValue(1);
-            verify(f.cache).prepareFirstAuth(grant); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+            verify(f.cache).prepareFirstAuth(grant); verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any());
             verify(f.cache, never()).resumeInitialAuth(any(), any()); verify(f.business).start(); verify(f.business).afterInitialReady();
             verify(f.target, never()).test(any(), any(), any());
         }
@@ -412,7 +417,7 @@ class OnPremInstallationCompletionTest {
             when(f.business.available()).thenReturn(true); f.root.localAuthentication();
             org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(3)).until(f.installation::firstAdministratorReady);
             verify(f.business).start(); verify(f.cache).resumeInitialAuth(eq(f.preparation), any());
-            verify(f.cache).prepareInitialBusiness(eq(f.preparation), any()); verify(f.cache, never()).prepareFirstAuth(any());
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any()); verify(f.cache, never()).prepareFirstAuth(any());
         }
     }
 
@@ -440,7 +445,7 @@ class OnPremInstallationCompletionTest {
             assertThat(f.files.capability()).contains(firstAdmin); assertThat(f.files.stage().scope()).isEqualTo(f.scope);
             assertThat(f.completions).hasValue(1); verify(f.business).start();
             verify(candidate).close();
-            verify(f.cache).prepareInitialBusiness(eq(f.preparation), any()); verify(f.business, never()).afterInitialReady();
+            verify(f.configuration, atLeastOnce()).prepareInitialValidationSchema(eq(f.preparation), same(f.cache), any()); verify(f.business, never()).afterInitialReady();
         }
     }
 
@@ -481,7 +486,8 @@ class OnPremInstallationCompletionTest {
                 assertThat(f.installation.firstAdministratorReady()).isTrue(); assertThat(f.completions).hasValue(1);
                 assertThat(f.bindings.load()).contains(f.binding); assertThat(f.bindings.cachePreparation()).contains(f.preparation);
                 verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache, never()).resumeInitialAuth(any(), any());
-                verify(f.cache, never()).prepareInitialBusiness(any(), any()); verify(f.business).start();
+                verify(f.cache, never()).prepareInitialBusiness(any(), any());
+                verify(f.configuration, never()).prepareInitialValidationSchema(any(), any(), any()); verify(f.business).start();
             } finally { server.stop(0); }
         }
     }
@@ -502,6 +508,7 @@ class OnPremInstallationCompletionTest {
             assertThat(f.files.capability()).isEmpty(); assertThat(f.completions).hasValue(1);
             verify(broken).close(); verify(f.business).start(); verify(f.business, never()).afterInitialReady();
             verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache, never()).prepareInitialBusiness(any(), any());
+            verify(f.configuration, never()).prepareInitialValidationSchema(any(), any(), any());
         }
     }
 }

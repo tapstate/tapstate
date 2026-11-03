@@ -439,9 +439,15 @@ final class StorageRoot implements AutoCloseable {
             if (committed.firstCreation().isPresent() && attemptedCreation != committed.firstCreation().orElseThrow()) {
                 attemptedCreation = committed.firstCreation().orElseThrow();
                 original.cache().prepareFirstAuth(attemptedCreation);
-            } else original.cache().resumeInitialAuth(committed.preparation(), active);
+            } else original.cache().resumeInitialAuth(committed.preparation(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
             original.verifyAuthentication();
-            original.cache().prepareInitialBusiness(committed.preparation(), active);
+            configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
             original.verifyBusiness(); active.run();
             activationStoragePrepared = true;
             var currentSetup = configuration.setupStates().load().scope();
@@ -451,6 +457,14 @@ final class StorageRoot implements AutoCloseable {
             configuration.bindings().guardedBy(active).complete(currentSetup);
         }
         active.run();
+        // Completed OP recovery already prepared validation under its original recovery operation.
+        if (cloud.cloud() || configuration.recoveryCommands().current(committed.preparation().authScope()).isEmpty()) {
+            configuration.prepareInitialValidationSchema(committed.preparation(), original.cache(), () -> {
+                requireOpen(); original.requireActive();
+                if (runtime.current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
+            });
+        }
+        original.verifyBusiness(); active.run();
         return original;
     }
 

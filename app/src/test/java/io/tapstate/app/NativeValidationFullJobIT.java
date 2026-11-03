@@ -1,0 +1,702 @@
+package io.tapstate.app;
+
+import io.tapstate.core.model.*;
+import io.tapstate.core.validation.*;
+import io.tapstate.runtime.engine.validation.*;
+import io.tapstate.spi.store.*;
+import io.tapstate.testsupport.RequiresDocker;
+import java.time.Clock;
+import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.*;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.MongoDBContainer;
+import org.testcontainers.junit.jupiter.Container;
+import static org.assertj.core.api.Assertions.*;
+
+/** Real native admission, original Jet execution, independent root checking and CONFIG publication. */
+@RequiresDocker
+class NativeValidationFullJobIT {
+    @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
+    static final ValidationValues.Limits ROW=new ValidationValues.Limits(16384,128,12);
+    @Test void theOriginalPinnedJobChecksBothTailsAndPersistsOnlyCompleteProblemRoots()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID())))
+                    .isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var request=new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+            var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.FULL_COLUMN);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,2,1,request.command().toString(),identity);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(identity,reservation.countingGeneration(),start,spec);
+            var plan=new Plan(identity,f.comparison.mappings().getFirst());
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            var actual=access.control().read(identity.owner(),original).orElseThrow();
+            assertThat(actual.state()).isEqualTo(ValidationRunState.COMPLETED);assertThat(actual.retired()).isTrue();
+            await(()->f.resources.snapshot().metadataFrames()==0);assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
+            assertThat(plan.checked).hasValue(5);assertThat(plan.borrowed).hasValue(0);assertThat(plan.drained()).isTrue();
+            var reports=f.raw.getDatabase(f.configName).getCollection("validation_reports");
+            assertThat(reports.find().first()).containsEntry("closed",true).containsEntry("rootCount",3L);
+            var differences=f.raw.getDatabase(f.configName).getCollection("validation_differences").find().into(new ArrayList<>());
+            assertThat(differences).hasSize(3);
+            assertThat(differences.toString()).contains("TARGET_VALUE","SOURCE_DUPLICATE","TARGET_EXTRA");
+            assertThat(f.member.getJet().getJobs()).hasSize(1);var job=f.member.getJet().getJobs().getFirst();
+            assertThat(job.getName()).startsWith("validation:"+identity.runId()+":");assertThat(job.getConfig().isAutoScaling()).isFalse();
+            assertThat(job.getConfig().getInitialSnapshotName()).isNull();
+        }
+    }
+    @Test void aQueuedRootPublicationReleasedAfterStopRemainsCancellationWithoutAnExecutionFault()throws Exception{queuedPublicationAfterStop(null);}
+    @Test void anOrdinaryPublicationPayloadCleanupFailureSurvivesStopAndMirroring()throws Exception{queuedPublicationAfterStop(new IllegalStateException("original publication payload cleanup failed"));}
+    @Test void aFatalPublicationPayloadCleanupFailureSurvivesStopAndMirroring()throws Exception{queuedPublicationAfterStop(new AssertionError("original publication payload cleanup failed"));}
+    private void queuedPublicationAfterStop(Throwable cleanup)throws Exception{
+        var checkEntered=new java.util.concurrent.CountDownLatch(1);var checkRelease=new java.util.concurrent.CountDownLatch(1);
+        var controlsEntered=new java.util.concurrent.CountDownLatch(4);var controlsRelease=new ArrayList<java.util.concurrent.CountDownLatch>();
+        for(int index=0;index<4;index++)controlsRelease.add(new java.util.concurrent.CountDownLatch(1));
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})){
+            var start=prepare(f);var reservation=f.owners.take(start);var mapping=f.comparison.mappings().getFirst();
+            var plan=new Plan(start.run(),mapping,List.of(Plan.row(1,"source")),List.of(Plan.row(1,"target"))){
+                @Override ValidationRootCheck check(ValidationObservation observation,Runnable guard){checkEntered.countDown();waitFor(checkRelease);return super.check(observation,guard);}
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            waitFor(checkEntered);
+            if(cleanup!=null){
+                var originalBudget=reservation.resources().budget();
+                var instrumented=org.mockito.Mockito.mock(ValidationLocalBudget.Run.class,org.mockito.AdditionalAnswers.delegatesTo(originalBudget));
+                org.mockito.Mockito.doAnswer(call->{
+                    var lease=originalBudget.reserve(call.getArgument(0));
+                    boolean payload=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().endsWith("NativeValidationRuns$RootPublication")&&frame.getMethodName().equals("<init>")));
+                    if(!payload)return lease;
+                    var retained=org.mockito.Mockito.mock(ValidationLocalBudget.Reservation.class,org.mockito.AdditionalAnswers.delegatesTo(lease));
+                    org.mockito.Mockito.doAnswer(ignored->{lease.close();if(cleanup instanceof Error fatal)throw fatal;throw (RuntimeException)cleanup;}).when(retained).close();return retained;
+                }).when(instrumented).reserve(org.mockito.ArgumentMatchers.any(ValidationLocalBudget.Amount.class));
+                org.springframework.test.util.ReflectionTestUtils.setField(reservation.resources(),"budget",instrumented);
+            }
+            ((java.util.concurrent.ScheduledFuture<?>)org.springframework.test.util.ReflectionTestUtils.getField(runs,"polling")).cancel(false);
+            await(()->runs.controlIdle(start.run()));
+            for(var release:controlsRelease)reservation.resources().executeControl(()->{controlsEntered.countDown();waitFor(release);},()->{throw new AssertionError("owned control must be queued");});
+            waitFor(controlsEntered);checkRelease.countDown();
+            var executor=(java.util.concurrent.ThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(f.process,"controls");
+            await(()->!runs.publicationsDrained(start.run())&&!executor.getQueue().isEmpty());
+            runs.stop(start.run());controlsRelease.getFirst().countDown();await(()->runs.publicationsDrained(start.run()));
+            controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);
+            // Polling was stopped only to make publication precede retirement on the real FIFO executor.
+            for(int attempt=0;attempt<100&&!runs.read(start.run()).drained();attempt++){runs.stop(start.run());Thread.sleep(10);}
+            await(()->runs.read(start.run()).drained());
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->reservation.access().reports().find(reference).filter(ValidationReports.Snapshot::closed).isPresent());
+            var report=reservation.access().reports().find(reference).orElseThrow();
+            assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);
+            if(cleanup==null)assertThat(report.failure()).isNull();
+            else assertThat(report.failure()).isNotNull().satisfies(failure->{assertThat(failure.technical()).contains("original publication payload cleanup failed");assertThat(failure.fatal()).isEqualTo(cleanup instanceof Error);});
+            assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isZero();
+        }finally{checkRelease.countDown();controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);}
+    }
+
+    @Test void stoppingAnOrderedConsumerKeepsItsBorrowedPairAndBudgetUntilItsActualExit()throws Exception{
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
+        var consumerExited=new AtomicBoolean();var borrowedPair=new AtomicReference<ValidationOrderedMerge.Pair>();var sample=new AtomicReference<ValidationOrderedGroups.Group>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})){
+            var start=prepare(f);var reservation=f.owners.take(start);var mapping=f.comparison.mappings().getFirst();
+            var plan=new Plan(start.run(),mapping,true){
+                @Override public List<ValidationFullScan.Mapping> mappings(){
+                    var original=super.mappings().getFirst();
+                    return List.of(ValidationFullScan.Mapping.paired(original.id(),original.open(),(observation,pair,guard)->{
+                        try{borrowedPair.set(pair);sample.set(pair.source().orElseThrow());entered.countDown();waitFor(resume);
+                        pair.source().orElseThrow().key();sample.get().sampleValues();sample.get().occurrences();
+                        return original.pairedChecker().read(observation,pair,guard);}finally{consumerExited.set(true);}
+                    }));
+                }
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            waitFor(entered);runs.stop(start.run());await(()->plan.closed);
+            assertThat(sample.get().isClosed()).isFalse();assertThat(borrowedPair.get().source().orElseThrow()).isSameAs(sample.get());
+            assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();assertThat(f.resources.snapshot().metadataFrames()).isPositive();
+            assertThat(consumerExited).isFalse();
+            resume.countDown();await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            var report=reservation.access().reports().find(reference).orElseThrow();
+            assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);assertThat(report.failure()).isNull();assertThat(sample.get().isClosed()).isTrue();assertThat(consumerExited).isTrue();
+        }finally{resume.countDown();}
+    }
+
+    @Test void businessCompletionKeepsTheOriginalReservationUntilTheLastGuardedTaskletPollExits()throws Exception {
+        var release=new java.util.concurrent.CountDownLatch(1);var entered=new java.util.concurrent.CountDownLatch(1);var workerMayFinish=new java.util.concurrent.CountDownLatch(1);
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
+            var reservation=f.owners.take(start);var access=reservation.access();var budget=reservation.resources().budget();
+            var closed=new AtomicBoolean();var paused=new AtomicBoolean();var taskletPolls=new AtomicInteger();var controlPasses=new AtomicInteger();
+            f.localGuard=()->{
+                var stack=StackWalker.getInstance().walk(frames->frames.map(frame->frame.getClassName()+"#"+frame.getMethodName()).toList());
+                int active=stack.indexOf("io.tapstate.app.NativeValidationOwnerReservations#requireActive");
+                boolean direct=active>=0&&active+1<stack.size()&&stack.get(active+1).equals("io.tapstate.app.NativeValidationOwnerReservations$Reservation#requireOwner");
+                if(direct&&stack.contains("io.tapstate.runtime.engine.validation.ValidationProcessorRegistry$Guarded#complete")&&stack.contains("io.tapstate.runtime.engine.validation.ValidationProcessorRegistry$Run#require")&&taskletPolls.incrementAndGet()==2&&paused.compareAndSet(false,true)){
+                    workerMayFinish.countDown();entered.countDown();waitFor(release);
+                }
+                if(direct&&closed.get()&&budget.used().bytes()<8L*1024*1024&&stack.contains("io.tapstate.app.NativeValidationRuns$Actor#requireOwner"))controlPasses.incrementAndGet();
+            };
+            var mapping=f.comparison.mappings().getFirst();
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->new NativeValidationFullJob.Plan(){
+                    public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("COUNT cannot read rows");}
+                    public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
+                        guard.run();waitFor(workerMayFinish);return new ValidationCountScan.Scalar(mapping.source(),1,new ValidationCheckEvent.ReadBoundary("source","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));
+                    },guard->{guard.run();return new ValidationCountScan.Scalar(mapping.target(),1,new ValidationCheckEvent.ReadBoundary("target","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));}));}
+                    public void close(){closed.set(true);}public boolean drained(){return closed.get();}
+                }));
+                waitFor(entered);
+                org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(5)).untilAsserted(()->{
+                    assertThat(closed).as("Worker plan closed after the second outer tasklet guard; polls=%s",taskletPolls.get()).isTrue();
+                    assertThat(budget.used().bytes()).as("The original plan lease returned; control IO may remain").isLessThan(8L*1024*1024);
+                });
+                await(()->controlPasses.get()>=2||f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                assertThat(f.tasks.read("flow","task").orElseThrow().full().permission().phase()).isNotEqualTo(ValidationTaskStore.Phase.CLOSED);
+                assertThat(f.member.getJet().getJobs().getFirst().getStatus().isTerminal()).isFalse();
+            }finally{release.countDown();workerMayFinish.countDown();}
+            await(()->f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            var job=f.member.getJet().getJobs().getFirst();job.getFuture().get(10,TimeUnit.SECONDS);
+            assertThat(job.getStatus()).isEqualTo(com.hazelcast.jet.core.JobStatus.COMPLETED);
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.terminal()==ValidationRunState.COMPLETED).isPresent());
+            assertThat(access.reports().find(reference).orElseThrow().failure()).isNull();
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+        }finally{release.countDown();workerMayFinish.countDown();}
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={0,1,2,3})
+    void stoppingDuringPlanPreparationKeepsCancellationOutOfTheFailureReport(int lateFailure)throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);var planClosed=new AtomicBoolean();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            try {
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{
+                    entered.countDown();waitFor(resume);
+                    if(lateFailure==1)throw new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","late-original-reader"),null);
+                    if(lateFailure==2)throw new AssertionError("late original fatal failure");
+                    if(lateFailure==3)return new NativeValidationFullJob.Plan(){
+                        public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("Stopped plan cannot open readers");}
+                        public boolean drained(){return planClosed.get();}public void close(){planClosed.set(true);}
+                    };
+                    original.requireReserved();
+                    throw new AssertionError("Stopped preparation must never create a plan");
+                }));
+                assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());
+                await(()->reservation.cancelled.get());
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).as("Preparation still owns its original worker allocation").isFalse();
+            }finally{resume.countDown();}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var failure=access.reports().find(reference).orElseThrow().failure();
+            if(lateFailure==0||lateFailure==3)assertThat(failure).as("An explicitly stopped preparation is incomplete, not a failed native read").isNull();
+            else if(lateFailure==1)assertThat(failure).isNotNull().satisfies(value->assertThat(value.code()).isEqualTo(ValidationError.READ_FAILED.code()));
+            else assertThat(failure).isNotNull().satisfies(value->assertThat(value.fatal()).isTrue());
+            if(lateFailure==3)assertThat(planClosed).as("The original late plan was closed and physically drained").isTrue();
+        }finally{resume.countDown();}
+    }
+
+    @Test void cancellationUnwindingAnActiveScanKeepsItsReaderCleanupFailure()throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
+        var cleanupEntered=new java.util.concurrent.CountDownLatch(4);var cleanupResume=new java.util.concurrent.CountDownLatch(1);
+        var opened=new AtomicBoolean();var paused=new AtomicBoolean();var readerFailed=new AtomicBoolean();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            f.localGuard=()->{
+                boolean checking=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().endsWith("NativeValidationFullJob$Work")&&frame.getMethodName().equals("require")));
+                if(opened.get()&&checking&&paused.compareAndSet(false,true)){entered.countDown();waitFor(resume);}
+            };
+            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),List.of(),List.of()){
+                @Override public List<ValidationFullScan.Mapping> mappings(){
+                    var mapping=super.mappings().getFirst();
+                    return List.of(new ValidationFullScan.Mapping(mapping.id(),guard->{var merge=mapping.open().apply(guard);opened.set(true);return merge;},mapping.checker()));
+                }
+                @Override ValidationRowCursor cursor(List<Map<String,Object>> rows,Runnable guard){return new ValidationRowCursor(){
+                    public Optional<Row> next(){throw new AssertionError("Stopped scan cannot advance a reader");}
+                    public void close(){
+                        if(Thread.currentThread().getName().startsWith("validation-check")&&readerFailed.compareAndSet(false,true))
+                            throw new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","original-reader-close"),null);
+                    }
+                };}
+            };
+            try {
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+                assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();
+                for(int index=0;index<4;index++)f.process.cleanup(()->{cleanupEntered.countDown();waitFor(cleanupResume);});
+                assertThat(cleanupEntered.await(5,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->reservation.cancelled.get());
+                resume.countDown();await(readerFailed::get);
+            }finally{resume.countDown();cleanupResume.countDown();}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(access.reports().find(reference).orElseThrow().failure()).isNotNull()
+                    .satisfies(failure->assertThat(failure.params()).containsEntry("table","original-reader-close"));
+        }finally{resume.countDown();cleanupResume.countDown();}
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints={0,1,2,3,4})
+    void stoppingWhileAnOriginalReaderReturnsIsIncompleteWithoutAnExecutionFailure(int nativeSignal)throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);
+        var retained=new AtomicReference<Throwable>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),List.of(),List.of()){
+                @Override ValidationRowCursor cursor(List<Map<String,Object>> rows,Runnable guard){return new ValidationRowCursor(){
+                    public Optional<Row> next(){
+                        guard.run();entered.countDown();waitFor(resume);
+                        if(nativeSignal>0){
+                            Throwable cause=switch(nativeSignal){case 1->null;case 2->new IllegalStateException("Unexpected cause from the original native read");
+                                case 3->new java.util.concurrent.CancellationException("Original read cancelled");default->new InterruptedException("Original read interrupted");};
+                            var signal=new io.tapstate.core.common.TapstateException(ValidationError.READ_CANCELLED,Map.of("table","original-reader"),cause);
+                            retained.set(signal);throw signal;
+                        }
+                        guard.run();return Optional.empty();
+                    }
+                    public void close(){}
+                };}
+                @Override public Throwable failure(){return retained.get();}
+            };
+            try {
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+                assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->reservation.cancelled.get());
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).as("Blocked reader retains original allocation").isFalse();
+            }finally{resume.countDown();}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var failure=access.reports().find(reference).orElseThrow().failure();
+            if(nativeSignal!=2)assertThat(failure).isNull();
+            else assertThat(failure).isNotNull().satisfies(value->assertThat(value.technical()).contains("Unexpected cause from the original native read"));
+        }finally{resume.countDown();}
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void anOuterJetFailureAfterStopIsKnownBeforeDrainAndFinalReportMirroring(boolean fatal)throws Exception {
+        var state=new ValidationJobExecutionTest.State();state.delayReceipt=true;state.readers.set(true);
+        state.callbackFailure=fatal?new AssertionError("Original outer Jet report failure"):new IllegalStateException("Original outer Jet report failure");
+        ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            var execution=new AtomicReference<ValidationJobExecution>();
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){var value=ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);execution.set(value);return value;}
+                });
+                assertThat(state.callbackEntered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->original.cancelled.get());state.callbackRelease.countDown();
+                assertThat(state.originalJobEnded.await(8,TimeUnit.SECONDS)).isTrue();await(()->state.exited.get());
+                assertThat(state.failure()).isNull();assertThat(execution.get().progress().processorsExited()).as("Original Job receipt is still unresolved").isFalse();
+                assertThat(f.resources.snapshot().processors()).as("Original processor receipt remains owned while Job diagnosis is unresolved").isEqualTo(1);
+                var pendingReference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+                assertThat(access.reports().find(pendingReference).orElseThrow().terminal()).as("No final mirror before the original Job receipt").isNull();
+            }finally{state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(java.util.Objects.requireNonNullElseGet(state.originalFailure.get(),()->new java.util.concurrent.CancellationException("Fixture cleanup")));}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
+            assertThat(failure.technical()).contains("Original outer Jet report failure");if(fatal)assertThat(failure.fatal()).isTrue();
+        }finally{state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
+    @Test void aFailedOriginalJobMirrorsItsLastReaderCleanupWithoutReplacingTheFirstDiagnosis()throws Exception {
+        var published=new AtomicBoolean();
+        var primary=new io.tapstate.core.common.TapstateException(ValidationError.OWNER_NOT_AUTHORIZED,Map.of("pipeline","flow"),null);
+        var cleanup=new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","last-reader-after-owner-failure"),null);
+        var state=new ValidationJobExecutionTest.State(){
+            @Override public boolean readersReleased(){if(readers.get())published.set(true);return readers.get();}
+            @Override public Throwable failure(){return published.get()?cleanup:null;}
+        };
+        state.delayReceipt=true;state.callbackFailure=primary;ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            var execution=new AtomicReference<ValidationJobExecution>();
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){var value=ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);execution.set(value);return value;}
+                });
+                assertThat(state.callbackEntered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());await(()->original.cancelled.get());state.callbackRelease.countDown();
+                assertThat(state.originalJobEnded.await(8,TimeUnit.SECONDS)).isTrue();await(()->state.exited.get());
+                state.delayedReceipt.completeExceptionally(primary);await(()->execution.get().progress().processorsExited());
+                assertThat(execution.get().progress().failure()).isSameAs(primary);assertThat(execution.get().progress().readersReleased()).isFalse();assertThat(published).isFalse();
+                var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+                assertThat(access.reports().find(reference).orElseThrow().terminal()).as("The last reader has not released its original resources").isNull();
+                state.readers.set(true);
+                await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+                await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+                var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
+                assertThat(failure.code()).isEqualTo(ValidationError.OWNER_NOT_AUTHORIZED.code());assertThat(failure.params()).containsEntry("pipeline","flow");
+                assertThat(failure.technical()).contains("validation.owner-not-authorized","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
+            }finally{state.readers.set(true);state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));}
+        }finally{if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
+    @Test void stopDuringGraphAuthorizationCreatesNoJobAndMirrorsNoExecutionFailure()throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var resume=new java.util.concurrent.CountDownLatch(1);var paused=new AtomicBoolean();
+        var state=new ValidationJobExecutionTest.State();state.readers.set(true);ValidationRunIdentity identity=null;
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);identity=start.run();var original=f.owners.take(start);var access=original.access();
+            f.localGuard=()->{
+                boolean submitting=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals("io.tapstate.runtime.engine.validation.ValidationJobGraph")&&frame.getMethodName().equals("submit")));
+                if(submitting&&paused.compareAndSet(false,true)){entered.countDown();waitFor(resume);}
+            };
+            try {
+                runs.start(start,new ValidationRunLifecycle.Activation(){
+                    public ValidationRunLifecycle.Readiness readiness(){return ValidationRunLifecycle.Readiness.READY;}
+                    public ValidationRunLifecycle.Execution create(){return ValidationJobExecutionTest.originalExecution(f.member,registry,start.run(),state,original::requireReserved);}
+                });
+                assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());assertThat(state.cancelled).isTrue();
+            }finally{resume.countDown();}
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            await(()->access.reports().find(reference).filter(report->report.closed()&&report.terminal()==ValidationRunState.STOPPED).isPresent());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processors()==0);
+            assertThat(f.member.getJet().getJobs()).as("A cancelled pre-handoff graph creates no original or replacement Job").isEmpty();
+            assertThat(access.reports().find(reference).orElseThrow().failure()).isNull();
+        }finally{resume.countDown();if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
+    }
+
+    @Test void nativeCountUsesTheOriginalFullSlotJobAndConfigSummaryWithoutCreatingRoots()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var request=f.request("FULL",1);var accepted=f.owners.reserve(request);
+            assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.COUNT);
+            var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+            var start=new ValidationReportAdmission.Start(f.task,1,1,request.command().toString(),identity);
+            var reservation=f.owners.take(start);var access=reservation.access();long countingGeneration=reservation.countingGeneration();var closed=new AtomicBoolean();var calls=new AtomicInteger();
+            var mapping=f.comparison.mappings().getFirst();
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->new NativeValidationFullJob.Plan(){
+                public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("COUNT must not open row readers");}
+                public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
+                    guard.run();calls.incrementAndGet();return new ValidationCountScan.Scalar(mapping.source(),9007199254740993L,
+                            new ValidationCheckEvent.ReadBoundary("source","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));
+                },guard->{guard.run();calls.incrementAndGet();return new ValidationCountScan.Scalar(mapping.target(),9007199254740992L,
+                            new ValidationCheckEvent.ReadBoundary("target","native-count-v1",java.time.Instant.EPOCH,java.time.Instant.EPOCH));}));}
+                public void close(){closed.set(true);}public boolean drained(){return closed.get();}
+            }));
+            await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            var original=new ValidationControlStore.Run(identity,countingGeneration,start,spec);
+            assertThat(access.control().read(identity.owner(),original).orElseThrow().state()).isEqualTo(ValidationRunState.COMPLETED);
+            await(()->f.resources.snapshot().processReserved().isEmpty()&&f.resources.snapshot().metadataFrames()==0);
+            var report=f.raw.getDatabase(f.configName).getCollection("validation_reports").find().first();
+            assertThat(report.getLong("rootCount")).isZero();
+            assertThat(report.getList("countSummaries",org.bson.Document.class)).singleElement().satisfies(value->
+                    assertThat(value).containsEntry("sourceCount",9007199254740993L).containsEntry("targetCount",9007199254740992L));
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+            assertThat(calls).hasValue(2);assertThat(f.member.getJet().getJobs()).hasSize(1);
+        }
+    }
+    @Test void aPlanFailureReportedBeforeItsLastReaderExitCannotBecomeSuccessfulCompletion()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);
+            var delegate=new Plan(start.run(),f.comparison.mappings().getFirst(),List.of(Plan.row(1,"same")),List.of(Plan.row(1,"same")));
+            var drained=new AtomicBoolean();var late=new AtomicReference<Throwable>();
+            var plan=new NativeValidationFullJob.Plan(){
+                public List<ValidationFullScan.Mapping> mappings(){return delegate.mappings();}
+                public boolean drained(){return drained.get()&&delegate.drained();}
+                public Throwable failure(){return late.get();}
+                public void close(){delegate.close();}
+            };
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            await(()->delegate.closed);
+            late.set(new io.tapstate.core.common.TapstateException(ValidationError.READ_FAILED,Map.of("table","original-reader"),null));
+            drained.set(true);
+            var exact=new org.bson.Document("_id.kind","run").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId()).append("_id.taskId",start.run().taskId())
+                    .append("_id.mode",start.run().mode().name()).append("_id.runId",start.run().runId());
+            var stored=f.raw.getDatabase(f.cacheName).getCollection("validation_runs");
+            var terminal=new AtomicReference<org.bson.Document>();
+            org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(45)).until(()->{
+                var state=stored.find(exact).first();
+                if(state==null||!Boolean.TRUE.equals(state.getBoolean("retired"))||!ValidationRunState.valueOf(state.getString("state")).terminal())return false;
+                terminal.set(state);return true;
+            });
+            assertThat(terminal.get()).containsEntry("state",ValidationRunState.FAILED.name());
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+        }
+    }
+    @Test void theThousandAndFirstLocatedProblemStopsTheOriginalJobAndKeepsItsFirstThousandRoots()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var rows=java.util.stream.LongStream.rangeClosed(1,1001).mapToObj(id->Plan.row(id,"missing")).toList();
+            var plan=new Plan(start.run(),f.comparison.mappings().getFirst(),rows,List.of(),true);
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,ignored->plan));
+            var stored=f.raw.getDatabase(f.cacheName).getCollection("validation_runs");
+            var exactRun=new org.bson.Document("_id.kind","run").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId()).append("_id.taskId",start.run().taskId())
+                    .append("_id.mode",start.run().mode().name()).append("_id.runId",start.run().runId());
+            var terminal=new AtomicReference<org.bson.Document>();
+            // A long finished run may already have released its live owner. Read the exact durable
+            // fixture record, rather than extending that owner merely to inspect its final result.
+            try{org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(90)).until(()->{
+                var saved=stored.find(exactRun).first();
+                if(saved==null||!Boolean.TRUE.equals(saved.getBoolean("retired"))||!ValidationRunState.valueOf(saved.getString("state")).terminal())return false;
+                if(f.tasks.read("flow","task").orElseThrow().full().permission().phase()!=ValidationTaskStore.Phase.CLOSED)return false;
+                terminal.set(saved);return true;
+            });}catch(org.awaitility.core.ConditionTimeoutException unresolved){
+                var facts=String.valueOf(stored.find(exactRun).first());
+                throw new AssertionError("Original quota run="+start.run().runId()+"; checked="+plan.checked.get()+"; resources="+f.resources.snapshot()
+                        +"; retained="+facts.substring(0,Math.min(facts.length(),4096)),unresolved);
+            }
+            assertThat(terminal.get()).containsEntry("state",ValidationRunState.STOPPED.name());
+            var pipeline=stored.find(new org.bson.Document("_id.kind","pipeline").append("_id.clusterId",start.run().owner().clusterId())
+                    .append("_id.pipelineId",start.run().owner().pipelineId())).first();
+            assertThat(pipeline).containsEntry("problemLimit",true).containsEntry("countingGeneration",original.countingGeneration());
+            var report=f.raw.getDatabase(f.configName).getCollection("validation_reports").find().first();
+            assertThat(report).containsEntry("closed",true).containsEntry("rootCount",1000L);
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isEqualTo(1000);
+            assertThat(plan.checked).hasValue(1001);
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(plan.drained()).isTrue();
+        }
+    }
+    @Test void aBlockedPublicationDoesNotHoldTheQuotaLockOrReturnItsBudgetOnStop()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var actual=access.results();var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+            var pending=new AtomicReference<ValidationResultStore.RootWrite>();
+            var captured=org.mockito.Mockito.spy(access);
+            org.mockito.Mockito.doReturn(new ValidationResultStore(){
+                public Publication publish(RootWrite write){
+                    assertThat(Thread.currentThread().getName()).startsWith("validation-control-io");
+                    pending.set(write);entered.countDown();
+                    try{assertThat(release.await(30,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    return actual.publish(write);
+                }
+                public Seal seal(Report report){return actual.seal(report);}
+            }).when(captured).results();
+            reservation.access=captured;
+            var probe=java.util.concurrent.Executors.newSingleThreadExecutor();
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst(),true)));
+                assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();
+                var quota=probe.submit(()->{
+                    while(true){
+                        var answer=runs.reserveConfirmed(start.run(),pending.get().check().observation().root());
+                        if(answer.isPresent())return answer.orElseThrow().admission();
+                        Thread.yield();
+                    }
+                });
+                assertThat(quota.get(5,TimeUnit.SECONDS)).isEqualTo(ValidationProblemQuota.Admission.EXISTING);
+                runs.stop(start.run());
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.STOPPED).isPresent());
+                assertThat(runs.read(start.run()).drained()).isFalse();
+                assertThat(runs.publicationsDrained(start.run())).isFalse();
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();
+            }finally{release.countDown();probe.shutdownNow();assertThat(probe.awaitTermination(5,TimeUnit.SECONDS)).isTrue();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+        }
+    }
+    @Test void refusedControlPublicationReturnsOnlyTheProvenUnsubmittedPayload()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var held=new AtomicReference<ValidationLocalBudget.Reservation>();var first=new AtomicBoolean(true);
+            f.localGuard=()->{
+                boolean publishing=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationRuns.class.getName())&&frame.getMethodName().equals("publishRoot")));
+                if(publishing&&first.compareAndSet(true,false)){
+                    long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                    while(held.get()==null&&System.nanoTime()-until<0){
+                        try{held.set(reservation.resources().budget().reserve(new ValidationLocalBudget.Amount(0,19,0,0)));}
+                        catch(io.tapstate.core.common.TapstateException busy){if(busy.code()!=ValidationError.VALUE_LIMIT_EXCEEDED)throw busy;Thread.yield();}
+                    }
+                    assertThat(held.get()).isNotNull();
+                }
+            };
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.FAILED).isPresent());
+                assertThat(held.get()).isNotNull();
+                assertThat(runs.publicationsDrained(start.run())).isTrue();
+                assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+            }finally{if(held.get()!=null)held.get().close();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+        }
+    }
+    @Test void anUnknownControlSubmissionRetainsItsRunningWriteUntilActualExit()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var access=reservation.access();
+            var original=new ValidationControlStore.Run(start.run(),reservation.countingGeneration(),start,reservation.spec());
+            var actual=access.results();var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+            var captured=org.mockito.Mockito.spy(access);var uncertain=new IllegalStateException("owned response lost after publication started");
+            org.mockito.Mockito.doReturn(new ValidationResultStore(){
+                public Publication publish(RootWrite write){
+                    entered.countDown();
+                    try{assertThat(release.await(30,TimeUnit.SECONDS)).isTrue();}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    return actual.publish(write);
+                }
+                public Seal seal(Report report){return actual.seal(report);}
+            }).when(captured).results();
+            reservation.access=captured;
+            var controls=new java.util.concurrent.ThreadPoolExecutor(4,4,0,TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<Runnable>(64),runnable->Thread.ofPlatform().daemon().name("validation-control-io-owned").unstarted(runnable)){
+                private final AtomicBoolean first=new AtomicBoolean(true);
+                @Override public void execute(Runnable action){
+                    super.execute(action);
+                    boolean publishing=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().equals(NativeValidationRuns.class.getName())&&frame.getMethodName().equals("publishRoot")));
+                    if(publishing&&first.compareAndSet(true,false)){
+                        try{assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();}
+                        catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                        throw uncertain;
+                    }
+                }
+            };
+            var unused=(java.util.concurrent.ExecutorService)org.springframework.test.util.ReflectionTestUtils.getField(f.process,"controls");
+            unused.shutdown();org.springframework.test.util.ReflectionTestUtils.setField(f.process,"controls",controls);
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,
+                        ignored->new Plan(start.run(),f.comparison.mappings().getFirst())));
+                assertThat(entered.await(12,TimeUnit.SECONDS)).isTrue();
+                await(()->access.control().read(start.run().owner(),original).filter(state->state.retired()&&state.state()==ValidationRunState.FAILED).isPresent());
+                assertThat(runs.publicationsDrained(start.run())).isFalse();
+                assertThat(runs.read(start.run()).drained()).isFalse();
+                assertThat(f.resources.snapshot().processReserved().isEmpty()).isFalse();
+            }finally{release.countDown();}
+            await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
+            assertThat(f.raw.getDatabase(f.configName).getCollection("validation_differences").countDocuments()).isZero();
+        }
+    }
+    @Test void refusedWorkerAdmissionCannotLeaveAPhantomReaderAfterTheJobFails()throws Exception {
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);var created=new AtomicInteger();var refuse=new AtomicBoolean(true);
+            var held=new AtomicReference<ValidationLocalBudget.Reservation>();
+            f.localGuard=()->{
+                boolean launching=StackWalker.getInstance().walk(frames->frames.anyMatch(frame->frame.getClassName().endsWith("NativeValidationFullJob$Work")&&frame.getMethodName().equals("launch")));
+                if(launching&&refuse.compareAndSet(true,false)){
+                    long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(5);
+                    while(held.get()==null&&System.nanoTime()-until<0){
+                        try{held.set(reservation.resources().budget().reserve(new ValidationLocalBudget.Amount(0,20,0,0)));}
+                        catch(io.tapstate.core.common.TapstateException busy){if(busy.code()!=ValidationError.VALUE_LIMIT_EXCEEDED)throw busy;Thread.yield();}
+                    }
+                    assertThat(held.get()).isNotNull();
+                }
+            };
+            try{
+                runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{created.incrementAndGet();return new Plan(start.run(),f.comparison.mappings().getFirst());}));
+                await(()->held.get()!=null&&!f.member.getJet().getJobs().isEmpty()&&f.member.getJet().getJobs().getFirst().getStatus().isTerminal());
+                held.get().close();
+                await(()->f.tasks.read("flow","task").orElseThrow().full().permission()!=null&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+            }finally{if(held.get()!=null)held.get().close();}
+            await(()->f.resources.snapshot().metadataFrames()==0);assertThat(created).hasValue(0);
+            await(()->{try{runs.read(start.run());return false;}catch(io.tapstate.core.common.TapstateException ended){return ended.args().containsValue("runs.originalUnavailable");}});
+        }
+    }
+    @Test void cancellationBeforePlanPublicationDoesNotConsumeItsFutureCleanupRetry()throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var returnPlan=new java.util.concurrent.CountDownLatch(1);
+        var cleanupEntered=new java.util.concurrent.CountDownLatch(4);var releases=List.of(new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1),new java.util.concurrent.CountDownLatch(1));
+        var closes=new AtomicInteger();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var registry=new ValidationProcessorRegistry(f.member,()->{})) {
+            var start=prepare(f);var reservation=f.owners.take(start);
+            runs.start(start,new NativeValidationFullJob(reservation,registry,f.member,f.process,runs,original->{
+                assertThat(Thread.currentThread().getName()).startsWith("validation-check");
+                assertThat(original.resources().budget().used().bytes()).isGreaterThanOrEqualTo(8L*1024*1024);
+                entered.countDown();waitFor(returnPlan);
+                return new NativeValidationFullJob.Plan(){
+                    public List<ValidationFullScan.Mapping> mappings(){throw new AssertionError("cancelled plan must not open readers");}
+                    public void close(){if(closes.incrementAndGet()==1)throw new io.tapstate.core.common.TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","fixture.firstCleanupUnknown"),null);}
+                    public boolean drained(){return closes.get()>=2;}
+                };
+            }));
+            assertThat(entered.await(10,TimeUnit.SECONDS)).isTrue();
+            for(var release:releases)f.process.cleanup(()->{cleanupEntered.countDown();waitFor(release);});
+            assertThat(cleanupEntered.await(5,TimeUnit.SECONDS)).isTrue();runs.stop(start.run());
+            var originalCleanupPassed=new java.util.concurrent.CountDownLatch(1);f.process.cleanup(originalCleanupPassed::countDown);
+            releases.getFirst().countDown();assertThat(originalCleanupPassed.await(5,TimeUnit.SECONDS)).isTrue();
+            returnPlan.countDown();await(()->closes.get()>=2);await(()->f.resources.snapshot().metadataFrames()==0);
+            assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,start.run().runId(),f.task.generation(),1);
+            var failure=reservation.access().reports().find(reference).orElseThrow().failure();
+            assertThat(failure).isNotNull().satisfies(value->assertThat(value.params()).containsEntry("field","fixture.firstCleanupUnknown"));
+        }finally{returnPlan.countDown();releases.forEach(java.util.concurrent.CountDownLatch::countDown);}
+    }
+    static void waitFor(java.util.concurrent.CountDownLatch latch){try{assertThat(latch.await(12,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
+    static ValidationReportAdmission.Start prepare(NativeValidationOwnerReservationsIT.Fixture f){
+        assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID())))
+                .isEqualTo(ValidationTaskStore.Write.APPLIED);
+        var request=new ValidationOwnerRouter.Request("flow","task",f.task.generation(),2,1,"FULL",UUID.randomUUID(),UUID.randomUUID().toString());
+        var accepted=f.owners.reserve(request);assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+        var spec=new ValidationRunSpec(f.comparison,ValidationMode.FULL,ValidationMethod.FULL_COLUMN);
+        var identity=new ValidationRunIdentity(accepted.owner(),"task",request.run(),ValidationMode.FULL,spec.fingerprint(),1,"rules");
+        return new ValidationReportAdmission.Start(f.task,2,1,request.command().toString(),identity);
+    }
+    static class Plan implements NativeValidationFullJob.Plan {
+        final ValidationRunIdentity run;final ValidationTaskSpec.Mapping mapping;final AtomicInteger checked=new AtomicInteger(),borrowed=new AtomicInteger();
+        final List<Map<String,Object>> source,target;
+        volatile boolean closed;final boolean ordered;
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping){this(run,mapping,
+                List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e")),
+                List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e")));}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,boolean ordered){this(run,mapping,
+                List.of(row(1,"a"),row(2,"b"),row(3,"c"),row(3,"duplicate"),row(5,"e")),
+                List.of(row(1,"a"),row(2,"wrong"),row(4,"extra"),row(5,"e")),ordered);}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target){this(run,mapping,source,target,false);}
+        Plan(ValidationRunIdentity run,ValidationTaskSpec.Mapping mapping,List<Map<String,Object>> source,List<Map<String,Object>> target,boolean ordered){
+            this.run=run;this.mapping=mapping;this.source=List.copyOf(source);this.target=List.copyOf(target);this.ordered=ordered;
+        }
+        public List<ValidationFullScan.Mapping> mappings(){
+            if(ordered)return List.of(ValidationFullScan.Mapping.paired(mapping.mappingId(),guard->
+                    new ValidationOrderedMerge(groups(source,mapping.source(),guard),groups(target,mapping.target(),guard)),
+                    (observation,pair,guard)->{
+                        checked.incrementAndGet();return ValidationRootReader.readOrderedDirect(observation,ValidationMethod.FULL_COLUMN,pair,
+                                new ValidationRootCheck.Limits(65536,32,32,8,2),guard,(values,root)->
+                                ValidationFieldCheck.check(observation,List.of(),values.source().working(),values.target().working(),values.sourceSample(),values.targetSample(),Optional.empty(),String::equals,
+                                        new ValidationValueComparison.TraversalLimits(ROW,10000),root));
+                    }));
+            return List.of(new ValidationFullScan.Mapping(mapping.mappingId(),guard->
+                new ValidationOrderedMerge(groups(source,mapping.source(),guard),groups(target,mapping.target(),guard)),this::check));}
+        ValidationOrderedGroups groups(List<Map<String,Object>> rows,ValidationTaskSpec.Table side,Runnable guard){
+            return new ValidationOrderedGroups(side.sourceId(),cursor(rows,guard),row->new ValidationOrderedGroups.Key(key(row),physical(side,key(row))),ROW.bytes());
+        }
+        ValidationRootCheck check(ValidationObservation observation,Runnable guard){
+            checked.incrementAndGet();var key=observation.root().rootKey();
+            return ValidationRootReader.read(observation,ValidationMethod.FULL_COLUMN,
+                    new ValidationRootReader.Query("source","fixture-fresh-v1",()->cursor(selected(source,key),guard)),new ValidationRootReader.Query("target","fixture-fresh-v1",()->cursor(selected(target,key),guard)),
+                    new ValidationRelationRows.Limits(65536,ROW),new ValidationRootCheck.Limits(65536,32,32,8,2),Clock.systemUTC(),guard,
+                    row->new ValidationRootReader.Source(new ValidationRelationReader.Evaluation(ValidationRelationRows.Disposition.INCLUDED,row,Optional.of(physical(mapping.source(),key(row)))),List.of()),
+                    row->new ValidationRootReader.Target(row,physical(mapping.target(),key(row))),
+                    (pair,root)->ValidationFieldCheck.check(observation,List.of(),pair.source().working(),pair.target().working(),pair.sourceSample(),pair.targetSample(),Optional.empty(),String::equals,
+                            new ValidationValueComparison.TraversalLimits(ROW,10000),root));
+        }
+        List<Map<String,Object>> selected(List<Map<String,Object>> rows,ValidationKey key){return rows.stream().filter(row->key.equals(key(ValidationValues.ownRow(row,ROW)))).toList();}
+        ValidationRowCursor cursor(List<Map<String,Object>> rows,Runnable guard){return new ValidationRowCursor(){
+            int index;boolean ended;
+            public Optional<Row> next(){guard.run();if(index==rows.size())return Optional.empty();int ordinal=index++;borrowed.incrementAndGet();var value=ValidationValues.ownRow(rows.get(ordinal),ROW);
+                return Optional.of(new Row(){boolean returned;public long ordinal(){return ordinal;}public ValidationValues.Row values(){return value;}public void close(){if(!returned){returned=true;borrowed.decrementAndGet();}}});}
+            public void close(){ended=true;}
+        };}
+        public boolean drained(){return closed&&borrowed.get()==0;}public void close(){closed=true;}
+        static Map<String,Object> row(long id,String value){return Map.of("id",id,"value",value);}
+        static ValidationKey key(ValidationValues.Row row){return new ValidationKey(List.of(ValidationKey.Part.number(((Number)row.fields().get("id")).longValue())));}
+        static ValidationPhysicalIdentity physical(ValidationTaskSpec.Table side,ValidationKey key){return new ValidationPhysicalIdentity(side.sourceId(),side.database(),side.schema(),side.table(),List.of(List.of("id")),key);}
+    }
+    static void await(java.util.function.BooleanSupplier fact)throws InterruptedException {long until=System.nanoTime()+TimeUnit.SECONDS.toNanos(15);while(!fact.getAsBoolean()&&System.nanoTime()-until<0)Thread.sleep(10);assertThat(fact.getAsBoolean()).isTrue();}
+}

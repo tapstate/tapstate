@@ -29,6 +29,20 @@ class MongoDirectChannelStoreIT {
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster",1,"incarnation","pipeline",1);
     private static final DirectChannelContext CONTEXT = new DirectChannelContext(SCOPE,"channel","source","capture");
     private static final Duration TTL = Duration.ofSeconds(60);
+    @Test void validationControlDoesNotLoadCursorWriterOrPendingBatchBodies(){
+        withBusiness(f->{
+            assertThat(f.store().control(CONTEXT,"orders")).isEmpty();open(f);
+            var offsets=SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.database());var filter=new Document("_id",MongoDirectChannelRecords.id(CONTEXT));
+            offsets.updateOne(filter,new Document("$set",new Document("cursor",new Document("unreadable","x".repeat(2*1024*1024)))));
+            var broken=new Document("_id",MongoDirectChannelRecords.batchId(CONTEXT,1,1)).append("unreadable","x".repeat(512*1024));
+            SystemCollections.DIRECT_BATCHES.on(f.database()).insertOne(broken);var before=offsets.find(filter).first();
+            var control=f.store().control(CONTEXT,"orders").orElseThrow();assertThat(control.epoch()).isOne();
+            assertThat(control.capture()).isEqualTo(f.captureFence());assertThat(control.pipeline()).isEqualTo(f.pipelineFence());assertThat(control.selectedTable()).isTrue();
+            assertThatThrownBy(()->f.store().load(CONTEXT)).isInstanceOf(TapstateException.class);assertThat(offsets.find(filter).first()).isEqualTo(before);
+            offsets.updateOne(filter,new Document("$set",new Document("current.captureFence.resourceId","wrong")));
+            assertThatThrownBy(()->f.store().control(CONTEXT,"orders")).isInstanceOf(TapstateException.class);
+        });
+    }
 
     @Test void reopenPreservesPendingHighAndQuietTablesDoNotHoldACompletedBatch() {
         withBusiness(f -> {
