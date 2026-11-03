@@ -20,6 +20,8 @@ final class StorageRuntime implements AutoCloseable {
         default boolean available() { return true; }
         /** A candidate may wait for its existing membership gate; it must never override that gate. */
         default void awaitAvailability() {}
+        /** Only the main application close event invokes this before invalidating original runtime proofs. */
+        default void beforeOrderlyClose() {}
         @Override void close();
     }
     private final MongoConfigurationDomain configuration;

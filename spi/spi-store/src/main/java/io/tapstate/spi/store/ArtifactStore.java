@@ -159,6 +159,16 @@ public interface ArtifactStore {
     /** Returns the stored resource for the id, or empty if none is stored. */
     Optional<Resource> get(String id);
 
+    /**
+     * Captures the Source and its original lifetime/binding atomically. Empty means no Source exists;
+     * missing identity capability must refuse rather than substitute a hash or a new random identity.
+     */
+    default Optional<SourceBindingSnapshot> sourceBinding(String id) {
+        Objects.requireNonNull(id, "id");
+        throw new io.tapstate.core.common.TapstateException(IoError.SOURCE_IDENTITY_UNAVAILABLE,
+                Map.of("id", id), null);
+    }
+
     /** Verified deployment-owned target identity; absent only for a store without a storage binding. */
     default Optional<String> managedDefaultSourceId() { return Optional.empty(); }
 

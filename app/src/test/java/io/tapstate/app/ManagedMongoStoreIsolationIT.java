@@ -279,6 +279,14 @@ class ManagedMongoStoreIsolationIT {
                 assertThat(files.configurationUri()).contains(uri(user, configDb));
                 assertThat(admin.getDatabase(configDb).getCollection("users").countDocuments()).isZero();
                 assertThat(admin.getDatabase(configDb).getCollection("sources").countDocuments()).isOne();
+                var initialRules = admin.getDatabase(configDb).getCollection("alert_rules").find().into(new ArrayList<>());
+                assertThat(initialRules).hasSize(5);
+                for (var rule : initialRules) {
+                    assertThat(rule.get("_id", Document.class)).containsEntry("authorityId", setup.scope().installationId())
+                            .containsEntry("clusterId", setup.scope().clusterId());
+                    assertThat(rule.getString("deployment")).isEqualTo("ON_PREM");
+                    assertThat(rule.get("body", Document.class)).containsEntry("enabled", true);
+                }
                 assertThat(admin.getDatabase(cacheDb).getCollection("workload_claims").countDocuments()).isZero();
             }
             String key = admin.getDatabase(configDb).getCollection("cluster_keys").find().first().getString("keyId");
@@ -299,6 +307,12 @@ class ManagedMongoStoreIsolationIT {
                 var login = publicClient.post().uri("/auth/login").body(Map.of("username", "admin", "password", "op-installation-password", "createSession", true))
                         .retrieve().body(io.tapstate.control.restapi.LoginResponse.class);
                 var client = publicClient.mutate().defaultHeader("Authorization", "Bearer " + login.token()).build();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                    var rules = client.post().uri("/api/alerts/configuration/list").body(Map.of("kind", "RULE")).retrieve().body(Map.class);
+                    assertThat((List<?>) rules.get("rows")).hasSize(5);
+                    assertThat(admin.getDatabase(configDb).getCollection("alert_node_lifecycles")
+                            .countDocuments(new Document("phase", "EXPECTED"))).isGreaterThanOrEqualTo(1);
+                });
                 var admitted = client.post().uri("/api/storage/status").body(Map.of()).retrieve().body(Map.class);
                 assertThat(((List<?>)admitted.get("allowedActions")).containsAll(List.of("configuration.export", "configuration.import.preflight",
                         "configuration.import.commit", "configuration.import.status"))).isTrue();

@@ -17,6 +17,24 @@ class ClusterFixtureTimingTest {
             assertThat(outer.valid()).isTrue();
         }
     }
+    @Test void nativeConfigurationHasCompleteAndDistinctTimingParameters() {
+        String nativeHash=parameterHash(null);
+        assertThat(nativeHash).matches("[0-9a-f]{64}");
+        assertThat(nativeHash).isEqualTo(parameterHash(null));
+        assertThat(nativeHash).isNotEqualTo(parameterHash(""));
+        assertThat(nativeHash).isNotEqualTo(parameterHash("<native-config>"));
+    }
+    private static String parameterHash(String operator) {
+        try(var scope=ClusterFixtureTiming.install()) {
+            long preparation=ClusterFixtureTiming.beginPreparation();
+            ClusterFixtureTiming.bind(preparation,12345);
+            ClusterFixtureTiming.prepared(12345,"mongodb://localhost/config",operator,"127.0.0.1",
+                    java.util.List.of("-Xmx768m"),java.util.List.of("--tapstate.cluster.id=timing-cluster"));
+            assertThat(scope.valid()).isTrue();
+            return scope.events().stream().filter(event->event.phase()==ClusterFixtureTiming.Phase.PREPARED)
+                    .findFirst().orElseThrow().parameters();
+        }
+    }
     @Test void disabledObserverDoesNotCreateAnObservation() {
         try (var scope = ClusterFixtureTiming.suspend()) {
             assertThat(ClusterFixtureTiming.beginPreparation()).isZero();

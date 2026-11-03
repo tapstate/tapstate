@@ -1,0 +1,75 @@
+{
+  "_id": {
+    "authorityId": "org-a",
+    "clusterId": "cluster-a",
+    "id": "route-a"
+  },
+  "formatVersion": 2,
+  "kind": "SUBSCRIPTION",
+  "incarnation": "11111111-1111-4111-8111-111111111111",
+  "recordRevision": {
+    "$numberLong": "1"
+  },
+  "writeFence": {
+    "$numberLong": "0"
+  },
+  "deployment": "ON_PREM",
+  "createdAt": "2026-10-27T00:00:00.123456789Z",
+  "createdBy": "actor-a",
+  "updatedAt": "2026-10-27T00:00:00.123456789Z",
+  "updatedBy": "actor-a",
+  "retiredAt": null,
+  "body": {
+    "name": "Team route",
+    "match": {
+      "resources": {
+        "kinds": [
+          "source"
+        ],
+        "all": true,
+        "selected": []
+      },
+      "typeIds": [],
+      "severities": []
+    },
+    "enabled": true,
+    "channels": [
+      {
+        "type": "email",
+        "receivers": [
+          {
+            "authorityId": "org-a",
+            "clusterId": "cluster-a",
+            "id": "receiver-a",
+            "kind": "RECEIVER",
+            "incarnation": "11111111-1111-4111-8111-111111111111"
+          }
+        ],
+        "messages": {
+          "titlePrefix": "[team] ",
+          "titleSuffix": "",
+          "messageNote": "Runbook",
+          "footerText": ""
+        }
+      }
+    ],
+    "groupBy": [
+      "TYPE"
+    ],
+    "grouping": {
+      "initialNanos": {
+        "$numberLong": "10000000000"
+      },
+      "changeNanos": {
+        "$numberLong": "30000000000"
+      },
+      "repeatNanos": {
+        "$numberLong": "120000000000"
+      }
+    },
+    "inhibition": [],
+    "bindingRevision": {
+      "$numberLong": "1"
+    }
+  }
+}

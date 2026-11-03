@@ -21,6 +21,33 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Temporarily isolated hundred-table diagnostic
+
+Only `AHundredTablesShareTheSinksWritersIT` is temporarily disabled in default
+verification under [#911](https://github.com/tapstate/tapstate/issues/911), by
+maintainer decision. Its source remains in the normal shard inventory and its
+XML result is explicitly **skipped**, not passed. All other test selection and
+evidence checks remain unchanged. This does not resolve the observed incomplete
+target writes or classify them as a confirmed fixture error.
+
+With JDK 21, Maven and an already-running Docker daemon, run it independently:
+
+```sh
+.github/scripts/hundred-table-diagnostic.sh
+```
+
+The script selects only the original method, explicitly deactivates JUnit's
+disabled condition for that invocation, and requires a fresh report with one
+executed test and zero skips. This manual result is separate from default CI's
+source-disabled evidence and must not replace it in aggregate admission.
+
+Restore default execution after #911 has a demonstrated root cause and a
+discriminating regression, table-to-target identity and per-table content
+assertions are strengthened, and CI stability is verified with the original
+100 tables, 3 rows each, 4 writers, 2 members, 2-minute startup and 3-minute
+delivery budgets. Extending a timeout, reducing the workload or one successful
+repeat does not meet these restoration conditions.
+
 ## Real connector fixture inputs
 
 The scheduled/manual Real connectors lane builds seven checked connector kinds,

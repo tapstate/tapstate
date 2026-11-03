@@ -113,6 +113,9 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     public synchronized Optional<Resource> get(String id) {
         var current = delegate.get(id); current.ifPresent(this::track); return current;
     }
+    @Override public synchronized Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        var current=delegate.sourceBinding(id);current.ifPresent(value->track(value.source()));return current;
+    }
     @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
 
     /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
