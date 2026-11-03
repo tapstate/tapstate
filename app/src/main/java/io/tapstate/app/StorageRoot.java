@@ -46,9 +46,11 @@ final class StorageRoot implements AutoCloseable {
     private final Object activationLock = new Object();
     private java.util.concurrent.ExecutorService activationWorker;
     private final java.util.concurrent.atomic.AtomicReference<java.util.concurrent.CompletableFuture<Void>> pendingActivation = new java.util.concurrent.atomic.AtomicReference<>();
-    private record InstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete) {}
+    private record InstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete,
+            java.util.function.BooleanSupplier deliveryPending, Runnable deliver) {}
     private final java.util.concurrent.atomic.AtomicReference<InstallationCompletion> installationCompletion = new java.util.concurrent.atomic.AtomicReference<>();
     private volatile boolean installationCompletionRegistered;
+    private volatile boolean installationReadinessPublished;
     private volatile boolean activationStoragePrepared;
     private boolean initialSourceTestPending;
     private volatile boolean activationFailed;
@@ -197,16 +199,23 @@ final class StorageRoot implements AutoCloseable {
         return activationStoragePrepared || originalSetupCreationAvailable()
                 || installationCompletionPending() && runtime.businessStarted();
     }
-    void retainInstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete) {
+    void retainInstallationCompletion(java.util.function.BooleanSupplier pending, Runnable complete,
+            java.util.function.BooleanSupplier deliveryPending, Runnable deliver) {
         synchronized (activationLock) {
             requireOpen();
             if (cloud.cloud() || !installationCompletion.compareAndSet(null,
-                    new InstallationCompletion(Objects.requireNonNull(pending), Objects.requireNonNull(complete))))
+                    new InstallationCompletion(Objects.requireNonNull(pending), Objects.requireNonNull(complete),
+                            Objects.requireNonNull(deliveryPending), Objects.requireNonNull(deliver))))
                 throw new IllegalStateException("installation completion already registered");
             installationCompletionRegistered = true;
         }
     }
     private boolean installationCompletionPending() {
+        if (!installationCompletionRegistered) return false;
+        var completion = installationCompletion.get();
+        return completion.pending().getAsBoolean() || completion.deliveryPending().getAsBoolean();
+    }
+    private boolean installationFilesPending() {
         return installationCompletionRegistered && installationCompletion.get().pending().getAsBoolean();
     }
     boolean completedInstallationActivationAllowed() {
@@ -216,7 +225,7 @@ final class StorageRoot implements AutoCloseable {
         var preparation = configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable);
         if (preparation.authScope().mode() != StorageBinding.Mode.OP) return false;
         if (runtime.businessStarted()) {
-            if (!installationCompletionPending()) return false;
+            if (!installationFilesPending()) return false;
             requirePublishedBusinessOwner(null);
         } else if (preparation.authScope().authGeneration() != 1) return false;
         OnPremInstallation.requireActivationPreparation(configuration, preparation);
@@ -246,16 +255,21 @@ final class StorageRoot implements AutoCloseable {
         if (!installationCompletionPending() || !runtime.businessStarted()) return;
         var original = requirePublishedBusinessOwner(expected); var scope = original.binding().setup();
         phase = Phase.BUSINESS_READY;
-        initializationProgress.begin(scope, 2, true);
-        initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
-        initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
-        try {
-            installationCompletion.get().complete().run();
-            activationFailed = false;
-            initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
-        } catch (RuntimeException | Error failure) {
-            activationFailed = true; initializationProgress.failed(scope, failure); throw failure;
+        var completion = installationCompletion.get();
+        if (!installationReadinessPublished) {
+            initializationProgress.begin(scope, 2, true);
+            initializationProgress.completed(scope, StorageInitializationProgress.Stage.START_RUNTIME);
+            initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+            try {
+                completion.complete().run();
+                initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
+                installationReadinessPublished = true;
+            } catch (RuntimeException | Error failure) {
+                activationFailed = true; initializationProgress.failed(scope, failure); throw failure;
+            }
         }
+        if (completion.deliveryPending().getAsBoolean()) completion.deliver().run();
+        activationFailed = false;
     }
 
     private void completeRetainedInstallation() {
@@ -292,7 +306,7 @@ final class StorageRoot implements AutoCloseable {
                     }
                     catch (RuntimeException | Error failure) {
                         activationFailed = true;
-                        initializationProgress.failed(committed.binding().setup(), failure);
+                        if (!installationReadinessPublished) initializationProgress.failed(committed.binding().setup(), failure);
                         completion.completeExceptionally(failure);
                         LOG.error("Initial CACHE activation failed [{}]", failure instanceof TapstateException coded
                                 ? coded.code().code() : failure.getClass().getName());
@@ -359,7 +373,7 @@ final class StorageRoot implements AutoCloseable {
                 initializationProgress.started(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
             }
             phase = Phase.BUSINESS_READY;
-            if (tracked && !installationCompletionPending())
+            if (tracked && !installationFilesPending())
                 initializationProgress.completed(scope, StorageInitializationProgress.Stage.PUBLISH_READY);
             if (initialSourceTestPending) {
                 initialSourceTestPending = false;

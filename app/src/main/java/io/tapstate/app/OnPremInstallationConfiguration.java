@@ -37,7 +37,7 @@ class OnPremInstallationConfiguration {
         if ("true".equals(environment.getProperty("tapstate.installation.automatic-restart"))) installation.onStartupCompleted(() -> {
                 if (!installation.automaticAuthorization() && root.runtime().requireConfiguration().firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase()
                         == io.tapstate.spi.store.FirstAdminStore.Phase.PENDING) {
-                    InstallationCommand.authorize(files, mongo, clock);
+                    InstallationCommand.authorizeFirstAdministrator(files, mongo, clock);
                     org.slf4j.LoggerFactory.getLogger(OnPremInstallationConfiguration.class)
                             .info("First-administrator authorization is ready in {}; continue at {}", files.directory().resolve("capability.json"), files.stage().managementUrl());
                 }

@@ -32,6 +32,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     private Connector connector;
     private volatile boolean closed;
     private volatile boolean installationReady;
+    private volatile boolean startupCompletedDelivered;
     private MongoConfigurationDomain.InitialOpRecovery recoveryInvocation;
     private boolean credentialRequired = true;
     void requireCredential(boolean required) { credentialRequired = required; }
@@ -68,7 +69,8 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                 new MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()), target, root::configurationEndpoint,
                 new AuditGate(record -> root.runtime().requireConfiguration().audit().record(record), clock), clock, root::requireActive,
                 this::continueSetup, root::coordinateSetup, this::prepareConfiguration, root.initializationProgress());
-        root.retainInstallationCompletion(() -> !installationReady, this::afterNormalStartup);
+        root.retainInstallationCompletion(() -> !installationReady, this::afterNormalStartup,
+                () -> !startupCompletedDelivered, this::afterReadyPublished);
     }
 
     InstallationFiles files() { return files; }
@@ -223,7 +225,14 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         });
         capabilities.close(); restored = null;
         installationReady = true;
+    }
+    synchronized void afterReadyPublished() {
+        if (closed) throw StorageRuntime.unavailable();
+        root.requireActive();
+        if (startupCompletedDelivered) return;
+        if (!firstAdministratorReady()) throw StorageRuntime.unavailable();
         startupCompleted.run();
+        startupCompletedDelivered = true;
     }
 
     StorageRecoveryService recoveryService() {

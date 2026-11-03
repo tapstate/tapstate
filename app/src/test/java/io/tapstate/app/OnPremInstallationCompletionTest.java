@@ -47,8 +47,9 @@ class OnPremInstallationCompletionTest {
         final OnPremInstallation installation;
         final StorageEntryStatus entry;
         final org.apache.catalina.connector.Request request = mock(org.apache.catalina.connector.Request.class);
-        Fixture(Path directory) { this(directory, 1); }
-        Fixture(Path directory, long authGeneration) {
+        Fixture(Path directory) { this(directory, 1, false); }
+        Fixture(Path directory, long authGeneration) { this(directory, authGeneration, false); }
+        Fixture(Path directory, long authGeneration, boolean automatic) {
             files = spy(InstallationFiles.initialize(directory)); scope = files.stage().scope(); currentScope = new AtomicReference<>(scope);
             preparation = new CachePreparation(scope.operationId(), new CacheAuthScope(scope.clusterId(), 1, StorageBinding.Mode.OP, "original-cache", authGeneration));
             binding = new StorageBinding(scope, StorageBinding.Mode.OP, 1, "views", new StorageBinding.Connection(
@@ -106,8 +107,18 @@ class OnPremInstallationCompletionTest {
             root.installOnPremConfiguration(configuration, CONFIG);
             root.runtime().loadBound().orElseThrow();
             when(business.available()).thenReturn(true); root.retainInitialAssembly(ignored -> business);
-            installation = new OnPremInstallation(root, files, mongo, target, Clock.systemUTC());
-            installation.requireCredential(true); installation.onStartupCompleted(completions::incrementAndGet);
+            if (automatic) {
+                @SuppressWarnings("unchecked") ObjectProvider<StorageSetupService.DefaultTarget> targets = mock(ObjectProvider.class);
+                when(targets.getObject()).thenReturn(target);
+                var environment = new org.springframework.mock.env.MockEnvironment()
+                        .withProperty("tapstate.installation.automatic-restart", "true")
+                        .withProperty("tapstate.installation.require-credential", "true");
+                installation = new OnPremInstallationConfiguration().onPremInstallation(root, files, mongo, targets, Clock.systemUTC(),
+                        mock(org.springframework.context.ConfigurableApplicationContext.class), environment);
+            } else {
+                installation = new OnPremInstallation(root, files, mongo, target, Clock.systemUTC());
+                installation.requireCredential(true); installation.onStartupCompleted(completions::incrementAndGet);
+            }
             var connector = mock(org.apache.catalina.connector.Connector.class); when(connector.getLocalPort()).thenReturn(65123);
             installation.attach(connector);
             var attributes = new HashMap<String,Object>();
@@ -142,6 +153,135 @@ class OnPremInstallationCompletionTest {
         @Override public boolean isTerminated() { return closed; }
         @Override public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) { return closed; }
         @Override public void execute(Runnable task) { if (closed) throw new java.util.concurrent.RejectedExecutionException(); task.run(); }
+    }
+
+    private static final class EntryBridge implements AutoCloseable {
+        final com.sun.net.httpserver.HttpServer server;
+        final List<String> observedEntries = new java.util.concurrent.CopyOnWriteArrayList<>();
+        final List<String> observedProgress = new java.util.concurrent.CopyOnWriteArrayList<>();
+        EntryBridge(Fixture fixture) throws Exception {
+            when(fixture.request.getMethod()).thenReturn("GET");
+            when(fixture.request.getRequestURI()).thenReturn("/auth/storage-entry");
+            @SuppressWarnings("unchecked") ObjectProvider<StorageEntryStatus> states = mock(ObjectProvider.class);
+            @SuppressWarnings("unchecked") ObjectProvider<io.tapstate.control.restapi.InstallationHttpAccess> installations = mock(ObjectProvider.class);
+            when(states.getIfAvailable()).thenReturn(fixture.entry); when(installations.getIfAvailable()).thenReturn(fixture.installation);
+            var type = Class.forName("io.tapstate.control.restapi.StorageEntryController");
+            var constructor = type.getDeclaredConstructor(ObjectProvider.class, ObjectProvider.class); constructor.setAccessible(true);
+            var controller = constructor.newInstance(states, installations);
+            var method = type.getDeclaredMethod("entry", jakarta.servlet.http.HttpServletRequest.class); method.setAccessible(true);
+            server = com.sun.net.httpserver.HttpServer.create(new java.net.InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/auth/storage-entry", exchange -> {
+                try {
+                    var response = (org.springframework.http.ResponseEntity<?>) method.invoke(controller, fixture.request);
+                    var body = (Map<?,?>) response.getBody();
+                    observedEntries.add(String.valueOf(body.get("entry")));
+                    var progress = (Map<?,?>) body.get("initializationProgress");
+                    observedProgress.add(progress == null ? "absent" : String.valueOf(progress.get("state")));
+                    byte[] bytes = io.tapstate.core.common.JsonWriter.write(body).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                    exchange.sendResponseHeaders(200, bytes.length); try (var output = exchange.getResponseBody()) { output.write(bytes); }
+                } catch (ReflectiveOperationException failure) { throw new java.io.IOException(failure); }
+            });
+            server.start();
+            fixture.files.saveStage(fixture.files.stage().withManagementUrl("http://127.0.0.1:" + server.getAddress().getPort()));
+        }
+        @Override public void close() { server.stop(0); }
+    }
+
+    private static final class AutomaticIssuer implements AutoCloseable {
+        final EntryBridge bridge;
+        final MongoConfigurationDomain issuer = mock(MongoConfigurationDomain.class);
+        final MongoCacheDomain validation = mock(MongoCacheDomain.class);
+        final MockedStatic<MongoConfigurationDomain> configurations = mockStatic(MongoConfigurationDomain.class);
+        AutomaticIssuer(Fixture f) throws Exception {
+            bridge = new EntryBridge(f);
+            var firstAdmin = f.configuration.firstAdmin(); var recoveries = f.configuration.recoveryCommands();
+            when(issuer.setupStates()).thenReturn(f.states); when(issuer.bindings()).thenReturn(f.bindings);
+            when(issuer.firstAdmin()).thenReturn(firstAdmin); when(issuer.recoveryCommands()).thenReturn(recoveries);
+            configurations.when(() -> MongoConfigurationDomain.openExisting(any())).thenReturn(issuer);
+            f.caches.when(() -> MongoCacheDomain.connect(any(StorageBinding.Connection.class), any(java.time.Duration.class), eq("installation-authorization")))
+                    .thenReturn(validation);
+            org.springframework.test.util.ReflectionTestUtils.setField(f.root, "activationWorker", new InlineExecutor());
+            org.springframework.test.util.ReflectionTestUtils.setField(f.root, "authenticationWorker", new InlineExecutor());
+        }
+        @Override public void close() { try { configurations.close(); } finally { bridge.close(); } }
+    }
+
+    @Test void strictAutomaticAuthorizationPassesThroughThePublishedEntryControllerGate() throws Exception {
+        try (var f = new Fixture(directory.resolve("automatic-capability"), 1, true); var issuer = new AutomaticIssuer(f)) {
+            f.installation.resumePreparation(); f.settle();
+            assertThat(issuer.bridge.observedEntries).isNotEmpty().containsOnly("FIRST_ADMIN_REQUIRED");
+            assertThat(issuer.bridge.observedProgress).containsOnly("COMPLETE");
+            var issued = f.files.capability().orElseThrow();
+            assertThat(issued.purpose()).isEqualTo(StorageSetupStateStore.Purpose.FIRST_ADMIN);
+            assertThat(f.installation.firstAdministratorReady()).isTrue();
+            assertThat(f.root.completedInstallationActivationAllowed()).isFalse();
+            f.management(() -> { f.installation.caller(f.request).require(ControlOperations.STORAGE_STATUS); return null; });
+            verify(issuer.issuer).close(); verify(issuer.validation).close(); verify(f.configuration, never()).close(); verify(f.cache, never()).close();
+            verify(f.business).start(); verify(f.business, never()).afterInitialReady();
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void failedAutomaticDeliveryCanBeRetriedWithoutReplayingTheCompletedHandoff(boolean writtenBeforeFailure) throws Exception {
+        try (var f = new Fixture(directory.resolve("delivery-" + writtenBeforeFailure), 1, true); var issuer = new AutomaticIssuer(f)) {
+            var fail = new AtomicBoolean(true); var attempted = new java.util.concurrent.CopyOnWriteArrayList<StorageSetupStateStore.Purpose>();
+            doAnswer(call -> {
+                var issued = call.<SetupCapabilityService.Issued>getArgument(0); attempted.add(issued.purpose());
+                if (issued.purpose() == StorageSetupStateStore.Purpose.FIRST_ADMIN && fail.compareAndSet(true, false)) {
+                    if (writtenBeforeFailure) call.callRealMethod();
+                    throw InstallationFiles.refused();
+                }
+                return call.callRealMethod();
+            }).when(f.files).saveCapability(any());
+            f.installation.resumePreparation(); f.settle();
+            assertThat(f.installation.firstAdministratorReady()).isTrue();
+            assertThat(f.installation.initializationProgress()).containsEntry("state", "COMPLETE");
+            assertThat(f.root.completedInstallationActivationAllowed()).isFalse();
+            var previous = f.files.capability(); var generation = f.currentScope.get().generation();
+            assertThat(previous.isPresent()).isEqualTo(writtenBeforeFailure);
+            f.root.localAuthentication();
+            var delivered = f.files.capability().orElseThrow();
+            assertThat(delivered.purpose()).isEqualTo(StorageSetupStateStore.Purpose.FIRST_ADMIN);
+            if (writtenBeforeFailure) {
+                assertThat(delivered).isEqualTo(previous.orElseThrow());
+                assertThat(f.currentScope.get().generation()).isEqualTo(generation);
+                assertThat(attempted).hasSize(1);
+            } else {
+                assertThat(f.currentScope.get().generation()).isEqualTo(generation + 1);
+                assertThat(attempted).hasSize(2);
+            }
+            var completedScope = f.files.stage().scope();
+            f.root.localAuthentication();
+            assertThat(f.files.capability()).contains(delivered); assertThat(f.files.stage().scope()).isEqualTo(completedScope);
+            assertThat(attempted).containsOnly(StorageSetupStateStore.Purpose.FIRST_ADMIN);
+            assertThat(issuer.bridge.observedEntries).containsOnly("FIRST_ADMIN_REQUIRED");
+            assertThat(issuer.bridge.observedProgress).containsOnly("COMPLETE");
+            verify(f.business).start(); verify(f.business, never()).afterInitialReady();
+            verify(f.cache, never()).prepareFirstAuth(any()); verify(f.cache).resumeInitialAuth(eq(f.preparation), any());
+            verify(f.cache).prepareInitialBusiness(eq(f.preparation), any()); verify(f.target, never()).test(any(), any(), any());
+        }
+    }
+
+    @Test void automaticDeliveryPreservesAnExpiredIndependentCapabilityForExplicitOwnerRenewal() throws Exception {
+        try (var f = new Fixture(directory.resolve("expired-delivery"), 1, true); var issuer = new AutomaticIssuer(f)) {
+            var expired = new SetupCapabilityService.Issued(f.scope, StorageSetupStateStore.Purpose.FIRST_ADMIN,
+                    Clock.systemUTC().instant().minusSeconds(1), "d".repeat(43));
+            f.files.saveCapability(expired);
+            f.installation.resumePreparation(); f.settle();
+            assertThat(f.installation.firstAdministratorReady()).isTrue();
+            assertThat(f.installation.initializationProgress()).containsEntry("state", "COMPLETE");
+            assertThat(f.files.capability()).contains(expired); assertThat(f.currentScope.get()).isEqualTo(f.scope);
+            f.root.localAuthentication();
+            assertThat(f.files.capability()).contains(expired); assertThat(f.currentScope.get()).isEqualTo(f.scope);
+            var renewed = InstallationCommand.authorize(f.files, new MongoProperties(), Clock.systemUTC());
+            assertThat(renewed.purpose()).isEqualTo(StorageSetupStateStore.Purpose.FIRST_ADMIN);
+            assertThat(renewed.scope().generation()).isEqualTo(f.scope.generation() + 1);
+            assertThat(renewed.token()).isNotEqualTo(expired.token());
+            f.root.localAuthentication();
+            assertThat(f.files.capability()).contains(renewed); assertThat(f.currentScope.get()).isEqualTo(renewed.scope());
+            verify(f.business).start(); verify(f.cache).prepareInitialBusiness(eq(f.preparation), any());
+        }
     }
 
     @ParameterizedTest @ValueSource(strings = {"stage", "capability"})

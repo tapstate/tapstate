@@ -97,6 +97,9 @@ class OnPremInstallationTest {
                 assertThat(files.capability()).isEmpty(); observed.set(true);
             });
             installation.afterNormalStartup();
+            assertThat(observed).as("local file completion precedes post-publication delivery").isFalse();
+            assertThat(installation.firstAdministratorReady()).isTrue();
+            installation.afterReadyPublished();
             assertThat(observed).isTrue(); assertThat(installation.firstAdministratorReady()).isTrue();
             when(root.phase()).thenReturn(StorageRoot.Phase.AUTH_READY);
             assertThat(installation.firstAdministratorReady()).isFalse();

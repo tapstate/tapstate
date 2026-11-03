@@ -49,6 +49,12 @@ final class InstallationCommand {
     }
 
     static SetupCapabilityService.Issued authorize(InstallationFiles files, MongoProperties mongo, Clock clock) {
+        return authorize(files, mongo, clock, false);
+    }
+    static SetupCapabilityService.Issued authorizeFirstAdministrator(InstallationFiles files, MongoProperties mongo, Clock clock) {
+        return authorize(files, mongo, clock, true);
+    }
+    private static SetupCapabilityService.Issued authorize(InstallationFiles files, MongoProperties mongo, Clock clock, boolean firstAdminOnly) {
             var stage = files.stage();
             MongoConfigurationDomain configuration = null;
             try {
@@ -63,16 +69,26 @@ final class InstallationCommand {
                 var states = new InstallationSetupStates(files, () -> Optional.ofNullable(original).map(MongoConfigurationDomain::setupStates),
                         () -> completedActivationAllowed(files, original));
                 var status = states.load();
-                var purpose = status.phase() == StorageSetupStateStore.Phase.COMPLETE && isLiveFirstAdministratorEntry(files)
+                var purpose = firstAdminOnly || status.phase() == StorageSetupStateStore.Phase.COMPLETE && isLiveFirstAdministratorEntry(files)
                         ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
                 var capabilities = new SetupCapabilityService(states, clock, files::requireOwner,
                         () -> { throw InstallationFiles.refused(); }, () -> requireFirstAdministratorReady(files, original, mongo));
-                var issued = capabilities.issue(status.scope(), purpose);
-                files.locked(() -> {
-                    if (!files.stage().scope().equals(issued.scope())) throw InstallationFiles.refused();
-                    files.saveCapability(issued); return null;
-                });
-                capabilities.close(); return issued;
+                try {
+                    if (firstAdminOnly) {
+                        var existing = files.capability();
+                        if (existing.isPresent()) {
+                            var issued = existing.orElseThrow();
+                            if (issued.purpose() != StorageSetupStateStore.Purpose.FIRST_ADMIN) throw InstallationFiles.refused();
+                            capabilities.restore(issued); return issued;
+                        }
+                    }
+                    var issued = capabilities.issue(status.scope(), purpose);
+                    files.locked(() -> {
+                        if (!files.stage().scope().equals(issued.scope())) throw InstallationFiles.refused();
+                        files.saveCapability(issued); return null;
+                    });
+                    return issued;
+                } finally { capabilities.close(); }
             } finally { if (configuration != null) configuration.close(); }
     }
 
