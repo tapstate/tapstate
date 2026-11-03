@@ -162,7 +162,10 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.URI_WRITTEN, hash));
             active.run();
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CREATE_STARTED, hash));
-            MongoConfigurationDomain prepared = MongoConfigurationBootstrap.prepare(settings(files, mongo), expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation());
+            MongoConfigurationDomain prepared = MongoConfigurationBootstrap.prepareWithAlerts(settings(files, mongo),
+                    expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation(),
+                    new io.tapstate.core.alerting.AlarmKey.Scope(expected.installationId(), expected.clusterId()),
+                    io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM);
             adopt(prepared, connection);
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, hash));
             return null;

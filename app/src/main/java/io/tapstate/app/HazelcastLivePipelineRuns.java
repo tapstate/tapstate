@@ -156,6 +156,9 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
      * measured on a three-member cluster, the listing went to an address that had stopped being a member
      * thirty milliseconds before the merged membership was installed, and came back as an uncoded page.
      *
+     * <p>Jet may also have no master address while reading a job's metadata during that transition. Only
+     * its exact exception type and message identify that window; other illegal states remain defects.
+     *
      * <p>The causes are walked because the engine hands some of these on wrapped. Anything else is thrown
      * as it came: a failure filed under a code that says the cluster is merely busy is one nobody goes
      * looking for.
@@ -164,6 +167,10 @@ final class HazelcastLivePipelineRuns implements LivePipelineRuns {
         Throwable cause = failed;
         for (int depth = 0; cause != null && depth < 16; depth++, cause = cause.getCause()) {
             if (cause instanceof HazelcastInstanceNotActiveException || cause instanceof RetryableException) {
+                return true;
+            }
+            if (cause.getClass() == IllegalStateException.class
+                    && "Master address unknown: instance is not yet initialized or is shut down".equals(cause.getMessage())) {
                 return true;
             }
         }

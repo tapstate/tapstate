@@ -339,6 +339,12 @@ final class TwoMemberCluster implements AutoCloseable {
         closeOwned(first, second, Map.of(), clusterId);
     }
 
+    /** Captures each owned member before a failing test shuts either process down. */
+    void captureFailureThreads() {
+        FailureScene.writeThreads(clusterId + "/" + NODE_A, first);
+        FailureScene.writeThreads(clusterId + "/" + NODE_B, second);
+    }
+
     /** Closes owned members in their original order and retains every cleanup failure. */
     private static void closeOwned(RealProcessServer first, RealProcessServer second,
             Map<String, RealProcessServer.PreparedLaunch> prepared, String clusterId) {

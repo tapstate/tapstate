@@ -234,7 +234,10 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                 ConfigurationVersion.advance(session, versions);
                 SourceConfigCipher cipher = cipherForWrite(session);
                 StorageBinding binding = new StorageBinding(expected, mode, 1L, captured.id(), cache);
-                sources.insertOne(session, codec.encode(captured, session).append("systemRole", DEFAULT_ROLE));
+                var sourceState = MongoSourceIdentitySchema.read(session, database, cipher.activeKeyId());
+                Document encodedSource = MongoSourceIdentity.decorate(sourceState, null, captured,
+                        codec.encode(captured, session), cipher);
+                sources.insertOne(session, encodedSource.append("systemRole", DEFAULT_ROLE));
                 bindings.insertOne(session, new Document("_id", "cluster")
                         .append("clusterId", expected.clusterId()).append("layoutId", MongoConfigurationDomain.LAYOUT)
                         .append("bindingVersion", 1L).append("mode", mode.name())

@@ -1,0 +1,44 @@
+{
+  "_id": {
+    "authorityId": "org-a",
+    "clusterId": "cluster-a",
+    "id": "rule-a"
+  },
+  "formatVersion": 2,
+  "kind": "RULE",
+  "incarnation": "11111111-1111-4111-8111-111111111111",
+  "recordRevision": {
+    "$numberLong": "1"
+  },
+  "writeFence": {
+    "$numberLong": "0"
+  },
+  "deployment": "ON_PREM",
+  "createdAt": "2026-10-27T00:00:00.123456789Z",
+  "createdBy": "actor-a",
+  "updatedAt": "2026-10-27T00:00:00.123456789Z",
+  "updatedBy": "actor-a",
+  "retiredAt": null,
+  "body": {
+    "name": "Source health",
+    "typeId": "source.connection-failed",
+    "typeVersion": 1,
+    "resources": {
+      "kinds": [
+        "source"
+      ],
+      "all": true,
+      "selected": []
+    },
+    "parameters": {
+      "resolve-for": "0",
+      "trigger-for": "0"
+    },
+    "severityOverride": null,
+    "enabled": true,
+    "metric": null,
+    "bindingRevision": {
+      "$numberLong": "1"
+    }
+  }
+}

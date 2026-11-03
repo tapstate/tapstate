@@ -68,13 +68,23 @@ public final class SourceConfigCipher {
 
     /** Encrypts caller-owned binary input without changing or retaining it. */
     String encryptBytes(String sourceId, String connector, byte[] plaintext) {
+        return seal(plaintext, keyId -> context(keyId, sourceId, connector));
+    }
+
+    /** Domain-separated use of the original CONFIG key; the legacy Source AAD remains unchanged. */
+    String encryptBoundBytes(String domain, String binding, byte[] plaintext) {
+        requireDomain(domain, binding);
+        return seal(plaintext, keyId -> boundContext(keyId, domain, binding));
+    }
+
+    private String seal(byte[] plaintext, java.util.function.Function<String, byte[]> aad) {
         Objects.requireNonNull(plaintext, "plaintext");
         byte[] iv = new byte[IV_BYTES];
         random.nextBytes(iv);
         try {
             Cipher cipher = cipher();
             cipher.init(Cipher.ENCRYPT_MODE, keys.get(activeKeyId), new GCMParameterSpec(TAG_BYTES * 8, iv));
-            cipher.updateAAD(context(activeKeyId, sourceId, connector));
+            cipher.updateAAD(aad.apply(activeKeyId));
             byte[] ciphertext = cipher.doFinal(plaintext);
             byte[] payload = ByteBuffer.allocate(iv.length + ciphertext.length).put(iv).put(ciphertext).array();
             return FORMAT + ":" + VERSION + ":" + activeKeyId + ":"
@@ -97,35 +107,59 @@ public final class SourceConfigCipher {
 
     /** Returns caller-owned plaintext; the caller must erase it after decoding. */
     byte[] decryptBytes(String sourceId, String connector, String envelope) {
+        return open(envelope, sourceId, keyId -> context(keyId, sourceId, connector));
+    }
+
+    byte[] decryptBoundBytes(String domain, String binding, String envelope) {
+        requireDomain(domain, binding);
+        return open(envelope, "alert-receiver-credentials", keyId -> boundContext(keyId, domain, binding));
+    }
+
+    private byte[] open(String envelope, String diagnosticId, java.util.function.Function<String, byte[]> aad) {
         Objects.requireNonNull(envelope, "envelope");
         String[] parts = envelope.split(":", -1);
         if (parts.length != 4 || !FORMAT.equals(parts[0]) || !VERSION.equals(parts[1])) {
-            throw unreadable(sourceId);
+            throw unreadable(diagnosticId);
         }
         SecretKeySpec key = keys.get(parts[2]);
-        if (key == null) throw unreadable(sourceId);
+        if (key == null) throw unreadable(diagnosticId);
         byte[] payload;
         try {
             payload = Base64.getUrlDecoder().decode(parts[3]);
         } catch (IllegalArgumentException invalidEncoding) {
-            throw unreadable(sourceId);
+            throw unreadable(diagnosticId);
         }
         if (payload.length < IV_BYTES + TAG_BYTES) {
-            throw unreadable(sourceId);
+            throw unreadable(diagnosticId);
         }
         try {
             Cipher cipher = cipher();
             cipher.init(Cipher.DECRYPT_MODE, key,
                     new GCMParameterSpec(TAG_BYTES * 8, Arrays.copyOfRange(payload, 0, IV_BYTES)));
-            cipher.updateAAD(context(parts[2], sourceId, connector));
+            cipher.updateAAD(aad.apply(parts[2]));
             return cipher.doFinal(payload, IV_BYTES, payload.length - IV_BYTES);
         } catch (AEADBadTagException invalidAuthentication) {
             // Wrong context, tampering, and wrong keys are all fail-closed stored-data refusals.
             // Crypto/parser messages and causes are not operator-safe diagnostic payloads.
-            throw unreadable(sourceId);
+            throw unreadable(diagnosticId);
         } catch (GeneralSecurityException unavailable) {
             throw new IllegalStateException("Source config decryption could not use the configured cipher", unavailable);
         }
+    }
+
+    /** Stable domain-separated authentication of bounded caller-owned bytes; no new persistent key is introduced. */
+    String keyedDigest(String keyId, String domain, byte[] value) {
+        requireDomain(domain, ""); Objects.requireNonNull(value, "value");
+        SecretKeySpec key = keys.get(keyId); if (key == null) { throw unreadable("alert-candidate"); }
+        byte[] encoded = key.getEncoded(); byte[] derived = null;
+        try {
+            var mac = javax.crypto.Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(encoded, "HmacSHA256"));
+            derived = mac.doFinal(boundContext(keyId, domain, "keyed-digest-v1"));
+            mac.init(new SecretKeySpec(derived, "HmacSHA256"));
+            return HexFormat.of().formatHex(mac.doFinal(value));
+        } catch (GeneralSecurityException unavailable) { throw new IllegalStateException("HmacSHA256 is required by the storage runtime", unavailable); }
+        finally { Arrays.fill(encoded, (byte) 0); if (derived != null) { Arrays.fill(derived, (byte) 0); } }
     }
 
     ProviderSecretCipher providerSecrets() {
@@ -149,6 +183,16 @@ public final class SourceConfigCipher {
         Objects.requireNonNull(connector, "connector");
         return JsonWriter.write(List.of(FORMAT, VERSION, keyId, sourceId, connector))
                 .getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static void requireDomain(String domain, String binding) {
+        if (domain == null || !domain.matches("[a-z][a-z0-9.-]{0,63}") || binding == null || binding.length() > 8192) {
+            throw new IllegalArgumentException("invalid bound cipher context");
+        }
+    }
+
+    private static byte[] boundContext(String keyId, String domain, String binding) {
+        return JsonWriter.write(List.of(FORMAT, VERSION, keyId, "domain", domain, binding)).getBytes(StandardCharsets.UTF_8);
     }
 
     private static Cipher cipher() {

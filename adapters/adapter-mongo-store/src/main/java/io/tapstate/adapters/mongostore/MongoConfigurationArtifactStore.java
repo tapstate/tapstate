@@ -51,6 +51,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             .build();
 
     private final MongoClient client;
+    private final MongoDatabase database;
+    private final SourceConfigCipherProvider ciphers;
     private static final CanonicalWriter WRITER = new CanonicalWriter();
     private final Map<String, MongoCollection<Document>> collections;
     private final MongoCollection<Document> versions;
@@ -67,7 +69,8 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     MongoConfigurationArtifactStore(MongoClient client, MongoDatabase database, SourceConfigCipherProvider ciphers) {
         this.client = Objects.requireNonNull(client, "client");
-        Objects.requireNonNull(database, "database");
+        this.database = Objects.requireNonNull(database, "database");
+        this.ciphers = Objects.requireNonNull(ciphers, "ciphers");
         Map<String, MongoCollection<Document>> tables = new LinkedHashMap<>();
         tables.put("source", durable(SystemCollections.SOURCES.on(database)));
         tables.put("pipeline", durable(SystemCollections.PIPELINES.on(database)));
@@ -118,6 +121,10 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 throw new Refused(id, ArtifactMutation.VERSION_CONFLICT);
             }
             requireUnmanaged(stored);
+            if ("source".equals(stored.get("kind"))) {
+                MongoSourceIdentity.requireWritable(MongoSourceIdentitySchema.read(session, database,
+                        ciphers.current().activeKeyId()), stored, id);
+            }
             requireRebuildDependenciesUnchanged(session, Set.of(id));
             if ("pipeline".equals(stored.getString("kind"))) stateMappings.refuseRemoval(session, id);
             else stateMappings.requireNoRetainedIdentity(session, id);
@@ -293,12 +300,21 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
             stateMappings.create(session,resource.id(),() -> bindings.cachePreparationForTransaction(session)
                     .orElseThrow(MongoPipelineRetirementFacts::fenced).businessScope());
         }
+        MongoSourceIdentitySchema.State sourceState = null;
+        if ("source".equals(resource.kind()) || observed != null && "source".equals(observed.get("kind"))) {
+            sourceState = MongoSourceIdentitySchema.read(session, database, ciphers.current().activeKeyId());
+            MongoSourceIdentity.requireWritable(sourceState, observed, resource.id());
+        }
         // Unconditional apply may replace a kind, but must never leave the same id in both tables.
         if (observed != null && !resource.kind().equals(observed.getString("kind"))) {
             collection(observed.getString("kind")).deleteOne(session, new Document("_id", resource.id()));
         }
-        collection(resource.kind()).replaceOne(session, new Document("_id", resource.id()),
-                codec.encode(resource, session), new ReplaceOptions().upsert(true));
+        Document encoded = codec.encode(resource, session);
+        if (resource instanceof io.tapstate.core.model.SourceResource source) {
+            encoded = MongoSourceIdentity.decorate(sourceState, observed, source, encoded, ciphers.current());
+        }
+        collection(resource.kind()).replaceOne(session, new Document("_id", resource.id()), encoded,
+                new ReplaceOptions().upsert(true));
     }
 
     private <T> T transaction(java.util.function.Function<ClientSession, T> body,
@@ -337,6 +353,33 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     public Optional<Resource> get(String id) {
         Objects.requireNonNull(id, "id");
         return readSnapshot(session -> Optional.ofNullable(find(session, id)).map(this::decode));
+    }
+
+    @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        Objects.requireNonNull(id, "id");
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        Document stored = budget.transaction(client, session -> {
+            var state = MongoSourceIdentitySchema.read(session, database, ciphers.current().activeKeyId());
+            if (state == null || state.phase() != MongoSourceIdentitySchema.Phase.READY) {
+                throw MongoSourceIdentitySchema.unavailable(id);
+            }
+            Document row = find(session, id);
+            if (row == null || !"source".equals(row.get("kind"))) { return null; }
+            MongoSourceIdentity.read(row);
+            return row;
+        });
+        if (stored == null) { return Optional.empty(); }
+        // A single captured row supplies definition and identity; key preparation stays outside the transaction.
+        SourceConfigCipher captured = ciphers.refresh(budget);
+        var source = (io.tapstate.core.model.SourceResource) new EncryptedArtifactCodec(captured).decode(stored);
+        budget.requireRemaining();
+        return Optional.of(new io.tapstate.spi.store.SourceBindingSnapshot(source, stored.getString("contentHash"),
+                MongoSourceIdentity.read(stored).binding()));
+    }
+
+    /** The owning ledger stages all protected writes in this same original CONFIG transaction. */
+    boolean fenceSourceBinding(ClientSession session, io.tapstate.spi.store.SourceBindingIdentity expected) {
+        return MongoSourceIdentity.fence(session, database, expected, ciphers.current().activeKeyId());
     }
 
     @Override

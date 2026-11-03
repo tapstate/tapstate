@@ -175,7 +175,13 @@ public enum IoError implements TapstateErrorCode {
             Set.of(Parameters.PIPELINE, "target", Parameters.BYTES, "limit")),
 
     /** Upload recovery could not establish publication or confirm removal of this attempt's chunks. */
-    CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt"));
+    CONNECTOR_UPLOAD_UNSETTLED("io.connector-upload-unsettled", Set.of("hash", "attempt")),
+
+    /** A Source exists but cannot yet provide its required original lifetime/binding facts. */
+    SOURCE_IDENTITY_UNAVAILABLE("io.source-identity-unavailable", Set.of("id")),
+
+    /** A necessary Source lifecycle revision cannot advance without wrapping or losing ordering. */
+    SOURCE_IDENTITY_EXHAUSTED("io.source-identity-exhausted", Set.of("id"));
 
     private static final class Parameters {
         private static final String PIPELINE = "pipeline";

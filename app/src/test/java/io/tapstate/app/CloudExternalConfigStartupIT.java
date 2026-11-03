@@ -505,13 +505,26 @@ class CloudExternalConfigStartupIT {
             exchange.getResponseBody().write(response); exchange.close();
         });
 
+        String egress = "/v1/api/clusters/" + CLUSTER + "/egress-address";
+        cloud.createContext(egress, exchange -> {
+            cloudRequests.incrementAndGet();
+            cloudPaths.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath());
+            assertThat(exchange.getRequestMethod()).isEqualTo("GET");
+            assertThat(exchange.getRequestHeaders().getFirst("Authorization")).isEqualTo("Bearer " + TOKEN);
+            byte[] response = JSON.writeValueAsBytes(Map.of("code", "ok", "data",
+                    Map.of("organizationId", "fixture-org", "clusterId", CLUSTER)));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response); exchange.close();
+        });
+
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
         running.awaitUnavailable(StoreError.INITIALIZATION_REFUSED.code(), "UNAVAILABLE");
         assertThat(running.get("/auth/exchange?code=unconsumed-diagnostic-code").statusCode()).isEqualTo(503);
         assertThat(running.safeOutput()).contains("stage=prepare", "stage=resume", "creationGranted=true", "creationInvoked=true")
                 .doesNotContain("unconsumed-diagnostic-code");
         assertSafeOutput(running, uri);
-        assertThat(cloudPaths).containsExactly("POST " + claim);
+        assertThat(cloudPaths).containsExactly("POST " + claim, "GET " + egress);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = raw.getDatabase(selected);
             assertThat(database.listCollectionNames().into(new ArrayList<>())).containsExactly("diagnostic_witness");
