@@ -122,6 +122,64 @@ class MongoStorageBindingStoreIT {
         }
     }
 
+    @Test
+    void aRootCollationCannotTurnAnUnrelatedResourceIntoAConflict() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY;
+            var row = identity.on(f.database).find().first();
+            identity.on(f.database).drop();
+            f.database.createCollection(identity.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            identity.on(f.database).insertOne(row);
+            SystemCollections.PIPELINES.on(f.database).insertOne(
+                    new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+            assertThat(individualStore(f).load()).contains(original);
+            assertThat(f.domain.bindings().load()).contains(original);
+        });
+    }
+
+    @Test
+    void singletonProbesPreserveEmbeddedIdOrderAndNumericQuerySemantics() {
+        for (boolean reverse : List.of(false, true)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                var notes = SystemCollections.PDK_NOTE_SCOPES.on(f.database);
+                var row = notes.find().first();
+                notes.deleteMany(new Document());
+                row.put("_id", reverse ? new Document("namespace", "pdk.global-state").append("bindingVersion", 1L)
+                        : new Document("bindingVersion", 1).append("namespace", "pdk.global-state"));
+                notes.insertOne(row);
+                if (reverse) {
+                    assertThatThrownBy(individualStore(f)::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                    assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                } else {
+                    assertThat(individualStore(f).load()).contains(original);
+                    assertThat(f.domain.bindings().load()).contains(original);
+                }
+            });
+        }
+    }
+
+    @Test
+    void populatedMetadataFallsBackToTheOriginalIndexedPredicates() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var rows = java.util.stream.IntStream.range(0, 1000)
+                    .mapToObj(i -> new Document("_id", "unrelated-" + i)).toList();
+            SystemCollections.STORAGE_SETUP.on(f.database).insertMany(rows);
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).insertMany(rows);
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { assertThat(f.domain.bindings().load()).contains(original); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(collections).containsEntry("storage_setup", 1).containsEntry("pdk_note_scopes", 1);
+        });
+    }
+
     private static MongoStorageBindingStore individualStore(Fixture f) throws Exception {
         var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(f.admin));
         org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
@@ -143,9 +201,9 @@ class MongoStorageBindingStoreIT {
             });
             try { f.domain.requireAuthenticationPublished(original.preparation()); }
             finally { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.COLLECTIONS.remove(); }
-            assertThat(commands).containsEntry("find", 10).containsEntry("commitTransaction", 1);
+            assertThat(commands).containsEntry("find", 3).containsEntry("aggregate", 1).containsEntry("commitTransaction", 1);
             assertThat(collections).containsEntry("storage_binding", 1).containsEntry("storage_recovery", 1)
-                    .containsEntry("storage_setup", 1);
+                    .doesNotContainKey("storage_setup");
         });
     }
 
@@ -167,7 +225,7 @@ class MongoStorageBindingStoreIT {
     }
 
     @Test
-    void individualFactsUseTheExistingIdIndexesWithoutCollectionScans() {
+    void retainedPredicatesUseIdIndexesAndUnfilteredProbesExamineBoundedRows() {
         withPrepared(f -> {
             var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
             // Materialize unrelated definitions so an absent collection's EOF shortcut cannot
@@ -176,10 +234,22 @@ class MongoStorageBindingStoreIT {
                     new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unrelated-flow\nsource: []\n"),
                     definition("transform", "unrelated-transform"), definition("view", "unrelated-view"),
                     definition("serve", "unrelated-serve")));
+            // Many unrelated notes/resources must not enlarge the joined transport or probe work.
+            var rows = java.util.stream.IntStream.range(0, 1000)
+                    .mapToObj(i -> new Document("_id", "unrelated-" + i)).toList();
+            for (var resource : List.of(SystemCollections.PDK_NOTE_SCOPES, SystemCollections.PIPELINES,
+                    SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS))
+                resource.on(f.database).insertMany(rows);
             var captured = new java.util.ArrayList<Document>();
+            var aggregates = new java.util.ArrayList<Document>();
             var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
                     .addCommandListener(new CommandListener() {
                         @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("aggregate")) {
+                                var command = Document.parse(event.getCommand().toJson());
+                                aggregates.add(new Document("aggregate", command.getString("aggregate"))
+                                        .append("pipeline", command.get("pipeline")).append("cursor", new Document()));
+                            }
                             if (event.getCommandName().equals("find")) {
                                 var command = Document.parse(event.getCommand().toJson());
                                 var filter = command.get("filter", Document.class);
@@ -194,7 +264,17 @@ class MongoStorageBindingStoreIT {
                 var database = client.getDatabase(f.database.getName());
                 var store = new MongoStorageBindingStore(client, database, (SourceConfigCipherProvider) key.get(f.domain));
                 assertThat(store.load()).contains(original);
-                assertThat(captured).hasSize(9);
+                assertThat(captured).hasSize(7);
+                assertThat(aggregates).hasSize(1);
+                var explain = database.runCommand(new Document("explain", aggregates.getFirst())
+                        .append("verbosity", "executionStats"));
+                int probes = 0;
+                for (var stage : explain.getList("stages", Document.class)) {
+                    if (!stage.containsKey("$lookup")) continue;
+                    probes++;
+                    assertThat(((Number) stage.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(2);
+                }
+                assertThat(probes).isEqualTo(6);
                 for (var command : captured) {
                     var plan = database.runCommand(new Document("explain", command).append("verbosity", "executionStats"));
                     var stats = plan.get("executionStats", Document.class);
@@ -263,7 +343,7 @@ class MongoStorageBindingStoreIT {
                 MongoCommandObservation.CURRENT.remove();
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
-            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("find", 10);
+            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("find", 3).containsEntry("aggregate", 1);
             assertThat(checks).hasValue(3);
         });
     }
