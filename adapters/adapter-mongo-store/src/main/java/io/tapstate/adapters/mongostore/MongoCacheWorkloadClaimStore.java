@@ -296,7 +296,7 @@ final class MongoCacheWorkloadClaimStore implements WorkloadClaimStore {
 
     static void requireCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
-        Document found = database.listCollections().filter(new Document("name", table.collectionName())).first();
+        Document found = MongoCollectionMetadata.first(database, table.collectionName());
         if (found == null || !"collection".equals(found.get("type"))) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                 Map.of("id", "cache-business", "field", "workload-claims"), null);
     }

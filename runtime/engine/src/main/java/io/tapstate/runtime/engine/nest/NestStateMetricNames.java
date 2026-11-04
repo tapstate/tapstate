@@ -29,6 +29,9 @@ public final class NestStateMetricNames {
 
     /** The deepest one key has been seen holding for something that has not arrived. */
     public static final String PENDING_HIGH_WATER = "pendingHighWater";
+    public static final String READ_KEYS = "readKeys";
+    public static final String WRITE_KEYS = "writeKeys";
+    public static final String COLD_KEYS = "coldKeys";
 
     private NestStateMetricNames() {
     }

@@ -22,4 +22,11 @@ interface NestStateGauge {
      */
     void reading(String namespace, long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater);
+
+    default void keyAccess(String namespace, io.tapstate.core.lifecycle.NestKeyAccess reading) { }
+
+    /** Called on the processor thread; the returned publisher may run on a partition loader. */
+    default java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> keyPublisher(String namespace) {
+        return reading -> keyAccess(namespace, reading);
+    }
 }

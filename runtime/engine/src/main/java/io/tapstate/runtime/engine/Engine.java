@@ -935,8 +935,14 @@ public final class Engine {
             }
         }
         Map<String, NestStateReading> readings = new HashMap<>();
-        byNamespace.forEach((namespace, kinds) -> readings.put(namespace,
-                NestStateMetricNames.readingFrom(kinds, stored(namespace))));
+        var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
+                .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
+        var keySamples = io.tapstate.runtime.engine.nest.NestStateSamples.keyAccess(collected, dataMembers);
+        byNamespace.forEach((namespace, kinds) -> {
+            NestStateReading legacy = NestStateMetricNames.readingFrom(kinds, stored(namespace));
+            readings.put(namespace, new NestStateReading(legacy.entries(), legacy.accesses(), legacy.backfills(),
+                    legacy.backfillMillis(), legacy.pendingHighWater(), legacy.stored(), keySamples.get(namespace)));
+        });
         return readings;
     }
 

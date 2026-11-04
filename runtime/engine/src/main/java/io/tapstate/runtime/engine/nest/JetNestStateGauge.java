@@ -37,4 +37,15 @@ final class JetNestStateGauge implements NestStateGauge {
     private Metric metric(String kind, String namespace) {
         return byName.computeIfAbsent(NestStateMetricNames.nameOf(kind, namespace), Metrics::metric);
     }
+
+    @Override public void keyAccess(String namespace, io.tapstate.core.lifecycle.NestKeyAccess reading) {
+        keyPublisher(namespace).accept(reading);
+    }
+
+    @Override public java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> keyPublisher(String namespace) {
+        Metric reads = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.READ_KEYS, namespace));
+        Metric writes = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.WRITE_KEYS, namespace));
+        Metric cold = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.COLD_KEYS, namespace));
+        return reading -> { reads.set(reading.reads()); writes.set(reading.writes()); cold.set(reading.coldLoads()); };
+    }
 }

@@ -220,6 +220,19 @@ class ObservationPublisherTest {
                         entry("nestStatePendingHighWater.nest.orders.doc.$root", 0L));
     }
 
+    @Test void coherentKeyCountsAreAdditionalFactsAndKeepLegacyUnits() {
+        state.seed("orders", PipelineState.RUNNING);
+        var reading = new NestStateReading(4, 2, 3, 21, 0, OptionalLong.empty(),
+                new io.tapstate.core.lifecycle.NestKeyAccess(100, 50, 90, "member"));
+        var wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("ns", reading));
+        wired.publish("orders");
+        assertThat(observations.read("orders").orElseThrow().metrics()).contains(
+                entry("nestStateAccesses.ns", 2L), entry("nestStateBackfills.ns", 3L),
+                entry("nestStateReadKeys.ns", 100L), entry("nestStateWriteKeys.ns", 50L), entry("nestStateColdKeys.ns", 90L));
+    }
+
     /**
      * The reading no other one can stand in for. What waits under a key lives inside that key's entry, so a
      * queue growing towards the limit that bounds it moves none of the numbers above - the namespace holds

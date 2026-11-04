@@ -30,7 +30,11 @@ import java.util.OptionalLong;
  * @param stored how many keys there are altogether as of the later reading, where there is a layer to ask
  */
 public record NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
-        OptionalLong stored) {
+        OptionalLong stored, NestKeyAccess keyAccess) {
+
+    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries, OptionalLong stored) {
+        this(accesses, backfills, backfillMillis, entries, stored, null);
+    }
 
     public NestStateWindow {
         Objects.requireNonNull(stored, "stored");
@@ -50,7 +54,7 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
         return new NestStateWindow(current.accesses() - previous.accesses(),
                 current.backfills() - previous.backfills(),
                 current.backfillMillis() - previous.backfillMillis(),
-                current.entries(), current.stored());
+                current.entries(), current.stored(), current.keyAccess() == null ? null : current.keyAccess().since(previous.keyAccess()));
     }
 
     /**
@@ -62,7 +66,7 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     public static NestStateWindow fromStart(NestStateReading current) {
         Objects.requireNonNull(current, "current");
         return new NestStateWindow(current.accesses(), current.backfills(), current.backfillMillis(),
-                current.entries(), current.stored());
+                current.entries(), current.stored(), current.keyAccess());
     }
 
     /**
@@ -71,8 +75,13 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
      * namespace would read as the one thing this is watched for.
      */
     public OptionalDouble servedFromCold() {
-        return accesses == 0 ? OptionalDouble.empty() : OptionalDouble.of((double) backfills / accesses);
+        long attempts = pressureAccesses();
+        return attempts <= 0 || pressureBackfills() < 0 ? OptionalDouble.empty()
+                : OptionalDouble.of((double) pressureBackfills() / attempts);
     }
+
+    public long pressureAccesses() { return keyAccess == null ? accesses : keyAccess.attempts(); }
+    public long pressureBackfills() { return keyAccess == null ? backfills : keyAccess.coldLoads(); }
 
     /**
      * How much of the namespace is in memory, between 0 and 1. Absent where there is no layer behind the
