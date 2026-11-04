@@ -20,7 +20,17 @@ final class AdmissionDrain {
         notifyAll();
     }
     synchronized void stop() { stopped=true;notifyAll(); }
+    boolean accepting() {return !stopped;}
     boolean current() { Long limit=deadline.get();return !stopped&&limit!=null&&limit-System.nanoTime()>0; }
+    long deadlineNanos() {
+        if(!current())throw ThreeLayerStorePort.refused();
+        return deadline.get();
+    }
+    long remainingNanos() {
+        Long limit=deadline.get();
+        if(limit==null)throw new IllegalStateException("no claim operation is admitted on this thread");
+        return limit-System.nanoTime();
+    }
     synchronized void await(long deadline) {
         if(local.get()>0)throw StorageRuntime.unavailable();
         while(running!=0) {

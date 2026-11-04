@@ -34,8 +34,19 @@ final class ClusterWorkloadClaims {
     private <T>T call(java.util.function.Supplier<T> action){
         if(admission==null)return action.get();
         if(!admission.enter())throw ThreeLayerStorePort.refused();
-        try {var result=action.get();if(!admission.current())throw ThreeLayerStorePort.refused();return result;}
+        try {
+            var result=store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded
+                    ? bounded.withDeadline(admission.deadlineNanos(),()->{
+                        if(!admission.accepting())throw ThreeLayerStorePort.refused();
+                    },action) : action.get();
+            if(!admission.current())throw ThreeLayerStorePort.refused();
+            return result;
+        }
         finally{admission.leave();}
+    }
+    void awaitStopped(long deadline) {
+        if(store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)
+            bounded.awaitQuiescence(deadline);
     }
 
     Optional<WorkloadClaimAttempt> acquire(

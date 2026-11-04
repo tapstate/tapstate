@@ -300,7 +300,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         }
         @Bean SrsLogStore srsLogStore(SrsStores stores) { return stores.log(); }
         @Bean WorkloadClaimStore workloadClaimStore(NativeBusinessContext owner) {
-            return new ObservedWorkloadClaims(owner.port.workloadClaims(),(write,failure)->{
+            return ObservedWorkloadClaims.observe(owner.port.workloadClaims(),(write,failure)->{
                 Object observer=owner.context==null?null:owner.context.getBeanFactory().getSingleton("builtinResourceSignals");
                 if(observer instanceof BuiltinResourceSignals signals)signals.cacheOperation(write,failure);
             });

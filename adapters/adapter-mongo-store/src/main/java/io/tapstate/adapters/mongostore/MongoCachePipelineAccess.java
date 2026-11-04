@@ -300,13 +300,18 @@ final class MongoCachePipelineAccess {
     }
 
     void verifyStateStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE); }
+    void verifyStateStructure(MongoReadBudget budget) { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE,budget); }
 
     private void verifyStructure(SystemCollections table) {
-        var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
+        verifyStructure(table,null);
+    }
+
+    private void verifyStructure(SystemCollections table,MongoReadBudget budget) {
+        var found = (budget==null?database:budget.database(database)).listCollections().filter(new Document("name", table.collectionName())).first();
         if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
         var options = found.get("options", Document.class);
         if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("structure");
-        var indexes = table.on(database).listIndexes().into(new ArrayList<>());
+        var indexes = table.on(budget==null?database:budget.database(database)).listIndexes().into(new ArrayList<>());
         if (indexes.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadable("index");
         var id = indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
         if (id == null || !new Document("_id", 1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden"))

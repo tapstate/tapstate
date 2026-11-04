@@ -31,7 +31,8 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     private final Map<String,Integer> byChannel=new HashMap<>();
     private final AtomicBoolean closed=new AtomicBoolean();
     private final Object scheduling=new Object();
-    private final ExecutorService cancellation=Executors.newSingleThreadExecutor(task->ShutdownAwait.daemon(task,"alert-delivery-stop"));
+    private final ExecutorService cancellation=new ThreadPoolExecutor(0,1,100,TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(),task->ShutdownAwait.daemon(task,"alert-delivery-stop"));
     private CompletableFuture<Void> cancelled,channelsClosed;
     private final java.util.concurrent.atomic.AtomicReference<Failure> failure=new java.util.concurrent.atomic.AtomicReference<>(); private AlertStore.DueCursor cursor;
     AlertDeliveryRuntime(AlertStore store,Clock clock,String worker,Runnable active,Channels channels,
@@ -171,6 +172,8 @@ final class AlertDeliveryRuntime implements AutoCloseable {
             running.clear();pending.clear();
             if(cancelled==null || cancelled.isCompletedExceptionally())
                 cancelled=CompletableFuture.runAsync(()->ShutdownAwait.all(cleanupChannels.stream().<Runnable>map(channel->()->closeChannel(channel)).toList()),cancellation);
+            if(channelsClosed==null || channelsClosed.isCompletedExceptionally())
+                channelsClosed=CompletableFuture.runAsync(channels::close,cancellation);
         }
     }
     void awaitStopped(long deadline){
