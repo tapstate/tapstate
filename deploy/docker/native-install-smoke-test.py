@@ -45,6 +45,20 @@ class Docker:
 
 
 class Ownership(unittest.TestCase):
+    def test_task_label_is_added_without_replacing_the_helper_cleanup_owner(self):
+        docker = Docker()
+        calls = []
+        def run(args, **kwargs):
+            calls.append(args)
+            return docker.run(args, **kwargs)
+        with patch.dict(SMOKE.os.environ, {"TAPSTATE_ISSUE_LOOP_OWNER": "owned-task"}), \
+                patch.object(SMOKE.subprocess, "run", run):
+            SMOKE.owned_container("fixture-image")
+        created = next(args for args in calls if args[1] == "create")
+        self.assertIn("io.tapstate.issue-loop.owner=owned-task", created)
+        self.assertIn("io.tapstate.native-install-smoke.owner=" + docker.owner, created)
+        self.assertEqual(docker.removed, [docker.identity])
+
     def test_a_lost_create_reply_still_removes_its_own_container(self):
         docker = Docker(timeout_at="create")
         with patch.object(SMOKE.subprocess, "run", docker.run):
