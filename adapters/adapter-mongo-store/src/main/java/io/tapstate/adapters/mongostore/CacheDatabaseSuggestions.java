@@ -16,13 +16,15 @@ final class CacheDatabaseSuggestions {
         Set<String> checked = new HashSet<>();
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             int suffix = suffixes.getAsInt();
-            if (suffix < 100_000 || suffix > 999_999) continue;
-            String candidate = withSuffix(database, suffix);
-            if (candidate == null || !checked.add(candidate)) continue;
-            try {
-                if (!containsCollections.test(candidate)) return Optional.of(candidate);
-            } catch (MongoException unavailable) {
-                return Optional.empty();
+            if (suffix >= 100_000 && suffix <= 999_999) {
+                String candidate = withSuffix(database, suffix);
+                if (candidate != null && checked.add(candidate)) {
+                    try {
+                        if (!containsCollections.test(candidate)) return Optional.of(candidate);
+                    } catch (MongoException unavailable) {
+                        return Optional.empty();
+                    }
+                }
             }
         }
         return Optional.empty();

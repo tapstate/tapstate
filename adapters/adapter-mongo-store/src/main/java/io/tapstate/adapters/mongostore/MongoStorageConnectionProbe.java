@@ -5,14 +5,15 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageConnectionProbe;
+import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.concurrent.ThreadLocalRandom;
 
 /** A short-lived, always-aborted permission probe; it never runs storage migrations. */
 public final class MongoStorageConnectionProbe implements StorageConnectionProbe {
+    private static final SecureRandom SUGGESTION_SUFFIXES = new SecureRandom();
     private final Duration timeout;
     private final java.util.function.Function<String,com.mongodb.ConnectionString> parser;
     public MongoStorageConnectionProbe(Duration timeout) { this(timeout, com.mongodb.ConnectionString::new); }
@@ -46,7 +47,7 @@ public final class MongoStorageConnectionProbe implements StorageConnectionProbe
                 Optional<String> suggestion;
                 try {
                     suggestion = CacheDatabaseSuggestions.find(database,
-                            () -> ThreadLocalRandom.current().nextInt(100_000, 1_000_000),
+                            () -> SUGGESTION_SUFFIXES.nextInt(100_000, 1_000_000),
                             candidate -> hasCollections(connection.client().getDatabase(candidate)));
                 } catch (MongoException unavailable) {
                     suggestion = Optional.empty();

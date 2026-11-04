@@ -157,48 +157,15 @@ public final class StorageSetupService {
     private Status commitOwned(String subject, StorageSetupScope expected, Runnable active, Candidate candidate, Map<Layer,String> stamps) {
         active.run();
         Prepared prepared = prepare(candidate);
-        if (mode == StorageBinding.Mode.OP && states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (progress != null) {
-                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
-                verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
-                progress.begin(expected, 0, false, verifiedChecks);
-            }
-            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE))
-                testLayer(prepared.candidate().connection(layer), layer);
-            requireSetup(expected, active);
-            configurationPreparation.prepare(expected, prepared.candidate(), active);
-        }
+        prepareLocalConfiguration(expected, active, prepared, stamps);
         requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
         if (progress != null && previous.isPresent()) progress.begin(expected, 1, false);
-        if (previous.isEmpty()) {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (progress != null) {
-                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
-                verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
-                progress.begin(expected, 0, false, verifiedChecks);
-            }
-            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) {
-                testLayer(prepared.candidate().connection(layer), layer);
-                if (progress != null) progress.checked(expected, layer);
-            }
-        }
-        Runnable writeGuard = previous.isPresent() ? active : () -> {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
-        };
-        audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()), () -> {
-            StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
-                    prepared.candidate().cache(), prepared.target(), writeGuard);
-            if (pending == null || result.firstCreation().isPresent() || !pending.binding().equals(result.binding())
-                    || !pending.preparation().equals(result.preparation())) pending = result;
-            return result.binding();
-        });
+        if (previous.isEmpty()) verifyFirstBinding(expected, active, prepared, stamps);
+        Runnable writeGuard = bindingWriteGuard(previous, expected, active, prepared, stamps);
+        audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()),
+                () -> commitBinding(expected, prepared, writeGuard));
         if (progress != null) progress.completed(expected, StorageInitializationProgress.Stage.SAVE_SETTINGS);
         // The committed operation owns continuation even if the HTTP request or its test stamps expire.
         continuation.accept(pending);
@@ -207,6 +174,61 @@ public final class StorageSetupService {
         // secret-free completion receipt may return; no later request inherits that authorization.
         if (result.setupPhase() != StorageSetupStateStore.Phase.COMPLETE) active.run();
         return result;
+    }
+
+    private void prepareLocalConfiguration(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        if (mode != StorageBinding.Mode.OP || states.load().phase() != StorageSetupStateStore.Phase.LOCAL_SETUP) return;
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        beginSetupProgress(expected);
+        for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE))
+            testLayer(prepared.candidate().connection(layer), layer);
+        requireSetup(expected, active);
+        configurationPreparation.prepare(expected, prepared.candidate(), active);
+    }
+
+    private void verifyFirstBinding(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        beginSetupProgress(expected);
+        for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) {
+            testLayer(prepared.candidate().connection(layer), layer);
+            if (progress != null) progress.checked(expected, layer);
+        }
+    }
+
+    private void beginSetupProgress(StorageSetupScope expected) {
+        if (progress == null) return;
+        var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
+        verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
+        progress.begin(expected, 0, false, verifiedChecks);
+    }
+
+    private Runnable bindingWriteGuard(Optional<StorageBinding> previous, StorageSetupScope expected,
+            Runnable active, Prepared prepared, Map<Layer,String> stamps) {
+        if (previous.isPresent()) return active;
+        return () -> requireFreshBindingWrite(expected, active, prepared, stamps);
+    }
+
+    private void requireFreshBindingWrite(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
+    }
+
+    private StorageBinding commitBinding(StorageSetupScope expected, Prepared prepared, Runnable writeGuard) {
+        StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
+                prepared.candidate().cache(), prepared.target(), writeGuard);
+        retainPending(result);
+        return result.binding();
+    }
+
+    private void retainPending(StorageBindingCommit result) {
+        if (pending == null || result.firstCreation().isPresent() || !pending.binding().equals(result.binding())
+                || !pending.preparation().equals(result.preparation())) pending = result;
     }
 
     private void testLayer(StorageBinding.Connection connection, Layer layer) {
