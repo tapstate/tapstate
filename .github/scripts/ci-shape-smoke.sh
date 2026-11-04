@@ -128,12 +128,16 @@ def check(workflows, contexts, inputs):
         'any shard assigned the Cloud context test must prepare its pinned inputs'
     assert 'prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"' in shards
     assert 'TAPSTATE_TEST_CLOUD_RELEASE_DIR=$RUNNER_TEMP/cloud-test-release' in shards
+    assert 'if [[ "$SHARD" == app-* ]]; then' in execute[1], 'App PDK inputs must stay in their selected Maven verify step'
+    assert 'for connector in mongodb mysql postgres; do' in execute[1], 'all direct-validation connector inputs are required'
+    assert 'test -f "$connector_jar"' in execute[1], 'missing real connector inputs must fail before tests'
+    assert '-Dtapstate.pdk.it.$connector-jar=$connector_jar' in execute[1], 'real PDK paths must reach the original Maven forks'
     namespace = {'m': 'http://maven.apache.org/POM/4.0.0'}
     reactor = ET.fromstring(inputs['pom.xml'])
     version = reactor.findtext('m:properties/m:cloud.sdk.version', namespaces=namespace)
-    # The Cloud SDK snapshot publisher preserves either a major.minor or major.minor.patch tag.
-    assert version and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-SNAPSHOT', version), \
-        'the reactor must declare a published Cloud SDK snapshot revision'
+    # Accept the publisher's base snapshot or an exact timestamped revision of that snapshot.
+    assert version and re.fullmatch(r'[0-9]+\.[0-9]+(?:\.[0-9]+)?-[0-9a-f]{8}-(?:SNAPSHOT|[0-9]{8}\.[0-9]{6}-[1-9][0-9]*)', version), \
+        'the reactor must declare a publisher-format Cloud SDK snapshot revision'
     app = ET.fromstring(inputs['app/pom.xml'])
     sdk = [dependency for dependency in app.findall('m:dependencies/m:dependency', namespace)
            if dependency.findtext('m:groupId', namespaces=namespace) == 'io.tapstate'
@@ -228,6 +232,10 @@ for original, replacement in [
     (MAVEN_ARGS, '          MAVEN_ARGS: "-Dapi.version=1.44"'),
     (MAVEN_ARGS, MAVEN_ARGS.replace('${{ runner.temp }}/test-tmp', '/tmp')),
     ('mkdir -p "$RUNNER_TEMP/test-tmp"', 'echo missing-test-tmp'),
+    ('if [[ "$SHARD" == app-* ]]; then', 'if false; then'),
+    ('for connector in mongodb mysql postgres; do', 'for connector in mongodb mysql; do'),
+    ('test -f "$connector_jar"', 'true'),
+    ('-Dtapstate.pdk.it.$connector-jar=$connector_jar', '-Dtapstate.pdk.it.unrelated-jar=$connector_jar'),
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
@@ -285,8 +293,14 @@ sdk_version = ET.fromstring(inputs['pom.xml']).findtext(
 patch_sdk_version = '0.1.1-' + sdk_version.split('-', 1)[1]
 accepted_patch_version = {**inputs, 'pom.xml': inputs['pom.xml'].replace(sdk_version, patch_sdk_version, 1)}
 check(workflows, contexts, accepted_patch_version)
+for accepted in ('0.2-5ad2cb0d-SNAPSHOT', '0.1.1-1813f345-SNAPSHOT',
+                 '0.1.1-1813f345-20261026.093742-1'):
+    check(workflows, contexts, {**inputs, 'pom.xml': inputs['pom.xml'].replace(sdk_version, accepted, 1)})
 for name, original, replacement in [
     ('pom.xml', sdk_version, 'LATEST'),
+    ('pom.xml', sdk_version, '0.1.1-1813f345-20261026.09374-1'),
+    ('pom.xml', sdk_version, '0.1.1-1813f34-20261026.093742-1'),
+    ('pom.xml', sdk_version, '0.1.1-1813f345-20261026.093742-LATEST'),
     ('pom.xml', sdk_version, sdk_version.replace('-', '.1.2-', 1)),
     ('app/pom.xml', '<artifactId>cloud-control-plane-sdk</artifactId>',
      '<artifactId>missing-cloud-sdk</artifactId>'),

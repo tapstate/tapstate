@@ -309,6 +309,18 @@ class SrsSnapshotPreparationTest {
             assertThat(registered(unit)).isEmpty(); assertThat(f.closedSessions).isOne();
         }
     }
+    @Test void sampledSnapshotRetryKeepsItsExactPinAndReadsOnlyOriginalModels() {
+        var f=new Fixture();var saved=new SrsSnapshotPin(5,"original-seam",Map.of(
+                "orders",model("orders",2).key(),"quiet",model("quiet",2).key()));
+        f.original=f.progress(saved,List.of("quiet"));f.forbidHeads=true;
+        var owner=f.owner();owner.beginRead();
+        var observed=new SourceTable("orders",List.of(new SourceField("different-sample","STRING(20480)")),List.of(),List.of());
+        owner.prepare(owner.request(),new SourcePosition("new-sample-seam"),Map.of("orders",observed),
+                SourceModelComparison.SAMPLED_DOCUMENT);
+        assertThat(owner.accepted()).isEqualTo(saved);assertThat(f.pinned).isEqualTo(saved);
+        assertThat(f.headReads).isZero();assertThat(f.exactReads).isOne();owner.close();
+    }
+
     private static java.util.Collection<?> registered(NativeSrsCaptureRunUnit unit) throws ReflectiveOperationException {
         var field = NativeSrsCaptureRunUnit.class.getDeclaredField("snapshots"); field.setAccessible(true);
         return (java.util.Collection<?>) field.get(unit);

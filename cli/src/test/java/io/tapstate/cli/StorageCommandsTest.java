@@ -40,9 +40,14 @@ class StorageCommandsTest {
             repl.dispatch("configuration export --file export.json");
             assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK); assertThat(paths.getLast()).isEqualTo("/api/configuration/export");
             assertThat(output.toString()).contains("opaque-ciphertext").doesNotContain(transferKey);
+            Files.writeString(work.resolve("activation.json"), "{\"operationId\":\"original\",\"generation\":1,\"bindingVersion\":1}");
+            repl.dispatch("storage setup activate --file activation.json");
+            assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK);
+            assertThat(paths.getLast()).isEqualTo("/api/storage/setup/activate");
+            assertThat(bodies.getLast()).isEqualTo(Map.of("operationId", "original", "generation", 1L, "bindingVersion", 1L));
             repl.dispatch("storage status"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_OK);
             repl.dispatch("storage test mongodb://sentinel-secret"); assertThat(repl.lastExitCode()).isEqualTo(Cli.EXIT_USAGE);
-            assertThat(calls).hasValue(3); assertThat(output.toString()).contains("cli.storage-usage").doesNotContain("sentinel-secret");
+            assertThat(calls).hasValue(4); assertThat(output.toString()).contains("cli.storage-usage").doesNotContain("sentinel-secret");
         } finally { server.stop(0); }
     }
     @Test void anUnknownWriteResultIsNotRetriedAgainstTheSameOrAnotherMember(@TempDir Path work) throws Exception {

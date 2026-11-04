@@ -99,9 +99,9 @@ class RestApiSecurityConfiguration {
                         .dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
                         // WebSocket upgrades retain their own handshake gate because they are not MVC verbs.
                         .requestMatchers(
-                                "/api/pipelines/*/status/watch",
-                                "/api/pipelines/*/logs/follow",
-                                "/api/data-browser/*/*/tail")
+                                PipelineStreamConfiguration.STATUS_WATCH_PATH,
+                                PipelineStreamConfiguration.LOGS_FOLLOW_PATH,
+                                DataBrowserStreamConfiguration.TAIL_PATH)
                         .permitAll()
                         .anyRequest().access(authorization));
         return http.build();

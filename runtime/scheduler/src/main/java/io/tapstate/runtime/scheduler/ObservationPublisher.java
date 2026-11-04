@@ -808,7 +808,8 @@ public final class ObservationPublisher {
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(known, FLAT_REDUCTIONS).metrics(),
                         previous != null ? previous.snapshot() : Map.of(),
-                        previous != null ? previous.positions() : Map.of(), carried, at, known, previous != null ? previous.initialLoad() : null);
+                        previous != null ? previous.positions() : Map.of(), carried, at, known,
+                        previous != null ? previous.initialLoad() : null);
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.

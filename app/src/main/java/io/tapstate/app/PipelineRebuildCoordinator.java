@@ -11,9 +11,6 @@ import java.util.function.*;
 
 /** Executes one confirmed replacement through existing CONFIG and CACHE commands after writer retirement. */
 final class PipelineRebuildCoordinator {
-    @FunctionalInterface interface ExternalClear {
-        void relinquished(PipelineRebuildPreparation original,List<SrsConsumerMembership> memberships,Map<String,SourceResource> desired);
-    }
     /** Must prove the original job, writers, capture and hot placements retired, including on retry. */
     @FunctionalInterface interface RetiredExecution {
         void require(PipelineRebuildRequest original,Optional<OperatorRunManifest> manifest);
@@ -29,17 +26,11 @@ final class PipelineRebuildCoordinator {
     private final RetiredExecution retired;
     private final Duration ttl;
     private final Clock clock;
-    private final ExternalClear external;
     PipelineRebuildCoordinator(Stores stores,PipelinePrivateNoteRetirement notes,Supplier<WorkloadClaimFence> node,
             Runnable requireActiveNode,RetiredExecution retired,Duration ttl,Clock clock) {
-        this(stores,notes,node,requireActiveNode,retired,ttl,clock,(original,memberships,desired) -> {});
-    }
-    PipelineRebuildCoordinator(Stores stores,PipelinePrivateNoteRetirement notes,Supplier<WorkloadClaimFence> node,
-            Runnable requireActiveNode,RetiredExecution retired,Duration ttl,Clock clock,ExternalClear external) {
         this.stores=Objects.requireNonNull(stores);this.notes=Objects.requireNonNull(notes);this.node=Objects.requireNonNull(node);
         this.requireActiveNode=Objects.requireNonNull(requireActiveNode);this.retired=Objects.requireNonNull(retired);
         this.ttl=Objects.requireNonNull(ttl);this.clock=Objects.requireNonNull(clock);
-        this.external=Objects.requireNonNull(external);
     }
     PipelinePreparation rebuild(PipelineConvergencePass pass,Optional<OperatorRunManifest> manifest) {
         requireActiveNode.run();pass.requirePipeline(pass.scope().pipelineId());
@@ -63,8 +54,7 @@ final class PipelineRebuildCoordinator {
         var request=original.request();var currentNode=Objects.requireNonNull(node.get(),"currentNode");
         Runnable guard=() -> {requireActiveNode.run();retired.require(request,manifest);requireActiveNode.run();};
         guard.run();stores.configuration().requirePending(original);
-        var originalMemberships=stores.consumers().guardedBy(guard).forPipeline(request.originalScope());
-        for(var member:originalMemberships) {
+        for(var member:stores.consumers().guardedBy(guard).forPipeline(request.originalScope())) {
             guard.run();if(member.detached())continue;
             if (stores.consumers().guardedBy(guard).detachForRebuild(original,member,currentNode).isEmpty()) throw fenced();
         }
@@ -75,7 +65,6 @@ final class PipelineRebuildCoordinator {
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())desired.put(
                 RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
-        external.relinquished(original,originalMemberships,Map.copyOf(desired));guard.run();
         notes.reconcile(original,Map.copyOf(desired),guard);guard.run();stores.configuration().requirePending(original);
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
         guard.run();return stores.configuration().complete(receipt);

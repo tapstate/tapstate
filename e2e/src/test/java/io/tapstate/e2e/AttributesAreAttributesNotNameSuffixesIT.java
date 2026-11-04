@@ -53,6 +53,7 @@ class AttributesAreAttributesNotNameSuffixesIT {
 
     private static final String FRONTIER_GAP = "tapstate.pipeline.frontier.gap";
     private static final String NEST_ENTRIES = "tapstate.pipeline.nest.entries";
+    private static final String PIPELINE = "tapstate.pipeline.id";
     private static final String CHAIN = "tapstate.chain.id";
     private static final String NAMESPACE = "tapstate.nest.namespace";
 
@@ -124,10 +125,19 @@ class AttributesAreAttributesNotNameSuffixesIT {
                         .isPresent();
 
                 Map<String, Object> entries = fact(control, NEST_ENTRIES).orElseThrow();
-                String rootNamespace = "nest." + PIPELINE_ID + "." + NEST_STEP + ".";
+                Map<String, Long> flatEntries = control.metricsNamed(PIPELINE_ID, NEST_ENTRIES_FLAT);
+                assertThat(flatEntries)
+                        .as("the queried pipeline publishes real nest namespace readings on the flat face")
+                        .isNotEmpty();
+                String namespaceKey = flatEntries.keySet().stream()
+                        .filter(key -> key.startsWith(NEST_ENTRIES_FLAT + "nest."))
+                        .findFirst()
+                        .orElseThrow(() -> new AssertionError(
+                                "no nest entries key belongs to the queried pipeline: " + flatEntries));
+                String namespace = namespaceKey.substring(NEST_ENTRIES_FLAT.length());
                 Map<String, Object> rootPoint = ((List<Map<String, Object>>) entries.get("points")).stream()
-                        .filter(point -> attributeOf(point, NAMESPACE).map(ns -> ns.startsWith(rootNamespace))
-                                .orElse(false))
+                        .filter(point -> attributeOf(point, NAMESPACE).map(namespace::equals).orElse(false))
+                        .filter(point -> attributeOf(point, PIPELINE).map(PIPELINE_ID::equals).orElse(false))
                         .findFirst()
                         .orElseThrow(() -> new AssertionError(
                                 "no nest entries point carries a namespace of this pipeline's nest step: "
@@ -143,10 +153,9 @@ class AttributesAreAttributesNotNameSuffixesIT {
                 assertThat(flatGaps)
                         .as("the flat face still spells the orders chain's distance under its old key")
                         .containsEntry(FRONTIER_GAP_FLAT + PARENT_TABLE, ((Number) ordersPoint.get("value")).longValue());
-                String rootNamespaceValue = attributeOf(rootPoint, NAMESPACE).orElseThrow();
-                assertThat(control.metricsNamed(PIPELINE_ID, NEST_ENTRIES_FLAT))
+                assertThat(flatEntries)
                         .as("and the nest level's entries under its old key, with the value that is on the point")
-                        .containsEntry(NEST_ENTRIES_FLAT + rootNamespaceValue,
+                        .containsEntry(namespaceKey,
                                 ((Number) rootPoint.get("value")).longValue());
 
                 assertThat(control.metricFacts(PIPELINE_ID))

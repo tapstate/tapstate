@@ -38,6 +38,7 @@ class NativePipelineDeletionTest {
         when(preparations.read("pipeline")).thenReturn(Optional.of(new PipelinePreparation("pipeline",1,PipelinePreparation.Phase.UNASSIGNED,null,null,null)));
         when(configuration.intents()).thenReturn(mock(PipelineIntentStore.class)); when(configuration.retirements()).thenReturn(lifecycle);
         when(configuration.requiredNotes()).thenReturn(notes); when(configuration.rebuilds()).thenReturn(mock(PipelineStateRebuilds.class));
+        when(configuration.retireValidation(any(),same(cache),any(),any())).thenAnswer(call -> { ((Runnable)call.getArgument(3)).run(); return true; });
         when(cache.pipelineRetirements(any(),any())).thenReturn(retirement); when(cache.srs(any(),any())).thenReturn(sources);
         when(sources.consumers()).thenReturn(consumers); when(ownership.unpreparedControl(scope)).thenReturn(control);
         when(lifecycle.begin(any())).thenAnswer(call -> {
@@ -62,6 +63,7 @@ class NativePipelineDeletionTest {
 
         verify(retirement).retire(held.get(),node,Optional.empty());
         verify(lifecycle).complete(receipt);
+        verify(configuration).retireValidation(eq(held.get()),same(cache),eq(node),any());
         verify(lifecycle,times(resume?0:1)).begin(any());
         verify(operators,atLeastOnce()).requireRetired(eq(scope),isNull(),any());
         verify(control,atLeastOnce()).requireActive();

@@ -7,6 +7,7 @@ import com.tngtech.archunit.core.domain.JavaModifier;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.StageTimer;
+import io.tapstate.runtime.engine.TransparentProcessor;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -71,7 +72,8 @@ class EveryProcessorDeclaresItsStageTest {
 
         assertThat(processors).extracting(JavaClass::getName).containsAll(TOPOLOGY);
         assertThat(processors)
-                .filteredOn(processor -> !TOPOLOGY.contains(processor.getName()))
+                .filteredOn(processor -> !TOPOLOGY.contains(processor.getName())
+                        && !processor.isAssignableTo(TransparentProcessor.class))
                 .allSatisfy(processor -> assertThat(processor.isAssignableTo(Staged.class))
                         .as("%s declares the stage its time is measured under", processor.getName())
                         .isTrue());
@@ -79,6 +81,32 @@ class EveryProcessorDeclaresItsStageTest {
             assertThat(tapstateClasses.get(topology).isAssignableTo(Staged.class))
                     .as("%s spends no time a reader would want to see on its own", topology)
                     .isFalse();
+        }
+    }
+
+    @Test
+    @DisplayName("transparent envelopes privately delegate every processing callback and own no timing")
+    void transparentEnvelopesHaveOnePrivateDelegateAndNoTimingOrDelegateEscape() {
+        Set<String> callbacks = Set.of("init", "process", "tryProcessWatermark", "tryProcess",
+                "completeEdge", "complete", "isCooperative", "closeIsCooperative", "close");
+        var envelopes = processors().stream().filter(type -> type.isAssignableTo(TransparentProcessor.class)).toList();
+        assertThat(envelopes).isNotEmpty();
+        for (var envelope : envelopes) {
+            assertThat(envelope.isAssignableTo(Staged.class)).as(envelope.getName()).isFalse();
+            var delegates = envelope.getFields().stream().filter(field -> field.getRawType().isAssignableTo(Processor.class)).toList();
+            assertThat(delegates).singleElement().satisfies(field ->
+                    assertThat(field.getModifiers()).contains(JavaModifier.PRIVATE, JavaModifier.FINAL));
+            assertThat(envelope.getFields()).noneMatch(field -> field.getRawType().isEquivalentTo(StageTimer.class));
+            assertThat(stageTimerCallsFrom(envelope)).isEmpty();
+            assertThat(envelope.getMethods()).noneMatch(method -> method.getRawReturnType().isAssignableTo(Processor.class));
+            var methods = envelope.getMethods().stream().filter(method -> callbacks.contains(method.getName())).toList();
+            assertThat(methods).extracting(method -> method.getName()).containsAll(callbacks);
+            for (var method : methods) {
+                assertThat(method.getMethodCallsFromSelf()).anySatisfy(call -> {
+                    assertThat(call.getTargetOwner().isEquivalentTo(Processor.class)).isTrue();
+                    assertThat(call.getTarget().getName()).isEqualTo(method.getName());
+                });
+            }
         }
     }
 

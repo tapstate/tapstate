@@ -28,6 +28,7 @@
     <module>spi-store</module>
     <module>spi-transform</module>
     <module>spi-metrics</module>
+    <module>spi-alerting</module>
   </modules>
 
   <dependencyManagement>

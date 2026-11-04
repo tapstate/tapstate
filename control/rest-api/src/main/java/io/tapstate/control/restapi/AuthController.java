@@ -12,7 +12,6 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.LocalAuthenticationContext;
 import io.tapstate.control.core.ManagedAuthenticationContext;
-import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;

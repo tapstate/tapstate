@@ -41,7 +41,7 @@ import java.util.Set;
  * writers would otherwise prepare each table once per writer, and a table cleared for a full load by one writer
  * after another had started writing into it would lose the other's rows.
  */
-final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTargets {
+final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSinkWriterFactory, PreparesTargets {
 
     private static final long serialVersionUID = 1L;
 
@@ -133,6 +133,9 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
         }).assess(config(),targets);
         return forRun(run,unchanged);
     }
+    PdkSinkWriterFactory withTargets(Map<String,TargetTable> restored) {
+        return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null);
+    }
     PdkSinkWriterFactory forRun(ConfiguredSinkRun run,Map<String,TargetIdentityPlan> identities) {
         if(!node.equals(run.node()) || purpose!=run.purpose())throw new IllegalArgumentException("configured sink run belongs to another node");
         if(!targets.keySet().equals(identities.keySet()))throw new IllegalArgumentException("frozen identities must cover every input stream");
@@ -160,9 +163,11 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
     boolean fullLoad() { return fullLoad; }
 
     @Override
-    public SinkWriter getEx() {
+    public SinkWriter getEx() {return forWriter(0,0);}
+    @Override public SinkWriter forWriter(int memberIndex,int localIndex) {
+        if(memberIndex<0 || localIndex<0)throw new IllegalArgumentException("invalid writer coordinates");
         HazelcastInstance member = localMember();
-        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member))
+        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member),"writer:"+memberIndex+":"+localIndex)
                 .withTargetIdentities(identities).openPrepared(config(),targets);
         return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
                 .openPrepared(config(), targets);
@@ -176,7 +181,7 @@ final class PdkSinkWriterFactory implements SupplierEx<SinkWriter>, PreparesTarg
 
     @Override
     public void prepareTargets(HazelcastInstance coordinator) {
-        if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null)
+        if(configured!=null){ScopedSinkStateProvider.of(coordinator).open(coordinator,configured,config(),provisioner(coordinator),null,"preparation")
                 .withTargetIdentities(identities).prepare(config(),targets);return;}
         new PdkSinkPort(provisioner(coordinator), stateStore(coordinator), null, purpose).prepare(config(), targets);
     }

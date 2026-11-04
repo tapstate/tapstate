@@ -24,6 +24,7 @@ import org.junit.jupiter.params.provider.Arguments;
 public final class CiProviderInventory {
     private static final int MAX_CASES = 4096;
     private static final Map<String, List<String>> PROVIDERS = Map.ofEntries(
+            Map.entry("io.tapstate.adapters.mongostore.MongoValidationIndependentPreparationIT", List.of("damagedControlFields")),
             Map.entry("io.tapstate.app.ServerTimeZoneTest", List.of("scenarios")),
             Map.entry("io.tapstate.core.dsl.CanonicalRoundTripTest", List.of("canonicalResources")),
             Map.entry("io.tapstate.core.dsl.CorpusSemanticGateTest", List.of("validScenarios", "invalidCases")),
@@ -31,7 +32,6 @@ public final class CiProviderInventory {
             Map.entry("io.tapstate.core.dsl.DslReferenceClosureTest", List.of("validScenarios", "closureViolations")),
             Map.entry("io.tapstate.core.dsl.TargetConnectorRulesTest", List.of("sinkConnectors")),
             Map.entry("io.tapstate.adapters.pdk.PdkTypeMappingTest", List.of("declaredColumnShapes", "driverNativeColumnShapes")),
-            Map.entry("io.tapstate.adapters.mongostore.MongoCaptureOpeningShapesTest", List.of("nativeDamage", "controlDamage")),
             Map.entry("io.tapstate.control.restapi.WrittenFilterTest", List.of("theVocabularyDownBothRoads")),
             Map.entry("io.tapstate.cli.PublishedConnectorArtifactsTest", List.of("publishedIds")),
             Map.entry("io.tapstate.e2e.JoinConformanceIT", List.of("carriers")),

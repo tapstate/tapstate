@@ -1,0 +1,14 @@
+{
+  "installedVersion": 7,
+  "clusterId": "cluster-a",
+  "layoutId": "three-layer-v1",
+  "keyId": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "operationId": "schema-op-a",
+  "authorityPreparationOperationId": "schema-op-a",
+  "queryPreparation": {
+    "operationId": "schema-op-a",
+    "phase": "READY",
+    "nextIndex": 6,
+    "indexContractVersion": 2
+  }
+}

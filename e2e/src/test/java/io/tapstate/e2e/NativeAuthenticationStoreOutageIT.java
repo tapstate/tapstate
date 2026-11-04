@@ -94,6 +94,12 @@ class NativeAuthenticationStoreOutageIT {
                 Await.until("native authentication and business storage to be ready", () ->
                         "READY".equals(control.storageStatus().get("businessPhase")), () -> String.valueOf(control.storageStatus()));
                 assertThat(control.clusterMemberNodeIds()).hasSize(1);
+                Await.until("the original node boot to be durably observed",()->configuration.getCollection("alert_node_lifecycles").countDocuments(new Document("phase","EXPECTED"))==1,
+                        ()->"the initial node lifecycle fact is absent");
+                control.awaitInitialAlertMaintenance();
+                Document readyKeys=SystemCollections.CLUSTER_KEYS.on(configuration).find().first();
+                assertThat(keyIdentity(readyKeys)).isEqualTo(keyIdentity(keys));
+                assertThat(readyKeys.getLong("sourceWriteFence")).isGreaterThanOrEqualTo(keys.getLong("sourceWriteFence"));
                 NetworkedMongo unavailable = layer == Layer.CONFIG ? config : cache;
                 unavailable.freeze();
                 try {
@@ -102,7 +108,7 @@ class NativeAuthenticationStoreOutageIT {
                     unavailable.thaw();
                 }
                 assertThat(control.storageStatus().get("clusterId")).isEqualTo(cluster);
-                assertThat(SystemCollections.CLUSTER_KEYS.on(configuration).find().first()).isEqualTo(keys);
+                assertThat(SystemCollections.CLUSTER_KEYS.on(configuration).find().first()).isEqualTo(readyKeys);
                 assertThat(SystemCollections.STORAGE_BINDING.on(configuration).find().first()).isEqualTo(bound);
                 assertThat(authIdentity(SystemCollections.CACHE_IDENTITY.on(cacheDatabase).find().first())).isEqualTo(auth);
                 assertThat(SystemCollections.OP_SESSIONS.on(cacheDatabase).countDocuments()).isZero();
@@ -117,4 +123,5 @@ class NativeAuthenticationStoreOutageIT {
         }
         return identity;
     }
+    private static Document keyIdentity(Document row){var identity=new Document(row);identity.remove("sourceWriteFence");return identity;}
 }

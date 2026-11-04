@@ -232,6 +232,28 @@ class SrsCaptureWriterTest {
         }
     }
 
+    @Test void nativePhysicalTailObservesOriginalEventsWithoutChangingDurablePublication() {
+        var f = new Fixture(); f.actual.keySet().forEach(name -> SHARED_LOG.stores.put(f.ring(name), f.log));
+        var observer = new RecordingCaptureObservation(); var callback = new AtomicReference<CaptureListener>();
+        var config = f.config().at(new io.tapstate.core.model.PipelineNode("flow", "input"));
+        try (var unit = new NativeSrsCaptureRunUnit(SCOPE, new SrsStores(f.chains, f.models, SHARED_LOG, unusedConsumers), member, observer)) {
+            var tail = unit.startTail(SCOPE, f.opened, FENCE, config, CaptureStart.present(),
+                    writer -> f.port(writer, callback, true), () -> {});
+            assertThat(observer.contexts).singleElement().satisfies(context -> {
+                assertThat(context.captureId()).isEqualTo("capture"); assertThat(context.chainId()).isEqualTo(f.chain);
+                assertThat(context.sourceId()).isEqualTo("input"); assertThat(context.pipelineId()).isEqualTo("flow");
+                assertThat(context.fence()).isEqualTo(FENCE); assertThat(context.epoch()).isEqualTo(2);
+            });
+            var original = Envelope.insert(1, "orders", Map.of("id", 11), null);
+            callback.get().onBatch(List.of(original), Optional.of(new SourcePosition("observed")));
+            assertThat(observer.events).containsExactly(original);
+            assertThat(f.saved.getLast().position().token()).isEqualTo("observed");
+            var failure = new IllegalStateException("source failed"); callback.get().onError(failure);
+            assertThat(observer.failures).containsExactly(failure); assertThat(tail.health().failure()).contains(failure);
+            tail.close(); tail.close(); assertThat(observer.retirements).hasValue(1);
+        }
+    }
+
     @Test void explicitResumeUsesTheRequestedTokenAndPublishesOnlyTheNewActualCheckpoint() {
         var f = new Fixture(); var previous = new LinkedHashMap<String,SrsTableCheckpoint>();
         for (String table : f.actual.keySet()) {
@@ -272,6 +294,52 @@ class SrsCaptureWriterTest {
         }
     }
 
+    @Test void sampledRecoveryKeepsOriginalBodiesAndPublishesActualNewEpochObservations() {
+        var f = new Fixture(); var refs = new TreeMap<String, SrsTableCheckpoint>();
+        for (String name : f.actual.keySet()) {
+            var key = new SrsModelKey(f.chain, name, "cache", 1, 0);
+            var sampled = new SourceTable(name, List.of(new SourceField("old", "STRING(20480)")), List.of(), List.of());
+            f.published.put(key, new SrsModel(key, f.ring(name), sampled, 0));
+            refs.put(name, new SrsTableCheckpoint(key, -1));
+        }
+        f.opened = f.state(1, new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "original-cut"), refs));
+        var original = Map.copyOf(f.published); var writer = f.writer();
+        writer.prepare(f.actual, SourceModelComparison.SAMPLED_DOCUMENT);
+        original.forEach((key, model) -> assertThat(f.published).containsEntry(key,model));
+        for (String name : f.actual.keySet()) {
+            var current = f.published.get(new SrsModelKey(f.chain, name, "cache", 2, 0));
+            assertThat(current.table().fields()).isEqualTo(f.actual.get(name).fields());
+        }
+        assertThat(f.saved).isEmpty();
+        assertThat(f.opened.checkpoint().position().token()).isEqualTo("original-cut");
+        writer.close();
+    }
+
+    @Test void aSampledRetryRevalidatesPublicationWithoutOverwritingItsExistingKey() {
+        var f = new Fixture();
+        for (String name : f.actual.keySet()) {
+            var key = new SrsModelKey(f.chain, name, "cache", 2, 0);
+            f.published.put(key, new SrsModel(key, f.ring(name),
+                    new SourceTable(name, List.of(new SourceField("observed-earlier", "string")), List.of(), List.of()), 0));
+        }
+        var before = Map.copyOf(f.published);
+        var writer = f.writer(); writer.prepare(f.actual, SourceModelComparison.SAMPLED_DOCUMENT);
+        writer.prepare(Map.of("orders", new SourceTable("orders", List.of(), List.of(), List.of()),
+                "quiet", f.actual.get("quiet")), SourceModelComparison.SAMPLED_DOCUMENT);
+        assertThat(f.published).isEqualTo(before); assertThat(f.saved).isEmpty(); writer.close();
+    }
+
+    @Test void aSamplingPolicyCannotReplaceAMissingCheckpointModel() {
+        var f = new Fixture();
+        var key = new SrsModelKey(f.chain, "orders", "cache", 1, 0);
+        f.opened = f.state(1, new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "original-cut"),
+                Map.of("orders", new SrsTableCheckpoint(key, -1))));
+        var writer = f.writer();
+        assertThatThrownBy(() -> writer.prepare(f.actual, SourceModelComparison.SAMPLED_DOCUMENT))
+                .satisfies(error -> code(error, IoError.SRS_MODEL_UNAVAILABLE));
+        assertThat(f.published).isEmpty(); assertThat(f.saved).isEmpty(); writer.close();
+    }
+
     private static final class Fixture {
         final String chain = "chain-" + UUID.randomUUID(); final AtomicBoolean active = new AtomicBoolean(true);
         final Map<String, SourceTable> actual = Map.of("orders", table("orders"), "quiet", table("quiet"));
@@ -300,6 +368,12 @@ class SrsCaptureWriterTest {
         }
         final SrsModelStore models = new SrsModelStore() {
             @Override public SrsModelStore guardedBy(Runnable guard) { return this; }
+            @Override public SrsModel publishObservedInitial(SrsModelKey key, String ring, SourceTable observed,
+                    WorkloadClaimFence fence, SourceModelComparison comparison) {
+                var held=published.get(key);
+                return publishInitial(key,ring,held!=null && comparison.acceptsObservation(held.table(),observed)
+                        ? held.table():observed,fence);
+            }
             @Override public SrsModel publishInitial(SrsModelKey key, String ring, SourceTable actual, WorkloadClaimFence fence) {
                 SrsModel held = published.get(key);
                 return publish(new SrsModel(key, ring, actual, held == null ? log.largestSequence(ring) + 1 : held.ddlSequence()), fence);

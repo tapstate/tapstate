@@ -39,12 +39,6 @@ class MongoRequiredNoteStoreIT {
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
-    static {
-        var owner=System.getProperty("tapstate.e2e.resource-owner");
-        if(owner!=null && !owner.isBlank())MONGO.withLabel("io.tapstate.issue-loop.owner",owner)
-                .withTmpFs(Map.of("/data/db","rw,size=512m","/data/configdb","rw,size=16m"))
-                .withCreateContainerCmdModifier(c -> c.getHostConfig().withMemory(1024L<<20).withNanoCPUs(1_000_000_000L));
-    }
 
     @Test
     void repeatedClearsRetainTheOriginalConnectionBeyondTheBoxedLongCache() {

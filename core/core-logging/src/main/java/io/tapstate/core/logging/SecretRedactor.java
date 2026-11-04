@@ -52,6 +52,14 @@ public final class SecretRedactor {
         return redactValues(text, snapshot.get(), REDACTED);
     }
 
+    /** An independent secret set for an already admitted operation, unaffected by later Source edits. */
+    public synchronized SecretRedactor fork(Collection<String> owners) {
+        Objects.requireNonNull(owners, "owners");
+        var retained = new SecretRedactor();
+        for (String owner : owners) retained.replace(owner, valuesByOwner.getOrDefault(owner, List.of()));
+        return retained;
+    }
+
     /** Also hides connection credential structures at an operational log output boundary. */
     public String redactLog(String text) {
         return redact(MongoLogSanitizer.redact(text));

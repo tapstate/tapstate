@@ -33,6 +33,7 @@ class ClusterRebuildAdmissionTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final ClusterProperties properties = production();
     private final ClusterMembershipGate membership = new ClusterMembershipGate(properties);
+    { membership.observeNodeSession(() -> true); }
     private final AtomicLong nanos = new AtomicLong();
     private final PipelineActuationOwnership ownership = new PipelineActuationOwnership(
             "cluster-a", NODE_A, membership, new ClusterWorkloadClaims(claims, membership), TTL, RENEW,

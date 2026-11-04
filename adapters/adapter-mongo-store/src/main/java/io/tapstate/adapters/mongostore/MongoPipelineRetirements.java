@@ -31,6 +31,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
     }
     @Override public PipelineRetirementPreparation begin(PipelineRetirementRequest original) {
         Objects.requireNonNull(original);
+        var validationClosing = UUID.randomUUID();
         return transaction(session -> {
             requireBusiness(session,original.scope());var row=mapping(session,original.scope().pipelineId());
             var state=MongoPipelineStateMappings.decode(original.scope().pipelineId(),row);
@@ -54,7 +55,8 @@ final class MongoPipelineRetirements implements PipelineRetirements {
                     || ConfigurationVersion.read(session,SystemCollections.CONFIGURATION_VERSION.on(database))>=Long.MAX_VALUE-2)throw fenced();
             var tokens=notes.retirementScopes(session,original.scope(),original.operationId());
             var fact=new MongoPipelineRetirementFacts.Fact(original,MongoPipelineRetirementFacts.notesHash(tokens),tokens.size(),"RETIRING",predecessor,Optional.empty());
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
+            MongoValidationPreparations.beginRetirement(session,database,cluster,original,validationClosing);
             var filter=new Document("_id",state.pipelineId()).append("phase","ACTIVE").append("stateGeneration",state.stateGeneration())
                     .append("noteWriteFence",row.get("noteWriteFence")).append("cachePreparation",row.get("cachePreparation"));
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,filter,new Document("$set",new Document("phase","RETIRING")
@@ -93,7 +95,8 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             notes.requireRetiredScopes(session,pending);
             var complete=new MongoPipelineRetirementFacts.Fact(pending.request(),pending.privateScopesHash(),pending.privateScopesCount(),"COMPLETE",pending.predecessor(),receipt.retiredState());
             long fence=row.getLong("noteWriteFence");if(fence>=Long.MAX_VALUE-1)throw fenced();
-            ConfigurationVersion.advance(session,SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
+            MongoValidationPreparations.requireRetired(session,database,cluster,pending.request().scope().pipelineId());
             artifacts.deleteRetiredPipeline(session,pending.request().scope().pipelineId(),pending.request().definitionHash());
             new MongoPipelineIntentStore(client,database,cluster,bindings).retire(session,pending.request().scope());
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,new Document("_id",pending.request().scope().pipelineId())
@@ -146,15 +149,6 @@ final class MongoPipelineRetirements implements PipelineRetirements {
     }
     static void requireOriginalActive(PipelineRetirementPreparation original) {
         if(!(original instanceof Pending pending))throw fenced();pending.owner.active.run();
-    }
-    static MongoPipelineRetirementFacts.Fact originalFact(PipelineRetirementPreparation original) {
-        if(!(original instanceof Pending pending))throw fenced();return pending.fact;
-    }
-    static void requireOriginalInTransaction(MongoClient client,MongoDatabase database,ClientSession session,PipelineRetirementPreparation original) {
-        if(!(original instanceof Pending pending) || pending.owner.client!=client || !pending.owner.database.getName().equals(database.getName()))throw fenced();
-        pending.owner.requireBusiness(session,pending.request().scope());
-        var current=pending.owner.retained(session,pending.request(),pending.owner.mapping(session,pending.request().scope().pipelineId()));
-        if(!pending.fact.equals(current.fact) || !pending.previous.equals(current.previous))throw fenced();
     }
     private record Pending(MongoPipelineRetirements owner,MongoPipelineRetirementFacts.Fact fact,PipelinePreparation previous) implements PipelineRetirementPreparation {
         public PipelineRetirementRequest request(){return fact.request();}public String privateScopesHash(){return fact.notesHash();}

@@ -95,6 +95,8 @@ class StorageRootConfigurationTest {
 
     private static StorageRoot root() {
         var root = mock(StorageRoot.class, CALLS_REAL_METHODS);
+        // This projection fixture bypasses construction and has no activation worker.
+        doReturn(false).when(root).initialActivationPending();
         ReflectionTestUtils.setField(root, "runtime", mock(StorageRuntime.class));
         ReflectionTestUtils.setField(root, "installationActive", (Runnable) () -> {});
         return root;

@@ -845,7 +845,7 @@ class MongoCachePipelinePreparationsIT {
                 }
                 SystemCollections.CACHE_IDENTITY.on(cache).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cache).insertOne(new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION).append("phase", "READY")
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(cache).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY")
                         .append("epoch", 1L).append("operationId", "business-a"));
                 var pipeline = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: []\n");
                 configuration.artifacts().create(pipeline);

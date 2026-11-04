@@ -172,6 +172,8 @@ public enum ConnectorError implements TapstateErrorCode {
      * FAILED result, not this code. {@code connector} is the connector id; {@code detail} is the failure
      * the connector reported.
      */
+    TEST_TIMEOUT("connector.test-timeout", Set.of(Parameters.CONNECTOR, Parameters.TIMEOUT)),
+
     TEST_FAILED("connector.test-failed", Set.of(Parameters.CONNECTOR, Parameters.DETAIL)),
 
     /**

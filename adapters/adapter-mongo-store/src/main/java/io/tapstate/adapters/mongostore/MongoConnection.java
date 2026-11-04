@@ -79,6 +79,9 @@ public final class MongoConnection implements AutoCloseable {
         this(settings, null, null, false, false);
     }
 
+    /** A separate explicit maintenance owner uses the same verified CONFIG endpoint. */
+    MongoConnectionSettings configurationSettings() { return settings; }
+
     /** A configuration domain preserves deployment authentication and verifies peers whenever TLS is enabled. */
     public static MongoConnection forConfiguration(MongoConnectionSettings settings) {
         return new MongoConnection(settings, null, null, true, false);
@@ -417,6 +420,7 @@ public final class MongoConnection implements AutoCloseable {
      */
     MongoClientSettings buildClientSettings(ConnectionString connectionString) {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
+                .addCommandListener(MongoCommandObservation.LISTENER)
                 .applyConnectionString(connectionString)
                 .applyToClusterSettings(b ->
                         b.serverSelectionTimeout(settings.serverSelectionTimeout().toMillis(), TimeUnit.MILLISECONDS));

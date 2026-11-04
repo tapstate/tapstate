@@ -16,6 +16,17 @@ public interface ConnectionTestResultStore {
     /** Upserts the latest test result for its connection id; latest-only, a re-test overwrites. */
     void save(ConnectionTestResult result);
 
+    /** Publishes a newly accepted managed default Source attempt in its existing latest-only row. */
+    default void beginDefaultAttempt(DefaultSourceTestAttempt attempt) { throw new UnsupportedOperationException("default Source attempts unsupported"); }
+
+    /** Publishes only the still-current CHECKING attempt. Late success must be rejected at the write. */
+    default boolean finishDefaultAttempt(DefaultSourceTestAttempt terminal, boolean controlledTimeout) {
+        throw new UnsupportedOperationException("default Source attempts unsupported");
+    }
+
+    /** Reads diagnostics only; an absent or legacy report cannot authorize a new attempt. */
+    default Optional<DefaultSourceTestAttempt> findDefaultAttempt(String connectionId) { return Optional.empty(); }
+
     /** Returns the stored latest result for the connection id, or empty if it has never been tested. */
     Optional<ConnectionTestResult> find(String connectionId);
 }

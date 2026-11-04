@@ -22,6 +22,7 @@ import io.tapstate.spi.capture.SharedNotes;
 import io.tapstate.spi.capture.CaptureListener;
 import io.tapstate.spi.capture.CapturePort;
 import io.tapstate.spi.capture.CaptureStart;
+import io.tapstate.spi.capture.CaptureStartedListener;
 import io.tapstate.spi.capture.ConnectionReport;
 import io.tapstate.spi.capture.DiscoveredSchema;
 import io.tapstate.spi.capture.SourcePosition;
@@ -256,6 +257,129 @@ class CaptureRunUnitTest {
 
     private CaptureRunUnit runUnit(CapturePort port, SrsMetaStore meta) {
         return new CaptureRunUnit(port, new SrsCoordinator(meta), meta, hz);
+    }
+
+    @Test
+    void observationSeesDirectAndBufferedFailuresOutsideHealthRecording() {
+        for (boolean buffered : List.of(false, true)) {
+            var meta = new InMemoryMeta();
+            var failure = new IllegalStateException("source failed");
+            var source = new FakeSource(List.of(), List.of()).failing(failure);
+            var observer = new RecordingObservation();
+            var selected = spec(ReadMode.CDC_ONLY, buffered, "observed-failure-" + buffered);
+            var unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz, observer);
+            try {
+                try (var run = unit.start(selected, ignored -> {})) {
+                    assertThat(run.failure()).containsSame(failure);
+                    assertThat(observer.errors).containsExactly(failure);
+                    assertThat(observer.contexts).singleElement().satisfies(context -> {
+                        assertThat(context.captureId()).isEqualTo(CaptureId.of(selected).value());
+                        assertThat(context.chainId()).isEqualTo(selected.miningChainId().value());
+                        assertThat(context.sourceId()).isEqualTo(selected.sourceId());
+                        assertThat(context.pipelineId()).isEqualTo(selected.pipelineId());
+                        assertThat(context.consumerId()).isEqualTo(selected.consumerId());
+                        assertThat(context.tables()).containsExactly("orders");
+                    });
+                    assertThat(observer.retired).isEmpty();
+                }
+                assertThat(source.cdcStarts).isOne();
+                assertThat(source.cdcClosed).isTrue();
+                assertThat(observer.retired).hasSize(1);
+            } finally { unit.close(); }
+        }
+    }
+
+    @Test
+    void optionalObservationFailureDoesNotChangeDirectDeliveryOrItsResumeAnchor() {
+        var meta = new InMemoryMeta();
+        var selected = spec(ReadMode.CDC_ONLY, false, "unavailable-observer");
+        meta.create(selected.miningChainId().value(), null);
+        meta.advanceSourceReadOffset(selected.miningChainId().value(),
+                new ChainPosition(new SourceOrder(1, 7), "original-anchor"));
+        var source = new FakeSource(List.of(), List.of(change(12)));
+        var received = new ArrayList<Envelope>();
+        var unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, hz,
+                ignored -> { throw new IllegalStateException("observer unavailable"); });
+        try (var run = unit.start(selected, received::add)) {
+            assertThat(source.cdcStart).isEqualTo(CaptureStart.resume(new SourcePosition("original-anchor")));
+            assertThat(received).hasSize(1);
+            assertThat(run.failure()).isEmpty();
+            assertThat(source.cdcStarts).isOne();
+        } finally { unit.close(); }
+        assertThat(source.cdcClosed).isTrue();
+    }
+
+    @Test
+    void sharedObservationBelongsToPhysicalOpeningAndRetiresOnlyAtReplacementOrLastRelease() {
+        var member = emptyDurableMember();
+        var requested = new AtomicReference<>(List.of("orders"));
+        var meta = new InMemoryMeta() {
+            @Override public List<String> captureTables(String chain) { return requested.get(); }
+        };
+        var source = new FakeSource(List.of(), List.of());
+        var observer = new RecordingObservation();
+        var owner = specFor("observer-owner", ReadMode.CDC_ONLY, "observed-shared");
+        var joining = specFor("observer-joiner", ReadMode.CDC_ONLY, "observed-shared");
+        var wider = new CaptureRunSpec(new CaptureConfig("mysql", Map.of(), List.of("orders", "customers")),
+                ReadMode.CDC_ONLY, "observed-shared", true, "src-2", "observer-wider", StartFrom.latest(), null, 0L);
+        var unit = new CaptureRunUnit(source, new SrsCoordinator(meta), meta, member, observer);
+        try {
+            var first = unit.start(owner, ignored -> {});
+            var second = unit.start(joining, ignored -> {});
+            assertThat(source.cdcStarts).isOne();
+            assertThat(observer.contexts).hasSize(1);
+            first.close();
+            assertThat(observer.retired).isEmpty();
+            assertThat(source.cdcClosed).isFalse();
+            requested.set(List.of("orders", "customers"));
+            var third = unit.start(wider, ignored -> {});
+            try {
+                assertThat(source.cdcStarts).isEqualTo(2);
+                assertThat(observer.contexts).hasSize(2);
+                var original = observer.contexts.get(0);
+                var replacement = observer.contexts.get(1);
+                assertThat(replacement.openingId()).isNotEqualTo(original.openingId());
+                assertThat(replacement.captureId()).isEqualTo(original.captureId());
+                assertThat(replacement.epoch()).isEqualTo(original.epoch());
+                assertThat(replacement.tables()).containsExactlyInAnyOrder("orders", "customers");
+                assertThat(observer.retired).containsExactly(original.openingId());
+                second.close();
+                assertThat(observer.retired).hasSize(1);
+            } finally { second.close(); third.close(); first.close(); }
+            assertThat(observer.retired).containsExactlyElementsOf(
+                    observer.contexts.stream().map(CaptureObservation.Context::openingId).toList());
+        } finally { unit.close(); member.shutdown(); }
+    }
+
+    private static final class RecordingObservation implements CaptureObservation.Factory {
+        final List<CaptureObservation.Context> contexts = new ArrayList<>();
+        final List<String> retired = new ArrayList<>();
+        final List<Throwable> errors = new ArrayList<>();
+        @Override public CaptureObservation.Hooks open(CaptureObservation.Context context) {
+            contexts.add(context);
+            return new CaptureObservation.Hooks() {
+                @Override public CaptureListener wrap(CaptureListener original) {
+                    class Forward implements CaptureListener {
+                        @Override public void onBatch(List<Envelope> events, Optional<SourcePosition> position) {
+                            original.onBatch(events, position);
+                        }
+                        @Override public void onError(Throwable failure) {
+                            errors.add(failure); original.onError(failure);
+                        }
+                        @Override public void onAcknowledged(SourcePosition position) { original.onAcknowledged(position); }
+                        @Override public void onAcknowledgeFailed(Throwable failure) { original.onAcknowledgeFailed(failure); }
+                    }
+                    if (original instanceof CaptureStartedListener started) {
+                        class Started extends Forward implements CaptureStartedListener {
+                            @Override public void onStart(SourcePosition position) { started.onStart(position); }
+                        }
+                        return new Started();
+                    }
+                    return new Forward();
+                }
+                @Override public void retire(Throwable reason) { retired.add(context.openingId()); }
+            };
+        }
     }
 
     // ---- a run begun: its load read while the pipeline takes it -------------------------------------

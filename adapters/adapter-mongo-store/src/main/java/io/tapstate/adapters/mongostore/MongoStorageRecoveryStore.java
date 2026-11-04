@@ -52,7 +52,7 @@ final class MongoStorageRecoveryStore {
         if (scope.authGeneration() >= Long.MAX_VALUE - 1 || current.row().getLong("revision") >= Long.MAX_VALUE - 2) throw fenced();
         var next = new CachePreparation(operation, new CacheAuthScope(scope.clusterId(), scope.bindingVersion(), scope.mode(),
                 incarnation, scope.authGeneration() + 1));
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), database);
         var values = new Document("recoveryId", operation).append("phase", AUTH_PREPARING)
                 .append("revision", current.row().getLong("revision") + 1).append("authGeneration", next.authScope().authGeneration())
                 .append("cacheIncarnation", incarnation);
@@ -64,7 +64,7 @@ final class MongoStorageRecoveryStore {
         if (!current.preparation().equals(expected)) throw fenced();
         if (AUTH_READY.equals(current.row().get("phase"))) return expected;
         if (!AUTH_PREPARING.equals(current.row().get("phase")) || current.row().getLong("revision") >= Long.MAX_VALUE - 1) throw fenced();
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), database);
         if (SystemCollections.STORAGE_RECOVERY.on(database).updateOne(session, filter(current.row()),
                 new Document("$set", new Document("phase", AUTH_READY).append("revision", current.row().getLong("revision") + 1))).getMatchedCount() != 1) throw fenced();
         return expected;

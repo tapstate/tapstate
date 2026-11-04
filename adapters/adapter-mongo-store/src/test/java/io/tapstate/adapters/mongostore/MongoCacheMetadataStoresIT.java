@@ -83,6 +83,51 @@ class MongoCacheMetadataStoresIT {
         });
     }
 
+    @Test void defaultSourceResultsFenceOldAttemptsAndIrreversibleTerminalsInTheOriginalCache() {
+        withFixture(f -> {
+            var results = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            long now = System.currentTimeMillis();
+            var owner = new io.tapstate.spi.store.WorkloadOwner("node", "boot");
+            var first = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    owner, 1, now, now + 60_000, io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            results.beginDefaultAttempt(first);
+            assertThat(results.find("source-a")).isEmpty();
+            var second = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    owner, 1, now, now + 60_000, io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            results.beginDefaultAttempt(second);
+            var passed = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.PASSED, List.of(), now + 1, true);
+            assertThat(results.finishDefaultAttempt(first.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.PASSED, now + 1, passed), false)).isFalse();
+            var failed = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(), now + 1, true);
+            assertThat(results.finishDefaultAttempt(second.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now + 1, failed), false)).isTrue();
+            assertThat(results.finishDefaultAttempt(second.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.PASSED, now + 1, passed), false)).isFalse();
+            assertThat(results.find("source-a")).contains(failed);
+            assertThat(results.findDefaultAttempt("source-a").orElseThrow().attemptId()).isEqualTo(second.attemptId());
+            assertThat(SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database).countDocuments()).isEqualTo(1);
+        });
+    }
+    @Test void expiredOrdinaryResultsAndOversizedReportsCannotPublishAsSuccessfulDiagnostics() {
+        withFixture(f -> {
+            var results = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            long now = System.currentTimeMillis();
+            var owner = new io.tapstate.spi.store.WorkloadOwner("node", "boot");
+            var expired = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    owner, 1, now - 2000, now - 1000, io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            results.beginDefaultAttempt(expired);
+            var report = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(), now, true);
+            assertThat(results.finishDefaultAttempt(expired.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now, report), false)).isFalse();
+            assertThat(results.finishDefaultAttempt(expired.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.UNKNOWN, now, null), false)).isTrue();
+            var next = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    owner, 1, now, now + 60_000, io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            results.beginDefaultAttempt(next);
+            var large = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.PASSED,
+                    List.of(new ConnectionTestItem("probe", ConnectionTestItem.Status.PASSED, "x".repeat(1024 * 1024), null, null, null)), now + 1, true);
+            assertThatThrownBy(() -> results.finishDefaultAttempt(next.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.PASSED, now + 1, large), false))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(results.find("source-a")).isEmpty();
+            assertThat(results.findDefaultAttempt("source-a").orElseThrow().state()).isEqualTo(io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING);
+        });
+    }
+
     private static ConnectorCatalogEntry declaredDb2Sink() {
         var base = entry("db2");
         return new ConnectorCatalogEntry(base.id(), base.name(), base.displayName(), base.icon(), base.group(), base.modes(), base.discovery(),
@@ -328,7 +373,7 @@ class MongoCacheMetadataStoresIT {
                 }, TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build()); }
                 SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION).append("phase", "READY")
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY")
                         .append("epoch", 1L).append("operationId", "business-a"));
                 scenario.run(new Fixture(client, database, domain, binding));
             } finally { database.drop(); }

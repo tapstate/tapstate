@@ -67,4 +67,7 @@ public interface SinkAck extends Serializable {
     default SinkAck forWriter(String writerId) {
         return this;
     }
+    /** Local metadata receipt after this actual writer's initialization; not a commit or source ACK. */
+    default void started(long jobId, long executionId) {}
+    default void started(long jobId, long executionId, WorkloadClaimFence fence) { started(jobId, executionId); }
 }

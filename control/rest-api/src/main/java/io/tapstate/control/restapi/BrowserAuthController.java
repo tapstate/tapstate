@@ -7,12 +7,12 @@ import io.tapstate.control.core.ClusterIdentityService;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.LoginService;
 import io.tapstate.control.core.LocalAuthenticationContext;
-import org.springframework.beans.factory.annotation.Autowired;
 import io.tapstate.control.core.SessionService;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.Cookie;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseCookie;
@@ -119,6 +119,7 @@ final class BrowserAuthController {
         SessionService.LogoutResult result = original.sessions().logoutForBrowser(token, original.identity().identityView().issuer());
         original.requireActive().run();
         if (result == SessionService.LogoutResult.INVALID) throw refused();
+        original.requireActive().run();
         return ResponseEntity.noContent().header(HttpHeaders.CACHE_CONTROL, NO_STORE)
                 .header(HttpHeaders.SET_COOKIE, cookie(browser.secure(), "", true)).build();
     }

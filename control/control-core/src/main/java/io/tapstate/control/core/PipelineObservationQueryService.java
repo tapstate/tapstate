@@ -62,23 +62,28 @@ public final class PipelineObservationQueryService {
      */
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members) {
-        this(artifacts, observations, plans, members, Clock.systemUTC(), PipelineStatusDiagnostics.NONE);
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, Clock.systemUTC());
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics) {
-        this(artifacts, observations, plans, members, Clock.systemUTC(), diagnostics);
+        this(artifacts, observations, plans, members, diagnostics, Clock.systemUTC());
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members, Clock clock) {
-        this(artifacts, observations, plans, members, clock, PipelineStatusDiagnostics.NONE);
+        this(artifacts, observations, plans, members, PipelineStatusDiagnostics.NONE, clock);
     }
 
     public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
             ExecutionPlans plans, Supplier<List<String>> members, Clock clock, PipelineStatusDiagnostics diagnostics) {
-        this.clock = Objects.requireNonNull(clock, "clock");
+        this(artifacts, observations, plans, members, diagnostics, clock);
+    }
+
+    public PipelineObservationQueryService(ArtifactQueryService artifacts, ObservationStore observations,
+            ExecutionPlans plans, Supplier<List<String>> members, PipelineStatusDiagnostics diagnostics, Clock clock) {
         this.diagnostics = Objects.requireNonNull(diagnostics, "diagnostics");
+        this.clock = Objects.requireNonNull(clock, "clock");
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.observations = Objects.requireNonNull(observations, "observations");
         this.plans = Objects.requireNonNull(plans, "plans");
@@ -108,6 +113,15 @@ public final class PipelineObservationQueryService {
         Objects.requireNonNull(pipelineId, PIPELINE_ID_ARGUMENT);
         return observations.read(pipelineId)
                 .map(this::statusOf);
+    }
+
+    /** One read keeps state, measurement times and snapshot progress on the same publication. */
+    public record Read(PipelineStatus status, PipelineMetrics metrics, PipelineSnapshot snapshot) { }
+    public Optional<Read> findRead(String pipelineId) {
+        Objects.requireNonNull(pipelineId,PIPELINE_ID_ARGUMENT);
+        return observations.read(pipelineId).map(value->new Read(statusOf(value),
+                new PipelineMetrics(value.pipelineId(),value.metrics(),value.positions(),value.facts()),
+                new PipelineSnapshot(value.pipelineId(),value.snapshot())));
     }
 
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */

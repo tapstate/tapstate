@@ -101,6 +101,7 @@ final class StorageAuthentication implements AutoCloseable {
 
     private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget) {
         Optional<VerifiedToken> verified;
+        Optional<CredentialEvidence> evidence;
         Optional<String> organization = Optional.empty();
         if (cloud.cloud()) {
             // The fenced session transaction checks CACHE identity and structure before reading.
@@ -110,8 +111,16 @@ final class StorageAuthentication implements AutoCloseable {
             verified = authenticated.map(AuthenticatedCloudSession::identity);
             organization = authenticated.map(value -> value.clusterContext().organizationId());
             original.requireLocallyActive();
+            evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
+                    Optional.empty(), original::requireLocallyActive));
         } else {
-            verified = original.authenticate(presented, budget);
+            var authenticated = original.authenticateTagged(presented, budget);
+            verified = authenticated.map(AuthenticatedIdentity::identity);
+            evidence = authenticated.map(value -> new CredentialEvidence(value.type(), value.configurationBinding(), () -> {
+                original.requireLocallyActive();
+                if (value.type() == CredentialType.HUMAN_JWT
+                        && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
+            }, value.humanToken()));
         }
         // The last CACHE transaction validates both scope and this exact session's revocation. A
         // scope-only check after the first session read would miss a denial committed in between.
@@ -139,7 +148,31 @@ final class StorageAuthentication implements AutoCloseable {
                                     .map(CredentialAuthentication::token)
                             : original.authenticate(presented, revalidation);
                     if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
-                }));
+                }, evidence));
+    }
+
+    /** Converts the original successful verification, including its exact mechanism, into a local alert request. */
+    io.tapstate.spi.store.AlertStore.Access alertAccess(CredentialAuthentication original,io.tapstate.spi.store.StorageSetupScope setup) {
+        original.requireActive().run(); Epoch epoch=selected();
+        if(cloud.cloud()||original.storageScope().filter(epoch.bound.preparation().authScope()::equals).isEmpty())throw unauthenticated();
+        var evidence=original.evidence().orElseThrow(StorageAuthentication::unauthenticated);
+        var identity=original.token();io.tapstate.core.alerting.AlertTestAuthority actor;
+        if(evidence.type()==CredentialType.MACHINE_TOKEN)actor=new io.tapstate.core.alerting.AlertTestAuthority(
+                io.tapstate.core.alerting.AlertTestAuthority.Mechanism.MACHINE_TOKEN,setup.installationId(),identity.subject(),identity.scope().name(),
+                evidence.configurationTokenBinding().orElseThrow(StorageAuthentication::unauthenticated),null);
+        else if(evidence.type()==CredentialType.HUMAN_JWT){var claims=evidence.humanToken().orElseThrow(StorageAuthentication::unauthenticated);
+            actor=new io.tapstate.core.alerting.AlertTestAuthority(io.tapstate.core.alerting.AlertTestAuthority.Mechanism.HUMAN_JWT,
+                    setup.installationId(),identity.subject(),identity.scope().name(),claims.verifierBinding(),claims.expiresAt());}
+        else throw unauthenticated();
+        return new io.tapstate.spi.store.AlertStore.Access(actor,original.requireActive(),()->{epoch.requireLocallyActive();evidence.requireLocallyActive().run();},
+                ()->((HmacTokenSigner)epoch.signer).verifierBinding());
+    }
+
+    /** Reopens only a persisted original test authority; CONFIG still checks its token/user and original permission. */
+    io.tapstate.spi.store.AlertStore.Access continueAlertTest(io.tapstate.core.alerting.AlertTestAuthority original) {
+        Epoch epoch=selected();if(cloud.cloud())throw unauthenticated();
+        return new io.tapstate.spi.store.AlertStore.Access(original,epoch::requireActive,epoch::requireLocallyActive,
+                ()->((HmacTokenSigner)epoch.signer).verifierBinding());
     }
 
     private Optional<AuthenticatedCloudSession> authenticateCloud(Epoch original, String presented, MongoReadBudget budget) {
@@ -179,11 +212,12 @@ final class StorageAuthentication implements AutoCloseable {
         }
         Optional<CredentialAuthentication> authenticate(String credential) {
             requireActive();
-            var verified = managed.authenticate(credential);
+            var verified = managed.authenticateWithContext(credential);
             if (verified.isEmpty()) return Optional.empty();
-            var organization = managed.clusterContext(credential).map(CloudSessionContext::organizationId);
+            var session = verified.orElseThrow();
+            var organization = Optional.ofNullable(session.clusterContext().organizationId());
             if (organization.isEmpty()) return Optional.empty();
-            var identity = verified.orElseThrow(); requireActive();
+            var identity = session.identity(); requireActive();
             return Optional.of(new CredentialAuthentication(identity, Optional.empty(), organization, () -> {
                 requireActive();
                 if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();
@@ -195,6 +229,11 @@ final class StorageAuthentication implements AutoCloseable {
     private Epoch selected() {
         if (closed) throw StorageRuntime.unavailable();
         Epoch selected = current.get(); if (selected == null) throw StorageRuntime.unavailable(); return selected;
+    }
+
+    private record AuthenticatedIdentity(VerifiedToken identity, CredentialType type, Optional<String> configurationBinding,
+            Optional<io.tapstate.control.core.HumanTokenEvidence> humanToken) {
+        AuthenticatedIdentity(VerifiedToken identity, CredentialType type, Optional<String> binding) { this(identity,type,binding,Optional.empty()); }
     }
 
     private final class Epoch {
@@ -229,11 +268,16 @@ final class StorageAuthentication implements AutoCloseable {
                             managed.identity(), secrets, clock, observer), observer, egressAddresses);
         }
         Optional<VerifiedToken> authenticate(String presented, MongoReadBudget budget) {
+            return authenticateTagged(presented, budget).map(AuthenticatedIdentity::identity);
+        }
+        Optional<AuthenticatedIdentity> authenticateTagged(String presented, MongoReadBudget budget) {
             requireActive(budget);
-            Optional<VerifiedToken> result = cloud.cloud() ? managed(budget).authenticate(presented)
+            Optional<AuthenticatedIdentity> result = cloud.cloud() ? managed(budget).authenticate(presented)
+                    .map(identity -> new AuthenticatedIdentity(identity, CredentialType.CLOUD_SESSION, Optional.empty()))
                     : TokenService.isMachineToken(presented)
-                            ? new TokenService(configuration.tokens(budget), secrets, clock).authenticate(presented)
-                            : signer.verify(presented);
+                            ? new TokenService(configuration.tokens(budget), secrets, clock).authenticateBound(presented)
+                                    .map(value -> new AuthenticatedIdentity(value.identity(), CredentialType.MACHINE_TOKEN, Optional.of(value.configurationBinding())))
+                            : signer.verifyDetailed(presented).map(value -> new AuthenticatedIdentity(value.identity(), CredentialType.HUMAN_JWT, Optional.empty(), Optional.of(value.continuation())));
             requireActive(budget); return result;
         }
         void requireActive() { requireActive(new MongoReadBudget(AUTHORIZATION_READ_BUDGET)); }

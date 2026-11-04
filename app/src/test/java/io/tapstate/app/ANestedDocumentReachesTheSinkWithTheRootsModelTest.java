@@ -216,13 +216,13 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         return new StoreBackedDagSource.SinkWriterBinder() {
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
+            public SupplierEx<SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     WriteMode writeMode, DdlPolicy ddl, TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId, Map<String, Object> settings,
+            public SupplierEx<SinkWriter> bind(String connectorId, Map<String, Object> settings,
                     WriteMode writeMode, DdlPolicy ddl, Map<String, TargetTable> targets, PipelineNode node) {
                 bound.set(targets);
                 return (SupplierEx<SinkWriter>) () -> null;

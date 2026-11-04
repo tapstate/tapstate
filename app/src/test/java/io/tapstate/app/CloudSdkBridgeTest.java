@@ -20,6 +20,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class CloudSdkBridgeTest {
+    @Test void alertAuthorityUsesOnlyTheMachineAuthenticatedActualOrganization() {
+        assertThat(bridge.alertScope()).contains(new io.tapstate.core.alerting.AlarmKey.Scope("org-one","cluster-one"));
+        sdk.address=new ClusterEgressAddress(CloudSdkBridge.DEPLOYMENT_ORGANIZATION,"cluster-one",null,"PROVISIONING");
+        assertThat(bridge.alertScope()).isEmpty();
+        sdk.address=new ClusterEgressAddress("org-one","another-cluster",null,"PROVISIONING");
+        assertThat(bridge.alertScope()).isEmpty();
+        sdk.failure=true;assertThat(bridge.alertScope()).isEmpty();
+    }
 
     @Test
     void exchangeResultCarriesTypedOptionalEgressMetadataAndAllowsOlderCloudResponses() {

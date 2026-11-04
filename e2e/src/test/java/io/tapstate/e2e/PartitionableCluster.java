@@ -140,7 +140,7 @@ final class PartitionableCluster implements AutoCloseable {
         Map<String, int[]> outbound = outboundRanges(nodeIds);
         Map<String, CuttableLink> links = new LinkedHashMap<>();
         Map<String, RealProcessServer> servers = new LinkedHashMap<>();
-        Map<String, RealProcessServer.PreparedLaunch> prepared = new LinkedHashMap<>();
+        Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
         // Kept per member, because what a member is told is fixed on its command line: a member that
         // comes back has to come back as the same member, on the same port, behind the same link.
         Map<String, IntFunction<List<String>>> launchArguments = new LinkedHashMap<>();
@@ -166,10 +166,10 @@ final class PartitionableCluster implements AutoCloseable {
                 });
             }
             for (String nodeId : nodeIds) {
-                prepared.put(nodeId, preparedInstallation
+                preparedLaunches.put(nodeId, preparedInstallation
                         ? RealProcessServer.preparePrepared(storeUri, "0.0.0.0", null, launchArguments.get(nodeId))
                         : RealProcessServer.prepare(storeUri, "0.0.0.0", launchArguments.get(nodeId)));
-                RealProcessServer server = prepared.get(nodeId).launch();
+                RealProcessServer server = preparedLaunches.get(nodeId).launch();
                 servers.put(nodeId, server);
                 server.awaitHealthy();
             }
@@ -177,8 +177,8 @@ final class PartitionableCluster implements AutoCloseable {
         } catch (RuntimeException | Error failure) {
             startingFailure = failure;
             Map<String, Path> launchedLogs = new LinkedHashMap<>();
-            prepared.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
-            try { closeOwned(servers, prepared, links, clusterId, launchedLogs); }
+            preparedLaunches.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
+            try { closeOwned(servers, preparedLaunches, links, clusterId, launchedLogs); }
             catch (RuntimeException | Error cleanup) {
                 if (cleanup != failure) failure.addSuppressed(cleanup);
             }
@@ -194,8 +194,8 @@ final class PartitionableCluster implements AutoCloseable {
                 portFailures.stream().filter(cleanup -> cleanup != primary).forEach(primary::addSuppressed);
                 if (startingFailure == null) {
                     Map<String, Path> launchedLogs = new LinkedHashMap<>();
-                    prepared.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
-                    try { closeOwned(servers, prepared, links, clusterId, launchedLogs); }
+                    preparedLaunches.forEach((nodeId, launch) -> launchedLogs.put(nodeId, launch.output()));
+                    try { closeOwned(servers, preparedLaunches, links, clusterId, launchedLogs); }
                     catch (RuntimeException | Error cleanup) {
                         if (cleanup != primary) primary.addSuppressed(cleanup);
                     }
@@ -340,7 +340,7 @@ final class PartitionableCluster implements AutoCloseable {
 
     /** Closes each owned member before the next, preserving failure aggregation and link cleanup. */
     private static void closeOwned(Map<String, RealProcessServer> servers,
-            Map<String, RealProcessServer.PreparedLaunch> prepared, Map<String, CuttableLink> links,
+            Map<String, RealProcessServer.PreparedLaunch> preparedLaunches, Map<String, CuttableLink> links,
             String clusterId, Map<String, Path> logs) {
         List<Throwable> failures = new ArrayList<>();
         for (RealProcessServer server : servers.values()) {
@@ -355,7 +355,7 @@ final class PartitionableCluster implements AutoCloseable {
                 failures.add(failure);
             }
         }
-        for (RealProcessServer.PreparedLaunch launch : prepared.values()) {
+        for (RealProcessServer.PreparedLaunch launch : preparedLaunches.values()) {
             try {
                 launch.close();
             } catch (RuntimeException | Error failure) {

@@ -74,7 +74,7 @@ final class MongoCacheBusinessPreparation {
                                 .append("businessRetirementId", new Document("$exists", false));
                         if (SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, filter, new Document("$set", new Document("businessPhase", "READY")
                                 .append("businessPreparationId", original.operationId()).append("claimAdmissionFence", 0L))).getMatchedCount() != 1) throw refused();
-                        SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION)
+                        SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", 1)
                                 .append("epoch", 1L).append("operationId", original.operationId()).append("phase", "READY"));
                         active.run();
                         return null;

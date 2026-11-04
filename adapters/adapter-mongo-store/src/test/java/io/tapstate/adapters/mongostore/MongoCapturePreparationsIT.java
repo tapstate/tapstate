@@ -30,16 +30,37 @@ import static org.assertj.core.api.Assertions.*;
 class MongoCapturePreparationsIT {
     @Container private static final MongoDBContainer CONFIG=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     @Container private static final MongoDBContainer CACHE=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
-    static {
-        var owner=System.getProperty("tapstate.e2e.resource-owner");
-        if(owner!=null && !owner.isBlank())for(var fixture:List.of(CONFIG,CACHE))fixture.withLabel("io.tapstate.issue-loop.owner",owner)
-                .withTmpFs(Map.of("/data/db","rw,size=512m","/data/configdb","rw,size=16m"))
-                .withCreateContainerCmdModifier(c -> c.getHostConfig().withMemory(1024L<<20).withNanoCPUs(1_000_000_000L));
-    }
     private static final Runnable ACTIVE=() -> {};
     private static final WorkloadOwner OWNER=new WorkloadOwner("node-a","boot-a");
     private static final Duration TTL=Duration.ofMinutes(2);
     private static final Instant AT=Instant.parse("2026-10-19T16:00:00Z");
+    @ParameterizedTest @ValueSource(strings={"claim","header"})
+    void validationCaptureControlRejectsOversizedProjectedFactsBeforeDecode(String changed){
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f->{
+            var first=f.preparations().createFirst(f.issue(f.request));
+            if(changed.equals("claim"))SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).updateOne(new Document("_id",MongoWorkloadClaimStore.id(first.claim().key())),new Document("$set",new Document("capturePreparation.padding","x".repeat(128*1024))));
+            else SystemCollections.SRS_CHAINS.on(f.cache).updateOne(new Document("_id",first.preparation().chainId()),new Document("$set",new Document("captureFence.padding","x".repeat(128*1024))));
+            var before=f.snapshot();
+            assertThatThrownBy(()->f.preparations().control(first.preparation(),"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+    @Test void validationControlProjectsIdentityWithoutCheckpointOrModelMaterialization(){
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f->{
+            var first=f.preparations().createFirst(f.issue(f.request));var original=first.preparation();
+            var root=SystemCollections.SRS_CHAINS.on(f.cache);
+            root.updateOne(new Document("_id",original.chainId()),new Document("$set",new Document("epoch",1L)
+                    .append("servingTables",List.of("orders")).append("checkpoint",new Document("unreadable-payload","x".repeat(2*1024*1024)))));
+            var before=f.snapshot();var control=f.preparations().control(original,"orders");
+            assertThat(control.preparation()).isEqualTo(original);assertThat(control.claim()).isEqualTo(first.claim());
+            assertThat(control.epoch()).isOne();assertThat(control.servesTable()).isTrue();
+            assertThat(f.preparations().control(original,"missing").servesTable()).isFalse();
+            assertThatThrownBy(()->f.preparations().load(original)).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+            root.updateOne(new Document("_id",original.chainId()),new Document("$set",new Document("recoveryControl",new Document("phase","CANCELLED"))));
+            assertThatThrownBy(()->f.preparations().control(original,"orders")).isInstanceOf(TapstateException.class);
+        });
+    }
 
     @Test void aReservedPhysicalReplacementBlocksOrdinaryLookupAndReadyPreservesCanonicalNotesWithoutRecreatingCache() {
         withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
@@ -63,10 +84,6 @@ class MongoCapturePreparationsIT {
             var ready=MongoCapturePreparationFacts.configurationRow(new MongoCapturePreparationFacts.Recovery(birth,replacement,
                     reserved.planHash(),MongoCapturePreparationFacts.RecoveryPhase.READY));
             assertThat(f.controls().replaceOne(pending,ready).getMatchedCount()).isEqualTo(1);
-            assertCode(() -> f.configuration.capturePreparations().read(f.scope,birth.captureId()),IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING);
-            // A synthetic READY fixture must seed both facts, like the real publication transaction.
-            SystemCollections.CAPTURE_EXTERNAL_RETIREMENTS.on(f.config).updateOne(new Document("_id",MongoCaptureExternalRetirements.id(birth)),
-                    new Document("$set",new Document("currentPreparation",MongoCapturePreparationFacts.row(replacement))).append("$inc",new Document("revision",1L)));
             try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster-a")) {
                 var preparations=reopened.capturePreparations();
                 assertThat(preparations.read(f.scope,birth.captureId())).contains(replacement);

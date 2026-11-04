@@ -27,6 +27,7 @@ public final class ConnectionTestService {
     /** Optional runtime-local observation; it never adds fields to the persisted test report. */
     public interface Observer {
         Attempt begin(ConnectionConfig connection);
+        default boolean manages(ConnectionConfig connection) { return false; }
     }
     public interface Attempt extends AutoCloseable {
         Attempt NONE = new Attempt() {
@@ -34,6 +35,8 @@ public final class ConnectionTestService {
             @Override public void close() {}
         };
         void completed(ConnectionTestResult result);
+        default java.util.OptionalLong deadlineNanos() { return java.util.OptionalLong.empty(); }
+        default void publish(ConnectionTestResult result, ConnectionTestResultStore store) { store.save(result); completed(result); }
         @Override void close();
     }
 
@@ -43,6 +46,8 @@ public final class ConnectionTestService {
     private final ConnectorConfigValidator configValidator;
     private final SourceConnectionResolver sourceConnections;
     private final Observer observer;
+    private record Flight(ConnectionConfig connection, java.util.concurrent.CompletableFuture<ConnectionTestReport> report) {}
+    private Flight defaultFlight;
 
     public ConnectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
@@ -74,6 +79,31 @@ public final class ConnectionTestService {
         SourceConnectionResolver.ResolvedConnection resolved =
                 sourceConnections.resolveWithSecrets(connectionId, connectorId, settings);
         ConnectionConfig config = resolved.config();
+        if (!observer.manages(config)) return execute(resolved, principal);
+        Flight captured;
+        boolean owner;
+        synchronized (this) {
+            owner = defaultFlight == null;
+            if (owner) defaultFlight = new Flight(config, new java.util.concurrent.CompletableFuture<>());
+            captured = defaultFlight;
+            if (!captured.connection().equals(config)) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
+        }
+        if (!owner) {
+            try { return captured.report().join(); }
+            catch (java.util.concurrent.CompletionException failed) {
+                if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
+                if (failed.getCause() instanceof Error error) throw error;
+                throw failed;
+            }
+        }
+        try {
+            var report = execute(resolved, principal); captured.report().complete(report); return report;
+        } catch (RuntimeException | Error failure) { captured.report().completeExceptionally(failure); throw failure; }
+        finally { synchronized (this) { if (defaultFlight == captured) defaultFlight = null; } }
+    }
+
+    private ConnectionTestReport execute(SourceConnectionResolver.ResolvedConnection resolved, String principal) {
+        ConnectionConfig config = resolved.config();
         List<String> secretValues = resolved.secretValues();
         try (var attempt = observer.begin(config)) {
             if (configValidator != null) {
@@ -83,10 +113,10 @@ public final class ConnectionTestService {
                     ControlOperations.CONNECTION_TEST,
                     new AuditContext(principal, config.id()),
                     () -> {
-                        ConnectionTestResult result = probe.probe(config);
+                        var deadline = attempt.deadlineNanos();
+                        ConnectionTestResult result = deadline.isPresent() ? probe.probeDefault(config, deadline.getAsLong()) : probe.probe(config);
                         ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(result, secretValues);
-                        resultStore.save(safeResult);
-                        attempt.completed(safeResult);
+                        attempt.publish(safeResult, resultStore);
                         return ConnectionTestReport.from(safeResult);
                     });
         } catch (TapstateException failure) {

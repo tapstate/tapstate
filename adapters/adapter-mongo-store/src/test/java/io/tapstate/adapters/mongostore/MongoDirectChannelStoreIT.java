@@ -29,6 +29,20 @@ class MongoDirectChannelStoreIT {
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster",1,"incarnation","pipeline",1);
     private static final DirectChannelContext CONTEXT = new DirectChannelContext(SCOPE,"channel","source","capture");
     private static final Duration TTL = Duration.ofSeconds(60);
+    @Test void validationControlDoesNotLoadCursorWriterOrPendingBatchBodies(){
+        withBusiness(f->{
+            assertThat(f.store().control(CONTEXT,"orders")).isEmpty();open(f);
+            var offsets=SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.database());var filter=new Document("_id",MongoDirectChannelRecords.id(CONTEXT));
+            offsets.updateOne(filter,new Document("$set",new Document("cursor",new Document("unreadable","x".repeat(2*1024*1024)))));
+            var broken=new Document("_id",MongoDirectChannelRecords.batchId(CONTEXT,1,1)).append("unreadable","x".repeat(512*1024));
+            SystemCollections.DIRECT_BATCHES.on(f.database()).insertOne(broken);var before=offsets.find(filter).first();
+            var control=f.store().control(CONTEXT,"orders").orElseThrow();assertThat(control.epoch()).isOne();
+            assertThat(control.capture()).isEqualTo(f.captureFence());assertThat(control.pipeline()).isEqualTo(f.pipelineFence());assertThat(control.selectedTable()).isTrue();
+            assertThatThrownBy(()->f.store().load(CONTEXT)).isInstanceOf(TapstateException.class);assertThat(offsets.find(filter).first()).isEqualTo(before);
+            offsets.updateOne(filter,new Document("$set",new Document("current.captureFence.resourceId","wrong")));
+            assertThatThrownBy(()->f.store().control(CONTEXT,"orders")).isInstanceOf(TapstateException.class);
+        });
+    }
 
     @Test void reopenPreservesPendingHighAndQuietTablesDoNotHoldACompletedBatch() {
         withBusiness(f -> {
@@ -259,7 +273,7 @@ class MongoDirectChannelStoreIT {
                 SystemCollections.CACHE_IDENTITY.on(database).insertOne(new Document("_id","cluster").append("clusterId",BUSINESS.clusterId())
                         .append("layoutId",MongoConfigurationDomain.LAYOUT).append("bindingVersion",1L).append("cacheIncarnation",BUSINESS.cacheIncarnation())
                         .append("businessPhase","READY").append("businessPreparationId","business").append("authGeneration",1L).append("claimAdmissionFence",0L));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id","business").append("installedVersion",MongoCacheBusinessIdentity.SCHEMA_VERSION)
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id","business").append("installedVersion",1)
                         .append("phase","READY").append("epoch",1L).append("operationId","business"));
                 var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database));
                 var capture = claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,"capture"),new WorkloadOwner("capture-node","boot"),1,TTL).claim();

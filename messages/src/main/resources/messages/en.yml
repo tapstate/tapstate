@@ -8,6 +8,63 @@
 #
 # Values are double-quoted single-line scalars; colons, apostrophes and backticks inside the quotes
 # are fine. Keep literal double-quotes out of values (use backticks for inline code).
+validation.schedule-field-count:
+  message: "A validation cron schedule needs five fields; this expression has {count}."
+  solution: "Use minute, hour, day of month, month and day of week. Seconds and years are not supported."
+validation.schedule-invalid:
+  message: "Validation schedule field {field} has an invalid value `{value}` at position {position}."
+  solution: "Check the field range and supported UNIX syntax, or choose an explicit IANA time zone. Technical details retain the parser cause."
+validation.schedule-no-date:
+  message: "The validation schedule has no possible calendar date."
+  solution: "Check the selected months and days. Leap days are supported."
+validation.schedule-search-exhausted:
+  message: "Validation schedule calculation reached its {limit} limit."
+  solution: "This is a calculation limit, not proof of an invalid expression. Retry within the available calculation budget before enabling the schedule."
+validation.execution-cancelled:
+  message: "Validation execution at node {node} was cancelled before completion."
+  solution: "A cancelled expansion is incomplete. Read the original run state before starting new work."
+validation.source-field-conflict:
+  message: "Source field {field} conflicts with a generated output field at node {node}."
+  solution: "Inspect the source shape and declared expansion; do not overwrite the original field or treat the conflict as an empty result."
+validation.rule-unsupported:
+  message: "Validation cannot interpret {rule} for field {field} at node {node}."
+  solution: "Use a supported validation rule; validation cannot execute production expressions as its reference."
+validation.codec-failed:
+  message: "Connector {connector} failed to convert validation field {field}."
+  solution: "Inspect the codec failure; another codec cannot silently replace its result."
+validation.codec-value-unavailable:
+  message: "Connector {connector} did not provide a usable validation value for field {field}."
+  solution: "Check the codec and logical type support. A missing result or raw driver value cannot establish equality."
+validation.read-cancelled:
+  message: "The independent validation read of {table} was cancelled."
+  solution: "A cancelled read is incomplete; start a new validation when authorized."
+validation.read-failed:
+  message: "The independent validation read of {table} failed."
+  solution: "Inspect the reader error and connection before starting another validation."
+validation.read-protocol-violation:
+  message: "The validation reader for {table} violated its result-delivery contract."
+  solution: "Check the connector's query implementation; incomplete data cannot be treated as EOF."
+validation.owner-not-authorized:
+  message: "The validation owner for Pipeline {pipeline} is no longer authorized."
+  solution: "The old validation run must end. Start a new run after the owner has been safely retired."
+validation.value-limit-exceeded:
+  message: "Validation read facts exceed their {limit} budget."
+  solution: "Inspect the affected value or root size; validation cannot truncate facts to continue."
+validation.value-type-unsupported:
+  message: "Validation cannot safely carry a value of type {type}."
+  solution: "Use a connector codec that preserves this value in a supported portable form."
+validation.illegal-transition:
+  message: "Validation cannot move from {from} to {to} in {mode} mode."
+  solution: "Read the original run state before retrying the operation."
+validation.incompatible-key:
+  message: "Validation key component {component} has an incompatible logical domain or shape."
+  solution: "Confirm compatible source and destination key mappings and native ordering."
+validation.invalid-contract:
+  message: "Validation field {field} is missing or invalid."
+  solution: "Correct the validation configuration or inspect the failed reader contract."
+validation.key-limit-exceeded:
+  message: "A validation key exceeds its {limit} limit."
+  solution: "Use a supported bounded key; the validation cannot truncate identity values."
 core.row-map-key-unsupported:
   message: "Row object at `{path}` contains an unsupported map key of type `{keyType}`."
   solution: "Use non-null string map keys at every nesting level. The row was refused without coercing its keys."
@@ -228,6 +285,9 @@ capture.srs-not-recoverable:
 io.srs-progress-unproven:
   message: "Pipeline `{pipeline}` has legacy progress that cannot prove each source node's confirmed SRS cursor."
   solution: "Keep the retained state for diagnosis and perform a full reload, or explicitly accept a new incremental baseline with the missing interval."
+capture.observer-failed:
+  message: "Capture `{captureId}` could not apply optional observer opening `{openingId}` during {phase}."
+  solution: "Inspect the observer failure and retry its operation after correcting the cause. The observer diagnostic does not change the normal source operation outcome."
 capture.claim-lost:
   message: "Capture `{captureId}` lost its cluster ownership claim."
   solution: "Let the current owner continue from the durable position; do not restart the fenced process."
@@ -619,6 +679,9 @@ io.schema-write-contention:
 io.sink-writer-progress-ambiguous:
   message: "Pipeline '{pipeline}' has retained sink progress from before progress was recorded per writer, but it now has multiple sink writers."
   solution: "Stop the pipeline to clear its retained state. Then run a full resync, or explicitly choose and accept a new incremental starting point knowing earlier changes will not be replayed. The old aggregate may belong only to the fastest sink, so it cannot be used as evidence for every target."
+io.sink-model-capacity:
+  message: "Prepared target '{target}' for pipeline '{pipeline}' requires {bytes} bytes, exceeding its {limit} byte budget."
+  solution: "Reduce the prepared target metadata. Required original models are not discarded to fit the budget."
 io.document-too-large:
   message: "The record for '{id}' no longer fits in one stored document."
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."
@@ -694,6 +757,9 @@ connector.release-failed:
 connector.discover-failed:
   message: "Connector '{connector}' could not discover its schema: {detail}."
   solution: "The connector failed while discovering the source model; check the source is reachable and the connection settings are correct."
+connector.test-timeout:
+  message: "Testing '{connector}' exceeded {timeout}; inspect its current result before an explicit retry."
+  solution: "Check the target and retry explicitly when the original test resources have ended."
 connector.test-failed:
   message: "Connector '{connector}' could not complete its connection test: {detail}."
   solution: "The connector failed while testing; check the connection settings and that the target is reachable."
@@ -1143,6 +1209,33 @@ actuation.unwind-parent-key-unresolved:
   message: "Cannot bind the parent key for step `{step}` and stream `{stream}`: {reason}."
   solution: "Discover a source primary key and keep its column names consistent across merged branches feeding unwind."
 
+alert.invalid-configuration:
+  message: "Alert field `{field}` is invalid: {reason}."
+  solution: "Use the supported field type, bounds and trusted identity binding."
+alert.stale-action:
+  message: "The alert action `{action}` does not match the current episode or evaluation generation."
+  solution: "Read the current alert and act on its exact identity."
+
+alert.channel-not-accepted:
+  message: "The notification channel `{channel}` did not accept the request at stage `{phase}`."
+  solution: "Review the bounded protocol status and the original delivery binding before retrying."
+alert.channel-result-unknown:
+  message: "The notification channel `{channel}` has an unknown result at stage `{phase}`."
+  solution: "The receiver may have accepted it. Preserve the delivery identity and inspect the existing result."
+alert.channel-unavailable:
+  message: "The notification channel `{channel}` is unavailable at stage `{phase}`."
+  solution: "Restore the required capability or bounded capacity without changing the original delivery identity."
+
+alert.command-conflict:
+  message: "The notification test command was already accepted with different parameters."
+  solution: "Query the original command. Use a new command only for another explicit test."
+alert.command-expired:
+  message: "The notification test command's first-admission window has expired."
+  solution: "Query the original result if it exists. Create a new command only for another explicit test."
+alert.command-not-yet-valid:
+  message: "The notification test command was created too far in the future."
+  solution: "Correct the client clock before explicitly starting a new test."
+
 io.note-origin-mismatch:
   message: "The connector context does not match the retained notes. Retire the original resources before using a new connection or artifact."
   solution: "Continue the original retirement operation with the saved connection and exact registered artifact."
@@ -1230,18 +1323,6 @@ io.capture-state-rebuild-required:
   message: "Capture {capture} has missing or unproven canonical claim history."
   solution: "Keep the original state and explicitly confirm Cluster cache recovery, including affected pipelines and sessions. Do not recreate the claim or reset its generations."
 
-io.capture-external-retirement-pending:
-  message: "Capture {capture} retirement {operation} is pending ({reason})."
-  solution: "Preserve the original notes and operation. Retry its reconciliation after the original physical openings or external call have positively ended; a new lease does not prove retirement."
-
-io.capture-external-retirement-unsupported:
-  message: "Capture {capture} retirement {operation} lacks original authority or identity ({reason})."
-  solution: "Restore the matching original control facts or use an explicitly authorized current-scope operation. Do not clear notes or treat missing evidence as permission to delete."
-
-io.capture-retirement-capacity:
-  message: "Capture {capture} retirement {operation} reached its control budget ({reason})."
-  solution: "Resolve the original pending openings or exact retired-prefix cleanup. Required uncertainty and retained dependencies cannot be evicted to make room."
-
 capture.still-ending:
   message: "Capture `{captureId}` has not finished stopping."
   solution: "Retry the original stop after the source call exits; retain its original resource identity."
@@ -1264,6 +1345,7 @@ connector.tls-trust-invalid:
 connector.tls-material-cleanup-failed:
   message: "Connector '{connector}' could not remove its temporary TLS material."
   solution: "Inspect the owning process file permissions before retrying cleanup."
+
 control.ai-not-configured:
   message: "Configure an AI provider in the Pipeline Builder before requesting a proposal."
 control.ai-provider-failed:
@@ -1323,6 +1405,12 @@ io.srs-position-model-unproven:
   message: "The requested source position for chain {chain} cannot prove compatibility with its model history."
   solution: "Arbitrary position editing is unavailable after model handoff or replacement-cache history. Stop, clear the task state and explicitly rerun a full load instead."
 
+io.source-identity-unavailable:
+  message: "Source '{id}' does not have a usable lifecycle binding."
+  solution: "Complete the supported Source identity preparation or restore its original configuration before retrying."
+io.source-identity-exhausted:
+  message: "The lifecycle revision of Source '{id}' cannot advance."
+  solution: "Replace the Source through its supported lifecycle after preserving required state. Do not reset its identity or counters in place."
 store.ai-provider-schema-unsupported:
   message: "AI provider settings require configuration schema {required}."
   solution: "Keep using the existing non-AI configuration, or explicitly initialize a supported configuration database. No automatic upgrade is performed."

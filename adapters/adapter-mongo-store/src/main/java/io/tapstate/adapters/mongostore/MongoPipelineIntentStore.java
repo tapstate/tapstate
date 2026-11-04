@@ -190,7 +190,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             if (desired != null) replacement.append("targetState", desired.targetState().name()).append("revision", desired.revision())
                     .append("purgeState", desired.purgeState()).append("assemblyRevision", desired.assemblyRevision())
                     .append("reassemble", desired.reassemble()).append("rebuiltAtStateEpoch", desired.rebuiltAtStateEpoch());
-            ConfigurationVersion.advance(session, versions);
+            ConfigurationVersion.advance(session, versions, client);
             if (mappings.updateOne(session, new Document("_id", scope.pipelineId()).append("stateGeneration", scope.stateGeneration())
                             .append("phase", PipelineStateMapping.Phase.ACTIVE.name()).append("noteWriteFence", generation.getLong("noteWriteFence")),
                     new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1) {

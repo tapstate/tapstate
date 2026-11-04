@@ -361,7 +361,7 @@ class MongoCacheSchemaStoreIT {
                 }, TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build()); }
                 SystemCollections.CACHE_IDENTITY.on(database).updateOne(new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                         .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
-                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION).append("phase", "READY")
+                SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(new Document("_id", "business").append("installedVersion", 1).append("phase", "READY")
                         .append("epoch", 1L).append("operationId", "business-a"));
                 scenario.run(new Fixture(client, database, domain));
             } finally { database.drop(); }

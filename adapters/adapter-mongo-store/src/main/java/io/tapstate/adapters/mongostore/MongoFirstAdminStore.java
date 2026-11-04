@@ -70,7 +70,7 @@ final class MongoFirstAdminStore implements FirstAdminStore {
         return StoreIo.call(() -> transaction(session -> {
             Status pending = load(session).orElseThrow(MongoFirstAdminStore::refused);
             if (pending.phase() != Phase.PENDING || !expected.equals(pending.scope())) throw refused();
-            ConfigurationVersion.advance(session, versions);
+            ConfigurationVersion.advance(session, versions, client);
             users.insertOne(session, MongoUserStore.toDocument(administrator));
             Document filter = new Document("_id", "cluster").append("phase", Phase.PENDING.name())
                     .append("clusterId", expected.clusterId()).append("installationId", expected.installationId())
@@ -106,7 +106,7 @@ final class MongoFirstAdminStore implements FirstAdminStore {
                 Status state = load(session).orElseThrow(MongoFirstAdminStore::refused);
                 // Only the dedicated insert command can create the first account, even for legacy callers.
                 if (state.phase() != Phase.COMPLETE) throw refused();
-                ConfigurationVersion.advance(session, versions);
+                ConfigurationVersion.advance(session, versions, client);
                 users.replaceOne(session, new Document("_id", user.username()), MongoUserStore.toDocument(user),
                         new ReplaceOptions().upsert(true));
                 return null;
@@ -167,7 +167,7 @@ final class MongoFirstAdminStore implements FirstAdminStore {
         if (bootstrap.find(session).limit(1).first() != null || users.find(session).limit(1).first() != null) throw unreadable();
     }
 
-    private static User decodeUser(Document row) {
+    static User decodeUser(Document row) {
         if (!row.keySet().equals(Set.of("_id", "passwordHash", "role")) || !(row.get("_id") instanceof String username)
                 || !(row.get("passwordHash") instanceof String hash) || !(row.get("role") instanceof String role)) throw unreadable();
         try { return new User(username, hash, role); }

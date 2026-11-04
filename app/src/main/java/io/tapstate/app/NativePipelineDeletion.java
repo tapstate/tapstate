@@ -32,24 +32,16 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
     private final PipelineCacheRetirements retirement;
     private final SrsConsumerStore consumers;
     private final PipelinePrivateNoteRetirement notes;
-    private final NativeCaptureExternalRetirement external;
 
     NativePipelineDeletion(MongoConfigurationDomain configuration, MongoCacheDomain cache, CacheBusinessScope business,
             PipelineActuationOwnership ownership, Supplier<WorkloadClaimFence> node, Runnable active,
             Engine engine, EngineLifecycleActuator actuator, HazelcastOperatorReadiness operators,
             HazelcastExecutionPlans plans, ConnectorProvisioner connectors) {
-        this(configuration,cache,business,ownership,node,active,engine,actuator,operators,plans,connectors,null);
-    }
-    NativePipelineDeletion(MongoConfigurationDomain configuration, MongoCacheDomain cache, CacheBusinessScope business,
-            PipelineActuationOwnership ownership, Supplier<WorkloadClaimFence> node, Runnable active,
-            Engine engine, EngineLifecycleActuator actuator, HazelcastOperatorReadiness operators,
-            HazelcastExecutionPlans plans, ConnectorProvisioner connectors,NativeCaptureExternalRetirement external) {
         this.configuration=configuration; this.cache=cache; this.business=business; this.ownership=ownership;
         this.node=node; this.active=active; this.engine=engine; this.actuator=actuator; this.operators=operators; this.plans=plans;
         lifecycle=configuration.retirements(); retirement=cache.pipelineRetirements(business,active);
         consumers=cache.srs(business,active).consumers();
         notes=new PipelinePrivateNoteRetirement(configuration.requiredNotes(),configuration.rebuilds(),connectors);
-        this.external=external;
     }
 
     @Override public Runnable prepare(PipelineResource original, String expectedHash) {
@@ -148,7 +140,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                 };
                 retired.run(); return new PipelineDeletionCoordinator.Isolated(isolated,retired,
                         () -> {active.run();control.requireHeld();active.run();});
-            },(receipt,memberships) -> {if(external!=null)external.deleted(receipt,memberships);});
+            },(fixed,current,local) -> configuration.retireValidation(fixed,cache,current,local));
             try {
                 if (pending.isPresent()) { if (coordinator.resume(scope,request.operationId(),manifest).isEmpty()) throw fenced(); }
                 else coordinator.delete(request,manifest);

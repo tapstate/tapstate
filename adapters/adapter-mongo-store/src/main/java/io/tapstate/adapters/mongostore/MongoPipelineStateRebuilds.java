@@ -63,7 +63,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                     version == 2 ? inputClosureHash(original.inputs(), original.dependencyHashes()) : null);
             long fence = mapping.getLong("noteWriteFence");
             if (fence >= Long.MAX_VALUE - 2 || ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database)) >= Long.MAX_VALUE - 2) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", state.pipelineId()).append("stateGeneration", state.stateGeneration()).append("phase", "ACTIVE")
                             .append("noteWriteFence", fence).append("cachePreparation", mapping.get("cachePreparation")),
@@ -124,7 +124,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             var result = new PipelinePreparation(target.pipelineId(), target.stateGeneration(), PipelinePreparation.Phase.COMPLETE,
                     target, pending.id, receipt.issuerNode());
             long writeFence = mapping.getLong("noteWriteFence"); if (writeFence >= Long.MAX_VALUE - 1) throw fenced();
-            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database));
+            ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             long intentRevision = intents.completeRebuild(session, pending.request.intent(), target);
             var annex = encode(pending).append("result", new Document("phase", "COMPLETE").append("checkpointEpoch", receipt.checkpointEpoch()).append("intentRevision", intentRevision));
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
@@ -312,13 +312,6 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         if (!(original instanceof Pending pending)) throw fenced();
         pending.owner.requirePending(pending);
     }
-    static void requireOriginalInTransaction(MongoClient client,MongoDatabase database,ClientSession session,
-            PipelineRebuildPreparation original) {
-        if(!(original instanceof Pending pending) || pending.owner.client!=client
-                || !pending.owner.database.getName().equals(database.getName()))throw fenced();
-        var retained=pending.owner.retained(pending.request,pending.hash,pending.owner.requireOriginal(session,pending.request));
-        if(!encode(retained).equals(encode(pending)))throw fenced();
-    }
 
     static void requireOriginalActive(PipelineRebuildPreparation original) {
         if (!(original instanceof Pending pending)) throw fenced();
@@ -419,7 +412,7 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
         return CanonicalHash.ofText(JsonWriter.write(new Document("targetInputs", MongoPipelineSourcePreparations.encode(inputs))
                 .append("dependencyHashes", new java.util.TreeMap<>(dependencies))));
     }
-    static Document claim(WorkloadClaimFence claim) {
+    private static Document claim(WorkloadClaimFence claim) {
         return new Document("clusterId", claim.key().clusterId()).append("pipelineId", claim.key().resourceId())
                 .append("nodeId", claim.owner().nodeId()).append("bootId", claim.owner().bootId())
                 .append("claimGeneration", claim.claimGeneration()).append("executionGeneration", claim.executionGeneration())

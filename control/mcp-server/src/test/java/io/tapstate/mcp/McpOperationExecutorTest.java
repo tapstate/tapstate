@@ -46,7 +46,7 @@ class McpOperationExecutorTest {
                 assertThat(paths.getLast()).isEqualTo(io.tapstate.control.client.StorageControlClient.path(id)).doesNotContain("sentinel");
                 assertThat(requests.getLast()).isEqualTo(body);
             }
-            assertThat(paths).hasSize(11);
+            assertThat(paths).hasSize(12).contains("/api/storage/setup/activate");
         } finally { server.stop(0); }
     }
 

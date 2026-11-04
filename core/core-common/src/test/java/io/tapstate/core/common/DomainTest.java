@@ -21,10 +21,10 @@ class DomainTest {
     void registryHoldsTheRegisteredDomains() {
         assertThat(Domain.ids())
                 .containsExactlyInAnyOrder(
-                        "dsl", "cli", "core", "catalog", "schema", "lifecycle", "role", "boot",
+                        "alert", "dsl", "cli", "core", "catalog", "schema", "lifecycle", "role", "boot",
                         "actuation", "store", "migration", "connector", "transform", "io", "control",
                         "engine", "monitor", "data-browser", "artifact", "source", "mcp",
-                        "capture", "nest", "pipeline", "pipeline-draft", "position", "cluster", "start-check");
+                        "capture", "nest", "pipeline", "pipeline-draft", "position", "cluster", "validation", "start-check");
     }
 
     @Test

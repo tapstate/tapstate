@@ -52,11 +52,17 @@ final class ConvergenceDriver {
     record ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable requireActive,
             Function<PipelineConvergencePass, LifecycleActuator> actuators,
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
-            Consumer<Collection<String>> retainRebuilds) {
+            Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts) {
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
+            this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none());
+        }
         ScopedPorts {
             Objects.requireNonNull(intents, "intents"); Objects.requireNonNull(stores, "stores");
             Objects.requireNonNull(requireActive, "requireActive"); Objects.requireNonNull(actuators, "actuators");
             Objects.requireNonNull(rebuilds, "rebuilds"); Objects.requireNonNull(retainRebuilds, "retainRebuilds");
+            Objects.requireNonNull(alerts, "alerts");
         }
     }
 
@@ -153,7 +159,7 @@ final class ConvergenceDriver {
                     if (permit.granted()) {
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
                         pass = new PipelineConvergencePass(snapshot.get(), WorkloadClaimFence.from(permit.claim()),
-                                scoped.stores(), scoped.requireActive());
+                                scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
                     }
                 }
                 if (!permit.granted()) {
@@ -165,6 +171,7 @@ final class ConvergenceDriver {
                     continue;
                 }
                 PipelineConvergencePass originalPass = pass;
+                if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
                 ConvergeResult result = scoped == null ? converger.converge(pipelineId)
                         : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
                                 scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
@@ -185,12 +192,15 @@ final class ConvergenceDriver {
                         : publisher.publishScoped(pass.scope(), pass.state(), pass.observations(), failure);
                 PipelineConvergencePass sampledPass = pass;
                 projection.ifPresent(published -> {
+                    if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
                     sample(published, sampledPass);
                     export(published);
                 });
                 // A clean pass ends the failure streak; the next throw starts counting from one again.
                 reconcileFailures.remove(pipelineId);
             } catch (RuntimeException e) {
+                PipelineConvergencePass failedPass = pass;
+                if (scoped != null) alert(() -> scoped.alerts().unavailable(failedPass));
                 // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
                 // permanently broken pipeline would look identical to a slow one. Count the consecutive
                 // failures and publish them as an error observation so the failure is observable, not just
@@ -230,11 +240,17 @@ final class ConvergenceDriver {
         // with whatever the deleted one had left of its budget.
         if (scoped == null) converger.retain(pipelineIds);
         else scoped.retainRebuilds().accept(pipelineIds);
+        if (scoped != null) alert(() -> scoped.alerts().retain(pipelineIds));
         publisher.forgetPipelinesOutside(pipelineIds);
         if (sampler != null) {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void alert(Runnable action) {
+        try { action.run(); }
+        catch (RuntimeException unavailable) { LOG.warn("Alert collection is degraded for this convergence pass"); }
     }
 
     /**

@@ -343,7 +343,7 @@ class MongoCacheClusterMembershipStoreIT {
             MongoCacheClusterMembershipStore.prepareInitial(session, database, SCOPE, "business-a"); afterMarker.run();
             SystemCollections.CACHE_IDENTITY.on(database).updateOne(session, new Document("_id", "cluster"), new Document("$set", new Document("businessPhase", "READY")
                     .append("businessPreparationId", "business-a").append("claimAdmissionFence", 0L)));
-            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", MongoCacheBusinessIdentity.SCHEMA_VERSION)
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).insertOne(session, new Document("_id", "business").append("installedVersion", 1)
                     .append("phase", "READY").append("epoch", 1L).append("operationId", "business-a")); return null;
         }, TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build()); }
     }

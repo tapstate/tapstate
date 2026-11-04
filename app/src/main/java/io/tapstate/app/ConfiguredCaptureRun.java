@@ -10,13 +10,8 @@ import java.util.Objects;
 
 /** Fixed necessary-note coordinates; a shared physical drive outlives its opening Pipeline. */
 record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, RequiredNoteScope primary, RequiredNoteScope global,
-        String connectorId, String artifactHash, java.util.function.Supplier<CaptureOpeningJournal.Opening> openings) {
-    ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, RequiredNoteScope primary, RequiredNoteScope global,
-            String connectorId, String artifactHash) {
-        this(original,node,primary,global,connectorId,artifactHash,() -> null);
-    }
+        String connectorId, String artifactHash) {
     ConfiguredCaptureRun {
-        Objects.requireNonNull(openings,"openings");
         Objects.requireNonNull(original,"original"); Objects.requireNonNull(node,"node"); Objects.requireNonNull(primary,"primary"); Objects.requireNonNull(global,"global");
         if (original.scope()==null || !original.pipelineId().equals(node.pipelineId())
                 || !global.owner().ownerId().equals(original.scope().clusterId())
@@ -29,10 +24,6 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                 || primary.owner().kind()==RequiredNoteOwner.Kind.GLOBAL) throw new IllegalArgumentException("invalid fixed capture notes");
     }
 
-    ConfiguredCaptureRun journaled(java.util.function.Supplier<CaptureOpeningJournal.Opening> factory) {
-        return new ConfiguredCaptureRun(original,node,primary,global,connectorId,artifactHash,factory);
-    }
-
     /** Original start preparation opens only CONFIG-reserved scopes, before any connector code. */
     static ConfiguredCaptureRun prepare(ExecutionFence original, CaptureConfig config, RequiredNoteStore notes,
             ConnectorProvisioner provisioner, Runnable requireOriginalStart) {
@@ -40,10 +31,6 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
     }
     static ConfiguredCaptureRun prepare(ExecutionFence original,CaptureConfig config,RequiredNoteStore notes,
             ConnectorProvisioner provisioner,Runnable requireOriginalStart,boolean recoveryPinned) {
-        return prepare(original,config,notes,provisioner,requireOriginalStart,recoveryPinned,null);
-    }
-    static ConfiguredCaptureRun prepare(ExecutionFence original,CaptureConfig config,RequiredNoteStore notes,
-            ConnectorProvisioner provisioner,Runnable requireOriginalStart,boolean recoveryPinned,CaptureOpeningJournal journal) {
         Objects.requireNonNull(requireOriginalStart,"requireOriginalStart"); requireOriginalStart.run();
         if (original.scope()==null || config.node()==null || !original.pipelineId().equals(config.node().pipelineId())) throw unavailable();
         var fixed=notes.guardedBy(requireOriginalStart); var scope=original.scope();
@@ -57,10 +44,7 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
         var artifact=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash()); requireOriginalStart.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),artifact.contentHash(),config.settings());
         if(pinned!=null && !pinned.equals(expected))throw unavailable();
-        String resource=journal instanceof CaptureExternalRetirements?new PdkExternalResourceRetirement(provisioner,fixed).resourceNameHash(expected,primary):null;
-        var retained=resource!=null && journal instanceof CaptureExternalRetirements gate
-                ?gate.admitOrigin(primary,expected,resource):fixed.prepareOrigin(primary,expected);
-        if (!expected.equals(retained)) throw unavailable();
+        if (!expected.equals(fixed.prepareOrigin(primary,expected))) throw unavailable();
         requireOriginalStart.run(); return new ConfiguredCaptureRun(original,config.node(),primary,global,config.connectorId(),artifact.contentHash());
     }
 
@@ -72,14 +56,31 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                         ? !primary.owner().hasPurpose(PipelineNode.Purpose.CAPTURE)
                         : primary.owner().kind()!=RequiredNoteOwner.Kind.CHAIN || !primary.owner().ownerId().equals(config.sharedNotes().sharedBy()))) throw unavailable();
         var captured=Map.of(primary.owner().namespace(),primary,global.owner().namespace(),global);
-        var scopes=ConnectorNoteScopes.journaled(notes,namespace -> {
+        var scopes=ConnectorNoteScopes.of(notes,namespace -> {
             var token=captured.get(namespace); if (token==null) throw unavailable(); return token;
-        },requireRun,openings);
+        },requireRun);
         ConnectorProvisioner exact=id -> {
             requireRun.run(); if (!connectorId.equals(id)) throw unavailable();
             var artifact=provisioner.resolve(id,artifactHash); requireRun.run(); return artifact;
         };
         return PdkCapturePort.withRequiredNotes(exact,null,scopes);
+    }
+
+    /** Current discovery cannot grant a source policy without the original configuration and artifact. */
+    SourceModelComparison modelComparison(CaptureConfig config, RequiredNoteStore notes,
+            ConnectorProvisioner provisioner, Runnable requireRun) {
+        requireRun.run();
+        if (!node.equals(config.node()) || !connectorId.equals(config.connectorId())
+                || (config.sharedNotes()==null
+                        ? !primary.owner().hasPurpose(PipelineNode.Purpose.CAPTURE)
+                        : primary.owner().kind()!=RequiredNoteOwner.Kind.CHAIN
+                                || !primary.owner().ownerId().equals(config.sharedNotes().sharedBy()))) throw unavailable();
+        var artifact = provisioner.resolve(connectorId, artifactHash);
+        if (!artifactHash.equals(artifact.contentHash())) throw unavailable();
+        var expected = ConnectorNoteOrigin.capture(connectorId, artifactHash, config.settings());
+        if (!expected.equals(notes.guardedBy(requireRun).origin(primary))) throw unavailable();
+        requireRun.run();
+        return PdkSourceModelComparison.forVerifiedArtifact(connectorId, artifact);
     }
     private static TapstateException unavailable() { return new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE,Map.of(),null); }
 }

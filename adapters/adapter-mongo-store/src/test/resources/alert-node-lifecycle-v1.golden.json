@@ -1,0 +1,45 @@
+{
+  "_id": "56f54f49c6ccbfbb4a085ec97b29784dd2845211f25a981977e47dd817da97f6",
+  "formatVersion": 1,
+  "authorityId": "installation-a",
+  "clusterId": "cluster-a",
+  "nodeId": "node-a",
+  "bootId": "boot-a",
+  "setup": {
+    "installationId": "installation-a",
+    "operationId": "setup-a",
+    "generation": {
+      "$numberLong": "1"
+    }
+  },
+  "cache": {
+    "bindingVersion": {
+      "$numberLong": "1"
+    },
+    "mode": "OP",
+    "cacheIncarnation": "cache-a",
+    "authGeneration": {
+      "$numberLong": "1"
+    }
+  },
+  "session": {
+    "claimGeneration": {
+      "$numberLong": "1"
+    },
+    "executionGeneration": {
+      "$numberLong": "0"
+    },
+    "topologyRevision": {
+      "$numberLong": "1"
+    }
+  },
+  "memberId": "e6e8d616-985e-49cc-a0f4-9802897abf95",
+  "membershipRevision": {
+    "$numberLong": "1"
+  },
+  "revision": {
+    "$numberLong": "1"
+  },
+  "registeredAt": "2026-10-29T00:00:00Z",
+  "phase": "EXPECTED"
+}

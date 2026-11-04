@@ -4,6 +4,8 @@ import io.tapstate.testsupport.JvmTestEnvironment;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.Volume;
 import com.mongodb.client.MongoClients;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.adapters.mongostore.SystemCollections;
@@ -15,7 +17,6 @@ import io.tapstate.control.restapi.RuntimeVersion;
 import io.tapstate.core.model.Metadata;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
-import io.tapstate.spi.store.ContentHash;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
@@ -40,7 +41,6 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumMap;
@@ -74,7 +74,19 @@ class CloudExternalConfigStartupIT {
 
     @Container
     private static final MongoDBContainer MONGO =
-            new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+            new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                    .withCreateContainerCmdModifier(command -> {
+                        String owner = System.getenv("TAPSTATE_ISSUE_LOOP_OWNER");
+                        if (owner != null && !owner.isBlank()) {
+                            command.getLabels().put("io.tapstate.issue-loop.owner", owner);
+                        }
+                        String dataVolume = System.getenv("TAPSTATE_TEST_MONGO_DATA_VOLUME");
+                        if (dataVolume != null && !dataVolume.isBlank()) {
+                            command.getHostConfig().withBinds(
+                                    new Bind(dataVolume, new Volume("/data/db")),
+                                    new Bind(dataVolume + "-config", new Volume("/data/configdb")));
+                        }
+                    });
 
     @TempDir static Path fixtureDirectory;
     private static final Map<Distribution, Path> JARS = new EnumMap<>(Distribution.class);
@@ -505,13 +517,26 @@ class CloudExternalConfigStartupIT {
             exchange.getResponseBody().write(response); exchange.close();
         });
 
+        String egress = "/v1/api/clusters/" + CLUSTER + "/egress-address";
+        cloud.createContext(egress, exchange -> {
+            cloudRequests.incrementAndGet();
+            cloudPaths.add(exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath());
+            assertThat(exchange.getRequestMethod()).isEqualTo("GET");
+            assertThat(exchange.getRequestHeaders().getFirst("Authorization")).isEqualTo("Bearer " + TOKEN);
+            byte[] response = JSON.writeValueAsBytes(Map.of("code", "ok", "data",
+                    Map.of("organizationId", "fixture-org", "clusterId", CLUSTER)));
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response); exchange.close();
+        });
+
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
         running.awaitUnavailable(StoreError.INITIALIZATION_REFUSED.code(), "UNAVAILABLE");
         assertThat(running.get("/auth/exchange?code=unconsumed-diagnostic-code").statusCode()).isEqualTo(503);
         assertThat(running.safeOutput()).contains("stage=prepare", "stage=resume", "creationGranted=true", "creationInvoked=true")
                 .doesNotContain("unconsumed-diagnostic-code");
         assertSafeOutput(running, uri);
-        assertThat(cloudPaths).containsExactly("POST " + claim);
+        assertThat(cloudPaths).containsExactly("POST " + claim, "GET " + egress);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = raw.getDatabase(selected);
             assertThat(database.listCollectionNames().into(new ArrayList<>())).containsExactly("diagnostic_witness");
@@ -614,7 +639,7 @@ class CloudExternalConfigStartupIT {
         Document keyring = database.getCollection(SystemCollections.CLUSTER_KEYS.collectionName())
                 .find(new Document("_id", "cluster")).first();
         assertThat(keyring).isNotNull();
-        return ContentHash.of(keyring.toJson().getBytes(StandardCharsets.UTF_8));
+        return KeyringFingerprint.of(keyring);
     }
 
     private static MongoConfigurationDomain metadataConnection(String database) {
@@ -662,7 +687,8 @@ class CloudExternalConfigStartupIT {
         // The Cloud fixture loads the bundled Db2 runtime; preserve the smaller on-prem budget.
         String heap = distribution == Distribution.CLOUD ? "-Xmx1024m" : "-Xmx384m";
         List<String> command = new ArrayList<>(List.of(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(), heap));
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(), heap,
+                "-Djava.io.tmpdir=" + System.getProperty("java.io.tmpdir")));
         if (carrier == Carrier.JVM) {
             values.forEach((key, value) -> command.add("-D" + key + "=" + value));
         }

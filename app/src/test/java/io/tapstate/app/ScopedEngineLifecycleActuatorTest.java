@@ -261,6 +261,33 @@ class ScopedEngineLifecycleActuatorTest {
         verify(captures).forRun(nextScope,claim(1),new ExecutionFence(SCOPE,claim(1)));
         verify(captures,never()).forRun(eq(SCOPE),any(),any());
     }
+    @Test void aNewerExecutionDoesNotInheritThePreviousCapturesRefusal() {
+        held.set(claim(2));
+        var next = new PipelineConvergencePass(pass.intent(), claim(2), views, () -> {});
+        var oldFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "p"), null);
+        when(fixedCapture.captureFailure("p")).thenReturn(Optional.of(oldFailure));
+        var actor = new ScopedEngineLifecycleActuator(next, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), ports(), submissions);
+
+        assertThat(actor.failure("p"))
+                .as("the current command cannot inherit a fenced predecessor's capture failure").isEmpty();
+        assertThat(actor.isCarryingAJob("p")).isFalse();
+        verify(captures).forRun(SCOPE, claim(2), new ExecutionFence(SCOPE, claim(1)));
+        verify(previous, never()).failure();
+        verify(fixedCapture, never()).captureFailure("p");
+    }
+    @Test void aCurrentDeferredCaptureStillReportsItsOwnFailure() {
+        doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("capture"))).when(fixedCapture)
+                .startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        var currentFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "p"), null);
+        when(fixedCapture.captureFailure("p")).thenReturn(Optional.of(currentFailure));
+        var actor = actuator();
+        actor.start("p");
+
+        assertThat(actor.failure("p")).containsSame(currentFailure);
+        verify(previous, never()).failure();
+        verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
     @Test void callbacksCannotAdoptANewerCommandOrControlAnyJobAfterIt() {
         var actor = actuator(); held.set(claim(2));
         assertThatThrownBy(() -> actor.stop("p",false)).isInstanceOf(TapstateException.class);
@@ -348,19 +375,6 @@ class ScopedEngineLifecycleActuatorTest {
                 .startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
         var actor = actuator(); actor.start("p"); assertThat(actor.isCarryingAJob("p")).isFalse(); assertThat(actor.failure("p")).isEmpty();
         verify(previous,never()).failure(); verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
-    }
-    @Test void aPendingExternalRetirementSubmitsNoJobAndAReadyRetryCanStart() {
-        doAnswer(call -> {
-            assertThat((WorkloadClaimFence)call.getArgument(2)).isEqualTo(held.get());
-            ((Runnable)call.getArgument(4)).run();return null;
-        }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
-        var pending=new TapstateException(IoError.CAPTURE_EXTERNAL_RETIREMENT_PENDING,
-                Map.of("capture","capture","operation","original-clear","reason","clear-successor-not-ready"),null);
-        doThrow(pending).doNothing().when(fixedCapture).startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
-        var actor=actuator();actor.start("p");
-        assertThat(actor.isCarryingAJob("p")).isFalse();assertThat(actor.failure("p")).isEmpty();
-        verify(previous,never()).failure();verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
-        actor.start("p");verify(engine).submitRun(eq("p"),any(),anyMap(),any(),any(OperatorRunManifest.class));
     }
     @Test void aSubmissionThatLosesAuthorityIsCancelledThroughOnlyItsReturnedConcreteHandle() {
         when(engine.submitRun(eq("p"),any(),anyMap(),any(),any(OperatorRunManifest.class))).thenAnswer(call -> { held.set(claim(3)); return submitted; });

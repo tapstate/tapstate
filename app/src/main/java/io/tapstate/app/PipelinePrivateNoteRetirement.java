@@ -105,7 +105,7 @@ final class PipelinePrivateNoteRetirement {
     }
     private void releaseOne(String clusterId,RequiredNoteRetirement retirement,Runnable guard,Runnable local) {
         guard.run();if(retirement.completed())return;var origin=retirement.origin();
-        if(origin.isPresent() && !retirement.unadmittedSuccessor()) {
+        if(origin.isPresent()) {
             var owner=retirement.scope().owner();
             var purpose=java.util.Arrays.stream(PipelineNode.Purpose.values()).filter(owner::hasPurpose).findFirst().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
             String prefix="pdk.state."+owner.ownerId()+"."+purpose.segment()+".";

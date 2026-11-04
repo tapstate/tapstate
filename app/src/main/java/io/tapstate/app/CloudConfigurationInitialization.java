@@ -40,9 +40,12 @@ final class CloudConfigurationInitialization implements AutoCloseable {
             active();
             MongoConfigurationDomain created;
             if (authorization.creationGranted() && !creationInvoked) {
+                stage = "alert-scope";
+                var alertScope = bridge.alertScope().orElseThrow(StorageRuntime::unavailable);
                 stage = "prepare";
                 creationInvoked = true;
-                created = MongoConfigurationBootstrap.prepare(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1);
+                created = MongoConfigurationBootstrap.prepareWithAlerts(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1,
+                        alertScope, io.tapstate.core.alerting.AlertChannelPolicy.Deployment.CLOUD_MANAGED);
             } else {
                 stage = "resume";
                 created = MongoConfigurationBootstrap.resume(connection, cloud.clusterId(), installationId(), authorization.operationId(), 1);
