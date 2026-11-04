@@ -249,6 +249,8 @@ class StorageAuthenticationLatencyIT {
     private static void withCloud(Change change, Consumer<Fixture> scenario) {
         String cluster = "cloud-auth-" + UUID.randomUUID();
         try (var mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withLabels(System.getenv("TAPSTATE_TEST_RESOURCE_OWNER") == null ? Map.of()
+                        : Map.of("io.tapstate.issue-loop.owner", System.getenv("TAPSTATE_TEST_RESOURCE_OWNER")))
                 .withCommand("--replSet", "docker-rs", "--bind_ip_all", "--setParameter", "enableTestCommands=1")) {
             mongo.start();
             String cacheDatabase = "authentication_cache";

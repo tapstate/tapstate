@@ -124,7 +124,7 @@ class CloudHttpConfigReadBudgetIT {
                                     path, repeat, millis, sample.elapsedMs(), after - before, sample.observed().bytes(), sample.observed().commands());
                             int budget = path.equals("/api/storage/status") ? 185 : path.equals("/api/auth/me") ? 75 : 110;
                             assertThat(sample.observed().started()).as(path + " driver command budget").isLessThanOrEqualTo(budget);
-                            assertThat(sample.observed().commands().getOrDefault("aggregate", 0)).isPositive();
+                            assertThat(sample.observed().commands().getOrDefault("find", 0)).isPositive();
                             samples.add(new Sample(path, millis, sample.elapsedMs(), sample.observed()));
                         }
                     }
@@ -172,7 +172,8 @@ class CloudHttpConfigReadBudgetIT {
     }
     private static MongoDBContainer mongo() {
         return new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
-                .withLabel("io.tapstate.issue-loop.owner", System.getenv().getOrDefault("TAPSTATE_TEST_RESOURCE_OWNER", "1544b244689d41719d87288f458d22f4"))
+                .withLabels(System.getenv("TAPSTATE_TEST_RESOURCE_OWNER") == null ? Map.of()
+                        : Map.of("io.tapstate.issue-loop.owner", System.getenv("TAPSTATE_TEST_RESOURCE_OWNER")))
                 .withTmpFs(Map.of("/data/db", "rw", "/data/configdb", "rw"))
                 .withCreateContainerCmdModifier(command -> command.getHostConfig().withMemory(768L * 1024 * 1024).withNanoCPUs(1_000_000_000L))
                 .withCommand("--replSet", "docker-rs", "--bind_ip_all", "--wiredTigerCacheSizeGB", "0.25", "--setParameter", "enableTestCommands=1");

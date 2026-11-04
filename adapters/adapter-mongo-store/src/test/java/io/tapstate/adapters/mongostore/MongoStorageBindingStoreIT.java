@@ -42,10 +42,94 @@ class MongoStorageBindingStoreIT {
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+    static {
+        String owner = System.getenv("TAPSTATE_TEST_RESOURCE_OWNER");
+        if (owner != null && !owner.isBlank()) MONGO.withLabel("io.tapstate.issue-loop.owner", owner);
+    }
     private static final StorageSetupScope SCOPE = new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1);
     private static final StorageBinding.Connection CACHE = new StorageBinding.Connection(
             StorageBinding.Connection.Kind.MONGODB, "mongodb://cache-user:cache-secret@cache.invalid/cache?tls=true",
             "cache", "CA-material-sentinel");
+
+    @Test
+    void eachResourceConflictUsesItsOwnCollectionCollationAfterRecreation() {
+        for (var resource : List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
+                SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                assertThat(f.domain.bindings().load()).contains(original);
+                resource.on(f.database).drop();
+                f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                        .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                                .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                resource.on(f.database).insertOne(new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+                assertThat(resource.on(f.database).find(new Document("_id", original.defaultSourceId())).first()).isNotNull();
+                assertThatThrownBy(individualStore(f)::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+            });
+        }
+    }
+
+    @Test
+    void joinedFactsCannotUseCurrentCatalogCollationsForAnOlderSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var resource = SystemCollections.PIPELINES;
+            resource.on(f.database).drop();
+            f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            resource.on(f.database).insertOne(new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            var store = new MongoStorageBindingStore(f.admin, f.database, (SourceConfigCipherProvider) key.get(f.domain));
+            try (var session = f.admin.startSession()) {
+                session.startTransaction(com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT).build());
+                try {
+                    assertThat(SystemCollections.STORAGE_BINDING.on(f.database).find(session).first()).isNotNull();
+                    resource.on(f.database).drop();
+                    f.database.createCollection(resource.collectionName());
+                    var metadata = f.database.listCollections().into(new java.util.ArrayList<>());
+                    for (var name : List.of(resource.collectionName(), SystemCollections.CONFIG_CLUSTER_IDENTITY.collectionName())) {
+                        var options = metadata.stream().filter(row -> name.equals(row.getString("name")))
+                                .findFirst().orElseThrow().get("options", Document.class);
+                        assertThat(options).doesNotContainKey("collation");
+                    }
+                    assertThat(resource.on(f.database).find(session, new Document("_id", original.defaultSourceId())).first())
+                            .as("the retained snapshot still uses the historical case-insensitive collection").isNotNull();
+                    assertThatThrownBy(() -> store.loadForTransaction(session)).satisfies(MongoStorageBindingStoreIT::unreadable);
+                } finally { session.abortTransaction(); }
+            }
+        });
+    }
+
+    @Test
+    void setupAndGlobalFactsUseTheirOwnCollectionCollations() {
+        for (var resource : List.of(SystemCollections.STORAGE_SETUP, SystemCollections.PDK_NOTE_SCOPES)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                var row = resource.on(f.database).find().first();
+                if (resource == SystemCollections.STORAGE_SETUP) row.put("_id", "CLUSTER");
+                else row.get("_id", Document.class).put("namespace", "PDK.GLOBAL-STATE");
+                resource.on(f.database).drop();
+                f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                        .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                                .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                resource.on(f.database).insertOne(row);
+                assertThat(individualStore(f).load()).contains(original);
+                assertThat(f.domain.bindings().load()).contains(original);
+            });
+        }
+    }
+
+    private static MongoStorageBindingStore individualStore(Fixture f) throws Exception {
+        var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(f.admin));
+        org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
+                com.mongodb.connection.ClusterConnectionMode.MULTIPLE, com.mongodb.connection.ClusterType.UNKNOWN, List.of()));
+        var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+        key.setAccessible(true);
+        return new MongoStorageBindingStore(client, f.database, (SourceConfigCipherProvider) key.get(f.domain));
+    }
 
     @Test
     void aPublicationUsesBoundedCommandsWithoutRepeatingItsRecoveryRead() {
@@ -59,9 +143,9 @@ class MongoStorageBindingStoreIT {
             });
             try { f.domain.requireAuthenticationPublished(original.preparation()); }
             finally { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.COLLECTIONS.remove(); }
-            assertThat(commands).containsEntry("aggregate", 1).containsEntry("find", 3).containsEntry("commitTransaction", 1);
-            assertThat(collections).containsEntry("storage_binding", 1).containsEntry("storage_recovery", 1);
-            assertThat(collections).doesNotContainKey("storage_setup");
+            assertThat(commands).containsEntry("find", 10).containsEntry("commitTransaction", 1);
+            assertThat(collections).containsEntry("storage_binding", 1).containsEntry("storage_recovery", 1)
+                    .containsEntry("storage_setup", 1);
         });
     }
 
@@ -83,7 +167,7 @@ class MongoStorageBindingStoreIT {
     }
 
     @Test
-    void batchedFactsUseTheExistingIdIndexesWithoutCollectionScans() {
+    void individualFactsUseTheExistingIdIndexesWithoutCollectionScans() {
         withPrepared(f -> {
             var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
             // Materialize unrelated definitions so an absent collection's EOF shortcut cannot
@@ -92,15 +176,15 @@ class MongoStorageBindingStoreIT {
                     new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unrelated-flow\nsource: []\n"),
                     definition("transform", "unrelated-transform"), definition("view", "unrelated-view"),
                     definition("serve", "unrelated-serve")));
-            var captured = new java.util.concurrent.atomic.AtomicReference<Document>();
+            var captured = new java.util.ArrayList<Document>();
             var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
                     .addCommandListener(new CommandListener() {
                         @Override public void commandStarted(CommandStartedEvent event) {
-                            if (event.getCommandName().equals("aggregate")) {
-                                var command = event.getCommand();
-                                captured.set(new Document("aggregate", command.getString("aggregate").getValue())
-                                        .append("pipeline", Document.parse(command.toJson()).get("pipeline"))
-                                        .append("cursor", new Document()));
+                            if (event.getCommandName().equals("find")) {
+                                var command = Document.parse(event.getCommand().toJson());
+                                var filter = command.get("filter", Document.class);
+                                if (filter != null && filter.containsKey("_id"))
+                                    captured.add(new Document("find", command.getString("find")).append("filter", filter));
                             }
                         }
                     }).build();
@@ -109,20 +193,14 @@ class MongoStorageBindingStoreIT {
             try (var client = MongoClients.create(settings)) {
                 var database = client.getDatabase(f.database.getName());
                 var store = new MongoStorageBindingStore(client, database, (SourceConfigCipherProvider) key.get(f.domain));
-                // Warm topology selection so the tested load uses the verified replica-set path.
-                database.runCommand(new Document("ping", 1));
                 assertThat(store.load()).contains(original);
-                assertThat(captured.get()).isNotNull();
-                var plan = database.runCommand(new Document("explain", captured.get()).append("verbosity", "executionStats"));
-                var lookups = plan.getList("stages", Document.class).stream().filter(stage -> stage.containsKey("$lookup")).toList();
-                assertThat(lookups).hasSize(6).allSatisfy(stage -> {
-                    assertThat(stage.getList("indexesUsed", String.class)).contains("_id_");
-                    assertThat(((Number) stage.get("collectionScans")).longValue()).isZero();
-                    assertThat(((Number) stage.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(1);
-                });
-                System.out.println("CONFIG_LOOKUP_PLAN " + lookups.stream().map(stage -> Map.of(
-                        "indexes", stage.get("indexesUsed"), "examined", stage.get("totalDocsExamined"),
-                        "scans", stage.get("collectionScans"))).toList());
+                assertThat(captured).hasSize(9);
+                for (var command : captured) {
+                    var plan = database.runCommand(new Document("explain", command).append("verbosity", "executionStats"));
+                    var stats = plan.get("executionStats", Document.class);
+                    assertThat(((Number) stats.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(1);
+                    assertThat(stats.toJson()).doesNotContain("COLLSCAN");
+                }
             }
         });
     }
@@ -137,7 +215,7 @@ class MongoStorageBindingStoreIT {
             });
             var admin = f.admin.getDatabase("admin");
             admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
-                    .append("data", new Document("failCommands", List.of("aggregate")).append("errorCode", 112)
+                    .append("data", new Document("failCommands", List.of("find")).append("errorCode", 112)
                             .append("errorLabels", List.of("TransientTransactionError"))));
             try { assertThatThrownBy(guarded::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
             finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
@@ -185,7 +263,7 @@ class MongoStorageBindingStoreIT {
                 MongoCommandObservation.CURRENT.remove();
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
-            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("aggregate", 1).containsEntry("find", 3);
+            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("find", 10);
             assertThat(checks).hasValue(3);
         });
     }

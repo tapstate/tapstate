@@ -331,21 +331,20 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     private TransactionFacts read(ClientSession session) {
-        boolean batched = MongoBindingReadFacts.supported(client);
-        Document stored = batched ? bindings.find(session, new Document("_id", SINGLETON_ID)).first() : null;
-        var facts = batched ? MongoBindingReadFacts.read(session, stored, identity, setup, noteScopes, otherResources) : null;
-        Document cluster = batched ? facts.identity() : identity.find(session, new Document("_id", SINGLETON_ID)).first();
+        // Each collection must apply its own collation in the retained transaction snapshot.
+        // Current catalog metadata cannot establish the historical semantics of a lookup.
+        Document cluster = identity.find(session, new Document("_id", SINGLETON_ID)).first();
         requireClusterIdentity(cluster);
         String clusterId = cluster.getString("clusterId");
         Long version = cluster.getLong(BINDING_VERSION);
-        if (!batched) stored = bindings.find(session, new Document("_id", SINGLETON_ID)).first();
-        Document state = batched ? facts.setup() : setup.find(session, new Document("_id", SINGLETON_ID)).first();
+        Document stored = bindings.find(session, new Document("_id", SINGLETON_ID)).first();
+        Document state = setup.find(session, new Document("_id", SINGLETON_ID)).first();
         long currentGeneration = requireSetupIdentity(state, clusterId);
         if (version == 0) {
             requireUnbound(session, stored, state);
             return new TransactionFacts(Optional.empty(), state);
         }
-        return readBound(session, stored, facts, clusterId, version, state, currentGeneration);
+        return readBound(session, stored, clusterId, version, state, currentGeneration);
     }
 
     private static void requireClusterIdentity(Document cluster) {
@@ -370,7 +369,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         MongoStorageRecoveryStore.requireAbsent(session, database);
     }
 
-    private TransactionFacts readBound(ClientSession session, Document stored, MongoBindingReadFacts.Facts facts,
+    private TransactionFacts readBound(ClientSession session, Document stored,
             String clusterId, Long version, Document state, long currentGeneration) {
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
@@ -383,13 +382,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             requireBoundSetup(state, scope, version, defaultId, currentGeneration);
             Document source = sources.find(session, new Document("_id", defaultId)).first();
             if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
-                    || (facts != null ? facts.conflictingResource() : hasOtherResource(session, defaultId))
+                    || hasOtherResource(session, defaultId)
                     || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
             String cacheJson = ciphers.current().decrypt(bindingContext(clusterId), "cache-binding", stored.getString("cache"));
             StorageBinding.Connection cache = decodeConnection(cacheJson);
             String candidateHash = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
             if (!candidateHash.equals(stored.get("candidateHash")) || !candidateHash.equals(state.get("candidateHash"))) throw unreadable();
-            Document global = facts != null ? facts.global() : noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
+            Document global = noteScopes.find(session, new Document("_id", new Document(BINDING_VERSION, version)
                     .append("namespace", "pdk.global-state"))).first();
             requireGlobalScope(global, clusterId);
             StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);

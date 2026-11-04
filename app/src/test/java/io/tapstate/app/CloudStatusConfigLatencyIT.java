@@ -148,7 +148,8 @@ class CloudStatusConfigLatencyIT {
 
     private static MongoDBContainer mongo() {
         return new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
-                .withLabel("io.tapstate.issue-loop.owner", "f7e1b36519fc4511bd06583f74106430")
+                .withLabels(System.getenv("TAPSTATE_TEST_RESOURCE_OWNER") == null ? Map.of()
+                        : Map.of("io.tapstate.issue-loop.owner", System.getenv("TAPSTATE_TEST_RESOURCE_OWNER")))
                 .withTmpFs(Map.of("/data/db", "rw", "/data/configdb", "rw"))
                 .withCreateContainerCmdModifier(cmd -> cmd.getHostConfig()
                         .withMemory(768L * 1024 * 1024).withNanoCPUs(1_000_000_000L))
