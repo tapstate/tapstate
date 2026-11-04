@@ -62,4 +62,36 @@ class PipelineRebuildCoordinatorTest {
         assertThat(PipelineRebuildCoordinator.clearingDirectPostgres(request,snapshot,shared,shared)).isEmpty();
     }
 
+    @Test void aSuccessorDirectChannelDoesNotRetireAnOriginalBoundedCapture() {
+        var scope=new PipelineIntentScope("cluster",1,"cache","flow",1);var owner=new WorkloadOwner("node","boot");
+        var claim=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"flow"),owner,1,1,1);
+        var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),owner,1,0,1);
+        var source=new SourceResource("pg",null,"postgres",Map.of(),SourceMode.CDC,List.of(TableRef.literal("t")),null,null);
+        var pipeline=new PipelineResource("flow",null,List.of(SourceRef.spec("pg",false)),null,null,null,null,null);
+        var artifacts=mock(ArtifactStore.class);when(artifacts.list()).thenReturn(List.of(pipeline,source));
+        var views=mock(PipelineStoreViews.class);var state=mock(StateStore.class);
+        when(views.pipelineStates(scope)).thenReturn(state);when(views.pipelineStates(eq(scope),any(),any())).thenReturn(state);
+        when(state.read("flow")).thenReturn(Optional.of(CheckpointDoc.initial("flow","STOPPED",Instant.EPOCH)));
+        var desired=new DesiredState("flow",PipelineState.RUNNING,CanonicalHash.of(pipeline),true,null,true,0L);
+        var pass=new PipelineConvergencePass(new PipelineIntentSnapshot(scope,2,desired),claim,views,() -> {});
+        var configuration=mock(PipelineStateRebuilds.class);var preparation=mock(PipelineRebuildPreparation.class);
+        when(configuration.begin(any())).thenAnswer(call -> {when(preparation.request()).thenReturn(call.getArgument(0));return preparation;});
+        var consumers=mock(SrsConsumerStore.class);when(consumers.guardedBy(any())).thenReturn(consumers);when(consumers.forPipeline(scope)).thenReturn(List.of());
+        var cache=mock(PipelineCacheRebuilds.class);when(cache.prepare(any(),any(),any(),any())).thenReturn(mock(PipelineRebuildReceipt.class));
+        var schemas=mock(SchemaStore.class);when(schemas.get("pg")).thenReturn(Optional.of(new DiscoveredSourceModel("pg","postgres",0,new SourceModel(List.of(new SourceTable("t",List.of(),List.of(),List.of()))))));
+        var notes=mock(RequiredNoteStore.class);when(notes.guardedBy(any())).thenReturn(notes);
+        var token=new RequiredNoteScope(RequiredNoteOwner.forNode(1,new PipelineNode("flow","pg"),PipelineNode.Purpose.CAPTURE,1),1);
+        var origin=io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture("postgres","a".repeat(64),Map.of());
+        when(notes.privateContexts(scope,"full-"+CanonicalHash.ofText(scope.toString()+":2"))).thenReturn(List.of(new RequiredNoteContext(token,Optional.of(origin),false)));
+        var retirement=mock(RequiredNoteRetirement.class);when(retirement.scope()).thenReturn(token);when(retirement.origin()).thenReturn(Optional.of(origin));
+        when(notes.retirement(eq(token),anyString())).thenReturn(retirement);
+        var privateNotes=new PipelinePrivateNoteRetirement(notes,configuration,(id,settings) -> origin,
+                (held,config,purpose,cluster,guard) -> {throw new AssertionError("bounded capture has no original PostgreSQL slot");});
+        var coordinator=new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(artifacts,schemas,views,consumers,configuration,cache),
+                privateNotes,() -> node,() -> {},(original,manifest) -> {},Duration.ofSeconds(30),Clock.systemUTC());
+        assertThatCode(() -> coordinator.rebuild(pass,Optional.empty())).doesNotThrowAnyException();
+        verify(retirement,never()).completeAfterVerifiedRelease();
+        verify(cache).prepare(any(),eq(node),any(),any());
+    }
+
 }

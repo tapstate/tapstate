@@ -68,7 +68,12 @@ final class PipelineRebuildCoordinator {
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
         notes.reconcile(original,Map.copyOf(desired),guard);guard.run();stores.configuration().requirePending(original);
         var direct=clearingDirectPostgres(request,snapshot,authored,pipeline);
-        if(!direct.isEmpty())notes.retireDirectPostgres(original,direct,guard);
+        if(!direct.isEmpty()) {
+            var originalSources=stores.cache().originalDirectSources(original,currentNode);guard.run();
+            var retained=new HashMap<String,SourceResource>();
+            direct.forEach((namespace,source) -> {if(originalSources.contains(source.id()))retained.put(namespace,source);});
+            if(!retained.isEmpty())notes.retireDirectPostgres(original,Map.copyOf(retained),guard);
+        }
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
         guard.run();return stores.configuration().complete(receipt);
     }
@@ -77,6 +82,7 @@ final class PipelineRebuildCoordinator {
         return intent.purgeState() && (intent.targetState()==io.tapstate.core.lifecycle.PipelineState.STOPPED
                 || intent.targetState()==io.tapstate.core.lifecycle.PipelineState.RUNNING && intent.reassemble());
     }
+    /** Current definitions bound candidates; original CACHE channels separately authorize their selection. */
     static Map<String,SourceResource> clearingDirectPostgres(PipelineRebuildRequest request,ArtifactStore snapshot,
             PipelineResource authored,PipelineResource pipeline) {
         if(!clearsPrivateCapture(request.intent().desired()))return Map.of();

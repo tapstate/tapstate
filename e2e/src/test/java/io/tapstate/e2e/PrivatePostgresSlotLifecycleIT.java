@@ -153,28 +153,41 @@ class PrivatePostgresSlotLifecycleIT {
             control.startAnswering(A,"target-not-empty","keep");state(control,A,PipelineState.RUNNING);row(mongo,targets.get(A),106);
             assertThat(PostgresSlots.names(source)).contains(fresh);
             facts.put("keepStopRetainedSlotAndResumedStoppedWindowCdc",true);save();
-            long beforeCarried=generation(storage,A);
-            try(var cache=MongoClients.create(storage.cacheUri());var held=cache.startSession();
-                    var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
-                held.startTransaction();
-                try {
-                    var checkpoints=SystemCollections.CACHE_PIPELINE_STATE.on(cache.getDatabase(storage.cacheDatabase()));
-                    assertThat(checkpoints.updateOne(held,new Document("_id",A),new Document("$inc",new Document("epoch",1L))).getMatchedCount()).isEqualTo(1);
-                    control.stop(A,true);
-                    assertThat(config.intents().load(A).orElseThrow().desired().purgeState()).isTrue();
-                    control.startAnswering(A,"target-not-empty","keep");
-                    var carried=config.intents().load(A).orElseThrow().desired();
-                    assertThat(carried.targetState()).isEqualTo(PipelineState.RUNNING);
-                    assertThat(carried.purgeState()).isTrue();assertThat(carried.reassemble()).isTrue();
-                    facts.put("clearingStopCarriedByStartBeforeCheckpointBarrierReleased",true);
-                } finally {if(held.hasActiveTransaction())held.abortTransaction();}
-            }
+            long beforeCarried=carryClearingStop(control,storage,A);
+            facts.put("clearingStopCarriedByStartBeforeCheckpointBarrierReleased",true);
             replacementCompleted(control,storage,A,beforeCarried,PipelineState.RUNNING);
             Await.until("the carried clearing stop to remove its old private slot",BOUND,
                     () -> !PostgresSlots.names(source).contains(fresh),() -> PostgresSlots.of(source).toString());
             insert(source,107);row(mongo,targets.get(A),107);row(mongo,targets.get(B),107);
             assertThat(PostgresSlots.names(source)).contains(slots.get(B),slots.get(S));
             facts.put("carriedStopRemovedOldPrivateSlotAndRestartedCdc",true);snapshot("carried-stop-complete",source,control);save();
+            facts.put("stage","bounded-to-cdc");save();
+            String bounded="bounded_to_cdc";String boundedTarget=SharedMongo.replicaSetUrl(databasePrefix+"_bounded");
+            var beforeBounded=PostgresSlots.names(source);
+            Map<String,String> boundedResources=new LinkedHashMap<>();
+            boundedResources.put(SOURCE+".tap.yml",sourceYaml(source));
+            boundedResources.put(bounded+"_target.tap.yml","version: tapstate/v1\nkind: source\nid: "+bounded+"_target\nconnector: mongodb\nconfig: { uri: \""+boundedTarget+"\" }\n");
+            boundedResources.put(bounded+".tap.yml",pipeline(bounded,false).replace("snapshot_and_cdc","snapshot_only"));
+            control.apply(boundedResources);
+            control.lifecycle(bounded,LifecycleVerb.START);state(control,bounded,PipelineState.COMPLETED);
+            assertThat(PostgresSlots.names(source)).containsExactlyInAnyOrderElementsOf(beforeBounded);
+            control.stop(bounded,false);state(control,bounded,PipelineState.STOPPED);
+            long oldBounded=carryClearingStop(control,storage,bounded,() -> {
+                // API apply reads the checkpoint deliberately held by this interleaving barrier.
+                // Publish only the authored definition through the real CONFIG artifact CAS.
+                try(var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
+                    var previous=config.artifacts().get(bounded).orElseThrow();
+                    var next=new io.tapstate.core.dsl.DslParser().parse(pipeline(bounded,false));
+                    assertThat(config.artifacts().replace(bounded,io.tapstate.core.model.canonical.CanonicalHash.of(previous),next))
+                            .isEqualTo(io.tapstate.spi.store.ArtifactMutation.REPLACED);
+                }
+            });
+            replacementCompleted(control,storage,bounded,oldBounded,PipelineState.RUNNING);
+            Await.until("one new live slot for the previously bounded source",BOUND,
+                    () -> PostgresSlots.of(source).stream().filter(slot -> !beforeBounded.contains(slot.name()) && slot.active()).count()==1,
+                    () -> PostgresSlots.of(source).toString());
+            row(mongo,boundedTarget,107);insert(source,108);row(mongo,boundedTarget,108);row(mongo,targets.get(B),108);
+            facts.put("boundedWithoutSlotChangedToCdcUnderCarriedClearAndDeliveredCdc",true);save();
         } catch (Throwable failure) {
             facts.put("terminalFailure",failure.toString());throw failure;
         } finally {
@@ -195,6 +208,39 @@ class PrivatePostgresSlotLifecycleIT {
     private static void row(MongoEndpoints mongo,String uri,int id) {Await.until("actual PG CDC row "+id+" at "+uri.substring(uri.lastIndexOf('/')+1),BOUND,() -> mongo.documents(EndpointAddress.uri(uri),TABLE).stream().anyMatch(d -> String.valueOf(id).equals(String.valueOf(d.get("id")))),() -> mongo.documents(EndpointAddress.uri(uri),TABLE).toString());}
     private static void insert(Map<String,Object> settings,int id) throws Exception {try(Connection c=SharedPostgres.connect(settings);Statement s=c.createStatement()){s.execute("SELECT pg_current_xact_id()");s.execute("INSERT INTO orders VALUES ("+id+",'cdc-"+id+"')");}}
     private static long generation(PreparedNativeStore s,String p) {try(var c=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(s.configurationUri(),null,Duration.ofSeconds(5)))){return c.pipelineStates().read(p).orElseThrow().stateGeneration();}}
+    private static long carryClearingStop(ControlPlane control,PreparedNativeStore storage,String pipeline) {
+        return carryClearingStop(control,storage,pipeline,() -> {});
+    }
+    private static long carryClearingStop(ControlPlane control,PreparedNativeStore storage,String pipeline,Runnable afterStop) {
+        long original=generation(storage,pipeline);
+        try(var cache=MongoClients.create(storage.cacheUri());var held=cache.startSession();
+                var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
+            var checkpoints=SystemCollections.CACHE_PIPELINE_STATE.on(cache.getDatabase(storage.cacheDatabase()));
+            Await.until("the original checkpoint to admit a transaction barrier",Duration.ofSeconds(5),() -> {
+                held.startTransaction();
+                try {
+                    assertThat(checkpoints.updateOne(held,new Document("_id",pipeline).append("scope.stateGeneration",original),
+                            new Document("$inc",new Document("epoch",1L))).getMatchedCount()).isEqualTo(1);
+                    return true;
+                } catch(com.mongodb.MongoException conflict) {
+                    if(held.hasActiveTransaction())held.abortTransaction();
+                    if(!conflict.hasErrorLabel("TransientTransactionError"))throw conflict;
+                    return false;
+                }
+            },() -> "checkpoint acquisition contention");
+            try {
+                control.stop(pipeline,true);
+                assertThat(config.intents().load(pipeline).orElseThrow().desired().purgeState()).isTrue();
+                afterStop.run();
+                control.startAnswering(pipeline,"target-not-empty","keep");
+                var carried=config.intents().load(pipeline).orElseThrow().desired();
+                assertThat(carried.targetState()).isEqualTo(PipelineState.RUNNING);
+                assertThat(carried.purgeState()).isTrue();assertThat(carried.reassemble()).isTrue();
+            } finally {if(held.hasActiveTransaction())held.abortTransaction();}
+        }
+        return original;
+    }
+
     private static void clearCompleted(ControlPlane control,PreparedNativeStore storage,String p,long generation) {
         replacementCompleted(control,storage,p,generation,PipelineState.STOPPED);
     }
