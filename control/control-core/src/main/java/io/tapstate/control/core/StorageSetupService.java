@@ -131,12 +131,7 @@ public final class StorageSetupService {
         if (layer != Layer.CACHE) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
         Candidate local = localCandidate(candidate);
         var cache = probe.normalize(local.cache());
-        try {
-            probe.test(cache);
-        } catch (TapstateException refused) {
-            throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
-                    Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
-        }
+        testLayer(cache, layer);
         requireSetup(expected, active);
         String hash = cacheHash(cache);
         if (tests.values().stream().anyMatch(test -> !test.scope().equals(expected) || !test.hash().equals(hash))) tests.clear();
@@ -170,7 +165,8 @@ public final class StorageSetupService {
                 verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
                 progress.begin(expected, 0, false, verifiedChecks);
             }
-            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) probe.test(prepared.candidate().connection(layer));
+            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE))
+                testLayer(prepared.candidate().connection(layer), layer);
             requireSetup(expected, active);
             configurationPreparation.prepare(expected, prepared.candidate(), active);
         }
@@ -187,14 +183,8 @@ public final class StorageSetupService {
                 progress.begin(expected, 0, false, verifiedChecks);
             }
             for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) {
-                try {
-                    probe.test(prepared.candidate().connection(layer));
-                    if (progress != null) progress.checked(expected, layer);
-                }
-                catch (TapstateException refused) {
-                    throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
-                            Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
-                }
+                testLayer(prepared.candidate().connection(layer), layer);
+                if (progress != null) progress.checked(expected, layer);
             }
         }
         Runnable writeGuard = previous.isPresent() ? active : () -> {
@@ -217,6 +207,37 @@ public final class StorageSetupService {
         // secret-free completion receipt may return; no later request inherits that authorization.
         if (result.setupPhase() != StorageSetupStateStore.Phase.COMPLETE) active.run();
         return result;
+    }
+
+    private void testLayer(StorageBinding.Connection connection, Layer layer) {
+        if (layer == Layer.CACHE) {
+            StorageConnectionProbe.CacheTestResult result;
+            try {
+                result = probe.testCache(connection);
+            } catch (TapstateException refused) {
+                throw testFailed(layer, refused);
+            }
+            if (!result.empty()) {
+                String suggestion = result.suggestedDatabase();
+                if (suggestion == null || suggestion.isBlank()) {
+                    throw new TapstateException(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED,
+                            Map.of("database", connection.database()), null);
+                }
+                throw new TapstateException(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED,
+                        Map.of("database", connection.database(), "suggestedDatabase", suggestion), null);
+            }
+            return;
+        }
+        try {
+            probe.test(connection);
+        } catch (TapstateException refused) {
+            throw testFailed(layer, refused);
+        }
+    }
+
+    private static TapstateException testFailed(Layer layer, TapstateException refused) {
+        return new TapstateException(ControlError.STORAGE_TEST_FAILED,
+                Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
     }
 
     /** Retries only the saved original activation; it accepts no replacement connection settings. */

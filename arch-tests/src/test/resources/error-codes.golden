@@ -214,6 +214,8 @@ control.preview-overloaded
 control.schema-derivation-incomplete
 control.source-config-reveal-unavailable
 control.state-database-unavailable
+control.storage-cache-database-occupied
+control.storage-cache-database-occupied-suggested
 control.storage-databases-overlap
 control.storage-quota-exceeded
 control.storage-scope-conflict

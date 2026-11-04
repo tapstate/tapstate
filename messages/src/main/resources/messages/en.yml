@@ -1327,6 +1327,12 @@ capture.still-ending:
   message: "Capture `{captureId}` has not finished stopping."
   solution: "Retry the original stop after the source call exits; retain its original resource identity."
 
+control.storage-cache-database-occupied:
+  message: "Cache database '{database}' already contains collections. Choose an empty database."
+  solution: "Enter another database name and test the connection again."
+control.storage-cache-database-occupied-suggested:
+  message: "Cache database '{database}' already contains collections. Choose a new, empty database."
+  solution: "Use the checked name '{suggestedDatabase}' or enter another name, then test again."
 control.storage-test-required:
   message: "Test every storage layer again using the current settings before saving."
 control.storage-test-failed:

@@ -813,14 +813,30 @@ class ManagedMongoStoreIsolationIT {
                     connection.verifyConnectivity();
                     var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
                     var normalized = probe.normalize(candidate);
-                    if (user.equals(writer)) probe.test(normalized);
-                    else assertThatThrownBy(() -> probe.test(normalized))
+                    if (user.equals(writer)) assertThat(probe.testCache(normalized).empty()).isTrue();
+                    else assertThatThrownBy(() -> probe.testCache(normalized))
                             .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                                     failure -> assertThat(failure.code()).isEqualTo(
                                             io.tapstate.adapters.mongostore.StoreError.DATABASE_ACCESS_FAILED));
                 }
                 assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
             }
+        }
+    }
+
+    @Test
+    void freshCacheProbeRejectsAnExistingEmptyCollectionAndOffersOnlyAnEmptySuggestion() {
+        String database = "setup_occupied_" + UUID.randomUUID().toString().replace("-", "");
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+            admin.getDatabase(database).createCollection("unrelated");
+            var candidate = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    uri("root", "admin"), database, null);
+            var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            var result = probe.testCache(probe.normalize(candidate));
+
+            assertThat(result.empty()).isFalse();
+            assertThat(result.suggestedDatabase()).matches(database + "_[0-9]{6}");
+            assertThat(admin.getDatabase(result.suggestedDatabase()).listCollectionNames().into(new ArrayList<>())).isEmpty();
         }
     }
 
