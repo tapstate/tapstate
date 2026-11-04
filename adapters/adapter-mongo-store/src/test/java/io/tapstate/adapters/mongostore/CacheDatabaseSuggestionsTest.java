@@ -37,6 +37,19 @@ class CacheDatabaseSuggestionsTest {
         assertThat(checked).hasSize(5);
     }
 
+    @Test void skipsOutOfRangeAndRepeatedSuffixesBeforeCheckingTheNextCandidate() {
+        var suffixes = new ArrayDeque<>(List.of(42, 483921, 483921, 483922));
+        var checked = new ArrayList<String>();
+
+        var suggestion = CacheDatabaseSuggestions.find("tapstate_cache", suffixes::removeFirst, name -> {
+            checked.add(name);
+            return checked.size() == 1;
+        });
+
+        assertThat(suggestion).contains("tapstate_cache_483922");
+        assertThat(checked).containsExactly("tapstate_cache_483921", "tapstate_cache_483922");
+    }
+
     @Test void returnsNoSuggestionWhenCheckingACandidateFails() {
         var checked = new AtomicInteger();
 
