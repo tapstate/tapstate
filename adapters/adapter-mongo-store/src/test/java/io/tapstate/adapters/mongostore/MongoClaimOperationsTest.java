@@ -22,7 +22,7 @@ import static org.mockito.ArgumentMatchers.*;
 
 class MongoClaimOperationsTest {
     @Test void acknowledgedTransactionRetainsItsSessionUntilLocalCloseSucceeds() {
-        var client=mock(MongoClient.class);var session=mock(ClientSession.class);
+        var client=client();var session=mock(ClientSession.class);
         var operations=new MongoClaimOperations(client);var transaction=operations.own(session);
         doThrow(new IllegalStateException("local session close failed")).doNothing().when(session).close();
         assertThatThrownBy(()->operations.committed(transaction)).isInstanceOf(IllegalStateException.class);
@@ -32,7 +32,7 @@ class MongoClaimOperationsTest {
     }
 
     @Test void terminalAbortWithFailedWriteConcernRetainsTheOriginalCleanupOwner() {
-        var client=mock(MongoClient.class);var database=mock(MongoDatabase.class);var session=mock(ClientSession.class);
+        var client=client();var database=mock(MongoDatabase.class);var session=mock(ClientSession.class);
         var server=mock(com.mongodb.session.ServerSession.class);
         var number=new java.util.concurrent.atomic.AtomicLong(42);
         var originalToken=org.bson.BsonDocument.parse("{recoveryShardId:'original-shard',opaque:{version:7}}");
@@ -62,7 +62,7 @@ class MongoClaimOperationsTest {
     }
 
     @Test void aRouterWithoutARecoveryTokenCannotReleaseAnUnconfirmedTransaction() {
-        var client=mock(MongoClient.class);var database=mock(MongoDatabase.class);var session=mock(ClientSession.class);
+        var client=client();var database=mock(MongoDatabase.class);var session=mock(ClientSession.class);
         var topology=mock(com.mongodb.connection.ClusterDescription.class);
         when(topology.getType()).thenReturn(com.mongodb.connection.ClusterType.SHARDED);
         when(client.getClusterDescription()).thenReturn(topology);
@@ -81,7 +81,7 @@ class MongoClaimOperationsTest {
     }
 
     @Test void callerExpiryRetainsTheActualUninterruptedWorkerForCleanupRetry() throws Exception {
-        var operations=new MongoClaimOperations(mock(MongoClient.class));
+        var operations=new MongoClaimOperations(client());
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var interrupted=new AtomicBoolean();
         try(var caller=Executors.newSingleThreadExecutor()) {
             var result=caller.submit(()->operations.call(deadline(300),()->{
@@ -101,7 +101,7 @@ class MongoClaimOperationsTest {
     }
 
     @Test void pendingExpiryNeverStartsTheOriginalOperationAfterWorkersAreReleased() throws Exception {
-        var operations=new MongoClaimOperations(mock(MongoClient.class));
+        var operations=new MongoClaimOperations(client());
         var entered=new CountDownLatch(4);var release=new CountDownLatch(1);var pendingCalls=new AtomicInteger();
         try(var callers=Executors.newFixedThreadPool(4)) {
             var originals=new ArrayList<java.util.concurrent.Future<Boolean>>();
@@ -120,7 +120,7 @@ class MongoClaimOperationsTest {
     }
 
     @Test void interruptedCallerRetainsItsFlagAndDoesNotInterruptTheOwnedIo() throws Exception {
-        var operations=new MongoClaimOperations(mock(MongoClient.class));
+        var operations=new MongoClaimOperations(client());
         var caller=new AtomicReference<Thread>();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         var ownedInterrupted=new AtomicBoolean();var callerInterrupted=new AtomicBoolean();
         try(var executor=Executors.newSingleThreadExecutor()) {
@@ -140,6 +140,15 @@ class MongoClaimOperationsTest {
             release.countDown();operations.await(deadline(2000));operations.closeIfIdle();
             assertThat(ownedInterrupted).isFalse();
         }finally {release.countDown();}
+    }
+
+    private static MongoClient client() {
+        var client = mock(MongoClient.class);
+        var topology = new com.mongodb.connection.ClusterDescription(
+                com.mongodb.connection.ClusterConnectionMode.MULTIPLE,
+                com.mongodb.connection.ClusterType.UNKNOWN, java.util.List.of());
+        when(client.getClusterDescription()).thenReturn(topology);
+        return client;
     }
 
     private static long deadline(long millis) {return System.nanoTime()+Duration.ofMillis(millis).toNanos();}

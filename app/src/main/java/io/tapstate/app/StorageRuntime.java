@@ -10,6 +10,8 @@ import io.tapstate.spi.store.StorageSetupStateStore;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
 /** Owns CONFIG independently from one original cache connection and its admitted runtime resources. */
@@ -35,12 +37,13 @@ final class StorageRuntime implements AutoCloseable {
     @SuppressWarnings("java:S3077")
     private volatile AutoCloseable business;
     // Creating owners are retained for cleanup, but are not published as recovered business state.
-    private volatile Business creatingBusiness;
+    private final AtomicReference<Business> creatingBusiness = new AtomicReference<>();
     private volatile boolean closed;
     private volatile boolean stopping;
     private final ShutdownAwait shutdown = new ShutdownAwait();
     private final AdmissionDrain operations = new AdmissionDrain();
-    private volatile java.util.concurrent.CompletableFuture<Void> businessOpening = java.util.concurrent.CompletableFuture.completedFuture(null);
+    private final AtomicReference<CompletableFuture<Void>> businessOpening =
+            new AtomicReference<>(CompletableFuture.completedFuture(null));
     private volatile boolean cleanupUnknown;
     private final Runnable ownerActive;
 
@@ -139,7 +142,7 @@ final class StorageRuntime implements AutoCloseable {
         }
         if (failure == null && original != null) {
             try { original.cache.close(); } catch (RuntimeException | Error cleanup) {
-                if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
+                failure = cleanup;
             }
         }
         if (failure != null) {
@@ -167,7 +170,7 @@ final class StorageRuntime implements AutoCloseable {
     private void startBusinessOwned(Bound original, Function<Bound, ? extends Business> assembly,
             io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication, boolean awaitReady) {
         var opening = new java.util.concurrent.CompletableFuture<Void>();
-        businessOpening = opening;
+        businessOpening.set(opening);
         try { startBusinessAttempt(original, assembly, running, beforePublication, awaitReady); }
         finally { opening.complete(null); }
     }
@@ -185,7 +188,7 @@ final class StorageRuntime implements AutoCloseable {
         verifyRecoveryPublication(original, running);
         original.requireAuthentication(); original.verifyBusiness();
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
-        creatingBusiness = candidate;
+        creatingBusiness.set(candidate);
         try {
             candidate.start();
             if (awaitReady) candidate.awaitAvailability();
@@ -197,10 +200,10 @@ final class StorageRuntime implements AutoCloseable {
             beforePublication.run();
             requireOriginal(original);
             business = candidate;
-            creatingBusiness = null;
+            creatingBusiness.set(null);
         } catch (RuntimeException | Error failure) {
             closeCandidate(candidate, failure);
-            if (!cleanupUnknown && creatingBusiness == candidate) creatingBusiness = null;
+            if (!cleanupUnknown) creatingBusiness.compareAndSet(candidate, null);
             throw failure;
         }
     }
@@ -292,8 +295,12 @@ final class StorageRuntime implements AutoCloseable {
         shutdown.complete(deadline, () -> {
             try {
                 operations.await(deadline);
-                ShutdownAwait.future(businessOpening, deadline);
-                if(creatingBusiness!=null){creatingBusiness.close();creatingBusiness=null;}
+                ShutdownAwait.future(businessOpening.get(), deadline);
+                var creating = creatingBusiness.get();
+                if (creating != null) {
+                    creating.close();
+                    creatingBusiness.compareAndSet(creating, null);
+                }
                 if (business != null) business.close();
                 if (bound != null) bound.cache.close();
                 if (configuration != null) configuration.close();

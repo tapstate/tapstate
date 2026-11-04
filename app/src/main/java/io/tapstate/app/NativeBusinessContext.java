@@ -44,7 +44,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
-    private volatile PipelineAlertRuntime alertRuntime;
+    private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
@@ -257,7 +257,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         active.set(false); handlers = List.of();
         Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
-        var alerts = alertRuntime;
+        var alerts = alertRuntime.get();
         if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
@@ -619,7 +619,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                 owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions(),maintenance);
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock,
                     diagnostics);
-            owner.alertRuntime = runtime;
+            owner.alertRuntime.set(runtime);
             return runtime;
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,

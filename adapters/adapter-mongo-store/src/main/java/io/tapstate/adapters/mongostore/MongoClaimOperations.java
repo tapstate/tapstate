@@ -48,12 +48,19 @@ final class MongoClaimOperations {
 
     MongoReadBudget budget() { return current.get(); }
     private void observeTopology() {
-        var topology=client.getClusterDescription();
-        if(topology==null)return;
-        if(topology.getType()==com.mongodb.connection.ClusterType.REPLICA_SET)replicaSet=true;
-        else if(topology.getType()!=com.mongodb.connection.ClusterType.UNKNOWN)routed=true;
+        var topology = client.getClusterDescription();
+        if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
+            replicaSet = true;
+        } else if (topology.getType() != com.mongodb.connection.ClusterType.UNKNOWN) {
+            routed = true;
+        }
     }
-    void check() {if(current.get()!=null)current.get().remainingMillis();if(active.get()!=null)active.get().run();}
+    void check() {
+        var budget = current.get();
+        if (budget != null) budget.remainingMillis();
+        var guard = active.get();
+        if (guard != null) guard.run();
+    }
     synchronized void requireAdmission() {
         if(stopping || closed)throw MongoCacheWorkloadClaimStore.claimFenced();
     }
