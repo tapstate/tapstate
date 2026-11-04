@@ -172,22 +172,24 @@ class PrivatePostgresSlotLifecycleIT {
             control.lifecycle(bounded,LifecycleVerb.START);state(control,bounded,PipelineState.COMPLETED);
             assertThat(PostgresSlots.names(source)).containsExactlyInAnyOrderElementsOf(beforeBounded);
             control.stop(bounded,false);state(control,bounded,PipelineState.STOPPED);
-            long oldBounded=carryClearingStop(control,storage,bounded,() -> {
-                // API apply reads the checkpoint deliberately held by this interleaving barrier.
-                // Publish only the authored definition through the real CONFIG artifact CAS.
-                try(var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
-                    var previous=config.artifacts().get(bounded).orElseThrow();
-                    var next=new io.tapstate.core.dsl.DslParser().parse(pipeline(bounded,false));
-                    assertThat(config.artifacts().replace(bounded,io.tapstate.core.model.canonical.CanonicalHash.of(previous),next))
-                            .isEqualTo(io.tapstate.spi.store.ArtifactMutation.REPLACED);
-                }
-            });
+            long oldBounded=carryClearingStop(control,storage,bounded,() -> replaceDefinition(storage,bounded,pipeline(bounded,false)));
             replacementCompleted(control,storage,bounded,oldBounded,PipelineState.RUNNING);
             Await.until("one new live slot for the previously bounded source",BOUND,
                     () -> PostgresSlots.of(source).stream().filter(slot -> !beforeBounded.contains(slot.name()) && slot.active()).count()==1,
                     () -> PostgresSlots.of(source).toString());
             row(mongo,boundedTarget,107);insert(source,108);row(mongo,boundedTarget,108);row(mongo,targets.get(B),108);
             facts.put("boundedWithoutSlotChangedToCdcUnderCarriedClearAndDeliveredCdc",true);save();
+            facts.put("stage","cdc-to-bounded");save();
+            String originalDirect=PostgresSlots.names(source).stream().filter(name -> !beforeBounded.contains(name)).findFirst().orElseThrow();
+            insert(source,109);row(mongo,boundedTarget,109);row(mongo,targets.get(B),109);
+            long beforeBoundedRestart=carryClearingStop(control,storage,bounded,
+                    () -> replaceDefinition(storage,bounded,pipeline(bounded,false).replace("snapshot_and_cdc","snapshot_only")));
+            Await.until("a bounded successor to release its original direct slot",BOUND,
+                    () -> !PostgresSlots.names(source).contains(originalDirect),() -> PostgresSlots.of(source).toString());
+            replacementCompleted(control,storage,bounded,beforeBoundedRestart,PipelineState.RUNNING,PipelineState.COMPLETED);
+            row(mongo,boundedTarget,109);row(mongo,targets.get(A),109);
+            assertThat(PostgresSlots.names(source)).containsExactlyInAnyOrderElementsOf(beforeBounded);
+            facts.put("cdcChangedToBoundedUnderCarriedClearReleasedOriginalSlot",true);save();
         } catch (Throwable failure) {
             facts.put("terminalFailure",failure.toString());throw failure;
         } finally {
@@ -208,6 +210,16 @@ class PrivatePostgresSlotLifecycleIT {
     private static void row(MongoEndpoints mongo,String uri,int id) {Await.until("actual PG CDC row "+id+" at "+uri.substring(uri.lastIndexOf('/')+1),BOUND,() -> mongo.documents(EndpointAddress.uri(uri),TABLE).stream().anyMatch(d -> String.valueOf(id).equals(String.valueOf(d.get("id")))),() -> mongo.documents(EndpointAddress.uri(uri),TABLE).toString());}
     private static void insert(Map<String,Object> settings,int id) throws Exception {try(Connection c=SharedPostgres.connect(settings);Statement s=c.createStatement()){s.execute("SELECT pg_current_xact_id()");s.execute("INSERT INTO orders VALUES ("+id+",'cdc-"+id+"')");}}
     private static long generation(PreparedNativeStore s,String p) {try(var c=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(s.configurationUri(),null,Duration.ofSeconds(5)))){return c.pipelineStates().read(p).orElseThrow().stateGeneration();}}
+    private static void replaceDefinition(PreparedNativeStore storage,String pipeline,String definition) {
+        // API apply reads the checkpoint deliberately held by the interleaving barrier.
+        // Publish only the authored definition through the real CONFIG artifact CAS.
+        try(var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
+            var previous=config.artifacts().get(pipeline).orElseThrow();
+            var next=new io.tapstate.core.dsl.DslParser().parse(definition);
+            assertThat(config.artifacts().replace(pipeline,io.tapstate.core.model.canonical.CanonicalHash.of(previous),next))
+                    .isEqualTo(io.tapstate.spi.store.ArtifactMutation.REPLACED);
+        }
+    }
     private static long carryClearingStop(ControlPlane control,PreparedNativeStore storage,String pipeline) {
         return carryClearingStop(control,storage,pipeline,() -> {});
     }
@@ -245,6 +257,9 @@ class PrivatePostgresSlotLifecycleIT {
         replacementCompleted(control,storage,p,generation,PipelineState.STOPPED);
     }
     private static void replacementCompleted(ControlPlane control,PreparedNativeStore storage,String p,long generation,PipelineState expected) {
+        replacementCompleted(control,storage,p,generation,expected,expected);
+    }
+    private static void replacementCompleted(ControlPlane control,PreparedNativeStore storage,String p,long generation,PipelineState expected,PipelineState observed) {
         try(var c=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)));var cache=MongoClients.create(storage.cacheUri())) {
             Await.until(p+" exact native clear completion",BOUND,() -> {
                 var before=c.pipelineStates().read(p).orElseThrow();var intent=c.intents().load(p).orElseThrow();
@@ -254,7 +269,7 @@ class PrivatePostgresSlotLifecycleIT {
                         &&intent.scope().stateGeneration()==generation+1&&!intent.desired().purgeState()
                         &&intent.desired().targetState()==expected&&checkpoint!=null
                         &&checkpoint.get("scope",Document.class).getLong("stateGeneration")==generation+1
-                        &&control.state(p).filter(expected::equals).isPresent();
+                        &&control.state(p).filter(observed::equals).isPresent();
             },() -> c.pipelineStates().read(p)+", "+control.logs(p));
         }
     }

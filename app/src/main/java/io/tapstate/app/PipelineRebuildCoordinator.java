@@ -86,10 +86,9 @@ final class PipelineRebuildCoordinator {
     static Map<String,SourceResource> clearingDirectPostgres(PipelineRebuildRequest request,ArtifactStore snapshot,
             PipelineResource authored,PipelineResource pipeline) {
         if(!clearsPrivateCapture(request.intent().desired()))return Map.of();
-        var tailSources=request.inputs().directChannels().stream().map(value -> value.context().sourceId()).collect(java.util.stream.Collectors.toSet());
         var direct=new HashMap<String,SourceResource>();
         for(var ref:pipeline.sources()) {
-            if(!(ref instanceof SourceRef.Spec spec) || spec.srs() || !tailSources.contains(ref.id()))continue;
+            if(!(ref instanceof SourceRef.Spec spec) || spec.srs())continue;
             var source=StoredArtifacts.requireSource(snapshot,ref.id());
             if(!source.connector().equals("postgres"))continue;
             direct.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.id()),PipelineNode.Purpose.CAPTURE),source);

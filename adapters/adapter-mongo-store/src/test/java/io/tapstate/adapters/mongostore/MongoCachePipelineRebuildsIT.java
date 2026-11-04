@@ -1669,8 +1669,8 @@ class MongoCachePipelineRebuildsIT {
     private static void assertCode(Runnable action,io.tapstate.core.common.TapstateErrorCode expected) {
         assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(expected));
     }
-    @ParameterizedTest @ValueSource(booleans={false,true})
-    void originalDirectEvidenceDoesNotAdoptSuccessorReadMode(boolean wasDirect) {
+    @ParameterizedTest @org.junit.jupiter.params.provider.CsvSource({"false,false","false,true","true,false","true,true"})
+    void originalDirectEvidenceDoesNotAdoptSuccessorReadMode(boolean wasDirect,boolean successorDirect) {
         withFixture(f -> {
             var source=new SourceResource("input",null,"postgres",Map.of("host","input.invalid"),
                     io.tapstate.core.model.SourceMode.CDC,List.of(io.tapstate.core.model.TableRef.literal("orders")),null,null);
@@ -1687,21 +1687,21 @@ class MongoCachePipelineRebuildsIT {
             var prep=f.domain.pipelinePreparations(f.business,ACTIVE);
             f.configuration.preparations().complete(prep.seed(prep.reserveFirst(creation,TTL),f.configuration.preparations(),AT));
             var pipeline=new io.tapstate.core.model.PipelineResource("private",null,oldPipeline.sources(),null,null,null,
-                    new io.tapstate.core.model.Settings(null,null,null,null,io.tapstate.core.model.ReadMode.SNAPSHOT_AND_CDC,null),null);
+                    new io.tapstate.core.model.Settings(null,null,null,null,successorDirect?io.tapstate.core.model.ReadMode.SNAPSHOT_AND_CDC:io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY,null),null);
             f.configuration.artifacts().saveAll(List.of(pipeline));
             var before=f.configuration.intents().load("private").orElseThrow();
             f.configuration.intents().compareAndSet(old,before.intentRevision(),new DesiredState("private",PipelineState.RUNNING,CanonicalHash.of(pipeline),true,null,true,0L));
             var intent=f.configuration.intents().load("private").orElseThrow();
             var target=new PipelineIntentScope(old.clusterId(),old.bindingVersion(),old.cacheIncarnation(),old.pipelineId(),2);
             var next=PipelinePreparationInputs.of(target,pipeline,Map.of("input",source),selected);
-            assertThat(next.directChannels()).hasSize(1);
+            assertThat(next.directChannels()).hasSize(successorDirect?1:0);
             var claim=f.domain.workloadClaims(f.business).read(new WorkloadClaimKey(old.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,"private")).orElseThrow().claim();
             var pending=f.configuration.rebuilds().begin(new PipelineRebuildRequest("read-mode-change",intent,WorkloadClaimFence.from(claim),0,next));
             var expected=wasDirect?java.util.Set.of("input"):java.util.Set.<String>of();
             assertThat(f.rebuilds().originalDirectSources(pending,f.node)).isEqualTo(expected);
             var receipt=f.rebuilds().prepare(pending,f.node,TTL,AT);
             assertThat(f.rebuilds().originalDirectSources(pending,f.node)).isEqualTo(expected);
-            assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cache).countDocuments(new Document("_id.scope",MongoPipelinePreparationFacts.scope(target)))).isEqualTo(1);
+            assertThat(SystemCollections.DIRECT_CHANNEL_OFFSETS.on(f.cache).countDocuments(new Document("_id.scope",MongoPipelinePreparationFacts.scope(target)))).isEqualTo(successorDirect?1L:0L);
             f.configuration.rebuilds().complete(receipt);
         });
     }
