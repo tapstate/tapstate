@@ -656,6 +656,7 @@ final class Synthetic {
                 + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"changeSlotOnRelease\")) channel().put(\"currentSlot\", \"changed-slot\");"
                 + "  if (channel().containsKey(\"hang\")) {"
                 + "    try {"
                 + "      Thread.sleep(Long.MAX_VALUE);"
@@ -675,6 +676,13 @@ final class Synthetic {
                 + "  if (channel().containsKey(\"unreachable\")) {"
                 + "    throw new IllegalStateException(\"connection refused\");"
                 + "  }"
+                + "});";
+        register += "functions.supportRunRawCommandFunction((context, sql, table, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<String> queries=(List<String>)channel().computeIfAbsent(\"queries\", key -> new java.util.concurrent.CopyOnWriteArrayList<String>());"
+                + "  queries.add(sql);"
+                + "  Map<String,Object> row=new LinkedHashMap<>();row.put(\"slot_count\",channel().getOrDefault(\"slotCount\",Long.valueOf(0)));"
+                + "  List<TapEvent> result=new ArrayList<>();result.add(TapInsertRecordEvent.create().table(table.getId()).after(row));"
+                + "  consumer.accept(result);"
                 + "});";
         String members = ""
                 + "@SuppressWarnings(\"unchecked\")"

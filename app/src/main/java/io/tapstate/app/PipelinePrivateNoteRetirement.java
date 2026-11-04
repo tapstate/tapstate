@@ -20,6 +20,12 @@ final class PipelinePrivateNoteRetirement {
     @FunctionalInterface interface Release {
         Optional<TapstateException> run(RequiredNoteRetirement original,CaptureConfig config,
                 PipelineNode.Purpose purpose,String clusterId,Runnable requireOriginal);
+        default boolean privatePostgres(RequiredNoteRetirement original,CaptureConfig config,String clusterId,Runnable guard) {
+            Object policy=config.settings().get("autoClearSlot");
+            if(Boolean.FALSE.equals(policy) || "false".equalsIgnoreCase(String.valueOf(policy)))return false;
+            run(original,config,PipelineNode.Purpose.CAPTURE,clusterId,guard).ifPresent(failure -> {throw failure;});
+            return true;
+        }
     }
     private final RequiredNoteStore notes;
     private final PipelineStateRebuilds operations;
@@ -31,20 +37,31 @@ final class PipelinePrivateNoteRetirement {
     }
     private static Release pdkRelease(ConnectorProvisioner connectors) {
         Objects.requireNonNull(connectors);
-        return (retirement,config,purpose,clusterId,guard) -> {
-            var fixed=retirement.scope();var store=retirement.notes();
-            guard.run();
-            var global=store.open(new RequiredNoteOwner(fixed.owner().bindingVersion(),"pdk.global-state",
-                    RequiredNoteOwner.Kind.GLOBAL,clusterId,0));
-            guard.run();
-            var scopes=ConnectorNoteScopes.of(store,namespace -> {
-                if(namespace.equals(fixed.owner().namespace()))return fixed;
-                if(namespace.equals(global.owner().namespace()))return global;
-                throw unavailable();
-            },guard);
-            return PdkCapturePort.withRequiredNotes(connectors,null,scopes).release(config,purpose);
+        return new Release() {
+            @Override public Optional<TapstateException> run(RequiredNoteRetirement retirement,CaptureConfig config,
+                    PipelineNode.Purpose purpose,String clusterId,Runnable guard) {
+                return port(retirement,clusterId,guard).release(config,purpose);
+            }
+            @Override public boolean privatePostgres(RequiredNoteRetirement retirement,CaptureConfig config,String clusterId,Runnable guard) {
+                var port=port(retirement,clusterId,guard);
+                if(!port.automaticallyClearsPrivatePostgres(retirement.origin().orElseThrow(PipelinePrivateNoteRetirement::unavailable)))return false;
+                port.releasePrivatePostgresSlot(config).ifPresent(failure -> {throw failure;});
+                return true;
+            }
+            private PdkCapturePort port(RequiredNoteRetirement retirement,String clusterId,Runnable guard) {
+                var fixed=retirement.scope();var store=retirement.notes();guard.run();
+                var global=store.open(new RequiredNoteOwner(fixed.owner().bindingVersion(),"pdk.global-state",
+                        RequiredNoteOwner.Kind.GLOBAL,clusterId,0));guard.run();
+                var scopes=ConnectorNoteScopes.of(store,namespace -> {
+                    if(namespace.equals(fixed.owner().namespace()))return fixed;
+                    if(namespace.equals(global.owner().namespace()))return global;
+                    throw unavailable();
+                },guard);
+                return PdkCapturePort.withRequiredNotes(connectors,null,scopes);
+            }
         };
     }
+
     PipelinePrivateNoteRetirement(RequiredNoteStore notes,PipelineStateRebuilds operations,Release release) {
         this(notes,operations,(id,settings) -> {throw new IllegalStateException("no context resolver supplied");},release);
     }
@@ -66,6 +83,29 @@ final class PipelinePrivateNoteRetirement {
             releaseOne(original.request().originalScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),request.operationId()),requireRetiredExecution);
         }
         operations.requirePending(original);requireRetiredExecution.run();
+    }
+
+    /** Only an explicit clearing stop may retire its proven private PostgreSQL capture notes. */
+    void retireDirectPostgres(PipelineRebuildPreparation original,Map<String,SourceResource> direct,Runnable guard) {
+        guard.run();operations.requirePending(original);var request=original.request();
+        for(var context:notes.guardedBy(guard).privateContexts(request.originalScope(),request.operationId())) {
+            guard.run();if(context.completed() || context.origin().isEmpty())continue;
+            var owner=context.scope().owner();var source=direct.get(owner.namespace());
+            if(source==null || owner.kind()!=RequiredNoteOwner.Kind.PIPELINE
+                    || !owner.ownerId().equals(request.originalScope().pipelineId())
+                    || owner.bindingVersion()!=request.originalScope().bindingVersion()
+                    || owner.stateGeneration()!=request.originalScope().stateGeneration()
+                    || !owner.namespace().equals(RequiredNoteOwner.namespace(new PipelineNode(owner.ownerId(),source.id()),PipelineNode.Purpose.CAPTURE))
+                    || !owner.hasPurpose(PipelineNode.Purpose.CAPTURE) || !source.connector().equals("postgres"))continue;
+            if(!context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))throw unavailable();
+            var retirement=notes.guardedBy(guard).retirement(context.scope(),request.operationId());
+            if(retirement.completed())continue;
+            var config=new CaptureConfig("postgres",source.config(),List.of(),new PipelineNode(owner.ownerId(),source.id()));
+            if(release.privatePostgres(retirement,config,request.originalScope().clusterId(),guard)) {
+                guard.run();operations.requirePending(original);retirement.completeAfterVerifiedRelease();guard.run();
+            }
+        }
+        operations.requirePending(original);guard.run();
     }
 
     /** Runs only for the winning first-preparation invocation after the original execution is isolated. */
