@@ -22,6 +22,10 @@
   <name>Tapstate :: E2E</name>
   <description>Declarative YAML test-specification envelope + Java executor (test scope only)</description>
 
+  <properties>
+    <tapstate.it.jvmArgs></tapstate.it.jvmArgs>
+  </properties>
+
   <dependencyManagement>
     <dependencies>
       <dependency>
@@ -339,7 +343,7 @@
                generated classes - blocked on JDK 17+ unless java.lang is opened. The shipped server
                carries the same opening in its launcher; the in-process tier must match it, or a real
                connector's very first init fails here with an ExceptionInInitializerError. -->
-          <argLine>--add-opens java.base/java.lang=ALL-UNNAMED</argLine>
+          <argLine>--add-opens java.base/java.lang=ALL-UNNAMED ${tapstate.it.jvmArgs}</argLine>
           <systemPropertyVariables>
             <!-- Where the reactor puts the service deliverable. The real-process tier drives this file
                  rather than a classpath, which is the whole of its fidelity claim; the app module is

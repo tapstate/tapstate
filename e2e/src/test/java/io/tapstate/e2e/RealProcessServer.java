@@ -49,6 +49,7 @@ final class RealProcessServer implements ServerHandle {
     private static final Map<Integer, Socket> PORT_RESERVATIONS = new LinkedHashMap<>();
 
     private final Process process;
+    private Runnable beforeClose = () -> { };
     private final URI baseUrl;
     private final Path output;
     private final Path stagingDirectory;
@@ -421,6 +422,7 @@ final class RealProcessServer implements ServerHandle {
         private boolean handedOff;
         private boolean released;
         private Process unhandedProcess;
+        private final String launchToken = java.util.UUID.randomUUID().toString();
         private long forcedAt;
 
         private PreparedLaunch(Path jar, List<String> jvmOptions, int httpPort, String listenAddress,
@@ -454,8 +456,8 @@ final class RealProcessServer implements ServerHandle {
             try {
                 if (processes != null) processes.beforeLaunch();
                 unhandedProcess = RealProcessServer.launch(jar, jvmOptions, httpPort, listenAddress,
-                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments, fixtureMain);
-                if (processes != null) processes.launched(unhandedProcess);
+                        storeUri, operatorStateDatabase, workingDirectory, output, stagingDirectory, extraArguments, fixtureMain,launchToken);
+                if (processes != null) processes.launched(unhandedProcess,output,launchToken);
                 ClusterFixtureTiming.spawned(httpPort, unhandedProcess);
                 ClusterHealthProbe.bind(unhandedProcess.pid(), baseUrl);
                 RealProcessServer server = new RealProcessServer(
@@ -647,9 +649,16 @@ final class RealProcessServer implements ServerHandle {
 
     @Override
     public void close() {
-        requestClose();
-        awaitClosed();
+        Throwable failure = null;
+        try { if(process.isAlive())beforeClose.run(); }catch(RuntimeException|Error stopped){failure=stopped;}
+        try {requestClose();awaitClosed();}catch(RuntimeException|Error stopped){
+            if(failure==null)failure=stopped;else failure.addSuppressed(stopped);
+        }
+        if(failure instanceof Error error)throw error;
+        if(failure instanceof RuntimeException runtime)throw runtime;
     }
+
+    void beforeClose(Runnable action) { beforeClose = java.util.Objects.requireNonNull(action); }
 
     /** Requests this owned process's polite exit without waiting for another member. */
     synchronized void requestClose() {
@@ -729,10 +738,11 @@ final class RealProcessServer implements ServerHandle {
 
     private static Process launch(Path jar, List<String> jvmOptions, int port, String listenAddress,
             String storeUri, String operatorStateDatabase, Path workingDirectory, Path output,
-            Path stagingDirectory, List<String> extraArguments,String fixtureMain) {
+            Path stagingDirectory, List<String> extraArguments,String fixtureMain,String launchToken) {
         List<String> command = new ArrayList<>();
         command.add(javaBinary());
         command.addAll(jvmOptions);
+        command.add("-Dlogging.pattern.level=%5p [launch="+launchToken+"]");
         command.addAll(fixtureMain==null?List.of("-jar",jar.toString()):List.of(
                 "--add-opens=java.base/java.lang=ALL-UNNAMED","-cp",
                 System.getProperty("surefire.test.class.path",System.getProperty("java.class.path")),fixtureMain));

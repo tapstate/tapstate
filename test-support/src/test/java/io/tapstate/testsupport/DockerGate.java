@@ -67,7 +67,9 @@ public class DockerGate implements ExecutionCondition {
 
     @Override
     public ConditionEvaluationResult evaluateExecutionCondition(ExtensionContext context) {
-        return resultFor(decide(dockerAvailable(), ci()));
+        var decision=decide(dockerAvailable(),ci());
+        if(decision==Decision.RUN)context.getTestClass().ifPresent(ContainerLabels::configure);
+        return resultFor(decision);
     }
 
     /** The decision as a test that has already started sees it: proceed, abort, or fail. */

@@ -20,10 +20,22 @@ final class ClusterWorkloadClaims {
 
     private final WorkloadClaimStore store;
     private final ClusterMembershipGate membership;
+    private final AdmissionDrain admission;
 
     ClusterWorkloadClaims(WorkloadClaimStore store, ClusterMembershipGate membership) {
+        this(store,membership,null);
+    }
+    private ClusterWorkloadClaims(WorkloadClaimStore store,ClusterMembershipGate membership,AdmissionDrain admission) {
         this.store = Objects.requireNonNull(store, "store");
         this.membership = Objects.requireNonNull(membership, "membership");
+        this.admission=admission;
+    }
+    ClusterWorkloadClaims draining(AdmissionDrain admission){return new ClusterWorkloadClaims(store,membership,admission);}
+    private <T>T call(java.util.function.Supplier<T> action){
+        if(admission==null)return action.get();
+        if(!admission.enter())throw ThreeLayerStorePort.refused();
+        try {var result=action.get();if(!admission.current())throw ThreeLayerStorePort.refused();return result;}
+        finally{admission.leave();}
     }
 
     Optional<WorkloadClaimAttempt> acquire(
@@ -31,17 +43,17 @@ final class ClusterWorkloadClaims {
         if (key.type() != WorkloadClaimType.NODE_SESSION && !membership.businessEligible()) {
             return Optional.empty();
         }
-        return Optional.of(store.acquire(key, owner, topologyRevision, ttl));
+        return call(()->Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
     }
 
     Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
         return membership.businessEligible()
-                ? Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl)) : Optional.empty();
+                ? call(()->Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl))) : Optional.empty();
     }
 
     Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
-        return membership.businessEligible() ? store.readPipeline(scope) : Optional.empty();
+        return membership.businessEligible() ? call(()->store.readPipeline(scope)) : Optional.empty();
     }
 
     /**
@@ -70,7 +82,7 @@ final class ClusterWorkloadClaims {
                 return Optional.empty();
             }
         }
-        return store.renew(expected, ttl);
+        return call(()->store.renew(expected, ttl));
     }
 
     /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
@@ -82,7 +94,7 @@ final class ClusterWorkloadClaims {
         if (!membership.businessEligible() || current == null
                 || !current.clusterId().equals(expected.key().clusterId())
                 || current.revision() < expected.topologyRevision()) return Optional.empty();
-        return store.renew(expected, ttl);
+        return call(()->store.renew(expected, ttl));
     }
 
     /**
@@ -91,21 +103,21 @@ final class ClusterWorkloadClaims {
      * requires the original live claim; an expired or replaced tenure is never recovered here.
      */
     Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl) {
-        return membership.singleControlEligible(expected) ? store.renew(expected, ttl) : Optional.empty();
+        return membership.singleControlEligible(expected) ? call(()->store.renew(expected, ttl)) : Optional.empty();
     }
 
     /** Read-only reporting proof for the exact retained SINGLE execution, never a business grant. */
     Optional<WorkloadClaimReading> readActuationControl(PipelineIntentScope scope, WorkloadClaim expected) {
         if (!membership.singleControlEligible(expected) || !scope.pipelineId().equals(expected.key().resourceId())
                 || !scope.clusterId().equals(expected.key().clusterId())) return Optional.empty();
-        var current = store.readPipeline(scope);
+        var current = call(()->store.readPipeline(scope));
         return membership.singleControlEligible(expected) ? current.filter(WorkloadClaimReading::leased)
                 .filter(value -> io.tapstate.spi.store.WorkloadClaimFence.from(value.claim())
                         .equals(io.tapstate.spi.store.WorkloadClaimFence.from(expected))) : Optional.empty();
     }
 
     boolean release(WorkloadClaim expected) {
-        return store.release(expected);
+        return call(()->store.release(expected));
     }
 
     /**
@@ -116,7 +128,7 @@ final class ClusterWorkloadClaims {
         if (key.type() != WorkloadClaimType.NODE_SESSION && !membership.businessEligible()) {
             return Optional.empty();
         }
-        return store.read(key);
+        return call(()->store.read(key));
     }
 
     Optional<WorkloadClaim> advanceExecution(
@@ -124,13 +136,13 @@ final class ClusterWorkloadClaims {
         if (!membership.businessEligible()) {
             return Optional.empty();
         }
-        return store.advanceExecution(expected, topologyRevision, executionNodeIds);
+        return call(()->store.advanceExecution(expected, topologyRevision, executionNodeIds));
     }
 
     Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
         if (!membership.businessEligible()) {
             return Optional.empty();
         }
-        return store.recordExecutionFailure(expected, afterMemberLoss);
+        return call(()->store.recordExecutionFailure(expected, afterMemberLoss));
     }
 }

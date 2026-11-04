@@ -22,19 +22,23 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     private record Pending(AlertIntent.Identity identity, DeliveryAttempt.Permit permit, NotificationChannel.Result result, int jitter) { }
     private final AlertStore store; private final Clock clock; private final String worker; private final Runnable active;
     private final Channels channels; private final Function<AlertTestAuthority,AlertStore.Access> continuation;
-    private final ScheduledThreadPoolExecutor timer=new ScheduledThreadPoolExecutor(1,r->{var t=new Thread(r,"alert-delivery-control");t.setDaemon(true);return t;});
-    private final ThreadPoolExecutor pool=new ThreadPoolExecutor(4,4,0,TimeUnit.SECONDS,new SynchronousQueue<>(),r->{var t=new Thread(r,"alert-delivery");t.setDaemon(true);return t;});
+    private final ScheduledThreadPoolExecutor timer=new ScheduledThreadPoolExecutor(1,r->{return ShutdownAwait.daemon(r,"alert-delivery-control");});
+    private final ThreadPoolExecutor pool=new ThreadPoolExecutor(4,4,0,TimeUnit.SECONDS,new SynchronousQueue<>(),r->{return ShutdownAwait.daemon(r,"alert-delivery");});
     private final Map<String,NotificationChannel> calls=new ConcurrentHashMap<>();
+    private final Set<NotificationChannel> cleanupChannels=ConcurrentHashMap.newKeySet();
     private final Set<String> running=ConcurrentHashMap.newKeySet();
     private final Map<String,Pending> pending=new ConcurrentHashMap<>();
     private final Map<String,Integer> byChannel=new HashMap<>();
     private final AtomicBoolean closed=new AtomicBoolean();
+    private final Object scheduling=new Object();
+    private final ExecutorService cancellation=Executors.newSingleThreadExecutor(task->ShutdownAwait.daemon(task,"alert-delivery-stop"));
+    private CompletableFuture<Void> cancelled,channelsClosed;
     private final java.util.concurrent.atomic.AtomicReference<Failure> failure=new java.util.concurrent.atomic.AtomicReference<>(); private AlertStore.DueCursor cursor;
     AlertDeliveryRuntime(AlertStore store,Clock clock,String worker,Runnable active,Channels channels,
             Function<AlertTestAuthority,AlertStore.Access> continuation) {
         this.store=store;this.clock=clock;this.worker=worker;this.active=active;this.channels=channels;this.continuation=continuation;timer.setRemoveOnCancelPolicy(true);
     }
-    synchronized void start(){if(closed.get())throw new IllegalStateException("closed delivery runtime");timer.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);}
+    void start(){synchronized(scheduling){if(!closed.get())timer.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);}}
     /** Capability inspection is local and never opens a channel or resolves private material. */
     boolean supportsForManagement(AlertIntent.Frozen frozen){return !closed.get()&&channels.supports(frozen);}
     synchronized void tick(){
@@ -110,10 +114,13 @@ final class AlertDeliveryRuntime implements AutoCloseable {
             NotificationChannel.Result result;
             if(prepared instanceof NotificationChannel.Result refusal)result=refusal;
             else {
-                try(var material=store.resolvePermittedMaterial(identity,permit,access);
-                        var channel=channels.open(f,material,prepared)){
-                    calls.put(key,channel);active.run();if(closed.get()||!clock.instant().isBefore(permit.deadline()))return;
-                    result=channel.send(request(granted.value(),permit));
+                try(var material=store.resolvePermittedMaterial(identity,permit,access)){
+                    var channel=channels.open(f,material,prepared);
+                    cleanupChannels.add(channel);
+                    try {
+                        calls.put(key,channel);active.run();if(closed.get()||!clock.instant().isBefore(permit.deadline()))return;
+                        result=channel.send(request(granted.value(),permit));
+                    }finally{closeChannel(channel);}
                 }finally{calls.remove(key);}
             }
             var receipt=new Pending(identity,permit,result,placeholder.jitter());
@@ -157,5 +164,34 @@ final class AlertDeliveryRuntime implements AutoCloseable {
     private synchronized void release(AlertIntent.Identity id){running.remove(id.deliveryId());byChannel.computeIfPresent(id.channelType(),(k,v)->v==1?null:v-1);}
     Failure failure(){return failure.get();}
     int occupied(){return running.size()+pending.size();}
-    @Override public synchronized void close(){if(closed.compareAndSet(false,true)){timer.shutdownNow();calls.values().forEach(NotificationChannel::close);pending.clear();pool.shutdownNow();channels.close();}}
+    @Override public void close(){
+        synchronized(scheduling){
+            closed.set(true);timer.shutdown();pool.shutdown();
+            // Local admission slots end immediately; executor/channel owners remain until quiescence.
+            running.clear();pending.clear();
+            if(cancelled==null || cancelled.isCompletedExceptionally())
+                cancelled=CompletableFuture.runAsync(()->ShutdownAwait.all(cleanupChannels.stream().<Runnable>map(channel->()->closeChannel(channel)).toList()),cancellation);
+        }
+    }
+    void awaitStopped(long deadline){
+        close();
+        ShutdownAwait.executor(timer,deadline);ShutdownAwait.executor(pool,deadline);
+        CompletableFuture<Void> result;
+        synchronized(scheduling){result=cancelled;}
+        ShutdownAwait.future(result,deadline);
+        synchronized(scheduling){
+            if(!cleanupChannels.isEmpty())cancelled=CompletableFuture.runAsync(
+                    ()->ShutdownAwait.all(cleanupChannels.stream().<Runnable>map(channel->()->closeChannel(channel)).toList()),cancellation);
+            result=cancelled;
+        }
+        ShutdownAwait.future(result,deadline);
+        synchronized(scheduling){
+            if(channelsClosed==null || channelsClosed.isCompletedExceptionally())
+                channelsClosed=CompletableFuture.runAsync(channels::close,cancellation);
+            result=channelsClosed;
+        }
+        ShutdownAwait.future(result,deadline);
+        pending.clear();byChannel.clear();cancellation.shutdown();ShutdownAwait.executor(cancellation,deadline);
+    }
+    private void closeChannel(NotificationChannel channel){channel.close();cleanupChannels.remove(channel);}
 }

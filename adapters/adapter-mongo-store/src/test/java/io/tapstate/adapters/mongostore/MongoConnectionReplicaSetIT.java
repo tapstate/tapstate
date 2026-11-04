@@ -186,6 +186,14 @@ class MongoConnectionReplicaSetIT {
      */
     @Test
     void theTransactionsAProcessLeftOpenAreEndedAndNobodyElsesAre() throws Exception {
+        endOnlyOriginalTransactions(false);
+    }
+
+    @Test void boundedDisposalEndsOnlyTheSameOriginalProcessTransactions() throws Exception {
+        endOnlyOriginalTransactions(true);
+    }
+
+    private void endOnlyOriginalTransactions(boolean bounded) throws Exception {
         String uri = REPLICA_SET.getReplicaSetUrl();
         ExecutorService threads = Executors.newFixedThreadPool(2);
         try (MongoConnection gone = connectedFor(uri, "boot-gone");
@@ -205,7 +213,8 @@ class MongoConnectionReplicaSetIT {
                         .as("a write to what the transaction wrote waits for it, which is the whole trouble")
                         .isInstanceOf(TimeoutException.class);
 
-                assertThat(left.endTransactionsLeftOpenBy("boot-gone"))
+                assertThat(bounded?left.endTransactionsLeftOpenBy("boot-gone",Duration.ofSeconds(10))
+                        :left.endTransactionsLeftOpenBy("boot-gone"))
                         .as("the one transaction the process that has gone left open")
                         .isEqualTo(1);
 

@@ -19,6 +19,7 @@ class StorageRecoveryPublicationTest {
         var configuration=mock(MongoConfigurationDomain.class);var commands=mock(StorageRecoveryCommands.class);var setup=mock(StorageSetupStateStore.class);
         @SuppressWarnings("unchecked") Function<StorageRuntime.Bound,StorageRuntime.Business> assembly=mock(Function.class);
         ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
+        ReflectionTestUtils.setField(root,"replacements",new AdmissionDrain());
         ReflectionTestUtils.setField(root,"retainedAssembly",assembly);
         ReflectionTestUtils.setField(root,"retainedTarget",(java.util.function.Supplier<StorageSetupService.DefaultTarget>)() -> mock(StorageSetupService.DefaultTarget.class));
         when(runtime.requireConfiguration()).thenReturn(configuration);when(runtime.current()).thenReturn(Optional.of(bound));when(runtime.business()).thenReturn(Optional.empty());

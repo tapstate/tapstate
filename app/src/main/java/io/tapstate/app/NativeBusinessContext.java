@@ -44,6 +44,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
+    private volatile PipelineAlertRuntime alertRuntime;
+    private final ShutdownAwait shutdown = new ShutdownAwait();
     private List<HandlerMapping> handlers = List.of();
     private final AtomicBoolean initialTestSubmitted = new AtomicBoolean();
     private final java.util.concurrent.atomic.AtomicReference<Thread> initialTestCaller = new java.util.concurrent.atomic.AtomicReference<>();
@@ -247,8 +249,17 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         Object source=context.getBeanFactory().getSingleton("clusterNodeAlertSource");
         if(source instanceof ClusterNodeAlertSource nodes)nodes.orderlyShutdown();
     }
-    @Override public synchronized void close() {
+    @Override public void close() { close(ShutdownAwait.deadline()); }
+    void close(long deadline) {
+        shutdown.complete(deadline, () -> closeOwned(deadline));
+    }
+    private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
+        Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
+        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
+        var alerts = alertRuntime;
+        if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
+        if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
         Throwable failure = null;
@@ -585,7 +596,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var types=owner.parent.getBeanProvider(AlertTypeAssembly.class).getIfAvailable(AlertTypeAssembly::builtin);
             String evaluatorId = java.util.UUID.randomUUID().toString();
             Runnable active=owner::requireAlertHost;
-            return new PipelineAlertRuntime(() -> {
+            var runtime = new PipelineAlertRuntime(() -> {
                 active.run();
                 var setup = owner.original.binding().setup();
                 var scope=alertScope(owner,cloud);
@@ -608,6 +619,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                 owner.root.authentication()::continueAlertTest),types.providers(),types.descriptions(),maintenance);
             }, owner.configuration.intents(), ownership::evaluationProof, active, clock,
                     diagnostics);
+            owner.alertRuntime = runtime;
+            return runtime;
         }
         @Bean io.tapstate.control.core.AlertControlDispatcher alertControlDispatcher(NativeBusinessContext owner,
                 PipelineAlertRuntime runtime, CloudRuntimeSettings cloud, Clock clock, AuditGate audit) {

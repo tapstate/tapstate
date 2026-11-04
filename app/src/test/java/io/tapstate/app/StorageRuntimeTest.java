@@ -11,6 +11,35 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class StorageRuntimeTest {
+    @Test void aCreatingBusinessIsOwnedForCleanupButPublishedOnlyAfterTheOriginalRecoveryCommit() {
+        var config=configuration();var cache=mock(MongoCacheDomain.class);var business=mock(StorageRuntime.Business.class);
+        when(business.available()).thenReturn(true);
+        try(var root=new StorageRuntime(config,ignored->cache)){
+            var bound=root.loadBound().orElseThrow();bound.verifyAuthentication();
+            doAnswer(call->{assertThat(root.business()).isEmpty();return null;}).when(business).start();
+            var committed=new java.util.concurrent.atomic.AtomicBoolean();
+            root.startRecoveredBusiness(bound,ignored->business,null,()->{
+                assertThat(root.business()).isEmpty();assertThat(root.current()).contains(bound);committed.set(true);
+            });
+            assertThat(committed).isTrue();assertThat(root.business()).contains(business);
+        }
+    }
+    @Test void aCacheStillBeingCreatedCannotOutliveClientClosure() throws Exception {
+        var config=configuration();var cache=mock(MongoCacheDomain.class);
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var root=new StorageRuntime(config,binding->{
+            entered.countDown();try{if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("creation was not released");}
+            catch(InterruptedException failure){throw new AssertionError(failure);}return cache;
+        });
+        try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()){
+            var opening=executor.submit(root::loadBound);
+            assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            assertThatThrownBy(()->root.close(System.nanoTime()+java.time.Duration.ofMillis(40).toNanos())).isInstanceOf(TapstateException.class);
+            verify(config,never()).close();assertThat(root.cleanupRequired()).isTrue();
+            release.countDown();assertThatThrownBy(()->opening.get(3,java.util.concurrent.TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+            root.close();verify(cache,atLeastOnce()).close();verify(config).close();
+        }finally{release.countDown();root.close();}
+    }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings={"SHARED_SRS","CLUSTER"})
     void partialSharedRecoveryCanAssembleItsOwnerWhileWholeCacheRecoveryStillRequiresItsPublication(String kind) {
@@ -97,16 +126,22 @@ class StorageRuntimeTest {
             assertThatThrownBy(() -> root.startBusiness(bound, ignored -> { throw new AssertionError("cleanup unknown"); }))
                     .isInstanceOf(TapstateException.class);
             assertThat(root.businessStarted()).isFalse();
+            doNothing().when(candidate).close();
         }
     }
 
-    @Test void businessCleanupErrorStillClosesCacheAndConfiguration() {
+    @Test void businessCleanupErrorRetainsClientsUntilTheOriginalOwnerCanBeRetried() {
         var config = configuration(); var cache = mock(MongoCacheDomain.class); var business = mock(StorageRuntime.Business.class);
         var failure = new AssertionError("business cleanup failed"); doThrow(failure).when(business).close();
         var root = new StorageRuntime(config, binding -> cache);
         var bound = root.loadBound().orElseThrow(); bound.verifyAuthentication(); root.startBusiness(bound, ignored -> business);
         assertThat(catchThrowable(root::close)).isSameAs(failure);
-        verify(cache).close(); verify(config).close();
+        verify(cache,never()).close(); verify(config,never()).close();
+        assertThat(root.cleanupRequired()).isTrue();
+        doNothing().when(business).close();
+        root.close();
+        verify(business,times(2)).close();verify(cache).close();verify(config).close();
+        assertThat(root.cleanupRequired()).isFalse();
     }
 
     @Test void candidateCleanupErrorPreservesTheStartupFailureAndBlocksAnotherCandidate() {
@@ -119,6 +154,7 @@ class StorageRuntimeTest {
             assertThat(startup.getSuppressed()).containsExactly(cleanup);
             assertThatThrownBy(() -> root.startBusiness(bound, ignored -> { throw new AssertionError("second candidate"); }))
                     .isInstanceOf(TapstateException.class);
+            doNothing().when(business).close();
         }
     }
 

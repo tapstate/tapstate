@@ -29,6 +29,14 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
     @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
         if (ring == null || ring.isBlank()) throw new IllegalArgumentException("blank original ring");
         var bound = ScopedSrsConsumerAccess.bind(member,run); var models = bound.models().guardedBy(bound.requireActive());
+        if(bound.store().supportsReadEventVerification())return (item,sequence)->{
+            bound.requireClaim(null);
+            var model=bound.store().verifyReadEvent(run,table,ring,sequence,item.epoch(),item.schemaVer(),item.captureFence())
+                    .orElseThrow(()->ScopedSrsConsumerAccess.refused(run));
+            var expected=new io.tapstate.spi.store.SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),item.epoch(),item.schemaVer());
+            if(!expected.equals(model.key()) || !ring.equals(model.ringName()))throw unavailable(ring,item);
+            bound.requireClaim(null);
+        };
         return (item,sequence) -> {
             bound.requireClaim(null); var progress = bound.progress();
             if (!progress.cursor().perTableSeq().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);

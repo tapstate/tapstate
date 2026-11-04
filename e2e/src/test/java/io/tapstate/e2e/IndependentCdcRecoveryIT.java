@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -471,10 +472,12 @@ class IndependentCdcRecoveryIT {
         Path delegate = E2eConnectorJar.buildInto(Files.createDirectory(temporary.resolve("connector")));
         var connector = CdcRecoveryFixture.connectorJar(delegate);
         var storage = PreparedNativeStore.create();
+        var processes = StoreProcessScope.open();
         try {
-            return new Fixture(source, rootTarget, mailTarget, signals, storage, new NativeSrsDocuments(storage), connector);
+            processes.rememberHostUri(storage.configurationUri());
+            return new Fixture(source, rootTarget, mailTarget, signals, storage, new NativeSrsDocuments(storage), connector,processes);
         } catch (RuntimeException | Error failed) {
-            try { storage.close(); } catch (RuntimeException cleanup) { failed.addSuppressed(cleanup); }
+            try { processes.closeWith(storage::close); } catch (RuntimeException | Error cleanup) { failed.addSuppressed(cleanup); }
             throw failed;
         }
     }
@@ -732,6 +735,14 @@ class IndependentCdcRecoveryIT {
                 if (!refused.get()) {
                     server.awaitReady(Duration.ofNanos(Math.max(1, deadline - System.nanoTime())));
                     if (System.nanoTime() >= deadline) throw new AssertionError("the prepared startup exceeded " + TIMEOUT);
+                    var earlier=Set.copyOf(CdcRecoveryFixture.streams(fixture.source()));
+                    server.beforeClose(()->{
+                        try {Files.writeString(fixture.source().resolve("end-stream"),"");}
+                        catch(java.io.IOException failure){throw new java.io.UncheckedIOException(failure);}
+                        Await.until("the replacement capture streams to end after assertions",Duration.ofSeconds(5),
+                                ()->CdcRecoveryFixture.streams(fixture.source()).stream().filter(path->!earlier.contains(path))
+                                        .allMatch(path->CdcRecoveryFixture.lines(path).stream().anyMatch(line->line.startsWith("END "))),server::tail);
+                    });
                     return server;
                 }
             } catch (RuntimeException | Error failed) {
@@ -745,9 +756,29 @@ class IndependentCdcRecoveryIT {
     }
 
     private record Fixture(Path source, Path rootTarget, Path mailTarget, Path signals,
-            PreparedNativeStore storage, NativeSrsDocuments srs, byte[] connector) implements AutoCloseable {
+            PreparedNativeStore storage, NativeSrsDocuments srs, byte[] connector,StoreProcessScope processes) implements AutoCloseable {
         @Override public void close() {
-            try { srs.close(); } finally { storage.close(); }
+            try(srs){
+            processes.closeWith(()->{
+                long deadline=System.nanoTime()+Duration.ofSeconds(20).toNanos();
+                var boots=processes.deadBootIds();
+                for(var boot:boots){
+                    long remaining=deadline-System.nanoTime();
+                    if(remaining<=0)throw new AssertionError("the dead-owner disposal deadline expired");
+                    long millis=Math.max(1,TimeUnit.NANOSECONDS.toMillis(remaining));
+                    String uri=storage.configurationUri();
+                    uri+=(uri.contains("?")?"&":"?")+"timeoutMS="+millis;
+                    try(var connection=io.tapstate.adapters.mongostore.MongoConnection.forConfiguration(
+                            new io.tapstate.adapters.mongostore.MongoConnectionSettings(uri,null,Duration.ofNanos(remaining)))){
+                        connection.verifyConnectivity();
+                        remaining=deadline-System.nanoTime();
+                        if(remaining<=0)throw new AssertionError("the dead-owner disposal deadline expired");
+                        connection.endTransactionsLeftOpenBy(boot,Duration.ofNanos(remaining));
+                    }
+                }
+                srs.close();storage.close(deadline);
+            });
+            }
         }
     }
 

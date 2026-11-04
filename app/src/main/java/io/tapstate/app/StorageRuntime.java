@@ -34,7 +34,13 @@ final class StorageRuntime implements AutoCloseable {
     // Liveness reads publish only the owner reference; the owner guards its own lifecycle.
     @SuppressWarnings("java:S3077")
     private volatile AutoCloseable business;
+    // Creating owners are retained for cleanup, but are not published as recovered business state.
+    private volatile Business creatingBusiness;
     private volatile boolean closed;
+    private volatile boolean stopping;
+    private final ShutdownAwait shutdown = new ShutdownAwait();
+    private final AdmissionDrain operations = new AdmissionDrain();
+    private volatile java.util.concurrent.CompletableFuture<Void> businessOpening = java.util.concurrent.CompletableFuture.completedFuture(null);
     private volatile boolean cleanupUnknown;
     private final Runnable ownerActive;
 
@@ -56,7 +62,8 @@ final class StorageRuntime implements AutoCloseable {
     }
 
     /** An ordinary restart only loads retained identities; it never creates auth or business facts. */
-    synchronized Optional<Bound> loadBound() {
+    Optional<Bound> loadBound() { return lifecycle(this::loadBoundOwned); }
+    private Optional<Bound> loadBoundOwned() {
         requireOpen();
         if (configuration == null) return Optional.empty();
         var binding = configuration.bindings().load();
@@ -74,6 +81,7 @@ final class StorageRuntime implements AutoCloseable {
         try {
             Bound candidate = new Bound(binding.orElseThrow(), preparation, cache);
             bound = candidate;
+            requireOpen();
             return Optional.of(candidate);
         } catch (RuntimeException | Error failure) {
             try { cache.close(); } catch (RuntimeException | Error cleanup) {
@@ -84,7 +92,7 @@ final class StorageRuntime implements AutoCloseable {
         }
     }
 
-    synchronized Optional<Bound> current() { requireOpen(); return Optional.ofNullable(bound); }
+    Optional<Bound> current() { requireOpen();var current=bound;requireOpen();return Optional.ofNullable(current); }
     /** Read-only progress compares a published identity without joining candidate startup. */
     Optional<Bound> boundForObservation() {
         requireOpen(); var original = bound; requireOpen(); return Optional.ofNullable(original);
@@ -92,7 +100,8 @@ final class StorageRuntime implements AutoCloseable {
     boolean cleanupRequired() { return cleanupUnknown; }
 
     /** Retires this process's original owners before loading a newly published authentication scope. */
-    synchronized Bound restoreAuthentication() {
+    Bound restoreAuthentication() { return lifecycle(this::restoreAuthenticationOwned); }
+    private Bound restoreAuthenticationOwned() {
         requireOpen();
         if (configuration == null || cleanupUnknown) throw unavailable();
         var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
@@ -123,13 +132,12 @@ final class StorageRuntime implements AutoCloseable {
     private void retireBound() {
         Bound original = bound;
         AutoCloseable owned = business;
-        bound = null; business = null;
         if (original != null) original.active = false;
         Throwable failure = null;
         if (owned != null) {
             try { owned.close(); } catch (Exception | Error cleanup) { failure = cleanup; }
         }
-        if (original != null) {
+        if (failure == null && original != null) {
             try { original.cache.close(); } catch (RuntimeException | Error cleanup) {
                 if (failure == null) failure = cleanup; else if (failure != cleanup) failure.addSuppressed(cleanup);
             }
@@ -139,25 +147,35 @@ final class StorageRuntime implements AutoCloseable {
             if (failure instanceof Error error) throw error;
             var unavailable = unavailable(); unavailable.addSuppressed(failure); throw unavailable;
         }
+        bound = null;business = null;
     }
 
     /** The caller passes the original owner, so a late callback cannot activate or close its successor. */
-    synchronized void startBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
+    void startBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
         startRecoveredBusiness(original, assembly, null, () -> {});
     }
 
-    synchronized void startRecoveredBusiness(Bound original, Function<Bound, ? extends Business> assembly,
+    void startRecoveredBusiness(Bound original, Function<Bound, ? extends Business> assembly,
             io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication) {
-        startBusinessOwned(original, assembly, running, beforePublication, running != null);
+        lifecycle(()->{startBusinessOwned(original, assembly, running, beforePublication, running != null);return null;});
     }
 
-    synchronized void startInitialBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
-        startBusinessOwned(original, assembly, null, () -> {}, true);
+    void startInitialBusiness(Bound original, Function<Bound, ? extends Business> assembly) {
+        lifecycle(()->{startBusinessOwned(original, assembly, null, () -> {}, true);return null;});
     }
 
     private void startBusinessOwned(Bound original, Function<Bound, ? extends Business> assembly,
             io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication, boolean awaitReady) {
+        var opening = new java.util.concurrent.CompletableFuture<Void>();
+        businessOpening = opening;
+        try { startBusinessAttempt(original, assembly, running, beforePublication, awaitReady); }
+        finally { opening.complete(null); }
+    }
+
+    private void startBusinessAttempt(Bound original, Function<Bound, ? extends Business> assembly,
+            io.tapstate.spi.store.StorageRecoveryCommands.Plan running, Runnable beforePublication, boolean awaitReady) {
         requireOriginal(original);
+        if (cleanupUnknown) throw unavailable();
         if (business != null) {
             if (awaitReady && !businessStarted()) throw unavailable();
             return;
@@ -167,6 +185,7 @@ final class StorageRuntime implements AutoCloseable {
         verifyRecoveryPublication(original, running);
         original.requireAuthentication(); original.verifyBusiness();
         Business candidate = Objects.requireNonNull(Objects.requireNonNull(assembly, "assembly").apply(original), "business assembly");
+        creatingBusiness = candidate;
         try {
             candidate.start();
             if (awaitReady) candidate.awaitAvailability();
@@ -178,8 +197,10 @@ final class StorageRuntime implements AutoCloseable {
             beforePublication.run();
             requireOriginal(original);
             business = candidate;
+            creatingBusiness = null;
         } catch (RuntimeException | Error failure) {
             closeCandidate(candidate, failure);
+            if (!cleanupUnknown && creatingBusiness == candidate) creatingBusiness = null;
             throw failure;
         }
     }
@@ -195,8 +216,8 @@ final class StorageRuntime implements AutoCloseable {
                 && plan.manifest().selection().extent()==io.tapstate.spi.store.StorageRecoveryCommands.Extent.CLUSTER).isPresent()) throw unavailable();
     }
 
-    boolean businessStarted() { return !closed && business instanceof Business actual && actual.available(); }
-    synchronized Optional<Business> business() {
+    boolean businessStarted() { return !closed && !stopping && !cleanupUnknown && business instanceof Business actual && actual.available(); }
+    Optional<Business> business() {
         requireOpen(); return business instanceof Business actual ? Optional.of(actual) : Optional.empty();
     }
 
@@ -223,7 +244,11 @@ final class StorageRuntime implements AutoCloseable {
         original.requireActive();
     }
 
-    private void requireOpen() { if (closed) throw unavailable(); ownerActive.run(); }
+    private void requireOpen() { if (closed || stopping) throw unavailable(); ownerActive.run(); }
+    private <T>T lifecycle(java.util.function.Supplier<T> action){
+        if(!operations.enter())throw unavailable();
+        try {synchronized(this){return action.get();}}finally{operations.leave();}
+    }
 
     final class Bound {
         private final StorageBinding binding;
@@ -258,26 +283,27 @@ final class StorageRuntime implements AutoCloseable {
         @Override public String toString() { return "BoundStorageRuntime[redacted]"; }
     }
 
-    @Override public synchronized void close() {
-        if (closed) return;
-        closed = true;
+    @Override public void close() { close(ShutdownAwait.deadline()); }
+
+    void close(long deadline) {
+        stopping = true;
+        operations.stop();
         if (bound != null) bound.active = false;
-        Throwable failure = null;
-        if (business != null) {
-            try { business.close(); } catch (Exception | Error stopped) { failure = stopped; }
-        }
-        if (bound != null) {
-            try { bound.cache.close(); } catch (RuntimeException | Error stopped) {
-                if (failure == null) failure = stopped; else if (failure != stopped) failure.addSuppressed(stopped);
+        shutdown.complete(deadline, () -> {
+            try {
+                operations.await(deadline);
+                ShutdownAwait.future(businessOpening, deadline);
+                if(creatingBusiness!=null){creatingBusiness.close();creatingBusiness=null;}
+                if (business != null) business.close();
+                if (bound != null) bound.cache.close();
+                if (configuration != null) configuration.close();
+                closed = true;cleanupUnknown = false;
+            } catch (Error error) { cleanupUnknown = true;throw error; }
+            catch (Exception failure) {
+                cleanupUnknown = true;
+                var unavailable = unavailable();unavailable.addSuppressed(failure);throw unavailable;
             }
-        }
-        if (configuration != null) {
-            try { configuration.close(); } catch (RuntimeException | Error stopped) {
-                if (failure == null) failure = stopped; else if (failure != stopped) failure.addSuppressed(stopped);
-            }
-        }
-        if (failure instanceof Error error) throw error;
-        if (failure != null) throw unavailable();
+        });
     }
 
     private void closeCandidate(AutoCloseable candidate, Throwable failure) {

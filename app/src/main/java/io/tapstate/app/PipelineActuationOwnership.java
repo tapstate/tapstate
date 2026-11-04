@@ -170,7 +170,7 @@ final class PipelineActuationOwnership {
                 long remaining = budget - (System.nanoTime() - started);
                 if (closing || !membership.businessEligible() || passes.get(pipeline).thread == Thread.currentThread()
                         || remaining <= 0) throw ThreeLayerStorePort.refused();
-                try { java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(this, remaining); }
+                try { java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(this, Math.min(remaining,java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(25))); }
                 catch (InterruptedException interrupted) {
                     Thread.currentThread().interrupt();
                     throw ThreeLayerStorePort.refused();
@@ -221,6 +221,7 @@ final class PipelineActuationOwnership {
         var command = new Control(scope, null); controls.put(scope.pipelineId(), command); return command;
     }
     private volatile boolean closing;
+    private final AdmissionDrain admission = new AdmissionDrain();
 
     /** One pipeline's local view: the claim this member proved, and when the next round trip is due. */
     private static final class Held {
@@ -329,7 +330,7 @@ final class PipelineActuationOwnership {
         this.clusterId = Objects.requireNonNull(clusterId, "clusterId");
         this.owner = Objects.requireNonNull(owner, "owner");
         this.membership = Objects.requireNonNull(membership, "membership");
-        this.claims = Objects.requireNonNull(claims, "claims");
+        this.claims = Objects.requireNonNull(claims, "claims").draining(admission);
         this.ttl = Objects.requireNonNull(ttl, "ttl");
         this.nanoTime = Objects.requireNonNull(nanoTime, "nanoTime");
         Objects.requireNonNull(renewInterval, "renewInterval");
@@ -341,7 +342,12 @@ final class PipelineActuationOwnership {
     }
 
     /** Answers whether this member drives {@code pipelineId} right now, renewing or acquiring when due. */
-    synchronized Permit permit(String pipelineId) {
+    Permit permit(String pipelineId) {
+        if(!admission.enter())return Permit.denied();
+        try { synchronized(this){return admittedPermit(pipelineId);} }
+        finally { admission.leave(); }
+    }
+    private Permit admittedPermit(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         if (closing || businessScope != null) return Permit.denied();
         if (!fenced) return Permit.unfenced();
@@ -350,7 +356,12 @@ final class PipelineActuationOwnership {
     }
 
     /** A new physical scope must be admitted by the store before it can replace the local holder. */
-    synchronized Permit permit(PipelineIntentScope scope) {
+    Permit permit(PipelineIntentScope scope) {
+        if(!admission.enter())return Permit.denied();
+        try { synchronized(this){return admittedPermit(scope);} }
+        finally { admission.leave(); }
+    }
+    private Permit admittedPermit(PipelineIntentScope scope) {
         Objects.requireNonNull(scope, "scope");
         if (closing || !accepts(scope) || controls.containsKey(scope.pipelineId())) return Permit.denied();
         String pipelineId = scope.pipelineId();
@@ -509,7 +520,7 @@ final class PipelineActuationOwnership {
                 if (state.claim.topologyRevision() != planned.revision()) {
                     var original = state.claim;
                     var rebased = claims.acquirePipeline(scope, owner, planned.revision(), ttl);
-                    if (rebased.isEmpty() || !rebased.orElseThrow().acquired()) return Execution.refused();
+                    if (closing || held.get(pipelineId)!=state || state.claim!=original || rebased.isEmpty() || !rebased.orElseThrow().acquired()) return Execution.refused();
                     var actual = rebased.orElseThrow().claim();
                     if (!actual.key().equals(original.key()) || !actual.owner().equals(original.owner())
                             || actual.claimGeneration() != original.claimGeneration()
@@ -528,7 +539,7 @@ final class PipelineActuationOwnership {
         } catch (RuntimeException unreachable) {
             advanced = Optional.empty();
         }
-        if (advanced.isEmpty()) {
+        if (closing || held.get(pipelineId)!=state || advanced.isEmpty()) {
             state.claim = null;
             return Execution.refused();
         }
@@ -956,10 +967,11 @@ final class PipelineActuationOwnership {
 
     /** A shutting-down member must leave its dying run unclassified for the next holder to recover. */
     @EventListener(ContextClosedEvent.class)
-    synchronized void stopForShutdown() {
+    void stopForShutdown() {
         closing = true;
-        notifyAll();
+        admission.stop();
     }
+    void awaitStopped(long deadline) { admission.await(deadline); }
 
     /**
      * What each committed member is to the run this member last submitted for {@code pipelineId} -- the
@@ -1055,6 +1067,7 @@ final class PipelineActuationOwnership {
         }
         state.contacted = true;
         state.nextContactNanos = now + renewIntervalNanos;
+        if(closing || state.scope!=null&&!accepts(state.scope))return Permit.denied();
         if (renewed.isEmpty()) {
             state.claim = null;
             return Permit.denied();
@@ -1083,6 +1096,8 @@ final class PipelineActuationOwnership {
                 || !attempt.get().claim().key().equals(key)) {
             return Permit.denied();
         }
+        if(closing || !admission.current() || !current.equals(membership.committed()) || !membership.businessEligible()
+                || state.scope!=null&&!accepts(state.scope))return Permit.denied();
         state.claim = attempt.get().claim();
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
