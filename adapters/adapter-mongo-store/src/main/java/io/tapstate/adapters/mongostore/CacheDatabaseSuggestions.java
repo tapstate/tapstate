@@ -15,19 +15,22 @@ final class CacheDatabaseSuggestions {
     static Optional<String> find(String database, IntSupplier suffixes, Predicate<String> containsCollections) {
         Set<String> checked = new HashSet<>();
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-            int suffix = suffixes.getAsInt();
-            if (suffix >= 100_000 && suffix <= 999_999) {
-                String candidate = withSuffix(database, suffix);
-                if (candidate != null && checked.add(candidate)) {
-                    try {
-                        if (!containsCollections.test(candidate)) return Optional.of(candidate);
-                    } catch (MongoException unavailable) {
-                        return Optional.empty();
-                    }
-                }
+            Optional<String> candidate = candidateName(database, suffixes.getAsInt(), checked);
+            if (candidate.isEmpty()) continue;
+            try {
+                if (!containsCollections.test(candidate.orElseThrow())) return candidate;
+            } catch (MongoException unavailable) {
+                return Optional.empty();
             }
         }
         return Optional.empty();
+    }
+
+    private static Optional<String> candidateName(String database, int suffix, Set<String> checked) {
+        if (suffix < 100_000 || suffix > 999_999) return Optional.empty();
+        String candidate = withSuffix(database, suffix);
+        if (candidate == null || !checked.add(candidate)) return Optional.empty();
+        return Optional.of(candidate);
     }
 
     private static String withSuffix(String database, int suffix) {
