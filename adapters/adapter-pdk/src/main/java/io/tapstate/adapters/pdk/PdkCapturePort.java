@@ -778,6 +778,28 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
 
     /** Release keeps the original connector purpose without changing its logical node identity. */
     public Optional<TapstateException> release(CaptureConfig config, PipelineNode.Purpose purpose) {
+        return release(config,purpose,false);
+    }
+
+    /** Uses only the saved original policy and artifact; a clearing stop cannot turn retention on. */
+    public boolean automaticallyClearsPrivatePostgres(io.tapstate.spi.store.RequiredNoteOrigin origin) {
+        if(!origin.connectorId().equals("postgres"))throw new IllegalArgumentException("private PostgreSQL origin required");
+        var ref=provisioner.resolve(origin.connectorId(),origin.artifactHash());
+        var settings=ConfigTypeCoercion.coerce(origin.connectorId(),ref.spec(),ConnectorNoteOrigin.settings(origin));
+        Object policy=settings.get("autoClearSlot");
+        if(policy==null)return true;
+        if(policy instanceof Boolean flag)return flag;
+        throw new IllegalStateException("the PostgreSQL slot policy was not coerced");
+    }
+
+    /** Verifies the exact original private slot before its necessary notes can be retired. */
+    public Optional<TapstateException> releasePrivatePostgresSlot(CaptureConfig config) {
+        if(!config.connectorId().equals("postgres") || config.sharedNotes()!=null || noteScopes==null)
+            throw new IllegalArgumentException("private PostgreSQL capture notes required");
+        return release(config,PipelineNode.Purpose.CAPTURE,true);
+    }
+
+    private Optional<TapstateException> release(CaptureConfig config,PipelineNode.Purpose purpose,boolean verifyPrivateSlot) {
         Objects.requireNonNull(config, "config"); Objects.requireNonNull(purpose, "purpose");
         if ((purpose != PipelineNode.Purpose.CAPTURE && stateStore != null)
                 || (purpose != PipelineNode.Purpose.CAPTURE && config.sharedNotes() != null)) {
@@ -817,6 +839,9 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,
                         config.sharedNotes(), connectorScopes, purpose);
                 try {
+                    Object savedSlot=verifyPrivateSlot?connector.context().getStateMap().get("tapdata_pg_slot"):null;
+                    if(verifyPrivateSlot && (!(savedSlot instanceof String slot) || slot.isBlank()))
+                        throw new IllegalStateException("the original PostgreSQL slot is not recorded");
                     List<String> names = namedOnTheSource(connector);
                     named.set(names);
                     ReleaseExternalFunction release = connector.functions().getReleaseExternalFunction();
@@ -830,6 +855,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                             return null;
                         });
                     }
+                    if(verifyPrivateSlot)verifyPrivateSlotAbsent(connectorId,reference,settings,config,connectorScopes,(String)savedSlot);
                 } finally {
                     connector.stopQuietly();
                     connector.close();
@@ -873,6 +899,30 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                         "resources", left == null ? "whatever its notes name, which could not be read"
                                 : left.isEmpty() ? "nothing its notes name" : String.join(", ", left)),
                 failure));
+    }
+
+    private static void verifyPrivateSlotAbsent(String connectorId,ConnectorRef reference,Map<String,Object> settings,
+            CaptureConfig config,ConnectorNoteScopes scopes,String slot) throws Throwable {
+        PdkConnector reader=PdkConnector.open(connectorId,reference,settings,config.node(),null,null,scopes,PipelineNode.Purpose.CAPTURE);
+        try {
+            reader.underLoader(() -> {reader.connector().init(reader.context());return null;});
+            var query=reader.functions().getRunRawCommandFunction();
+            if(query==null)throw new IllegalStateException("the PostgreSQL slot verification function is unavailable");
+            var table=new io.tapdata.entity.schema.TapTable("private_slot_verification")
+                    .add(new io.tapdata.entity.schema.TapField("slot_count","bigint"));
+            reader.fillFieldTypes(table);
+            var rows=new java.util.ArrayList<io.tapdata.entity.event.TapEvent>();var callbacks=new int[1];
+            String sql="SELECT COUNT(*) AS slot_count FROM pg_catalog.pg_replication_slots WHERE slot_name='"+slot.replace("'","''")+"'";
+            reader.underLoader(() -> {query.run(reader.context(),sql,table,2,events -> {
+                callbacks[0]++;if(events==null)throw new IllegalStateException("the slot query returned no rows");rows.addAll(events);
+            });return null;});
+            if(callbacks[0]!=1 || rows.size()!=1 || !(rows.getFirst() instanceof io.tapdata.entity.event.dml.TapInsertRecordEvent row)
+                    || row.getAfter()==null || !(row.getAfter().get("slot_count") instanceof Number count)
+                    || new java.math.BigDecimal(count.toString()).signum()!=0)
+                throw new IllegalStateException("the original PostgreSQL slot is not confirmed absent");
+        } finally {
+            try {reader.stopForCleanup();} finally {reader.close();}
+        }
     }
 
     /**

@@ -136,6 +136,45 @@ class PrivatePostgresSlotLifecycleIT {
                 facts.put("slotRemovalObservationSeconds",(System.nanoTime()-start)/1_000_000_000.0);
                 snapshot("final",source,control);save();
             }
+            facts.put("stage","new-private-full");save();
+            control.startAnswering(A,"target-not-empty","keep");state(control,A,PipelineState.RUNNING);
+            Await.until("one fresh slot for the new private full",BOUND,
+                    () -> PostgresSlots.names(source).stream().filter(n -> !n.equals(slots.get(B)) && !n.equals(slots.get(S))).count()==1,
+                    () -> PostgresSlots.of(source).toString());
+            String fresh=PostgresSlots.names(source).stream().filter(n -> !n.equals(slots.get(B)) && !n.equals(slots.get(S))).findFirst().orElseThrow();
+            assertThat(fresh).isNotEqualTo(slots.get(A));
+            insert(source,105);row(mongo,targets.get(A),105);row(mongo,targets.get(B),105);
+            facts.put("newFullCreatedDifferentPrivateSlotAndDeliveredCdc",true);
+            control.stop(A,false);state(control,A,PipelineState.STOPPED);
+            Await.until("the retained private reader to end",BOUND,
+                    () -> PostgresSlots.of(source).stream().noneMatch(slot -> slot.name().equals(fresh) && slot.active()),
+                    () -> PostgresSlots.of(source).toString());
+            assertThat(PostgresSlots.names(source)).contains(fresh);insert(source,106);row(mongo,targets.get(B),106);
+            control.startAnswering(A,"target-not-empty","keep");state(control,A,PipelineState.RUNNING);row(mongo,targets.get(A),106);
+            assertThat(PostgresSlots.names(source)).contains(fresh);
+            facts.put("keepStopRetainedSlotAndResumedStoppedWindowCdc",true);save();
+            long beforeCarried=generation(storage,A);
+            try(var cache=MongoClients.create(storage.cacheUri());var held=cache.startSession();
+                    var config=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)))) {
+                held.startTransaction();
+                try {
+                    var checkpoints=SystemCollections.CACHE_PIPELINE_STATE.on(cache.getDatabase(storage.cacheDatabase()));
+                    assertThat(checkpoints.updateOne(held,new Document("_id",A),new Document("$inc",new Document("epoch",1L))).getMatchedCount()).isEqualTo(1);
+                    control.stop(A,true);
+                    assertThat(config.intents().load(A).orElseThrow().desired().purgeState()).isTrue();
+                    control.startAnswering(A,"target-not-empty","keep");
+                    var carried=config.intents().load(A).orElseThrow().desired();
+                    assertThat(carried.targetState()).isEqualTo(PipelineState.RUNNING);
+                    assertThat(carried.purgeState()).isTrue();assertThat(carried.reassemble()).isTrue();
+                    facts.put("clearingStopCarriedByStartBeforeCheckpointBarrierReleased",true);
+                } finally {if(held.hasActiveTransaction())held.abortTransaction();}
+            }
+            replacementCompleted(control,storage,A,beforeCarried,PipelineState.RUNNING);
+            Await.until("the carried clearing stop to remove its old private slot",BOUND,
+                    () -> !PostgresSlots.names(source).contains(fresh),() -> PostgresSlots.of(source).toString());
+            insert(source,107);row(mongo,targets.get(A),107);row(mongo,targets.get(B),107);
+            assertThat(PostgresSlots.names(source)).contains(slots.get(B),slots.get(S));
+            facts.put("carriedStopRemovedOldPrivateSlotAndRestartedCdc",true);snapshot("carried-stop-complete",source,control);save();
         } catch (Throwable failure) {
             facts.put("terminalFailure",failure.toString());throw failure;
         } finally {
@@ -157,6 +196,9 @@ class PrivatePostgresSlotLifecycleIT {
     private static void insert(Map<String,Object> settings,int id) throws Exception {try(Connection c=SharedPostgres.connect(settings);Statement s=c.createStatement()){s.execute("SELECT pg_current_xact_id()");s.execute("INSERT INTO orders VALUES ("+id+",'cdc-"+id+"')");}}
     private static long generation(PreparedNativeStore s,String p) {try(var c=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(s.configurationUri(),null,Duration.ofSeconds(5)))){return c.pipelineStates().read(p).orElseThrow().stateGeneration();}}
     private static void clearCompleted(ControlPlane control,PreparedNativeStore storage,String p,long generation) {
+        replacementCompleted(control,storage,p,generation,PipelineState.STOPPED);
+    }
+    private static void replacementCompleted(ControlPlane control,PreparedNativeStore storage,String p,long generation,PipelineState expected) {
         try(var c=MongoConfigurationDomain.openExisting(new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)));var cache=MongoClients.create(storage.cacheUri())) {
             Await.until(p+" exact native clear completion",BOUND,() -> {
                 var before=c.pipelineStates().read(p).orElseThrow();var intent=c.intents().load(p).orElseThrow();
@@ -164,9 +206,9 @@ class PrivatePostgresSlotLifecycleIT {
                 var after=c.pipelineStates().read(p).orElseThrow();
                 return before.equals(after)&&after.stateGeneration()==generation+1&&after.phase()==PipelineStateMapping.Phase.ACTIVE
                         &&intent.scope().stateGeneration()==generation+1&&!intent.desired().purgeState()
-                        &&intent.desired().targetState()==PipelineState.STOPPED&&checkpoint!=null
+                        &&intent.desired().targetState()==expected&&checkpoint!=null
                         &&checkpoint.get("scope",Document.class).getLong("stateGeneration")==generation+1
-                        &&control.state(p).filter(PipelineState.STOPPED::equals).isPresent();
+                        &&control.state(p).filter(expected::equals).isPresent();
             },() -> c.pipelineStates().read(p)+", "+control.logs(p));
         }
     }
