@@ -35,12 +35,12 @@ final class MongoBindingReadFacts {
         pipeline.add(new Document("$match", new Document("_id", SINGLETON_ID)));
         pipeline.add(new Document("$limit", 1));
         pipeline.add(captured());
-        pipeline.add(probe(setup, "setup", 2));
+        pipeline.add(probe(setup, "setup", 2, captured()));
         boolean bound = binding != null && binding.get("defaultSourceId") instanceof String
                 && binding.get(BINDING_VERSION) instanceof Long;
         if (bound) {
-            pipeline.add(probe(notes, "global", 2));
-            for (int i = 0; i < resources.size(); i++) pipeline.add(probe(resources.get(i), "resource" + i, 1));
+            pipeline.add(probe(notes, "global", 2, captured()));
+            for (int i = 0; i < resources.size(); i++) pipeline.add(probe(resources.get(i), "resource" + i, 1, presence()));
         }
         Document row = identity.aggregate(session, pipeline).first();
         if (row == null) return new Facts(null, null, null, false);
@@ -56,18 +56,24 @@ final class MongoBindingReadFacts {
                 // Only emptiness is independent of the aggregate's collation. A populated
                 // namespace must evaluate its ID predicate under its own historical collation.
                 if (!row.getList("resource" + i, Document.class).isEmpty()
-                        && resources.get(i).find(session, new Document("_id", binding.get("defaultSourceId"))).first() != null)
+                        && resources.get(i).find(session, new Document("_id", binding.get("defaultSourceId"))).first() != null) {
                     conflict = true;
+                    break;
+                }
             }
         }
         return new Facts(cluster, stage, global, conflict);
     }
 
-    private static Document probe(MongoCollection<Document> table, String field, int limit) {
+    private static Document probe(MongoCollection<Document> table, String field, int limit, Document projection) {
         // No foreign predicate uses the root collection's collation. Limit BEFORE projection
         // bounds both examined documents and result size, including populated namespaces.
         return new Document("$lookup", new Document("from", table.getNamespace().getCollectionName())
-                .append("pipeline", List.of(new Document("$limit", limit), captured())).append("as", field));
+                .append("pipeline", List.of(new Document("$limit", limit), projection)).append("as", field));
+    }
+
+    private static Document presence() {
+        return new Document("$project", new Document("_id", 0).append("present", new Document("$literal", true)));
     }
 
     private static Document captured() {

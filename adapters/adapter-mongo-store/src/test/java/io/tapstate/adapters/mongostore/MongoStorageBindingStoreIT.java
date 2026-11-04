@@ -6,6 +6,7 @@ import com.mongodb.MongoClientSettings;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandFailedEvent;
+import com.mongodb.event.CommandSucceededEvent;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.common.TapstateException;
@@ -180,6 +181,26 @@ class MongoStorageBindingStoreIT {
         });
     }
 
+    @Test
+    void aResourceConflictStopsTheRemainingCollectionLocalReads() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            SystemCollections.PIPELINES.on(f.database).insertOne(new Document("_id", original.defaultSourceId()));
+            var laterResources = List.of(SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS,
+                    SystemCollections.SERVE_DEFINITIONS);
+            for (var resource : laterResources)
+                resource.on(f.database).insertOne(new Document("_id", "unrelated"));
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(collections).containsEntry(SystemCollections.PIPELINES.collectionName(), 1);
+            for (var resource : laterResources) assertThat(collections).doesNotContainKey(resource.collectionName());
+        });
+    }
+
     private static MongoStorageBindingStore individualStore(Fixture f) throws Exception {
         var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(f.admin));
         org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
@@ -240,8 +261,12 @@ class MongoStorageBindingStoreIT {
             for (var resource : List.of(SystemCollections.PDK_NOTE_SCOPES, SystemCollections.PIPELINES,
                     SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS))
                 resource.on(f.database).insertMany(rows);
+            for (var resource : List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
+                    SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS))
+                resource.on(f.database).updateOne(new Document(), new Document("$set", new Document("payload", "x".repeat(60 * 1024))));
             var captured = new java.util.ArrayList<Document>();
             var aggregates = new java.util.ArrayList<Document>();
+            var aggregateRows = new java.util.ArrayList<Document>();
             var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
                     .addCommandListener(new CommandListener() {
                         @Override public void commandStarted(CommandStartedEvent event) {
@@ -257,6 +282,11 @@ class MongoStorageBindingStoreIT {
                                     captured.add(new Document("find", command.getString("find")).append("filter", filter));
                             }
                         }
+                        @Override public void commandSucceeded(CommandSucceededEvent event) {
+                            if (event.getCommandName().equals("aggregate"))
+                                for (var row : event.getResponse().getDocument("cursor").getArray("firstBatch"))
+                                    aggregateRows.add(Document.parse(row.asDocument().toJson()));
+                        }
                     }).build();
             var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
             key.setAccessible(true);
@@ -266,6 +296,10 @@ class MongoStorageBindingStoreIT {
                 assertThat(store.load()).contains(original);
                 assertThat(captured).hasSize(7);
                 assertThat(aggregates).hasSize(1);
+                assertThat(aggregateRows).hasSize(1);
+                for (int i = 0; i < 4; i++)
+                    assertThat(aggregateRows.getFirst().getList("resource" + i, Document.class))
+                            .containsExactly(new Document("present", true));
                 var explain = database.runCommand(new Document("explain", aggregates.getFirst())
                         .append("verbosity", "executionStats"));
                 int probes = 0;
