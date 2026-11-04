@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash, createPublicKey, verify } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { CLUSTER, CODE, TOKEN, createWireFixture, web } from './image-runtime-probe.mjs';
+import { CLUSTER, CODE, FORMAL_CODE, TOKEN, createWireFixture, verify as verifyPhase, web } from './image-runtime-probe.mjs';
 
 test('the Web probe requests HTML documents while preserving asset and API dispatch', async (t) => {
   const html = '<html><script src="/assets/runtime.js"></script></html>';
@@ -45,6 +46,22 @@ async function fixture(t) {
     signal: AbortSignal.timeout(5000) });
   return { ...peer, base, post };
 }
+
+test('the real-image peer grants a fresh CONFIG initialization claim', async (t) => {
+  const peer = await fixture(t);
+  const contract = JSON.parse(readFileSync(new URL(
+    '../../app/src/test/resources/cloud-configuration-initialization-v1.json', import.meta.url), 'utf8'));
+  const path = contract.claimPath.replace(contract.clusterId, CLUSTER);
+  const response = await peer.post(path, contract.claimRequest, { Authorization: `Bearer ${TOKEN}` });
+  const body = await response.json();
+  assert.equal(response.status, 200,
+    `fresh CONFIG initialization claim must be supported by the smoke peer: ${JSON.stringify(body)}`);
+  assert.equal(body.code, contract.claimResponse.code);
+  const { operationId } = body.data;
+  assert.match(operationId, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.deepEqual(body.data, { ...contract.claimResponse.data, clusterId: CLUSTER, operationId });
+  assert.equal(peer.state.failures, 0);
+});
 
 test('the controlled peer signs real RS256 claims and consumes a code once', async (t) => {
   const peer = await fixture(t);
@@ -112,4 +129,73 @@ test('malformed and unexpected requests cannot become successful fixture evidenc
   assert.equal((await peer.post(`/v1/api/clusters/${CLUSTER}/status-report`, {
     nonce: 'nonce', runtimeVersion: '0.6.0', activePipelines: 0, uptimeMs: 1 }, {})).status, 400);
   assert.equal(peer.state.failures, 2);
+});
+
+test('configuration claim, bodyless egress and completion retain the original scope', async (t) => {
+  const peer = await fixture(t);
+  const prefix = `/v1/api/clusters/${CLUSTER}/configuration-initialization/`;
+  const headers = { Authorization: `Bearer ${TOKEN}` };
+  const claim = { bootId: '550e8400-e29b-41d4-a716-446655440001', configurationHash: 'a'.repeat(64) };
+  const granted = await peer.post(prefix + 'claim', claim, headers);
+  assert.equal(granted.status, 200);
+  const { data } = await granted.json();
+  assert.equal(data.creationGranted, true);
+  const egress = await fetch(peer.base + `/v1/api/clusters/${CLUSTER}/egress-address`, { headers });
+  assert.equal(egress.status, 200);
+  assert.deepEqual((await egress.json()).data,
+    { organizationId: 'image-runtime-org', clusterId: CLUSTER, egressAddressStatus: 'DYNAMIC' });
+  const completion = { operationId: data.operationId, configurationHash: claim.configurationHash };
+  assert.equal((await peer.post(prefix + 'complete', { ...completion, configurationHash: 'b'.repeat(64) }, headers)).status, 400);
+  assert.equal((await peer.post(prefix + 'complete', completion, headers)).status, 200);
+  const repeated = await peer.post(prefix + 'claim', claim, headers);
+  assert.deepEqual((await repeated.json()).data, { ...data, creationGranted: false, phase: 'COMPLETE' });
+  assert.equal((await peer.post(prefix + 'claim', { ...claim, bootId: '550e8400-e29b-41d4-a716-446655440002' }, headers)).status, 400);
+  assert.equal((await peer.post(prefix + 'claim', claim, { Authorization: 'Bearer wrong' })).status, 400);
+  assert.equal(peer.state.claims.length, 2);
+  assert.equal(peer.state.completions.length, 1);
+  assert.equal(peer.state.failures, 3);
+});
+
+test('setup and formal exchange codes are independently consumed and never leak in proof', async (t) => {
+  const peer = await fixture(t);
+  const exchange = (exchangeCode) => peer.post('/v1/api/auth/exchange', { exchangeCode, clusterId: CLUSTER },
+    { 'X-Cluster-Identity-Secret': TOKEN });
+  const jtis = [];
+  for (const code of [CODE, FORMAL_CODE]) {
+    const response = await exchange(code);
+    assert.equal(response.status, 200);
+    jtis.push((await response.json()).data.jti);
+    assert.equal((await exchange(code)).status, 401);
+  }
+  assert.notEqual(jtis[0], jtis[1]);
+  const proof = await (await fetch(peer.base + '/proof')).text();
+  for (const secret of [TOKEN, CODE, FORMAL_CODE]) assert(!proof.includes(secret));
+  assert.equal(peer.state.exchanges, 4);
+  assert.equal(peer.state.failures, 0);
+});
+
+test('a seed refusal requires the unavailable business code while retaining the login root', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  let status = 503;
+  let code = 'control.storage-unavailable';
+  let entry = 'LOGIN';
+  const server = createServer((req, res) => {
+    const body = req.url === '/auth/storage-entry' ? { mode: 'CLOUD', entry }
+      : { code };
+    res.writeHead(req.url === '/auth/storage-entry' ? 200 : req.url === '/auth/bootstrap' ? 403 : status,
+      { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(body));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const probe = () => verifyPhase('seed-refused', base, undefined,
+    new URL('./connectors.lock.json', import.meta.url), undefined);
+  await probe();
+  code = 'control.cloud-auth-unavailable';
+  await assert.rejects(probe);
+  code = 'control.storage-unavailable'; status = 200;
+  await assert.rejects(probe);
+  status = 503; entry = 'UNAVAILABLE';
+  await assert.rejects(probe);
 });
