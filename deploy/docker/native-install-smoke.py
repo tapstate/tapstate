@@ -43,8 +43,11 @@ def owned_container(*args, body=None):
     owner = uuid.uuid4().hex
     name = "tapstate-native-install-" + owner
     label = "io.tapstate.native-install-smoke.owner"
+    labels = ["--label", label + "=" + owner]
+    if os.environ.get("TAPSTATE_ISSUE_LOOP_OWNER"):
+        labels += ["--label", "io.tapstate.issue-loop.owner=" + os.environ["TAPSTATE_ISSUE_LOOP_OWNER"]]
     try:
-        identity = command("docker", "create", "--name", name, "--label", label + "=" + owner, *args).decode().strip()
+        identity = command("docker", "create", "--name", name, *labels, *args).decode().strip()
         if not re.fullmatch(r"[0-9a-f]{64}", identity):
             raise RuntimeError("Docker did not return an exact created container identity")
         flags = ("--attach", "--interactive") if body is not None else ("--attach",)
