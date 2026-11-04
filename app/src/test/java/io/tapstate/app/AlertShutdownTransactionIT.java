@@ -23,8 +23,6 @@ import static org.awaitility.Awaitility.await;
 @RequiresDocker
 class AlertShutdownTransactionIT {
     @Container static final MongoDBContainer MONGO = AlertEvaluationHostIT.MONGO
-            .withLabels(System.getenv("TAPSTATE_TEST_RESOURCE_OWNER") == null ? Map.of()
-                    : Map.of("io.tapstate.issue-loop.owner", System.getenv("TAPSTATE_TEST_RESOURCE_OWNER")))
             .withTmpFs(Map.of("/data/db", "rw", "/data/configdb", "rw"));
 
     @Test void closeEndsTheEvaluationTransactionBeforeConfigurationClientClosure() {
