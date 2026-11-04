@@ -112,7 +112,15 @@ class MongoClaimOperationsTest {
                 return true;
             })));
             assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();
-            assertThatThrownBy(()->operations.call(deadline(30),pendingCalls::incrementAndGet)).isInstanceOf(TapstateException.class);
+            for (int i = 0; i < 8; i++) {
+                assertThatThrownBy(()->operations.call(deadline(30),pendingCalls::incrementAndGet)).isInstanceOf(TapstateException.class);
+            }
+            var field = MongoClaimOperations.class.getDeclaredField("workers");
+            field.setAccessible(true);
+            var workers = (java.util.concurrent.ThreadPoolExecutor) field.get(operations);
+            assertThat(workers.getQueue()).as("expired pending actions must release their closures").isEmpty();
+            assertThat(originals).allMatch(original -> !original.isDone());
+            assertThat(pendingCalls).hasValue(0);
             release.countDown();for(var original:originals)assertThat(original.get(2,TimeUnit.SECONDS)).isTrue();
             operations.await(deadline(2000));operations.closeIfIdle();
             assertThat(pendingCalls).hasValue(0);

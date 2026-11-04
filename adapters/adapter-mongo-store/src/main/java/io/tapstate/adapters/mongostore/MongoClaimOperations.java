@@ -130,6 +130,7 @@ final class MongoClaimOperations {
 
         void cancelPending() {
             if (state.compareAndSet(0, 2)) {
+                workers.remove(this);
                 finished();
                 result.completeExceptionally(MongoCacheWorkloadClaimStore.claimFenced());
             }

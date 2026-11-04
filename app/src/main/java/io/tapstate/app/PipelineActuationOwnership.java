@@ -724,17 +724,30 @@ final class PipelineActuationOwnership {
      * A claim the store will not renew is dropped here exactly as the pass would drop it, and the pass
      * takes it from there.
      */
-    void renewDue() {admittedCall(()->{renewDueOwned();return null;},()->null);}
-    private synchronized void renewDueOwned() {
-        if (!fenced || closing) {
-            return;
+    void renewDue() {
+        Set<Held> visited = new HashSet<>();
+        // Each independent renewal owns one allowance and yields the fair IO gate afterward.
+        // Reselect from the current map so a claim admitted during IO can join this pass.
+        while (admittedCall(() -> renewNextDue(visited), () -> false)) {
+            // A Held is visited once even if its next contact becomes due again during this pass.
         }
+    }
+
+    private synchronized boolean renewNextDue(Set<Held> visited) {
+        if (!fenced || closing || !admission.current()) return false;
         long now = nanoTime.getAsLong();
+        Held oldest = null;
         for (Held state : held.values()) {
-            if (state.claim != null && state.contacted && now - state.nextContactNanos >= 0) {
-                renew(state, now);
+            if (state.claim != null && state.contacted && !visited.contains(state)
+                    && now - state.nextContactNanos >= 0
+                    && (oldest == null || state.nextContactNanos - oldest.nextContactNanos < 0)) {
+                oldest = state;
             }
         }
+        if (oldest == null) return false;
+        visited.add(oldest);
+        renew(oldest, now);
+        return true;
     }
 
     /**
