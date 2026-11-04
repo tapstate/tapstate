@@ -159,7 +159,9 @@ class PipelineExplainServiceTest {
 
         assertThat(answer.kind()).isEqualTo(Kind.NO_MATCH);
         assertThat(answer.evidence()).contains(new Evidence(Source.SNAPSHOT, "initialLoad",
-                Map.of("order_line", "READING", "customer", "LANDED")));
+                Map.of(
+                        "order_line", new InitialLoad.Table(InitialLoad.Stage.READING, 50_344L, 100_280L),
+                        "customer", new InitialLoad.Table(InitialLoad.Stage.LANDED, 10_000L, 10_000L))));
         assertThat(answer.cannotSay()).doesNotContain("explain.cannot-snapshot-phase");
     }
 

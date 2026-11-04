@@ -150,9 +150,9 @@ public final class PipelineExplainService {
                 evidence(Source.METRICS, RECORD_COUNT, facts.recordCount()),
                 evidence(Source.METRICS, "frontierStalledMillis", facts.frontierStalledMillis()),
                 evidence(Source.SNAPSHOT, "rowsDone", facts.snapshotRowsDone()));
-        if (facts.loadStages() != null) {
+        if (facts.initialLoadTables() != null) {
             evidence = new ArrayList<>(evidence);
-            evidence.add(evidence(Source.SNAPSHOT, "initialLoad", facts.loadStages()));
+            evidence.add(evidence(Source.SNAPSHOT, "initialLoad", facts.initialLoadTables()));
         }
         List<String> cannotSay = new ArrayList<>();
         if (time.freshness() == Freshness.UNKNOWN) {
@@ -162,7 +162,7 @@ public final class PipelineExplainService {
         if (observation.state() == PipelineState.PAUSED) {
             cannotSay.add(text("explain.cannot-paused-job", Map.of()));
         }
-        if (facts.loadStages() == null) {
+        if (facts.initialLoadTables() == null) {
             cannotSay.add(text("explain.cannot-snapshot-phase", Map.of()));
         }
         return answer(observation, time, Kind.NO_MATCH, text("explain.no-match", Map.of()),
@@ -176,7 +176,7 @@ public final class PipelineExplainService {
     }
 
     private Facts facts(Observation observation) {
-        Map<String, String> loadStages = loadStages(observation.initialLoad());
+        Map<String, InitialLoad.Table> initialLoadTables = initialLoadTables(observation.initialLoad());
         Map<String, Long> frontierStalledMillis = new TreeMap<>();
         Map<String, Long> stalled = new TreeMap<>();
         observation.metrics().forEach((name, value) -> {
@@ -185,7 +185,8 @@ public final class PipelineExplainService {
                 frontierStalledMillis.put(chain, value);
                 // A table still in its initial load has no durable position to advance yet, so its pinned
                 // time grows with the load and says nothing about the target.
-                if (FrontierStallPressure.EXPLAIN.isOver(value) && !stillLoading(loadStages, observation, chain)) {
+                if (FrontierStallPressure.EXPLAIN.isOver(value)
+                        && !stillLoading(initialLoadTables, observation, chain)) {
                     stalled.put(chain, value);
                 }
             }
@@ -194,30 +195,29 @@ public final class PipelineExplainService {
         return new Facts(observation.metrics().get(RECONCILE_STREAK),
                 observation.metrics().get(RECORD_COUNT),
                 Collections.unmodifiableMap(new LinkedHashMap<>(frontierStalledMillis)),
-                Collections.unmodifiableMap(new LinkedHashMap<>(stalled)), rowsDone, loadStages);
+                Collections.unmodifiableMap(new LinkedHashMap<>(stalled)), rowsDone, initialLoadTables);
     }
 
-    /** Each table's initial-load stage by name, or null when the observation carries no initial load. */
-    private static Map<String, String> loadStages(InitialLoad initialLoad) {
+    /** Each table's initial-load reading by name, or null when the observation carries no initial load. */
+    private static Map<String, InitialLoad.Table> initialLoadTables(InitialLoad initialLoad) {
         if (initialLoad == null || initialLoad.tables().isEmpty()) {
             return null;
         }
-        Map<String, String> stages = new TreeMap<>();
-        initialLoad.tables().forEach((table, load) -> stages.put(table, load.stage().name()));
-        return Collections.unmodifiableMap(stages);
+        return Collections.unmodifiableMap(new TreeMap<>(initialLoad.tables()));
     }
 
     /**
      * Whether the chain's table is still in its initial load. Without an initial-load reading, as a copy publishes,
      * a table the snapshot reports read through but not yet landed is still loading.
      */
-    private static boolean stillLoading(Map<String, String> loadStages, Observation observation, String chain) {
-        if (loadStages == null) {
+    private static boolean stillLoading(Map<String, InitialLoad.Table> initialLoadTables,
+            Observation observation, String chain) {
+        if (initialLoadTables == null) {
             TableSnapshot table = observation.snapshot().get(chain);
             return table != null && !table.landed();
         }
-        String stage = loadStages.get(chain);
-        return stage != null && !InitialLoad.Stage.LANDED.name().equals(stage);
+        InitialLoad.Table table = initialLoadTables.get(chain);
+        return table != null && table.stage() != InitialLoad.Stage.LANDED;
     }
 
     private Time time(Instant observedAt) {
@@ -277,6 +277,6 @@ public final class PipelineExplainService {
 
     private record Facts(Long reconcileFailures, Long recordCount,
             Map<String, Long> frontierStalledMillis, Map<String, Long> stalledChains,
-            long snapshotRowsDone, Map<String, String> loadStages) {
+            long snapshotRowsDone, Map<String, InitialLoad.Table> initialLoadTables) {
     }
 }

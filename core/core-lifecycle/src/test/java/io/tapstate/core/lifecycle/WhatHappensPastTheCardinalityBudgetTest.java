@@ -365,6 +365,21 @@ class WhatHappensPastTheCardinalityBudgetTest {
         return new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points);
     }
 
+    /** A namespace info reading whose origin labels vary with every namespace. */
+    private static MetricFact namespaceOriginsOver(int namespaces) {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 1; index <= namespaces; index++) {
+            String suffix = String.format("%04d", index);
+            points.add(MetricPoint.reading(Map.of(
+                    PIPELINE_ID, PIPELINE,
+                    NEST_NAMESPACE, "ns" + suffix,
+                    MetricAttributes.NEST_STEP, "step" + suffix,
+                    MetricAttributes.NEST_PATH, "[\"path" + suffix + "\"]",
+                    MetricAttributes.NEST_MAP, "state"), OBSERVED, 1L));
+        }
+        return new MetricFact("tapstate.pipeline.nest.namespace.info", MetricType.GAUGE, "1", points);
+    }
+
     @Test
     @DisplayName("an id applied again over other tables gets its budget back, because the fold gave up the old ones")
     void aFolderGivesUpWhatItNamedForAPipelineThatIsGone() {
@@ -408,6 +423,20 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(overflowSeries(folded)).singleElement()
                 .satisfies(series -> assertThat(series.value()).isEqualTo(tables));
         assertThat(folded.points().stream().mapToLong(MetricPoint::value).max().orElseThrow()).isEqualTo(tables);
+    }
+
+    @Test
+    @DisplayName("namespace info folds origin labels with namespaces past its budget")
+    void namespaceInfoOriginsFoldIntoOneOverflowSeriesPerPipeline() {
+        MetricFact folded = CardinalityBudget.folder().fold(namespaceOriginsOver(1_200));
+
+        assertThat(folded.points()).hasSize(CardinalityBudget.NEST_NAMESPACE_INFO.distinctValues() + 1);
+        assertThat(overflowSeries(folded)).singleElement().satisfies(series -> {
+            assertThat(series.attributes()).containsEntry(PIPELINE_ID, PIPELINE).containsEntry(OVERFLOW, "true");
+            assertThat(series.attributes()).doesNotContainKeys(NEST_NAMESPACE, MetricAttributes.NEST_STEP,
+                    MetricAttributes.NEST_PATH, MetricAttributes.NEST_MAP);
+            assertThat(series.value()).isEqualTo(1L);
+        });
     }
 
     @Test
