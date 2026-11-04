@@ -13,6 +13,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import org.bson.Document;
@@ -65,8 +66,8 @@ class AStatusReadReusesItsSetupSnapshotIT {
             } finally {
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
-            assertThat(status.get("clusterId")).isEqualTo(storage.clusterId());
-            assertThat(status.get("businessPhase")).isEqualTo("READY");
+            assertThat(new HashMap<Object, Object>(status)).containsEntry("clusterId", storage.clusterId())
+                    .containsEntry("businessPhase", "READY");
             System.out.println("NATIVE_STATUS_SETUP_SNAPSHOT directFindFault=2 businessPhase=READY");
 
             setup.updateOne(new Document("_id", "cluster"), new Document("$set", new Document("generation", "invalid")));
@@ -76,9 +77,9 @@ class AStatusReadReusesItsSetupSnapshotIT {
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString("{}")).build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(503);
-                assertThat(((Map<?, ?>) JsonReader.parse(response.body())).get("code"))
-                        .isEqualTo(ControlError.STORAGE_UNAVAILABLE.code());
-                assertThat(setup.find(new Document("_id", "cluster")).first().get("generation")).isEqualTo("invalid");
+                assertThat(new HashMap<Object, Object>((Map<?, ?>) JsonReader.parse(response.body())))
+                        .containsEntry("code", ControlError.STORAGE_UNAVAILABLE.code());
+                assertThat(setup.find(new Document("_id", "cluster")).first()).containsEntry("generation", "invalid");
             } finally {
                 setup.replaceOne(new Document("_id", "cluster"), original);
             }

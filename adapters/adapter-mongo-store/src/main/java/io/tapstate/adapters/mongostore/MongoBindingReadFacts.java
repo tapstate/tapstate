@@ -6,10 +6,15 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.connection.ClusterType;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import org.bson.Document;
 
 /** Bounded transport of facts from one CONFIG transaction attempt; validators remain at each caller. */
 final class MongoBindingReadFacts {
+    private static final String SINGLETON_ID = "cluster";
+    private static final String BINDING_VERSION = "bindingVersion";
+    private static final String ROOT_DOCUMENT = "$$ROOT";
+
     private static final int INLINE_BYTES = 64 * 1024;
     record Facts(Document identity, Document setup, Document global, boolean conflictingResource) {}
 
@@ -27,13 +32,13 @@ final class MongoBindingReadFacts {
             MongoCollection<Document> setup, MongoCollection<Document> notes,
             List<MongoCollection<Document>> otherResources) {
         var pipeline = new ArrayList<Document>();
-        pipeline.add(new Document("$match", new Document("_id", "cluster")));
+        pipeline.add(new Document("$match", new Document("_id", SINGLETON_ID)));
         pipeline.add(captured());
-        pipeline.add(lookup(setup, "cluster", "setup", false));
+        pipeline.add(lookup(setup, SINGLETON_ID, "setup", false));
         boolean bound = binding != null && binding.get("defaultSourceId") instanceof String
-                && binding.get("bindingVersion") instanceof Long;
+                && binding.get(BINDING_VERSION) instanceof Long;
         if (bound) {
-            Object noteId = new Document("bindingVersion", binding.get("bindingVersion"))
+            Object noteId = new Document(BINDING_VERSION, binding.get(BINDING_VERSION))
                     .append("namespace", "pdk.global-state");
             pipeline.add(lookup(notes, noteId, "global", false));
             for (int i = 0; i < otherResources.size(); i++)
@@ -41,13 +46,13 @@ final class MongoBindingReadFacts {
         }
         Document row = identity.aggregate(session, pipeline).first();
         if (row == null) return new Facts(null, null, null, false);
-        Document cluster = unwrap(session, row, identity, "cluster");
-        Document stage = unwrap(session, first(row, "setup"), setup, "cluster");
+        Document cluster = unwrap(session, row, identity, SINGLETON_ID).orElse(null);
+        Document stage = unwrap(session, first(row, "setup"), setup, SINGLETON_ID).orElse(null);
         Document global = null;
         boolean conflict = false;
         if (bound) {
-            global = unwrap(session, first(row, "global"), notes, new Document("bindingVersion", binding.get("bindingVersion"))
-                    .append("namespace", "pdk.global-state"));
+            global = unwrap(session, first(row, "global"), notes, new Document(BINDING_VERSION, binding.get(BINDING_VERSION))
+                    .append("namespace", "pdk.global-state")).orElse(null);
             for (int i = 0; i < otherResources.size(); i++)
                 conflict |= first(row, "conflict" + i) != null;
         }
@@ -65,10 +70,10 @@ final class MongoBindingReadFacts {
         // An existing legal document may be close to the BSON limit. Return a marker, then read
         // that document separately in this same snapshot instead of enlarging the lookup result.
         return new Document("$project", new Document("_id", 0)
-                .append("large", new Document("$gt", List.of(new Document("$bsonSize", "$$ROOT"), INLINE_BYTES)))
+                .append("large", new Document("$gt", List.of(new Document("$bsonSize", ROOT_DOCUMENT), INLINE_BYTES)))
                 .append("value", new Document("$cond", new Document("if",
-                        new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), INLINE_BYTES)))
-                        .append("then", "$$ROOT").append("else", null))));
+                        new Document("$lte", List.of(new Document("$bsonSize", ROOT_DOCUMENT), INLINE_BYTES)))
+                        .append("then", ROOT_DOCUMENT).append("else", null))));
     }
 
     private static Document first(Document row, String field) {
@@ -76,9 +81,9 @@ final class MongoBindingReadFacts {
         return values.isEmpty() ? null : values.getFirst();
     }
 
-    private static Document unwrap(ClientSession session, Document captured, MongoCollection<Document> table, Object id) {
-        if (captured == null) return null;
-        return Boolean.TRUE.equals(captured.get("large"))
-                ? table.find(session, new Document("_id", id)).first() : captured.get("value", Document.class);
+    private static Optional<Document> unwrap(ClientSession session, Document captured, MongoCollection<Document> table, Object id) {
+        if (captured == null) return Optional.empty();
+        return Optional.ofNullable(Boolean.TRUE.equals(captured.get("large"))
+                ? table.find(session, new Document("_id", id)).first() : captured.get("value", Document.class));
     }
 }
