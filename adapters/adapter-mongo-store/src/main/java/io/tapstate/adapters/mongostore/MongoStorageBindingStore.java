@@ -164,8 +164,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         });
     }
     private void requireAuthenticationPublished(ClientSession session, CachePreparation original) {
-        var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
-        var current = MongoStorageRecoveryStore.authentication(session, database, bound);
+        var loaded = load(session).orElseThrow(MongoStorageBindingStore::refused);
+        var current = loaded.recovery().authentication();
         if (current.pending() || !current.preparation().equals(original)) throw refused();
     }
     private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
@@ -319,12 +319,24 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     private Optional<Loaded> load(ClientSession session) {
-        Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+        return read(session).loaded();
+    }
+
+    TransactionFacts readForTransaction(ClientSession session) {
+        verifyIndex();
+        return read(session);
+    }
+
+    private TransactionFacts read(ClientSession session) {
+        boolean batched = MongoBindingReadFacts.supported(client);
+        Document stored = batched ? bindings.find(session, new Document("_id", "cluster")).first() : null;
+        var facts = batched ? MongoBindingReadFacts.read(session, stored, identity, setup, noteScopes, otherResources) : null;
+        Document cluster = batched ? facts.identity() : identity.find(session, new Document("_id", "cluster")).first();
         if (cluster == null || !(cluster.get("clusterId") instanceof String clusterId) || clusterId.isBlank()
                 || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
                 || !(cluster.get("bindingVersion") instanceof Long version) || version < 0 || version > 1) throw unreadable();
-        Document stored = bindings.find(session, new Document("_id", "cluster")).first();
-        Document state = setup.find(session, new Document("_id", "cluster")).first();
+        if (!batched) stored = bindings.find(session, new Document("_id", "cluster")).first();
+        Document state = batched ? facts.setup() : setup.find(session, new Document("_id", "cluster")).first();
         if (state == null || !clusterId.equals(state.get("clusterId"))
                 || !(state.get("installationId") instanceof String installationId) || installationId.isBlank()
                 || !(state.get("operationId") instanceof String operationId) || operationId.isBlank()
@@ -335,7 +347,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || state.containsKey("defaultSourceId") || state.containsKey("candidateHash")) throw unreadable();
             if (stored != null || sources.find(session, new Document("systemRole", DEFAULT_ROLE)).first() != null) throw unreadable();
             MongoStorageRecoveryStore.requireAbsent(session, database);
-            return Optional.empty();
+            return new TransactionFacts(Optional.empty(), state);
         }
         try {
             if (stored == null || !clusterId.equals(stored.get("clusterId"))
@@ -354,13 +366,13 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || !scope.operationId().equals(state.get("operationId"))) throw unreadable();
             Document source = sources.find(session, new Document("_id", defaultId)).first();
             if (source == null || !DEFAULT_ROLE.equals(source.get("systemRole"))
-                    || hasOtherResource(session, defaultId)
+                    || (batched ? facts.conflictingResource() : hasOtherResource(session, defaultId))
                     || !stored.get("sourceHash").equals(CanonicalHash.of(codec.decode(source)))) throw unreadable();
             String cacheJson = ciphers.current().decrypt(bindingContext(clusterId), "cache-binding", stored.getString("cache"));
             StorageBinding.Connection cache = decodeConnection(cacheJson);
             String candidateHash = fingerprint(mode, cacheJson, stored.getString("sourceHash"));
             if (!candidateHash.equals(stored.get("candidateHash")) || !candidateHash.equals(state.get("candidateHash"))) throw unreadable();
-            Document global = noteScopes.find(session, new Document("_id", new Document("bindingVersion", version)
+            Document global = batched ? facts.global() : noteScopes.find(session, new Document("_id", new Document("bindingVersion", version)
                     .append("namespace", "pdk.global-state"))).first();
             if (global == null || !"GLOBAL".equals(global.get("ownerKind")) || !clusterId.equals(global.get("ownerId"))
                     || !(global.get("generation") instanceof Long generation) || generation < 1
@@ -369,7 +381,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
                     || !Long.valueOf(0).equals(global.get("incomingCarries"))
                     || !Long.valueOf(0).equals(global.get("originGeneration"))) throw unreadable();
             StorageBinding binding = new StorageBinding(scope, mode, version, defaultId, cache);
-            return Optional.of(new Loaded(binding, candidateHash, MongoStorageRecoveryStore.load(session, database, binding)));
+            return new TransactionFacts(Optional.of(new Loaded(binding, candidateHash,
+                    MongoStorageRecoveryStore.read(session, database, binding, state))), state);
         } catch (NullPointerException | IllegalArgumentException | ClassCastException invalid) {
             // Stored or decrypted values may contain credentials. Never attach parser input or causes.
             throw unreadable();
@@ -477,5 +490,8 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         @Override public String toString() { return "FirstCacheCreation[redacted]"; }
     }
 
-    private record Loaded(StorageBinding binding, String candidateHash, CachePreparation cachePreparation) {}
+    record TransactionFacts(Optional<Loaded> loaded, Document setup) {}
+    record Loaded(StorageBinding binding, String candidateHash, MongoStorageRecoveryStore.Stored recovery) {
+        CachePreparation cachePreparation() { return recovery.preparation(); }
+    }
 }

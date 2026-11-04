@@ -48,6 +48,181 @@ class MongoStorageBindingStoreIT {
             "cache", "CA-material-sentinel");
 
     @Test
+    void aPublicationUsesBoundedCommandsWithoutRepeatingItsRecoveryRead() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var commands = new java.util.HashMap<String, Integer>();
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.CURRENT.set(command -> commands.merge(command, 1, Integer::sum));
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { f.domain.requireAuthenticationPublished(original.preparation()); }
+            finally { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).containsEntry("aggregate", 1).containsEntry("find", 3).containsEntry("commitTransaction", 1);
+            assertThat(collections).containsEntry("storage_binding", 1).containsEntry("storage_recovery", 1);
+            assertThat(collections).doesNotContainKey("storage_setup");
+        });
+    }
+
+    @Test
+    void legalLargeConfigurationFactsStillLoadIndividuallyInTheSameSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            String padding = "x".repeat(8 * 1024 * 1024 + 1024);
+            for (var collection : List.of(SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP,
+                    SystemCollections.PDK_NOTE_SCOPES))
+                collection.on(f.database).updateOne(new Document(), new Document("$set", new Document("padding", padding)));
+            assertThat(f.domain.bindings().load()).contains(original);
+            assertThat(f.domain.setupStates().load().scope()).isEqualTo(SCOPE);
+            // Extra recovery records remain corruption even when the canonical record is intact.
+            var recovery = SystemCollections.STORAGE_RECOVERY.on(f.database);
+            recovery.insertOne(new Document(recovery.find().first()).append("_id", "extra"));
+            assertThatThrownBy(() -> f.domain.bindings().load()).satisfies(MongoStorageBindingStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void batchedFactsUseTheExistingIdIndexesWithoutCollectionScans() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            // Materialize unrelated definitions so an absent collection's EOF shortcut cannot
+            // stand in for proving the ID lookup plan on populated collections.
+            f.domain.artifacts().saveAll(List.of(
+                    new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unrelated-flow\nsource: []\n"),
+                    definition("transform", "unrelated-transform"), definition("view", "unrelated-view"),
+                    definition("serve", "unrelated-serve")));
+            var captured = new java.util.concurrent.atomic.AtomicReference<Document>();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("aggregate")) {
+                                var command = event.getCommand();
+                                captured.set(new Document("aggregate", command.getString("aggregate").getValue())
+                                        .append("pipeline", Document.parse(command.toJson()).get("pipeline"))
+                                        .append("cursor", new Document()));
+                            }
+                        }
+                    }).build();
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            try (var client = MongoClients.create(settings)) {
+                var database = client.getDatabase(f.database.getName());
+                var store = new MongoStorageBindingStore(client, database, (SourceConfigCipherProvider) key.get(f.domain));
+                // Warm topology selection so the tested load uses the verified replica-set path.
+                database.runCommand(new Document("ping", 1));
+                assertThat(store.load()).contains(original);
+                assertThat(captured.get()).isNotNull();
+                var plan = database.runCommand(new Document("explain", captured.get()).append("verbosity", "executionStats"));
+                var lookups = plan.getList("stages", Document.class).stream().filter(stage -> stage.containsKey("$lookup")).toList();
+                assertThat(lookups).hasSize(6).allSatisfy(stage -> {
+                    assertThat(stage.getList("indexesUsed", String.class)).contains("_id_");
+                    assertThat(((Number) stage.get("collectionScans")).longValue()).isZero();
+                    assertThat(((Number) stage.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(1);
+                });
+                System.out.println("CONFIG_LOOKUP_PLAN " + lookups.stream().map(stage -> Map.of(
+                        "indexes", stage.get("indexesUsed"), "examined", stage.get("totalDocsExamined"),
+                        "scans", stage.get("collectionScans"))).toList());
+            }
+        });
+    }
+
+    @Test
+    void aRetriedReadRebuildsAllFactsAndRunsItsGuardAgain() {
+        withPrepared(f -> {
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                if (checks.incrementAndGet() == 3) SystemCollections.STORAGE_SETUP.on(f.database).deleteMany(new Document());
+            });
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("aggregate")).append("errorCode", 112)
+                            .append("errorLabels", List.of("TransientTransactionError"))));
+            try { assertThatThrownBy(guarded::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            assertThat(checks.get()).isGreaterThanOrEqualTo(3);
+            assertThat(f.revision()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aCommitFailureDiscardsTheCompletedAttemptBeforeRereadingFacts() {
+        withPrepared(f -> {
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                // The first callback reached its final guard before commit failed. The next
+                // callback must observe this loss instead of publishing its previous facts.
+                if (checks.incrementAndGet() == 4) SystemCollections.STORAGE_SETUP.on(f.database).deleteMany(new Document());
+            });
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("commitTransaction")).append("errorCode", 112)
+                            .append("errorLabels", List.of("TransientTransactionError"))));
+            try { assertThatThrownBy(guarded::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            assertThat(checks.get()).isGreaterThanOrEqualTo(4);
+            assertThat(f.revision()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void anUnknownCommitResultRetriesOnlyTheCommitOfTheSameSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(checks::incrementAndGet);
+            var commands = new java.util.HashMap<String, Integer>();
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("commitTransaction"))
+                            .append("writeConcernError", new Document("code", 64).append("errmsg", "commit receipt unavailable"))
+                            .append("errorLabels", List.of("UnknownTransactionCommitResult"))));
+            MongoCommandObservation.CURRENT.set(command -> commands.merge(command, 1, Integer::sum));
+            try { assertThat(guarded.load()).contains(original); }
+            finally {
+                MongoCommandObservation.CURRENT.remove();
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("aggregate", 1).containsEntry("find", 3);
+            assertThat(checks).hasValue(3);
+        });
+    }
+
+    @Test
+    void unknownAndRouterTopologiesRetainEquivalentIndividualReads() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            var ciphers = (SourceConfigCipherProvider) key.get(f.domain);
+            var aggregates = new AtomicInteger();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("aggregate")) aggregates.incrementAndGet();
+                        }
+                    }).build();
+            try (var real = MongoClients.create(settings)) {
+                for (var topology : List.of(com.mongodb.connection.ClusterType.UNKNOWN, com.mongodb.connection.ClusterType.SHARDED)) {
+                    var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                    org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
+                            com.mongodb.connection.ClusterConnectionMode.MULTIPLE, topology, List.of()));
+                    var store = new MongoStorageBindingStore(client, real.getDatabase(f.database.getName()), ciphers);
+                    assertThat(store.load()).contains(original);
+                    SystemCollections.STORAGE_SETUP.on(f.database).updateOne(new Document(),
+                            new Document("$unset", new Document("generation", "")));
+                    assertThatThrownBy(store::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                    SystemCollections.STORAGE_SETUP.on(f.database).updateOne(new Document(),
+                            new Document("$set", new Document("generation", 1L)));
+                }
+                assertThat(aggregates).hasValue(0);
+            }
+        });
+    }
+
+    @Test
     void committedFirstCacheInvocationKeepsItsOperationOwnerWithoutSubmissionChecks() {
         withPrepared(f -> {
             var owner = new java.util.concurrent.atomic.AtomicBoolean(true);

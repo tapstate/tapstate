@@ -18,7 +18,9 @@ final class MongoStorageRecoveryStore {
     static final String AUTH_PREPARING = "AUTH_RECOVERY_PREPARING";
     static final String AUTH_READY = "AUTH_RECOVERY_READY";
     record Authentication(CachePreparation preparation, boolean pending) {}
-    private record Stored(Document row, CachePreparation preparation) {}
+    record Stored(Document row, CachePreparation preparation) {
+        Authentication authentication() { return new Authentication(preparation, AUTH_PREPARING.equals(row.get("phase"))); }
+    }
 
     private MongoStorageRecoveryStore() {}
 
@@ -39,7 +41,7 @@ final class MongoStorageRecoveryStore {
     }
     static Authentication authentication(ClientSession session, MongoDatabase database, StorageBinding binding) {
         var value = read(session, database, binding);
-        return new Authentication(value.preparation(), AUTH_PREPARING.equals(value.row().get("phase")));
+        return value.authentication();
     }
     static Authentication reserve(ClientSession session, MongoDatabase database, StorageBinding binding, CachePreparation expected,
             String operation, String incarnation) {
@@ -75,6 +77,14 @@ final class MongoStorageRecoveryStore {
                 .append("cacheIncarnation", row.get("cacheIncarnation"));
     }
     private static Stored read(ClientSession session, MongoDatabase database, StorageBinding binding) {
+        return read(session, database, binding, () -> SystemCollections.STORAGE_SETUP.on(database)
+                .find(session, new Document("_id", "cluster")).first());
+    }
+    static Stored read(ClientSession session, MongoDatabase database, StorageBinding binding, Document setup) {
+        return read(session, database, binding, () -> setup);
+    }
+    private static Stored read(ClientSession session, MongoDatabase database, StorageBinding binding,
+            java.util.function.Supplier<Document> setup) {
         var rows = SystemCollections.STORAGE_RECOVERY.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         if (rows.size() != 1) throw unreadable();
         Document row = rows.getFirst();
@@ -93,9 +103,9 @@ final class MongoStorageRecoveryStore {
             } else {
                 if (!java.util.Set.of(AUTH_PREPARING, AUTH_READY).contains(row.get("phase")) || generation < 2 || revision < 1
                         || !UUID.fromString(operation).toString().equals(operation)) throw unreadable();
-                Document setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
-                if (setup == null || !("COMPLETE".equals(setup.get("phase"))
-                        || binding.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(setup.get("phase")))) throw unreadable();
+                Document stage = setup.get();
+                if (stage == null || !("COMPLETE".equals(stage.get("phase"))
+                        || binding.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get("phase")))) throw unreadable();
             }
             var scope = new CacheAuthScope(binding.setup().clusterId(), binding.bindingVersion(), binding.mode(), incarnation, generation);
             var pending = MongoStorageRecoveryCommands.pending(row);
