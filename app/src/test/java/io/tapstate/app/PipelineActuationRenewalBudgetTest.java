@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -88,23 +89,29 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
-    @Test void aNormallyAdmittedMidBatchClaimIsRenewedBeforeItsLeaseExpires() throws Exception {
+    @ParameterizedTest
+    @CsvSource({"6,5", "4,10"})
+    void aNormallyAdmittedMidBatchClaimIsRenewedBeforeItsLeaseExpires(int oldCount, int intervalSeconds) throws Exception {
         try (var io = new ControlledIo(); var callers = Executors.newFixedThreadPool(2)) {
-            var owner = io.owner();
-            var originals = seed(io, owner, 6);
-            io.makeDue();io.delayMillis = 4000;
+            var interval = Duration.ofSeconds(intervalSeconds);
+            var owner = io.owner(true, interval);
+            var originals = seed(io, owner, oldCount);
+            io.localOffset.addAndGet(interval.toNanos());io.delayMillis = 4000;
             io.release = new CountDownLatch(1);
             var renewal = callers.submit(owner::renewDue);
             try {
                 assertThat(io.entered.await(2, TimeUnit.SECONDS)).isTrue();
-                var admitting = callers.submit(() -> seedOne(io, owner, IDS.get(6)));
+                String newcomer = IDS.get(oldCount);
+                var admitting = callers.submit(() -> seedOne(io, owner, newcomer));
                 awaitQueuedAdmission(owner);
                 io.release.countDown();
                 originals.add(admitting.get(15, TimeUnit.SECONDS));
                 renewal.get(40, TimeUnit.SECONDS);
-                assertThat(io.attempts).containsExactlyElementsOf(IDS);
+                assertThat(io.attempts).containsExactlyElementsOf(IDS.subList(0, oldCount));
                 Thread.sleep(1000);
                 owner.renewDue();
+                // The newcomer's acquire reply precedes later tail renewals, so it gets an earlier turn.
+                assertThat(io.attempts.subList(oldCount, oldCount + 2)).contains(newcomer);
                 assertLive(io, owner, originals);
             } finally {
                 io.release.countDown();
@@ -230,17 +237,19 @@ class PipelineActuationRenewalBudgetTest {
 
         private PipelineActuationOwnership owner() { return owner(true); }
 
-        private PipelineActuationOwnership owner(boolean scoped) {
+        private PipelineActuationOwnership owner(boolean scoped) { return owner(scoped, RENEW); }
+
+        private PipelineActuationOwnership owner(boolean scoped, Duration interval) {
             var properties = new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
             var membership = new ClusterMembershipGate(properties);membership.observeNodeSession(() -> true);
             membership.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
             membership.canCommit(Set.of("node-a", "node-b"));
             assertThat(membership.businessEligible()).isTrue();
             if (!scoped) return new PipelineActuationOwnership("cluster-a", OWNER, membership,
-                    new ClusterWorkloadClaims(store, membership), TTL, RENEW,
+                    new ClusterWorkloadClaims(store, membership), TTL, interval,
                     () -> System.nanoTime() + localOffset.get());
             return PipelineActuationOwnership.scoped(BUSINESS, OWNER, membership,
-                    new ClusterWorkloadClaims(store, membership), TTL, RENEW,
+                    new ClusterWorkloadClaims(store, membership), TTL, interval,
                     () -> System.nanoTime() + localOffset.get());
         }
 

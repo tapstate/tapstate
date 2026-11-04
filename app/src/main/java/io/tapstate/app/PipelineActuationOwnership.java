@@ -15,10 +15,11 @@ import io.tapstate.spi.store.WorkloadOwner;
 
 import java.time.Duration;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -81,6 +82,8 @@ final class PipelineActuationOwnership {
     private final boolean fenced;
     private final Map<String, Held> held = new HashMap<>();
     private final Map<String, Control> controls = new HashMap<>();
+    /** Local scheduling order only; neither a lease deadline nor an authority token. */
+    private long leaseProofSequence;
 
     /** A synchronous control command pins the existing holder; it creates no second durable lease. */
     final class Control implements AutoCloseable {
@@ -267,6 +270,8 @@ final class PipelineActuationOwnership {
         }
         private long nextContactNanos;
         private boolean contacted;
+        /** Successful acquire/renew replies are serialized by the ownership IO gate. */
+        private long leaseProofOrder;
         /**
          * The members the run this member last submitted was planned over -- the ones in sight when it
          * was submitted -- or null while it has submitted none. Kept apart from the claim, whose own
@@ -563,6 +568,7 @@ final class PipelineActuationOwnership {
                         state.claim = null; return Execution.refused();
                     }
                     state.claim = actual;
+                    state.leaseProofOrder = ++leaseProofSequence;
                 }
                 if (!planned.equals(membership.committed()) || !membership.businessEligible()) {
                     state.claim = null; return Execution.refused();
@@ -725,29 +731,33 @@ final class PipelineActuationOwnership {
      * takes it from there.
      */
     void renewDue() {
-        Set<Held> visited = new HashSet<>();
-        // Each independent renewal owns one allowance and yields the fair IO gate afterward.
-        // Reselect from the current map so a claim admitted during IO can join this pass.
-        while (admittedCall(() -> renewNextDue(visited), () -> false)) {
-            // A Held is visited once even if its next contact becomes due again during this pass.
+        // A finite pass lets previously renewed claims compete again even under continuous arrivals.
+        List<Held> due = admittedCall(this::dueRenewals, List::of);
+        for (Held state : due) {
+            // Each independent renewal owns one allowance and yields the fair IO gate afterward.
+            admittedCall(() -> { renewIfDue(state);return null; }, () -> null);
         }
     }
 
-    private synchronized boolean renewNextDue(Set<Held> visited) {
-        if (!fenced || closing || !admission.current()) return false;
+    private synchronized List<Held> dueRenewals() {
+        if (!fenced || closing || !admission.current()) return List.of();
         long now = nanoTime.getAsLong();
-        Held oldest = null;
-        for (Held state : held.values()) {
-            if (state.claim != null && state.contacted && !visited.contains(state)
-                    && now - state.nextContactNanos >= 0
-                    && (oldest == null || state.nextContactNanos - oldest.nextContactNanos < 0)) {
-                oldest = state;
-            }
+        // Earlier successful lease proofs take priority over subsequently renewed tails. This also
+        // gives mid-pass arrivals their turn without interpreting the store's absolute deadlines.
+        return held.values().stream().filter(state -> due(state, now))
+                .sorted(Comparator.comparingLong(state -> state.leaseProofOrder)).toList();
+    }
+
+    private synchronized void renewIfDue(Held state) {
+        long now = nanoTime.getAsLong();
+        if (!closing && admission.current() && due(state, now)
+                && held.get(state.claim.key().resourceId()) == state) {
+            renew(state, now);
         }
-        if (oldest == null) return false;
-        visited.add(oldest);
-        renew(oldest, now);
-        return true;
+    }
+
+    private static boolean due(Held state, long now) {
+        return state.claim != null && state.contacted && now - state.nextContactNanos >= 0;
     }
 
     /**
@@ -1156,6 +1166,7 @@ final class PipelineActuationOwnership {
             return Permit.denied();
         }
         state.claim = renewed.get();
+        state.leaseProofOrder = ++leaseProofSequence;
         return new Permit(true, state.claim);
     }
 
@@ -1182,6 +1193,7 @@ final class PipelineActuationOwnership {
         if(closing || !admission.current() || !current.equals(membership.committed()) || !membership.businessEligible()
                 || state.scope!=null&&!accepts(state.scope))return Permit.denied();
         state.claim = attempt.get().claim();
+        state.leaseProofOrder = ++leaseProofSequence;
         state.failureObservedAtNanos = NEVER;
         state.visibilityRevisionAtDetectionWindow = NEVER;
         if (state.claim.executionGeneration() != state.runExecutionGeneration) {
