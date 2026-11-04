@@ -161,6 +161,46 @@ class ConfiguredCaptureNotesTest {
         assertThat(port.discoverSchema(config()).tables()).extracting("name").contains("t1");
     }
 
+    @Test void privatePostgresReleaseVerifiesTheFrozenOriginalSlot(@TempDir Path dir) {
+        try(Fixture fixture=fixture(dir,false)) {
+            fixture.channel.put("changeSlotOnRelease",true);
+            var port=PdkCapturePort.withRequiredNotes(id -> fixture.ref,null,fixture.scopes);
+            assertThat(port.releasePrivatePostgresSlot(config())).isEmpty();
+            assertThat(fixture.released).containsExactly("recorded-slot");
+            assertThat((List<?>)fixture.channel.get("queries")).singleElement().satisfies(sql ->
+                    assertThat(sql.toString()).contains("slot_name='recorded-slot'").doesNotContain("changed-slot"));
+        }
+    }
+
+    @Test void aRemainingPrivateSlotIsNotReportedAsRetired(@TempDir Path dir) {
+        try(Fixture fixture=fixture(dir,false)) {
+            fixture.channel.put("slotCount",1L);
+            var port=PdkCapturePort.withRequiredNotes(id -> fixture.ref,null,fixture.scopes);
+            assertThat(port.releasePrivatePostgresSlot(config())).hasValueSatisfying(refused -> {
+                assertThat(refused.code()).isEqualTo(ConnectorError.RELEASE_FAILED);
+                assertThat(refused.args().get("detail").toString()).contains("not confirmed absent");
+            });
+        }
+    }
+
+    @Test void aNonNumericAbsenceResultDoesNotAuthorizeRetirement(@TempDir Path dir) {
+        try(Fixture fixture=fixture(dir,false)) {
+            fixture.channel.put("slotCount","0");
+            var port=PdkCapturePort.withRequiredNotes(id -> fixture.ref,null,fixture.scopes);
+            assertThat(port.releasePrivatePostgresSlot(config())).hasValueSatisfying(refused ->
+                    assertThat(refused.code()).isEqualTo(ConnectorError.RELEASE_FAILED));
+        }
+    }
+
+    @Test void privateSlotPolicyUsesThePinnedOriginalConfiguration(@TempDir Path dir) {
+        try(Fixture fixture=fixture(dir,false)) {
+            var port=PdkCapturePort.withRequiredNotes(id -> fixture.ref,null,fixture.scopes);
+            assertThat(port.automaticallyClearsPrivatePostgres(ConnectorNoteOrigin.capture("postgres",fixture.ref.contentHash(),Map.of()))).isTrue();
+            assertThat(port.automaticallyClearsPrivatePostgres(ConnectorNoteOrigin.capture("postgres",fixture.ref.contentHash(),Map.of("autoClearSlot",true)))).isTrue();
+            assertThat(port.automaticallyClearsPrivatePostgres(ConnectorNoteOrigin.capture("postgres",fixture.ref.contentHash(),Map.of("autoClearSlot",false)))).isFalse();
+        }
+    }
+
     private static CaptureConfig config() {
         return new CaptureConfig("postgres", Map.of(), List.of("t1")).at(NODE);
     }
@@ -205,7 +245,7 @@ class ConfiguredCaptureNotesTest {
                         if (method.getName().equals("read")) {
                             if (args[1].equals("late")) lateReads.incrementAndGet();
                             return args[1].equals("tapdata_pg_slot")
-                                    ? new RequiredNoteValue(1, ConnectorStateCodec.encode("recorded-slot"))
+                                    ? new RequiredNoteValue(1, ConnectorStateCodec.encode(String.valueOf(channel.getOrDefault("currentSlot","recorded-slot"))))
                                     : new RequiredNoteValue(0, null);
                         }
                         throw new AssertionError("unexpected configured note operation: " + method.getName());
