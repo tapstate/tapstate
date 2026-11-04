@@ -4,21 +4,23 @@ import io.tapstate.spi.store.KeyedStateStore;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Coalesces partition loaders already waiting for the same namespace's backend. The first caller
- * executes immediately; callers arriving during that I/O form the next bounded batch. No timer,
- * executor, read cache or background write is introduced. Each map operation remains blocked until
- * its own backend result is known, preserving the map's write-through and split-brain protection.
+ * Coalesces partition callbacks for the same namespace's backend. Reads execute immediately;
+ * fresh writes gather concurrent callbacks against a fixed one-millisecond deadline.
+ * No executor, cache or background write is introduced. Every caller still waits for its own
+ * durable backend outcome, preserving write-through and split-brain protection.
  *
  * <p>Hazelcast splits getAll/setAll by partition. Batching only above the map therefore still sends a
  * remote command per partition. Combining the pending calls here keeps resident hits in the map and
@@ -31,10 +33,19 @@ final class NestStateIo {
 
     private final KeyedStateStore store;
     private final String namespace;
+    private final long writeGatherNanos;
     private final Batcher reads = new Batcher(false);
     private final Batcher writes = new Batcher(true);
 
     NestStateIo(KeyedStateStore store, String namespace) {
+        this(store, namespace, 1_000_000L);
+    }
+
+    /** Bounded timing seam for concurrency tests; production uses the fixed one-millisecond window. */
+    NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos) {
+        if (writeGatherNanos < 0 || writeGatherNanos > 1_000_000_000L)
+            throw new IllegalArgumentException("write gather duration is outside its bounded range");
+        this.writeGatherNanos = writeGatherNanos;
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
     }
@@ -66,8 +77,11 @@ final class NestStateIo {
         private int pendingKeys;
         private long pendingBytes;
         private boolean running;
+        private int admissionWaiters;
+        private int isolatedWrites;
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition changed = lock.newCondition();
+        private final Condition arrivals = lock.newCondition();
 
         private Batcher(boolean writing) {
             this.writing = writing;
@@ -90,12 +104,20 @@ final class NestStateIo {
                 lock.lock();
                 try {
                     while (!roomFor(request)) {
-                        changed.awaitUninterruptibly();
-                        interrupted |= Thread.interrupted();
+                        admissionWaiters++;
+                        arrivals.signal();
+                        try {
+                            changed.awaitUninterruptibly();
+                            interrupted |= Thread.interrupted();
+                        } finally {
+                            admissionWaiters--;
+                        }
                     }
+                    request.admittedAt = System.nanoTime();
                     pending.add(request);
                     pendingKeys += values.size();
                     pendingBytes += request.bytes;
+                    if (writing) arrivals.signal();
                 } finally {
                     lock.unlock();
                 }
@@ -110,6 +132,7 @@ final class NestStateIo {
                             continue;
                         }
                         running = true;
+                        interrupted |= gatherWrites();
                         batch = takeBatch();
                         changed.signalAll();
                     } finally {
@@ -122,6 +145,34 @@ final class NestStateIo {
                 // acknowledged merely because its waiter stopped waiting. Preserve the caller's flag.
                 if (interrupted) Thread.currentThread().interrupt();
             }
+        }
+
+        private boolean gatherWrites() {
+            if (!writing || writeGatherNanos == 0 || isolatedWrites >= 2) return false;
+            boolean interrupted = false;
+            long began = pending.element().admittedAt;
+            // The oldest queued request owns the deadline. Arrivals and interrupts never extend it;
+            // requests that already waited through backend I/O need no additional gathering delay.
+            while (canGather()) {
+                long remaining = writeGatherNanos - (System.nanoTime() - began);
+                if (remaining <= 0) break;
+                try {
+                    arrivals.awaitNanos(remaining);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            return interrupted;
+        }
+
+        private boolean canGather() {
+            if (admissionWaiters != 0 || pending.size() >= MAX_REQUESTS
+                    || pendingKeys >= MAX_KEYS || pendingBytes >= MAX_BYTES) return false;
+            Set<String> keys = new HashSet<>();
+            for (Request request : pending) {
+                for (String key : request.values.keySet()) if (!keys.add(key)) return false;
+            }
+            return true;
         }
 
         private boolean roomFor(Request request) {
@@ -164,6 +215,10 @@ final class NestStateIo {
                     request.failure = failure;
                     request.done = true;
                 }
+                // A serial partition or sparse stream cannot benefit from waiting. Stop paying the
+                // gather window after two isolated writes, and relearn when concurrent work appears.
+                if (writing) isolatedWrites = batch.size() > 1 || !pending.isEmpty()
+                        ? 0 : Math.min(2, isolatedWrites + 1);
                 running = false;
                 changed.signalAll();
             } finally {
@@ -206,6 +261,7 @@ final class NestStateIo {
         private final Map<String, byte[]> values;
         private final long bytes;
         private final boolean batchRead;
+        private long admittedAt;
         private boolean done;
         private Map<String, byte[]> result;
         private Throwable failure;
