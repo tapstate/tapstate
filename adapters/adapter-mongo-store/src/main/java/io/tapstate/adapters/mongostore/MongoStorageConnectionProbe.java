@@ -41,17 +41,13 @@ public final class MongoStorageConnectionProbe implements StorageConnectionProbe
             try {
                 occupied = hasCollections(connection.database());
             } catch (MongoException unavailable) {
-                throw databaseAccessFailure(database);
+                if (unavailable.getCode() == 13) throw databaseAccessFailure(database);
+                throw StoreIo.coded(unavailable);
             }
             if (occupied) {
-                Optional<String> suggestion;
-                try {
-                    suggestion = CacheDatabaseSuggestions.find(database,
-                            () -> SUGGESTION_SUFFIXES.nextInt(100_000, 1_000_000),
-                            candidate -> hasCollections(connection.client().getDatabase(candidate)));
-                } catch (MongoException unavailable) {
-                    suggestion = Optional.empty();
-                }
+                Optional<String> suggestion = CacheDatabaseSuggestions.find(database,
+                        () -> SUGGESTION_SUFFIXES.nextInt(100_000, 1_000_000),
+                        candidate -> hasCollections(connection.client().getDatabase(candidate)));
                 return CacheTestResult.occupied(suggestion.orElse(null));
             }
             connection.verifyStoragePermissions();

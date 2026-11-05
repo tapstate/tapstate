@@ -131,7 +131,15 @@ public final class StorageSetupService {
         if (layer != Layer.CACHE) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
         Candidate local = localCandidate(candidate);
         var cache = probe.normalize(local.cache());
-        testLayer(cache, layer);
+        var setup = states.guardedBy(active).load();
+        var bound = setup.phase() == StorageSetupStateStore.Phase.STORAGE_BOUND
+                ? bindings.guardedBy(active).load() : Optional.<StorageBinding>empty();
+        boolean existingCache = bound.isPresent() && sameOperation(bound.get().setup(), expected) && bound.get().cache().equals(cache);
+        if (existingCache) {
+            try { probe.test(cache); } catch (TapstateException refused) { throw testFailed(layer, refused); }
+        } else {
+            testLayer(cache, layer);
+        }
         requireSetup(expected, active);
         String hash = cacheHash(cache);
         if (tests.values().stream().anyMatch(test -> !test.scope().equals(expected) || !test.hash().equals(hash))) tests.clear();
@@ -139,7 +147,9 @@ public final class StorageSetupService {
         Instant checkedAt = clock.instant();
         Instant expires = checkedAt.plus(TEST_LIFETIME);
         tests.put(layer, new Tested(expected, hash, stamp, checkedAt, expires));
-        return new TestResult(layer, stamp, expires, List.of("transactional-crud", "index-permissions"));
+        return new TestResult(layer, stamp, expires, existingCache
+                ? List.of("transactional-crud", "index-permissions")
+                : List.of("transactional-crud", "index-permissions", "cache-database-empty"));
     }
 
     /** Binding is durable before runtime activation. A lost HTTP response never discards its original first-cache invocation. */
@@ -241,7 +251,7 @@ public final class StorageSetupService {
             }
             if (!result.empty()) {
                 String suggestion = result.suggestedDatabase();
-                if (suggestion == null || suggestion.isBlank()) {
+                if (suggestion == null) {
                     throw new TapstateException(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED,
                             Map.of("database", connection.database()), null);
                 }

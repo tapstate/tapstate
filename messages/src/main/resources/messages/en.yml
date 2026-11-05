@@ -1332,7 +1332,7 @@ control.storage-cache-database-occupied:
   solution: "Enter another database name and test the connection again."
 control.storage-cache-database-occupied-suggested:
   message: "Cache database '{database}' already contains collections. Choose a new, empty database."
-  solution: "Use the checked name '{suggestedDatabase}' or enter another name, then test again."
+  solution: "Try the empty name '{suggestedDatabase}' or enter another name, then test permissions again."
 control.storage-test-required:
   message: "Test every storage layer again using the current settings before saving."
 control.storage-test-failed:

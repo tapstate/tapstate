@@ -828,6 +828,7 @@ class ManagedMongoStoreIsolationIT {
     void freshCacheProbeRejectsAnExistingEmptyCollectionAndOffersOnlyAnEmptySuggestion() {
         String database = "setup_occupied_" + UUID.randomUUID().toString().replace("-", "");
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+          try {
             admin.getDatabase(database).createCollection("unrelated");
             var candidate = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
                     uri("root", "admin"), database, null);
@@ -837,6 +838,9 @@ class ManagedMongoStoreIsolationIT {
             assertThat(result.empty()).isFalse();
             assertThat(result.suggestedDatabase()).matches(database + "_[0-9]{6}");
             assertThat(admin.getDatabase(result.suggestedDatabase()).listCollectionNames().into(new ArrayList<>())).isEmpty();
+          } finally {
+            admin.getDatabase(database).drop();
+          }
         }
     }
 
