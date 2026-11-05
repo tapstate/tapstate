@@ -20,8 +20,9 @@ final class AlertMaintenanceRuntime implements AutoCloseable {
     void evaluation(java.util.function.Supplier<PipelineAlertRuntime.Health> health){this.evaluation=health;}
 
     private final Runnable active;
-    private final ScheduledThreadPoolExecutor worker=new ScheduledThreadPoolExecutor(1,r->{var t=new Thread(r,"alert-maintenance");t.setDaemon(true);return t;});
+    private final ScheduledThreadPoolExecutor worker=new ScheduledThreadPoolExecutor(1,r->{return ShutdownAwait.daemon(r,"alert-maintenance");});
     private final AtomicBoolean closed=new AtomicBoolean();
+    private final Object scheduling=new Object();
     private final AlertMaintenance.Cursor[] cursors=new AlertMaintenance.Cursor[12];
     private final Instant[] oldestCandidates=new Instant[12],oldestProtected=new Instant[12];
     private final boolean[] isolated=new boolean[12],isolatedInScan=new boolean[12];
@@ -35,7 +36,7 @@ final class AlertMaintenanceRuntime implements AutoCloseable {
     private AlertMaintenancePolicy.Capacity capacity=AlertMaintenancePolicy.Capacity.initial();
     private final Map<String,Long> skipped=new TreeMap<>();
     AlertMaintenanceRuntime(AlertMaintenance store,Clock clock,Runnable active){this.store=store;store.enableCapacityProtection();this.clock=clock;this.active=active;worker.setRemoveOnCancelPolicy(true);}
-    void start(){worker.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);}
+    void start(){synchronized(scheduling){if(!closed.get())worker.scheduleWithFixedDelay(this::tick,0,1,TimeUnit.SECONDS);}}
     synchronized void tick() {
         if(closed.get())return;
         Instant now=clock.instant();
@@ -116,5 +117,6 @@ final class AlertMaintenanceRuntime implements AutoCloseable {
         return Collections.unmodifiableMap(result);
     }
     private static String text(Instant instant){return instant==null?null:instant.toString();}
-    @Override public void close(){if(closed.compareAndSet(false,true))worker.shutdownNow();}
+    @Override public void close(){synchronized(scheduling){if(closed.compareAndSet(false,true))worker.shutdown();}}
+    void awaitStopped(long deadline){ShutdownAwait.executor(worker,deadline);}
 }

@@ -418,6 +418,34 @@ class PipelineAlertRuntimeTest {
                 new AlertConfiguration.Resources(Set.of("source"),true,Set.of()),Map.of(),null,true,null)
                 .validated(BuiltinAlarmTypes.catalog());
     }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
+    void concurrentStopSettlesEveryPendingResourceCallbackOnceEvenWhenOneCallbackFails(boolean failCallback) throws Exception {
+        useResourceRule();var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        doAnswer(call->{entered.countDown();if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("commit was not released");
+            return AlertStore.Outcome.CONFLICT;}).when(fixture.store).commit(any());
+        var runtime=runtime();var settlements=new AtomicInteger[16];
+        for(int i=0;i<settlements.length;i++)settlements[i]=new AtomicInteger();
+        try(var executor=Executors.newFixedThreadPool(2)){
+            runtime.tick();drained(runtime);
+            for(int i=0;i<settlements.length;i++){
+                int index=i;
+                runtime.resourceInput(new AlarmKey.Resource("source","erp","uuid"),"source.connection-failed",1,"producer",()->{},()->{},
+                        new AlertInput.Operational(T.plusMillis(i),"a".repeat(64),OperationalEvidence.Capability.STREAM_READ,false),
+                        ()->{settlements[index].incrementAndGet();if(failCallback&&index==1)throw StorageRuntime.unavailable();});
+                if(i==0)assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+            }
+            var close=executor.submit(runtime::close);
+            var drain=executor.submit(()->runtime.awaitStopped(System.nanoTime()+Duration.ofSeconds(3).toNanos()));
+            close.get(1,TimeUnit.SECONDS);release.countDown();
+            if(failCallback)assertThatThrownBy(()->drain.get(3,TimeUnit.SECONDS)).hasCauseInstanceOf(io.tapstate.core.common.TapstateException.class);
+            else drain.get(3,TimeUnit.SECONDS);
+            runtime.awaitStopped(System.nanoTime()+Duration.ofSeconds(3).toNanos());
+            for(var settled:settlements)assertThat(settled).hasValue(1);
+            assertThat(runtime.health().queuedInputs()).isZero();assertThat(runtime.health().queuedBytes()).isZero();
+        }finally{release.countDown();runtime.close();}
+    }
     private AlertConfiguration.Rule useResourceRule() {
         var rule=resourceRule();
         when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));

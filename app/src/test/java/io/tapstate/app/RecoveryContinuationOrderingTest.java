@@ -44,6 +44,7 @@ class RecoveryContinuationOrderingTest {
         Function<StorageRuntime.Bound,StorageRuntime.Business> assembly=ignored -> business;
         doAnswer(call -> {if(startupFails)throw StorageRuntime.unavailable();current.set(business);return null;}).when(runtime).startBusiness(bound,assembly);
         var executor=new ManualExecutor();var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
+        ReflectionTestUtils.setField(root,"replacements",new AdmissionDrain());
         ReflectionTestUtils.setField(root,"initializationProgress",new StorageInitializationProgress(java.time.Clock.systemUTC()));
         ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
         ReflectionTestUtils.setField(root,"authentication",mock(StorageAuthentication.class));ReflectionTestUtils.setField(root,"cloud",CloudRuntimeSettings.resolve(new CloudProperties()));
@@ -94,6 +95,7 @@ class RecoveryContinuationOrderingTest {
                 mock(PipelineCaptureCoordinator.class),mock(ExecutionAuthorization.class),() -> {},() -> true,mock(PipelineStoreViews.class));
         ReflectionTestUtils.setField(recovery,"inspector",inspector);
         var root=mock(StorageRoot.class,CALLS_REAL_METHODS);
+        ReflectionTestUtils.setField(root,"replacements",new AdmissionDrain());
         ReflectionTestUtils.setField(root,"runtime",runtime);ReflectionTestUtils.setField(root,"installationActive",(Runnable)() -> {});
         ReflectionTestUtils.setField(root,"retainedAssembly",(Function<StorageRuntime.Bound,StorageRuntime.Business>)ignored -> business);
         ReflectionTestUtils.setField(root,"retainedTarget",(java.util.function.Supplier<StorageSetupService.DefaultTarget>)() -> mock(StorageSetupService.DefaultTarget.class));
