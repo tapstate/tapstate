@@ -64,12 +64,28 @@ final class ClearStateCompletionInterleaving implements AutoCloseable {
         assertThat(mappings.updateOne(held, original,
                 new Document("$inc", new Document("noteWriteFence", 1L))).getMatchedCount()).isEqualTo(1);
         convergence.scheduleWithFixedDelay(pass, 0, 1, TimeUnit.SECONDS);
+        var last = new AtomicReference<String>("no native replacement thread observed");
         Await.until("the native replacement to contend on its original CONFIG mapping", Duration.ofSeconds(20),
-                () -> worker.get() != null && Arrays.stream(worker.get().getStackTrace()).anyMatch(frame ->
-                        frame.getClassName().equals("io.tapstate.adapters.mongostore.MongoPipelineStateRebuilds")
-                                && frame.getMethodName().equals("begin")),
-                () -> worker.get() == null ? "no native pass" : Arrays.toString(worker.get().getStackTrace()));
+                () -> {
+                    String nativeThreads = nativeReplacementThreads();
+                    if (!nativeThreads.isEmpty()) {
+                        last.set(nativeThreads);
+                        return true;
+                    }
+                    Thread probe = worker.get();
+                    last.set(probe == null ? "no probe worker" : "probe=" + Arrays.toString(probe.getStackTrace()));
+                    return false;
+                }, last::get);
         assertThat(mappings.find(new Document("_id", pipeline)).first()).isEqualTo(original);
+    }
+
+    private static String nativeReplacementThreads() {
+        return Thread.getAllStackTraces().entrySet().stream()
+                .filter(entry -> Arrays.stream(entry.getValue()).anyMatch(frame ->
+                        frame.getClassName().equals("io.tapstate.adapters.mongostore.MongoPipelineStateRebuilds")
+                                && frame.getMethodName().equals("begin")))
+                .map(entry -> entry.getKey().getName() + "=" + Arrays.toString(entry.getValue()))
+                .collect(java.util.stream.Collectors.joining(System.lineSeparator()));
     }
 
     void observed(boolean stopped) {

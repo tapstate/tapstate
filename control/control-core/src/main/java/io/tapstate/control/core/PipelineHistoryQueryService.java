@@ -391,15 +391,12 @@ public final class PipelineHistoryQueryService {
     }
 
     private static Rate rawRate(RateSample left, RateSample right, String counter) {
-        Long before = left.counters().get(counter);
-        Long after = right.counters().get(counter);
+        Long growth = HistoryAggregator.growth(left, right, counter);
         Duration elapsed = Duration.between(left.observedAt(), right.observedAt());
-        if (elapsed.isZero() || elapsed.isNegative() || before == null || after == null
-                || left.countingSince() == null || !left.countingSince().equals(right.countingSince())
-                || after < before) {
+        if (elapsed.isZero() || elapsed.isNegative() || growth == null) {
             return null;
         }
-        BigDecimal delta = BigDecimal.valueOf(after - before);
+        BigDecimal delta = BigDecimal.valueOf(growth);
         long nanos = Math.addExact(Math.multiplyExact(elapsed.getSeconds(), 1_000_000_000L), elapsed.getNano());
         BigDecimal rate = delta.multiply(NANOS_PER_SECOND)
                 .divide(BigDecimal.valueOf(nanos), 9, RoundingMode.HALF_EVEN);

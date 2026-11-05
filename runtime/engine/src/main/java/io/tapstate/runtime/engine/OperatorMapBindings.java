@@ -243,6 +243,16 @@ public final class OperatorMapBindings implements AutoCloseable {
     }
 
     /** The caller drains and destroys the original hot map before releasing its exact binding. */
+    /**
+     * The placement a live hot map was installed for, so a reading filed under the map's name can be
+     * traced back to the step and level of the definition it belongs to. Empty for a name this member does
+     * not hold live, including a cold placement name, which is never a hot map.
+     */
+    public synchronized Optional<OperatorPlacement> placementOf(String hotMapName) {
+        Bound held = hotMaps.get(hotMapName);
+        return held == null || !held.active.get() ? Optional.empty() : Optional.of(held.binding.placement());
+    }
+
     public synchronized boolean release(OperatorMapBinding original) {
         requireOpen(); Bound held = slots.get(original.placement().mapName());
         if (held == null || !held.binding.equals(original) || !held.active.get()) return false;
