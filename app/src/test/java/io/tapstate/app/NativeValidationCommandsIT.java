@@ -17,6 +17,19 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class NativeValidationCommandsIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
+    static {
+        String owner=System.getProperty("tapstate.test.resourceOwner");
+        if(owner!=null){
+            var directory=java.nio.file.Path.of(System.getProperty("java.io.tmpdir"),"stop-drain-mongo-"+UUID.randomUUID());
+            try{
+                java.nio.file.Files.createDirectories(directory.resolve("data"));
+                java.nio.file.Files.createDirectories(directory.resolve("config"));
+            }catch(java.io.IOException failed){throw new java.io.UncheckedIOException(failed);}
+            MONGO.withLabel("io.tapstate.issue-loop.owner",owner);
+            MONGO.withFileSystemBind(directory.resolve("data").toString(),"/data/db");
+            MONGO.withFileSystemBind(directory.resolve("config").toString(),"/data/configdb");
+        }
+    }
     @Test void aLostReservationReplyCanBeReadPassivelyBeforeOnlyAnExplicitOriginalRetryActivates()throws Exception{
         var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
         var returned=new java.util.concurrent.CountDownLatch(1);var reservations=new AtomicInteger();var plans=new AtomicInteger();var receiptsVisible=new AtomicBoolean();
@@ -323,7 +336,6 @@ class NativeValidationCommandsIT {
             }
         }
     }
-    @org.junit.jupiter.api.Disabled("Tracked by #961: polling must retry transient metadata-frame contention.")
     @Test @org.junit.jupiter.api.Timeout(90) void threeLiveCountRunsDoNotPreventRetryingALostOriginalStop()throws Exception{
         var reads=new java.util.concurrent.CountDownLatch(3);var stopAttempts=new AtomicInteger();
         var releases=new java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.CountDownLatch>();
@@ -367,7 +379,7 @@ class NativeValidationCommandsIT {
                     try(var stopped=coordinator.stop(operations.get("flow"))){assertThat(stopped.value().original()).isEqualTo(operations.get("flow"));}
                     await(()->stopAttempts.get()>=2&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
                     try(var foreground=coordinator.read(operations.get("count-b"))){assertThat(foreground.value().state()).isEqualTo("RUNNING");}
-                    await(()->{try(var observed=coordinator.read(operations.get("flow"))){return "STOPPED".equals(observed.value().state())&&observed.value().drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
+                    ReportObservation.await(()->{try(var observed=coordinator.read(operations.get("flow"))){return "STOPPED".equals(observed.value().state())&&observed.value().drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
                     for(String id:tasks.keySet())assertThat(f.tasks.read(id,"task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
                 }finally{
                     releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);
@@ -376,6 +388,78 @@ class NativeValidationCommandsIT {
                 }
             }
         }finally{releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);}
+    }
+
+    @Test @org.junit.jupiter.api.Timeout(90) void stopDrainPollingRetriesTransientMetadataFrameContention()throws Exception{
+        var controlEntered=new java.util.concurrent.CountDownLatch(1);var releaseControl=new java.util.concurrent.CountDownLatch(1);
+        var allowDrain=new AtomicBoolean();
+        var reads=new java.util.concurrent.CountDownLatch(3);var stopAttempts=new AtomicInteger();
+        var releases=new java.util.concurrent.ConcurrentHashMap<String,java.util.concurrent.CountDownLatch>();
+        try(var f=new NativeValidationOwnerReservationsIT.Fixture(8);var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
+            var processors=new ValidationProcessorRegistry(f.member,()->{})){
+            var tasks=new LinkedHashMap<String,ValidationReportAdmission.Task>();tasks.put("flow",f.task);
+            for(String id:List.of("count-b","count-c")){
+                var pipe=new io.tapstate.core.model.PipelineResource(id,null,List.of(io.tapstate.core.model.SourceRef.spec("input",false)),null,null,
+                        new io.tapstate.core.model.ServeBlock.Inline("serving",io.tapstate.core.model.FromRef.literal("orders"),List.of(new io.tapstate.core.model.SyncElement("out","views",null,null,null)),null,null),null,null);
+                assertThat(f.configuration.artifacts().create(pipe)).isEqualTo(ArtifactMutation.CREATED);
+                var hashes=new TreeMap<>(f.comparison.dependencyHashes());hashes.remove("flow");hashes.put(id,io.tapstate.core.model.canonical.CanonicalHash.of(pipe));
+                var task=new ValidationReportAdmission.Task("cluster",id,"task",UUID.randomUUID());tasks.put(id,task);
+                assertThat(f.tasks.create(new ValidationTaskStore.Create(task,new ValidationTaskSpec(id,hashes,1,"rules",f.comparison.mappings()),ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
+            }
+            NativeValidationFullJob.Factory factory=original->{
+                var id=original.spec().task().pipelineId();var release=new java.util.concurrent.CountDownLatch(1);releases.put(id,release);var closed=new AtomicBoolean();var mapping=original.spec().task().mappings().getFirst();
+                return new NativeValidationFullJob.Plan(){
+                    public List<ValidationCountScan.Mapping> counts(){return List.of(new ValidationCountScan.Mapping(mapping.mappingId(),guard->{
+                        reads.countDown();try{assertThat(release.await(30,java.util.concurrent.TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new NativeValidationCancellation("node");}
+                        guard.run();return scalar(mapping.source(),1);
+                    },guard->{guard.run();return scalar(mapping.target(),1);}));}
+                    public boolean drained(){return closed.get()&&(!id.equals("flow")||allowDrain.get());}public void close(){closed.set(true);release.countDown();}
+                };
+            };
+            var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,factory);
+            Commands delivered=command->{
+                if(command.action()==Action.STOP&&command.request().pipeline().equals("flow")&&stopAttempts.incrementAndGet()==1)return commandUnavailable(command,Outcome.UNKNOWN,null);
+                return commands.execute(command);
+            };
+            try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),f.owners::readOwner,f.owners,delivered,()->{},Duration.ofSeconds(5));
+                var coordinator=new NativeValidationStartCoordinator(f.member,f.configuration,router,f.resources,f.process,()->{})){
+                var operations=new LinkedHashMap<String,io.tapstate.runtime.probe.ValidationOperation>();
+                try{
+                    for(var item:tasks.entrySet()){
+                        var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),item.getKey(),"task",item.getValue().generation(),1,1,UUID.randomUUID());operations.put(item.getKey(),op);
+                        try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
+                        int admitted=operations.size();await(()->reads.getCount()==3-admitted&&f.resources.snapshot().metadataFrames()==admitted);
+                    }
+                    assertThat(reads.await(15,java.util.concurrent.TimeUnit.SECONDS)).isTrue();await(()->f.resources.snapshot().metadataFrames()==3);
+                    assertThat(f.resources.snapshot().processors()).isEqualTo(3);assertThat(f.member.getJet().getJobs()).hasSize(3);
+                    try(var stopped=coordinator.stop(operations.get("flow"))){assertThat(stopped.value().original()).isEqualTo(operations.get("flow"));}
+                    await(()->stopAttempts.get()>=2&&f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                    try(var foreground=coordinator.read(operations.get("count-b"))){assertThat(foreground.value().state()).isEqualTo("RUNNING");}
+                    // Keep the original native frame until the first drain observation has contended.
+                    await(()->f.resources.snapshot().metadataFrames()==3);
+                    try(var contention=f.resources.admitControl()){
+                        contention.execute(()->{
+                            controlEntered.countDown();
+                            try{if(!releaseControl.await(30,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("metadata contention barrier timeout");}
+                            catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                        });
+                        assertThat(controlEntered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        contention.close();
+                        assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(4);
+                        // Logical close cannot return a frame whose physical control body is still blocked.
+                        int refusals=ReportObservation.await(()->{try(var observed=coordinator.read(operations.get("flow"))){return "STOPPED".equals(observed.value().state())&&observed.value().drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}
+                            finally{releaseControl.countDown();allowDrain.set(true);}});
+                        assertThat(refusals).isGreaterThanOrEqualTo(1);
+                    }
+                    for(String id:tasks.keySet())assertThat(f.tasks.read(id,"task").orElseThrow().full().nextStartSequence()).isEqualTo(2);
+                }finally{
+                    releaseControl.countDown();allowDrain.set(true);
+                    releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);
+                    for(var op:operations.values())try{var original=f.tasks.read(op.pipeline(),op.task()).orElseThrow().full().permission();if(original!=null)runs.stop(original.start().run());}catch(io.tapstate.core.common.TapstateException alreadyReaped){}
+                    await(()->f.resources.snapshot().metadataFrames()==0);
+                }
+            }
+        }finally{releaseControl.countDown();allowDrain.set(true);releases.values().forEach(java.util.concurrent.CountDownLatch::countDown);}
     }
 
     private static AutoCloseable refuseReportBirth(NativeValidationOwnerReservationsIT.Fixture f){
@@ -393,6 +477,25 @@ class NativeValidationCommandsIT {
     }
     private static ValidationOwner owner(Reply reply){return new ValidationOwner("cluster","flow",reply.receiver().node(),reply.receiver().boot(),reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
     private static ValidationCountScan.Scalar scalar(ValidationTaskSpec.Table table,long value){return new ValidationCountScan.Scalar(table,value,new ValidationCheckEvent.ReadBoundary("fixture-count","v1",Instant.EPOCH,Instant.EPOCH));}
+    /** Only report observation can retry this admission refusal; other waits retain their strict behavior. */
+    static final class ReportObservation {
+        @FunctionalInterface interface Pause {void pause()throws InterruptedException;}
+        static int await(java.util.function.BooleanSupplier condition)throws InterruptedException{
+            return await(condition,System::nanoTime,()->Thread.sleep(20));
+        }
+        static int await(java.util.function.BooleanSupplier condition,java.util.function.LongSupplier clock,Pause pause)throws InterruptedException{
+            long until=clock.getAsLong()+java.util.concurrent.TimeUnit.SECONDS.toNanos(30);int refusals=0;
+            while(clock.getAsLong()-until<0){
+                try{if(condition.getAsBoolean())return refusals;}
+                catch(io.tapstate.core.common.TapstateException refused){
+                    if(refused.code()!=ValidationError.VALUE_LIMIT_EXCEEDED||!"validation.metadataFrames".equals(refused.args().get("limit")))throw refused;
+                    refusals++;
+                }
+                pause.pause();
+            }
+            throw new AssertionError("Report observation did not succeed within 30 seconds");
+        }
+    }
     private static void await(java.util.function.BooleanSupplier condition)throws Exception{
         long until=System.nanoTime()+java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
         while(!condition.getAsBoolean()&&System.nanoTime()-until<0)Thread.sleep(20);assertThat(condition.getAsBoolean()).isTrue();
