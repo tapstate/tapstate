@@ -1,0 +1,154 @@
+name: app-2 hosted diagnostic
+run-name: app-2 fixed cohort, forkCount=2
+'on':
+  push:
+    branches:
+    - codex/app2-hosted-runner-20261105
+    paths:
+    - .github/workflows/app2-hosted-diagnostic.yml
+permissions:
+  contents: read
+jobs:
+  app2:
+    name: app-2, 210 classes, two forks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    env:
+      MAVEN_OPTS: -Xmx1536m -XX:ActiveProcessorCount=2
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: f5b734f1d728ab58f2eb61e59867a66ae7f4650d
+        persist-credentials: false
+    - uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: 21.0.13+9.0.LTS
+        cache: maven
+    - name: Pin Maven 3.9.9
+      run: |
+        mkdir -p "$RUNNER_TEMP/maven-tool"
+        cd "$RUNNER_TEMP/maven-tool"
+        curl --fail --silent --show-error --location --retry 2 -O https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz
+        curl --fail --silent --show-error --location --retry 2 -O https://archive.apache.org/dist/maven/maven-3/3.9.9/binaries/apache-maven-3.9.9-bin.tar.gz.sha512
+        printf '%s  %s\n' "$(cat apache-maven-3.9.9-bin.tar.gz.sha512)" apache-maven-3.9.9-bin.tar.gz | sha512sum --check
+        tar -xzf apache-maven-3.9.9-bin.tar.gz
+        echo "$RUNNER_TEMP/maven-tool/apache-maven-3.9.9/bin" >> "$GITHUB_PATH"
+    - name: Record actual runner and toolchain
+      run: |
+        mkdir -p "$RUNNER_TEMP/app2-diagnostic"
+        {
+          uname -a
+          nproc
+          free -b
+          df -h . "$RUNNER_TEMP"
+          docker info --format 'Docker={{.ServerVersion}} CPUs={{.NCPU}} Memory={{.MemTotal}}'
+          java -version
+          mvn -version
+        } > "$RUNNER_TEMP/app2-diagnostic/runner.txt" 2>&1
+        cat "$RUNNER_TEMP/app2-diagnostic/runner.txt"
+    - name: Freeze the exact app-2 cohort
+      run: |
+        python3 - <<'PY'
+        import os,json,hashlib,subprocess
+        from pathlib import Path
+        root=Path.cwd();out=Path(os.environ['RUNNER_TEMP'])/'app2-diagnostic';out.mkdir(exist_ok=True)
+        assert subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()=='f5b734f1d728ab58f2eb61e59867a66ae7f4650d'
+        subprocess.run(['.github/scripts/ci-shard.sh','plan','--root','.','--durations','.github/ci-test-durations.json','--output',str(out/'plan.json')],check=True)
+        plan=json.loads((out/'plan.json').read_text());shard=next(s for s in plan['shards'] if s['id']=='app-2');items=sorted((t['module'],t['kind'],t['class']) for t in shard['tests'])
+        assert len(items)==210
+        assert hashlib.sha256(json.dumps(items,separators=(',',':')).encode()).hexdigest()=='51bae5f242fd5c610bfc7f22c8a2e67804613bd2865e44e0741a459ef9b374c1'
+        (out/'selected-cohort.json').write_text(json.dumps(shard,indent=2))
+        metadata={'code_sha':plan['source_sha'],'workflow_sha':os.environ['GITHUB_SHA'],'workflow_ref':os.environ['GITHUB_WORKFLOW_REF'],'run_id':os.environ['GITHUB_RUN_ID'],'expected_classes':210,'expected_cases':1753,'forkCount':2,'test_jvm_heap':'2048m','active_processor_hint':2,'note':'Hosted diagnostic, not the complete repository CI workflow.'}
+        (out/'metadata.json').write_text(json.dumps(metadata,indent=2))
+        PY
+    - name: Prepare an isolated dependency repository
+      run: |
+        .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+    - name: Build without executing tests
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -Dapi.version=1.44 -DskipTests install
+    - name: Prepare the locked connector inputs
+      run: |
+        python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
+    - name: Run all 210 original classes with two forks
+      env:
+        TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/cloud-test-release
+      run: |
+        python3 - <<'PY'
+        import os,json,time,subprocess,shutil,xml.etree.ElementTree as E
+        from pathlib import Path
+        out=Path(os.environ['RUNNER_TEMP'])/'app2-diagnostic';root=Path.cwd();repo=Path(os.environ['RUNNER_TEMP'])/'m2';tmp=Path(os.environ['RUNNER_TEMP'])/'test-tmp';tmp.mkdir(exist_ok=True)
+        shard=json.loads((out/'selected-cohort.json').read_text());classes=shard['tests'];units=sorted(t['class'] for t in classes if t['kind']=='unit');its=sorted(t['class'] for t in classes if t['kind']=='it')
+        assert len(units)==160 and len(its)==50
+        release=Path(os.environ['TAPSTATE_TEST_CLOUD_RELEASE_DIR']);env=os.environ.copy();env['JAVA_TOOL_OPTIONS']='-Xmx2048m -XX:ActiveProcessorCount=2 -Djava.io.tmpdir='+str(tmp)
+        for key in ['TAPSTATE_TEST_NATIVE_CLI','TAPSTATE_ATLAS_TEST_URI','TAPSTATE_ATLAS_STANDARD_URI']:env.pop(key,None)
+        args=['mvn','-B','-T','1','-Dmaven.repo.local='+str(repo),'-pl','app','verify','-Dapi.version=1.44','-DforkCount=2','-Djunit.jupiter.execution.parallel.enabled=false','-Dtapstate.it.jvmArgs=-Xmx2048m -XX:ActiveProcessorCount=2 -Djava.io.tmpdir='+str(tmp)]
+        for connector in ['mongodb','mysql','postgres']:args.append('-Dtapstate.pdk.it.'+connector+'-jar='+str(release/'connectors'/(connector+'-connector.jar')))
+        for directory in ['surefire-reports','failsafe-reports']:
+         p=root/'app/target'/directory
+         if p.exists():shutil.rmtree(p)
+        record={'started_at':time.time(),'stages':[],'forkCount':2,'requested_classes':210,'requested_cases':1753}
+        def run(label,command):
+         step={'label':label,'command':command,'started_at':time.time()};record['stages'].append(step);(out/'execution.json').write_text(json.dumps(record,indent=2))
+         with (out/(label+'.log')).open('w') as log:
+          child=subprocess.Popen(command,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
+          for line in child.stdout:print(line,end='',flush=True);log.write(line)
+          code=child.wait()
+         step.update(exit_code=code,finished_at=time.time());(out/'execution.json').write_text(json.dumps(record,indent=2));return code
+        code=run('full',args+['-Dtest='+','.join(units),'-Dit.test='+','.join(its)])
+        actual=set()
+        for directory in ['surefire-reports','failsafe-reports']:
+         for p in (root/'app/target'/directory).glob('TEST-*.xml'):actual.add(E.parse(p).getroot().get('name','').split('$')[0])
+        expected={t['class'] for t in classes};missing=expected-actual
+        if code and missing==set(its) and not actual-expected:
+         for directory in ['surefire-reports','failsafe-reports']:
+          p=root/'app/target'/directory
+          if p.exists():shutil.copytree(p,out/('original-'+directory))
+         run('original-it-completion',args+['-Dtest=__diagnostic_no_units__','-Dsurefire.failIfNoSpecifiedTests=false','-Dit.test='+','.join(its)])
+        record['finished_at']=time.time();record['wall_seconds']=record['stages'][-1]['finished_at']-record['stages'][0]['started_at'];record['single_maven_command']=len(record['stages'])==1
+        (out/'execution.json').write_text(json.dumps(record,indent=2))
+        raise SystemExit(0 if all(s['exit_code']==0 for s in record['stages']) else 1)
+        PY
+    - name: Verify the complete original cases and report timing
+      if: always()
+      run: |
+        python3 - <<'PY'
+        import os,json,hashlib,xml.etree.ElementTree as E
+        from pathlib import Path
+        out=Path(os.environ['RUNNER_TEMP'])/'app2-diagnostic';root=Path.cwd();plan=json.loads((out/'selected-cohort.json').read_text());expected={t['class'] for t in plan['tests']};rows=[];identities=[];classes=set()
+        for directory in ['surefire-reports','failsafe-reports']:
+         for p in (root/'app/target'/directory).glob('TEST-*.xml'):
+          r=E.parse(p).getroot();name=r.get('name','');classes.add(name.split('$')[0]);failures=[]
+          for c in r.findall('testcase'):
+           identities.append((c.get('classname'),c.get('name')))
+           for f in [*c.findall('failure'),*c.findall('error')]:failures.append({'case':c.get('name'),'type':f.get('type'),'message':f.get('message','')})
+          rows.append({'class':name,'tests':int(r.get('tests',0)),'failures':int(r.get('failures',0)),'errors':int(r.get('errors',0)),'skipped':int(r.get('skipped',0)),'seconds':float(r.get('time',0)),'failure_details':failures,'sha256':hashlib.sha256(p.read_bytes()).hexdigest()})
+        execution=json.loads((out/'execution.json').read_text()) if (out/'execution.json').exists() else {}
+        digest=hashlib.sha256(json.dumps(sorted(identities),separators=(',',':')).encode()).hexdigest();totals={k:sum(r[k] for r in rows) for k in ['tests','failures','errors','skipped']}
+        result={'code_sha':'f5b734f1d728ab58f2eb61e59867a66ae7f4650d','classes':len(classes),'totals':totals,'missing_classes':sorted(expected-classes),'extra_classes':sorted(classes-expected),'case_digest':digest,'case_identity_matches_frozen_ci':digest=='04c33f3b2bea5a90fcb7563a4b819f58a17f9f6e08dcbb68a542b802223b18c7','wall_seconds':execution.get('wall_seconds'),'stages':execution.get('stages',[]),'single_maven_command':execution.get('single_maven_command'),'class_reports':rows}
+        (out/'result.json').write_text(json.dumps(result,indent=2));print(json.dumps({k:v for k,v in result.items() if k not in ['class_reports','stages']},indent=2))
+        with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+         summary.write('## app-2 hosted measurement\n\n')
+         summary.write('| Item | Result |\n| --- | --- |\n')
+         for name,value in [('Code','f5b734f1d728ab58f2eb61e59867a66ae7f4650d'),('Classes',len(classes)),('Cases',totals['tests']),('Failures',totals['failures']),('Errors',totals['errors']),('Skipped',totals['skipped']),('Test wall seconds',execution.get('wall_seconds')),('Single Maven command',execution.get('single_maven_command'))]:summary.write(f'| {name} | {value} |\n')
+        assert classes==expected and len(identities)==1753 and result['case_identity_matches_frozen_ci']
+        assert not totals['failures'] and not totals['errors']
+        assert execution and all(s['exit_code']==0 for s in execution['stages'])
+        PY
+    - name: Preserve original reports and measurement
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: app2-hosted-fixed-cohort-forks2
+        path: |
+          ${{ runner.temp }}/app2-diagnostic/
+          app/target/surefire-reports/
+          app/target/failsafe-reports/
+        if-no-files-found: error
+        retention-days: 7
