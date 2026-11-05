@@ -92,6 +92,8 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.entries",
                         "tapstate.pipeline.nest.accesses",
                         "tapstate.pipeline.nest.backfills",
+                        "tapstate.pipeline.nest.key.accesses",
+                        "tapstate.pipeline.nest.cold.keys",
                         "tapstate.pipeline.nest.backfill.time",
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
@@ -115,6 +117,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
         }
         for (CardinalityBudget budget : List.of(CardinalityBudget.NEST_ENTRIES, CardinalityBudget.NEST_ACCESSES,
                 CardinalityBudget.NEST_BACKFILLS, CardinalityBudget.NEST_BACKFILL_TIME,
+                CardinalityBudget.NEST_KEY_ACCESSES, CardinalityBudget.NEST_COLD_KEYS,
                 CardinalityBudget.NEST_PENDING_HIGH_WATER, CardinalityBudget.NEST_STORED,
                 CardinalityBudget.NEST_DEAD_LETTERED, CardinalityBudget.NEST_NAMESPACE_INFO)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.NEST_NAMESPACE);

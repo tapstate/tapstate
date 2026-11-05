@@ -1,9 +1,12 @@
 package io.tapstate.adapters.mongostore;
 
 import com.mongodb.MongoNamespace;
+import java.nio.charset.StandardCharsets;
 
 /** Keeps driver-specific database name validation behind the Mongo adapter boundary. */
 public final class MongoDatabaseNames {
+    static final int MAX_DATABASE_NAME_BYTES = 63;
+
     private MongoDatabaseNames() { }
 
     /** Returns an explicit URI database without letting driver diagnostics expose credentials. */
@@ -18,6 +21,7 @@ public final class MongoDatabaseNames {
     }
 
     public static boolean isValid(String name) {
+        if (name == null || name.getBytes(StandardCharsets.UTF_8).length > MAX_DATABASE_NAME_BYTES) return false;
         try {
             MongoNamespace.checkDatabaseNameValidity(name);
             return true;

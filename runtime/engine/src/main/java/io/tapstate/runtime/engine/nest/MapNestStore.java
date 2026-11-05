@@ -84,8 +84,9 @@ final class MapNestStore<S> implements NestStore<S> {
         if (keys.isEmpty()) {
             return Map.of();
         }
-        countAccess();
-        Map<Object, S> loaded = map.getAll(new LinkedHashSet<>(keys));
+        Set<Object> distinct = new LinkedHashSet<>(keys);
+        countAccess(distinct.size());
+        Map<Object, S> loaded = map.getAll(distinct);
         publishReading();
         return loaded;
     }
@@ -109,6 +110,7 @@ final class MapNestStore<S> implements NestStore<S> {
         NestStateStats.Counted counted = stats.counted(namespace);
         gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
+        gauge.keyReading(namespace, counted.keyAccesses(), counted.coldKeys());
     }
 
     /**
@@ -244,8 +246,13 @@ final class MapNestStore<S> implements NestStore<S> {
      * the map for exactly this reason and makes no trip at all.
      */
     private void countAccess() {
+        countAccess(1);
+    }
+
+    private void countAccess(long keys) {
         if (stats != null) {
             stats.access(map.getName());
+            stats.accessKeys(map.getName(), keys);
         }
     }
 

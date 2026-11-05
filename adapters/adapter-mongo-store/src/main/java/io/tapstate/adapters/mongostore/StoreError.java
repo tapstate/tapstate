@@ -24,6 +24,9 @@ public enum StoreError implements TapstateErrorCode {
     /** A deployment-owned database could not prove read/write access using the configured identity. */
     DATABASE_ACCESS_FAILED("store.database-access-failed", Set.of("database")),
 
+    /** The cache identity cannot enumerate collections to verify a fresh database. */
+    CACHE_LIST_COLLECTIONS_DENIED("store.cache-list-collections-denied", Set.of("database")),
+
     /** The store was reached but lacks a transactional topology: {@code target} is the connection target. */
     NOT_REPLICA_SET("store.not-replica-set", Set.of("target")),
 

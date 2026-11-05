@@ -95,6 +95,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         Object state = bytes == null ? null : fromBytes(bytes);
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
+            stats.coldKeys(namespace, 1);
         }
         return state;
     }
@@ -125,6 +126,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         Map<String, byte[]> found = stateIo.loadAll(byName.keySet());
         if (stats != null) {
             stats.backfill(namespace, System.nanoTime() - began);
+            stats.coldKeys(namespace, byName.size());
         }
         Map<Object, Object> loaded = new LinkedHashMap<>();
         found.forEach((name, state) -> loaded.put(byName.get(name), fromBytes(state)));

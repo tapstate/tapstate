@@ -145,6 +145,8 @@ class ApiExceptionHandler {
             Map.entry("alert.command-not-yet-valid", HttpStatus.CONFLICT),
             Map.entry("alert.channel-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("actuation.source-schema-not-discovered", HttpStatus.CONFLICT),
+            Map.entry("control.storage-cache-database-occupied", HttpStatus.BAD_REQUEST),
+            Map.entry("control.storage-cache-database-occupied-suggested", HttpStatus.BAD_REQUEST),
             Map.entry("control.storage-databases-overlap", HttpStatus.BAD_REQUEST),
             Map.entry("control.storage-scope-conflict", HttpStatus.CONFLICT),
             Map.entry("control.storage-test-failed", HttpStatus.BAD_REQUEST),

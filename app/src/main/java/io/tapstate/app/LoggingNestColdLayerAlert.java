@@ -47,7 +47,8 @@ final class LoggingNestColdLayerAlert implements NestColdLayerAlert {
 
     @Override
     public void cleared(String pipelineId, String namespace, NestStateWindow window) {
-        LOG.info("{} no longer applies to {} of pipeline {}: {} of {} state reads went to storage ({})",
+        LOG.info("{} no longer applies to {} of pipeline {}: {} cold loader callbacks for {} logical "
+                        + "state accesses; cold key share {}",
                 NestError.STATE_SERVED_FROM_COLD_LAYER.code(), namespace, pipelineId,
                 window.backfills(), window.accesses(), share(window));
     }

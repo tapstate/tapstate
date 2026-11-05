@@ -24,13 +24,21 @@ import java.util.OptionalLong;
  * produce a negative over a negative, which is a ratio that can read like anything at all.
  *
  * @param accesses how many times the state was reached for during the window, read or written
- * @param backfills how many of those found nothing in memory and went to the layer behind
+ * @param backfills how many cold loader callbacks completed during the window
  * @param backfillMillis how long those took in total
  * @param entries how many keys the namespace holds in memory as of the later reading
  * @param stored how many keys there are altogether as of the later reading, where there is a layer to ask
+ * @param keyAccesses requested key accesses during the window, where measured
+ * @param coldKeys keys requested by completed cold loaders during the window, where measured
  */
 public record NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
-        OptionalLong stored) {
+        OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys) {
+
+    /** Compatibility window without key instrumentation. */
+    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
+            OptionalLong stored) {
+        this(accesses, backfills, backfillMillis, entries, stored, OptionalLong.empty(), OptionalLong.empty());
+    }
 
     public NestStateWindow {
         Objects.requireNonNull(stored, "stored");
@@ -50,7 +58,8 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
         return new NestStateWindow(current.accesses() - previous.accesses(),
                 current.backfills() - previous.backfills(),
                 current.backfillMillis() - previous.backfillMillis(),
-                current.entries(), current.stored());
+                current.entries(), current.stored(), difference(previous.keyAccesses(), current.keyAccesses()),
+                difference(previous.coldKeys(), current.coldKeys()));
     }
 
     /**
@@ -62,16 +71,22 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     public static NestStateWindow fromStart(NestStateReading current) {
         Objects.requireNonNull(current, "current");
         return new NestStateWindow(current.accesses(), current.backfills(), current.backfillMillis(),
-                current.entries(), current.stored());
+                current.entries(), current.stored(), current.keyAccesses(), current.coldKeys());
     }
 
     /**
-     * How much of the reaching during this window had to go to the layer behind memory, between 0 and 1.
-     * Absent where nothing was reached for: zero would be the healthy end of the same scale, so an idle
-     * namespace would read as the one thing this is watched for.
+     * The cold key share, using requested keys on both sides. Absent without both key counters or with
+     * no key accesses: missing instrumentation and an idle namespace must not look like healthy traffic.
      */
     public OptionalDouble servedFromCold() {
-        return accesses == 0 ? OptionalDouble.empty() : OptionalDouble.of((double) backfills / accesses);
+        return keyAccesses.isEmpty() || coldKeys.isEmpty() || keyAccesses.getAsLong() == 0
+                ? OptionalDouble.empty()
+                : OptionalDouble.of((double) coldKeys.getAsLong() / keyAccesses.getAsLong());
+    }
+
+    private static OptionalLong difference(OptionalLong previous, OptionalLong current) {
+        return previous.isPresent() && current.isPresent()
+                ? OptionalLong.of(current.getAsLong() - previous.getAsLong()) : OptionalLong.empty();
     }
 
     /**
@@ -104,6 +119,7 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     private static boolean startedOver(NestStateReading previous, NestStateReading current) {
         return current.accesses() < previous.accesses()
                 || current.backfills() < previous.backfills()
-                || current.backfillMillis() < previous.backfillMillis();
+                || current.backfillMillis() < previous.backfillMillis()
+                || current.keyCountsRestartedSince(previous);
     }
 }
