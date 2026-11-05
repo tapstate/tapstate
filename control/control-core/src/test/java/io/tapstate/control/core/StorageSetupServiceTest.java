@@ -135,9 +135,10 @@ class StorageSetupServiceTest {
             @Override public CacheTestResult testCache(StorageBinding.Connection input) { return CacheTestResult.occupied(null); }
         };
         var result = f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE);
-        assertThat(result.checks()).doesNotContain("cache-database-empty");
+        assertThat(result.checks()).containsExactly("transactional-crud", "index-permissions");
         var different = new StorageSetupService.Candidate(CANDIDATE.configuration(), connection("other"), CANDIDATE.master());
-        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, different, StorageSetupService.Layer.CACHE))
+        var retestService = f.service();
+        assertThatThrownBy(() -> retestService.test(SCOPE, () -> {}, different, StorageSetupService.Layer.CACHE))
                 .isInstanceOf(TapstateException.class);
     }
 
