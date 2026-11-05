@@ -106,8 +106,7 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     private static boolean validDatabase(String database) {
-        return database != null && !database.isBlank() && database.getBytes(StandardCharsets.UTF_8).length <= 63
-                && MongoDatabaseNames.isValid(database);
+        return database != null && !database.isBlank() && MongoDatabaseNames.isValid(database);
     }
 
     String selectedDatabase(ConnectionString connectionString) {
