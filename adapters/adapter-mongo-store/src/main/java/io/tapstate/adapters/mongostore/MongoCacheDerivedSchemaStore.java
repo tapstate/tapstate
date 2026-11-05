@@ -53,6 +53,27 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
     }
 
     @Override public void record(String pipelineId, String stepId, Map<String, String> schema, String statement, String derivedFrom, String derivedBy) {
+        Prepared recording = prepare(pipelineId, stepId, schema, statement, derivedFrom, derivedBy);
+        access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, session -> {
+            record(session, recording); return null;
+        });
+    }
+
+    @Override public void recordBatch(String pipelineId, List<Recording> recordings) {
+        access.requirePipeline(Objects.requireNonNull(pipelineId, "pipelineId"));
+        var captured = List.copyOf(recordings).stream().map(recording -> prepare(pipelineId,
+                recording.stepId(), recording.schema(), recording.statement(), recording.derivedFrom(), recording.derivedBy())).toList();
+        if (captured.isEmpty()) return;
+        access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, session -> {
+            for (Prepared recording : captured) record(session, recording);
+            return null;
+        });
+    }
+
+    private record Prepared(String key, DerivedSchema model) { }
+
+    private Prepared prepare(String pipelineId, String stepId, Map<String, String> schema,
+            String statement, String derivedFrom, String derivedBy) {
         String key = key(pipelineId, stepId);
         var captured = new DerivedSchema(0, schema, statement, derivedFrom, derivedBy);
         try {
@@ -61,17 +82,20 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
         } catch (TapstateException | IllegalArgumentException | NullPointerException | ClassCastException invalid) {
             throw new TapstateException(IoError.DOCUMENT_INVALID, Map.of("id", key, "field", "schema"), null);
         }
-        access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, session -> {
-            Stored before = read(session, key); requireIntactHistory(before);
-            var versions = new ArrayList<DerivedSchema>(before == null ? List.of() : before.versions());
-            DerivedSchema last = versions.isEmpty() ? null : versions.getLast();
-            if (last != null && last.schema().equals(captured.schema())) {
-                versions.set(versions.size() - 1, new DerivedSchema(last.version(), last.schema(), statement, derivedFrom, derivedBy));
-            } else {
-                versions.add(new DerivedSchema(versions.size(), captured.schema(), statement, derivedFrom, derivedBy));
-            }
-            write(session, key, versions, before == null ? null : before.pin()); return null;
-        });
+        return new Prepared(key, captured);
+    }
+
+    private void record(ClientSession session, Prepared recording) {
+        String key = recording.key(); var captured = recording.model();
+        Stored before = read(session, key); requireIntactHistory(before);
+        var versions = new ArrayList<DerivedSchema>(before == null ? List.of() : before.versions());
+        DerivedSchema last = versions.isEmpty() ? null : versions.getLast();
+        if (last != null && last.schema().equals(captured.schema())) {
+            versions.set(versions.size() - 1, new DerivedSchema(last.version(), last.schema(), captured.statement(), captured.derivedFrom(), captured.derivedBy()));
+        } else {
+            versions.add(new DerivedSchema(versions.size(), captured.schema(), captured.statement(), captured.derivedFrom(), captured.derivedBy()));
+        }
+        write(session, key, versions, before == null ? null : before.pin());
     }
 
     @Override public void pin(String pipelineId, String stepId, long version) {
