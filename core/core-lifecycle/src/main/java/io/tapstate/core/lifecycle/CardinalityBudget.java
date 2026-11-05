@@ -76,6 +76,8 @@ public enum CardinalityBudget {
     NEST_ENTRIES("tapstate.pipeline.nest.entries", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_ACCESSES("tapstate.pipeline.nest.accesses", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_BACKFILLS("tapstate.pipeline.nest.backfills", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_KEY_ACCESSES("tapstate.pipeline.nest.key.accesses", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_COLD_KEYS("tapstate.pipeline.nest.cold.keys", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_BACKFILL_TIME("tapstate.pipeline.nest.backfill.time", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     /** A mark each namespace's own worst moment left: the peaks did not happen together, so they do not add. */

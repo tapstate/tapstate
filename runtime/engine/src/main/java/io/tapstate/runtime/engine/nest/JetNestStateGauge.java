@@ -34,6 +34,12 @@ final class JetNestStateGauge implements NestStateGauge {
         metric(NestStateMetricNames.PENDING_HIGH_WATER, namespace).set(pendingHighWater);
     }
 
+    @Override
+    public void keyReading(String namespace, long keyAccesses, long coldKeys) {
+        metric(NestStateMetricNames.KEY_ACCESSES, namespace).set(keyAccesses);
+        metric(NestStateMetricNames.COLD_KEYS, namespace).set(coldKeys);
+    }
+
     private Metric metric(String kind, String namespace) {
         return byName.computeIfAbsent(NestStateMetricNames.nameOf(kind, namespace), Metrics::metric);
     }

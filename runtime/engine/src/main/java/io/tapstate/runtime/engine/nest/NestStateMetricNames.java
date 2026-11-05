@@ -18,11 +18,17 @@ public final class NestStateMetricNames {
     /** How many keys the namespace holds. */
     public static final String ENTRIES = "entries";
 
-    /** How many times its state was read. */
+    /** The established logical access accounting, including reads and writes. */
     public static final String ACCESSES = "accesses";
 
-    /** How many of those went to the layer behind the map. */
+    /** Completed cold loader callbacks, independent of the number of keys in each callback. */
     public static final String BACKFILLS = "backfills";
+
+    /** Requested key accesses, distinct within each logical operation. */
+    public static final String KEY_ACCESSES = "keyAccesses";
+
+    /** Keys requested by completed cold loader callbacks, including absent stored values. */
+    public static final String COLD_KEYS = "coldKeys";
 
     /** How long those took in total. */
     public static final String BACKFILL_MILLIS = "backfillMillis";
@@ -35,21 +41,23 @@ public final class NestStateMetricNames {
 
     /**
      * The reading {@code kinds} describes, with {@code stored} answering what the layer behind the memory
-     * holds. A kind the statistics do not carry reads as zero: a run publishes every kind on every reading,
-     * so a missing one is a run that has not been collected from yet rather than a namespace at zero.
+     * holds. Legacy kinds absent from the statistics retain their zero defaults. Key counters require
+     * both instruments; an older or incomplete reading cannot supply a measured cold share.
      *
      * <p>Assembling it here rather than where the statistics are read keeps the two ends of the contract in
      * one file. A kind published under a name nobody reads back is invisible in the way that costs most: the
      * metric is present and at zero, exactly as it would be for a namespace where nothing ever happened.
      */
     public static NestStateReading readingFrom(Map<String, Long> kinds, OptionalLong stored) {
-        return new NestStateReading(
+        NestStateReading reading = new NestStateReading(
                 kinds.getOrDefault(ENTRIES, 0L),
                 kinds.getOrDefault(ACCESSES, 0L),
                 kinds.getOrDefault(BACKFILLS, 0L),
                 kinds.getOrDefault(BACKFILL_MILLIS, 0L),
                 kinds.getOrDefault(PENDING_HIGH_WATER, 0L),
                 stored);
+        return kinds.containsKey(KEY_ACCESSES) && kinds.containsKey(COLD_KEYS)
+                ? reading.withKeyCounts(kinds.get(KEY_ACCESSES), kinds.get(COLD_KEYS)) : reading;
     }
 
     /** The name a reading of {@code kind} about {@code namespace} is left under. */

@@ -57,7 +57,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 id -> loaded(),
                 id -> Map.of("chain-a", 4L),
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
+                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
+                                .withKeyCounts(1_200L, 60L)),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of("chain-b", 61_000L),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -82,7 +83,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
 
         List<MetricFact> measured = publisher.facts("orders", PipelineState.RUNNING, AT,
                 Map.of("nest.orders.doc.$root",
-                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))),
+                        new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
+                                .withKeyCounts(1_200L, 60L)),
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L),
                 Map.of("nest.orders.doc.$root", 3L), Map.of("orders.region", 120L),
                 Map.of("orders.region", 1_000L), loaded());
@@ -90,7 +92,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         // empty set: the count is asserted before the two are compared. Failures are the one family with
         // no source to wire -- they are counted from a cause handed over on a witnessing pass, so they are
         // absent here and are covered by the case that feeds one.
-        assertThat(measured).hasSize(14);
+        assertThat(measured).hasSize(16);
         FlatMetricProjection flat = FlatMetricProjection.of(measured, ObservationPublisher.FLAT_REDUCTIONS);
         // The load's two measurements are the only ones this face cannot carry, and it says so rather than
         // letting them go missing. They are not lost with them: the same observation carries the same load
@@ -105,6 +107,7 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "tapstate.pipeline.frontier.gap", "tapstate.pipeline.frontier.stall",
                 "tapstate.pipeline.nest.entries", "tapstate.pipeline.nest.accesses",
                 "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
+                "tapstate.pipeline.nest.key.accesses", "tapstate.pipeline.nest.cold.keys",
                 "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
                 "tapstate.pipeline.nest.dead_lettered",
                 "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total",
@@ -122,6 +125,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "nestStateEntries.nest.orders.doc.$root",
                 "nestStateAccesses.nest.orders.doc.$root",
                 "nestStateBackfills.nest.orders.doc.$root",
+                "nestStateKeyAccesses.nest.orders.doc.$root",
+                "nestStateColdKeys.nest.orders.doc.$root",
                 "nestStateBackfillMillis.nest.orders.doc.$root",
                 "nestStatePendingHighWater.nest.orders.doc.$root",
                 "nestStateStored.nest.orders.doc.$root",
@@ -132,6 +137,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 .containsEntry("frontierGap.chain-a", 4L)
                 .containsEntry("frontierStalledMillis.chain-b", 61_000L)
                 .containsEntry("nestStateStored.nest.orders.doc.$root", 400_000L)
+                .containsEntry("nestStateKeyAccesses.nest.orders.doc.$root", 1_200L)
+                .containsEntry("nestStateColdKeys.nest.orders.doc.$root", 60L)
                 .containsEntry("nestDeadLettered.nest.orders.doc.$root", 3L);
         assertThat(published.snapshot())
                 .containsOnly(entry("orders", new TableSnapshot(90_000L, 120_000L, 75)));

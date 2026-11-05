@@ -72,6 +72,23 @@ latest observation and can still return retained samples for a stopped pipeline.
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 
+## Nest cold-layer counters
+
+`tapstate.pipeline.nest.accesses` retains its logical-operation accounting, and
+`tapstate.pipeline.nest.backfills` counts cold loader callbacks. A batched operation can cause several
+partition callbacks, so dividing these counters does not produce a cold percentage.
+
+`tapstate.pipeline.nest.key.accesses` and `tapstate.pipeline.nest.cold.keys` count requested keys in
+operations and cold loaders respectively, including keys with no stored value. Keys are deduplicated
+within an operation; later visits count again. The flat view spells these instruments
+`nestStateKeyAccesses.<namespace>` and `nestStateColdKeys.<namespace>`. The cold share uses their window
+deltas. Older observations without both instruments have no measured cold share. Existing callback
+timings and counters keep their units; callbacks are not physical database command counts.
+
+The cold-layer alert still requires at least 100 logical accesses and a cold share of at least 50%.
+Small samples accumulate, missing key measurements do not establish recovery, and notifications describe
+pressure and recovery transitions.
+
 ## Current-run initial-load display
 
 The snapshot response can additionally carry `initialLoad`. Its `runKey` binds the reading to the
