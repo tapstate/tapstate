@@ -1,5 +1,5 @@
 name: app-2 hosted diagnostic
-run-name: app-2 fixed cohort, forkCount=2
+run-name: app-2 fixed cohort, forkCount=3
 'on':
   push:
     branches:
@@ -10,7 +10,7 @@ permissions:
   contents: read
 jobs:
   app2:
-    name: app-2, 210 classes, two forks
+    name: app-2, 210 classes, three forks
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     env:
@@ -62,7 +62,7 @@ jobs:
         assert len(items)==210
         assert hashlib.sha256(json.dumps(items,separators=(',',':')).encode()).hexdigest()=='51bae5f242fd5c610bfc7f22c8a2e67804613bd2865e44e0741a459ef9b374c1'
         (out/'selected-cohort.json').write_text(json.dumps(shard,indent=2))
-        metadata={'code_sha':plan['source_sha'],'workflow_sha':os.environ['GITHUB_SHA'],'workflow_ref':os.environ['GITHUB_WORKFLOW_REF'],'run_id':os.environ['GITHUB_RUN_ID'],'expected_classes':210,'expected_cases':1753,'forkCount':2,'test_jvm_heap':'2048m','active_processor_hint':2,'note':'Hosted diagnostic, not the complete repository CI workflow.'}
+        metadata={'code_sha':plan['source_sha'],'workflow_sha':os.environ['GITHUB_SHA'],'workflow_ref':os.environ['GITHUB_WORKFLOW_REF'],'run_id':os.environ['GITHUB_RUN_ID'],'expected_classes':210,'expected_cases':1753,'forkCount':3,'test_jvm_heap':'2048m','active_processor_hint':2,'note':'Hosted diagnostic, not the complete repository CI workflow.'}
         (out/'metadata.json').write_text(json.dumps(metadata,indent=2))
         PY
     - name: Prepare an isolated dependency repository
@@ -76,7 +76,7 @@ jobs:
     - name: Prepare the locked connector inputs
       run: |
         python3 deploy/cloud/prepare-test-inputs.py --output "$RUNNER_TEMP/cloud-test-release"
-    - name: Run all 210 original classes with two forks
+    - name: Run all 210 original classes with three forks
       env:
         TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/cloud-test-release
       run: |
@@ -88,12 +88,12 @@ jobs:
         assert len(units)==160 and len(its)==50
         release=Path(os.environ['TAPSTATE_TEST_CLOUD_RELEASE_DIR']);env=os.environ.copy();env['JAVA_TOOL_OPTIONS']='-Xmx2048m -XX:ActiveProcessorCount=2 -Djava.io.tmpdir='+str(tmp)
         for key in ['TAPSTATE_TEST_NATIVE_CLI','TAPSTATE_ATLAS_TEST_URI','TAPSTATE_ATLAS_STANDARD_URI']:env.pop(key,None)
-        args=['mvn','-B','-T','1','-Dmaven.repo.local='+str(repo),'-pl','app','verify','-Dapi.version=1.44','-DforkCount=2','-Djunit.jupiter.execution.parallel.enabled=false','-Dtapstate.it.jvmArgs=-Xmx2048m -XX:ActiveProcessorCount=2 -Djava.io.tmpdir='+str(tmp)]
+        args=['mvn','-B','-T','1','-Dmaven.repo.local='+str(repo),'-pl','app','verify','-Dapi.version=1.44','-DforkCount=3','-Djunit.jupiter.execution.parallel.enabled=false','-Dtapstate.it.jvmArgs=-Xmx2048m -XX:ActiveProcessorCount=2 -Djava.io.tmpdir='+str(tmp)]
         for connector in ['mongodb','mysql','postgres']:args.append('-Dtapstate.pdk.it.'+connector+'-jar='+str(release/'connectors'/(connector+'-connector.jar')))
         for directory in ['surefire-reports','failsafe-reports']:
          p=root/'app/target'/directory
          if p.exists():shutil.rmtree(p)
-        record={'started_at':time.time(),'stages':[],'forkCount':2,'requested_classes':210,'requested_cases':1753}
+        record={'started_at':time.time(),'stages':[],'forkCount':3,'requested_classes':210,'requested_cases':1753}
         def run(label,command):
          step={'label':label,'command':command,'started_at':time.time()};record['stages'].append(step);(out/'execution.json').write_text(json.dumps(record,indent=2))
          with (out/(label+'.log')).open('w') as log:
@@ -145,7 +145,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: app2-hosted-fixed-cohort-forks2
+        name: app2-hosted-fixed-cohort-forks3
         path: |
           ${{ runner.temp }}/app2-diagnostic/
           app/target/surefire-reports/
