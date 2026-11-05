@@ -12,6 +12,17 @@ class NestColdLayerPressureTest {
     private static final NestColdLayerPressure PRESSURE = new NestColdLayerPressure(0.5, 100);
 
     @Test
+    void theSampleFloorStillCountsLegacyAccessesAndTheThresholdUsesKeyShare() {
+        assertThat(NestColdLayerPressure.DEFAULT).isEqualTo(PRESSURE);
+        assertThat(PRESSURE.isOver(NestStateWindow.fromStart(
+                new NestStateReading(8, 99, 400, 0).withKeyCounts(800, 800)))).isFalse();
+        assertThat(PRESSURE.isOver(NestStateWindow.fromStart(
+                new NestStateReading(8, 100, 400, 0).withKeyCounts(800, 400)))).isTrue();
+        assertThat(PRESSURE.isOver(NestStateWindow.fromStart(
+                new NestStateReading(8, 100, 400, 0).withKeyCounts(800, 399)))).isFalse();
+    }
+
+    @Test
     void aNamespaceServingMostOfItsReachingFromDiskIsUnderPressure() {
         // The failure this exists for: nothing else says it is happening. The queues are short, the lag is
         // flat and the throughput is what it always was, because per-key state is a buffer backpressure
@@ -80,7 +91,7 @@ class NestColdLayerPressureTest {
     /** A window over which {@code accesses} were served and {@code backfills} of them went to the store. */
     private static NestStateWindow window(long accesses, long backfills) {
         return NestStateWindow.between(
-                new NestStateReading(50, 0, 0, 0, OptionalLong.of(500)),
-                new NestStateReading(50, accesses, backfills, backfills, OptionalLong.of(500)));
+                new NestStateReading(50, 0, 0, 0, OptionalLong.of(500)).withKeyCounts(0, 0),
+                new NestStateReading(50, accesses, backfills, backfills, OptionalLong.of(500)).withKeyCounts(accesses, backfills));
     }
 }

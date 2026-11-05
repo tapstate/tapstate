@@ -97,6 +97,8 @@ public final class ObservationPublisher {
     private static final String NEST_ENTRIES_PREFIX = "nestStateEntries.";
     private static final String NEST_ACCESSES_PREFIX = "nestStateAccesses.";
     private static final String NEST_BACKFILLS_PREFIX = "nestStateBackfills.";
+    private static final String NEST_KEY_ACCESSES_PREFIX = "nestStateKeyAccesses.";
+    private static final String NEST_COLD_KEYS_PREFIX = "nestStateColdKeys.";
     private static final String NEST_BACKFILL_MILLIS_PREFIX = "nestStateBackfillMillis.";
 
     /**
@@ -154,6 +156,8 @@ public final class ObservationPublisher {
     private static final String NEST_ENTRIES_METRIC = "tapstate.pipeline.nest.entries";
     private static final String NEST_ACCESSES_METRIC = "tapstate.pipeline.nest.accesses";
     private static final String NEST_BACKFILLS_METRIC = "tapstate.pipeline.nest.backfills";
+    private static final String NEST_KEY_ACCESSES_METRIC = "tapstate.pipeline.nest.key.accesses";
+    private static final String NEST_COLD_KEYS_METRIC = "tapstate.pipeline.nest.cold.keys";
     private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
@@ -297,6 +301,8 @@ public final class ObservationPublisher {
             Map.entry(NEST_ENTRIES_METRIC, keyed(NEST_ENTRIES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_ACCESSES_METRIC, keyed(NEST_ACCESSES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_BACKFILLS_METRIC, keyed(NEST_BACKFILLS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_KEY_ACCESSES_METRIC, keyed(NEST_KEY_ACCESSES_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_COLD_KEYS_METRIC, keyed(NEST_COLD_KEYS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_BACKFILL_TIME_METRIC, keyed(NEST_BACKFILL_MILLIS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
                     keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
@@ -990,11 +996,13 @@ public final class ObservationPublisher {
         readingsAt(pipelineId, FRONTIER_STALL_METRIC, "ms", at, CHAIN_ID_ATTRIBUTE, pinned).ifPresent(facts::add);
         // One point per namespace that reported, so a resolver thrashing against its cold layer stays
         // distinguishable from an assembler that is not; a namespace reporting nothing is absent rather
-        // than present at zero, which would read as a state layer that had emptied. Six quantities, six
-        // facts: each is its own instrument, read against the others rather than added to them.
+        // than present at zero, which would read as a state layer that had emptied. Each quantity is its
+        // own instrument, read against the others rather than added to them.
         Map<String, Long> entries = new LinkedHashMap<>();
         Map<String, Long> accesses = new LinkedHashMap<>();
         Map<String, Long> backfills = new LinkedHashMap<>();
+        Map<String, Long> keyAccesses = new LinkedHashMap<>();
+        Map<String, Long> coldKeys = new LinkedHashMap<>();
         Map<String, Long> backfillMillis = new LinkedHashMap<>();
         Map<String, Long> pendingHighWater = new LinkedHashMap<>();
         Map<String, Long> stored = new LinkedHashMap<>();
@@ -1002,6 +1010,8 @@ public final class ObservationPublisher {
             entries.put(namespace, reading.entries());
             accesses.put(namespace, reading.accesses());
             backfills.put(namespace, reading.backfills());
+            reading.keyAccesses().ifPresent(keys -> keyAccesses.put(namespace, keys));
+            reading.coldKeys().ifPresent(keys -> coldKeys.put(namespace, keys));
             backfillMillis.put(namespace, reading.backfillMillis());
             pendingHighWater.put(namespace, reading.pendingHighWater());
             reading.stored().ifPresent(whole -> stored.put(namespace, whole));
@@ -1011,6 +1021,10 @@ public final class ObservationPublisher {
         readingsAt(pipelineId, NEST_ACCESSES_METRIC, "{access}", at, NEST_NAMESPACE_ATTRIBUTE, accesses)
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_BACKFILLS_METRIC, "{backfill}", at, NEST_NAMESPACE_ATTRIBUTE, backfills)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_KEY_ACCESSES_METRIC, "{key}", at, NEST_NAMESPACE_ATTRIBUTE, keyAccesses)
+                .ifPresent(facts::add);
+        readingsAt(pipelineId, NEST_COLD_KEYS_METRIC, "{key}", at, NEST_NAMESPACE_ATTRIBUTE, coldKeys)
                 .ifPresent(facts::add);
         readingsAt(pipelineId, NEST_BACKFILL_TIME_METRIC, "ms", at, NEST_NAMESPACE_ATTRIBUTE, backfillMillis)
                 .ifPresent(facts::add);

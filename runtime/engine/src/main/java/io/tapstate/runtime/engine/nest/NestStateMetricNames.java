@@ -24,6 +24,12 @@ public final class NestStateMetricNames {
     /** How many of those went to the layer behind the map. */
     public static final String BACKFILLS = "backfills";
 
+    /** Requested key accesses, distinct within each logical operation. */
+    public static final String KEY_ACCESSES = "keyAccesses";
+
+    /** Keys requested by completed cold loader callbacks, including absent stored values. */
+    public static final String COLD_KEYS = "coldKeys";
+
     /** How long those took in total. */
     public static final String BACKFILL_MILLIS = "backfillMillis";
 
@@ -43,13 +49,15 @@ public final class NestStateMetricNames {
      * metric is present and at zero, exactly as it would be for a namespace where nothing ever happened.
      */
     public static NestStateReading readingFrom(Map<String, Long> kinds, OptionalLong stored) {
-        return new NestStateReading(
+        NestStateReading reading = new NestStateReading(
                 kinds.getOrDefault(ENTRIES, 0L),
                 kinds.getOrDefault(ACCESSES, 0L),
                 kinds.getOrDefault(BACKFILLS, 0L),
                 kinds.getOrDefault(BACKFILL_MILLIS, 0L),
                 kinds.getOrDefault(PENDING_HIGH_WATER, 0L),
                 stored);
+        return kinds.containsKey(KEY_ACCESSES) && kinds.containsKey(COLD_KEYS)
+                ? reading.withKeyCounts(kinds.get(KEY_ACCESSES), kinds.get(COLD_KEYS)) : reading;
     }
 
     /** The name a reading of {@code kind} about {@code namespace} is left under. */

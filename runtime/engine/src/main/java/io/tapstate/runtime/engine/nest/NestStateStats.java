@@ -43,6 +43,16 @@ public final class NestStateStats {
         counters(namespace).accesses.increment();
     }
 
+    /** Requested keys, counted separately from the established logical access counter. */
+    public void accessKeys(String namespace, long keys) {
+        counters(namespace).keyAccesses.add(keys);
+    }
+
+    /** Requested cold keys, including those for which the backend has no stored value. */
+    public void coldKeys(String namespace, long keys) {
+        counters(namespace).coldKeys.add(keys);
+    }
+
     /** Counts one reach that was not in memory, and what going to the layer behind it cost. */
     public void backfill(String namespace, long nanos) {
         Counters counters = counters(namespace);
@@ -67,9 +77,9 @@ public final class NestStateStats {
     public Counted counted(String namespace) {
         Counters counters = byNamespace.get(namespace);
         return counters == null
-                ? new Counted(0, 0, 0, 0)
+                ? new Counted(0, 0, 0, 0, 0, 0)
                 : new Counted(counters.accesses.sum(), counters.backfills.sum(), counters.backfillNanos.sum(),
-                        counters.pendingHighWater.get());
+                        counters.pendingHighWater.get(), counters.keyAccesses.sum(), counters.coldKeys.sum());
     }
 
     /** Whether anything has been counted for {@code namespace} at all - absence being distinct from zero. */
@@ -91,7 +101,11 @@ public final class NestStateStats {
     }
 
     /** One namespace's counts, as read together. Nanoseconds, because the trips being timed are short. */
-    public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
+    public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater,
+            long keyAccesses, long coldKeys) {
+        public Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
+            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0);
+        }
     }
 
     /**
@@ -104,6 +118,8 @@ public final class NestStateStats {
         private final LongAdder accesses = new LongAdder();
         private final LongAdder backfills = new LongAdder();
         private final LongAdder backfillNanos = new LongAdder();
+        private final LongAdder keyAccesses = new LongAdder();
+        private final LongAdder coldKeys = new LongAdder();
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
     }
 }

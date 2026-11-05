@@ -22,4 +22,8 @@ interface NestStateGauge {
      */
     void reading(String namespace, long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater);
+
+    /** Additional key-unit instruments; existing gauges may continue to publish only legacy readings. */
+    default void keyReading(String namespace, long keyAccesses, long coldKeys) {
+    }
 }

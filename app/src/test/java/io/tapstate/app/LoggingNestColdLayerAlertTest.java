@@ -28,6 +28,18 @@ class LoggingNestColdLayerAlertTest {
     private Logger logger;
     private Level previousLevel;
 
+    @Test
+    void theMessageNamesCallbackAndLogicalCountsSeparatelyFromTheKeyShare() {
+        NestStateWindow window = NestStateWindow.fromStart(
+                new NestStateReading(8, 100, 400, 2_000).withKeyCounts(800, 400));
+        new LoggingNestColdLayerAlert().crossed("p1", "nest.p1.items", window);
+        assertThat(only().getFormattedMessage()).contains("accesses=100", "backfills=400", "share=50%");
+        written.list.clear();
+        new LoggingNestColdLayerAlert().cleared("p1", "nest.p1.items", window);
+        assertThat(only().getFormattedMessage())
+                .contains("400 cold loader callbacks", "100 logical state accesses", "cold key share 50%");
+    }
+
     @BeforeEach
     void captureWhatIsWritten() {
         logger = (Logger) LoggerFactory.getLogger(LoggingNestColdLayerAlert.class);
@@ -116,7 +128,8 @@ class LoggingNestColdLayerAlertTest {
     /** A window over a namespace holding 100 of its 10000 keys in memory. */
     private static NestStateWindow window(long accesses, long backfills, long backfillMillis) {
         return NestStateWindow.between(
-                new NestStateReading(100, 0, 0, 0, OptionalLong.of(10_000)),
-                new NestStateReading(100, accesses, backfills, backfillMillis, OptionalLong.of(10_000)));
+                new NestStateReading(100, 0, 0, 0, OptionalLong.of(10_000)).withKeyCounts(0, 0),
+                new NestStateReading(100, accesses, backfills, backfillMillis, OptionalLong.of(10_000))
+                        .withKeyCounts(accesses, backfills));
     }
 }
