@@ -52,11 +52,9 @@ class ColdPartitionRatioDiagnosticTest {
                     Capture capture = new Capture();
                     MapNestStore<Object> store = new MapNestStore<>(member.getMap(namespace),
                             NestStateStats.of(member), capture);
-                    NestStateReading before = capture.reading();
                     int callsBefore = backend.calls(namespace);
                     Map<Object, Object> found = store.loadAll(keys);
-                    assertThat(found).hasSize(8);
-                    keys.forEach(key -> assertThat(found.get(key)).isEqualTo("value-" + key));
+                    assertLoadedValues(found, keys);
                     NestStateWindow cold = NestStateWindow.fromStart(capture.reading());
                     assertThat(cold.accesses()).isOne();
                     assertThat(cold.keyAccesses()).hasValue(8);
@@ -70,7 +68,7 @@ class ColdPartitionRatioDiagnosticTest {
                     emit(repeat, "cold", partitions, 8, cold, backend.calls(namespace) - callsBefore);
                     coldShares.add(cold.servedFromCold().orElseThrow());
 
-                    before = capture.reading();
+                    NestStateReading before = capture.reading();
                     callsBefore = backend.calls(namespace);
                     assertThat(store.loadAll(keys)).isEqualTo(found);
                     NestStateWindow hot = NestStateWindow.between(before, capture.reading());
@@ -107,6 +105,11 @@ class ColdPartitionRatioDiagnosticTest {
         } finally {
             member.shutdown();
         }
+    }
+
+    private static void assertLoadedValues(Map<Object, Object> found, List<Object> keys) {
+        assertThat(found).hasSize(8);
+        keys.forEach(key -> assertThat(found).containsEntry(key, "value-" + key));
     }
 
     private static void emit(int repeat, String phase, int partitions, int coldKeys,
