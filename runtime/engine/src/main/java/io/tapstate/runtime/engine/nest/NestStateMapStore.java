@@ -74,7 +74,8 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             String resolved = database == null ? stores.defaultDatabase() : database;
             this.store = stores.inDatabase(resolved).state();
         }
-        this.stateIo = new NestStateIo(store, namespace);
+        this.stateIo = bindings == null ? new NestStateIo(store, namespace)
+                : new NestStateIo(store, namespace, () -> bindings.isRootNestState(namespace));
         this.stats = NestStateStats.of(member);
     }
 

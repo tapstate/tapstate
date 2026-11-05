@@ -15,10 +15,11 @@ import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
 
 /**
- * Coalesces partition callbacks for the same namespace's backend. Reads execute immediately;
- * fresh writes gather concurrent callbacks against a fixed one-millisecond deadline.
+ * Coalesces partition callbacks for the same namespace's backend. Selected root bulk reads and
+ * fresh writes gather concurrent callbacks against independent one-millisecond deadlines.
  * No executor, cache or background write is introduced. Every caller still waits for its own
  * durable backend outcome, preserving write-through and split-brain protection.
  *
@@ -34,18 +35,36 @@ final class NestStateIo {
     private final KeyedStateStore store;
     private final String namespace;
     private final long writeGatherNanos;
+    private final long readGatherNanos;
+    private final BooleanSupplier rootBulkReads;
     private final Batcher reads = new Batcher(false);
     private final Batcher writes = new Batcher(true);
 
     NestStateIo(KeyedStateStore store, String namespace) {
-        this(store, namespace, 1_000_000L);
+        this(store, namespace, 1_000_000L, 0);
     }
 
-    /** Bounded timing seam for concurrency tests; production uses the fixed one-millisecond window. */
+    NestStateIo(KeyedStateStore store, String namespace, BooleanSupplier rootBulkReads) {
+        this(store, namespace, 1_000_000L, 1_000_000L, rootBulkReads);
+    }
+
+    /** Bounded timing seams for concurrency tests; production windows remain fixed at one millisecond. */
     NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos) {
-        if (writeGatherNanos < 0 || writeGatherNanos > 1_000_000_000L)
-            throw new IllegalArgumentException("write gather duration is outside its bounded range");
+        this(store, namespace, writeGatherNanos, 0);
+    }
+
+    NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos, long readGatherNanos) {
+        this(store, namespace, writeGatherNanos, readGatherNanos, () -> true);
+    }
+
+    NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos,
+            long readGatherNanos, BooleanSupplier rootBulkReads) {
+        if (writeGatherNanos < 0 || writeGatherNanos > 1_000_000_000L
+                || readGatherNanos < 0 || readGatherNanos > 1_000_000_000L)
+            throw new IllegalArgumentException("state gather duration is outside its bounded range");
         this.writeGatherNanos = writeGatherNanos;
+        this.readGatherNanos = readGatherNanos;
+        this.rootBulkReads = Objects.requireNonNull(rootBulkReads, "rootBulkReads");
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
     }
@@ -53,17 +72,18 @@ final class NestStateIo {
     Map<String, byte[]> loadAll(Collection<String> keys) {
         Map<String, byte[]> request = new LinkedHashMap<>();
         for (String key : keys) request.put(key, null);
-        return reads.call(request, true);
+        if (request.isEmpty()) return Map.of();
+        return reads.call(request, true, readGatherNanos != 0 && rootBulkReads.getAsBoolean());
     }
 
     byte[] load(String key) {
         Map<String, byte[]> request = new LinkedHashMap<>();
         request.put(key, null);
-        return reads.call(request, false).get(key);
+        return reads.call(request, false, false).get(key);
     }
 
     void saveAll(Map<String, byte[]> states) {
-        writes.call(new LinkedHashMap<>(states), false);
+        writes.call(new LinkedHashMap<>(states), false, false);
     }
 
     /** Admission facts used to verify that blocked callers cannot grow the internal queue without bound. */
@@ -79,6 +99,7 @@ final class NestStateIo {
         private boolean running;
         private int admissionWaiters;
         private int isolatedWrites;
+        private int isolatedBulkReads;
         private final ReentrantLock lock = new ReentrantLock();
         private final Condition changed = lock.newCondition();
         private final Condition arrivals = lock.newCondition();
@@ -96,9 +117,9 @@ final class NestStateIo {
             }
         }
 
-        private Map<String, byte[]> call(Map<String, byte[]> values, boolean batchRead) {
+        private Map<String, byte[]> call(Map<String, byte[]> values, boolean batchRead, boolean gatherRead) {
             if (values.isEmpty()) return Map.of();
-            Request request = new Request(values, batchRead);
+            Request request = new Request(values, batchRead, gatherRead);
             boolean interrupted = false;
             try {
                 lock.lock();
@@ -117,7 +138,7 @@ final class NestStateIo {
                     pending.add(request);
                     pendingKeys += values.size();
                     pendingBytes += request.bytes;
-                    if (writing) arrivals.signal();
+                    if (writing || readGatherNanos != 0) arrivals.signal();
                 } finally {
                     lock.unlock();
                 }
@@ -133,6 +154,7 @@ final class NestStateIo {
                         }
                         running = true;
                         interrupted |= gatherWrites();
+                        if (!writing) interrupted |= gatherReads();
                         batch = takeBatch();
                         changed.signalAll();
                     } finally {
@@ -155,6 +177,24 @@ final class NestStateIo {
             // requests that already waited through backend I/O need no additional gathering delay.
             while (canGather()) {
                 long remaining = writeGatherNanos - (System.nanoTime() - began);
+                if (remaining <= 0) break;
+                try {
+                    arrivals.awaitNanos(remaining);
+                } catch (InterruptedException ignored) {
+                    interrupted = true;
+                }
+            }
+            return interrupted;
+        }
+
+        private boolean gatherReads() {
+            if (readGatherNanos == 0 || isolatedBulkReads >= 2 || !pending.element().gatherRead) return false;
+            boolean interrupted = false;
+            long began = pending.element().admittedAt;
+            while (admissionWaiters == 0 && pending.size() < MAX_REQUESTS
+                    && pendingKeys < MAX_KEYS && pendingBytes < MAX_BYTES
+                    && pending.stream().allMatch(request -> request.gatherRead)) {
+                long remaining = readGatherNanos - (System.nanoTime() - began);
                 if (remaining <= 0) break;
                 try {
                     arrivals.awaitNanos(remaining);
@@ -219,6 +259,10 @@ final class NestStateIo {
                 // gather window after two isolated writes, and relearn when concurrent work appears.
                 if (writing) isolatedWrites = batch.size() > 1 || !pending.isEmpty()
                         ? 0 : Math.min(2, isolatedWrites + 1);
+                if (!writing && batch.stream().anyMatch(request -> request.gatherRead)) {
+                    isolatedBulkReads = batch.size() > 1 || !pending.isEmpty()
+                            ? 0 : Math.min(2, isolatedBulkReads + 1);
+                }
                 running = false;
                 changed.signalAll();
             } finally {
@@ -261,6 +305,7 @@ final class NestStateIo {
         private final Map<String, byte[]> values;
         private final long bytes;
         private final boolean batchRead;
+        private final boolean gatherRead;
         private long admittedAt;
         private boolean done;
         private Map<String, byte[]> result;
@@ -273,9 +318,10 @@ final class NestStateIo {
             return result;
         }
 
-        private Request(Map<String, byte[]> values, boolean batchRead) {
+        private Request(Map<String, byte[]> values, boolean batchRead, boolean gatherRead) {
             this.values = values;
             this.batchRead = batchRead;
+            this.gatherRead = gatherRead;
             long size = 0;
             for (Map.Entry<String, byte[]> entry : values.entrySet()) {
                 size += 64L + 3L * (namespace.length() + entry.getKey().length());
