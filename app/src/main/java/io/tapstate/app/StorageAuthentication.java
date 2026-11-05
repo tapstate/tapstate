@@ -58,7 +58,8 @@ final class StorageAuthentication implements AutoCloseable {
         original.verifyAuthentication();
         Epoch candidate = new Epoch(original);
         original.requireAuthentication();
-        if (bootstrap != null) bootstrap.sessions.close();
+        if (bootstrap != null) bootstrap.sessions.handoffTo(
+                original.cache().cloudSessions(original.preparation().authScope()), clock.instant());
         current.set(candidate);
     }
 
