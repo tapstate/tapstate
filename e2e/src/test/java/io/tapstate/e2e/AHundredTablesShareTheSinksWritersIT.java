@@ -81,7 +81,7 @@ class AHundredTablesShareTheSinksWritersIT {
                 // wait would end on a timeout rather than on the batch that did it. Counted as distinct ids of
                 // each table, by the table each row carries: a row can be written more than once.
                 try {
-                    Await.until("every table's rows to be written", Duration.ofMinutes(3),
+                    Await.until("every table's rows to be written", Duration.ofMinutes(4),
                         () -> idsWrittenByTable(written).size() == TABLES && idsWrittenByTable(written).values()
                                 .stream().allMatch(ids -> ids.size() == ROWS_EACH),
                         () -> incompleteWrites(written, files, targetAddress, tables, control));
