@@ -1500,7 +1500,8 @@ class ManagedMongoStoreIsolationIT {
                     }
                     assertThat(root.runtime().business()).contains(ownerRef.get());
                     assertThat(child.isActive()).isTrue(); assertThat(member.getLifecycleService().isRunning()).isTrue();
-                    assertCloudStatus(application,temporary,401);
+                    assertThat(cloudPost(application,temporary,"/api/storage/status",Map.of()))
+                            .containsEntry("businessPhase","READY").containsEntry("operationId",original.operationId());
                     String fresh=exchangeCookie(application,"fresh");
                     assertThat(cloudPost(application,fresh,"/api/storage/setup/commit",request)).containsEntry("setupPhase","COMPLETE");
                     assertThat(cloudPost(application,fresh,"/api/storage/status",Map.of())).containsEntry("businessPhase","READY");
@@ -1639,8 +1640,17 @@ class ManagedMongoStoreIsolationIT {
                 assertComposedConfiguration(admin.getDatabase(configDb), admin.getDatabase(cacheDb), null);
                 assertThat(admin.getDatabase(cacheDb).getCollection("schema_migrations").find(new Document("_id", "business")).first().getInteger("installedVersion")).isEqualTo(2);
                 assertThat(admin.getDatabase(cacheDb).listCollectionNames()).contains("validation_runs");
-                assertThat(admin.getDatabase(cacheDb).getCollection("cloud_sessions").countDocuments()).isZero();
-                assertCloudStatus(application, temporary, 401);
+                var sessions = admin.getDatabase(cacheDb).getCollection("cloud_sessions");
+                if (failAfterCompletion) {
+                    assertThat(sessions.countDocuments()).isZero();
+                    assertCloudStatus(application, temporary, 401);
+                } else {
+                    assertThat(sessions.countDocuments()).isOne();
+                    assertThat(sessions.find(new Document("jwtId", "old")).first())
+                            .isNotNull().containsEntry("revoked", false);
+                    assertThat(cloudPost(application, temporary, "/api/storage/status", Map.of()))
+                            .containsEntry("businessPhase", "READY").containsEntry("operationId", original.operationId());
+                }
                 assertThatThrownBy(() -> oldContext.service().exchangeCode("late", "127.0.0.1")).isInstanceOf(TapstateException.class);
                 assertThatThrownBy(() -> exchangeCookie(application, "old")).isInstanceOf(org.springframework.web.client.RestClientResponseException.class);
                 String fresh = exchangeCookie(application, "fresh");
