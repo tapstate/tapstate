@@ -27,6 +27,10 @@ public final class MongoReadBudget {
 
     }
 
+    private MongoReadBudget(long deadlineNanos) { nanos = deadlineNanos - started; }
+    static MongoReadBudget until(long deadlineNanos) { return new MongoReadBudget(deadlineNanos); }
+    long deadlineNanos() { return started + nanos; }
+
     public void requireRemaining() { StoreIo.run(this::remainingMillis); }
 
     long remainingMillis() {

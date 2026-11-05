@@ -72,6 +72,35 @@ class AlertDeliveryRuntimeIT {
     static void seed(AlertEvaluationHostIT.Fixture f){route(f,Duration.ZERO);var planner=planner(f,"planner");f.evaluator().withPlanner(planner);bad(f);planner.tick();}
     static List<AlertIntent.Identity> ids(AlertEvaluationHostIT.Fixture f){return intents(f).stream().map(v->v.value().frozen().identity()).toList();}
     static void settled(AlertDeliveryRuntime runtime){await().atMost(Duration.ofSeconds(10)).until(()->runtime.occupied()==0);}
+
+    @Test void failedChannelCloseRetainsItsActualHandleForCleanupRetryAfterDispatchExits() {
+        AlertEvaluationHostIT.withFixture(f->{
+            seed(f);var store=sendingStore(f);var sending=new CountDownLatch(2);var release=new CountDownLatch(1);
+            var failedCloses=new CountDownLatch(4);var attempts=new CopyOnWriteArrayList<AtomicInteger>();
+            AlertDeliveryRuntime.Channels channels=new AlertDeliveryRuntime.Channels(){
+                public boolean supports(AlertIntent.Frozen frozen){return true;}
+                public Object prepare(AlertIntent.Frozen frozen){return null;}
+                public NotificationChannel open(AlertIntent.Frozen frozen,AlertStore.PrivateMaterial material,Object prepared){
+                    var closes=new AtomicInteger();attempts.add(closes);
+                    return new NotificationChannel(){
+                        public AlertChannelPolicy.Capability capability(){return frozen.channel();}
+                        public Result send(Request request){sending.countDown();try{release.await();}catch(InterruptedException failure){throw new AssertionError(failure);}return accepted();}
+                        public void close(){if(closes.incrementAndGet()<=2){failedCloses.countDown();throw StorageRuntime.unavailable();}}
+                    };
+                }
+                public void close(){}
+            };
+            var worker=new AlertDeliveryRuntime(store,f.clock(),"retry-close",ACTIVE,channels,ignored->access());
+            try {
+                worker.tick();assertThat(sending.await(5,TimeUnit.SECONDS)).isTrue();worker.close();
+                await().atMost(Duration.ofSeconds(3)).until(()->failedCloses.getCount()==2);
+                release.countDown();assertThat(failedCloses.await(3,TimeUnit.SECONDS)).isTrue();
+                worker.awaitStopped(ShutdownAwait.deadline());
+                assertThat(attempts).hasSize(2);for(var attempt:attempts)assertThat(attempt.get()).isGreaterThanOrEqualTo(3);
+            }catch(InterruptedException failure){Thread.currentThread().interrupt();throw new AssertionError(failure);}
+            finally{release.countDown();worker.close();worker.awaitStopped(ShutdownAwait.deadline());}
+        });
+    }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void closeReleasesLocalSlotsWhenAnInterruptedResultCannotBePersisted(boolean finishesAfterClose) {
@@ -104,7 +133,7 @@ class AlertDeliveryRuntimeIT {
                 f.now().set(T.plusSeconds(1));
                 try(var replacement=runtime(f,store,channels,"replacement-results")){replacement.tick();settled(replacement);}
                 assertThat(channels.calls).hasValue(2);
-            } finally { release.countDown();worker.close(); }
+            } finally { release.countDown();worker.close();worker.awaitStopped(ShutdownAwait.deadline()); }
         });
     }
     @Test void anActiveWorkerRetainsAndRetriesAPendingResultWithoutResending() {

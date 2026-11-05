@@ -6,10 +6,20 @@ import java.util.*;
 import java.util.function.*;
 
 /** Observes the existing necessary CACHE operations without issuing any extra database request. */
-final class ObservedWorkloadClaims implements WorkloadClaimStore {
+class ObservedWorkloadClaims implements WorkloadClaimStore {
     private final WorkloadClaimStore delegate;
     private final BiConsumer<Boolean,Throwable> observer;
     ObservedWorkloadClaims(WorkloadClaimStore delegate,BiConsumer<Boolean,Throwable> observer){this.delegate=delegate;this.observer=observer;}
+    static WorkloadClaimStore observe(WorkloadClaimStore delegate,BiConsumer<Boolean,Throwable> observer) {
+        return delegate instanceof DeadlineWorkloadClaimStore bounded
+                ? new Bounded(bounded,observer) : new ObservedWorkloadClaims(delegate,observer);
+    }
+    private static final class Bounded extends ObservedWorkloadClaims implements DeadlineWorkloadClaimStore {
+        private final DeadlineWorkloadClaimStore bounded;
+        Bounded(DeadlineWorkloadClaimStore bounded,BiConsumer<Boolean,Throwable> observer){super(bounded,observer);this.bounded=bounded;}
+        public <T>T withDeadline(long deadline,Runnable active,Supplier<T> operation){return bounded.withDeadline(deadline,active,operation);}
+        public void awaitQuiescence(long deadline){bounded.awaitQuiescence(deadline);}
+    }
     private <T>T call(boolean write,Supplier<T> action){
         T result;
         try {result=action.get();}

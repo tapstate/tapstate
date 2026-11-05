@@ -22,15 +22,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final MongoConnection connection;
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
+    private final MongoClaimOperations claimOperations;
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+    private boolean connectionClosed;
 
     private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
         this.operatorDatabases = operatorDatabases;
         this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention; this.targetFingerprint = targetFingerprint;
+        this.claimOperations = new MongoClaimOperations(client);
     }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
@@ -344,9 +347,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** The claims share this exact cache client, original scope and owner lifecycle. */
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
+        claimOperations.requireAdmission();
         loadBusinessScope(expected);
         StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
-        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
+        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
     }
 
     public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected) {
@@ -657,5 +661,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private static TapstateException unreadableIndex() {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cache-auth", "field", "index"), null);
     }
-    @Override public void close() { if (closed.compareAndSet(false, true)) connection.close(); }
+    @Override public synchronized void close() {
+        if(connectionClosed)return;
+        claimOperations.closeIfIdle();
+        closed.set(true);
+        connection.close();
+        connectionClosed=true;
+    }
 }

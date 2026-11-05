@@ -64,6 +64,7 @@ final class SharedMongo {
         if (container == null) {
             DockerGate.require();
             MongoDBContainer starting = new MongoDBContainer(IMAGE);
+            io.tapstate.testsupport.ContainerLabels.configure(starting);
             String owner = System.getProperty("tapstate.e2e.resource-owner");
             if (owner != null && !owner.isBlank()) {
                 starting.withLabel(System.getProperty("tapstate.e2e.resource-owner-label",

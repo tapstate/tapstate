@@ -24,6 +24,15 @@ public interface SrsConsumerStore {
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
+    /** An implementation may validate one event's original consumer and model in one guarded read. */
+    default boolean supportsReadEventVerification() { return false; }
+
+    /** Empty means the original consumer is unavailable; model and fence failures retain their errors. */
+    default Optional<SrsModel> verifyReadEvent(SrsConsumerRun run, String table, String ring, long sequence,
+            long epoch, long version, WorkloadClaimFence capture) {
+        throw new UnsupportedOperationException("read event verification is not supported");
+    }
+
     /** Freezes the original current view and one store-issued completed CONFIG full. */
     default SrsFreshFullPreparation inspectFreshFull(CompletedPipelineFull full, SrsConsumerRun original, long expectedProgressRevision,
             WorkloadClaimFence originalNode, WorkloadClaimFence originalCapture) {

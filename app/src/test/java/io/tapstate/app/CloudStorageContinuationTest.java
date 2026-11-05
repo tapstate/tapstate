@@ -451,6 +451,7 @@ class CloudStorageContinuationTest {
                 throw new AssertionError("unknown old activity must prevent another assembly");
             })).isInstanceOf(TapstateException.class);
             assertThat(f.phase.get()).isEqualTo(StorageSetupStateStore.Phase.COMPLETE);
+            doNothing().when(failed).close();
         }
     }
 

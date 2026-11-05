@@ -105,6 +105,7 @@ class StorageRootActivationAuthorizationTest {
             assertThat(f.root.completedInstallationActivationAllowed()).isFalse();
             verify(business).close();
             verify(f.configuration, never()).requireOriginalInitialPreparation(any());
+            doNothing().when(business).close();
         }
     }
 }

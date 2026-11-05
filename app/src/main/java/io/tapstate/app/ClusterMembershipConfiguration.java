@@ -44,6 +44,11 @@ class ClusterMembershipConfiguration {
     @Bean
     @org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean(BootId.class)
     BootId bootId() {
-        return BootId.fresh();
+        var boot = BootId.fresh();
+        var process = ProcessHandle.current();
+        org.slf4j.LoggerFactory.getLogger(ClusterMembershipConfiguration.class).info(
+                "Process boot identity [boot_id={}, pid={}, started_at={}]", boot.value(), process.pid(),
+                process.info().startInstant().map(java.time.Instant::toString).orElse("unknown"));
+        return boot;
     }
 }
