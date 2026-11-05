@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -68,6 +69,20 @@ class CacheDatabaseSuggestionsTest {
         assertThat(suggestion).isPresent();
         String name = suggestion.orElseThrow();
         assertThat(name).matches("x+_483921");
+        assertThat(name.getBytes(StandardCharsets.UTF_8)).hasSizeLessThanOrEqualTo(63);
         assertThat(MongoDatabaseNames.isValid(name)).isTrue();
+    }
+
+    @Test void truncatesAsciiSuggestionsAtTheMongoDatabaseByteLimit() {
+        var suggestion = CacheDatabaseSuggestions.find("x".repeat(57), () -> 483921, name -> false);
+
+        assertThat(suggestion).contains("x".repeat(56) + "_483921");
+    }
+
+    @Test void truncatesMultibyteSuggestionsWithoutSplittingCodePoints() {
+        var suggestion = CacheDatabaseSuggestions.find("\u00e9".repeat(29), () -> 483921, name -> false);
+
+        assertThat(suggestion).contains("\u00e9".repeat(28) + "_483921");
+        assertThat(suggestion.orElseThrow().getBytes(StandardCharsets.UTF_8)).hasSize(63);
     }
 }
