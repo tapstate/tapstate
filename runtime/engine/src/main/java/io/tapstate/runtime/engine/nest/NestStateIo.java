@@ -16,6 +16,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 
 /**
  * Coalesces partition callbacks for the same namespace's backend. Selected root bulk reads and
@@ -37,7 +38,8 @@ final class NestStateIo {
     private final long writeGatherNanos;
     private final long readGatherNanos;
     private final BooleanSupplier rootBulkReads;
-    private final Batcher reads = new Batcher(false);
+    private final LongSupplier readNanos;
+    private volatile Batcher reads;
     private final Batcher writes = new Batcher(true);
 
     NestStateIo(KeyedStateStore store, String namespace) {
@@ -59,12 +61,18 @@ final class NestStateIo {
 
     NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos,
             long readGatherNanos, BooleanSupplier rootBulkReads) {
+        this(store, namespace, writeGatherNanos, readGatherNanos, rootBulkReads, System::nanoTime);
+    }
+
+    NestStateIo(KeyedStateStore store, String namespace, long writeGatherNanos,
+            long readGatherNanos, BooleanSupplier rootBulkReads, LongSupplier readNanos) {
         if (writeGatherNanos < 0 || writeGatherNanos > 1_000_000_000L
                 || readGatherNanos < 0 || readGatherNanos > 1_000_000_000L)
             throw new IllegalArgumentException("state gather duration is outside its bounded range");
         this.writeGatherNanos = writeGatherNanos;
         this.readGatherNanos = readGatherNanos;
         this.rootBulkReads = Objects.requireNonNull(rootBulkReads, "rootBulkReads");
+        this.readNanos = Objects.requireNonNull(readNanos, "readNanos");
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
     }
@@ -73,13 +81,16 @@ final class NestStateIo {
         Map<String, byte[]> request = new LinkedHashMap<>();
         for (String key : keys) request.put(key, null);
         if (request.isEmpty()) return Map.of();
-        return reads.call(request, true, readGatherNanos != 0 && rootBulkReads.getAsBoolean());
+        boolean gatherRead = readGatherNanos != 0 && rootBulkReads.getAsBoolean();
+        return readBatcher(gatherRead).call(request, true, gatherRead);
     }
 
     byte[] load(String key) {
         Map<String, byte[]> request = new LinkedHashMap<>();
         request.put(key, null);
-        return reads.call(request, false, false).get(key);
+        Batcher reader = reads;
+        if (reader == null) reader = readBatcher(readGatherNanos != 0 && rootBulkReads.getAsBoolean());
+        return reader.call(request, false, false).get(key);
     }
 
     void saveAll(Map<String, byte[]> states) {
@@ -87,9 +98,24 @@ final class NestStateIo {
     }
 
     /** Admission facts used to verify that blocked callers cannot grow the internal queue without bound. */
-    Pending queuedReads() { return reads.pending(); }
+    Pending queuedReads() {
+        Batcher reader = reads;
+        return reader == null ? new Pending(0, 0, 0) : reader.pending();
+    }
     Pending queuedWrites() { return writes.pending(); }
     record Pending(int requests, int keys, long bytes) { }
+
+    /** Role classification happens before this monitor; it never replaces the backend's active guards. */
+    private Batcher readBatcher(boolean rootState) {
+        Batcher reader = reads;
+        if (reader == null) {
+            synchronized (this) {
+                reader = reads;
+                if (reader == null) reads = reader = new Batcher(false, rootState);
+            }
+        }
+        return reader;
+    }
 
     private final class Batcher {
         private final boolean writing;
@@ -100,12 +126,19 @@ final class NestStateIo {
         private int admissionWaiters;
         private int isolatedWrites;
         private int isolatedBulkReads;
-        private final ReentrantLock lock = new ReentrantLock();
-        private final Condition changed = lock.newCondition();
-        private final Condition arrivals = lock.newCondition();
+        private final ReentrantLock lock;
+        private final Condition changed;
+        private final Condition arrivals;
 
         private Batcher(boolean writing) {
+            this(writing, false);
+        }
+
+        private Batcher(boolean writing, boolean fair) {
             this.writing = writing;
+            this.lock = new ReentrantLock(fair);
+            this.changed = lock.newCondition();
+            this.arrivals = lock.newCondition();
         }
 
         private Pending pending() {
@@ -190,12 +223,23 @@ final class NestStateIo {
         private boolean gatherReads() {
             if (readGatherNanos == 0 || isolatedBulkReads >= 2 || !pending.element().gatherRead) return false;
             boolean interrupted = false;
+            boolean awaitAttempted = false;
             long began = pending.element().admittedAt;
             while (admissionWaiters == 0 && pending.size() < MAX_REQUESTS
                     && pendingKeys < MAX_KEYS && pendingBytes < MAX_BYTES
                     && pending.stream().allMatch(request -> request.gatherRead)) {
-                long remaining = readGatherNanos - (System.nanoTime() - began);
-                if (remaining <= 0) break;
+                long remaining = readGatherNanos - (readNanos.getAsLong() - began);
+                if (remaining <= 0) {
+                    // Give existing admission predecessors one turn if no timed wait released this lock.
+                    // The fair root read queue keeps this leader behind them without opening a new window.
+                    if (!awaitAttempted && lock.isFair() && lock.hasQueuedThreads()) {
+                        lock.unlock();
+                        lock.lock();
+                        interrupted |= Thread.interrupted();
+                    }
+                    break;
+                }
+                awaitAttempted = true;
                 try {
                     arrivals.awaitNanos(remaining);
                 } catch (InterruptedException ignored) {

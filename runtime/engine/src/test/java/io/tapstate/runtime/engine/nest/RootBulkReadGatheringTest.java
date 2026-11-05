@@ -27,15 +27,60 @@ class RootBulkReadGatheringTest {
         } finally { close(store, threads); }
     }
 
-    @Test void otherNamespacesEmptyRequestsSinglesAndWritesDoNotConsultTheRootSelector() {
+    @Test void emptyRequestsWritesAndInspectionDoNotInitializeTheReadQueue() {
         Store store = new Store(); store.release.countDown(); AtomicInteger classifications = new AtomicInteger();
         NestStateIo io = new NestStateIo(store, "ns", () -> { classifications.incrementAndGet(); return false; });
         assertThat(io.loadAll(List.of())).isEmpty();
-        assertThat(io.load("single")).isNotNull(); io.saveAll(Map.of("write", new byte[] {2}));
+        io.saveAll(Map.of("write", new byte[] {2}));
+        assertThat(io.queuedReads()).isEqualTo(new NestStateIo.Pending(0, 0, 0));
         assertThat(classifications.get()).isZero();
-        assertThat(io.loadAll(List.of("other"))).containsOnlyKeys("other");
+        assertThat(io.load("single")).isNotNull();
         assertThat(classifications.get()).isEqualTo(1);
-        assertThat(store.batches).containsExactly(List.of("single"), List.of("other"));
+        assertThat(io.load("another-single")).isNotNull();
+        assertThat(classifications.get()).isEqualTo(1);
+        assertThat(io.loadAll(List.of("other"))).containsOnlyKeys("other");
+        assertThat(classifications.get()).isEqualTo(2);
+        assertThat(store.batches).containsExactly(List.of("single"), List.of("another-single"), List.of("other"));
+    }
+
+    @Test void concurrentFirstScalarAndBulkReadsShareOneQueue() throws Exception {
+        Store store = new Store(); var classifyTogether = new CyclicBarrier(2); var classified = new CountDownLatch(2);
+        NestStateIo io = new NestStateIo(store, "ns", 0, TimeUnit.SECONDS.toNanos(1), () -> {
+            try { classifyTogether.await(5, TimeUnit.SECONDS); }
+            catch (Exception failed) { throw new AssertionError(failed); }
+            classified.countDown(); return true;
+        });
+        List<Thread> threads = new ArrayList<>();
+        try {
+            var scalar = start(() -> io.load("scalar"), threads);
+            var bulk = start(() -> io.loadAll(List.of("bulk")), threads);
+            assertThat(classified.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            NestStateIoTest.awaitAllBlockedInsideIo(threads);
+            assertThat(threads).allSatisfy(thread -> assertThat(Arrays.stream(thread.getStackTrace())
+                    .noneMatch(frame -> frame.getMethodName().equals("gatherReads"))).isTrue());
+            assertThat(store.batches).hasSize(1);
+            store.release.countDown();
+            assertThat(scalar.get(5, TimeUnit.SECONDS)).containsExactly((byte) 1);
+            assertThat(bulk.get(5, TimeUnit.SECONDS)).containsOnlyKeys("bulk");
+        } finally { close(store, threads); }
+    }
+
+    @Test void failedInitialClassificationPublishesNoQueueAndCanBeRetried() {
+        Store store = new Store(); store.release.countDown(); AtomicInteger classifications = new AtomicInteger();
+        var failure = new IllegalStateException("classification unavailable");
+        NestStateIo io = new NestStateIo(store, "ns", () -> {
+            if (classifications.incrementAndGet() == 1) throw failure;
+            return true;
+        });
+        assertThatThrownBy(() -> io.load("first")).isSameAs(failure);
+        assertThat(io.queuedReads()).isEqualTo(new NestStateIo.Pending(0, 0, 0));
+        assertThat(classifications.get()).isEqualTo(1);
+        assertThat(store.batches).isEmpty();
+        assertThat(io.load("retry")).isNotNull();
+        assertThat(io.load("next")).isNotNull();
+        assertThat(classifications.get()).isEqualTo(2);
+        assertThat(store.batches).containsExactly(List.of("retry"), List.of("next"));
     }
 
     @Test void aScalarArrivalEndsTheBulkGatherWithoutStartingAnotherWindow() throws Exception {
