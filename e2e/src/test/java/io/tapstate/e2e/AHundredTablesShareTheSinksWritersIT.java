@@ -16,7 +16,6 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -46,7 +45,6 @@ class AHundredTablesShareTheSinksWritersIT {
     }
 
     @Test
-    @Disabled("Temporarily isolated under #911; use .github/scripts/hundred-table-diagnostic.sh.")
     void aHundredTablesAreWrittenByTheSinksFourWritersOneTableABatch(@TempDir Path directory) throws IOException {
         byte[] connector = Files.readAllBytes(E2eConnectorJar.buildInto(directory));
         Path source = Files.createDirectories(directory.resolve("src"));
