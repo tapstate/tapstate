@@ -7,6 +7,8 @@ import io.tapstate.spi.store.AlertStore;
 import io.tapstate.testsupport.RequiresDocker;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.bson.Document;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -74,7 +76,13 @@ class AlertRuleIsolationIT {
                 if(futureFormat){var future=Document.parse(saved.toJson());future.put("formatVersion",999);future.put("body",new Document("opaque",true));rules.replaceOne(new Document("_id",saved.get("_id")),future);}
                 var old=f.configuration().alerts(f.storeHost(),BuiltinAlarmTypes.catalog(),f.clock());var evaluator=new AlertEvaluationHost(old,BuiltinAlarmTypes.catalog(),f.storeHost().deployment(),f.clock(),"known-refresh",ACTIVE);
                 try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(old,evaluator),f.configuration().intents(),(scope,fence)->Optional.of(ACTIVE),ACTIVE,f.clock())){
-                    runtime.tick();org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).until(()->org.springframework.test.util.ReflectionTestUtils.getField(runtime,"services")!=null);
+                    runtime.tick();
+                    // Publish only after the first refresh has installed its services and rule snapshot.
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(10)).until(()->{
+                        var services=(AtomicReference<?>)org.springframework.test.util.ReflectionTestUtils.getField(runtime,"services");
+                        var refreshing=(AtomicBoolean)org.springframework.test.util.ReflectionTestUtils.getField(runtime,"refreshing");
+                        return services.get()!=null&&!refreshing.get();
+                    });
                     var pass=org.mockito.Mockito.mock(PipelineConvergencePass.class);org.mockito.Mockito.when(pass.scope()).thenReturn(f.intent().scope());org.mockito.Mockito.when(pass.intent()).thenReturn(f.intent());org.mockito.Mockito.when(pass.claim()).thenReturn(io.tapstate.spi.store.WorkloadClaimFence.from(f.claim()));
                     runtime.published(pass,new io.tapstate.core.lifecycle.Observation("orders",io.tapstate.core.lifecycle.PipelineState.FAILED,Map.of(),Map.of(),Map.of(),null,T,List.of()),null);
                     var known=f.binding(()->new AlertStore.EvaluationProof(f.intent(),ACTIVE)).key();
