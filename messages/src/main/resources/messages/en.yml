@@ -598,6 +598,9 @@ store.unreachable:
 store.database-access-failed:
   message: "Cannot verify read/write access to the deployment database {database}."
   solution: "Check MongoDB connectivity and grant the Cluster user read/write access to its metadata, operator-state, and views databases."
+store.cache-list-collections-denied:
+  message: "Cannot inspect collections in cache database {database}."
+  solution: "Grant the cache user the MongoDB listCollections privilege on this database, then test again."
 store.not-replica-set:
   message: "The store at {target} is not a transaction-capable replica set or sharded cluster."
   solution: "Use a replica set or sharded cluster; standalone MongoDB cannot host checkpoint transactions."

@@ -407,6 +407,7 @@ start-check.target-rows-unknown
 start-check.target-set-to-clear
 start-check.unavailable
 store.ai-provider-schema-unsupported
+store.cache-list-collections-denied
 store.database-access-failed
 store.default-source-protected
 store.history-retention-mismatch

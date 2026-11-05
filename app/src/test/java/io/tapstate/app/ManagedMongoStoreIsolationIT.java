@@ -796,6 +796,7 @@ class ManagedMongoStoreIsolationIT {
         String writer = "writer_" + database;
         String reader = "reader_" + database;
         String noIndex = "noindex_" + database;
+        String noList = "nolist_" + database;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             createUser(admin, writer, List.of(database));
             admin.getDatabase("admin").runCommand(new Document("createUser", reader).append("pwd", PASSWORD)
@@ -806,6 +807,18 @@ class ManagedMongoStoreIsolationIT {
                             .append("actions", List.of("find", "insert", "update", "remove", "createCollection", "listCollections")))));
             admin.getDatabase("admin").runCommand(new Document("createUser", noIndex).append("pwd", PASSWORD)
                     .append("roles", List.of(new Document("role", "crud_without_indexes").append("db", database))));
+            admin.getDatabase(database).runCommand(new Document("createRole", "crud_without_list")
+                    .append("roles", List.of()).append("privileges", List.of(new Document("resource",
+                            new Document("db", database).append("collection", ""))
+                            .append("actions", List.of("find", "insert", "update", "remove", "createCollection", "createIndex")))));
+            admin.getDatabase("admin").runCommand(new Document("createUser", noList).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", "crud_without_list").append("db", database))));
+            var noListCandidate = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    uri(noList, database), database, null);
+            var storageProbe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            assertThatThrownBy(() -> storageProbe.testCache(storageProbe.normalize(noListCandidate)))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
+                            .isEqualTo(io.tapstate.adapters.mongostore.StoreError.CACHE_LIST_COLLECTIONS_DENIED));
             for (String user : List.of(writer, reader, noIndex)) {
                 var candidate = new io.tapstate.spi.store.StorageBinding.Connection(
                         io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, database), database, null);

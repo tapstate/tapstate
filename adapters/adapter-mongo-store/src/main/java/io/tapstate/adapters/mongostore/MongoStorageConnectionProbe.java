@@ -41,7 +41,7 @@ public final class MongoStorageConnectionProbe implements StorageConnectionProbe
             try {
                 occupied = hasCollections(connection.database());
             } catch (MongoException unavailable) {
-                if (unavailable.getCode() == 13) throw databaseAccessFailure(database);
+                if (unavailable.getCode() == 13) throw new TapstateException(StoreError.CACHE_LIST_COLLECTIONS_DENIED, Map.of("database", database), null);
                 throw StoreIo.coded(unavailable);
             }
             if (occupied) {
@@ -59,7 +59,4 @@ public final class MongoStorageConnectionProbe implements StorageConnectionProbe
         return database.listCollectionNames().first() != null;
     }
 
-    private static TapstateException databaseAccessFailure(String database) {
-        return new TapstateException(StoreError.DATABASE_ACCESS_FAILED, Map.of("database", database), null);
-    }
 }

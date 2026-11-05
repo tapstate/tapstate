@@ -141,6 +141,25 @@ class StorageSetupServiceTest {
                 .isInstanceOf(TapstateException.class);
     }
 
+    @Test void opLocalSetupPreservesLayerAndCauseWhenRecheckFails() {
+        var f = new Fixture();
+        f.states.state = new StorageSetupStateStore.Status(SCOPE, StorageSetupStateStore.Phase.LOCAL_SETUP, 0);
+        var refused = new java.util.concurrent.atomic.AtomicBoolean();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {
+                if (refused.get()) throw new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
+            }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
+        };
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE); refused.set(true);
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.STORAGE_TEST_FAILED);
+                    assertThat(failure.args()).containsEntry("layer", "CONFIG").containsEntry("causeCode", IoError.STORE_UNAUTHORIZED.code());
+                });
+    }
+
     @Test void anUnsupportedOccupancyProbeCannotClaimAnEmptyDatabase() {
         StorageConnectionProbe probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
