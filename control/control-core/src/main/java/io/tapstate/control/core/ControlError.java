@@ -104,6 +104,11 @@ public enum ControlError implements TapstateErrorCode {
     STORAGE_DATABASES_OVERLAP("control.storage-databases-overlap", Set.of()),
     STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),
     STORAGE_TEST_FAILED("control.storage-test-failed", Set.of("layer", "causeCode")),
+    /** A fresh CACHE candidate contains one or more collections. */
+    STORAGE_CACHE_DATABASE_OCCUPIED("control.storage-cache-database-occupied", Set.of("database")),
+    /** An occupied CACHE candidate has a separately checked empty database suggestion. */
+    STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED("control.storage-cache-database-occupied-suggested",
+            Set.of("database", "suggestedDatabase")),
     STORAGE_SCOPE_CONFLICT("control.storage-scope-conflict", Set.of()),
     STORAGE_UNAVAILABLE("control.storage-unavailable", Set.of()),
     STORAGE_QUOTA_EXCEEDED("control.storage-quota-exceeded", Set.of());

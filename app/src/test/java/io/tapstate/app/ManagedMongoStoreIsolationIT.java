@@ -796,6 +796,7 @@ class ManagedMongoStoreIsolationIT {
         String writer = "writer_" + database;
         String reader = "reader_" + database;
         String noIndex = "noindex_" + database;
+        String noList = "nolist_" + database;
         try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
             createUser(admin, writer, List.of(database));
             admin.getDatabase("admin").runCommand(new Document("createUser", reader).append("pwd", PASSWORD)
@@ -806,6 +807,18 @@ class ManagedMongoStoreIsolationIT {
                             .append("actions", List.of("find", "insert", "update", "remove", "createCollection", "listCollections")))));
             admin.getDatabase("admin").runCommand(new Document("createUser", noIndex).append("pwd", PASSWORD)
                     .append("roles", List.of(new Document("role", "crud_without_indexes").append("db", database))));
+            admin.getDatabase(database).runCommand(new Document("createRole", "crud_without_list")
+                    .append("roles", List.of()).append("privileges", List.of(new Document("resource",
+                            new Document("db", database).append("collection", ""))
+                            .append("actions", List.of("find", "insert", "update", "remove", "createCollection", "createIndex")))));
+            admin.getDatabase("admin").runCommand(new Document("createUser", noList).append("pwd", PASSWORD)
+                    .append("roles", List.of(new Document("role", "crud_without_list").append("db", database))));
+            var noListCandidate = new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    uri(noList, database), database, null);
+            var storageProbe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            assertThatThrownBy(() -> storageProbe.testCache(storageProbe.normalize(noListCandidate)))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code())
+                            .isEqualTo(io.tapstate.adapters.mongostore.StoreError.CACHE_LIST_COLLECTIONS_DENIED));
             for (String user : List.of(writer, reader, noIndex)) {
                 var candidate = new io.tapstate.spi.store.StorageBinding.Connection(
                         io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB, uri(user, database), database, null);
@@ -813,14 +826,34 @@ class ManagedMongoStoreIsolationIT {
                     connection.verifyConnectivity();
                     var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
                     var normalized = probe.normalize(candidate);
-                    if (user.equals(writer)) probe.test(normalized);
-                    else assertThatThrownBy(() -> probe.test(normalized))
+                    if (user.equals(writer)) assertThat(probe.testCache(normalized).empty()).isTrue();
+                    else assertThatThrownBy(() -> probe.testCache(normalized))
                             .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                                     failure -> assertThat(failure.code()).isEqualTo(
                                             io.tapstate.adapters.mongostore.StoreError.DATABASE_ACCESS_FAILED));
                 }
                 assertThat(admin.getDatabase(database).listCollectionNames().into(new ArrayList<>())).isEmpty();
             }
+        }
+    }
+
+    @Test
+    void freshCacheProbeRejectsAnExistingEmptyCollectionAndOffersOnlyAnEmptySuggestion() {
+        String database = "setup_occupied_" + UUID.randomUUID().toString().replace("-", "");
+        try (MongoClient admin = MongoClients.create(uri("root", "admin"))) {
+          try {
+            admin.getDatabase(database).createCollection("unrelated");
+            var candidate = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    uri("root", "admin"), database, null);
+            var probe = new io.tapstate.adapters.mongostore.MongoStorageConnectionProbe(Duration.ofSeconds(5));
+            var result = probe.testCache(probe.normalize(candidate));
+
+            assertThat(result.empty()).isFalse();
+            assertThat(result.suggestedDatabase()).matches(database + "_[0-9]{6}");
+            assertThat(admin.getDatabase(result.suggestedDatabase()).listCollectionNames().into(new ArrayList<>())).isEmpty();
+          } finally {
+            admin.getDatabase(database).drop();
+          }
         }
     }
 

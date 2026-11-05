@@ -28,6 +28,7 @@ class StorageQuotaBoundaryTest {
                 if (value.database().equals("cache") && failureCode.get() != null)
                     throw new TapstateException(failureCode.get(), Map.of(), null);
             }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         var service = f.service(); var stamps = f.tested(service, StorageSetupServiceTest.CANDIDATE);
         for (var code : new TapstateErrorCode[]{IoError.STORE_QUOTA_EXCEEDED, ControlError.STORAGE_UNAVAILABLE, IoError.STORE_UNAUTHORIZED}) {

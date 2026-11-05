@@ -131,11 +131,14 @@ public final class StorageSetupService {
         if (layer != Layer.CACHE) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
         Candidate local = localCandidate(candidate);
         var cache = probe.normalize(local.cache());
-        try {
-            probe.test(cache);
-        } catch (TapstateException refused) {
-            throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
-                    Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
+        var setup = states.guardedBy(active).load();
+        var bound = setup.phase() == StorageSetupStateStore.Phase.STORAGE_BOUND
+                ? bindings.guardedBy(active).load() : Optional.<StorageBinding>empty();
+        boolean existingCache = bound.isPresent() && sameOperation(bound.get().setup(), expected) && bound.get().cache().equals(cache);
+        if (existingCache) {
+            try { probe.test(cache); } catch (TapstateException refused) { throw testFailed(layer, refused); }
+        } else {
+            testLayer(cache, layer);
         }
         requireSetup(expected, active);
         String hash = cacheHash(cache);
@@ -144,7 +147,9 @@ public final class StorageSetupService {
         Instant checkedAt = clock.instant();
         Instant expires = checkedAt.plus(TEST_LIFETIME);
         tests.put(layer, new Tested(expected, hash, stamp, checkedAt, expires));
-        return new TestResult(layer, stamp, expires, List.of("transactional-crud", "index-permissions"));
+        return new TestResult(layer, stamp, expires, existingCache
+                ? List.of("transactional-crud", "index-permissions")
+                : List.of("transactional-crud", "index-permissions", "cache-database-empty"));
     }
 
     /** Binding is durable before runtime activation. A lost HTTP response never discards its original first-cache invocation. */
@@ -162,53 +167,15 @@ public final class StorageSetupService {
     private Status commitOwned(String subject, StorageSetupScope expected, Runnable active, Candidate candidate, Map<Layer,String> stamps) {
         active.run();
         Prepared prepared = prepare(candidate);
-        if (mode == StorageBinding.Mode.OP && states.load().phase() == StorageSetupStateStore.Phase.LOCAL_SETUP) {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (progress != null) {
-                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
-                verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
-                progress.begin(expected, 0, false, verifiedChecks);
-            }
-            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) probe.test(prepared.candidate().connection(layer));
-            requireSetup(expected, active);
-            configurationPreparation.prepare(expected, prepared.candidate(), active);
-        }
+        prepareLocalConfiguration(expected, active, prepared, stamps);
         requireInstalledConfiguration(prepared.candidate().configuration());
         var guarded = bindings.guardedBy(active);
         Optional<StorageBinding> previous = guarded.load();
         if (progress != null && previous.isPresent()) progress.begin(expected, 1, false);
-        if (previous.isEmpty()) {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (progress != null) {
-                var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
-                verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
-                progress.begin(expected, 0, false, verifiedChecks);
-            }
-            for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) {
-                try {
-                    probe.test(prepared.candidate().connection(layer));
-                    if (progress != null) progress.checked(expected, layer);
-                }
-                catch (TapstateException refused) {
-                    throw new TapstateException(ControlError.STORAGE_TEST_FAILED,
-                            Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
-                }
-            }
-        }
-        Runnable writeGuard = previous.isPresent() ? active : () -> {
-            requireSetup(expected, active);
-            requireTests(expected, prepared, stamps);
-            if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
-        };
-        audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()), () -> {
-            StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
-                    prepared.candidate().cache(), prepared.target(), writeGuard);
-            if (pending == null || result.firstCreation().isPresent() || !pending.binding().equals(result.binding())
-                    || !pending.preparation().equals(result.preparation())) pending = result;
-            return result.binding();
-        });
+        if (previous.isEmpty()) verifyFirstBinding(expected, active, prepared, stamps);
+        Runnable writeGuard = bindingWriteGuard(previous, expected, active, prepared, stamps);
+        audit.dispatch(ControlOperations.STORAGE_SETUP_COMMIT, new AuditContext(subject, expected.operationId()),
+                () -> commitBinding(expected, prepared, writeGuard));
         if (progress != null) progress.completed(expected, StorageInitializationProgress.Stage.SAVE_SETTINGS);
         // The committed operation owns continuation even if the HTTP request or its test stamps expire.
         continuation.accept(pending);
@@ -217,6 +184,92 @@ public final class StorageSetupService {
         // secret-free completion receipt may return; no later request inherits that authorization.
         if (result.setupPhase() != StorageSetupStateStore.Phase.COMPLETE) active.run();
         return result;
+    }
+
+    private void prepareLocalConfiguration(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        if (mode != StorageBinding.Mode.OP || states.load().phase() != StorageSetupStateStore.Phase.LOCAL_SETUP) return;
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        beginSetupProgress(expected);
+        for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE))
+            testLayer(prepared.candidate().connection(layer), layer);
+        requireSetup(expected, active);
+        configurationPreparation.prepare(expected, prepared.candidate(), active);
+    }
+
+    private void verifyFirstBinding(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        beginSetupProgress(expected);
+        for (Layer layer : List.of(Layer.CONFIG, Layer.CACHE)) {
+            testLayer(prepared.candidate().connection(layer), layer);
+            if (progress != null) progress.checked(expected, layer);
+        }
+    }
+
+    private void beginSetupProgress(StorageSetupScope expected) {
+        if (progress == null) return;
+        var verifiedChecks = new EnumMap<Layer, Instant>(Layer.class);
+        verifiedChecks.put(Layer.CACHE, tests.get(Layer.CACHE).checkedAt());
+        progress.begin(expected, 0, false, verifiedChecks);
+    }
+
+    private Runnable bindingWriteGuard(Optional<StorageBinding> previous, StorageSetupScope expected,
+            Runnable active, Prepared prepared, Map<Layer,String> stamps) {
+        if (previous.isPresent()) return active;
+        return () -> requireFreshBindingWrite(expected, active, prepared, stamps);
+    }
+
+    private void requireFreshBindingWrite(StorageSetupScope expected, Runnable active, Prepared prepared,
+            Map<Layer,String> stamps) {
+        requireSetup(expected, active);
+        requireTests(expected, prepared, stamps);
+        if (!prepared.connector().equals(target.identity(prepared.candidate().master()))) throw testsRequired();
+    }
+
+    private StorageBinding commitBinding(StorageSetupScope expected, Prepared prepared, Runnable writeGuard) {
+        StorageBindingCommit result = bindings.guardedBy(operationActive).commitWithFirstCache(expected, mode,
+                prepared.candidate().cache(), prepared.target(), writeGuard);
+        retainPending(result);
+        return result.binding();
+    }
+
+    private void retainPending(StorageBindingCommit result) {
+        if (pending == null || result.firstCreation().isPresent() || !pending.binding().equals(result.binding())
+                || !pending.preparation().equals(result.preparation())) pending = result;
+    }
+
+    private void testLayer(StorageBinding.Connection connection, Layer layer) {
+        if (layer == Layer.CACHE) {
+            StorageConnectionProbe.CacheTestResult result;
+            try {
+                result = probe.testCache(connection);
+            } catch (TapstateException refused) {
+                throw testFailed(layer, refused);
+            }
+            if (!result.empty()) {
+                String suggestion = result.suggestedDatabase();
+                if (suggestion == null) {
+                    throw new TapstateException(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED,
+                            Map.of("database", connection.database()), null);
+                }
+                throw new TapstateException(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED,
+                        Map.of("database", connection.database(), "suggestedDatabase", suggestion), null);
+            }
+            return;
+        }
+        try {
+            probe.test(connection);
+        } catch (TapstateException refused) {
+            throw testFailed(layer, refused);
+        }
+    }
+
+    private static TapstateException testFailed(Layer layer, TapstateException refused) {
+        return new TapstateException(ControlError.STORAGE_TEST_FAILED,
+                Map.of("layer", layer.name(), "causeCode", refused.code().code()), null);
     }
 
     /** Retries only the saved original activation; it accepts no replacement connection settings. */

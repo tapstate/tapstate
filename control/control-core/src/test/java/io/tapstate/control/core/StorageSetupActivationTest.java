@@ -26,6 +26,7 @@ class StorageSetupActivationTest {
             @Override public void test(StorageBinding.Connection input) {
                 if (retry.get()) throw new AssertionError("retry must not repeat a network test");
             }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         var service = f.service(); var stamps = f.tested(service, CANDIDATE);
         service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps);
