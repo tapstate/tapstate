@@ -404,16 +404,18 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         });
     }
     private Document root(ClientSession session, CacheAuthScope expected) {
-        var preparation = bindings.cachePreparationForTransaction(session).orElseThrow(MongoStorageRecoveryCommands::refused);
+        var facts = bindings.readForTransaction(session);
+        var loaded = facts.loaded().orElseThrow(MongoStorageRecoveryCommands::refused);
+        var preparation = loaded.cachePreparation();
         if (!preparation.authScope().equals(expected)) throw refused();
-        Document setup = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
+        Document setup = facts.setup();
         if (setup != null && "STORAGE_BOUND".equals(setup.get("phase"))
                 && expected.mode() == io.tapstate.spi.store.StorageBinding.Mode.OP && expected.authGeneration() == 1) {
             MongoInitialOpRecovery.require(client, session, database, bindings, artifacts, expected, false);
         } else if (setup == null || !("COMPLETE".equals(setup.get("phase"))
                 || expected.mode() == io.tapstate.spi.store.StorageBinding.Mode.CLOUD && expected.authGeneration() > 1
                 && "STORAGE_BOUND".equals(setup.get("phase")))) throw refused();
-        Document root = SystemCollections.STORAGE_RECOVERY.on(database).find(session, new Document("_id", "cluster")).first();
+        Document root = loaded.recovery().row();
         if (root == null) throw unreadable();
         return root;
     }

@@ -57,8 +57,9 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
     }
 
     private Status load(ClientSession session) {
-        var binding = bindings.loadForTransaction(session);
-        Document row = SystemCollections.STORAGE_SETUP.on(database).find(session, new Document("_id", "cluster")).first();
+        var facts = bindings.readForTransaction(session);
+        var binding = facts.loaded().map(MongoStorageBindingStore.Loaded::binding);
+        Document row = facts.setup();
         try {
             var scope = new StorageSetupScope(row.getString("clusterId"), row.getString("installationId"),
                     row.getString("operationId"), row.getLong("generation"));

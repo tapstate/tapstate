@@ -6,6 +6,7 @@ import com.mongodb.MongoClientSettings;
 import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandFailedEvent;
+import com.mongodb.event.CommandSucceededEvent;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import io.tapstate.core.common.TapstateException;
@@ -42,10 +43,376 @@ class MongoStorageBindingStoreIT {
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
+    static {
+        String owner = System.getenv("TAPSTATE_TEST_RESOURCE_OWNER");
+        if (owner != null && !owner.isBlank()) MONGO.withLabel("io.tapstate.issue-loop.owner", owner);
+    }
     private static final StorageSetupScope SCOPE = new StorageSetupScope("cluster-a", "installation-a", "setup-a", 1);
     private static final StorageBinding.Connection CACHE = new StorageBinding.Connection(
             StorageBinding.Connection.Kind.MONGODB, "mongodb://cache-user:cache-secret@cache.invalid/cache?tls=true",
             "cache", "CA-material-sentinel");
+
+    @Test
+    void eachResourceConflictUsesItsOwnCollectionCollationAfterRecreation() {
+        for (var resource : List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
+                SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                assertThat(f.domain.bindings().load()).contains(original);
+                resource.on(f.database).drop();
+                f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                        .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                                .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                resource.on(f.database).insertOne(new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+                assertThat(resource.on(f.database).find(new Document("_id", original.defaultSourceId())).first()).isNotNull();
+                assertThatThrownBy(individualStore(f)::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+            });
+        }
+    }
+
+    @Test
+    void joinedFactsCannotUseCurrentCatalogCollationsForAnOlderSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var resource = SystemCollections.PIPELINES;
+            resource.on(f.database).drop();
+            f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            resource.on(f.database).insertOne(new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            var store = new MongoStorageBindingStore(f.admin, f.database, (SourceConfigCipherProvider) key.get(f.domain));
+            try (var session = f.admin.startSession()) {
+                session.startTransaction(com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT).build());
+                try {
+                    assertThat(SystemCollections.STORAGE_BINDING.on(f.database).find(session).first()).isNotNull();
+                    resource.on(f.database).drop();
+                    f.database.createCollection(resource.collectionName());
+                    var metadata = f.database.listCollections().into(new java.util.ArrayList<>());
+                    for (var name : List.of(resource.collectionName(), SystemCollections.CONFIG_CLUSTER_IDENTITY.collectionName())) {
+                        var options = metadata.stream().filter(row -> name.equals(row.getString("name")))
+                                .findFirst().orElseThrow().get("options", Document.class);
+                        assertThat(options).doesNotContainKey("collation");
+                    }
+                    assertThat(resource.on(f.database).find(session, new Document("_id", original.defaultSourceId())).first())
+                            .as("the retained snapshot still uses the historical case-insensitive collection").isNotNull();
+                    assertThatThrownBy(() -> store.loadForTransaction(session)).satisfies(MongoStorageBindingStoreIT::unreadable);
+                } finally { session.abortTransaction(); }
+            }
+        });
+    }
+
+    @Test
+    void setupAndGlobalFactsUseTheirOwnCollectionCollations() {
+        for (var resource : List.of(SystemCollections.STORAGE_SETUP, SystemCollections.PDK_NOTE_SCOPES)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                var row = resource.on(f.database).find().first();
+                if (resource == SystemCollections.STORAGE_SETUP) row.put("_id", "CLUSTER");
+                else row.get("_id", Document.class).put("namespace", "PDK.GLOBAL-STATE");
+                resource.on(f.database).drop();
+                f.database.createCollection(resource.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                        .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                                .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+                resource.on(f.database).insertOne(row);
+                assertThat(individualStore(f).load()).contains(original);
+                assertThat(f.domain.bindings().load()).contains(original);
+            });
+        }
+    }
+
+    @Test
+    void aRootCollationCannotTurnAnUnrelatedResourceIntoAConflict() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var identity = SystemCollections.CONFIG_CLUSTER_IDENTITY;
+            var row = identity.on(f.database).find().first();
+            identity.on(f.database).drop();
+            f.database.createCollection(identity.collectionName(), new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            identity.on(f.database).insertOne(row);
+            SystemCollections.PIPELINES.on(f.database).insertOne(
+                    new Document("_id", original.defaultSourceId().toUpperCase(java.util.Locale.ROOT)));
+            assertThat(individualStore(f).load()).contains(original);
+            assertThat(f.domain.bindings().load()).contains(original);
+        });
+    }
+
+    @Test
+    void singletonProbesPreserveEmbeddedIdOrderAndNumericQuerySemantics() {
+        for (boolean reverse : List.of(false, true)) {
+            withPrepared(f -> {
+                var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+                var notes = SystemCollections.PDK_NOTE_SCOPES.on(f.database);
+                var row = notes.find().first();
+                notes.deleteMany(new Document());
+                row.put("_id", reverse ? new Document("namespace", "pdk.global-state").append("bindingVersion", 1L)
+                        : new Document("bindingVersion", 1).append("namespace", "pdk.global-state"));
+                notes.insertOne(row);
+                if (reverse) {
+                    assertThatThrownBy(individualStore(f)::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                    assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                } else {
+                    assertThat(individualStore(f).load()).contains(original);
+                    assertThat(f.domain.bindings().load()).contains(original);
+                }
+            });
+        }
+    }
+
+    @Test
+    void populatedMetadataFallsBackToTheOriginalIndexedPredicates() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var rows = java.util.stream.IntStream.range(0, 1000)
+                    .mapToObj(i -> new Document("_id", "unrelated-" + i)).toList();
+            SystemCollections.STORAGE_SETUP.on(f.database).insertMany(rows);
+            SystemCollections.PDK_NOTE_SCOPES.on(f.database).insertMany(rows);
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { assertThat(f.domain.bindings().load()).contains(original); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(collections).containsEntry("storage_setup", 1).containsEntry("pdk_note_scopes", 1);
+        });
+    }
+
+    @Test
+    void aResourceConflictStopsTheRemainingCollectionLocalReads() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            SystemCollections.PIPELINES.on(f.database).insertOne(new Document("_id", original.defaultSourceId()));
+            var laterResources = List.of(SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS,
+                    SystemCollections.SERVE_DEFINITIONS);
+            for (var resource : laterResources)
+                resource.on(f.database).insertOne(new Document("_id", "unrelated"));
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { assertThatThrownBy(f.domain.bindings()::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(collections).containsEntry(SystemCollections.PIPELINES.collectionName(), 1);
+            for (var resource : laterResources) assertThat(collections).doesNotContainKey(resource.collectionName());
+        });
+    }
+
+    private static MongoStorageBindingStore individualStore(Fixture f) throws Exception {
+        var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(f.admin));
+        org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
+                com.mongodb.connection.ClusterConnectionMode.MULTIPLE, com.mongodb.connection.ClusterType.UNKNOWN, List.of()));
+        var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+        key.setAccessible(true);
+        return new MongoStorageBindingStore(client, f.database, (SourceConfigCipherProvider) key.get(f.domain));
+    }
+
+    @Test
+    void aPublicationUsesBoundedCommandsWithoutRepeatingItsRecoveryRead() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var commands = new java.util.HashMap<String, Integer>();
+            var collections = new java.util.HashMap<String, Integer>();
+            MongoCommandObservation.CURRENT.set(command -> commands.merge(command, 1, Integer::sum));
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) collections.merge(collection, 1, Integer::sum);
+            });
+            try { f.domain.requireAuthenticationPublished(original.preparation()); }
+            finally { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).containsEntry("find", 3).containsEntry("aggregate", 1).containsEntry("commitTransaction", 1);
+            assertThat(collections).containsEntry("storage_binding", 1).containsEntry("storage_recovery", 1)
+                    .doesNotContainKey("storage_setup");
+        });
+    }
+
+    @Test
+    void legalLargeConfigurationFactsStillLoadIndividuallyInTheSameSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            String padding = "x".repeat(8 * 1024 * 1024 + 1024);
+            for (var collection : List.of(SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP,
+                    SystemCollections.PDK_NOTE_SCOPES))
+                collection.on(f.database).updateOne(new Document(), new Document("$set", new Document("padding", padding)));
+            assertThat(f.domain.bindings().load()).contains(original);
+            assertThat(f.domain.setupStates().load().scope()).isEqualTo(SCOPE);
+            // Extra recovery records remain corruption even when the canonical record is intact.
+            var recovery = SystemCollections.STORAGE_RECOVERY.on(f.database);
+            recovery.insertOne(new Document(recovery.find().first()).append("_id", "extra"));
+            assertThatThrownBy(() -> f.domain.bindings().load()).satisfies(MongoStorageBindingStoreIT::unreadable);
+        });
+    }
+
+    @Test
+    void retainedPredicatesUseIdIndexesAndUnfilteredProbesExamineBoundedRows() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            // Materialize unrelated definitions so an absent collection's EOF shortcut cannot
+            // stand in for proving the ID lookup plan on populated collections.
+            f.domain.artifacts().saveAll(List.of(
+                    new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: unrelated-flow\nsource: []\n"),
+                    definition("transform", "unrelated-transform"), definition("view", "unrelated-view"),
+                    definition("serve", "unrelated-serve")));
+            // Many unrelated notes/resources must not enlarge the joined transport or probe work.
+            var rows = java.util.stream.IntStream.range(0, 1000)
+                    .mapToObj(i -> new Document("_id", "unrelated-" + i)).toList();
+            for (var resource : List.of(SystemCollections.PDK_NOTE_SCOPES, SystemCollections.PIPELINES,
+                    SystemCollections.TRANSFORM_DEFINITIONS, SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS))
+                resource.on(f.database).insertMany(rows);
+            for (var resource : List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
+                    SystemCollections.VIEW_DEFINITIONS, SystemCollections.SERVE_DEFINITIONS))
+                resource.on(f.database).updateOne(new Document(), new Document("$set", new Document("payload", "x".repeat(60 * 1024))));
+            var captured = new java.util.ArrayList<Document>();
+            var aggregates = new java.util.ArrayList<Document>();
+            var aggregateRows = new java.util.ArrayList<Document>();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("aggregate")) {
+                                var command = Document.parse(event.getCommand().toJson());
+                                aggregates.add(new Document("aggregate", command.getString("aggregate"))
+                                        .append("pipeline", command.get("pipeline")).append("cursor", new Document()));
+                            }
+                            if (event.getCommandName().equals("find")) {
+                                var command = Document.parse(event.getCommand().toJson());
+                                var filter = command.get("filter", Document.class);
+                                if (filter != null && filter.containsKey("_id"))
+                                    captured.add(new Document("find", command.getString("find")).append("filter", filter));
+                            }
+                        }
+                        @Override public void commandSucceeded(CommandSucceededEvent event) {
+                            if (event.getCommandName().equals("aggregate"))
+                                for (var row : event.getResponse().getDocument("cursor").getArray("firstBatch"))
+                                    aggregateRows.add(Document.parse(row.asDocument().toJson()));
+                        }
+                    }).build();
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            try (var client = MongoClients.create(settings)) {
+                var database = client.getDatabase(f.database.getName());
+                var store = new MongoStorageBindingStore(client, database, (SourceConfigCipherProvider) key.get(f.domain));
+                assertThat(store.load()).contains(original);
+                assertThat(captured).hasSize(7);
+                assertThat(aggregates).hasSize(1);
+                assertThat(aggregateRows).hasSize(1);
+                for (int i = 0; i < 4; i++)
+                    assertThat(aggregateRows.getFirst().getList("resource" + i, Document.class))
+                            .containsExactly(new Document("present", true));
+                var explain = database.runCommand(new Document("explain", aggregates.getFirst())
+                        .append("verbosity", "executionStats"));
+                int probes = 0;
+                for (var stage : explain.getList("stages", Document.class)) {
+                    if (!stage.containsKey("$lookup")) continue;
+                    probes++;
+                    assertThat(((Number) stage.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(2);
+                }
+                assertThat(probes).isEqualTo(6);
+                for (var command : captured) {
+                    var plan = database.runCommand(new Document("explain", command).append("verbosity", "executionStats"));
+                    var stats = plan.get("executionStats", Document.class);
+                    assertThat(((Number) stats.get("totalDocsExamined")).longValue()).isLessThanOrEqualTo(1);
+                    assertThat(stats.toJson()).doesNotContain("COLLSCAN");
+                }
+            }
+        });
+    }
+
+    @Test
+    void aRetriedReadRebuildsAllFactsAndRunsItsGuardAgain() {
+        withPrepared(f -> {
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                if (checks.incrementAndGet() == 3) SystemCollections.STORAGE_SETUP.on(f.database).deleteMany(new Document());
+            });
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("find")).append("errorCode", 112)
+                            .append("errorLabels", List.of("TransientTransactionError"))));
+            try { assertThatThrownBy(guarded::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            assertThat(checks.get()).isGreaterThanOrEqualTo(3);
+            assertThat(f.revision()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void aCommitFailureDiscardsTheCompletedAttemptBeforeRereadingFacts() {
+        withPrepared(f -> {
+            f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(() -> {
+                // The first callback reached its final guard before commit failed. The next
+                // callback must observe this loss instead of publishing its previous facts.
+                if (checks.incrementAndGet() == 4) SystemCollections.STORAGE_SETUP.on(f.database).deleteMany(new Document());
+            });
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("commitTransaction")).append("errorCode", 112)
+                            .append("errorLabels", List.of("TransientTransactionError"))));
+            try { assertThatThrownBy(guarded::load).satisfies(MongoStorageBindingStoreIT::unreadable); }
+            finally { admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off")); }
+            assertThat(checks.get()).isGreaterThanOrEqualTo(4);
+            assertThat(f.revision()).isEqualTo(1);
+        });
+    }
+
+    @Test
+    void anUnknownCommitResultRetriesOnlyTheCommitOfTheSameSnapshot() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var checks = new AtomicInteger();
+            var guarded = f.domain.bindings().guardedBy(checks::incrementAndGet);
+            var commands = new java.util.HashMap<String, Integer>();
+            var admin = f.admin.getDatabase("admin");
+            admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                    .append("data", new Document("failCommands", List.of("commitTransaction"))
+                            .append("writeConcernError", new Document("code", 64).append("errmsg", "commit receipt unavailable"))
+                            .append("errorLabels", List.of("UnknownTransactionCommitResult"))));
+            MongoCommandObservation.CURRENT.set(command -> commands.merge(command, 1, Integer::sum));
+            try { assertThat(guarded.load()).contains(original); }
+            finally {
+                MongoCommandObservation.CURRENT.remove();
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+            assertThat(commands).containsEntry("commitTransaction", 2).containsEntry("find", 3).containsEntry("aggregate", 1);
+            assertThat(checks).hasValue(3);
+        });
+    }
+
+    @Test
+    void unknownAndRouterTopologiesRetainEquivalentIndividualReads() {
+        withPrepared(f -> {
+            var original = f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
+            var key = MongoConfigurationDomain.class.getDeclaredField("configurationKey");
+            key.setAccessible(true);
+            var ciphers = (SourceConfigCipherProvider) key.get(f.domain);
+            var aggregates = new AtomicInteger();
+            var settings = MongoClientSettings.builder().applyConnectionString(new ConnectionString(f.settings.uri()))
+                    .addCommandListener(new CommandListener() {
+                        @Override public void commandStarted(CommandStartedEvent event) {
+                            if (event.getCommandName().equals("aggregate")) aggregates.incrementAndGet();
+                        }
+                    }).build();
+            try (var real = MongoClients.create(settings)) {
+                for (var topology : List.of(com.mongodb.connection.ClusterType.UNKNOWN, com.mongodb.connection.ClusterType.SHARDED)) {
+                    var client = org.mockito.Mockito.mock(MongoClient.class, org.mockito.AdditionalAnswers.delegatesTo(real));
+                    org.mockito.Mockito.when(client.getClusterDescription()).thenReturn(new com.mongodb.connection.ClusterDescription(
+                            com.mongodb.connection.ClusterConnectionMode.MULTIPLE, topology, List.of()));
+                    var store = new MongoStorageBindingStore(client, real.getDatabase(f.database.getName()), ciphers);
+                    assertThat(store.load()).contains(original);
+                    SystemCollections.STORAGE_SETUP.on(f.database).updateOne(new Document(),
+                            new Document("$unset", new Document("generation", "")));
+                    assertThatThrownBy(store::load).satisfies(MongoStorageBindingStoreIT::unreadable);
+                    SystemCollections.STORAGE_SETUP.on(f.database).updateOne(new Document(),
+                            new Document("$set", new Document("generation", 1L)));
+                }
+                assertThat(aggregates).hasValue(0);
+            }
+        });
+    }
 
     @Test
     void committedFirstCacheInvocationKeepsItsOperationOwnerWithoutSubmissionChecks() {
