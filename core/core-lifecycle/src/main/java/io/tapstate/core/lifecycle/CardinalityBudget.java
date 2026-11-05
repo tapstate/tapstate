@@ -84,6 +84,10 @@ public enum CardinalityBudget {
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
+    /** One reading per namespace naming where it comes from; overflow folds its origin labels with the namespace. */
+    NEST_NAMESPACE_INFO("tapstate.pipeline.nest.namespace.info", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.HIGHEST, Set.of(MetricAttributes.NEST_NAMESPACE, MetricAttributes.NEST_STEP,
+                    MetricAttributes.NEST_PATH, MetricAttributes.NEST_MAP)),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,
@@ -125,12 +129,26 @@ public enum CardinalityBudget {
     private final String openDimension;
     private final int distinctValues;
     private final Fold fold;
+    private final Set<String> overflowDimensions;
 
     CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold) {
+        this(instrument, openDimension, distinctValues, fold,
+                openDimension == null ? Set.of() : Set.of(openDimension));
+    }
+
+    CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold,
+            Set<String> overflowDimensions) {
         this.instrument = instrument;
         this.openDimension = openDimension;
         this.distinctValues = distinctValues;
         this.fold = fold;
+        this.overflowDimensions = Set.copyOf(overflowDimensions);
+        if (openDimension != null && !this.overflowDimensions.contains(openDimension)) {
+            throw new IllegalArgumentException("overflow dimensions must include the budget dimension");
+        }
+        if (openDimension == null && !this.overflowDimensions.isEmpty()) {
+            throw new IllegalArgumentException("a closed instrument cannot declare overflow dimensions");
+        }
     }
 
     /** The budget declared for {@code instrument}, or empty for a name that declares none. */
@@ -230,7 +248,7 @@ public enum CardinalityBudget {
                     continue;
                 }
                 Map<String, String> rest = new HashMap<>(point.attributes());
-                rest.remove(budget.openDimension);
+                budget.overflowDimensions.forEach(rest::remove);
                 rest.put(MetricAttributes.OVERFLOW, "true");
                 folded.computeIfAbsent(Map.copyOf(rest), key -> new ArrayList<>()).add(point);
             }
