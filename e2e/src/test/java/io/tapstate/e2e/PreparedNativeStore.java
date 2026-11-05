@@ -144,4 +144,17 @@ final class PreparedNativeStore implements AutoCloseable {
             for (String database : owned) client.getDatabase(database).drop();
         }
     }
+
+    /** A disposal attempt shares its remaining allowance across the original databases. */
+    void close(long deadline) {
+        try(var client=MongoClients.create(configurationUri())){
+            var owned=borrowedMaster==null?List.of(configurationDatabase,cacheDatabase,masterDatabase)
+                    :List.of(configurationDatabase,cacheDatabase);
+            for(String database:owned){
+                long remaining=deadline-System.nanoTime();
+                if(remaining<=0)throw new AssertionError("the owned database disposal deadline expired");
+                client.getDatabase(database).withTimeout(remaining,java.util.concurrent.TimeUnit.NANOSECONDS).drop();
+            }
+        }
+    }
 }

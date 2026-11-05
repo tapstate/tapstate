@@ -64,7 +64,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final PipelineIntentStore intents;
     private final ThreadPoolExecutor workers;
     private final ScheduledThreadPoolExecutor freshness = new ScheduledThreadPoolExecutor(1, task -> {
-        var thread=new Thread(task,"alert-freshness");thread.setDaemon(true);return thread;
+        return ShutdownAwait.daemon(task,"alert-freshness");
     });
     private final AtomicBoolean started=new AtomicBoolean();
     private final Object objectAdmission=new Object();
@@ -85,6 +85,13 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicReference<java.util.function.Consumer<AlarmKey.Resource>> resourceRetired=new AtomicReference<>(r->{});
     void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired.set(listener);}
     private final AtomicReference<Services> services=new AtomicReference<>();
+    private final Set<Services> ownedServices=ConcurrentHashMap.newKeySet();
+    private final Set<Services> stoppedServices=ConcurrentHashMap.newKeySet();
+    private final ShutdownAwait shutdown=new ShutdownAwait();
+    private final AtomicReference<CompletableFuture<Void>> stopping=new AtomicReference<>();
+    private final AdmissionDrain inputAdmission=new AdmissionDrain();
+    private final ExecutorService settlements=Executors.newSingleThreadExecutor(task->ShutdownAwait.daemon(task,"alert-settlement"));
+    private final java.util.concurrent.ConcurrentLinkedQueue<Throwable> settlementFailures=new java.util.concurrent.ConcurrentLinkedQueue<>();
     private volatile Instant lastEvaluatedAt;
     private final ConcurrentMap<Work,Instant> inputTimes=new ConcurrentHashMap<>();
     private final AlertDiagnosticMessages diagnostics;
@@ -108,7 +115,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         this.clock = Objects.requireNonNull(clock);
         var serial = new AtomicInteger();
         workers = new ThreadPoolExecutor(2, 2, 0, TimeUnit.MILLISECONDS, new ArrayBlockingQueue<>(QUEUE_SIZE), task -> {
-            var thread = new Thread(task, "alert-evaluation-" + serial.incrementAndGet()); thread.setDaemon(true); return thread;
+            return ShutdownAwait.daemon(task, "alert-evaluation-" + serial.incrementAndGet());
         }, new ThreadPoolExecutor.AbortPolicy());
     }
     @Override public void expecting(PipelineConvergencePass pass) { if (pass != null && !closed.get()) slot(pass); }
@@ -226,6 +233,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         Failure previousFailure=failure.get();
         active.run();
         Services resolved = services.get() == null ? Objects.requireNonNull(open.get()) : services.get();
+        ownedServices.add(resolved);
+        if(closed.get()){stop(resolved);return;}
         var all = new ArrayList<AlertConfiguration.Rule>();
         var unavailableRules=new HashSet<String>();
         String cursor = null;
@@ -240,7 +249,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if (all.size()+unavailableRules.size() > 1000 || all.size()+unavailableRules.size() == 1000 && cursor != null) throw refused("rule-snapshot-budget");
         } while (cursor != null);
         active.run(); synchronized(this){
-            if(closed.get()){if(resolved.planner()!=null)resolved.planner().close();if(resolved.delivery()!=null)resolved.delivery().close();if(resolved.maintenance()!=null)resolved.maintenance().close();return;}
+            if(closed.get()){stop(resolved);return;}
             if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(List.copyOf(all));
         }
         observerTick.get().run();
@@ -311,6 +320,12 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private void resourceInput(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
             Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared) {
+        if(!inputAdmission.enter()){settled.run();return;}
+        try {resourceInputAdmitted(resource,typeId,sourceRevision,producer,originalGuard,localProof,input,settled,shared);}
+        finally{inputAdmission.leave();}
+    }
+    private void resourceInputAdmitted(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
+            Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared) {
         if(closed.get()){settled.run();return;}
         ResourceSlot slot;
         synchronized(objectAdmission){
@@ -365,6 +380,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private void submitResource(ResourceSlot slot,int bytes,Runnable action){submitResource(slot,bytes,action,()->{});}
     private void submitResource(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
+        if(!inputAdmission.enter()){refused.run();return;}
+        try {submitResourceAdmitted(slot,bytes,action,refused);}finally{inputAdmission.leave();}
+    }
+    private void submitResourceAdmitted(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
         if(closed.get()){refused.run();return;}
         if(queuedTasks.incrementAndGet()>QUEUE_SIZE){queuedTasks.decrementAndGet();reject(null,"queue-capacity");refused.run();return;}
         if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);reject(null,"queue-byte-budget");refused.run();return;}
@@ -381,7 +400,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             try{if(work!=null)work.run();}finally{boolean more;synchronized(slot.pending){more=!slot.pending.isEmpty();if(!more)slot.scheduled=false;}if(more)dispatchResource(slot);}
         }
     }
-    private void cancelResource(ResourceSlot slot){List<Work> pending;synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.scheduled=false;}pending.forEach(Work::cancel);}
+    private void cancelResource(ResourceSlot slot){List<Work> pending;synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.scheduled=false;}ShutdownAwait.all(pending.stream().<Runnable>map(work->work::cancel).toList());}
     void collectionUnavailable(String reason){reject(null,reason);}
 
     private List<AlertConfiguration.Rule> matching(Slot slot, List<AlertConfiguration.Rule> snapshot) {
@@ -472,6 +491,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private void submit(Slot slot, int bytes, Runnable action) { submit(slot, bytes, action, () -> { }); }
     private void submit(Slot slot, int bytes, Runnable action, Runnable refused) {
+        if(!inputAdmission.enter()){refused.run();return;}
+        try {submitAdmitted(slot,bytes,action,refused);}finally{inputAdmission.leave();}
+    }
+    private void submitAdmitted(Slot slot, int bytes, Runnable action, Runnable refused) {
         if (closed.get()) { refused.run(); return; }
         if (queuedTasks.incrementAndGet() > QUEUE_SIZE) { queuedTasks.decrementAndGet(); reject(slot, "queue-capacity"); refused.run(); return; }
         int retained = queuedBytes.addAndGet(bytes);
@@ -488,10 +511,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }
     }
     private final class Work implements Runnable {
-        final Slot slot; final int bytes; final Runnable action, refused; final AtomicBoolean finished = new AtomicBoolean();
+        final Slot slot; final int bytes; final Runnable action, refused; final AtomicInteger state = new AtomicInteger();
         Work(Slot slot, int bytes, Runnable action, Runnable refused) { this.slot=slot;this.bytes=bytes;this.action=action;this.refused=refused; inputTimes.put(this,clock.instant()); }
         public void run() {
-            if (closed.get()) { cancel(); return; }
+            if(!state.compareAndSet(0,1))return;
+            if (closed.get()) { try{refused.run();}finally{release();} return; }
             try { action.run(); lastEvaluatedAt=clock.instant(); }
             catch (RuntimeException unavailable) {
                 if(unavailable instanceof TapstateException coded)reject(slot,coded);else reject(slot,"evaluation-failed");
@@ -499,8 +523,15 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             }
             finally { release(); }
         }
-        void release() { if(finished.compareAndSet(false,true)){queuedBytes.addAndGet(-bytes);queuedTasks.decrementAndGet();inputTimes.remove(this);} }
-        void cancel() { if(!finished.get()){reject(slot,"closed-or-capacity");refused.run();release();} }
+        void release() { if(state.getAndSet(2)!=2)settle(); }
+        void settle(){queuedBytes.addAndGet(-bytes);queuedTasks.decrementAndGet();inputTimes.remove(this);}
+        void cancel() {
+            if(state.compareAndSet(0,2))settlements.execute(()->{
+                try{reject(slot,"closed-or-capacity");refused.run();}
+                catch(RuntimeException|Error failure){settlementFailures.add(failure);}
+                finally{settle();}
+            });
+        }
     }
     private void dispatch(Slot slot) {
         try { workers.execute(new Dispatcher(slot)); }
@@ -523,7 +554,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private void cancelPending(Slot slot) {
         List<Work> pending;
         synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.scheduled=false;}
-        pending.forEach(Work::cancel);
+        ShutdownAwait.all(pending.stream().<Runnable>map(work->work::cancel).toList());
     }
     private void reject(Slot slot, String reason) {
         reject(slot,refused(reason));
@@ -581,16 +612,66 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             return java.util.HexFormat.of().formatHex(digest.digest());
         } catch (java.security.NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
     }
-    @Override public void close() {
-        if(closed.compareAndSet(false,true)){
-            freshness.shutdownNow();
-            synchronized(this){if(services.get()!=null&&services.get().planner()!=null)services.get().planner().close();if(services.get()!=null&&services.get().delivery()!=null)services.get().delivery().close();if(services.get()!=null&&services.get().maintenance()!=null)services.get().maintenance().close();}
-            for(Runnable task:workers.shutdownNow()){
+    @Override public void close() { requestStop(); }
+    private CompletableFuture<Void> requestStop() {
+        closed.set(true);inputAdmission.stop();
+        var proposed=new CompletableFuture<Void>();
+        var existing=stopping.compareAndExchange(null,proposed);
+        if(existing!=null)return existing;
+        try {initiateStop();proposed.complete(null);}
+        catch(RuntimeException|Error failure){proposed.completeExceptionally(failure);stopping.compareAndSet(proposed,null);throw failure;}
+        return proposed;
+    }
+    private void initiateStop() {
+        closed.set(true);
+        inputAdmission.stop();
+        freshness.shutdown();workers.shutdown();
+        var actions=new ArrayList<Runnable>();
+        var cancelled=new ArrayList<Runnable>();workers.getQueue().drainTo(cancelled);
+        for(Runnable task:cancelled){actions.add(()->{
                 if(task instanceof Work work)work.cancel();
                 else if(task instanceof Dispatcher dispatcher)cancelPending(dispatcher.slot);
                 else if(task instanceof ResourceDispatcher dispatcher)cancelResource(dispatcher.slot);
+        });}
+        slots.values().forEach(slot->actions.add(()->cancelPending(slot)));
+        resourceSlots.values().forEach(slot->actions.add(()->cancelResource(slot)));
+        ownedServices.forEach(owned->actions.add(()->stop(owned)));
+        ShutdownAwait.all(actions);
+    }
+    private void stop(Services resolved){
+        if(!stoppedServices.add(resolved))return;
+        try {
+            ShutdownAwait.all(List.of(
+                    ()->{if(resolved.planner()!=null)resolved.planner().close();},
+                    ()->{if(resolved.delivery()!=null)resolved.delivery().close();},
+                    ()->{if(resolved.maintenance()!=null)resolved.maintenance().close();}));
+        }catch(RuntimeException|Error failure){stoppedServices.remove(resolved);throw failure;}
+    }
+    void awaitStopped(long deadline){
+        var stopped=requestStop();
+        shutdown.complete(deadline,()->{
+            ShutdownAwait.future(stopped,deadline);
+            inputAdmission.await(deadline);
+            ShutdownAwait.executor(freshness,deadline);ShutdownAwait.executor(workers,deadline);
+            // A creating evaluation may register services after stop's first snapshot.
+            for(var owned:ownedServices){
+                stop(owned);
+                if(owned.planner()!=null)owned.planner().awaitStopped(deadline);
+                if(owned.delivery()!=null)owned.delivery().awaitStopped(deadline);
+                if(owned.maintenance()!=null)owned.maintenance().awaitStopped(deadline);
             }
-            slots.values().forEach(this::cancelPending);slots.clear();resourceSlots.values().forEach(this::cancelResource);resourceSlots.clear();retainedResourceBindings.set(0);rules.set(List.of());
-        }
+            settlements.shutdown();ShutdownAwait.executor(settlements,deadline);
+            var failure=settlementFailures.poll();
+            if(failure!=null){
+                var failures=new ArrayList<Runnable>();
+                do{
+                    var captured=failure;
+                    failures.add(()->{if(captured instanceof Error error)throw error;
+                        if(captured instanceof RuntimeException runtime)throw runtime;});
+                }while((failure=settlementFailures.poll())!=null);
+                ShutdownAwait.all(failures);
+            }
+            slots.clear();resourceSlots.clear();retainedResourceBindings.set(0);rules.set(List.of());
+        });
     }
 }

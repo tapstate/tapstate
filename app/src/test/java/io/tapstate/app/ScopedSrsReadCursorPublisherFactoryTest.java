@@ -96,6 +96,35 @@ class ScopedSrsReadCursorPublisherFactoryTest {
         verify(f.models,never()).requireEvent(any(),anyString(),anyLong(),any());
     }
     private static TapstateException modelUnavailable() { return new TapstateException(IoError.SRS_EVENT_MODEL_UNAVAILABLE,Map.of("ring",RING,"epoch","3","version","2"),null); }
+    @Test void fusedReadNeverFallsBackAfterAConsumerOrModelRefusal() {
+        var f=new Fixture();when(f.store.supportsReadEventVerification()).thenReturn(true);
+        var verifier=new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING);
+        var item=new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),2,CAPTURE,3);
+        when(f.store.verifyReadEvent(RUN,"orders",RING,7,3,2,CAPTURE)).thenReturn(Optional.empty());
+        assertThatThrownBy(()->verifier.verify(item,7)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
+        when(f.store.verifyReadEvent(RUN,"orders",RING,7,3,2,CAPTURE)).thenThrow(modelUnavailable());
+        assertThatThrownBy(()->verifier.verify(item,7)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);
+        verify(f.store,never()).progress(any());verify(f.models,never()).requireEvent(any(),anyString(),anyLong(),any());
+        verify(f.store,never()).advanceReadSequence(any(),anyLong(),anyString(),anyLong(),any());
+    }
+
+    @Test void fusedReadStillRejectsAnIncorrectModelAndAuthorizationLostDuringTheRead() {
+        var f=new Fixture();when(f.store.supportsReadEventVerification()).thenReturn(true);
+        var verifier=new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING);
+        var item=new io.tapstate.runtime.srs.SrsItem(null,io.tapstate.core.event.Op.INSERT,1,null,Map.of("id",1),2,CAPTURE,3);
+        var model=new SrsModel(new SrsModelKey("chain","orders","cache",3,2),RING,
+                new SourceTable("orders",List.of(),List.of(),List.of()),0);
+        when(f.store.verifyReadEvent(RUN,"orders",RING,7,3,2,CAPTURE)).thenReturn(Optional.of(model));
+        verifier.verify(item,7);
+        when(f.store.verifyReadEvent(RUN,"orders",RING,7,3,2,CAPTURE)).thenAnswer(call->{f.active.set(false);return Optional.of(model);});
+        assertThatThrownBy(()->verifier.verify(item,7)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
+        f.active.set(true);
+        var wrong=new SrsModel(new SrsModelKey("chain","other","cache",3,2),RING,
+                new SourceTable("other",List.of(),List.of(),List.of()),0);
+        doReturn(Optional.of(wrong)).when(f.store).verifyReadEvent(RUN,"orders",RING,7,3,2,CAPTURE);
+        assertThatThrownBy(()->verifier.verify(item,7)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);
+        verify(f.models,never()).requireEvent(any(),anyString(),anyLong(),any());
+    }
     private static void missingModel(Throwable failure) {assertThat(failure).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(IoError.SRS_EVENT_MODEL_UNAVAILABLE));}
 
     private static SrsConsumerProgress progress(long membership,Long floor,ChainPosition confirmed) {

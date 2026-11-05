@@ -594,6 +594,26 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
 
+    @Override public boolean supportsReadEventVerification() { return true; }
+
+    @Override public Optional<SrsModel> verifyReadEvent(SrsConsumerRun run, String table, String ring, long sequence,
+            long epoch, long version, WorkloadClaimFence capture) {
+        Objects.requireNonNull(run,"run");
+        if(!scope.equals(run.cacheScope()))return Optional.empty();
+        return transaction(session -> {
+            var original=own(session,run.context());
+            if(original==null || original.member().detached())return Optional.empty();
+            var held=original.cursor();validateSnapshot(session,run.context(),held.snapshot());
+            if(original.member().revision()!=run.membershipRevision() || !held.value().perTableSeq().containsKey(table))return Optional.empty();
+            if(sequence<0 || sequence==Long.MAX_VALUE || epoch<1 || epoch==Long.MAX_VALUE || version==Long.MAX_VALUE || capture==null)
+                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                        Map.of("ring",ring,"epoch",String.valueOf(epoch),"version",String.valueOf(version)),null);
+            var expected=new SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),epoch,version);
+            var models=new MongoSrsModelStore(client,database,scope,requireActive,requireStructure);
+            return Optional.of(models.requireEventInSession(session,expected,ring,sequence,capture));
+        });
+    }
+
     @Override public boolean beginWriterRun(SrsConsumerContext context,long membershipRevision,String runId,
             Map<String,List<String>> expected,WorkloadClaimFence fence) {
         Objects.requireNonNull(context,"context"); requireRevision(membershipRevision);

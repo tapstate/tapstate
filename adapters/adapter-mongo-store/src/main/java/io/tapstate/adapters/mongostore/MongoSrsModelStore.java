@@ -216,19 +216,25 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (ring == null || ring.isBlank() || sequence < 0 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid event model coordinates");
         return transaction(session -> {
             requireBusiness(session);
-            try {
-                if(originalCapture==null)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
-                if(originalCapture.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId()))throw claimFenced();
-                var chain = requireChain(session, expected);
-                var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false, chain);
-                if (!expected.equals(reference.model().key())) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
-                reference.range().requireAt(sequence, ring, expected.captureEpoch(), expected.modelVersion());
-                return reference.model();
-            } catch (TapstateException missing) {
-                if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
-                throw missing;
-            }
+            return requireEventInSession(session,expected,ring,sequence,originalCapture);
         });
+    }
+
+    SrsModel requireEventInSession(ClientSession session,SrsModelKey expected,String ring,long sequence,WorkloadClaimFence originalCapture) {
+        // Both callers have verified the business identity in this same read transaction.
+        requireScope(expected);requireActive.run();
+        try {
+            if(originalCapture==null)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
+            if(originalCapture.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId()))throw claimFenced();
+            var chain=requireChain(session,expected);
+            var reference=eventReference(session,ring,expected.captureEpoch(),expected.modelVersion(),originalCapture,false,chain);
+            if(!expected.equals(reference.model().key()))throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
+            reference.range().requireAt(sequence,ring,expected.captureEpoch(),expected.modelVersion());
+            requireActive.run();return reference.model();
+        }catch(TapstateException missing){
+            if(missing.code()==IoError.SRS_MODEL_UNAVAILABLE)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
+            throw missing;
+        }
     }
 
     @Override public Optional<Map<String, SrsModel>> publishedForNewSnapshot(String chainId, Map<String, String> tableRings) {
