@@ -46,6 +46,43 @@ test('registers only the checked dev image, with both pinned revisions and a ver
   assert.ok(!result.includes('private-dev-token'));
 });
 
+for (const branch of ['develop', 'feature/cloud-dev']) {
+  test(`registers the source-specific image and actual branch for ${branch}`, async () => {
+    const version = `0.7.0-dev-${'b'.repeat(12)}`;
+    const imageTag = `ghcr.io/tapstate/tapstate-cloud:${version}`;
+    const result = await notifyCloudDev(environment({ DEV_BRANCH: branch, CLOUD_IMAGE_TAG: imageTag }),
+      async (_url, options) => {
+        const body = JSON.parse(options.body);
+        assert.equal(body.version, version);
+        assert.equal(body.git.branch, branch);
+        assert.equal(body.git.extra.imageTag, imageTag);
+        assert.equal(body.git.extra.buildVersion, '0.7.0');
+        return { status: 201, json: async () => receipt(options) };
+      });
+    assert.ok(result.includes(`Registered Cloud dev version ${version}`));
+  });
+}
+
+test('rejects a branch image tagged with a different source SHA before sending', async () => {
+  let calls = 0;
+  await assert.rejects(notifyCloudDev(environment({
+    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'d'.repeat(12)}`,
+  }), async () => { calls++; }), /must match its dev tag/);
+  assert.equal(calls, 0);
+});
+
+test('rejects a branch registration receipt that reports main', async () => {
+  await assert.rejects(notifyCloudDev(environment({
+    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
+  }), async (_url, options) => ({
+    status: 201, json: async () => {
+      const saved = receipt(options);
+      saved.data.git.branch = 'main';
+      return saved;
+    },
+  })), /receipt does not match/);
+});
+
 for (const [name, value] of [
   ['DEV_VERSION', '0.7.0-dev'], ['DEV_VERSION', 'v0.7.0'], ['DEV_SHA', 'bbbbbbb'],
   ['DEV_WEB_SHA', 'ccccccc'], ['DEV_BRANCH', 'release/0.7.0'],
