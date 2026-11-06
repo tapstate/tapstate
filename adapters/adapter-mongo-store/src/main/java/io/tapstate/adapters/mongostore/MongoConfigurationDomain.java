@@ -930,6 +930,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         requireOpen(); bindings.requireAuthenticationPublished(Objects.requireNonNull(original), Objects.requireNonNull(budget));
     }
 
+    /** HTTP admission reads authentication authority without auditing business configuration. */
+    public void requireRequestAuthenticationPublished(io.tapstate.spi.store.CachePreparation original, MongoReadBudget budget) {
+        requireOpen(); bindings.requireRequestAuthenticationPublished(Objects.requireNonNull(original), Objects.requireNonNull(budget));
+    }
+
     public io.tapstate.spi.store.StorageSetupStateStore setupStates() {
         requireOpen();
         return new MongoStorageSetupStateStore(connection.client(), connection.database(), bindings, this::requireOpen);

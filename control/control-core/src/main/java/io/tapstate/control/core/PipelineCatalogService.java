@@ -74,7 +74,7 @@ public final class PipelineCatalogService {
             throw new IllegalArgumentException("pipeline catalog offset must be non-negative and limit positive");
         }
         Map<String, ArtifactSummary> artifactById = new HashMap<>();
-        for (StoredResource stored : artifacts.listResources()) {
+        for (StoredResource stored : artifacts.listResources("pipeline")) {
             Resource resource = stored.resource();
             if (resource instanceof PipelineResource pipeline) {
                 artifactById.put(pipeline.id(), new ArtifactSummary(pipeline, stored.contentHash()));

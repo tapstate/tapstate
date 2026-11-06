@@ -70,13 +70,21 @@ public final class ArtifactQueryService {
         return resourceInventory().resources();
     }
 
+    public List<StoredResource> listResources(String kind) { return resourceInventory(kind).resources(); }
+
     public record ResourceInventory(List<StoredResource> resources,
-            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog) { }
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId) { }
 
     public ResourceInventory resourceInventory() {
         var inventory = store.readableInventory();
         return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
-                inventory.connectorCatalog());
+                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
+    }
+
+    public ResourceInventory resourceInventory(String kind) {
+        var inventory = store.readableInventory(kind);
+        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
+                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
     }
 
     /**

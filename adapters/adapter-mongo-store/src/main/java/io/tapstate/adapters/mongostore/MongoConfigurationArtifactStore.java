@@ -515,6 +515,23 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         });
     }
 
+    @Override public ReadableInventory readableInventory(String kind) {
+        return StoreIo.call(() -> {
+            var resources = new ArrayList<Resource>();
+            Optional<String> managed = Optional.empty();
+            try (var cursor = collection(kind).find().iterator()) {
+                while (cursor.hasNext()) {
+                    var document = cursor.next(); requireKind(document, kind);
+                    if ("source".equals(kind) && MongoStorageBindingStore.DEFAULT_ROLE.equals(document.get("systemRole")))
+                        managed = Optional.of(document.getString("_id"));
+                    try { resources.add(decode(document)); }
+                    catch (TapstateException failure) { if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure; }
+                }
+            }
+            return new ReadableInventory(resources, Optional.empty(), managed);
+        });
+    }
+
     @Override
     public List<StoredArtifactRecord> listStored() {
         return readSnapshot(session -> documents(session).stream().map(this::browse).toList());

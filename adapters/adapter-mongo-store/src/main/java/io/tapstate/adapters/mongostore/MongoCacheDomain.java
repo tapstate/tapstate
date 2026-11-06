@@ -210,8 +210,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public CloudSessionStore cloudSessions(CacheAuthScope scope, MongoReadBudget budget) {
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
         Objects.requireNonNull(budget, "budget").requireRemaining();
-        return new MongoCacheCloudSessionStore(facts(scope), connection.database(),
-                () -> verifyAuthPresence(scope.mode(), budget), budget);
+        // This view is owned by an admitted HTTP operation. Installation and recovery validate structures;
+        // its transaction still reads current identity, schema, revocation and session facts.
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> {}, budget);
     }
 
     /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */

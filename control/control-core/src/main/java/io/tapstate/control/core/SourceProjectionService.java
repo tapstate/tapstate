@@ -32,8 +32,8 @@ public final class SourceProjectionService {
 
     /** Lists stored Sources in stable id order. */
     public List<SourceView> list() {
-        var managed = artifacts.managedDefaultSourceId();
-        var inventory = artifacts.resourceInventory();
+        var inventory = artifacts.resourceInventory("source");
+        var managed = inventory.managedDefaultSourceId();
         var renderer = inventory.connectorCatalog().map(representation::withCatalog).orElse(representation);
         return inventory.resources().stream()
                 .filter(stored -> stored.resource() instanceof SourceResource)

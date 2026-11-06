@@ -141,12 +141,19 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     @Override public synchronized ReadableInventory readableInventory() {
-        var inventory = delegate.readableInventory();
+        return trackInventory(delegate.readableInventory());
+    }
+
+    @Override public synchronized ReadableInventory readableInventory(String kind) {
+        return trackInventory(delegate.readableInventory(kind));
+    }
+
+    private ReadableInventory trackInventory(ReadableInventory inventory) {
         boolean hasSources = inventory.resources().stream().anyMatch(SourceResource.class::isInstance);
         if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }
         TapstateCatalog captured = inventory.connectorCatalog().orElseGet(catalog);
         inventory.resources().forEach(resource -> track(resource, () -> captured));
-        return new ReadableInventory(inventory.resources(), Optional.of(captured));
+        return new ReadableInventory(inventory.resources(), Optional.of(captured), inventory.managedDefaultSourceId());
     }
 
     @Override

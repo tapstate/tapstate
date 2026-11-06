@@ -20,7 +20,7 @@ class SecretTrackingArtifactStoreTest {
         var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
         org.mockito.Mockito.when(delegate.listStored()).thenReturn(List.of());
         var first = source("first", "first-list-secret"); var second = source("second", "second-list-secret");
-        org.mockito.Mockito.when(delegate.readableInventory()).thenAnswer(ignored ->
+        org.mockito.Mockito.when(delegate.readableInventory("source")).thenAnswer(ignored ->
                 new ArtifactStore.ReadableInventory(List.of(first, second), Optional.empty()));
         org.mockito.Mockito.when(delegate.managedDefaultSourceId()).thenReturn(Optional.empty());
         var reads = new java.util.concurrent.atomic.AtomicInteger(); var redactor = new SecretRedactor();
@@ -31,7 +31,7 @@ class SecretTrackingArtifactStoreTest {
         assertThat(service.list()).hasSize(2); assertThat(reads.get()).isEqualTo(1);
         assertThat(redactor.redact("first-list-secret second-list-secret")).isEqualTo("******** ********");
         assertThat(service.list()).hasSize(2); assertThat(reads.get()).isEqualTo(2);
-        org.mockito.Mockito.verify(delegate, org.mockito.Mockito.times(2)).readableInventory();
+        org.mockito.Mockito.verify(delegate, org.mockito.Mockito.times(2)).readableInventory("source");
         org.mockito.Mockito.verify(delegate, org.mockito.Mockito.never()).get(org.mockito.ArgumentMatchers.anyString());
     }
 

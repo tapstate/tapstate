@@ -24,15 +24,26 @@ public interface ArtifactStore {
 
     /** One operation's readable resources and, when supplied by a decorator, its redaction catalog. */
     record ReadableInventory(List<Resource> resources,
-            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog) {
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId) {
         public ReadableInventory {
             resources = List.copyOf(resources);
             Objects.requireNonNull(connectorCatalog);
+            Objects.requireNonNull(managedDefaultSourceId);
+        }
+        public ReadableInventory(List<Resource> resources, Optional<io.tapstate.core.catalog.TapstateCatalog> catalog) {
+            this(resources, catalog, Optional.empty());
         }
     }
 
     default ReadableInventory readableInventory() {
         return new ReadableInventory(listReadable(), Optional.empty());
+    }
+
+    /** Typed daily inventory; persistent adapters can select one physical collection directly. */
+    default ReadableInventory readableInventory(String kind) {
+        Objects.requireNonNull(kind, "kind");
+        return new ReadableInventory(listReadable().stream().filter(resource -> kind.equals(resource.kind())).toList(),
+                Optional.empty(), managedDefaultSourceId());
     }
 
     /**

@@ -110,9 +110,8 @@ final class StorageAuthentication implements AutoCloseable {
             Optional<CredentialEvidence> evidence;
             Optional<String> organization = Optional.empty();
             if (cloud.cloud()) {
-                // The fenced session transaction checks CACHE identity and structure before reading.
-                // Check CONFIG first, then publish only after the full final CACHE/index validation.
-                original.requirePublished(budget);
+                // Admission reads current publication once; the CACHE transaction is the session boundary.
+                original.requirePublished(budget, true);
                 var authenticated = authenticateCloud(original, presented, budget);
                 verified = authenticated.map(AuthenticatedCloudSession::identity);
                 organization = authenticated.map(value -> value.clusterContext().organizationId());
@@ -128,16 +127,7 @@ final class StorageAuthentication implements AutoCloseable {
                             && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
                 }, value.humanToken()));
             }
-            // The last CACHE transaction validates both scope and this exact session's revocation. A
-            // scope-only check after the first session read would miss a denial committed in between.
-            if (cloud.cloud() && verified.isPresent()) {
-                original.requireActive(budget);
-                var checked = authenticateCloud(original, presented, budget);
-                original.requireLocallyActive();
-                if (!checked.map(AuthenticatedCloudSession::identity).equals(verified)
-                        || !checked.map(value -> value.clusterContext().organizationId()).equals(organization)) return Optional.empty();
-            } else if (cloud.cloud() || verified.isPresent()) {
-                // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
+            if (!cloud.cloud() && verified.isPresent()) {
                 original.requireActive(budget);
             }
             if (verified.isEmpty()) return Optional.empty();
@@ -316,9 +306,13 @@ final class StorageAuthentication implements AutoCloseable {
             requireLocallyActive();
         }
         void requirePublished(MongoReadBudget budget) {
+            requirePublished(budget, false);
+        }
+        void requirePublished(MongoReadBudget budget, boolean admission) {
             requireLocallyActive();
             try {
-                configuration.requireAuthenticationPublished(bound.preparation(), budget);
+                if (admission) configuration.requireRequestAuthenticationPublished(bound.preparation(), budget);
+                else configuration.requireAuthenticationPublished(bound.preparation(), budget);
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());

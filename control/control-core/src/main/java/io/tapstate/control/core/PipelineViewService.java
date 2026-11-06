@@ -50,7 +50,7 @@ public final class PipelineViewService {
         if (offset < 0 || limit < 1) {
             throw new IllegalArgumentException("pipeline page offset must be non-negative and limit positive");
         }
-        List<StoredResource> matching = artifacts.listResources().stream()
+        List<StoredResource> matching = artifacts.listResources("pipeline").stream()
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
                 .toList();

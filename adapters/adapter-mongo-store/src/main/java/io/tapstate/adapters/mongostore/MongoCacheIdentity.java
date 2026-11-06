@@ -162,6 +162,20 @@ final class MongoCacheIdentity {
         }
     }
 
+    /** Request admission takes the existing publication fence and returns its pre-update identity in one command. */
+    Document admitRequest(ClientSession session) {
+        var filter = scopeFilter(expected).append("authPhase", READY).append("authWriteFence",
+                new Document("$type", "long").append("$gte", 0L).append("$lt", Long.MAX_VALUE));
+        Document row = identity.findOneAndUpdate(session, filter, new Document("$inc", new Document("authWriteFence", 1L)),
+                new com.mongodb.client.model.FindOneAndUpdateOptions().returnDocument(com.mongodb.client.model.ReturnDocument.BEFORE));
+        if (row == null) throw fenced();
+        return checkedIdentity(row);
+    }
+
+    void requireRequestSchema(Document row, Document admitted) {
+        requireSchema(row, READY, AUTH_VERSION, admitted.getString("authPreparationId"));
+    }
+
     /** Only an explicitly authorized first preparation may create missing facts; ordinary loads never call this. */
     void beginPreparation(String operationId, boolean emptyTarget, Runnable requireActive) {
         beginPreparation(operationId, emptyTarget, requireActive, false);
@@ -294,6 +308,9 @@ final class MongoCacheIdentity {
 
     private Document requireIdentity(ClientSession session) {
         Document row = identity.find(session, new Document("_id", "cluster")).first();
+        return checkedIdentity(row);
+    }
+    private Document checkedIdentity(Document row) {
         if (row == null || !matches(row, expected)) throw fenced();
         if (!MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId"))
                 || !(row.get("authWriteFence") instanceof Long counter) || counter < 0 || counter == Long.MAX_VALUE
@@ -306,6 +323,9 @@ final class MongoCacheIdentity {
     }
     private void requireSchema(ClientSession session, String phase, int installed, String operationId) {
         Document row = schemas.find(session, new Document("_id", "auth")).first();
+        requireSchema(row, phase, installed, operationId);
+    }
+    private void requireSchema(Document row, String phase, int installed, String operationId) {
         if (row == null || !(row.get("installedVersion") instanceof Integer version)) throw unreadable();
         if (version > AUTH_VERSION) throw new TapstateException(MigrationError.DATA_NEWER_THAN_BINARY,
                 Map.of("installed", String.valueOf(version), "supported", String.valueOf(AUTH_VERSION)), null);

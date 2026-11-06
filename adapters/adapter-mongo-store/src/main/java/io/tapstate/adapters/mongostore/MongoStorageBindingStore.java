@@ -171,6 +171,60 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         var current = loaded.recovery().authentication();
         if (current.pending() || !current.preparation().equals(original)) throw refused();
     }
+
+    /** One snapshot command for request authority; business resources are validated by their own operations. */
+    void requireRequestAuthenticationPublished(CachePreparation original, MongoReadBudget budget) {
+        if (client.getClusterDescription().getServerDescriptions().stream().anyMatch(server -> server.getMaxWireVersion() < 13)) {
+            requireAuthenticationPublished(original, budget);
+            return;
+        }
+        StoreIo.run(() -> {
+            requireActive.run(); budget.requireRemaining();
+            var selected = budget.database(database).withReadConcern(ReadConcern.SNAPSHOT);
+            var pipeline = List.of(new Document("$match", new Document("_id", SINGLETON_ID)),
+                    new Document("$project", new Document("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)),
+                    authorityLookup(SystemCollections.STORAGE_BINDING, "binding", new Document("_id", 1)
+                            .append("clusterId", 1).append("layoutId", 1).append(BINDING_VERSION, 1)
+                            .append("installationId", 1).append("operationId", 1).append("generation", 1)
+                            .append("mode", 1).append("defaultSourceId", 1)),
+                    authorityLookup(SystemCollections.STORAGE_SETUP, "setup", null),
+                    authorityLookup(SystemCollections.STORAGE_RECOVERY, "recovery", null));
+            Document row = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(selected).aggregate(pipeline).first();
+            if (row == null || !SINGLETON_ID.equals(row.get("_id"))) throw refused();
+            requireClusterIdentity(row);
+            var expected = original.authScope();
+            if (!expected.clusterId().equals(row.get("clusterId"))
+                    || !Long.valueOf(expected.bindingVersion()).equals(row.get(BINDING_VERSION))) throw refused();
+            Document bound = authorityDocument(row, "binding"), stage = authorityDocument(row, "setup");
+            try {
+                if (!expected.clusterId().equals(bound.get("clusterId"))
+                        || !MongoConfigurationDomain.LAYOUT.equals(bound.get("layoutId"))
+                        || !Long.valueOf(expected.bindingVersion()).equals(bound.get(BINDING_VERSION))
+                        || !expected.mode().name().equals(bound.get("mode"))) throw refused();
+                var owner = new StorageSetupScope(expected.clusterId(), bound.getString("installationId"),
+                        bound.getString("operationId"), bound.getLong("generation"));
+                requireBoundSetup(stage, owner, expected.bindingVersion(), StorageBinding.defaultSourceId(expected.mode()),
+                        requireSetupIdentity(stage, expected.clusterId()));
+                if (!StorageBinding.defaultSourceId(expected.mode()).equals(bound.get("defaultSourceId"))) throw refused();
+                var current = MongoStorageRecoveryStore.read(authorityDocument(row, "recovery"), owner,
+                        expected.mode(), expected.bindingVersion(), () -> stage).authentication();
+                if (current.pending() || !current.preparation().equals(original)) throw refused();
+            } catch (NullPointerException | IllegalArgumentException | ClassCastException malformed) { throw unreadable(); }
+            budget.requireRemaining(); requireActive.run();
+        });
+    }
+
+    private static Document authorityLookup(SystemCollections table, String field, Document projection) {
+        var stages = new java.util.ArrayList<Document>(); stages.add(new Document("$limit", 2));
+        if (projection != null) stages.add(new Document("$project", projection));
+        return new Document("$lookup", new Document("from", table.collectionName()).append("pipeline", stages).append("as", field));
+    }
+
+    private static Document authorityDocument(Document row, String field) {
+        var values = row.getList(field, Document.class);
+        if (values == null || values.size() != 1 || !SINGLETON_ID.equals(values.getFirst().get("_id"))) throw unreadable();
+        return values.getFirst();
+    }
     private StorageBinding requireAuthenticationRecoveryConfiguration(ClientSession session) {
         var bound = load(session).orElseThrow(MongoStorageBindingStore::refused).binding();
         var stage = setup.find(session, new Document("_id", SINGLETON_ID)).first();

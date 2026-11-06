@@ -74,6 +74,29 @@ class ReadableArtifactInventoryIT {
             assertThatThrownBy(failing::listReadable).isSameAs(failure);
         });
     }
+    @Test void typedInventoryReadsOneCollectionAndRetainsManagedIdentityWithoutAuditingOtherKinds() {
+        withStore((unused,db,codec)->{
+            Resource source=new SourceResource("atlas-store",null,"mongodb",Map.of("uri","mongodb://fixture:secret@localhost/db"),null,null,null,null);
+            var stored=codec.encode(source).append("systemRole",MongoStorageBindingStore.DEFAULT_ROLE);
+            SystemCollections.SOURCES.on(db).insertMany(List.of(stored,new Document("_id","broken").append("kind","source").append("body","invalid")));
+            SystemCollections.PIPELINES.on(db).insertOne(new Document("_id","atlas-store").append("kind","pipeline").append("body","invalid"));
+            var settings=com.mongodb.MongoClientSettings.builder().applyConnectionString(new com.mongodb.ConnectionString(mongo.getReplicaSetUrl()))
+                    .addCommandListener(MongoCommandObservation.LISTENER).build();
+            try(var reader=MongoClients.create(settings)) {
+                reader.getDatabase(db.getName()).runCommand(new Document("ping",1));
+                var typed=new MongoConfigurationArtifactStore(reader,reader.getDatabase(db.getName()),new SourceConfigCipher(new byte[32]));
+                try(var diagnostics=MongoHttpDiagnosticsScope.open()) {
+                    var inventory=typed.readableInventory("source");
+                    assertThat(inventory.resources()).containsExactly(source);
+                    assertThat(inventory.managedDefaultSourceId()).contains("atlas-store");
+                    assertThat(((Number)((Map<?,?>)diagnostics.snapshot().get("mongo")).get("started")).intValue()).isEqualTo(1);
+                    assertThat(diagnostics.snapshot().get("complete")).isEqualTo(true);
+                }
+                assertThatThrownBy(typed::listReadable).isInstanceOf(TapstateException.class);
+            }
+        });
+    }
+
     @Test void mongoRetainsExistingCollectionLocalCollationResults() throws Exception {
         MongoDatabase db=client.getDatabase("readable_collation_"+UUID.randomUUID().toString().replace("-",""));
         try {

@@ -91,18 +91,23 @@ final class MongoStorageRecoveryStore {
         var rows = SystemCollections.STORAGE_RECOVERY.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         if (rows.size() != 1) throw unreadable();
         Document row = rows.getFirst();
+        return read(row, binding.setup(), binding.mode(), binding.bindingVersion(), setup);
+    }
+
+    static Stored read(Document row, io.tapstate.spi.store.StorageSetupScope owner, StorageBinding.Mode mode,
+            long bindingVersion, java.util.function.Supplier<Document> setup) {
         if (!SINGLETON_ID.equals(row.get("_id")) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                 || !MongoConfigurationDomain.LAYOUT.equals(row.get("layoutId"))
-                || !binding.setup().clusterId().equals(row.get("clusterId"))
-                || !Long.valueOf(binding.bindingVersion()).equals(row.get("bindingVersion"))
+                || !owner.clusterId().equals(row.get("clusterId"))
+                || !Long.valueOf(bindingVersion).equals(row.get("bindingVersion"))
                 || !(row.get("revision") instanceof Long revision) || revision < 0 || revision == Long.MAX_VALUE
                 || !(row.get("authGeneration") instanceof Long generation) || generation < 1 || generation == Long.MAX_VALUE
                 || !(row.get("recoveryId") instanceof String operation) || operation.isBlank()
                 || !(row.get("cacheIncarnation") instanceof String incarnation)) throw unreadable();
         try {
             if (!UUID.fromString(incarnation).toString().equals(incarnation)) throw unreadable();
-            requireRecoveryPhase(row, binding, setup, operation, revision, generation);
-            var scope = new CacheAuthScope(binding.setup().clusterId(), binding.bindingVersion(), binding.mode(), incarnation, generation);
+            requireRecoveryPhase(row, owner, mode, setup, operation, revision, generation);
+            var scope = new CacheAuthScope(owner.clusterId(), bindingVersion, mode, incarnation, generation);
             requirePendingScope(row, scope);
             return new Stored(row, new CachePreparation(operation, scope));
         } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) {
@@ -110,16 +115,16 @@ final class MongoStorageRecoveryStore {
         }
     }
 
-    private static void requireRecoveryPhase(Document row, StorageBinding binding,
+    private static void requireRecoveryPhase(Document row, io.tapstate.spi.store.StorageSetupScope owner, StorageBinding.Mode mode,
             java.util.function.Supplier<Document> setup, String operation, long revision, long generation) {
         if (INITIAL.equals(row.get(PHASE))) {
-            if (!binding.setup().operationId().equals(operation) || revision != 0 || generation != 1) throw unreadable();
+            if (!owner.operationId().equals(operation) || revision != 0 || generation != 1) throw unreadable();
         } else {
             if (!java.util.Set.of(AUTH_PREPARING, AUTH_READY).contains(row.get(PHASE)) || generation < 2 || revision < 1
                     || !UUID.fromString(operation).toString().equals(operation)) throw unreadable();
             Document stage = setup.get();
             if (stage == null || !("COMPLETE".equals(stage.get(PHASE))
-                    || binding.mode() == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get(PHASE)))) throw unreadable();
+                    || mode == StorageBinding.Mode.CLOUD && "STORAGE_BOUND".equals(stage.get(PHASE)))) throw unreadable();
         }
     }
 
