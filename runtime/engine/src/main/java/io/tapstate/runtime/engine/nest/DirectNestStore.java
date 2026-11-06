@@ -71,8 +71,11 @@ final class DirectNestStore<S> implements NestStore<S> {
     /** Resolves the backing store the same way the MapStore for this namespace would have. */
     private static KeyedStateStore resolve(HazelcastInstance member, String namespace) {
         MapConfig config = member.getConfig().findMapConfig(namespace);
-        Properties properties = config.getMapStoreConfig() == null ? new Properties()
-                : config.getMapStoreConfig().getProperties();
+        if (config.getMapStoreConfig() == null || !config.getMapStoreConfig().isEnabled()) {
+            // A map configured with nothing behind it kept its state in memory only; so does this.
+            return new InMemory();
+        }
+        Properties properties = config.getMapStoreConfig().getProperties();
         String database = properties.getProperty(NestMaps.STATE_DATABASE_PROPERTY);
         boolean required = OperatorMapBindings.required(properties);
         OperatorMapBindings bindings = OperatorMapBindings.resolve(member, required);
@@ -273,6 +276,21 @@ final class DirectNestStore<S> implements NestStore<S> {
                 oldest.remove();
             }
         }
+    }
+
+    /** State held in this process only, for a namespace whose map had no store behind it. */
+    private static final class InMemory implements KeyedStateStore {
+        private final Map<String, byte[]> held = new ConcurrentHashMap<>();
+        @Override public java.util.Optional<byte[]> load(String namespace, String key) {
+            return java.util.Optional.ofNullable(held.get(key));
+        }
+        @Override public void save(String namespace, String key, byte[] state) { held.put(key, state); }
+        @Override public java.util.Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return java.util.Optional.ofNullable(held.putIfAbsent(key, state));
+        }
+        @Override public void delete(String namespace, String key) { held.remove(key); }
+        @Override public void dropNamespace(String namespace) { held.clear(); }
+        @Override public long count(String namespace) { return held.size(); }
     }
 
     private static byte[] toBytes(Object value) {
