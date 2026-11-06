@@ -155,6 +155,22 @@ public final class BenchCacheStore implements AutoCloseable {
         calls.computeIfAbsent(operation + ":" + level, ignored -> new AtomicLong()).incrementAndGet();
     }
 
+    /** Stored nest state rows by namespace level, read directly. */
+    public Map<String, Long> storedByLevel() {
+        Map<String, Long> out = new TreeMap<>();
+        for (Document row : SystemCollections.CACHE_NEST_STATE.on(database).aggregate(List.of(
+                new Document("$group", new Document("_id", "$_id.placement.namespace").append("n", new Document("$sum", 1)))))) {
+            String namespace = OperatorStateText.decode(row.getString("_id"));
+            String level = namespace.substring(namespace.lastIndexOf('.') + 1);
+            if (namespace.endsWith(".refs") || namespace.endsWith(".parking")) {
+                String trimmed = namespace.substring(0, namespace.lastIndexOf('.'));
+                level = trimmed.substring(trimmed.lastIndexOf('.') + 1) + "." + level;
+            }
+            out.merge(level, ((Number) row.get("n")).longValue(), Long::sum);
+        }
+        return out;
+    }
+
     /** Stored nest state rows, read directly. */
     public long storedRows() {
         return SystemCollections.CACHE_NEST_STATE.on(database).countDocuments();

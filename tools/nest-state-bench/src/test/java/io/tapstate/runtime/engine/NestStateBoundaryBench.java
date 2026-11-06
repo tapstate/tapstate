@@ -64,7 +64,7 @@ import org.testcontainers.utility.DockerImageName;
  * <p>Knobs, as system properties: {@code bench.customers}, {@code bench.orders}, {@code bench.lines}
  * (defaults 1000 / 10000 / 23000, the 34k fixture), {@code bench.latencyMs} (one-way latency added in
  * front of Mongo by a proxy, default 0), {@code bench.label} and {@code bench.out} (a file the result
- * line is appended to).
+ * line is appended to), {@code bench.memoryState} (keep state in process memory instead, as a ceiling).
  */
 class NestStateBoundaryBench {
 
@@ -86,7 +86,7 @@ class NestStateBoundaryBench {
              MongoDBContainer mongo = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
                      .withNetwork(network).withNetworkAliases("mongo");
              ToxiproxyContainer toxiproxy = latency > 0
-                     ? new ToxiproxyContainer(DockerImageName.parse("ghcr.io/shopify/toxiproxy:2.5.0")).withNetwork(network)
+                     ? new ToxiproxyContainer(DockerImageName.parse("shopify/toxiproxy:2.1.4")).withNetwork(network)
                      : null) {
             mongo.start();
             String direct = "mongodb://" + mongo.getHost() + ":" + mongo.getMappedPort(27017) + "/?directConnection=true";
@@ -102,7 +102,12 @@ class NestStateBoundaryBench {
             try (BenchCacheStore cache = BenchCacheStore.open(direct, work)) {
                 HazelcastInstance member = Hazelcast.newHazelcastInstance(memberConfig());
                 try {
-                    NestStateMapStoreFactory.bindTo(member, cache.stores());
+                    if (Boolean.getBoolean("bench.memoryState")) {
+                        // Ceiling arm: the same operator with state kept in process memory, no store I/O.
+                        NestStateMapStoreFactory.bindTo(member, new MemoryState());
+                    } else {
+                        NestStateMapStoreFactory.bindTo(member, cache.stores());
+                    }
                     run(member, cache, customers, orders, lines, latency, budget, label);
                 } finally {
                     member.shutdown();
@@ -142,6 +147,8 @@ class NestStateBoundaryBench {
             }
             sleep(50);
         }
+        // Give the operator a moment to finish what it had in hand, so the state count is the settled one.
+        sleep(Long.getLong("bench.settleMs", 3_000L));
         job.cancel();
         assertThat(completeAt).describedAs("the snapshot did not complete within " + budget
                 + "; " + LATEST.size() + " of " + orders + " documents seen").isPositive();
@@ -152,9 +159,9 @@ class NestStateBoundaryBench {
         String result = String.format(java.util.Locale.ROOT,
                 "{\"label\":\"%s\",\"latencyMs\":%d,\"input\":%d,\"orders\":%d,\"seconds\":%.3f,"
                         + "\"docsPerSecond\":%.1f,\"inputRowsPerSecond\":%.1f,\"emitted\":%d,\"storeCommands\":%d,"
-                        + "\"commandsPerInputRow\":%.2f,\"storedRows\":%d,\"byCommand\":%s,\"storeCalls\":%s}",
+                        + "\"commandsPerInputRow\":%.2f,\"storedRows\":%d,\"byCommand\":%s,\"storeCalls\":%s,\"storedByLevel\":%s}",
                 label, latency, input, orders, seconds, orders / seconds, input / seconds, EMITTED.get(), total,
-                (double) total / input, cache.storedRows(), json(commands), json(cache.calls()));
+                (double) total / input, cache.storedRows(), json(commands), json(cache.calls()), json(cache.storedByLevel()));
         System.out.println("NEST-BENCH " + result);
         String out = System.getProperty("bench.out");
         if (out != null) Files.writeString(Path.of(out), result + System.lineSeparator(),
@@ -280,6 +287,20 @@ class NestStateBoundaryBench {
             }
             return false;
         }
+    }
+
+    private static final class MemoryState implements io.tapstate.spi.store.KeyedStateStore {
+        private final Map<String, byte[]> held = new ConcurrentHashMap<>();
+        @Override public java.util.Optional<byte[]> load(String namespace, String key) {
+            return java.util.Optional.ofNullable(held.get(namespace + "\0" + key));
+        }
+        @Override public void save(String namespace, String key, byte[] state) { held.put(namespace + "\0" + key, state); }
+        @Override public java.util.Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
+            return java.util.Optional.ofNullable(held.putIfAbsent(namespace + "\0" + key, state));
+        }
+        @Override public void delete(String namespace, String key) { held.remove(namespace + "\0" + key); }
+        @Override public void dropNamespace(String namespace) { held.keySet().removeIf(k -> k.startsWith(namespace + "\0")); }
+        @Override public long count(String namespace) { return held.keySet().stream().filter(k -> k.startsWith(namespace + "\0")).count(); }
     }
 
     private static final class LatestDocumentSink implements SinkWriter {
