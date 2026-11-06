@@ -33,7 +33,7 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
     throw new Error('Dev source revisions must be full commit SHAs');
   }
   const branch = required(env, 'DEV_BRANCH');
-  const version = `${buildVersion}-dev${branch === 'main' ? '' : `-${commitId.slice(0, 12)}`}`;
+  const version = `${buildVersion}-dev`;
   const image = required(env, 'CLOUD_IMAGE');
   const imageTag = required(env, 'CLOUD_IMAGE_TAG');
   const imageDigest = required(env, 'CLOUD_IMAGE_DIGEST');

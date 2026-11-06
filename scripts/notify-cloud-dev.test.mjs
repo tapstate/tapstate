@@ -47,8 +47,8 @@ test('registers only the checked dev image, with both pinned revisions and a ver
 });
 
 for (const branch of ['develop', 'feature/cloud-dev']) {
-  test(`registers the source-specific image and actual branch for ${branch}`, async () => {
-    const version = `0.7.0-dev-${'b'.repeat(12)}`;
+  test(`registers the canonical dev image and actual branch for ${branch}`, async () => {
+    const version = '0.7.0-dev';
     const imageTag = `ghcr.io/tapstate/tapstate-cloud:${version}`;
     const result = await notifyCloudDev(environment({ DEV_BRANCH: branch, CLOUD_IMAGE_TAG: imageTag }),
       async (_url, options) => {
@@ -63,17 +63,17 @@ for (const branch of ['develop', 'feature/cloud-dev']) {
   });
 }
 
-test('rejects a branch image tagged with a different source SHA before sending', async () => {
+test('rejects a source-suffixed branch image before sending', async () => {
   let calls = 0;
   await assert.rejects(notifyCloudDev(environment({
-    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'d'.repeat(12)}`,
+    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
   }), async () => { calls++; }), /must match its dev tag/);
   assert.equal(calls, 0);
 });
 
 test('rejects a branch registration receipt that reports main', async () => {
   await assert.rejects(notifyCloudDev(environment({
-    DEV_BRANCH: 'develop', CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
+    DEV_BRANCH: 'develop',
   }), async (_url, options) => ({
     status: 201, json: async () => {
       const saved = receipt(options);
@@ -85,7 +85,7 @@ test('rejects a branch registration receipt that reports main', async () => {
 
 for (const [name, value] of [
   ['DEV_VERSION', '0.7.0-dev'], ['DEV_VERSION', 'v0.7.0'], ['DEV_SHA', 'bbbbbbb'],
-  ['DEV_WEB_SHA', 'ccccccc'], ['DEV_BRANCH', 'release/0.7.0'],
+  ['DEV_WEB_SHA', 'ccccccc'],
   ['CLOUD_IMAGE_TAG', 'ghcr.io/tapstate/tapstate-cloud:0.7.0'],
   ['CLOUD_IMAGE_TAG', 'ghcr.io/tapstate/tapstate-cloud:0.8.0-dev'],
   ['CLOUD_IMAGE', `ghcr.io/other/cloud@${digest}`],

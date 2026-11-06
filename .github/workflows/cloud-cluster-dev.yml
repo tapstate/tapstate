@@ -1,5 +1,5 @@
 # Build a pinned release candidate or the next main-line version for Cloud development validation.
-# Main owns the mutable -dev tag; branch builds use their source SHA in the tag and catalog version.
+# All branch builds publish the same mutable -dev tag and catalog version.
 # Configure cloud-ghcr-dev with VITE_CLOUD_CONSOLE_URL and reuse the Public
 # tapstate-cloud package with workflow write access. The repository's
 # RELEASE_SATELLITE_TOKEN supplies private Web reads; no plaintext artifacts are uploaded.
@@ -226,16 +226,11 @@ jobs:
           CLOUD_GHCR_TOKEN: ${{ secrets.CLOUD_GHCR_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.source.outputs.version }}
-          SOURCE_SHA: ${{ steps.source.outputs.sha }}
-          RELEASE_VERSION: ${{ inputs.version }}
           DIGEST: ${{ steps.verify.outputs.digest }}
         run: |
-          args=(publish-dev --archive "$RUNNER_TEMP/cloud-image.tar" \
-            --version "$VERSION" --expected-digest "$DIGEST")
-          if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then
-            args+=(--dev-source-sha "$SOURCE_SHA")
-          fi
-          bash deploy/cloud/ghcr-publish.sh "${args[@]}"
+          bash deploy/cloud/ghcr-publish.sh publish-dev \
+            --archive "$RUNNER_TEMP/cloud-image.tar" \
+            --version "$VERSION" --expected-digest "$DIGEST"
       - name: report the dev deployment image
         env:
           IMAGE: ${{ steps.publish.outputs.image }}
