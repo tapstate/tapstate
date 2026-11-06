@@ -94,11 +94,12 @@ class StorageControlCallersTest {
 
     @Test void verifiedCloudSetupIdentityCanReadSetupButCannotBorrowAFormalCacheScope() {
         var verified = new CredentialAuthentication(new VerifiedToken("cloud-user", Scope.WRITE), Optional.empty(),
-                Optional.of("organization"), () -> {});
+                Optional.of("organization"), () -> {}, Optional.empty(), Optional.of(SETUP));
         var credentials = CredentialAuthenticator.scoped(raw -> Optional.of(verified));
         SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("tcs_setup-cookie")));
-        var caller = ordinary(StorageBinding.Mode.CLOUD, () -> SETUP).current();
+        var caller = ordinary(StorageBinding.Mode.CLOUD, () -> { throw new AssertionError("must retain the authenticated setup"); }).current();
+        assertThat(caller.setup()).isEqualTo(SETUP);
         caller.require(ControlOperations.STORAGE_STATUS);
         assertThatThrownBy(caller::cache).isInstanceOf(TapstateException.class);
     }

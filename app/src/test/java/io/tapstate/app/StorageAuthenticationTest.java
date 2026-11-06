@@ -193,6 +193,7 @@ class StorageAuthenticationTest {
         when(configuration.bindings()).thenReturn(mock(StorageBindingStore.class));
         when(states.load()).thenAnswer(ignored -> new StorageSetupStateStore.Status(scope, phase.get(),
                 phase.get() == StorageSetupStateStore.Phase.CONFIG_PREPARED ? 0 : 1));
+        when(states.loadView()).thenAnswer(ignored -> new StorageSetupStateStore.View(states.load(), Optional.empty(), Optional.empty()));
         try (var authentication = new StorageAuthentication(configuration, cloud, new CloudSdkBridge(cloud, sdk),
                 new RandomTokenSecrets(), clock, new byte[32])) {
             var original = authentication.managed();
@@ -203,7 +204,12 @@ class StorageAuthenticationTest {
             var counted = spy(temporary);
             var service = (io.tapstate.control.core.CloudSessionService)org.springframework.test.util.ReflectionTestUtils.getField(original.service(), "sessions");
             org.springframework.test.util.ReflectionTestUtils.setField(service, "sessions", counted);
+            clearInvocations(states);
+            assertThat(authentication.credentials().authenticateContext("malformed-cookie")).isEmpty();
+            verifyNoInteractions(states);
             var proof = authentication.credentials().authenticateContext(created.token()).orElseThrow();
+            verify(states, times(1)).loadView();
+            assertThat(proof.setupScope()).contains(scope);
             assertThat(proof.storageScope()).isEmpty();
             assertThat(proof.organizationId()).contains("organization");
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
@@ -214,6 +220,20 @@ class StorageAuthenticationTest {
             clearInvocations(counted);
             proof.requireActive().run();
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
+            var recovered = new CachePreparation(scope.operationId(),
+                    new CacheAuthScope(scope.clusterId(), 1, StorageBinding.Mode.CLOUD, "recovered-incarnation", 2));
+            doReturn(new StorageSetupStateStore.View(
+                    new StorageSetupStateStore.Status(scope, StorageSetupStateStore.Phase.STORAGE_BOUND, 1),
+                    Optional.empty(), Optional.of(recovered))).when(states).loadView();
+            assertThatThrownBy(() -> authentication.credentials().authenticateContext(created.token()))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            doThrow(StorageRuntime.unavailable()).when(states).loadView();
+            assertThatThrownBy(() -> authentication.credentials().authenticateContext(created.token()))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            doAnswer(ignored -> new StorageSetupStateStore.View(states.load(), Optional.empty(), Optional.empty()))
+                    .when(states).loadView();
             phase.set(StorageSetupStateStore.Phase.COMPLETE);
             assertThatThrownBy(proof.requireActive()::run).isInstanceOf(TapstateException.class);
             assertThatThrownBy(authentication::managed).isInstanceOf(TapstateException.class);

@@ -51,7 +51,7 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
         // local lifetime; the next HTTP request authenticates its credential again.
         Runnable active = original.evidence().map(CredentialEvidence::requireLocallyActive).orElse(() -> {});
         var request = new CredentialAuthentication(original.token(), original.storageScope(),
-                original.organizationId(), active, original.evidence());
+                original.organizationId(), active, original.evidence(), original.setupScope());
         return new TapstateAuthentication(principal, request);
     }
 

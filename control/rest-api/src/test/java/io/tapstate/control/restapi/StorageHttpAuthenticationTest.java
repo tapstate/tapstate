@@ -33,6 +33,7 @@ class StorageHttpAuthenticationTest {
     private static final AtomicInteger SETUP_CHECKS = new AtomicInteger();
     private static final AtomicLong GENERATION = new AtomicLong(1);
     private static final AtomicReference<Runnable> DURING_PROBE = new AtomicReference<>(() -> {});
+    private static final AtomicReference<Runnable> DURING_NORMALIZATION = new AtomicReference<>(() -> {});
     private static final AtomicReference<Scope> SCOPE = new AtomicReference<>(Scope.WRITE);
     private static ConfigurableApplicationContext context;
     private static HttpClient client;
@@ -52,6 +53,7 @@ class StorageHttpAuthenticationTest {
         REVOKED.set(false); OWNER_ACTIVE.set(true); GENERATION.set(1); SCOPE.set(Scope.WRITE);
         AUTHENTICATIONS.set(0); REAUTHENTICATIONS.set(0); LOCAL_CHECKS.set(0); PROBES.set(0); SETUP_CHECKS.set(0);
         DURING_PROBE.set(() -> {});
+        DURING_NORMALIZATION.set(() -> {});
     }
 
     @Test void storageTestAuthenticatesOnceAcrossDispatcherAndTransactionGuards() throws Exception {
@@ -82,6 +84,14 @@ class StorageHttpAuthenticationTest {
         assertThat(AUTHENTICATIONS).hasValue(1);
         assertThat(REAUTHENTICATIONS).hasValue(0);
         assertThat(SETUP_CHECKS).hasValue(2);
+    }
+
+    @Test void installationGenerationIsCheckedAfterNormalizationBeforeAnyProbe() throws Exception {
+        DURING_NORMALIZATION.set(() -> GENERATION.incrementAndGet());
+        var response = request("tcs_fixture");
+        assertThat(response.statusCode()).as(response.body()).isEqualTo(409);
+        assertThat(PROBES).hasValue(0);
+        assertThat(SETUP_CHECKS).hasValue(1);
     }
 
     @Test void closingTheSelectedOwnerStillRejectsTheRequest() throws Exception {
@@ -129,6 +139,10 @@ class StorageHttpAuthenticationTest {
             guard.run();
             return result;
         }
+        public View loadView() { return new View(load(), Optional.empty(), Optional.empty()); }
+        public View requireCurrentView(StorageSetupScope expected, Purpose purpose) {
+            requireCurrent(expected, purpose); return loadView();
+        }
         public Status rotate(StorageSetupScope expected, Purpose purpose) { throw new AssertionError("unexpected rotate"); }
         public void requireCurrent(StorageSetupScope expected, Purpose purpose) {
             guard.run();
@@ -154,7 +168,7 @@ class StorageHttpAuthenticationTest {
                             localCheck();
                             if (REVOKED.get()) throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
                         }, Optional.of(new CredentialEvidence(CredentialType.CLOUD_SESSION, Optional.empty(),
-                                StorageHttpAuthenticationTest::localCheck))));
+                                StorageHttpAuthenticationTest::localCheck)), Optional.of(SETUP)));
             });
         }
         @Bean StorageControlCaller caller() {
@@ -166,7 +180,9 @@ class StorageHttpAuthenticationTest {
             var bindings = (StorageBindingStore) Proxy.newProxyInstance(StorageBindingStore.class.getClassLoader(),
                     new Class<?>[]{StorageBindingStore.class}, (proxy, method, args) -> { throw new AssertionError("unexpected binding access"); });
             var probe = new StorageConnectionProbe() {
-                public StorageBinding.Connection normalize(StorageBinding.Connection candidate) { return candidate; }
+                public StorageBinding.Connection normalize(StorageBinding.Connection candidate) {
+                    DURING_NORMALIZATION.get().run(); return candidate;
+                }
                 public void test(StorageBinding.Connection candidate) { throw new AssertionError("unexpected generic probe"); }
                 public CacheTestResult testCache(StorageBinding.Connection candidate) {
                     PROBES.incrementAndGet(); DURING_PROBE.get().run(); return CacheTestResult.emptyDatabase();

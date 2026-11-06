@@ -209,8 +209,14 @@ final class StorageAuthentication implements AutoCloseable {
                     new CloudSessionService(sessions, identity, secrets, clock, observer), observer, egressAddresses);
         }
         boolean incomplete() {
-            try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE
-                    && configuration.bindings().cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true); }
+            return incomplete(setupView());
+        }
+        boolean incomplete(StorageSetupStateStore.View view) {
+            return view.status().phase() != StorageSetupStateStore.Phase.COMPLETE
+                    && view.cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true);
+        }
+        StorageSetupStateStore.View setupView() {
+            try { return configuration.setupStates().loadView(); }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
         }
         void requireLocallyActive() {
@@ -219,23 +225,24 @@ final class StorageAuthentication implements AutoCloseable {
         }
         void requireActive() {
             requireLocallyActive();
-            var actual = configuration.setupStates().load();
-            if (!actual.scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
-                    || !incomplete()) throw unauthenticated();
+            var view = setupView();
+            if (!view.status().scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
+                    || !incomplete(view)) throw unauthenticated();
         }
         Optional<CredentialAuthentication> authenticate(String credential) {
-            requireActive();
+            requireLocallyActive();
             var verified = managed.authenticateWithContext(credential);
             if (verified.isEmpty()) return Optional.empty();
             var session = verified.orElseThrow();
             var organization = Optional.ofNullable(session.clusterContext().organizationId());
             if (organization.isEmpty()) return Optional.empty();
-            var identity = session.identity(); requireActive();
+            var identity = session.identity(); requireLocallyActive();
             return Optional.of(new CredentialAuthentication(identity, Optional.empty(), organization, () -> {
                 requireActive();
                 if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();
                 requireActive();
-            }, Optional.of(new CredentialEvidence(CredentialType.CLOUD_SESSION, Optional.empty(), this::requireLocallyActive))));
+            }, Optional.of(new CredentialEvidence(CredentialType.CLOUD_SESSION, Optional.empty(), this::requireLocallyActive)),
+                    Optional.of(setup)));
         }
     }
 
