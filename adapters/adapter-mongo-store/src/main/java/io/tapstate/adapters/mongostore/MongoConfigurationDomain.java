@@ -313,7 +313,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
 
         private void begin(boolean first) {
-            transaction(session -> {
+            var prepared = transaction(session -> {
                 requireOriginal(session);
                 var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
                 var row = schemas.find(session, new Document("_id", "config")).first();
@@ -331,17 +331,21 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                             .projection(new Document("_id", 0).append("found", new Document("$literal", true))).limit(1).first() != null)
                         throw MongoValidationSchema.refused();
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
+                    var marker = MongoValidationSchema.configurationMarker(operation.toString(), "PREPARING", 0, scope);
                     if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row))
-                            .append("validation", MongoValidationSchema.configurationMarker(operation.toString(), "PREPARING", 0, scope)))).getMatchedCount() != 1)
+                            .append("validation", marker))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
-                } else requireOperation(row);
-                return null;
+                    return marker;
+                }
+                return new Document(requireOperation(row));
             });
+            if (MongoValidationSchema.queryIndexVersion(prepared) == 0) prepareQueryIndexes(prepared);
             MongoValidationSchema.verify(database, MongoValidationSchema.CONFIG);
         }
 
         private ValidationSchemaStatus initialConfiguration() {
-            return transaction(session -> {
+            record Retained(ValidationSchemaStatus status, Document marker) { }
+            var result = transaction(session -> {
                 requireOriginal(session);
                 var row = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
                 if (!MongoValidationSchema.configurationHasValidation(database, row)) {
@@ -352,7 +356,33 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 }
                 var marker = MongoValidationSchema.requireConfiguration(row, "READY");
                 if (!scope.equals(MongoValidationSchema.scope(marker)) || marker.getLong("initializedPipelines") != 0) throw MongoValidationSchema.refused();
-                return new ValidationSchemaStatus(marker.getString("operationId"), true, 0);
+                return new Retained(new ValidationSchemaStatus(marker.getString("operationId"), true, 0), new Document(marker));
+            });
+            if (result != null && operation.toString().equals(result.status().operationId())
+                    && MongoValidationSchema.queryIndexVersion(result.marker()) == 0) prepareQueryIndexes(result.marker());
+            return result == null ? null : result.status();
+        }
+
+        /** Adds only declared read indexes under the existing preparation owner, outside data transactions. */
+        private void prepareQueryIndexes(Document original) {
+            for (var table : MongoValidationSchema.CONFIG) {
+                for (var index : table.indexes()) if (MongoValidationSchema.queryIndex(index))
+                    StoreIo.run(() -> IndexEnsure.ensure(database, table.on(database), index));
+            }
+            MongoValidationSchema.verifyQueryIndexes(database);
+            transaction(session -> {
+                requireOriginal(session);
+                var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+                var row = schemas.find(session, new Document("_id", "config")).first();
+                var current = requireOperation(row);
+                if (MongoValidationSchema.queryIndexVersion(current) == MongoValidationSchema.CURRENT_QUERY_INDEX_VERSION) return null;
+                if (!original.equals(current)) throw MongoValidationSchema.refused();
+                ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), connection.client());
+                if (schemas.updateOne(session, new Document("_id", "config").append("validation", current),
+                        new Document("$set", new Document("validation." + MongoValidationSchema.QUERY_INDEX_VERSION,
+                                MongoValidationSchema.CURRENT_QUERY_INDEX_VERSION))).getMatchedCount() != 1)
+                    throw MongoValidationSchema.refused();
+                return null;
             });
         }
 

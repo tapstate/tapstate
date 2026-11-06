@@ -12,6 +12,10 @@ import java.util.*;
 final class MongoValidationSchema {
     static final int VERSION = 2;
     static final int COMPOSED_CONFIGURATION_VERSION = 3;
+    static final String QUERY_INDEX_VERSION = "queryIndexVersion";
+    static final int CURRENT_QUERY_INDEX_VERSION = 1;
+    private static final Set<String> QUERY_INDEX_NAMES = Set.of("validation_tasks_pipeline_task",
+            "validation_reports_history", "validation_differences_page");
     static final List<SystemCollections> CONFIG = List.of(SystemCollections.VALIDATION_TASKS,
             SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES);
     static final List<SystemCollections> CACHE = List.of(SystemCollections.VALIDATION_RUNS);
@@ -27,6 +31,7 @@ final class MongoValidationSchema {
         var result = marker(operation, phase, initialized, scope);
         result.put("formatVersion", 2);
         result.put("scheduledAdmission", scheduledMarker(operation, "READY", null, 0));
+        result.put(QUERY_INDEX_VERSION, CURRENT_QUERY_INDEX_VERSION);
         return validateMarker(result);
     }
     static Document recoveredMarker(Document previous, String operation, long initialized, CacheBusinessScope scope) {
@@ -34,6 +39,7 @@ final class MongoValidationSchema {
         if (Integer.valueOf(2).equals(previous.get("formatVersion"))) {
             result.put("formatVersion", 2); result.put("scheduledAdmission", previous.get("scheduledAdmission"));
         }
+        if (previous.containsKey(QUERY_INDEX_VERSION)) result.put(QUERY_INDEX_VERSION, queryIndexVersion(previous));
         return validateMarker(result);
     }
     static Document scheduledMarker(String operation, String phase, Document cursor, long initialized) {
@@ -60,6 +66,7 @@ final class MongoValidationSchema {
         boolean covered = value != null && Integer.valueOf(2).equals(value.get("formatVersion"));
         var fields = new HashSet<>(Set.of("formatVersion", "operationId", "phase", "initializedPipelines", "scope"));
         if (covered) fields.add("scheduledAdmission");
+        if (value != null && value.containsKey(QUERY_INDEX_VERSION)) fields.add(QUERY_INDEX_VERSION);
         if (value == null || !value.keySet().equals(fields)
                 || !covered && !Integer.valueOf(1).equals(value.get("formatVersion")) || !(value.get("operationId") instanceof String operation)
                 || operation.isBlank() || operation.length() > 512 || !(value.get("phase") instanceof String phase)
@@ -78,7 +85,18 @@ final class MongoValidationSchema {
                     || pipeline.isBlank() || pipeline.length() > 512 || !(cursor.get("taskId") instanceof String task) || task.isBlank() || task.length() > 512)) throw unreadable("scheduled-cursor");
             if (MongoValidationTaskCodec.bsonBytes(watermark) > 4096 || MongoValidationTaskCodec.bsonBytes(value) > 8192) throw unreadable("scheduled-marker-bytes");
         }
-        scope(value); MongoValidationPreparationFacts.bounded(value); return value;
+        queryIndexVersion(value); scope(value); MongoValidationPreparationFacts.bounded(value); return value;
+    }
+
+    static int queryIndexVersion(Document marker) {
+        if (!marker.containsKey(QUERY_INDEX_VERSION)) return 0;
+        if (!(marker.get(QUERY_INDEX_VERSION) instanceof Integer version) || version != CURRENT_QUERY_INDEX_VERSION)
+            throw unreadable("query-index-version");
+        return version;
+    }
+
+    static boolean queryIndex(SystemCollections.IndexSpec index) {
+        return QUERY_INDEX_NAMES.contains(index.indexName());
     }
 
     static CacheBusinessScope scope(Document marker) {
@@ -110,10 +128,10 @@ final class MongoValidationSchema {
             requireAbsent(database, CONFIG);
             return false;
         }
-        configurationMarker(schema);
+        var marker = configurationMarker(schema);
         if (version == VERSION) requireAbsent(database, List.of(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS));
         else MongoConfigurationAiProviderSettingsStore.verifyStructure(database);
-        verify(database, CONFIG);
+        verify(database, CONFIG, queryIndexVersion(marker) == CURRENT_QUERY_INDEX_VERSION);
         return true;
     }
 
@@ -167,6 +185,14 @@ final class MongoValidationSchema {
     }
 
     static void verify(MongoDatabase database, List<SystemCollections> tables) {
+        verify(database, tables, false);
+    }
+
+    static void verifyQueryIndexes(MongoDatabase database) {
+        verify(database, CONFIG, true);
+    }
+
+    private static void verify(MongoDatabase database, List<SystemCollections> tables, boolean requireQueryIndexes) {
         for (var table : tables) {
             var description = database.listCollections().filter(new Document("name", table.collectionName())).first();
             if (description == null || !"collection".equals(description.get("type"))) throw unreadable("collection");
@@ -175,12 +201,16 @@ final class MongoValidationSchema {
             var indexes = table.on(database).listIndexes().into(new ArrayList<>());
             var expected = new HashMap<String, SystemCollections.IndexSpec>();
             for (var index : table.indexes()) expected.put(index.indexName(), index);
-            if (indexes.size() != expected.size() + 1) throw unreadable("indexes");
+            var required = new HashSet<String>(); required.add("_id_");
+            for (var declared : table.indexes()) if (requireQueryIndexes || !queryIndex(declared)) required.add(declared.indexName());
+            var actualNames = new HashSet<String>();
+            for (var index : indexes) actualNames.add(index.getString("name"));
+            if (!actualNames.containsAll(required)) throw unreadable("indexes");
             for (var index : indexes) {
                 var declared = expected.get(index.getString("name"));
                 var keys = new Document();
                 if ("_id_".equals(index.get("name"))) keys.put("_id", 1);
-                else if (declared != null) declared.keys().forEach(key -> keys.put(key, 1));
+                else if (declared != null) keys.putAll(declared.keyDocument());
                 else throw unreadable("index");
                 if (!keys.equals(index.get("key")) || Boolean.TRUE.equals(index.get("hidden")) || Boolean.TRUE.equals(index.get("sparse"))
                         || index.containsKey("expireAfterSeconds") || Boolean.TRUE.equals(index.get("unique")) != (declared != null && declared.unique())

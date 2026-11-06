@@ -136,6 +136,19 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return delegate.listStored();
     }
 
+    @Override public synchronized List<Resource> listReadable() {
+        return readableInventory().resources();
+    }
+
+    @Override public synchronized ReadableInventory readableInventory() {
+        var inventory = delegate.readableInventory();
+        boolean hasSources = inventory.resources().stream().anyMatch(SourceResource.class::isInstance);
+        if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }
+        TapstateCatalog captured = inventory.connectorCatalog().orElseGet(catalog);
+        inventory.resources().forEach(resource -> track(resource, () -> captured));
+        return new ReadableInventory(inventory.resources(), Optional.of(captured));
+    }
+
     @Override
     public List<StoredArtifactRecord> listStored(String kind) {
         // Delegated rather than left to the interface default: the default would filter here, over rows
@@ -145,14 +158,18 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     }
 
     private void track(Resource resource) {
+        track(resource, catalog);
+    }
+
+    private void track(Resource resource, Supplier<TapstateCatalog> selectedCatalog) {
         if (!(resource instanceof SourceResource source)) {
             redactor.remove(resource.id());
             return;
         }
-        redactor.replace(source.id(), secretValues(source));
+        redactor.replace(source.id(), secretValues(source, selectedCatalog));
     }
 
-    private Collection<String> secretValues(SourceResource source) {
+    private Collection<String> secretValues(SourceResource source, Supplier<TapstateCatalog> selectedCatalog) {
         List<String> secrets = new ArrayList<>();
         if (("mongodb".equals(source.connector()) || "mongodb-atlas".equals(source.connector()))
                 && source.config().get(io.tapstate.control.core.StorageSetupService.CA_BUNDLE_FIELD) instanceof String ca) {
@@ -162,7 +179,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         }
         ConnectorCatalogEntry connector;
         try {
-            connector = catalog.get().byId(source.connector());
+            connector = selectedCatalog.get().byId(source.connector());
         } catch (IllegalArgumentException unavailable) {
             secrets.addAll(namedSecretValues(source.config()));
             SecretConfigPaths.shared().forEach(path -> collectScalars(path.value(source.config()), secrets));

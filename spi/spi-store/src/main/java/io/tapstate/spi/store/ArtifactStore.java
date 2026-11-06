@@ -1,6 +1,8 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Resource;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -19,6 +21,19 @@ import java.util.Optional;
  * unavailable.
  */
 public interface ArtifactStore {
+
+    /** One operation's readable resources and, when supplied by a decorator, its redaction catalog. */
+    record ReadableInventory(List<Resource> resources,
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog) {
+        public ReadableInventory {
+            resources = List.copyOf(resources);
+            Objects.requireNonNull(connectorCatalog);
+        }
+    }
+
+    default ReadableInventory readableInventory() {
+        return new ReadableInventory(listReadable(), Optional.empty());
+    }
 
     /**
      * Atomically applies every requested resource write while evaluating each write's condition in the
@@ -174,6 +189,20 @@ public interface ArtifactStore {
 
     /** Lists every stored resource. */
     List<Resource> list();
+
+    /** Lists readable resources, skipping bodies that cannot be reconstructed. */
+    default List<Resource> listReadable() {
+        List<Resource> resources = new ArrayList<>();
+        for (StoredArtifactRecord row : listStored()) {
+            if (!row.readable()) continue;
+            try {
+                get(row.id()).ifPresent(resources::add);
+            } catch (TapstateException failure) {
+                if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+            }
+        }
+        return List.copyOf(resources);
+    }
 
     /**
      * Lists the stored rows without requiring every canonical body to reconstruct as a {@link Resource}.

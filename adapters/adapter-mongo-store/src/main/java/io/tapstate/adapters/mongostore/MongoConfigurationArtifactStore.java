@@ -482,6 +482,40 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     @Override
+    public List<Resource> listReadable() {
+        return readSnapshot(session -> {
+            List<Document> stored = documents(session);
+            Set<String> populated = new HashSet<>();
+            Map<String, Resource> readable = new LinkedHashMap<>();
+            for (Document document : stored) {
+                populated.add(document.getString("kind"));
+                try {
+                    readable.put(document.getString("_id"), decode(document));
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+                }
+            }
+            List<Resource> resources = new ArrayList<>();
+            for (Document document : stored) {
+                String id = document.getString("_id");
+                if (!readable.containsKey(id)) continue;
+                try {
+                    // Emptiness is collation-independent; every populated collection still resolves
+                    // the ID under its own collation in this same transaction snapshot.
+                    Document found = find(session, id, populated);
+                    if (found != null) {
+                        Resource resource = readable.get(found.getString("_id"));
+                        if (resource != null) resources.add(resource);
+                    }
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+                }
+            }
+            return List.copyOf(resources);
+        });
+    }
+
+    @Override
     public List<StoredArtifactRecord> listStored() {
         return readSnapshot(session -> documents(session).stream().map(this::browse).toList());
     }
@@ -528,8 +562,13 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     private Document find(ClientSession session, String id) {
+        return find(session, id, collections.keySet());
+    }
+
+    private Document find(ClientSession session, String id, Set<String> selectedKinds) {
         Document found = null;
         for (var entry : collections.entrySet()) {
+            if (!selectedKinds.contains(entry.getKey())) continue;
             Document candidate = entry.getValue().find(session, new Document("_id", id)).first();
             if (candidate == null) continue;
             requireKind(candidate, entry.getKey());

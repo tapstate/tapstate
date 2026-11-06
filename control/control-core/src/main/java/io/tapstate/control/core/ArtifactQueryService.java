@@ -67,7 +67,16 @@ public final class ArtifactQueryService {
 
     /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
     public List<StoredResource> listResources() {
-        return ReadableArtifactInventory.list(store).stream().map(this::typedView).toList();
+        return resourceInventory().resources();
+    }
+
+    public record ResourceInventory(List<StoredResource> resources,
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog) { }
+
+    public ResourceInventory resourceInventory() {
+        var inventory = store.readableInventory();
+        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
+                inventory.connectorCatalog());
     }
 
     /**

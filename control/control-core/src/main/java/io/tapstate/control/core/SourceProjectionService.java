@@ -33,10 +33,12 @@ public final class SourceProjectionService {
     /** Lists stored Sources in stable id order. */
     public List<SourceView> list() {
         var managed = artifacts.managedDefaultSourceId();
-        return artifacts.listResources().stream()
+        var inventory = artifacts.resourceInventory();
+        var renderer = inventory.connectorCatalog().map(representation::withCatalog).orElse(representation);
+        return inventory.resources().stream()
                 .filter(stored -> stored.resource() instanceof SourceResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
-                .map(stored -> view(stored, managed))
+                .map(stored -> view(stored, managed, renderer))
                 .toList();
     }
 
@@ -99,6 +101,10 @@ public final class SourceProjectionService {
                     Map.of("reason", "the managed default target cannot be changed through authoring"), null);
     }
     private SourceView view(StoredResource stored, java.util.Optional<String> managed) {
+        return view(stored, managed, representation);
+    }
+
+    private SourceView view(StoredResource stored, java.util.Optional<String> managed, SourceRepresentation renderer) {
         var resource = source(stored.resource());
         if (managed.isPresent()) {
             var metadata = resource.metadata();
@@ -110,7 +116,7 @@ public final class SourceProjectionService {
             resource = new SourceResource(resource.id(), display, resource.connector(), resource.config(), resource.mode(),
                     resource.tables(), resource.srs(), resource.execution(), resource.experimental());
         }
-        return representation.toView(resource, stored.contentHash());
+        return renderer.toView(resource, stored.contentHash());
     }
 
     private static SourceResource source(Resource resource) {
