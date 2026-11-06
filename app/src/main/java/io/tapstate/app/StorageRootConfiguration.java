@@ -178,7 +178,7 @@ class StorageRootConfiguration {
                 new AuditGate(configuration.audit(), clock), clock, root::requireActive,
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
-                        root.handoffActivation(committed, () -> root.continueCloudSetup(committed, target, original -> factories.getObject().create(original)));
+                        root.handoffCloudSetup(committed, target, original -> factories.getObject().create(original));
                 }, root::coordinateSetup, (expected, tested, active) -> {},
                 root.mode() == StorageBinding.Mode.CLOUD ? root.initializationProgress() : null);
     }

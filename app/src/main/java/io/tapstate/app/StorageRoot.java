@@ -306,6 +306,22 @@ final class StorageRoot implements AutoCloseable {
 
     /** One original setup handoff; HTTP callers and their capabilities do not own its lifetime. */
     void handoffActivation(StorageBindingCommit committed, Runnable continuation) {
+        handoffPreparedActivation(committed, () -> continuation);
+    }
+
+    /** Publishes Cloud authentication before returning; only business startup remains asynchronous. */
+    void handoffCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+            Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
+        lifecycle(() -> {
+            handoffPreparedActivation(committed, () -> {
+                var original = continueCloudSetup(committed, target, assembly, false);
+                return () -> lifecycle(() -> { startInitialBusiness(original, assembly, true); return null; });
+            });
+            return null;
+        });
+    }
+
+    private void handoffPreparedActivation(StorageBindingCommit committed, java.util.function.Supplier<Runnable> preparation) {
         synchronized (activationLock) {
             requireOpen();
             if (runtime.cleanupRequired() || committed.binding().bindingVersion() != 1) throw StorageRuntime.unavailable();
@@ -315,6 +331,9 @@ final class StorageRoot implements AutoCloseable {
             if (phase == Phase.BUSINESS_READY && runtime.businessStarted() && !installationCompletionPending()
                     || initialActivationPending()) return;
             activationFailed = false;
+            Runnable continuation;
+            try { continuation = preparation.get(); }
+            catch (RuntimeException | Error failure) { activationFailed = true; throw failure; }
             if (activationWorker == null) activationWorker = java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
                 var thread = new Thread(task, "tapstate-initial-cache-activation"); thread.setDaemon(true); return thread;
             });
@@ -371,7 +390,7 @@ final class StorageRoot implements AutoCloseable {
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly) {
         lifecycle(()->{continueCloudSetup(committed, target, assembly, true);return null;});
     }
-    private void continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
+    private StorageRuntime.Bound continueCloudSetup(StorageBindingCommit committed, StorageSetupService.DefaultTarget target,
             Function<StorageRuntime.Bound, ? extends StorageRuntime.Business> assembly, boolean startBusiness) {
         requireOpen();
         if (!cloud.cloud() || committed.binding().mode() != StorageBinding.Mode.CLOUD || runtime.cleanupRequired())
@@ -384,6 +403,7 @@ final class StorageRoot implements AutoCloseable {
             authentication.install(original); phase = Phase.AUTH_READY;
             initializationProgress.completed(scope, StorageInitializationProgress.Stage.PREPARE_STORAGE);
             if (startBusiness) startInitialBusiness(original, assembly, true);
+            return original;
         } catch (RuntimeException | Error failure) {
             initializationProgress.failed(scope, failure);
             throw failure;
