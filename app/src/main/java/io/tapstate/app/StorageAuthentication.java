@@ -213,8 +213,12 @@ final class StorageAuthentication implements AutoCloseable {
                     && configuration.bindings().cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true); }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
         }
-        void requireActive() {
+        void requireLocallyActive() {
             if (closed || current.get() != null) throw unauthenticated();
+            sessions.requireLocallyActive();
+        }
+        void requireActive() {
+            requireLocallyActive();
             var actual = configuration.setupStates().load();
             if (!actual.scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
                     || !incomplete()) throw unauthenticated();
@@ -231,7 +235,7 @@ final class StorageAuthentication implements AutoCloseable {
                 requireActive();
                 if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();
                 requireActive();
-            }));
+            }, Optional.of(new CredentialEvidence(CredentialType.CLOUD_SESSION, Optional.empty(), this::requireLocallyActive))));
         }
     }
 

@@ -207,6 +207,10 @@ class StorageAuthenticationTest {
             assertThat(proof.storageScope()).isEmpty();
             assertThat(proof.organizationId()).contains("organization");
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
+            var evidence = proof.evidence().orElseThrow();
+            clearInvocations(configuration, states);
+            evidence.requireLocallyActive().run();
+            verifyNoInteractions(configuration, states);
             clearInvocations(counted);
             proof.requireActive().run();
             verify(counted, times(1)).authenticate(any(), anyString(), anyString(), any(), any());
@@ -217,6 +221,8 @@ class StorageAuthenticationTest {
             assertThatThrownBy(() -> original.service().invalidateJwt("jti")).isInstanceOf(TapstateException.class);
             verify(configuration, never()).users();
             verify(configuration, never()).tokens();
+            temporary.close();
+            assertThatThrownBy(evidence.requireLocallyActive()::run).isInstanceOf(TapstateException.class);
         }
     }
 

@@ -22,12 +22,14 @@ class StorageControlCallersTest {
     }
     @AfterEach void clear() { SecurityContextHolder.clearContext(); }
 
-    @Test void selectedRequestKeepsItsOriginalScopeAndRechecksItsOriginalCredential() {
+    @Test void selectedRequestKeepsItsOriginalScopeAndChecksItsSelectedOwner() {
         var active = new AtomicBoolean(true);
         var verified = new CredentialAuthentication(new VerifiedToken("alice", Scope.ADMIN), Optional.of(ORIGINAL),
                 Optional.empty(), () -> {
                     if (!active.get()) throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
-                });
+                }, Optional.of(new CredentialEvidence(CredentialType.HUMAN_JWT, Optional.empty(), () -> {
+                    if (!active.get()) throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
+                })));
         var credentials = CredentialAuthenticator.scoped(raw -> "credential".equals(raw) ? Optional.of(verified) : Optional.empty());
         var selected = new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("credential"));
@@ -100,18 +102,22 @@ class StorageControlCallersTest {
         caller.require(ControlOperations.STORAGE_STATUS);
         assertThatThrownBy(caller::cache).isInstanceOf(TapstateException.class);
     }
-    @Test void anInvalidatedOriginalCredentialCannotReadConfigurationBeforeReauthentication() {
+    @Test void revocationAfterEntryAppliesToTheNextRequest() {
         var active = new AtomicBoolean(true); var reads = new java.util.concurrent.atomic.AtomicInteger();
         var verified = new CredentialAuthentication(new VerifiedToken("alice", Scope.ADMIN), Optional.of(ORIGINAL), Optional.empty(), () -> {
             if (!active.get()) throw new TapstateException(ControlError.UNAUTHENTICATED,Map.of(),null);
         });
-        var credentials = CredentialAuthenticator.scoped(raw -> Optional.of(verified));
+        var credentials = CredentialAuthenticator.scoped(raw -> active.get() ? Optional.of(verified) : Optional.empty());
         SecurityContextHolder.getContext().setAuthentication(new TapstateCredentialAuthenticationProvider(credentials)
                 .authenticate(new TapstateCredentialAuthenticationToken("credential")));
         active.set(false);
-        assertThatThrownBy(() -> ordinary(StorageBinding.Mode.OP, () -> { reads.incrementAndGet(); return SETUP; }).current())
-                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
-        assertThat(reads).hasValue(0);
+        var caller = ordinary(StorageBinding.Mode.OP, () -> { reads.incrementAndGet(); return SETUP; }).current();
+        assertThat(caller.cache()).isEqualTo(ORIGINAL);
+        assertThat(reads).hasValue(1);
+        assertThatThrownBy(() -> new TapstateCredentialAuthenticationProvider(credentials)
+                .authenticate(new TapstateCredentialAuthenticationToken("credential")))
+                .isInstanceOf(org.springframework.security.authentication.BadCredentialsException.class);
+        assertThatThrownBy(verified.requireActive()::run).isInstanceOf(TapstateException.class);
     }
 
 }
