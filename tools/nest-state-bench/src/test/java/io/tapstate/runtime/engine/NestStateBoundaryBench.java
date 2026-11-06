@@ -152,9 +152,9 @@ class NestStateBoundaryBench {
         String result = String.format(java.util.Locale.ROOT,
                 "{\"label\":\"%s\",\"latencyMs\":%d,\"input\":%d,\"orders\":%d,\"seconds\":%.3f,"
                         + "\"docsPerSecond\":%.1f,\"inputRowsPerSecond\":%.1f,\"emitted\":%d,\"storeCommands\":%d,"
-                        + "\"commandsPerInputRow\":%.2f,\"storedRows\":%d,\"byCommand\":%s}",
+                        + "\"commandsPerInputRow\":%.2f,\"storedRows\":%d,\"byCommand\":%s,\"storeCalls\":%s}",
                 label, latency, input, orders, seconds, orders / seconds, input / seconds, EMITTED.get(), total,
-                (double) total / input, cache.storedRows(), json(commands));
+                (double) total / input, cache.storedRows(), json(commands), json(cache.calls()));
         System.out.println("NEST-BENCH " + result);
         String out = System.getProperty("bench.out");
         if (out != null) Files.writeString(Path.of(out), result + System.lineSeparator(),

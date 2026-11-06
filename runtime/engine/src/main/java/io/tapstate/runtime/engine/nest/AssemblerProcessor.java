@@ -440,7 +440,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         forgetDeletionsReplayCannotReach();
         // Only after the documents above have gone out, for the usual reason: a bound offered ahead of what is
         // queued behind it would say it had left.
-        return !forgetHandOversThatHaveLanded() || bounds == null || bounds.release(this::tryEmit);
+        return !forgetHandOversThatHaveLanded() || bounds == null || (commitState() && bounds.release(this::tryEmit));
     }
 
     /**
@@ -634,6 +634,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         NestInbound edge = vertex.inbound().get(ordinal);
         Map<Object, Touched> touched = new LinkedHashMap<>();
+        readAhead(edge, inbox);
         boolean snapshotWaves = canUseSnapshotWaves(edge);
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
@@ -651,6 +652,36 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         // else is coming for.
         collectWhatIsOwed();
         sendWhatWindowsHaveRunOutOn();
+    }
+
+    /**
+     * Reads the documents an inbox will touch in one batch, when the store makes that one round trip per
+     * batch instead of one per row. The inbox is already bounded by the engine, so the whole of it is read;
+     * anything this cannot key is left to be read where it is handled.
+     */
+    private void readAhead(NestInbound edge, Inbox inbox) {
+        if (!store.readsAhead() || edge.carriesDepartures()) return;
+        Set<Object> keys = new LinkedHashSet<>();
+        for (Object item : inbox) {
+            if (item instanceof NestTouch word) {
+                keys.add(word.key());
+                continue;
+            }
+            if (item instanceof KeyedElement arrived) {
+                keys.add(arrived.key());
+                continue;
+            }
+            if (edge.isCascade() || !(item instanceof Envelope event)) continue;
+            try {
+                Map<String, Object> row = NestKeys.rowOf(event);
+                keys.add(edge.pathId().isEmpty() ? NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName())
+                        : NestKeys.valuesOf(row, edge.keyFields(), vertex.mapName()));
+            } catch (TapstateException unkeyable) {
+                // Reported where the row is handled.
+            }
+        }
+        keys.removeIf(key -> recentReferenceStates.get(key) == ReferenceState.ABSENT);
+        if (!keys.isEmpty()) store.loadAll(keys);
     }
 
     private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched) {
@@ -819,7 +850,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (bounds == null) {
             return true;
         }
-        return bounds.advance(ordinal, watermark, this::tryEmit);
+        return (commitState() && bounds.advance(ordinal, watermark, this::tryEmit));
     }
 
     private void observeLookupSnapshots(int ordinal, Watermark watermark) {
@@ -880,7 +911,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return false;
         }
         snapshotWaiters = null;
-        return bounds == null || bounds.release(this::tryEmit);
+        return bounds == null || (commitState() && bounds.release(this::tryEmit));
     }
 
     /**
@@ -1615,7 +1646,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         flushingCompletedReferenceBatch = false;
         // Flush each bounded batch before taking in another. The last send can clear a window's hold
         // without going through sendFolded, so release its bound here too, retrying a refused offer.
-        return settledMissingReferencesOnComplete && (bounds == null || bounds.release(this::tryEmit));
+        return settledMissingReferencesOnComplete && (bounds == null || (commitState() && bounds.release(this::tryEmit)));
     }
 
     private void waitForReference(Object key, long ts, RootAssembly assembly,
@@ -1663,7 +1694,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         writes.flush();
         if (!flush()) return false;
         // A bound follows the actual output; queued documents must never be overtaken.
-        return !letGo || bounds == null || bounds.release(this::tryEmit);
+        return !letGo || bounds == null || (commitState() && bounds.release(this::tryEmit));
     }
 
     private boolean sendWindow(Map.Entry<Object, Window> entry, Iterator<Map.Entry<Object, Window>> open,
@@ -1882,7 +1913,19 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         ABSENT, COMPLETE
     }
 
+    /**
+     * Makes the state this processor has changed durable before anything that depends on it goes out:
+     * a document, a touch, or a position the frontier may pass. A no-op for stores that write through.
+     */
+    private boolean commitState() {
+        if (store != null) store.commit();
+        if (parking != null) parking.commit();
+        if (referenced != null) referenced.values().forEach(NestStore::commit);
+        return true;
+    }
+
     private boolean flush() {
+        commitState();
         while (!outgoing.isEmpty()) {
             if (!tryEmit(outgoing.peek())) {
                 return false;

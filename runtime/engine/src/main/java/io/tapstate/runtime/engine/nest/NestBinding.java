@@ -303,12 +303,22 @@ public record NestBinding(
 
         @Override
         public NestStore<ResolverState> forResolver(NestVertex vertex) {
-            return metered(mapOf(vertex));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()));
         }
 
         @Override
         public NestStore<RootAssembly> forAssembler(NestVertex vertex) {
-            return metered(mapOf(vertex));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()));
+        }
+
+        /** The map-backed store, or the operator-held one with group commit when that is selected. */
+        private <S> NestStore<S> stateOf(String askedFor, String name) {
+            if (DirectNestStore.selected()) {
+                if (member == null) throw new IllegalStateException(
+                        "nest stores were asked for " + askedFor + " before being bound to a member");
+                return DirectNestStore.on(member, name);
+            }
+            return metered(mapNamed(askedFor, name));
         }
 
         /**
@@ -326,22 +336,19 @@ public record NestBinding(
 
         @Override
         public NestStore<ParkedSubtree> forParking(NestVertex vertex) {
-            return metered(mapNamed(vertex.name(), name(vertex.pathId(),NestMap.PARKING,null,vertex.parkingMapName())));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.PARKING,null,vertex.parkingMapName()));
         }
 
         @Override
         public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.LOOKUP,lookup.alias(),lookup.mapName())));
+            return stateOf(lookup.name(), name(lookup.pathId(),NestMap.LOOKUP,lookup.alias(),lookup.mapName()));
         }
 
         @Override
         public NestStore<Set<Object>> forReferences(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.REFERENCES,lookup.alias(),lookup.referencesMapName())));
+            return stateOf(lookup.name(), name(lookup.pathId(),NestMap.REFERENCES,lookup.alias(),lookup.referencesMapName()));
         }
 
-        private <S> IMap<Object, S> mapOf(NestVertex vertex) {
-            return mapNamed(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()));
-        }
 
         private String name(java.util.List<String> path,NestMap kind,String alias,String legacy) {
             if (original == null) return legacy;

@@ -62,6 +62,7 @@ public final class BenchCacheStore implements AutoCloseable {
     private final WorkloadClaim claim;
     private final Map<String, AtomicLong> commands = new ConcurrentHashMap<>();
     private final Map<String, KeyedStateStore> byNamespace = new ConcurrentHashMap<>();
+    private final Map<String, AtomicLong> calls = new ConcurrentHashMap<>();
 
     private BenchCacheStore(String setupUrl, String workUrl) {
         String name = "bench_" + UUID.randomUUID().toString().replace("-", "");
@@ -138,6 +139,22 @@ public final class BenchCacheStore implements AutoCloseable {
         return out;
     }
 
+    /** Store calls by operation and namespace suffix, each one a transaction (or more, past 256 keys). */
+    public Map<String, Long> calls() {
+        Map<String, Long> out = new TreeMap<>();
+        calls.forEach((name, count) -> out.put(name, count.get()));
+        return out;
+    }
+
+    private void call(String operation, String namespace) {
+        String level = namespace.substring(namespace.lastIndexOf('.') + 1);
+        if (namespace.endsWith(".refs") || namespace.endsWith(".parking")) {
+            String trimmed = namespace.substring(0, namespace.lastIndexOf('.'));
+            level = trimmed.substring(trimmed.lastIndexOf('.') + 1) + "." + level;
+        }
+        calls.computeIfAbsent(operation + ":" + level, ignored -> new AtomicLong()).incrementAndGet();
+    }
+
     /** Stored nest state rows, read directly. */
     public long storedRows() {
         return SystemCollections.CACHE_NEST_STATE.on(database).countDocuments();
@@ -177,12 +194,12 @@ public final class BenchCacheStore implements AutoCloseable {
         private String name(String namespace) {
             return new OperatorPlacement(SCOPE, database.getName(), OperatorPlacement.Resource.NEST_STATE, STEP, PATH, namespace).mapName();
         }
-        @Override public Optional<byte[]> load(String namespace, String key) { return placed(namespace).load(name(namespace), key); }
-        @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { return placed(namespace).loadAll(name(namespace), keys); }
-        @Override public void save(String namespace, String key, byte[] state) { placed(namespace).save(name(namespace), key, state); }
-        @Override public void saveAll(String namespace, Map<String, byte[]> states) { placed(namespace).saveAll(name(namespace), states); }
-        @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) { return placed(namespace).saveIfAbsent(name(namespace), key, state); }
-        @Override public void delete(String namespace, String key) { placed(namespace).delete(name(namespace), key); }
+        @Override public Optional<byte[]> load(String namespace, String key) { call("load", namespace); return placed(namespace).load(name(namespace), key); }
+        @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { call("loadAll", namespace); return placed(namespace).loadAll(name(namespace), keys); }
+        @Override public void save(String namespace, String key, byte[] state) { call("save", namespace); placed(namespace).save(name(namespace), key, state); }
+        @Override public void saveAll(String namespace, Map<String, byte[]> states) { call("saveAll", namespace); placed(namespace).saveAll(name(namespace), states); }
+        @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) { call("saveIfAbsent", namespace); return placed(namespace).saveIfAbsent(name(namespace), key, state); }
+        @Override public void delete(String namespace, String key) { call("delete", namespace); placed(namespace).delete(name(namespace), key); }
         @Override public void dropNamespace(String namespace) { placed(namespace).dropNamespace(name(namespace)); }
         @Override public long count(String namespace) { return placed(namespace).count(name(namespace)); }
         @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
