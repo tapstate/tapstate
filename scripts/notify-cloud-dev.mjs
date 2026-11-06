@@ -32,10 +32,8 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
   if (!/^[0-9a-f]{40}$/.test(commitId) || !/^[0-9a-f]{40}$/.test(webCommitId)) {
     throw new Error('Dev source revisions must be full commit SHAs');
   }
-  if (required(env, 'DEV_BRANCH') !== 'main') {
-    throw new Error('Only main builds can register Cloud dev versions');
-  }
-  const version = `${buildVersion}-dev`;
+  const branch = required(env, 'DEV_BRANCH');
+  const version = `${buildVersion}-dev${branch === 'main' ? '' : `-${commitId.slice(0, 12)}`}`;
   const image = required(env, 'CLOUD_IMAGE');
   const imageTag = required(env, 'CLOUD_IMAGE_TAG');
   const imageDigest = required(env, 'CLOUD_IMAGE_DIGEST');
@@ -50,7 +48,7 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
   }
   const extra = { buildVersion, image, imageTag, imageDigest, webCommitId, workflowUrl };
   const body = { version, releaseCode, releaseNotes: workflowUrl,
-    git: { branch: 'main', commitId, extra } };
+    git: { branch, commitId, extra } };
   let response;
   try {
     response = await fetchImpl(endpoint, {
@@ -80,7 +78,7 @@ export async function notifyCloudDev(env = process.env, fetchImpl = fetch) {
   catch { throw new Error('Cloud dev version registration received an invalid JSON response'); }
   const saved = receipt?.data;
   if (receipt?.code !== 'ok' || saved?.version !== version || saved?.releaseCode !== releaseCode
-      || saved?.state !== 'ACTIVE' || saved?.git?.commitId !== commitId || saved?.git?.branch !== 'main'
+      || saved?.state !== 'ACTIVE' || saved?.git?.commitId !== commitId || saved?.git?.branch !== branch
       || Object.entries(extra).some(([key, value]) => saved?.git?.extra?.[key] !== value)) {
     throw new Error('Cloud dev version registration receipt does not match the published image');
   }
