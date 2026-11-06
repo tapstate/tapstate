@@ -60,6 +60,22 @@ public interface DerivedSchemaStore {
     void record(String pipelineId, String stepId, Map<String, String> schema, String statement,
             String derivedFrom, String derivedBy);
 
+    /** One model to record, captured independently of later caller mutations. */
+    record Recording(String stepId, Map<String, String> schema, String statement,
+            String derivedFrom, String derivedBy) {
+        public Recording {
+            schema = new DerivedSchema(0, schema, statement, derivedFrom, derivedBy).schema();
+        }
+    }
+
+    /** Records a bounded group in order; backends may share one transaction for the group. */
+    default void recordBatch(String pipelineId, java.util.List<Recording> recordings) {
+        for (Recording recording : java.util.List.copyOf(recordings)) {
+            record(pipelineId, recording.stepId(), recording.schema(), recording.statement(),
+                    recording.derivedFrom(), recording.derivedBy());
+        }
+    }
+
     /**
      * Notes which version of a step's history a run is holding on to. Written by the assembly a run is
      * built from, once per step, and overwritten by the next assembly of the same pipeline.
