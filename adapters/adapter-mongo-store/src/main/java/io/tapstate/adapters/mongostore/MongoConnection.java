@@ -420,6 +420,7 @@ public final class MongoConnection implements AutoCloseable {
     MongoClientSettings buildClientSettings(ConnectionString connectionString) {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
                 .addCommandListener(MongoCommandObservation.LISTENER)
+                .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(MongoHttpDiagnosticsScope.POOL_LISTENER))
                 .applyConnectionString(connectionString)
                 .applyToClusterSettings(b ->
                         b.serverSelectionTimeout(settings.serverSelectionTimeout().toMillis(), TimeUnit.MILLISECONDS));

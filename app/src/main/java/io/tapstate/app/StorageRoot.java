@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+
 import io.tapstate.adapters.mongostore.*;
 import io.tapstate.control.core.*;
 import io.tapstate.core.common.TapstateException;
@@ -167,8 +169,10 @@ final class StorageRoot implements AutoCloseable {
     }
 
     Optional<CredentialAuthentication> authenticateCredentials(String presented) {
-        if(!replacements.enter())throw StorageRuntime.unavailable();
-        try{return authenticateCredentialsOwned(presented);}finally{replacements.leave();}
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ENTRY)) {
+            if(!replacements.enter())throw StorageRuntime.unavailable();
+            try{return authenticateCredentialsOwned(presented);}finally{replacements.leave();}
+        }
     }
     private Optional<CredentialAuthentication> authenticateCredentialsOwned(String presented) {
         requireOpen();
@@ -552,30 +556,32 @@ final class StorageRoot implements AutoCloseable {
 
     /** Valid sessions never join business startup; a missing owner waits only within this request's allowance. */
     private <T> T authenticationContext(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select) {
-        requireOpen();
-        long deadline = System.nanoTime() + StorageAuthentication.AUTHORIZATION_READ_BUDGET.toNanos();
-        var budget = new MongoReadBudget(StorageAuthentication.AUTHORIZATION_READ_BUDGET);
-        T result;
-        try { result = selectAuthentication(select, budget); }
-        catch (TapstateException unavailable) {
-            if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE && !quota(unavailable)) throw unavailable;
-            var pending = continueAuthentication();
-            try { pending.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS); }
-            catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt(); throw StorageRuntime.unavailable();
-            } catch (java.util.concurrent.TimeoutException timeout) { throw initializationDiagnostic(StorageRuntime.unavailable()); }
-            catch (java.util.concurrent.ExecutionException failed) {
-                if (failed.getCause() instanceof TapstateException coded) throw initializationDiagnostic(coded);
-                if (failed.getCause() instanceof RuntimeException failure) throw failure;
-                if (failed.getCause() instanceof Error failure) throw failure;
-                throw new IllegalStateException("authentication continuation failed", failed.getCause());
-            }
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.CONTEXT_SELECT)) {
+            requireOpen();
+            long deadline = System.nanoTime() + StorageAuthentication.AUTHORIZATION_READ_BUDGET.toNanos();
+            var budget = new MongoReadBudget(StorageAuthentication.AUTHORIZATION_READ_BUDGET);
+            T result;
             try { result = selectAuthentication(select, budget); }
-            catch (TapstateException failure) { throw initializationDiagnostic(failure); }
+            catch (TapstateException unavailable) {
+                if (unavailable.code() != ControlError.STORAGE_UNAVAILABLE && !quota(unavailable)) throw unavailable;
+                var pending = continueAuthentication();
+                try (var waiting = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.CONTINUATION_WAIT)) { pending.get(Math.max(0, deadline - System.nanoTime()), java.util.concurrent.TimeUnit.NANOSECONDS); }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt(); throw StorageRuntime.unavailable();
+                } catch (java.util.concurrent.TimeoutException timeout) { throw initializationDiagnostic(StorageRuntime.unavailable()); }
+                catch (java.util.concurrent.ExecutionException failed) {
+                    if (failed.getCause() instanceof TapstateException coded) throw initializationDiagnostic(coded);
+                    if (failed.getCause() instanceof RuntimeException failure) throw failure;
+                    if (failed.getCause() instanceof Error failure) throw failure;
+                    throw new IllegalStateException("authentication continuation failed", failed.getCause());
+                }
+                try { result = selectAuthentication(select, budget); }
+                catch (TapstateException failure) { throw initializationDiagnostic(failure); }
+            }
+            if (System.nanoTime() >= deadline) throw StorageRuntime.unavailable();
+            continueAuthentication();
+            return result;
         }
-        if (System.nanoTime() >= deadline) throw StorageRuntime.unavailable();
-        continueAuthentication();
-        return result;
     }
 
     private <T> T selectAuthentication(java.util.function.BiFunction<StorageAuthentication, MongoReadBudget, T> select,
