@@ -191,9 +191,9 @@ def check(workflows, contexts, inputs):
         'Cloud dev version calculation must use the tagged main history'
     assert '--dev-source-sha "$SOURCE_SHA"' in cloud_dev, \
         'feature builds must publish under a source-specific dev tag'
-    assert cloud_dev.count("if: inputs.version != '' || github.ref == 'refs/heads/main'") == 2 \
-        and 'DEV_BRANCH: main' in cloud_dev, \
-        'only main builds and pinned release candidates may register in the dev catalog'
+    assert cloud_dev.count("if: inputs.version != '' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'") == 2 \
+        and "DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}" in cloud_dev, \
+        'only main, develop and pinned release candidates may register in the dev catalog'
     assert 'if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then' in cloud_dev, \
         'pinned releases retain the canonical dev tag even when dispatched from an allowed branch'
     sonar = ci.get('sonarqube', '')
@@ -334,11 +334,11 @@ for original, replacement in [
     ('RELEASE_VERSION: ${{ inputs.version }}', 'RELEASE_VERSION: ""'),
     ('environment: cloud-ghcr-dev', 'environment: cloud-ghcr-release'),
     ('secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV', 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD'),
-    ("inputs.version != '' || github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/main'"),
+    ("inputs.version != '' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'", "github.ref == 'refs/heads/main'"),
     ('-z "$RELEASE_VERSION" && "$GITHUB_REF"', '"$GITHUB_REF"'),
     ('.github/scripts/next-version.sh "$BUMP" origin/main', '.github/scripts/next-version.sh "$BUMP" HEAD'),
     ('--dev-source-sha "$SOURCE_SHA"', ''),
-    ('DEV_BRANCH: main', 'DEV_BRANCH: ${{ github.ref_name }}'),
+    ("DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}", 'DEV_BRANCH: main'),
 ]:
     assert original in workflows['cloud-cluster-dev.yml'], f'Cloud dev mutation target absent: {original}'
     mutated_workflows = {**workflows,

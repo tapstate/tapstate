@@ -46,6 +46,31 @@ test('registers only the checked dev image, with both pinned revisions and a ver
   assert.ok(!result.includes('private-dev-token'));
 });
 
+test('registers the develop source tag as a separate catalog version', async () => {
+  const env = environment({
+    DEV_BRANCH: 'develop',
+    CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'b'.repeat(12)}`,
+  });
+  let submitted;
+  const result = await notifyCloudDev(env, async (_url, options) => {
+    submitted = JSON.parse(options.body);
+    return { status: 201, json: async () => receipt(options) };
+  });
+  assert.equal(submitted.version, `0.7.0-dev-${'b'.repeat(12)}`);
+  assert.equal(submitted.git.branch, 'develop');
+  assert.equal(submitted.git.extra.imageTag, env.CLOUD_IMAGE_TAG);
+  assert.match(result, /Registered Cloud dev version 0\.7\.0-dev-b{12}/);
+});
+
+test('rejects a develop tag whose hash does not match its source', async () => {
+  let calls = 0;
+  await assert.rejects(notifyCloudDev(environment({
+    DEV_BRANCH: 'develop',
+    CLOUD_IMAGE_TAG: `ghcr.io/tapstate/tapstate-cloud:0.7.0-dev-${'d'.repeat(12)}`,
+  }), async () => { calls++; }));
+  assert.equal(calls, 0);
+});
+
 for (const [name, value] of [
   ['DEV_VERSION', '0.7.0-dev'], ['DEV_VERSION', 'v0.7.0'], ['DEV_SHA', 'bbbbbbb'],
   ['DEV_WEB_SHA', 'ccccccc'], ['DEV_BRANCH', 'release/0.7.0'],
