@@ -25,6 +25,21 @@ public interface DesiredStore {
     /** Returns the current desired intent for a pipeline, or empty if none is set. */
     Optional<DesiredState> read(String pipelineId);
 
+    record StartIntent(Optional<DesiredState> desired, Optional<PipelineIntentScope> scope, long revision) {}
+    record StartPreparation(PipelineIntentScope scope, PipelinePreparationInputs inputs) {}
+
+    default StartIntent readForStart(String pipelineId) {
+        return new StartIntent(read(pipelineId), Optional.empty(), 0);
+    }
+
+    default void saveStart(DesiredState desired, StartIntent original) {
+        save(desired);
+    }
+
+    default void saveStart(DesiredState desired, StartIntent original, Optional<StartPreparation> preparation) {
+        saveStart(desired, original);
+    }
+
     /**
      * Lists the id of every pipeline that has a stored desired intent — the set the converge side
      * reconciles. It returns ids only, not reconstructed intents, so enumerating the set never fails on

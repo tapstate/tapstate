@@ -3,11 +3,16 @@ package io.tapstate.app;
 import io.tapstate.control.core.PipelineChains;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.spi.store.ArtifactStore;
+import io.tapstate.spi.store.SourceModel;
+import io.tapstate.spi.store.SrsStores;
 import io.tapstate.spi.store.StorePort;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Resolves a pipeline into the mining chains it reads, through the one derivation the capture side and
@@ -45,7 +50,12 @@ final class StoreBackedPipelineChains implements PipelineChains {
 
     @Override
     public List<String> progressChainsOf(String pipelineId) {
-        return resolutions(pipelineId,true).stream()
+        return progressChainsOf(pipelineId, storePort.artifacts(), source -> SourceDiscovery.model(storePort, source), null);
+    }
+
+    List<String> progressChainsOf(String pipelineId, ArtifactStore artifacts, Function<SourceResource, SourceModel> models,
+            Supplier<SrsStores> stores) {
+        return resolutions(pipelineId, true, artifacts, models, stores).stream()
                 .flatMap(resolution -> storePort instanceof ThreeLayerStorePort
                         ?java.util.stream.Stream.of(resolution.chainId().value()):resolution.progressChainIds(pipelineId).stream())
                 .distinct()
@@ -54,13 +64,26 @@ final class StoreBackedPipelineChains implements PipelineChains {
 
     /** Each source the pipeline reads, resolved the way its capture resolves it, in declaration order. */
     private List<SourceCaptureResolution> resolutions(String pipelineId,boolean requireAttachment) {
+        return resolutions(pipelineId, requireAttachment, storePort.artifacts(),
+                source -> SourceDiscovery.model(storePort, source), null);
+    }
+
+    private List<SourceCaptureResolution> resolutions(String pipelineId, boolean requireAttachment,
+            ArtifactStore artifacts, Function<SourceResource, SourceModel> models, Supplier<SrsStores> stores) {
         Objects.requireNonNull(pipelineId, "pipelineId");
-        PipelineResource pipeline = StoredArtifacts.requirePipeline(storePort.artifacts(), pipelineId);
+        PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts, pipelineId);
         List<SourceCaptureResolution> resolutions = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
-            SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
-            SourceCaptureResolution.forStoredPipeline(storePort,pipeline, source, SourceDiscovery.model(storePort, source),requireAttachment)
-                    .ifPresent(resolutions::add);
+            SourceResource source = StoredArtifacts.requireSource(artifacts, sourceId);
+            var model = models.apply(source);
+            if (stores != null && storePort instanceof ThreeLayerStorePort nativeStore) {
+                SourceCaptureResolution.forPipeline(pipeline, source, model)
+                        .flatMap(resolution -> nativeStore.sharedReading(pipeline, source, resolution, requireAttachment, stores))
+                        .ifPresent(resolutions::add);
+            } else {
+                SourceCaptureResolution.forStoredPipeline(storePort,pipeline, source, model,requireAttachment)
+                        .ifPresent(resolutions::add);
+            }
         }
         return List.copyOf(resolutions);
     }

@@ -377,17 +377,27 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
     @Override public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
+        return srs(expected, requireActive, false);
+    }
+
+    /** One validated view for the synchronous reads of a start plan. */
+    public io.tapstate.spi.store.SrsStores startPlanningSrs(CacheBusinessScope expected, Runnable requireActive) {
+        return srs(expected, requireActive, true);
+    }
+
+    private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean planning) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
         structure.verifySrs(); active.run();
-        var models = new MongoSrsModelStore(client, database, expected, active, structure::verifySrs);
+        Runnable verifyStructure = planning ? () -> {} : structure::verifySrs;
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure);
         return new io.tapstate.spi.store.SrsStores(
-                new MongoSrsChainStore(client, database, expected, active, structure::verifySrs), models,
+                new MongoSrsChainStore(client, database, expected, active, verifyStructure), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models),
-                new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,

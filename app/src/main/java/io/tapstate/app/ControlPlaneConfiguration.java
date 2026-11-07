@@ -838,9 +838,15 @@ class ControlPlaneConfiguration {
             PipelineWriteTargets pipelineWriteTargets, StorePort storePort, DataBrowserService dataBrowserService,
             ApplyService applyService, AuditGate auditGate, Clock clock, ConnectorProvisioner connectorProvisioner) {
         MessageCatalog catalog = MessageCatalog.bundled();
+        var meta = storePort.meta();
+        var planner = storePort instanceof ThreeLayerStorePort nativeStore
+                && pipelineChains instanceof StoreBackedPipelineChains chains
+                && pipelineWriteTargets instanceof StoreBackedPipelineWriteTargets targets
+                ? new StartPlanner(pipeline -> targets.capture(nativeStore, chains, pipeline))
+                : new StartPlanner(pipelineChains, meta, pipelineWriteTargets);
         StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(
                 new StoreBackedTargetIdentities(storePort, connectorProvisioner)),
-                new StartPlanner(pipelineChains, storePort.meta(), pipelineWriteTargets),
+                planner,
                 new DataBrowserTargetProbe(dataBrowserService),
                 (code, params) -> catalog.render(code, params).message(),
                 Executors.newVirtualThreadPerTaskExecutor(), clock);

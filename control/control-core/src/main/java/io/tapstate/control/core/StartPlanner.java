@@ -6,11 +6,14 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
 import io.tapstate.spi.store.SrsMeta;
 import io.tapstate.spi.store.SrsMetaStore;
+import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.StartLoad;
 
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Predicts, before a start writes anything, how that start will load each target its pipeline writes.
@@ -29,14 +32,23 @@ import java.util.Optional;
  */
 public final class StartPlanner {
 
-    private final PipelineChains chains;
-    private final SrsMetaStore meta;
-    private final PipelineWriteTargets targets;
+    private final Function<PipelineResource, Reads> capture;
+
+    public record Reads(Supplier<List<String>> progressChains,
+            Function<String, Optional<SrsMeta>> progress,
+            Supplier<List<PipelineWriteTargets.WriteTarget>> targets, Runnable verify,
+            Supplier<Optional<DesiredStore.StartPreparation>> preparation) {}
 
     public StartPlanner(PipelineChains chains, SrsMetaStore meta, PipelineWriteTargets targets) {
-        this.chains = Objects.requireNonNull(chains, "chains");
-        this.meta = Objects.requireNonNull(meta, "meta");
-        this.targets = Objects.requireNonNull(targets, "targets");
+        this(definition -> new Reads(() -> chains.progressChainsOf(definition.id()), meta::read,
+                () -> targets.of(definition), chains.readingGuard(definition.id()), Optional::empty));
+        Objects.requireNonNull(chains, "chains");
+        Objects.requireNonNull(targets, "targets");
+        Objects.requireNonNull(meta, "meta");
+    }
+
+    public StartPlanner(Function<PipelineResource, Reads> capture) {
+        this.capture = Objects.requireNonNull(capture, "capture");
     }
 
     /**
@@ -51,22 +63,23 @@ public final class StartPlanner {
         Objects.requireNonNull(definition, "definition");
         Objects.requireNonNull(prior, "prior");
         Objects.requireNonNull(intent, "intent");
-        Runnable current=chains.readingGuard(definition.id());
-        StartLoad load = StartLoad.of(readMode(definition), definition.id(), recordsAtStart(definition, prior, intent));
-        var result=new StartPlan(load, targets.of(definition).stream()
+        Reads reads = capture.apply(definition);
+        StartLoad load = StartLoad.of(readMode(definition), definition.id(), recordsAtStart(reads, prior, intent));
+        var result=new StartPlan(load, reads.targets().get().stream()
                 .map(target -> new StartPlan.Entry(target, load))
-                .toList());
-        current.run();return result;
+                .toList(), clearsFirst(prior, intent) ? Optional::empty : reads.preparation());
+        reads.verify().run();
+        return result;
     }
 
     /** What this pipeline will have recorded on its chains when the predicted start reaches them. */
     private List<SrsMeta> recordsAtStart(
-            PipelineResource definition, Optional<DesiredState> prior, StartIntent intent) {
+            Reads reads, Optional<DesiredState> prior, StartIntent intent) {
         if (clearsFirst(prior, intent)) {
             return List.of();
         }
-        return chains.progressChainsOf(definition.id()).stream()
-                .map(meta::read)
+        return reads.progressChains().get().stream()
+                .map(reads.progress())
                 .flatMap(Optional::stream)
                 .toList();
     }

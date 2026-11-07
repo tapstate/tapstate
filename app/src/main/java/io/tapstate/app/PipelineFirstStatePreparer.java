@@ -53,7 +53,6 @@ final class PipelineFirstStatePreparer {
     /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
     PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(inputs,"inputs"); requireActive.run();
-        configuration.validateSources(original,inputs); requireActive.run();
         var result = prepareAttempt(original,inputs,null,() -> {}); requireActive.run();
         cache.verifySources(original,inputs); requireActive.run(); return result;
     }
@@ -76,6 +75,10 @@ final class PipelineFirstStatePreparer {
         PipelinePreparation facts = configuration.read(original.pipelineId()).orElseThrow(PipelineFirstStatePreparer::fenced);
         requireOriginal(original, facts);
         requireActive.run();
+        if (inputs != null && confirmation == null && facts.phase() != PipelinePreparation.Phase.UNASSIGNED) {
+            configuration.validateSources(original, inputs);
+            requireActive.run();
+        }
         if (facts.phase() == PipelinePreparation.Phase.COMPLETE) return facts;
         WorkloadClaimFence node = currentNode.get().orElseThrow(PipelineFirstStatePreparer::claimFenced);
         requireNode(node);
@@ -92,6 +95,12 @@ final class PipelineFirstStatePreparer {
             } else {
                 facts = ((FirstPipelineCreationResult.AlreadyIssued) issued).preparation();
                 requireOriginal(original, facts);
+                // A winning issuance validates inputs in its CONFIG write transaction. A losing
+                // attempt receives retained facts and still needs its own input proof.
+                if (inputs != null && confirmation == null) {
+                    configuration.validateSources(original, inputs);
+                    requireActive.run();
+                }
                 if (facts.phase() == PipelinePreparation.Phase.COMPLETE) return facts;
                 return continueExisting(original, facts, node);
             }

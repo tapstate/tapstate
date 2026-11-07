@@ -3808,6 +3808,13 @@ final class StoreBackedDagSource implements DagSource {
         return definition -> captured.outputNameDetails(definition, resources);
     }
 
+    List<PipelineWriteTargets.WriteTarget> startWriteTargets(PipelineResource definition, ArtifactStore captured,
+            Function<SourceResource, SourceModel> models) {
+        var read = new StoreBackedDagSource(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                sourcePlacement, captured, requireMarkedStore, members, parallelismBudget, modelRecords, models);
+        return read.writeTargets(definition);
+    }
+
     PipelineOutputNames.Description outputNameDetails(PipelineResource definition, Map<String, Resource> resources) {
         PipelineResource pipeline;
         try {

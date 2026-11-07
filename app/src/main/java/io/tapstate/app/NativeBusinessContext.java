@@ -65,7 +65,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline);
+        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
@@ -166,6 +166,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         expanded.sourceIds().forEach(id -> sources.put(id, StoredArtifacts.requireSource(snapshot, id)));
         var models = SourceModelSnapshot.capture(scope.pipelineId(), sources.values(), port.schemas());
         var inputs = models.preparationInputs(scope, authored, expanded, sources);
+        preparePipeline(scope, inputs);
+    }
+
+    private void preparePipeline(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        original.requireBusiness();
         context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
