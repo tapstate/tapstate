@@ -13,6 +13,9 @@ final class ValidationKeyMetadata {
         Map<String,ValidationKey.Kind> domains(){var result=new HashMap<String,ValidationKey.Kind>();fields.forEach((field,rule)->result.put(field,rule.domain()));return Map.copyOf(result);}
     }
     static Rules describe(SourceTable model,boolean nativeBson){
+        return describe(model, nativeBson, false);
+    }
+    static Rules describe(SourceTable model, boolean nativeBson, boolean simpleMongoStringId) {
         Objects.requireNonNull(model);if(model.fields().size()>4096)throw invalid("keyFields");
         var rules=new LinkedHashMap<String,ValidationKeyBinding.Component>();var unavailable=new LinkedHashMap<String,String>();var names=new HashSet<String>();
         for(var field:model.fields()){
@@ -29,8 +32,9 @@ final class ValidationKeyMetadata {
                 case STRING -> {
                     domain=ValidationKey.Kind.TEXT;
                     boolean identifier=nativeBson&&field.dataType()!=null&&field.dataType().replace("_","").equalsIgnoreCase("OBJECTID");
-                    if(!identifier){unavailable.put(name,"native-text-ordering-unproven");continue;}
-                    logical=Set.of("object-id");
+                    if (identifier) logical = Set.of("object-id");
+                    else if (nativeBson && simpleMongoStringId && name.equals("_id")) logical = Set.of("text");
+                    else { unavailable.put(name, "native-text-ordering-unproven"); continue; }
                 }
                 case BOOLEAN -> {domain=ValidationKey.Kind.BOOLEAN;logical=Set.of("boolean");}
                 case BINARY -> {unavailable.put(name,"binary-key-subtype-unavailable");continue;}
