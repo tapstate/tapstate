@@ -46,7 +46,11 @@ import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
-import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import io.tapstate.runtime.engine.nest.DirectNestStore;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * That a document reads the row it points at when that row lives on another member, and reads it again
@@ -139,6 +143,9 @@ class ARowIsReadAcrossMembersByTheDocumentsThatPointAtItTest {
 
     @AfterEach
     void stopBoth() {
+        System.clearProperty("tapstate.nest.store");
+        System.clearProperty("tapstate.nest.direct.track-writers");
+        DirectNestStore.forgetUnbacked();
         if (job != null) {
             job.cancel();
             job = null;
@@ -151,9 +158,18 @@ class ARowIsReadAcrossMembersByTheDocumentsThatPointAtItTest {
         }
     }
 
-    @Test
+    /**
+     * Runs on the map-backed store and on the direct store. The second is where the ownership rule has to
+     * hold by construction: each key written by one member only, no member holding a row it does not own,
+     * and the documents away from the row reading it through the store.
+     */
+    @ParameterizedTest(name = "nest state on the {0} store")
+    @ValueSource(strings = {"map", "direct"})
     @DisplayName("documents held on one member read and re-read a row that lives on the other")
-    void everyDocumentFollowsAnEditToARowHeldOnAnotherMember() {
+    void everyDocumentFollowsAnEditToARowHeldOnAnotherMember(String mode) {
+        System.setProperty("tapstate.nest.store", mode);
+        System.setProperty("tapstate.nest.direct.track-writers", "true");
+        DirectNestStore.counters().reset();
         assertThat(first.getCluster().getMembers())
                 .describedAs("both members have to be in one cluster, or this is two separate "
                         + "single-member runs and the whole question does not arise")
@@ -165,6 +181,10 @@ class ARowIsReadAcrossMembersByTheDocumentsThatPointAtItTest {
 
         String lookup = "nest.p.doc.customer";
         String roots = "nest.p.doc.$root";
+        if ("direct".equals(mode)) {
+            assertOwnership(lookup, roots);
+            return;
+        }
         boolean rowOnFirst = !first.<Object, Object>getMap(lookup).localKeySet().isEmpty();
         HazelcastInstance elsewhere = rowOnFirst ? second : first;
 
@@ -188,6 +208,39 @@ class ARowIsReadAcrossMembersByTheDocumentsThatPointAtItTest {
                         + "at all; one that reads across the cluster but never again leaves them at %s",
                         BEFORE)
                 .containsOnly(AFTER);
+    }
+
+    /**
+     * The same three claims as the map case, read off the direct store's own records rather than off a
+     * map's placement, plus the two the ownership rule adds: a key has one writer, and nobody holds a row
+     * it does not own.
+     */
+    private void assertOwnership(String lookup, String roots) {
+        Set<String> rowByFirst = DirectNestStore.keysWrittenOn(first, lookup);
+        Set<String> rowBySecond = DirectNestStore.keysWrittenOn(second, lookup);
+        assertThat(rowByFirst.isEmpty() ^ rowBySecond.isEmpty())
+                .describedAs("the pointed-at row is written by exactly one member: first %s, second %s",
+                        rowByFirst, rowBySecond)
+                .isTrue();
+        HazelcastInstance owner = rowByFirst.isEmpty() ? second : first;
+        HazelcastInstance elsewhere = owner == first ? second : first;
+        Set<String> rowKeys = owner == first ? rowByFirst : rowBySecond;
+        assertThat(DirectNestStore.keysWrittenOn(elsewhere, roots))
+                .describedAs("some documents are owned away from the row they point at")
+                .isNotEmpty();
+        for (String namespace : List.of(lookup, roots, "nest.p.doc.customer.refs")) {
+            Set<String> both = new HashSet<>(DirectNestStore.keysWrittenOn(first, namespace));
+            both.retainAll(DirectNestStore.keysWrittenOn(second, namespace));
+            assertThat(both).describedAs("keys of %s written by both members", namespace).isEmpty();
+        }
+        Set<String> heldAway = new HashSet<>(DirectNestStore.keysResidentOn(elsewhere, lookup));
+        heldAway.retainAll(rowKeys);
+        assertThat(heldAway).describedAs("the member that does not own the row never holds it").isEmpty();
+        assertThat(DirectNestStore.counters().readThroughCalls())
+                .describedAs("referenced fields were read through the store")
+                .isPositive();
+        assertThat(namesByOrder()).hasSize(ORDERS);
+        assertThat(namesByOrder().values()).containsOnly(AFTER);
     }
 
     /** The customer name on the last document seen for each order. */

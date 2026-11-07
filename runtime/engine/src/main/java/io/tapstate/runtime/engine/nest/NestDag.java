@@ -438,7 +438,7 @@ public final class NestDag {
 
         @Override
         public void init(Context context) {
-            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
+            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new).inGeneration(context.executionId());
         }
 
         @Override
@@ -564,7 +564,7 @@ public final class NestDag {
             floor = replayFloor.resolve(context.hazelcastInstance());
             // Metered from here and nowhere else: this is the one place a job is what the stores are
             // being bound for, and a reading can only be left from a thread running its processors.
-            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
+            bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new).inGeneration(context.executionId());
             // Bound for the same reason and at the same moment: somewhere to keep what cannot be assembled
             // is reached through a handle that does not travel with the graph.
             boundDeadLetter = deadLetter.bind(context.hazelcastInstance());
@@ -593,7 +593,9 @@ public final class NestDag {
         private Map<String, NestStore<Map<String, Object>>> referenced() {
             Map<String, NestStore<Map<String, Object>>> byNamespace = new LinkedHashMap<>();
             for (NestLookup lookup : lookups) {
-                byNamespace.put(lookup.mapName(), bound.forLookup(lookup));
+                // Read, never written, from here: the lookup vertex owning each row is its only writer, and
+                // on a member that does not own it the only current copy is the store's.
+                byNamespace.put(lookup.mapName(), bound.forReferencedRows(lookup));
             }
             return byNamespace;
         }

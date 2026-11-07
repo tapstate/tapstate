@@ -175,6 +175,24 @@ public record NestBinding(
             return this;
         }
 
+        /**
+         * Says which execution generation the stores asked for from here on serve. A store that keeps keys
+         * resident across calls drops them when the generation changes, since that is the one event that can
+         * move a key to another member. Stores with nothing resident ignore it.
+         */
+        default NestStores inGeneration(long generation) {
+            return this;
+        }
+
+        /**
+         * The rows a level points at, as the assembler reads them to render: another vertex's namespace,
+         * read and never written. Defaults to the lookup's own store, which for a cluster-wide map is the
+         * same thing; a store whose residency is per member answers with a read through to the store.
+         */
+        default NestStore<Map<String, Object>> forReferencedRows(NestLookup lookup) {
+            return forLookup(lookup);
+        }
+
         /** The store for one resolver's mappings and the children waiting in it. */
         NestStore<ResolverState> forResolver(NestVertex vertex);
 
@@ -263,6 +281,7 @@ public record NestBinding(
         private final OperatorRunManifest original;
         private final String stepId;
         private final OperatorStepMaps names;
+        private final long generation;
 
         private MapNestStores(HazelcastInstance member) {
             this(member, () -> NestStateGauge.NONE);
@@ -270,7 +289,11 @@ public record NestBinding(
 
         private MapNestStores(HazelcastInstance member, Supplier<NestStateGauge> gauges) { this(member,gauges,null,null); }
         private MapNestStores(HazelcastInstance member,Supplier<NestStateGauge> gauges,OperatorRunManifest original,String stepId) {
+            this(member, gauges, original, stepId, 0L);
+        }
+        private MapNestStores(HazelcastInstance member,Supplier<NestStateGauge> gauges,OperatorRunManifest original,String stepId,long generation) {
             this.member = member; this.gauges = gauges; this.original = original; this.stepId = stepId;
+            this.generation = generation;
             this.names = original == null || stepId == null ? null : original.forStep(original.pipelineId(),stepId);
         }
         @Override public boolean hasTypedPlacements() { return original != null; }
@@ -287,18 +310,33 @@ public record NestBinding(
 
         @Override public NestStores forStep(String pipelineId,String stepId) {
             if (original == null) return this;
-            original.requirePipeline(pipelineId); return new MapNestStores(member,gauges,original,Objects.requireNonNull(stepId,"stepId"));
+            original.requirePipeline(pipelineId); return new MapNestStores(member,gauges,original,Objects.requireNonNull(stepId,"stepId"),generation);
+        }
+
+        @Override public NestStores inGeneration(long generation) {
+            return new MapNestStores(member, gauges, original, stepId, generation);
+        }
+
+        @Override
+        public NestStore<Map<String, Object>> forReferencedRows(NestLookup lookup) {
+            String name = name(lookup.pathId(), NestMap.LOOKUP, lookup.alias(), lookup.mapName());
+            if (DirectNestStore.selected()) {
+                if (member == null) throw new IllegalStateException(
+                        "nest stores were asked for " + lookup.name() + " before being bound to a member");
+                return DirectNestStore.readThrough(member, name);
+            }
+            return metered(mapNamed(lookup.name(), name));
         }
 
         @Override
         public NestStores bind(HazelcastInstance member) {
-            return new MapNestStores(Objects.requireNonNull(member, "member"),() -> NestStateGauge.NONE,original,stepId);
+            return new MapNestStores(Objects.requireNonNull(member, "member"),() -> NestStateGauge.NONE,original,stepId,generation);
         }
 
         @Override
         public NestStores bind(HazelcastInstance member, Supplier<NestStateGauge> gauges) {
             return new MapNestStores(Objects.requireNonNull(member, "member"),
-                    Objects.requireNonNull(gauges, "gauges"),original,stepId);
+                    Objects.requireNonNull(gauges, "gauges"),original,stepId,generation);
         }
 
         @Override
@@ -316,7 +354,7 @@ public record NestBinding(
             if (DirectNestStore.selected()) {
                 if (member == null) throw new IllegalStateException(
                         "nest stores were asked for " + askedFor + " before being bound to a member");
-                return DirectNestStore.on(member, name);
+                return DirectNestStore.on(member, name, generation);
             }
             return metered(mapNamed(askedFor, name));
         }
