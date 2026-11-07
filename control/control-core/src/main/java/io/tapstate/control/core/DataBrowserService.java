@@ -142,7 +142,7 @@ public final class DataBrowserService {
      */
     private Map<String, ViewResource> declaringViews() {
         Map<String, ViewResource> byCollection = new LinkedHashMap<>();
-        for (Resource stored : ReadableArtifactInventory.list(store)) {
+        for (Resource stored : ReadableArtifactInventory.list(store, "view")) {
             if (stored instanceof ViewResource view
                     && view.storage() != null
                     && view.storage().warm() != null) {

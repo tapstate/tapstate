@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
@@ -26,6 +27,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -66,6 +68,32 @@ class DataBrowserServiceTest {
         assertThat(driven.get().id()).isEqualTo("views");
         assertThat(driven.get().connectorId()).isEqualTo("mongodb");
         assertThat(driven.get().settings()).containsEntry("database", "shop");
+    }
+
+    @Test
+    void collectionDescriptionsResolveOnlyViewCandidatesAfterBrowsingTheDirectory() {
+        var parser = new DslParser();
+        var pipeline = parser.parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: unrelated_pipeline
+                source: [views]
+                """);
+        var view = parser.parse("""
+                version: tapstate/v1
+                kind: view
+                id: order_view
+                metadata: {description: Orders by customer}
+                primary_key: id
+                storage: {warm: {collection: orders}}
+                """);
+        var lookups = new ArrayList<String>();
+        var browser = service(store(lookups::add, VIEWS, pipeline, view), config -> List.of("orders", "raw"));
+
+        assertThat(browser.collections("views")).containsExactly(
+                new DataBrowserCollection("orders", DataBrowserCollection.VIEW, null, "Orders by customer"),
+                new DataBrowserCollection("raw", null, null, null));
+        assertThat(lookups).containsExactly("views", "order_view");
     }
 
     @Test
@@ -586,6 +614,10 @@ class DataBrowserServiceTest {
     }
 
     private static ArtifactStore store(Resource... stored) {
+        return store(ignored -> {}, stored);
+    }
+
+    private static ArtifactStore store(Consumer<String> lookup, Resource... stored) {
         Map<String, Resource> byId = new LinkedHashMap<>();
         for (Resource resource : stored) {
             byId.put(resource.id(), resource);
@@ -598,6 +630,7 @@ class DataBrowserServiceTest {
 
             @Override
             public Optional<Resource> get(String id) {
+                lookup.accept(id);
                 return Optional.ofNullable(byId.get(id));
             }
 
