@@ -76,7 +76,9 @@ import org.testcontainers.utility.DockerImageName;
  *
  * <p>Knobs, as system properties: {@code bench.customers}, {@code bench.orders}, {@code bench.lines}
  * (default 1000 / 10000 / 23000), {@code bench.batch} (256), {@code bench.latencyMs} (one-way latency in
- * front of Mongo, 0), {@code bench.compare} (compare every document with the maintain path's, default on
+ * front of Mongo, 0), {@code bench.commit} ({@code production}, or {@code session} for the lever priced by
+ * {@code SessionCommitStore}), {@code bench.pipelineEmit} (emit each batch while the next one is built,
+ * off), {@code bench.warmup} (a tenth-size round first, on), {@code bench.compare} (compare every document with the maintain path's, default on
  * up to 20,000 orders), {@code bench.label}, {@code bench.out} (a file the result line is appended to).
  */
 class NestBuildPhaseBench {
@@ -202,6 +204,9 @@ class NestBuildPhaseBench {
         Map<Object, Set<Object>> references = new LinkedHashMap<>();
         long dangling = 0;
         long stagingReads = 0;
+        java.util.concurrent.ExecutorService emitter = Boolean.getBoolean("bench.pipelineEmit")
+                ? java.util.concurrent.Executors.newSingleThreadExecutor() : null;
+        java.util.concurrent.CompletableFuture<Void> inFlight = null;
         Mark rendering = mark(commands);
         for (int from = 0; from < orders; from += batch) {
             int to = Math.min(orders, from + batch);
@@ -259,13 +264,23 @@ class NestBuildPhaseBench {
             assemblies.saveAll(group, group.keySet());
             assemblies.commit();
             long t3 = System.nanoTime();
-            documents.bulkWrite(emitted, new BulkWriteOptions().ordered(false));
+            if (emitter == null) {
+                documents.bulkWrite(emitted, new BulkWriteOptions().ordered(false));
+            } else {
+                // Pipelined lever: this batch's documents go out while the next batch is read, built and
+                // committed. Still durable before passed: the write starts only after its own commit.
+                if (inFlight != null) inFlight.join();
+                inFlight = java.util.concurrent.CompletableFuture.runAsync(
+                        () -> documents.bulkWrite(emitted, new BulkWriteOptions().ordered(false)), emitter);
+            }
             long t4 = System.nanoTime();
             split.merge("render.read", t1 - t0, Long::sum);
             split.merge("render.assemble", t2 - t1, Long::sum);
             split.merge("render.commit", t3 - t2, Long::sum);
             split.merge("render.emit", t4 - t3, Long::sum);
         }
+        if (inFlight != null) inFlight.join();
+        if (emitter != null) emitter.shutdown();
         steps.put("render", rendering.end(commands, orders, orders));
 
         // 4. index: the reverse reference index, once, in bulk.
@@ -333,13 +348,13 @@ class NestBuildPhaseBench {
         double withHandoff = buildSeconds + steps.get("handoff").seconds;
         StringBuilder out = new StringBuilder();
         out.append(String.format(Locale.ROOT,
-                "{\"label\":\"%s\",\"commit\":\"%s\",\"latencyMs\":%d,\"customers\":%d,\"orders\":%d,\"lines\":%d,\"batch\":%d,"
+                "{\"label\":\"%s\",\"commit\":\"%s\",\"pipelineEmit\":%b,\"latencyMs\":%d,\"customers\":%d,\"orders\":%d,\"lines\":%d,\"batch\":%d,"
                         + "\"copySeconds\":%.3f,\"buildSeconds\":%.3f,\"ratio\":%.2f,\"buildWithHandoffSeconds\":%.3f,"
                         + "\"ratioWithHandoff\":%.2f,\"targetDocuments\":%d,\"mostTargetWritesPerRoot\":%d,"
                         + "\"incompleteDocuments\":%d,\"danglingReferences\":%d,\"differingFromMaintain\":%d,"
                         + "\"stagingReadsPerBatch\":%.1f,\"stagingBytes\":%d,\"stagingStorageBytes\":%d,"
                         + "\"stagingIndexBytes\":%d,\"referenceBuckets\":%d,\"steps\":{",
-                label, session == null ? "production" : "session", latency, customers, orders, lines, batch, copySeconds, buildSeconds, buildSeconds / copySeconds,
+                label, session == null ? "production" : "session", Boolean.getBoolean("bench.pipelineEmit"), latency, customers, orders, lines, batch, copySeconds, buildSeconds, buildSeconds / copySeconds,
                 withHandoff, withHandoff / copySeconds, targetDocuments, mostWrites, incomplete, dangling, differing,
                 (double) stagingReads / Math.ceil((double) orders / batch), number(footprint, "size"),
                 number(footprint, "storageSize"), number(footprint, "totalIndexSize"), references.size()));
