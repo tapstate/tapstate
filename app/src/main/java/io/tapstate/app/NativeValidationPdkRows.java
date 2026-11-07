@@ -162,8 +162,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             var query=original.resources().queryExecutor();var decode=original.resources().decodeExecutor();
             Runnable active=()->{require();guard.run();};
             raw=PdkValidationReads.scan(connection,artifact,CanonicalHash.of(resource),side.table(),binding(side),keys,full(),active,query,decode,2,ROW,
-                    postgres(artifact)?nativeFields:PdkValidationReads.POSTGRES_NATIVE_FIELDS,
-                    simpleOrdering(connection, artifact, side.table()));
+                    postgres(artifact)?nativeFields:PdkValidationReads.POSTGRES_NATIVE_FIELDS);
             var handle=raw;read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),PdkValidationReads.cleanupCompleted(handle));read.opened();require();guard.run();
             return new ValidationReadHandle(){
                 @Override public Optional<Row> next(){require();guard.run();return handle.next();}
@@ -216,16 +215,6 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static boolean postgres(ConnectorRef artifact){return PdkValidationReads.boundedPostgresPages(artifact);}
     static ConnectionConfig rowConnection(SourceResource resource,ConnectorRef artifact){
         return PdkValidationReads.boundedConnection(new ConnectionConfig(resource.id(),resource.connector(),resource.config()),artifact);
-    }
-
-    static java.util.function.BooleanSupplier simpleOrdering(ConnectionConfig connection, ConnectorRef artifact, String table) {
-        var settings = connection.settings();
-        if (!artifact.className().equals("io.tapdata.mongodb.MongodbConnector")
-                || Boolean.FALSE.equals(settings.get("isUri"))
-                || !(settings.get("uri") instanceof String uri) || uri.isEmpty()
-                || Boolean.TRUE.equals(settings.get("ssl")) || settings.containsKey("tlsCaPem")) return null;
-        // Only the URI form without connector-specific TLS material can be opened unchanged.
-        return () -> io.tapstate.adapters.mongostore.MongoConnection.hasSimpleCollectionOrdering(uri, table);
     }
 
     private Read admit(long bytes){

@@ -25,9 +25,8 @@ import java.util.*;
 final class PdkValidationModelVersion {
     private static final String PROFILE="pdk-validation-model-v1";
     private static final String DOCUMENT_PROFILE="pdk-validation-document-model-v1";
-    private static final String DOCUMENT_SCOPE_PROFILE="pdk-validation-document-scope-v1";
+    private static final String STABLE_SCOPE_PROFILE="pdk-validation-stable-scope-v1";
     private static final String CODEC_PROFILE="pdk-validation-codecs-v2";
-    private static final Set<String> DOCUMENT_STATISTICS=Set.of("size","storageSize","avgObjSize","indexSize");
     private static final long MAX_BYTES=1024L*1024;
     private static final int MAX_NODES=65536,MAX_DEPTH=32,MAX_ITEMS=8192;
     private static final Set<Class<?>> MODELS=Set.of(TapTable.class,TapField.class,TapIndex.class,TapIndexEx.class,
@@ -54,39 +53,46 @@ final class PdkValidationModelVersion {
         return PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(List.of(PROFILE,tree)));
     }
 
-    static String of(TapTable model,ConnectorRef artifact){
-        String profile=documentFields(artifact)?DOCUMENT_PROFILE:PROFILE;
-        return profile+":"+CanonicalHash.ofText(JsonWriter.write(List.of(profile,canonicalModel(model,artifact))));
+    record Profile(boolean stableScope, Set<String> observedAttributes) { }
+
+    static Profile profile(ConnectorRef artifact) {
+        return new Profile(PdkValidationCapabilities.supports(artifact, PdkValidationCapabilities.STABLE_MODEL),
+                PdkValidationCapabilities.observedAttributes(artifact));
     }
 
-    /**
-     * A document collection's sampled fields describe data, not column DDL. Persist its native
-     * namespace/collection contract; every actual read separately pins the complete current model.
-     * The connector still receives its own unchanged model and all registered codecs retain priority.
-     */
-    static String scopeVersion(TapTable model,ConnectorRef artifact){
-        if(!documentFields(artifact))return of(model,artifact);
-        // Validate and account the complete model even when some inferred properties are not scope.
-        canonicalModel(model,artifact);
-        var scope=Arrays.asList(DOCUMENT_SCOPE_PROFILE,new Walker(true,true).value(model,0));
-        return DOCUMENT_SCOPE_PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(scope));
+    static String of(TapTable model, ConnectorRef artifact) {
+        return of(model, profile(artifact));
+    }
+
+    static String of(TapTable model, Profile profile) {
+        return fingerprint(model, profile, profile.stableScope() ? DOCUMENT_PROFILE : PROFILE);
+    }
+
+    /** Pin named schema and codec inputs, independently of connector-private table statistics. */
+    static String scopeVersion(TapTable model, ConnectorRef artifact) {
+        var profile = profile(artifact);
+        return fingerprint(model, profile, profile.stableScope() ? STABLE_SCOPE_PROFILE : PROFILE);
+    }
+
+    private static String fingerprint(TapTable model, Profile profile, String version) {
+        return version + ":" + CanonicalHash.ofText(JsonWriter.write(List.of(version,
+                canonicalModel(model, profile.stableScope(), profile.observedAttributes()))));
     }
 
     /** Internal bounded representation, also used to verify complete schema-property differences. */
-    static Object canonicalModel(TapTable model,ConnectorRef artifact){return canonicalModel(model,documentFields(artifact));}
+    static Object canonicalModel(TapTable model, ConnectorRef artifact) {
+        var profile = profile(artifact);
+        return canonicalModel(model, profile.stableScope(), profile.observedAttributes());
+    }
 
-    private static Object canonicalModel(TapTable model){return canonicalModel(model,false);}
-    private static Object canonicalModel(TapTable model,boolean documentFields){
+    private static Object canonicalModel(TapTable model){return canonicalModel(model,false,Set.of());}
+    private static Object canonicalModel(TapTable model,boolean stableScope, Set<String> observedAttributes){
         Objects.requireNonNull(model,"independent model");
         if(model.getNameFieldMap()==null||model.getNameFieldMap().size()>4096)throw invalid("fields");
         for(var entry:model.getNameFieldMap().entrySet())
             if(entry.getKey()==null||entry.getValue()==null||!entry.getKey().equals(entry.getValue().getName()))throw invalid("fieldNames");
-        return new Walker(documentFields).value(model,0);
+        return new Walker(stableScope, observedAttributes).value(model,0);
     }
-    private static boolean documentFields(ConnectorRef artifact){
-        return Objects.requireNonNull(artifact).className().equals("io.tapdata.mongodb.MongodbConnector");
-    }
-
     /** Binding to actual retained artifact/configuration/profile; never an equivalence oracle. */
     static String codecBinding(ConnectorRef artifact,String configurationHash,String modelVersion){
         Objects.requireNonNull(artifact);Objects.requireNonNull(modelVersion);
@@ -102,10 +108,13 @@ final class PdkValidationModelVersion {
         private enum Slot { VALUE, NAMED_FIELDS, NAMED_FIELD, TABLE_ATTRIBUTES }
         private long bytes;
         private int nodes;
-        private final boolean documentFields,documentScope;
+        private final boolean stableScope;
+        private final Set<String> observedAttributes;
         private final IdentityHashMap<Object,Boolean> active=new IdentityHashMap<>();
-        Walker(boolean documentFields){this(documentFields,false);}
-        Walker(boolean documentFields,boolean documentScope){this.documentFields=documentFields;this.documentScope=documentScope;}
+        Walker(boolean stableScope, Set<String> observedAttributes) {
+            this.stableScope = stableScope;
+            this.observedAttributes = observedAttributes;
+        }
         Object value(Object value,int depth){return value(value,depth,Slot.VALUE);}
         private Object value(Object value,int depth,Slot slot){
             if(depth>MAX_DEPTH||++nodes>MAX_NODES)throw limit();
@@ -138,7 +147,7 @@ final class PdkValidationModelVersion {
                     if(map.size()>MAX_ITEMS)throw limit();var sorted=new TreeMap<String,Object>();
                     for(var entry:map.entrySet()){
                         if(!(entry.getKey() instanceof String key))throw invalid("mapKey");
-                        if(documentFields&&slot==Slot.TABLE_ATTRIBUTES&&DOCUMENT_STATISTICS.contains(key)){
+                        if(slot==Slot.TABLE_ATTRIBUTES&&observedAttributes.contains(key)){
                             // These collection counters are not schema, query fields or codec input.
                             // Validate and charge even excluded metadata; opaque values cannot hide here.
                             if(entry.getValue()!=null&&!(entry.getValue() instanceof Number))throw invalid("documentStatistic");
@@ -161,10 +170,10 @@ final class PdkValidationModelVersion {
                     // Document inference replaces fields in random sample order. Its layout ordinal
                     // is not a physical column or a named query/codec input. Keep primary-key order,
                     // all types and attributes, and the original live model supplied to the plugin.
-                    if(documentScope&&depth==0&&value.getClass()==TapTable.class
-                            &&Set.of("getNameFieldMap","getMaxPos","getMaxPKPos").contains(reader.getName()))continue;
-                    if(documentFields&&slot==Slot.NAMED_FIELD&&value.getClass()==TapField.class&&reader.getName().equals("getPos"))continue;
-                    if(documentFields&&depth==0&&value.getClass()==TapTable.class&&reader.getName().equals("getMaxPos"))continue;
+                    if (stableScope && depth == 0 && value.getClass() == TapTable.class
+                            && Set.of("getMaxPos", "getMaxPKPos").contains(reader.getName())) continue;
+                    if (stableScope && slot == Slot.NAMED_FIELD && value.getClass() == TapField.class
+                            && reader.getName().equals("getPos")) continue;
                     charge(64L+2L*reader.getName().length());
                     Slot child=Slot.VALUE;
                     if(depth==0&&value.getClass()==TapTable.class){

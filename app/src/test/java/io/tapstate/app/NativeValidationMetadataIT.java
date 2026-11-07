@@ -54,8 +54,8 @@ class NativeValidationMetadataIT {
                 var original=f.tasks.read("flow","task").orElseThrow();long revision=f.configuration.configurationRevision();
                 try(var result=probe.inspect(new ValidationTaskStore.Selection("flow",List.of("out")),choices(),ValidationMethod.COUNT,Map.of(),clock.instant().plusSeconds(30))){
                     assertThat(result.mappings()).hasSize(2).allSatisfy(mapping->{
-                        assertThat(mapping.source().countOperation()).isEqualTo(PdkValidationCounts.Operation.DOCUMENT_COUNT);
-                        assertThat(mapping.target().countOperation()).isEqualTo(PdkValidationCounts.Operation.DOCUMENT_COUNT);
+                        assertThat(mapping.source().countOperation()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+                        assertThat(mapping.target().countOperation()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
                         assertThat(mapping.source().model()).isNull();assertThat(mapping.target().model()).isNull();
                     });
                     assertThat(result.declarations().original().configurationRevision()).isEqualTo(revision);

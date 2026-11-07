@@ -48,15 +48,21 @@ class NativeValidationApiIT {
                 var stableRow=new Document("_id","order-1").append("id",1L).append("payload","same");
                 observer.getDatabase(sourceDb).getCollection("orders").insertOne(stableRow);
                 observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document(stableRow));
+                var itemRow=new Document("_id",new org.bson.types.ObjectId("650000000000000000000001"))
+                        .append("id",2L).append("payload","same item");
+                observer.getDatabase(sourceDb).getCollection("z_items").insertOne(itemRow);
+                observer.getDatabase(targetDb).getCollection("checked_z_items").insertOne(new Document(itemRow));
                 var artifacts=child.getBean(ArtifactStore.class);
-                artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"database",sourceDb,"isUri",true),
-                        SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null));
+                artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"isUri",true),
+                        SourceMode.SNAPSHOT,List.of(TableRef.literal("orders"),TableRef.literal("z_items")),null,null));
                 artifacts.create(new SourceResource("validation_target",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(targetDb),"isUri",true),null,null,null,null));
                 artifacts.create(new PipelineResource("validation_flow",null,List.of(SourceRef.spec("validation_input",false)),null,null,
-                        new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("validation_input.orders")),List.of(new SyncElement("out","validation_target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
+                        new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("validation_input.orders"),FromRef.literal("validation_input.z_items")),List.of(new SyncElement("out","validation_target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
                 var http=RestClient.create("http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort());
                 var input=Map.of("pipelineId","validation_flow","taskId","validation_task","taskGeneration",UUID.randomUUID().toString(),"expectedRevision","0","method","COUNT",
-                        "mappings",List.of(Map.of("mappingId","orders","outputId","out","sourceId","validation_input","table","orders")),"confirmations",Map.of());
+                        "mappings",List.of(
+                                Map.of("mappingId","orders","outputId","out","sourceId","validation_input","table","orders"),
+                                Map.of("mappingId","z_items","outputId","out","sourceId","validation_input","table","z_items")),"confirmations",Map.of());
                 assertThat(http.post().uri("/api/validation:evaluate").contentType(MediaType.APPLICATION_JSON).body(input)
                         .<Integer>exchange((request,response)->response.getStatusCode().value())).isEqualTo(401);
                 var token=child.getBean(TokenService.class).create(Scope.READ);
@@ -132,7 +138,13 @@ class NativeValidationApiIT {
                         .header("Authorization","Bearer "+token).<Integer>exchange((request,httpResponse)->httpResponse.getStatusCode().value())).isEqualTo(404);
                 var report=completedReport(http,token,reportPath);
                 assertThat(report).containsEntry("method","COUNT").containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("physicalDrain","UNKNOWN").containsEntry("premiseVerifiedBySystem",false);
-                var counts=(List<?>)report.get("counts");var count=(Map<?,?>)counts.getFirst();assertThat(count.get("source")).isEqualTo("1");assertThat(count.get("target")).isEqualTo("1");assertThat(count.get("difference")).isEqualTo("0");
+                var counts=(List<?>)report.get("counts");assertThat(counts).hasSize(2);
+                for (var entry : counts) {
+                    var count=(Map<?,?>)entry;
+                    assertThat(count.get("source")).isEqualTo("1");
+                    assertThat(count.get("target")).isEqualTo("1");
+                    assertThat(count.get("difference")).isEqualTo("0");
+                }
                 var occupied=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(2));
                 try{
                     assertThat(http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
@@ -141,8 +153,9 @@ class NativeValidationApiIT {
                 }finally{occupied.forEach(ValidationMemberResources.Metadata::close);}
                 for(var method:List.of("UNIQUE_KEY","FULL_COLUMN")){
                     var task=method.equals("UNIQUE_KEY")?"validation_keys":"validation_columns";
-                    var key=method.equals("UNIQUE_KEY")?"_id":"id";
-                    var confirmed=Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source",key,"target",key))));
+                    var confirmed=Map.of(
+                            "orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","_id","target","_id"))),
+                            "z_items",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","_id","target","_id"))));
                     var selected=new LinkedHashMap<String,Object>(input);selected.put("taskId",task);selected.put("taskGeneration",UUID.randomUUID().toString());
                     selected.put("method",method);selected.put("confirmations",confirmed);
                     var checked=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(selected).retrieve().body(Map.class);
@@ -151,6 +164,7 @@ class NativeValidationApiIT {
                     assertThat(serverSaved).containsEntry("outcome","APPLIED");assertThat(serverSaved.get("taskGeneration")).isNotEqualTo(selected.get("taskGeneration"));
                     var original=Map.of("context",checked.get("context"),"pipeline","validation_flow","task",task,"taskGeneration",serverSaved.get("taskGeneration"),
                             "revision","1","sequence","1","command",UUID.randomUUID().toString());
+                    observer.getDatabase("admin").runCommand(new Document("fsync",1));
                     var complete=runAndReport(http,write,token,original,task);
                     assertThat(complete).containsEntry("method",method).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED");
                     if(method.equals("FULL_COLUMN")){
@@ -165,6 +179,28 @@ class NativeValidationApiIT {
                         String detail=http.get().uri(rootPath+"/"+root.get("id")+query).header("Authorization","Bearer "+token).retrieve().body(String.class);
                         assertThat(detail).contains("same","changed","codecBinding","observation");
                     }
+                }
+                var originalTarget = observer.getDatabase(targetDb).getCollection("checked_orders");
+                originalTarget.deleteOne(new Document("_id", "order-1"));
+                originalTarget.insertOne(new Document(stableRow).append("_id", new org.bson.types.ObjectId()));
+                try {
+                    var mixed = new LinkedHashMap<String,Object>(input);
+                    mixed.put("taskId", "validation_mixed_keys");
+                    mixed.put("taskGeneration", UUID.randomUUID().toString());
+                    mixed.put("method", "UNIQUE_KEY");
+                    mixed.put("confirmations", Map.of(
+                            "orders", Map.of("id", UUID.randomUUID().toString(), "fields", List.of(Map.of("source","_id","target","_id"))),
+                            "z_items", Map.of("id", UUID.randomUUID().toString(), "fields", List.of(Map.of("source","_id","target","_id")))));
+                    assertThatThrownBy(() -> http.post().uri("/api/validation:evaluate")
+                            .header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON)
+                            .body(mixed).retrieve().body(Map.class))
+                            .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, refused -> {
+                                assertThat(refused.getStatusCode().value()).isEqualTo(400);
+                                assertThat(refused.getResponseBodyAsString()).contains("native-object-id-domain-mismatch");
+                            });
+                } finally {
+                    originalTarget.deleteOne(new Document("id",1L));
+                    originalTarget.insertOne(new Document(stableRow));
                 }
                 var finalFrames=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(5));
                 try { assertThat(child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()).isEqualTo(4); }

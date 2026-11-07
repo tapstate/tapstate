@@ -77,10 +77,7 @@ final class NativeValidationMetadata {
         ValidationSelectedDeclarations declarations(){require();return selected;}
         ValidationMethod method(){require();return method;}
         Projection projection(String mapping){require();return projections.get(mapping);}
-        boolean nativeBson(String source){
-            require();var resource=StoredArtifacts.requireSource(selected.artifacts(),source);var ref=artifacts.get(resource.connector());
-            if(ref==null)throw invalid("unobservedArtifact");return ref.className().equals("io.tapdata.mongodb.MongodbConnector");
-        }
+
         List<Mapping> mappings(){require();return List.copyOf(results);}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         private ConnectorRef artifact(SourceResource source){
@@ -99,13 +96,13 @@ final class NativeValidationMetadata {
         private Side read(ValidationDirectMappings.Declared declared,boolean source,List<String> fields){
             require();var side=source?declared.mapping().source():declared.mapping().target();
             var resource=StoredArtifacts.requireSource(selected.artifacts(),side.sourceId());var artifact=artifact(resource);
-            var connection=method==ValidationMethod.COUNT?NativeValidationPdkPlans.countConnection(resource,artifact):NativeValidationPdkRows.rowConnection(resource,artifact);
+            var connection=method==ValidationMethod.COUNT?new ConnectionConfig(resource.id(), resource.connector(), resource.config()):NativeValidationPdkRows.rowConnection(resource,artifact);
             var probe=method==ValidationMethod.COUNT?member.admitProbe():member.admitProbeWithConsumer();
             synchronized(this){if(closed){probe.close();throw invalid("scopeClosed");}active.add(probe);}
             probe.released().whenComplete((ignored,failed)->{if(failed!=null)record(failed);synchronized(Scope.this){active.remove(probe);}releaseIfDone();});
             try{
                 if(method==ValidationMethod.COUNT){
-                    var reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(side.table(),NativeValidationPdkPlans.database(side,connection),PdkValidationCounts.Operation.NATIVE_PROTOCOL),
+                    var reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(side.table()),
                             ()->{require();probe.require();},name->{if(source)ValidationDirectMappings.requireObservedSourceTable(declared,name);});
                     var drained=new CompletableFuture<Void>();
                     try{probe.retain(()->{try{reader.close();}finally{if(reader.drained())drained.complete(null);}},reader.callExited(),drained);}
@@ -115,7 +112,6 @@ final class NativeValidationMetadata {
                 }
                 var projection=method==ValidationMethod.FULL_COLUMN?List.<String>of():fields;
                 var reader=PdkValidationReads.inspect(connection,artifact,CanonicalHash.of(resource),side.table(),projection,
-                        NativeValidationPdkRows.simpleOrdering(connection, artifact, side.table()),
                         ()->{require();probe.require();},probe.queryExecutor(),probe.decodeExecutor(),ROW);
                 try{probe.retain(reader,reader.workersExited(),CompletableFuture.allOf(
                         reader.rowsReleased().toCompletableFuture(),reader.cleanupCompleted().toCompletableFuture()));}

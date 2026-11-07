@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
-import java.util.function.BooleanSupplier;
+import io.tapdata.pdk.apis.entity.TapExecuteCommand;
 
 /**
  * One independent, non-reusable utility-query session. The caller admits the connection, model and
@@ -60,8 +60,7 @@ final class PdkValidationSession {
     }
 
     /** Uses the same independent discovery/type binding without invoking a business query. */
-    private record Metadata(String table, List<String> projection, BooleanSupplier simpleOrdering,
-                            BiConsumer<TapTable, Boolean> capture) implements Request {
+    private record Metadata(String table, List<String> projection, BiConsumer<TapTable, Map<String, String>> capture) implements Request {
         private Metadata {
             Objects.requireNonNull(table, "table"); projection = List.copyOf(projection);
             if (table.isBlank() || table.length() > 512 || projection.size() > 4096
@@ -75,9 +74,9 @@ final class PdkValidationSession {
 
     /** Empty projection reads the complete row; a nonempty projection lists literal physical fields. */
     record Scan(String table, List<String> ascendingKeys, List<String> projection, int batchSize,
-                BooleanSupplier requireSimpleOrdering) implements Request {
+                Map<String, String> keyOrder) implements Request {
         Scan(String table, List<String> ascendingKeys, List<String> projection, int batchSize) {
-            this(table, ascendingKeys, projection, batchSize, null);
+            this(table, ascendingKeys, projection, batchSize, Map.of());
         }
 
         Scan(String table, List<String> ascendingKeys, int batchSize) {
@@ -86,6 +85,7 @@ final class PdkValidationSession {
 
         Scan {
             Objects.requireNonNull(table, "table");
+            keyOrder = Map.copyOf(keyOrder);
             ascendingKeys = List.copyOf(ascendingKeys);
             projection = List.copyOf(projection);
             if (table.isBlank() || table.length() > 512 || ascendingKeys.isEmpty()
@@ -209,16 +209,16 @@ final class PdkValidationSession {
     static ValidationReadHandle inspect(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
             String table, List<String> projection, Consumer<TapTable> capture, Runnable requireAuthorized,
             ExecutorService io, ExecutorService decodeIo, ValidationValues.Limits rowLimits) {
-        return inspect(connectorId, artifact, settings, table, projection, null,
-                (model, simpleStringId) -> capture.accept(model), requireAuthorized, io, decodeIo, rowLimits);
+        return inspect(connectorId, artifact, settings, table, projection,
+                (model, keyOrder) -> capture.accept(model), requireAuthorized, io, decodeIo, rowLimits);
     }
 
     static ValidationReadHandle inspect(String connectorId, ConnectorRef artifact, Map<String, Object> settings,
-            String table, List<String> projection, BooleanSupplier simpleOrdering, BiConsumer<TapTable, Boolean> capture,
+            String table, List<String> projection, BiConsumer<TapTable, Map<String, String>> capture,
             Runnable requireAuthorized, ExecutorService io, ExecutorService decodeIo, ValidationValues.Limits rowLimits) {
         if (io == decodeIo) throw new IllegalArgumentException("query and decoding require distinct executors");
         var session = new PdkValidationSession(connectorId, artifact, settings, "independent-metadata-v1",
-                new Metadata(table, projection, simpleOrdering, capture), (model, codecs) -> raw -> {
+                new Metadata(table, projection, capture), (model, codecs) -> raw -> {
                     throw new IllegalStateException("metadata discovery cannot deliver a business row");
                 }, null, requireAuthorized, decodeIo);
         return session.open(io, 1, rowLimits);
@@ -304,15 +304,6 @@ final class PdkValidationSession {
         Throwable primary = null;
         try {
             checkActive();
-            var orderProof = scan instanceof Metadata metadata ? metadata.simpleOrdering()
-                    : scan instanceof Scan ordered ? ordered.requireSimpleOrdering() : null;
-            // Finish the bounded native metadata check before opening the PDK connection.
-            boolean simpleOrdering = orderProof != null && orderProof.getAsBoolean();
-            checkActive();
-            if (scan instanceof Scan && orderProof != null && !simpleOrdering) {
-                throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
-                        Map.of("node", connectorId, "field", "_id", "rule", "native-text-ordering-unproven"), null);
-            }
             // No production node, notes store, connection, registry or mutable connector is borrowed.
             PdkConnector opened = PdkConnector.open(connectorId, artifact, settings);
             connector = opened;
@@ -328,8 +319,14 @@ final class PdkValidationSession {
                 TapTable model = discover(opened);
                 checkAlive(opened);
                 if (scan instanceof Metadata metadata) {
-                    metadata.capture().accept(model, simpleOrdering && mongoStringId(model));
+                    metadata.capture().accept(model, keyOrder(opened, model, model.getNameFieldMap().keySet()));
                     return null;
+                }
+                if (scan instanceof Scan ordered && !ordered.keyOrder().isEmpty()
+                        && !ordered.keyOrder().equals(keyOrder(opened, model, ordered.keyOrder().keySet()))) {
+                    throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
+                            Map.of("node", connectorId, "field", ordered.keyOrder().keySet().iterator().next(),
+                                    "rule", "native-text-ordering-unproven"), null);
                 }
                 var codecs = new PdkValidationCodecs(connectorId, codecBinding, opened.codecs());
                 var admittedDecoder = Objects.requireNonNull(admission.prepare(model, codecs), "admitted decoder");
@@ -488,10 +485,37 @@ final class PdkValidationSession {
         return new TapstateException(ValidationError.READ_FAILED, Map.of("table", scan.table()), cause);
     }
 
-    private static boolean mongoStringId(TapTable model) {
-        var field = model.getNameFieldMap().get("_id");
-        return field != null && field.getTapType() instanceof io.tapdata.entity.schema.type.TapString
-                && field.getDataType() != null && field.getDataType().matches("STRING(?:\\([0-9]+\\))?");
+    private Map<String, String> keyOrder(PdkConnector opened, TapTable model,
+                                         java.util.Set<String> fields) throws Throwable {
+        if (!PdkValidationCapabilities.supports(artifact, PdkValidationCapabilities.KEY_ORDER)) return Map.of();
+        var execute = opened.functions().getExecuteCommandFunction();
+        if (execute == null) throw protocol();
+        var facts = new LinkedHashMap<String, String>();
+        for (var name : fields) {
+            var field = model.getNameFieldMap().get(name);
+            if (field == null || field.getDataType() == null
+                    || !(field.getTapType() instanceof io.tapdata.entity.schema.type.TapString)) continue;
+            checkAlive(opened);
+            var response = new AtomicReference<Map<?, ?>>();
+            var params = new LinkedHashMap<String, Object>(Map.of(
+                    "collection", scan.table(), "field", name, "nativeType", field.getDataType()));
+            invoke(() -> {
+                execute.execute(opened.context(), TapExecuteCommand.create()
+                        .command(PdkValidationCapabilities.KEY_ORDER).params(params), result -> {
+                    if (result == null || result.getError() != null || !(result.getResult() instanceof Map<?, ?> map)
+                            || !response.compareAndSet(null, map)) throw protocol();
+                });
+                return null;
+            });
+            checkAlive(opened);
+            var map = response.get();
+            if (map == null) throw protocol();
+            if (map.isEmpty()) continue;
+            var logical = map.get("logicalType");
+            if (!"text".equals(logical) && !"object-id".equals(logical)) throw protocol();
+            facts.put(name, (String) logical);
+        }
+        return Map.copyOf(facts);
     }
 
     private TapTable discover(PdkConnector opened) throws Throwable {

@@ -21,16 +21,22 @@ class PdkValidationModelVersionTest {
         fields.put("value",new TapField("value","VARCHAR(64)").pos(2).tapType(new TapString().bytes(64L)));
         var model=new TapTable("records");model.setNameFieldMap(fields);return model;
     }
-    @Test void documentDataInferenceDoesNotBecomeColumnDdlButTheActualReadModelRemainsStrict(){
-        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+    @Test void observationStatisticsDoNotBecomeSchemaButFieldContractsRemainBound(){
+        var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var first=table();var second=table();
+        first.setTableAttr(Map.of("storageSize",1));
+        second.setTableAttr(Map.of("storageSize",2));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
         second.getNameFieldMap().get("id").setDataType("INTEGER");
         second.getNameFieldMap().get("id").setTapType(new TapNumber().bit(32).fixed(true).precision(10).scale(0));
         second.getNameFieldMap().get("value").setDataType("STRING(1500)");
         second.getNameFieldMap().get("value").setTapType(new TapString().bytes(1500L));
         second.add(new TapField("optional","STRING(100)").tapType(new TapString().bytes(100L)));
         assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
-        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
+        second=table();
         second.setId("another");assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
         second.setId(first.getId());second.setTableAttr(Map.of("capped",true,"maxSize",1000));
         assertThat(PdkValidationModelVersion.scopeVersion(first,artifact)).isNotEqualTo(PdkValidationModelVersion.scopeVersion(second,artifact));
@@ -39,7 +45,9 @@ class PdkValidationModelVersionTest {
     }
 
     @Test void documentCollectionDefinitionsRemainBoundEvenWithoutFixedColumnDdl(){
-        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var first=table();var second=table();
         first.setTableAttr(Map.of("timeField","at","metaField","group","granularity","seconds"));
         second.setTableAttr(Map.of("timeField","at","metaField","group","granularity","hours"));
@@ -51,7 +59,9 @@ class PdkValidationModelVersionTest {
     }
 
     @Test void aCustomCodecCannotMutateTheActualDocumentReadModelBehindTheStableScope()throws Exception{
-        var model=table();var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var model=table();var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         String configuration="b".repeat(64);String version=PdkValidationModelVersion.scopeVersion(model,artifact);
         var expected=new PdkValidationReads.Binding(version,PdkValidationModelVersion.codecBinding(artifact,configuration,version));
         var calls=new java.util.concurrent.atomic.AtomicInteger();var registry=new io.tapdata.entity.codec.TapCodecsRegistry();
@@ -60,9 +70,9 @@ class PdkValidationModelVersionTest {
             return new io.tapdata.entity.schema.value.TapStringValue("custom:"+value);
         });
         var codecs=new PdkValidationCodecs("mongo",expected.codecBinding(),registry);
-        var method=PdkValidationReads.class.getDeclaredMethod("decoder",TapTable.class,PdkValidationCodecs.class,ConnectorRef.class,String.class,PdkValidationReads.Binding.class,List.class,io.tapstate.core.validation.ValidationValues.Limits.class);method.setAccessible(true);
+        var method=PdkValidationReads.class.getDeclaredMethod("decoder",TapTable.class,PdkValidationCodecs.class,ConnectorRef.class,String.class,PdkValidationReads.Binding.class,List.class,io.tapstate.core.validation.ValidationValues.Limits.class,boolean.class);method.setAccessible(true);
         var keys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER,java.util.Set.of("exact-number")));
-        var decoder=(PdkValidationCursor.Decoder)method.invoke(null,model,codecs,artifact,configuration,expected,keys,new io.tapstate.core.validation.ValidationValues.Limits(8192,100,12));
+        var decoder=(PdkValidationCursor.Decoder)method.invoke(null,model,codecs,artifact,configuration,expected,keys,new io.tapstate.core.validation.ValidationValues.Limits(8192,100,12),true);
         assertThatThrownBy(()->decoder.decode(Map.of("id",1L,"value","same"))).isInstanceOfSatisfying(TapstateException.class,
                 changed->{assertThat(changed.code()).isEqualTo(ValidationError.INVALID_CONTRACT);assertThat(changed.args()).containsEntry("field","pdkRead.modelChanged.afterRow.records");});
         assertThat(calls).hasValue(1);
@@ -153,7 +163,9 @@ class PdkValidationModelVersionTest {
                 .isInstanceOf(TapstateException.class);
     }
     @Test void sampledDocumentPositionsAreNotColumnsButKeyOrderAndTypesStillBind(){
-        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var first=table();var second=table();second.getNameFieldMap().get("value").pos(4);
         assertThat(PdkValidationModelVersion.of(first)).isNotEqualTo(PdkValidationModelVersion.of(second));
         assertThat(PdkValidationModelVersion.of(first,artifact)).isEqualTo(PdkValidationModelVersion.of(second,artifact));
@@ -163,7 +175,9 @@ class PdkValidationModelVersionTest {
         assertThat(PdkValidationModelVersion.of(first,artifact)).isNotEqualTo(PdkValidationModelVersion.of(second,artifact));
     }
     @Test void documentModelProfileDoesNotDropUnknownTableAttributesOrGrantCapabilityByLogicalId(){
-        var actual=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var actual=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var ordinary=new ConnectorRef(List.of(),"synthetic.Ordinary","2.0.8",null,null,"a".repeat(64),false);
         var first=table();var second=table();first.setTableAttr(Map.of("schema-choice",1));second.setTableAttr(Map.of("schema-choice",2));
         assertThat(PdkValidationModelVersion.of(first,actual)).isNotEqualTo(PdkValidationModelVersion.of(second,actual));
@@ -171,7 +185,9 @@ class PdkValidationModelVersionTest {
         assertThat(PdkValidationModelVersion.of(table(),ordinary)).isNotEqualTo(PdkValidationModelVersion.of(second,ordinary));
     }
     @Test void documentLayoutNormalizationCannotHideAFieldInsideUnknownMetadata(){
-        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var first=table();var second=table();
         first.setTableAttr(Map.of("extension",new TapField("nested","VARCHAR").pos(1).tapType(new TapString())));
         second.setTableAttr(Map.of("extension",new TapField("nested","VARCHAR").pos(2).tapType(new TapString())));
@@ -186,7 +202,9 @@ class PdkValidationModelVersionTest {
         assertThat(PdkValidationModelVersion.of(first)).isNotEqualTo(PdkValidationModelVersion.of(second));
     }
     @Test void documentRuntimeStatisticsDoNotBecomeSchemaButOtherAttributesStillDo(){
-        var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
+        var artifact=new ConnectorRef(List.of(),"synthetic.ValidationConnector","2.0.8",null,
+                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_stable_model_v1\",\"alternatives\":[\"size\",\"storageSize\",\"avgObjSize\",\"indexSize\"]}]}}",
+                "a".repeat(64),false);
         var first=table();var second=table();
         first.setTableAttr(Map.of("storageSize",4096L,"indexSize",4096L,"size",100L,"avgObjSize",50.0,"schema-choice",1));
         second.setTableAttr(Map.of("storageSize",32768L,"indexSize",8192L,"size",200L,"avgObjSize",100.0,"schema-choice",1));

@@ -326,34 +326,6 @@ public final class MongoConnection implements AutoCloseable {
         }
     }
 
-    /** Returns the URI's data database, independently of its authentication database. */
-    public static String databaseFromUri(String uri) {
-        return parseConnectionString(uri, ConnectionString::new).getDatabase();
-    }
-
-    /** Reads only the exact named collection's default collation from the URI's data database. */
-    public static boolean hasSimpleCollectionOrdering(String uri, String collection) {
-        try {
-            var connection = new ConnectionString(uri);
-            var database = connection.getDatabase();
-            if (database == null) return false;
-            var settings = MongoClientSettings.builder().applyConnectionString(connection)
-                    .timeout(3, TimeUnit.SECONDS).build();
-            try (var client = MongoClients.create(settings)) {
-                var found = client.getDatabase(database).listCollections()
-                        .filter(new Document("name", collection)).first();
-                if (found == null || !collection.equals(found.getString("name"))
-                        || !"collection".equals(found.getString("type"))
-                        || !(found.get("options") instanceof Document options)) return false;
-                var collation = options.get("collation");
-                return collation == null || collation instanceof Document attributes
-                        && "simple".equals(attributes.getString("locale"));
-            }
-        } catch (MongoException | IllegalArgumentException unavailable) {
-            return false;
-        }
-    }
-
     /** The driver's effective authentication database, including SRV/TXT, or null without credentials. */
     public static String authenticationSource(String uri) {
         var credential = parseConnectionString(uri, ConnectionString::new).getCredential();

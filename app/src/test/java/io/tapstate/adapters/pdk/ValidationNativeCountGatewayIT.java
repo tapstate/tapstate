@@ -116,12 +116,12 @@ class ValidationNativeCountGatewayIT {
             try(var observer=MongoClients.create(mongo.getReplicaSetUrl(DB))) {
                 var database=observer.getDatabase(DB);database.getCollection("records").insertMany(List.of(new Document("_id",1),new Document("_id",2)));
                 database.createCollection("empty_records");database.runCommand(new Document("profile",2));
-                assertThat(count(source,sourceRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(3);
-                assertThat(count(target,targetRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(2);
-                assertThat(count(source,sourceRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
-                assertThat(count(target,targetRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
-                assertThatThrownBy(()->count(source,sourceRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(()->count(target,targetRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
+                assertThat(count(source,sourceRef,"records")).isEqualTo(3);
+                assertThat(count(target,targetRef,"records")).isEqualTo(2);
+                assertThat(count(source,sourceRef,"empty_records")).isZero();
+                assertThat(count(target,targetRef,"empty_records")).isZero();
+                assertThatThrownBy(()->count(source,sourceRef,"missing_records")).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(()->count(target,targetRef,"missing_records")).isInstanceOf(TapstateException.class);
                 var commands=database.getCollection("system.profile").find().into(new ArrayList<>()).stream()
                         .map(row->row.get("command",Document.class)).filter(Objects::nonNull).toList();
                 assertThat(commands).filteredOn(command->"records".equals(command.get("aggregate"))||"empty_records".equals(command.get("aggregate")))
@@ -132,8 +132,8 @@ class ValidationNativeCountGatewayIT {
             }
         }
     }
-    private static long count(ConnectionConfig connection,ConnectorRef artifact,String table,PdkValidationCounts.Operation operation) {
-        try(var count=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table,DB,operation),()->{})) {
+    private static long count(ConnectionConfig connection,ConnectorRef artifact,String table) {
+        try(var count=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table),()->{})) {
             long value=count.count();assertThat(count.drained()).isTrue();assertThat(count.callExited().toCompletableFuture()).isCompleted();return value;
         }
     }
