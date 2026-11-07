@@ -32,12 +32,19 @@ import java.util.function.Supplier;
  */
 public final class StartPlanner {
 
-    private final Function<PipelineResource, Reads> capture;
+    private final java.util.function.BiFunction<PipelineResource, Optional<io.tapstate.spi.store.PipelineIntentScope>, Reads> capture;
 
     public record Reads(Supplier<List<String>> progressChains,
             Function<String, Optional<SrsMeta>> progress,
             Supplier<List<PipelineWriteTargets.WriteTarget>> targets, Runnable verify,
-            Supplier<Optional<DesiredStore.StartPreparation>> preparation) {}
+            Supplier<Optional<DesiredStore.StartPreparation>> preparation,
+            Function<String, Optional<io.tapstate.core.model.SourceResource>> targetConnections) {
+        public Reads(Supplier<List<String>> progressChains, Function<String, Optional<SrsMeta>> progress,
+                Supplier<List<PipelineWriteTargets.WriteTarget>> targets, Runnable verify,
+                Supplier<Optional<DesiredStore.StartPreparation>> preparation) {
+            this(progressChains, progress, targets, verify, preparation, ignored -> Optional.empty());
+        }
+    }
 
     public StartPlanner(PipelineChains chains, SrsMetaStore meta, PipelineWriteTargets targets) {
         this(definition -> new Reads(() -> chains.progressChainsOf(definition.id()), meta::read,
@@ -48,6 +55,11 @@ public final class StartPlanner {
     }
 
     public StartPlanner(Function<PipelineResource, Reads> capture) {
+        this((definition, scope) -> capture.apply(definition));
+        Objects.requireNonNull(capture, "capture");
+    }
+
+    public StartPlanner(java.util.function.BiFunction<PipelineResource, Optional<io.tapstate.spi.store.PipelineIntentScope>, Reads> capture) {
         this.capture = Objects.requireNonNull(capture, "capture");
     }
 
@@ -60,14 +72,23 @@ public final class StartPlanner {
      * @param intent     which start is being predicted
      */
     public StartPlan plan(PipelineResource definition, Optional<DesiredState> prior, StartIntent intent) {
+        return plan(definition, prior, intent, Optional.empty());
+    }
+
+    StartPlan plan(PipelineResource definition, Optional<DesiredState> prior, StartIntent intent,
+            Optional<DesiredStore.StartIntent> original) {
         Objects.requireNonNull(definition, "definition");
         Objects.requireNonNull(prior, "prior");
         Objects.requireNonNull(intent, "intent");
-        Reads reads = capture.apply(definition);
-        StartLoad load = StartLoad.of(readMode(definition), definition.id(), recordsAtStart(reads, prior, intent));
+        var scope = original.flatMap(DesiredStore.StartIntent::scope);
+        Reads reads = capture.apply(definition, scope);
+        boolean firstStart = scope.isPresent() && original.orElseThrow().revision() == 0;
+        ReadMode mode = readMode(definition);
+        StartLoad load = StartLoad.of(mode, definition.id(),
+                mode == ReadMode.CDC_ONLY || firstStart ? List.of() : recordsAtStart(reads, prior, intent));
         var result=new StartPlan(load, reads.targets().get().stream()
                 .map(target -> new StartPlan.Entry(target, load))
-                .toList(), clearsFirst(prior, intent) ? Optional::empty : reads.preparation());
+                .toList(), clearsFirst(prior, intent) ? Optional::empty : reads.preparation(), reads.targetConnections());
         reads.verify().run();
         return result;
     }

@@ -842,7 +842,7 @@ class ControlPlaneConfiguration {
         var planner = storePort instanceof ThreeLayerStorePort nativeStore
                 && pipelineChains instanceof StoreBackedPipelineChains chains
                 && pipelineWriteTargets instanceof StoreBackedPipelineWriteTargets targets
-                ? new StartPlanner(pipeline -> targets.capture(nativeStore, chains, pipeline))
+                ? new StartPlanner((pipeline, scope) -> targets.capture(nativeStore, chains, pipeline, scope))
                 : new StartPlanner(pipelineChains, meta, pipelineWriteTargets);
         StartCheckEvaluator evaluator = new StartCheckEvaluator(StartChecks.registered(
                 new StoreBackedTargetIdentities(storePort, connectorProvisioner)),

@@ -174,6 +174,15 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return delegate.listStored(kind);
     }
 
+    @Override public java.util.function.Function<SourceResource, Runnable> resolvedSourceTracking() {
+        TapstateCatalog captured = catalog.get();
+        return source -> {
+            String probe = "start-probe:" + java.util.UUID.randomUUID();
+            redactor.replace(probe, secretValues(source, () -> captured));
+            return () -> redactor.remove(probe);
+        };
+    }
+
     private void track(Resource resource) {
         track(resource, catalog);
     }

@@ -1,6 +1,7 @@
 package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import java.util.List;
 import java.util.Optional;
 
@@ -27,6 +28,13 @@ public interface DesiredStore {
 
     record StartIntent(Optional<DesiredState> desired, Optional<PipelineIntentScope> scope, long revision) {}
     record StartPreparation(PipelineIntentScope scope, PipelinePreparationInputs inputs) {}
+
+    record StartEntry(io.tapstate.core.model.PipelineResource pipeline, StartIntent intent, Optional<CheckpointDoc> checkpoint) {}
+
+    default Optional<StartEntry> startEntry(String pipelineId) { return Optional.empty(); }
+
+    /** A deferred native start validates this captured definition before background preparation. */
+    default boolean defersStart(DesiredState desired, StartIntent original, Optional<StartPreparation> preparation) { return false; }
 
     default StartIntent readForStart(String pipelineId) {
         return new StartIntent(read(pipelineId), Optional.empty(), 0);

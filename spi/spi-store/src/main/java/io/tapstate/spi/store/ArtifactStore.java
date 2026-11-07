@@ -23,6 +23,11 @@ import java.util.Set;
  */
 public interface ArtifactStore {
 
+    /** Registers already resolved sources with read-side credential tracking. */
+    default java.util.function.Function<io.tapstate.core.model.SourceResource, Runnable> resolvedSourceTracking() {
+        return ignored -> () -> {};
+    }
+
     /**
      * One operation's readable resources and optional redaction catalog.
      * Exact lookup IDs are keys the store resolved to those same resources in this snapshot.
@@ -52,6 +57,10 @@ public interface ArtifactStore {
     /** A complete draft dependency slice, including the original target if it exists. */
     default Optional<ReadableInventory> draftPublicationInventory(io.tapstate.core.model.PipelineResource candidate) {
         return Optional.empty();
+    }
+
+    default Optional<ReadableInventory> startPlanningInventory(io.tapstate.core.model.PipelineResource pipeline) {
+        return draftPublicationInventory(pipeline);
     }
 
     /** Typed point read with the same display facts as the daily inventory. */

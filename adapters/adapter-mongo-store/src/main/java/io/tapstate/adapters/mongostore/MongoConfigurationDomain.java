@@ -564,6 +564,32 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return requiredNotes;
     }
 
+    public record StartSnapshot(io.tapstate.core.model.PipelineResource pipeline, PipelineStateMapping mapping,
+            PipelinePreparation preparation, Optional<io.tapstate.spi.store.PipelineIntentSnapshot> intent) {}
+
+    /** Definition, state generation, and previous intent from one CONFIG snapshot. */
+    public Optional<StartSnapshot> startSnapshot(String pipelineId) {
+        requireOpen();
+        var client = connection.client();
+        var database = connection.database();
+        return StoreIo.call(() -> {
+            try (var session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    var resource = artifacts.getInTransaction(session, pipelineId);
+                    if (resource.isEmpty() || !(resource.orElseThrow() instanceof io.tapstate.core.model.PipelineResource pipeline))
+                        return Optional.empty();
+                    var key = new Document("_id", pipelineId);
+                    var mapping = SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, key).first();
+                    var preparation = MongoPipelinePreparationFacts.decode(pipelineId, mapping, clusterId);
+                    var intent = new MongoPipelineIntentStore(client, database, clusterId, bindings)
+                            .loadRetainedInTransaction(session, pipelineId);
+                    return Optional.of(new StartSnapshot(pipeline, MongoPipelineStateMappings.decode(pipelineId, mapping), preparation, intent));
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+        });
+    }
+
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure) {

@@ -424,6 +424,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }
 
+    /** Read planning keeps the business fence and reuses admitted collection structure. */
+    public io.tapstate.spi.store.SchemaStore admittedStartSchemas(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheSchemaStore(new MongoCacheMetadataAccess(client, database, expected,
+                SystemCollections.CACHE_SOURCE_SCHEMAS, () -> { businessActive(); requireActive.run(); }, false));
+    }
+
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
         var registry = new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
         registry.verify(); return registry;

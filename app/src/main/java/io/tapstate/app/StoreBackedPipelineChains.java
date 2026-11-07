@@ -78,7 +78,7 @@ final class StoreBackedPipelineChains implements PipelineChains {
             var model = models.apply(source);
             if (stores != null && storePort instanceof ThreeLayerStorePort nativeStore) {
                 SourceCaptureResolution.forPipeline(pipeline, source, model)
-                        .flatMap(resolution -> nativeStore.sharedReading(pipeline, source, resolution, requireAttachment, stores))
+                        .flatMap(resolution -> nativeStore.sharedReadingForStart(pipeline, source, resolution, stores))
                         .ifPresent(resolutions::add);
             } else {
                 SourceCaptureResolution.forStoredPipeline(storePort,pipeline, source, model,requireAttachment)

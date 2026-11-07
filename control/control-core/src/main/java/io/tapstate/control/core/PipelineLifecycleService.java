@@ -8,6 +8,7 @@ import io.tapstate.core.lifecycle.LifecycleMachine;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.DesiredStore;
 
 import java.util.Map;
@@ -91,6 +92,14 @@ public final class PipelineLifecycleService {
      */
     public Startable startable(String pipelineId) {
         Objects.requireNonNull(pipelineId, "pipelineId");
+        var captured = desired.startEntry(pipelineId);
+        if (captured.isPresent()) {
+            var entry = captured.orElseThrow();
+            var artifact = new StoredResource(entry.pipeline(), CanonicalHash.of(entry.pipeline()));
+            requireRunnable(pipelineId, entry.pipeline());
+            LifecycleMachine.transition(currentState(entry.intent().desired(), entry.checkpoint()), LifecycleVerb.START);
+            return new Startable(artifact, entry.pipeline(), entry.intent(), entry.checkpoint());
+        }
         StoredResource latestArtifact = requireRunnable(pipelineId);
         var intent = desired.readForStart(pipelineId);
         var checkpoint = actualCheckpoint.apply(pipelineId);
@@ -153,12 +162,15 @@ public final class PipelineLifecycleService {
     /** The applied pipeline, refused when it is unknown or is a draft that cannot run yet. */
     private StoredResource requireRunnable(String pipelineId) {
         StoredResource latestArtifact = requireApplied(pipelineId);
-        PipelineResource pipeline = (PipelineResource) latestArtifact.resource();
+        requireRunnable(pipelineId, (PipelineResource) latestArtifact.resource());
+        return latestArtifact;
+    }
+
+    private static void requireRunnable(String pipelineId, PipelineResource pipeline) {
         if (pipeline.sources().isEmpty() || pipeline.view() == null && pipeline.serve() == null) {
             throw new TapstateException(
                     LifecycleError.PIPELINE_NOT_RUNNABLE, Map.of("pipeline", pipelineId), null);
         }
-        return latestArtifact;
     }
 
     private StoredResource requireApplied(String pipelineId) {
@@ -271,13 +283,15 @@ public final class PipelineLifecycleService {
                     // Asked again at the last moment for a start held to a definition: the definition could
                     // have been replaced while the intent was being worked out, and a start that went ahead
                     // over that would run a definition nobody checked.
-                    if (expectedContentHash != null && !artifacts.getResource(pipelineId)
+                    var preparation = checked == null || plan == null
+                            ? Optional.<DesiredStore.StartPreparation>empty() : plan.preparation().get();
+                    if (expectedContentHash != null && (checked == null || !desired.defersStart(next, checked.intent(), preparation))
+                            && !artifacts.getResource(pipelineId)
                             .map(StoredResource::contentHash).filter(expectedContentHash::equals).isPresent()) {
                         throw new TapstateException(PipelineError.VERSION_CONFLICT, Map.of("id", pipelineId), null);
                     }
                     if (checked == null) desired.save(next);
-                    else desired.saveStart(next, checked.intent(),
-                            plan == null ? Optional.empty() : plan.preparation().get());
+                    else desired.saveStart(next, checked.intent(), preparation);
                     return next;
                 });
     }

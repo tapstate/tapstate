@@ -131,7 +131,7 @@ public final class PipelineStartService {
 
     private StartEvaluation evaluate(String pipelineId, PipelineLifecycleService.Startable startable,
             PipelineResource definition, StartIntent intent) {
-        return evaluator.evaluate(pipelineId, definition, startable.artifact().contentHash(), startable.prior(), intent);
+        return evaluator.evaluate(pipelineId, definition, startable.artifact().contentHash(), startable.prior(), intent, java.util.Optional.of(startable.intent()));
     }
 
     /**

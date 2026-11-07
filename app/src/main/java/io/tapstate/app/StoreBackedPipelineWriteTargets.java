@@ -47,16 +47,17 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
         return source.writeTargets(pipeline);
     }
 
-    StartPlanner.Reads capture(ThreeLayerStorePort store, StoreBackedPipelineChains chains, PipelineResource pipeline) {
-        var scope = store.planningScope(pipeline.id());
+    StartPlanner.Reads capture(ThreeLayerStorePort store, StoreBackedPipelineChains chains, PipelineResource pipeline,
+            Optional<io.tapstate.spi.store.PipelineIntentScope> original) {
+        var scope = original.map(store::planningScope).orElseGet(() -> store.planningScope(pipeline.id()));
         var live = store.artifacts();
         var resources = new HashMap<String, Optional<Resource>>();
-        live.draftPublicationInventory(pipeline).ifPresent(inventory -> {
-            resources.put(pipeline.id(), Optional.empty());
+        live.startPlanningInventory(pipeline).ifPresent(inventory -> {
             io.tapstate.core.dsl.ReferenceGraph.declaredReferences(pipeline).forEach(edge ->
                     resources.put(edge.id(), Optional.empty()));
             inventory.resources().forEach(resource -> resources.put(resource.id(), Optional.of(resource)));
         });
+        resources.put(pipeline.id(), Optional.of(pipeline));
         ArtifactStore captured = new ArtifactStore() {
             private Optional<String> managed;
             private List<Resource> all;
@@ -73,7 +74,9 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
         };
         var models = new HashMap<SourceResource, Optional<SourceModel>>();
         Function<SourceResource, SourceModel> discovery = definition -> models.computeIfAbsent(definition,
-                key -> Optional.ofNullable(SourceDiscovery.model(store, key))).orElse(null);
+                key -> Optional.ofNullable(original.isPresent()
+                        ? SourceDiscovery.matched(store.startSchemas().get(key.id()), key)
+                        : SourceDiscovery.model(store, key))).orElse(null);
         Supplier<SrsStores> progress = new Supplier<>() {
             private SrsStores stores;
             @Override public SrsStores get() {
@@ -95,6 +98,7 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
                     }
                     return Optional.of(new DesiredStore.StartPreparation(scope.scope(),
                             PipelinePreparationInputs.of(scope.scope(), pipeline, sources, tables)));
-                });
+                }, id -> captured.get(id).filter(SourceResource.class::isInstance).map(SourceResource.class::cast)
+                        .filter(resolved -> id.equals(resolved.id())));
     }
 }

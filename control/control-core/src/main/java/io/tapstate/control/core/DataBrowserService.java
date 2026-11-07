@@ -164,6 +164,22 @@ public final class DataBrowserService {
         return written == null || written.isBlank() ? null : written;
     }
 
+    java.util.function.Function<SourceResource, Runnable> resolvedSourceTracking() {
+        return store.resolvedSourceTracking();
+    }
+
+    DataBrowserPreviewReport firstRow(SourceResource source, String collection) {
+        var config = requireBrowsable(connection(source.id(), Optional.of(source)));
+        requireHolds(config, source.id(), collection);
+        return DataBrowserPreviewReport.from(findProbe.find(config, new DataBrowserQuery(collection, null, null, 1)));
+    }
+
+    DataBrowserStatsReport stats(SourceResource source, String collection) {
+        var config = connection(source.id(), Optional.of(source));
+        requireHolds(config, source.id(), collection);
+        return DataBrowserStatsReport.from(statsProbe.stats(config, collection));
+    }
+
     /** Reports what the connector knows about one of the source's collections. */
     public DataBrowserStatsReport stats(String sourceId, String collection) {
         ConnectionConfig config = requireCollection(sourceId, collection);

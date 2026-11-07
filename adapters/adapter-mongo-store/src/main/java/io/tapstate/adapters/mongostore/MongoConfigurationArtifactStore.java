@@ -560,10 +560,18 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
+        return definitionInventory(candidate, true);
+    }
+
+    @Override public Optional<ReadableInventory> startPlanningInventory(PipelineResource candidate) {
+        return definitionInventory(candidate, false);
+    }
+
+    private Optional<ReadableInventory> definitionInventory(PipelineResource candidate, boolean includePipeline) {
         // A reused Serve may introduce more Source ids after the first lookup.
         if (candidate.serve() instanceof io.tapstate.core.model.ServeBlock.Use) return Optional.empty();
         var ids = new java.util.LinkedHashSet<String>();
-        ids.add(candidate.id());
+        if (includePipeline) ids.add(candidate.id());
         io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> ids.add(edge.id()));
         if (ids.size() > 128) return Optional.empty();
         return readSnapshot(session -> {

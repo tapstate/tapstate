@@ -102,10 +102,22 @@ final class ThreeLayerStorePort implements StorePort {
         return new PlanningScope(original,
                 () -> {active();if(revision!=configuration.configurationRevision() || !original.equals(scope(pipeline)))throw refused();});
     }
+    PlanningScope planningScope(PipelineIntentScope original) {
+        active();
+        if (!business().equals(new CacheBusinessScope(original.clusterId(), original.bindingVersion(), original.cacheIncarnation())))
+            throw refused();
+        return new PlanningScope(original, this::active);
+    }
+
+    SchemaStore startSchemas() {
+        active();
+        return bound.cache().admittedStartSchemas(business(), this::active);
+    }
+
     Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
             io.tapstate.core.model.SourceResource source,SourceCaptureResolution canonical,boolean requireAttachment) {
         return sharedReading(pipeline, source, canonical, requireAttachment,
-                () -> bound.cache().srs(business(), this::active));
+                () -> bound.cache().srs(business(), this::active), true);
     }
 
     SrsStores startPlanningSrs() {
@@ -113,9 +125,14 @@ final class ThreeLayerStorePort implements StorePort {
         return bound.cache().startPlanningSrs(business(), this::active);
     }
 
-    Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
+    Optional<SourceCaptureResolution> sharedReadingForStart(io.tapstate.core.model.PipelineResource pipeline,
+            io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, Supplier<SrsStores> stores) {
+        return sharedReading(pipeline, source, canonical, true, stores, false);
+    }
+
+    private Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
             io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, boolean requireAttachment,
-            Supplier<SrsStores> stores) {
+            Supplier<SrsStores> stores, boolean verifyMissingCapture) {
         active();
         if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
                 && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
@@ -124,10 +141,10 @@ final class ThreeLayerStorePort implements StorePort {
         var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
         var prepared=configuration.capturePreparations().read(business(),capture);
         if(prepared.isEmpty()) {
-            // Necessary notes can predate this CACHE incarnation. Current CACHE controls, however,
-            // must never lose their original CONFIG preparation and then read as a fresh capture.
-            if(bound.cache().workloadClaims(business()).read(new WorkloadClaimKey(business().clusterId(),WorkloadClaimType.CAPTURE,capture)).isPresent()
-                    || stores.get().chains().load(canonical.chainId().value()).isPresent())
+            // Start planning can leave the absent-history proof to the transaction that creates capture.
+            if (verifyMissingCapture && (bound.cache().workloadClaims(business())
+                    .read(new WorkloadClaimKey(business().clusterId(), WorkloadClaimType.CAPTURE, capture)).isPresent()
+                    || stores.get().chains().load(canonical.chainId().value()).isPresent()))
                 throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
             return requireAttachment?Optional.empty():Optional.of(canonical);
         }
@@ -231,6 +248,23 @@ final class ThreeLayerStorePort implements StorePort {
                 submit(desired, original, previous.map(PipelineIntentSnapshot::desired),
                         previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), Optional.empty());
             }
+            @Override public Optional<StartEntry> startEntry(String pipeline) {
+                if (!deferFirstStart) return Optional.empty();
+                active();
+                var snapshot = configuration.startSnapshot(pipeline);
+                active();
+                return snapshot.map(value -> {
+                    var original = activeScope(pipeline, value.mapping());
+                    var current = value.intent();
+                    if (current.isPresent() && !current.orElseThrow().scope().equals(original)) throw refused();
+                    var desired = current.filter(valueAtStart -> !valueAtStart.deleted()).map(PipelineIntentSnapshot::desired);
+                    var intent = new StartIntent(desired, Optional.of(original), current.map(PipelineIntentSnapshot::intentRevision).orElse(0L));
+                    var checkpoint = desired.isPresent() && value.preparation().phase() == PipelinePreparation.Phase.COMPLETE
+                            ? bound.cache().pipelineStates(original).read(pipeline) : Optional.<CheckpointDoc>empty();
+                    active();
+                    return new StartEntry(value.pipeline(), intent, checkpoint);
+                });
+            }
             @Override public StartIntent readForStart(String pipeline) {
                 var original = scope(pipeline);
                 var current = configuration.intents().load(pipeline);
@@ -241,11 +275,15 @@ final class ThreeLayerStorePort implements StorePort {
             @Override public void saveStart(DesiredState desired, StartIntent original) {
                 saveStart(desired, original, Optional.empty());
             }
+            @Override public boolean defersStart(DesiredState desired, StartIntent original, Optional<StartPreparation> captured) {
+                return deferFirstStart && original.revision() == 0 && desired.targetState() == PipelineState.RUNNING
+                        && !desired.purgeState() && captured.isPresent();
+            }
             @Override public void saveStart(DesiredState desired, StartIntent original, Optional<StartPreparation> captured) {
                 active();
                 var scope = original.scope().orElseThrow(ThreeLayerStorePort::refused);
                 if (!scope.pipelineId().equals(desired.pipelineId())) throw refused();
-                if (deferFirstStart && original.revision() == 0 && desired.targetState() == PipelineState.RUNNING && !desired.purgeState() && captured.isPresent()) {
+                if (defersStart(desired, original, captured)) {
                     var inputs = captured.orElseThrow();
                     if (!scope.equals(inputs.scope()) || !configuration.intents().guardedBy(ThreeLayerStorePort.this::active)
                             .compareAndSetStart(scope, original.revision(), desired, inputs.inputs())) throw refused();
