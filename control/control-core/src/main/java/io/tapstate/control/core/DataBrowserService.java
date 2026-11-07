@@ -20,6 +20,7 @@ import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,6 +28,8 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.BiFunction;
+import java.util.function.Function;
 
 /**
  * The control plane's three data-browser verbs: list a declared source's collections, report one
@@ -165,6 +168,40 @@ public final class DataBrowserService {
     public DataBrowserStatsReport stats(String sourceId, String collection) {
         ConnectionConfig config = requireCollection(sourceId, collection);
         return DataBrowserStatsReport.from(statsProbe.stats(config, collection));
+    }
+
+    /** The catalog shares target reads within one request, using the resolved connection as the key. */
+    BiFunction<String, String, Optional<DataBrowserStatsReport>> catalogStats(Function<String, Optional<Resource>> lookup) {
+        var collections = new HashMap<ConnectionConfig, List<String>>();
+        var reports = new HashMap<ConnectionConfig, Map<String, Optional<DataBrowserStatsReport>>>();
+        return (sourceId, collection) -> {
+            try {
+                var config = connection(sourceId, lookup.apply(sourceId));
+                if (!collections.computeIfAbsent(config, this::catalogCollections).contains(collection)) {
+                    return Optional.empty();
+                }
+                return reports.computeIfAbsent(config, ignored -> new HashMap<>())
+                        .computeIfAbsent(collection, name -> catalogStats(config, name));
+            } catch (TapstateException unavailable) {
+                return Optional.empty();
+            }
+        };
+    }
+
+    private List<String> catalogCollections(ConnectionConfig config) {
+        try {
+            return collectionsProbe.collections(config);
+        } catch (TapstateException unavailable) {
+            return List.of();
+        }
+    }
+
+    private Optional<DataBrowserStatsReport> catalogStats(ConnectionConfig config, String collection) {
+        try {
+            return Optional.of(DataBrowserStatsReport.from(statsProbe.stats(config, collection)));
+        } catch (TapstateException unavailable) {
+            return Optional.empty();
+        }
     }
 
     /**
@@ -343,7 +380,11 @@ public final class DataBrowserService {
     /** The stored source's connection, or a coded not-found naming the id the caller asked for. */
     private ConnectionConfig connection(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId");
-        SourceResource source = store.get(sourceId)
+        return connection(sourceId, store.get(sourceId));
+    }
+
+    private static ConnectionConfig connection(String sourceId, Optional<Resource> resource) {
+        SourceResource source = resource
                 .filter(SourceResource.class::isInstance)
                 .map(SourceResource.class::cast)
                 .orElseThrow(() -> new TapstateException(

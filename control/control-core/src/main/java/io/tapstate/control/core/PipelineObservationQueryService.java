@@ -119,9 +119,20 @@ public final class PipelineObservationQueryService {
     public record Read(PipelineStatus status, PipelineMetrics metrics, PipelineSnapshot snapshot) { }
     public Optional<Read> findRead(String pipelineId) {
         Objects.requireNonNull(pipelineId,PIPELINE_ID_ARGUMENT);
-        return observations.read(pipelineId).map(value->new Read(statusOf(value),
+        return observations.read(pipelineId).map(this::publication);
+    }
+
+    Map<String, Read> findReads(List<String> ids) {
+        if (ids.isEmpty()) return Map.of();
+        var result = new java.util.HashMap<String, Read>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, publication(value)));
+        return Map.copyOf(result);
+    }
+
+    private Read publication(Observation value) {
+        return new Read(statusOf(value),
                 new PipelineMetrics(value.pipelineId(),value.metrics(),value.positions(),value.facts()),
-                new PipelineSnapshot(value.pipelineId(),value.snapshot())));
+                new PipelineSnapshot(value.pipelineId(),value.snapshot()));
     }
 
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */

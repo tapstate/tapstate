@@ -73,12 +73,11 @@ public final class ArtifactQueryService {
     public List<StoredResource> listResources(String kind) { return resourceInventory(kind).resources(); }
 
     public record ResourceInventory(List<StoredResource> resources,
-            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId) { }
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId,
+            java.util.Set<String> exactLookupIds) { }
 
     public ResourceInventory resourceInventory() {
-        var inventory = store.readableInventory();
-        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
-                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
+        return projectInventory(store.readableInventory());
     }
 
     public Optional<StoredResource> getResource(String kind, String id) {
@@ -86,15 +85,16 @@ public final class ArtifactQueryService {
     }
 
     public ResourceInventory resourceInventory(String kind, String id) {
-        var inventory = store.readableInventory(kind, id);
-        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
-                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
+        return projectInventory(store.readableInventory(kind, id));
     }
 
     public ResourceInventory resourceInventory(String kind) {
-        var inventory = store.readableInventory(kind);
+        return projectInventory(store.readableInventory(kind));
+    }
+
+    private ResourceInventory projectInventory(ArtifactStore.ReadableInventory inventory) {
         return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
-                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
+                inventory.connectorCatalog(), inventory.managedDefaultSourceId(), inventory.exactLookupIds());
     }
 
     /**

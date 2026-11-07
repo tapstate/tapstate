@@ -97,6 +97,29 @@ class DataBrowserServiceTest {
     }
 
     @Test
+    void catalogStatsShareOneListingAndReadEachTargetCollectionOncePerRequest() {
+        var artifacts = store(VIEWS);
+        var listings = new java.util.concurrent.atomic.AtomicInteger();
+        var stats = new ArrayList<String>();
+        var browser = new DataBrowserService(artifacts, new EmptySchemaStore(),
+                config -> { listings.incrementAndGet(); return List.of("orders", "customers"); },
+                (config, collection) -> { stats.add(collection); return new DataBrowserTableInfo(2L, 10L, 5L); },
+                (config, query) -> NOTHING, NO_FOLLOWS);
+        var request = browser.catalogStats(artifacts::get);
+
+        assertThat(request.apply("views", "orders")).isPresent();
+        assertThat(request.apply("views", "orders")).isPresent();
+        assertThat(request.apply("views", "customers")).isPresent();
+        assertThat(request.apply("views", "absent")).isEmpty();
+        assertThat(listings.get()).isOne();
+        assertThat(stats).containsExactly("orders", "customers");
+
+        assertThat(browser.catalogStats(artifacts::get).apply("views", "orders")).isPresent();
+        assertThat(listings.get()).isEqualTo(2);
+        assertThat(stats).containsExactly("orders", "customers", "orders");
+    }
+
+    @Test
     void readsAtlasRowsThroughTheSourcesConnection() {
         SourceResource atlas = new SourceResource(
                 "atlas_rows", null, "mongodb-atlas", VIEWS.config(), null, null, null, null);

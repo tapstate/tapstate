@@ -83,6 +83,7 @@ import io.tapstate.spi.transform.TransformPort;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -3726,6 +3727,31 @@ final class StoreBackedDagSource implements DagSource {
         return outputNameDetails(definition, null).names();
     }
 
+    Function<PipelineResource, PipelineOutputNames.Description> catalogOutputNames(Map<String, Resource> resources,
+            Function<String, Optional<Resource>> lookup) {
+        var live = artifacts();
+        ArtifactStore catalogArtifacts = new ArtifactStore() {
+            private Optional<String> managedDefault;
+            private List<Resource> allResources;
+
+            @Override public Optional<String> managedDefaultSourceId() {
+                if (managedDefault == null) managedDefault = live.managedDefaultSourceId();
+                return managedDefault;
+            }
+            @Override public Optional<Resource> get(String id) { return lookup.apply(id); }
+            @Override public List<Resource> list() {
+                if (allResources == null) allResources = live.list();
+                return allResources;
+            }
+            @Override public void saveAll(List<Resource> artifacts) { throw new UnsupportedOperationException(); }
+        };
+        var models = new HashMap<SourceResource, Optional<SourceModel>>();
+        var captured = new StoreBackedDagSource(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                sourcePlacement, catalogArtifacts, requireMarkedStore, members, parallelismBudget, modelRecords,
+                source -> models.computeIfAbsent(source, value -> Optional.ofNullable(modelInputs.apply(value))).orElse(null));
+        return definition -> captured.outputNameDetails(definition, resources);
+    }
+
     PipelineOutputNames.Description outputNameDetails(PipelineResource definition, Map<String, Resource> resources) {
         PipelineResource pipeline;
         try {
@@ -3746,7 +3772,7 @@ final class StoreBackedDagSource implements DagSource {
             unresolved.add(outputProblem(pipeline, unavailable));
         }
         boolean sync = pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty();
-        if (sync || resources != null) {
+        if (sync || resources != null && pipeline.view() instanceof ViewBlock.Inline) {
             try {
                 PartialOutputStreams partial = new PartialOutputStreams(pipeline, unresolved);
                 if (resources != null && pipeline.view() instanceof ViewBlock.Inline view) {

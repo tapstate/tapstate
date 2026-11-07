@@ -112,6 +112,7 @@ class ReadableArtifactInventoryIT {
             var existing=baseline(store);
             assertThat(existing).as("unchanged helper behavior under collection-local collation").containsExactly(view);
             assertThat(store.listReadable()).as("optimized typed list must preserve existing collation results").containsExactlyElementsOf(existing);
+            assertThat(store.readableInventory().exactLookupIds()).containsExactly("Alias");
         } finally {db.drop();}
     }
     @Test void mongoRetainsNumericCollectionCollation() throws Exception {
@@ -127,6 +128,7 @@ class ReadableArtifactInventoryIT {
             var existing=baseline(store);
             assertThat(existing).containsExactly(view);
             assertThat(store.listReadable()).containsExactlyElementsOf(existing);
+            assertThat(store.readableInventory().exactLookupIds()).containsExactly("item02");
         } finally {db.drop();}
     }
     @Test void mongoUsesHistoricalCollationAfterConcurrentCollectionRecreation() {

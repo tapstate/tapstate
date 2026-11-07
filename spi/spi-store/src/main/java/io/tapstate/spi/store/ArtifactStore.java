@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * The artifact truth layer: the canonical, authoritative store of the resources a workspace applies.
@@ -22,13 +23,22 @@ import java.util.Optional;
  */
 public interface ArtifactStore {
 
-    /** One operation's readable resources and, when supplied by a decorator, its redaction catalog. */
+    /**
+     * One operation's readable resources and optional redaction catalog.
+     * Exact lookup IDs are keys the store resolved to those same resources in this snapshot.
+     */
     record ReadableInventory(List<Resource> resources,
-            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId) {
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId,
+            Set<String> exactLookupIds) {
         public ReadableInventory {
             resources = List.copyOf(resources);
             Objects.requireNonNull(connectorCatalog);
             Objects.requireNonNull(managedDefaultSourceId);
+            exactLookupIds = Set.copyOf(exactLookupIds);
+        }
+        public ReadableInventory(List<Resource> resources, Optional<io.tapstate.core.catalog.TapstateCatalog> catalog,
+                Optional<String> managedDefaultSourceId) {
+            this(resources, catalog, managedDefaultSourceId, Set.of());
         }
         public ReadableInventory(List<Resource> resources, Optional<io.tapstate.core.catalog.TapstateCatalog> catalog) {
             this(resources, catalog, Optional.empty());

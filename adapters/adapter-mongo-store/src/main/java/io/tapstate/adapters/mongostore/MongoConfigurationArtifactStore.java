@@ -483,6 +483,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     @Override
     public List<Resource> listReadable() {
+        return readableInventory().resources();
+    }
+
+    @Override
+    public ReadableInventory readableInventory() {
         return readSnapshot(session -> {
             List<Document> stored = documents(session);
             Set<String> populated = new HashSet<>();
@@ -496,6 +501,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                 }
             }
             List<Resource> resources = new ArrayList<>();
+            Set<String> exactLookupIds = new HashSet<>();
             for (Document document : stored) {
                 String id = document.getString("_id");
                 if (!readable.containsKey(id)) continue;
@@ -505,13 +511,17 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
                     Document found = find(session, id, populated);
                     if (found != null) {
                         Resource resource = readable.get(found.getString("_id"));
-                        if (resource != null) resources.add(resource);
+                        if (resource != null) {
+                            resources.add(resource);
+                            // Only this key was proven to resolve to itself under every collection's collation.
+                            if (id.equals(resource.id())) exactLookupIds.add(id);
+                        }
                     }
                 } catch (TapstateException failure) {
                     if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
                 }
             }
-            return List.copyOf(resources);
+            return new ReadableInventory(resources, Optional.empty(), Optional.empty(), exactLookupIds);
         });
     }
 

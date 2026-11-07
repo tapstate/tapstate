@@ -157,7 +157,8 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }
         TapstateCatalog captured = inventory.connectorCatalog().orElseGet(catalog);
         inventory.resources().forEach(resource -> track(resource, () -> captured));
-        return new ReadableInventory(inventory.resources(), Optional.of(captured), inventory.managedDefaultSourceId());
+        return new ReadableInventory(inventory.resources(), Optional.of(captured), inventory.managedDefaultSourceId(),
+                inventory.exactLookupIds());
     }
 
     @Override
