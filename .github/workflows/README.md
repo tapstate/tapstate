@@ -132,8 +132,10 @@ both repositories). Select `minor`, `patch`, or `major`; the version calculator
 uses the tagged `main` history so an unmerged feature branch does not need a
 release tag ancestor. The selected ref still supplies the Tapstate and Web source.
 Dev runs create no Git tags or releases. Main may replace the shared candidate
-version's `-dev` tag; each feature build publishes a tag with the Tapstate source
-SHA suffix for manual validation without changing main's image or the dev catalog.
+version's `-dev` tag. A `develop` build publishes and registers a tag with the
+Tapstate source SHA suffix; its new ACTIVE catalog entry can become the default
+for new subscriptions. Other feature branches publish source-specific tags for
+manual validation without changing the catalog.
 
 | Lane | Image | Version tag policy |
 | --- | --- | --- |
@@ -167,8 +169,9 @@ Version registration uses these additional `cloud-ghcr-dev` environment settings
 | `CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV` | Repository or environment Secret | The same static token configured on the dev Cloud control plane |
 
 The workflow validates this configuration before building the image. After a
-successful public push and digest readback, it registers `<version>-dev` with the
-main and Web revisions, image tag, digest reference, and workflow run URL. The
+successful public push and digest readback, it registers `<version>-dev` for
+main or `<version>-dev-<source-sha>` for develop with the actual branch, Web
+revision, image tag, digest reference, and workflow run URL. The
 caller rejects production endpoints and checks the returned record against the
 published image. It never follows redirects, logs credential-bearing response
 bodies, or retries a write whose delivery is uncertain. The API returns HTTP 409
