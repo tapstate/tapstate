@@ -891,7 +891,10 @@ class MongoSrsConsumerStoreIT {
             var checkpoint = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id",A.key().pipelineId())).first();
             var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(new Document("_id",WorkloadClaimDocuments.live(f.fenceA()).get("_id"))).first();
             try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(),f.database().getName(),"update","srs_consumer_offsets")) {
-                var guarded = new MongoSrsConsumerStore(witness.client,witness.database,SCOPE).guardedBy(witness::refuseAfterCommand);
+                var store = operation.equals("ack") || operation.equals("read")
+                        ? runtimeConsumer(witness.client, witness.database)
+                        : new MongoSrsConsumerStore(witness.client, witness.database, SCOPE);
+                var guarded = store.guardedBy(witness::refuseAfterCommand);
                 assertThatThrownBy(() -> {
                     switch (operation) {
                         case "begin" -> guarded.beginWriterRun(A,1,"run",Map.of("orders",List.of("writer")),f.fenceA());
@@ -1158,6 +1161,53 @@ class MongoSrsConsumerStoreIT {
         return Map.copyOf(refs);
     }
     private static String ring(String table) { return "srs." + CHAIN + "." + table; }
+
+    @Test void incrementalBatchKeepsSchemaBoundariesAndOriginalProgressFences() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().startReadingAfter(A, member.revision(), 0, "orders", -1, f.fenceA())).isTrue();
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 1, new SrsSnapshotPin(1, "seam", refs), f.fenceA())).isTrue();
+            assertThat(f.consumers().beginWriterRun(A, member.revision(), "run", Map.of("orders", List.of("sink")), f.fenceA())).isTrue();
+            var scope = new io.tapstate.spi.store.PipelineIntentScope(
+                    SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), A.key().pipelineId(), A.stateGeneration());
+            var run = io.tapstate.spi.store.SrsConsumerRun.of(scope, member);
+            var ring = ring("orders");
+            var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 1), ring,
+                    new SourceTable("orders", List.of(new SourceField("id", "long")), List.of(), List.of()), 100);
+            models(f).publish(next, f.captureFence());
+            var store = runtimeConsumer(f.client(), f.database());
+            var beforeDdl = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(99, 1, 0, f.captureFence());
+            var afterDdl = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(100, 1, 1, f.captureFence());
+            var wrongSchema = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(100, 1, 0, f.captureFence());
+            var changed = f.captureFence();
+            var wrongCapture = new WorkloadClaimFence(changed.key(), changed.owner(), changed.claimGeneration() + 1,
+                    changed.executionGeneration(), changed.topologyRevision());
+            assertThat(store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, afterDdl))).isTrue();
+            assertThatThrownBy(() -> store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, wrongSchema)))
+                    .satisfies(error -> code(error, IoError.SRS_EVENT_MODEL_UNAVAILABLE));
+            assertThatThrownBy(() -> store.verifyReadEvents(run, "orders", ring, List.of(afterDdl,
+                    new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(101, 1, 1, wrongCapture))))
+                    .satisfies(error -> code(error, IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(store.advanceReadSequence(A, member.revision(), "orders", 100, f.fenceA())).isTrue();
+            assertThat(store.advanceWriter(A, member.revision(), "run", "orders", "sink", point(1, 100, "t100"), f.fenceA())).isTrue();
+            var before = cursor(f, A);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(f.fenceA().key())),
+                    new Document("$inc", new Document("executionGeneration", 1L)));
+            assertThatThrownBy(() -> store.advanceReadSequence(A, member.revision(), "orders", 101, f.fenceA()))
+                    .satisfies(error -> code(error, IoError.WORKLOAD_CLAIM_FENCED));
+            assertThatThrownBy(() -> store.advanceWriter(A, member.revision(), "run", "orders", "sink", point(1, 101, "t101"), f.fenceA()))
+                    .satisfies(error -> code(error, IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(cursor(f, A)).isEqualTo(before);
+        });
+    }
+
+    private static MongoSrsConsumerStore runtimeConsumer(MongoClient client, MongoDatabase database) {
+        var structure = new MongoCacheMetadataStructure(database, Duration.ofHours(1));
+        structure.verifySrsRuntime();
+        return MongoSrsConsumerStore.admittedRuntime(client, database, SCOPE, () -> {}, structure::verifySrs);
+    }
 
     @Test void fusedReadKeepsTheHistoricalModelAndItsExactEffectiveRange() {
         withBusiness(f->{

@@ -28,7 +28,21 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
     }
     @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
         if (ring == null || ring.isBlank()) throw new IllegalArgumentException("blank original ring");
-        var bound = ScopedSrsConsumerAccess.bind(member,run); var models = bound.models().guardedBy(bound.requireActive());
+        var bound = ScopedSrsConsumerAccess.bind(member,run);
+        if (bound.store().supportsReadBatchVerification()) {
+            return (io.tapstate.runtime.srs.SrsEventModelVerifier.Batch) (items, firstSequence) -> {
+                bound.requireClaim(null);
+                var events = new java.util.ArrayList<io.tapstate.spi.store.SrsConsumerStore.ReadEvent>(items.size());
+                long sequence = firstSequence;
+                for (var item : items) {
+                    events.add(new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(
+                            sequence++, item.epoch(), item.schemaVer(), item.captureFence()));
+                }
+                if (!bound.store().verifyReadEvents(run, table, ring, events)) throw ScopedSrsConsumerAccess.refused(run);
+                bound.requireClaim(null);
+            };
+        }
+        var models = bound.models().guardedBy(bound.requireActive());
         if(bound.store().supportsReadEventVerification())return (item,sequence)->{
             bound.requireClaim(null);
             var model=bound.store().verifyReadEvent(run,table,ring,sequence,item.epoch(),item.schemaVer(),item.captureFence())

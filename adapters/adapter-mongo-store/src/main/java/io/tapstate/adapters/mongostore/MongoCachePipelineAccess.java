@@ -242,9 +242,13 @@ final class MongoCachePipelineAccess {
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {
+        return state(session, false);
+    }
+
+    Document state(ClientSession session, boolean structureChecked) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         validateState(state);
-        requirePreparedClaim(session);
+        requirePreparedClaim(session, structureChecked);
         return state;
     }
 
@@ -256,8 +260,8 @@ final class MongoCachePipelineAccess {
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
     }
 
-    private void requirePreparedClaim(ClientSession session) {
-        MongoCacheWorkloadClaimStore.requireCollection(database);
+    private void requirePreparedClaim(ClientSession session, boolean structureChecked) {
+        if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         Document row = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
@@ -299,13 +303,17 @@ final class MongoCachePipelineAccess {
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
     }
 
-    void proveClaim(ClientSession session) { proveClaim(session,"fencedPipelineWrites"); }
+    void proveClaim(ClientSession session) { proveClaim(session,"fencedPipelineWrites",false); }
 
-    void proveConsumerClaim(ClientSession session) { proveClaim(session,"fencedConsumerWrites"); }
+    void proveConsumerClaim(ClientSession session) { proveConsumerClaim(session,false); }
 
-    private void proveClaim(ClientSession session,String counter) {
+    void proveConsumerClaim(ClientSession session, boolean structureChecked) {
+        proveClaim(session,"fencedConsumerWrites",structureChecked);
+    }
+
+    private void proveClaim(ClientSession session,String counter,boolean structureChecked) {
         if (original == null) throw fenced();
-        MongoCacheWorkloadClaimStore.requireCollection(database);
+        if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
         if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
                         .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
                 new Document("$inc",new Document(counter,1L))).getMatchedCount() != 1) throw claimFenced();

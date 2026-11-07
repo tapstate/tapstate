@@ -326,7 +326,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             });
         }
         @Bean SrsStores nativeSrsStores(NativeBusinessContext owner) {
-            return owner.original.cache().srs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
+            return owner.original.cache().runtimeSrs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
         }
         @Bean SrsLogStore srsLogStore(SrsStores stores) { return stores.log(); }
         @Bean WorkloadClaimStore workloadClaimStore(NativeBusinessContext owner) {

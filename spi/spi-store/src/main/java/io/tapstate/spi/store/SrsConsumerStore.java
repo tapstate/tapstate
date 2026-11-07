@@ -33,6 +33,15 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("read event verification is not supported");
     }
 
+    record ReadEvent(long sequence, long epoch, long version, WorkloadClaimFence capture) {}
+
+    default boolean supportsReadBatchVerification() { return false; }
+
+    /** Verifies every event against one view of the original consumer and its models. */
+    default boolean verifyReadEvents(SrsConsumerRun run, String table, String ring, java.util.List<ReadEvent> events) {
+        throw new UnsupportedOperationException("read batch verification is not supported");
+    }
+
     /** Freezes the original current view and one store-issued completed CONFIG full. */
     default SrsFreshFullPreparation inspectFreshFull(CompletedPipelineFull full, SrsConsumerRun original, long expectedProgressRevision,
             WorkloadClaimFence originalNode, WorkloadClaimFence originalCapture) {

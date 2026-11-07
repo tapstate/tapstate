@@ -272,8 +272,7 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
         // for the loads they could overtake: the ring keeps them, in order, until the gate opens.
         if (ringTail != null && !awaitingSnapshot && !holding && openReader()) {
             try {
-                reader.fill((item, seq) -> {
-                    modelVerifier.verify(item,seq);
+                reader.fill(modelVerifier, (item, seq) -> {
                     SourceOrder order = orderOf(item, seq);
                     Envelope row = SrsProjection.toEnvelope(item, src, order);
                     arrivals.received(src, row);
