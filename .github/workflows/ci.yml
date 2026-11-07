@@ -168,6 +168,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
+          case "$SHARD" in
+            app-1|app-2|rest)
+              export MAVEN_ARGS="$MAVEN_ARGS -DforkCount=2"
+              ;;
+          esac
           if [[ "$SHARD" == e2e-* ]]; then
             export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
           fi
