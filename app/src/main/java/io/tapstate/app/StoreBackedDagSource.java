@@ -1151,6 +1151,11 @@ final class StoreBackedDagSource implements DagSource {
     List<String> copySourceSchemas(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        return copySourceSchemas(pipeline);
+    }
+
+    private List<String> copySourceSchemas(PipelineResource pipeline) {
+        String pipelineId = pipeline.id();
         List<String> copied = new ArrayList<>();
         for (String sourceId : pipeline.sourceIds()) {
             if (artifacts().managedDefaultSourceId().filter(sourceId::equals).isPresent())
@@ -1629,6 +1634,11 @@ final class StoreBackedDagSource implements DagSource {
     void refreshStepSchemas(String pipelineId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        refreshStepSchemas(pipeline);
+    }
+
+    private void refreshStepSchemas(PipelineResource pipeline) {
+        String pipelineId = pipeline.id();
         Map<String, SourceVertex> vertices = sourceVertices(pipeline, true);
         Map<String, String> keysByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> keysBySource = sourceKeysById(vertices);
@@ -1650,6 +1660,52 @@ final class StoreBackedDagSource implements DagSource {
         }
         recordStepSchemas(pipelineId, deriveSteps(pipeline, vertices, keysByTable, keysBySource,
                 steps, compiled, copied, incomplete));
+    }
+
+    /** Keep publication's derivation local until all changes can share the original write fence. */
+    void recordPublishedModels(String pipelineId, io.tapstate.control.core.SchemaDerivation.PublishedInputs inputs,
+            io.tapstate.spi.store.DerivedSchemaStore records) {
+        ArtifactStore captured = new ArtifactStore() {
+            @Override public Optional<String> managedDefaultSourceId() { return inputs.managedSource(); }
+            @Override public Optional<Resource> get(String id) { return Optional.ofNullable(inputs.definitions().get(id)); }
+            @Override public List<Resource> list() { return List.copyOf(inputs.definitions().values()); }
+            @Override public void saveAll(List<Resource> resources) { throw new UnsupportedOperationException(); }
+        };
+        var pending = new LinkedHashMap<String, io.tapstate.spi.store.DerivedSchema>();
+        var changes = new ArrayList<io.tapstate.spi.store.DerivedSchemaStore.Change>();
+        io.tapstate.spi.store.DerivedSchemaStore staged = new io.tapstate.spi.store.DerivedSchemaStore() {
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String pipeline, String step) {
+                var value = pending.get(step);
+                return value == null ? records.latest(pipeline, step) : Optional.of(value);
+            }
+            @Override public Map<String, io.tapstate.spi.store.DerivedSchema> latestMany(String pipeline, Set<String> steps) {
+                var result = new LinkedHashMap<String, io.tapstate.spi.store.DerivedSchema>();
+                var missing = new LinkedHashSet<String>();
+                for (String step : steps) {
+                    var value = pending.get(step);
+                    if (value == null) missing.add(step);
+                    else result.put(step, value);
+                }
+                if (!missing.isEmpty()) result.putAll(records.latestMany(pipeline, missing));
+                return result;
+            }
+            @Override public void record(String pipeline, String step, Map<String, String> columns,
+                    String statement, String from, String by) {
+                var value = new io.tapstate.spi.store.DerivedSchema(0, columns, statement, from, by);
+                changes.add(new Change(step, value));
+                pending.put(step, value);
+            }
+            @Override public void pin(String pipeline, String step, long version) { throw new UnsupportedOperationException(); }
+            @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String pipeline, String step) { throw new UnsupportedOperationException(); }
+            @Override public void delete(String pipeline) { throw new UnsupportedOperationException(); }
+        };
+        var deriving = new StoreBackedDagSource(storePort, sinkWriterBinder, nestSettings, storeReachability,
+                sourcePlacement, captured, requireMarkedStore, members, parallelismBudget, staged,
+                source -> SourceDiscovery.matched(inputs.models().getOrDefault(source.id(), Optional.empty()), source));
+        var pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(captured, pipelineId), captured);
+        deriving.copySourceSchemas(pipeline);
+        deriving.refreshStepSchemas(pipeline);
+        records.recordMany(pipelineId, changes);
     }
 
     /**

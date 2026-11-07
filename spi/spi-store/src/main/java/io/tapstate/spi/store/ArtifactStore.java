@@ -49,6 +49,11 @@ public interface ArtifactStore {
         return new ReadableInventory(listReadable(), Optional.empty());
     }
 
+    /** A complete draft dependency slice, including the original target if it exists. */
+    default Optional<ReadableInventory> draftPublicationInventory(io.tapstate.core.model.PipelineResource candidate) {
+        return Optional.empty();
+    }
+
     /** Typed point read with the same display facts as the daily inventory. */
     default ReadableInventory readableInventory(String kind, String id) {
         var resource = get(id).filter(value -> kind.equals(value.kind()));

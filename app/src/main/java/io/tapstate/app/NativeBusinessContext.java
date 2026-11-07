@@ -169,6 +169,24 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
+        return modelCommand(pipeline, ownership, false);
+    }
+
+    private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership,
+            boolean publication) {
+        if (publication) {
+            memberStorage.requireNode();
+            var captured = port.draftAuthoringScope(pipeline);
+            if (captured.isPresent()) {
+                var scope = captured.orElseThrow();
+                var models = configuration.publicationAuthoringModels(scope);
+                var node = context.getBean(NodeSessionLease.class).currentFence().orElseThrow(ThreeLayerStorePort::refused);
+                var command = ownership.unpreparedControl(scope);
+                Runnable guard = () -> { memberStorage.requireNode(); command.requireActive(); };
+                try { return new StoreBackedDerivedSchemas.Command(port.forUnpreparedControl(models, node, guard), command::close); }
+                catch (RuntimeException | Error failed) { command.close(); throw failed; }
+            }
+        }
         var live = new LivePipelines(port.desired(), port.state());
         Runnable resting = () -> {
             memberStorage.requireNode();
@@ -293,7 +311,14 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     static class Wiring {
         @Bean StoreBackedDerivedSchemas nativeDerivedSchemas(NativeBusinessContext owner, AuditGate audit,
                 PipelineActuationOwnership ownership) {
-            return new StoreBackedDerivedSchemas(owner.port, audit, pipeline -> owner.modelCommand(pipeline, ownership));
+            return new StoreBackedDerivedSchemas(owner.port, audit, new StoreBackedDerivedSchemas.Commands() {
+                @Override public StoreBackedDerivedSchemas.Command bind(String pipeline) {
+                    return owner.modelCommand(pipeline, ownership);
+                }
+                @Override public StoreBackedDerivedSchemas.Command bindPublication(String pipeline) {
+                    return owner.modelCommand(pipeline, ownership, true);
+                }
+            });
         }
         @Bean SrsStores nativeSrsStores(NativeBusinessContext owner) {
             return owner.original.cache().srs(owner.original.preparation().businessScope(), owner.original::requireBusiness);

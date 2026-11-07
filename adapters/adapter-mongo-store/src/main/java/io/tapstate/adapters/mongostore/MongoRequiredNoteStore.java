@@ -175,6 +175,67 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         } else initialize(session,owner,true);
     }
 
+    /** All owners were derived from the publication's original CONFIG transaction. */
+    void reservePublication(ClientSession session, Document cluster, Document operator, RequiredNoteOwner global,
+            List<RequiredNoteOwner> known, List<RequiredNoteOwner> added) {
+        requireOrdinary();
+        var description = database.listCollections()
+                .filter(new Document("name", SystemCollections.PDK_NOTE_SCOPES.collectionName())).first();
+        var options = description == null ? null : description.get("options", Document.class);
+        if (known.size() + added.size() > 128 || options != null && options.containsKey("collation")) {
+            open(session, global);
+            for (var owner : known) reserveAuthoring(session, owner, true);
+            for (var owner : added) reserveAuthoring(session, owner, false);
+            return;
+        }
+        checkBinding(cluster, global);
+        var owners = new java.util.LinkedHashMap<Document, RequiredNoteOwner>();
+        owners.put(scopeId(global), global);
+        for (var owner : known) owners.put(scopeId(owner), owner);
+        for (var owner : added) owners.putIfAbsent(scopeId(owner), owner);
+        var rows = new java.util.HashMap<Document, Document>();
+        for (var row : scopes.find(session, new Document("_id", new Document("$in", List.copyOf(owners.keySet()))))) {
+            if (!(row.get("_id") instanceof Document key) || !owners.containsKey(key) || rows.put(key, row) != null)
+                throw unavailable();
+        }
+        scopeOf(global, rows.get(scopeId(global)));
+        for (var owner : known) scopeOf(owner, rows.get(scopeId(owner)));
+        MongoCacheRecoveryFacts.read(operator);
+        if (added.isEmpty()) return;
+        cipherForWrite(session);
+        var fresh = new java.util.LinkedHashMap<Document, Document>();
+        for (var owner : added) {
+            var key = scopeId(owner);
+            var existing = rows.get(key);
+            if (existing != null) scopeOf(owner, existing);
+            else fresh.putIfAbsent(key, new Document("_id", key).append("ownerKind", owner.kind().name())
+                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
+                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L));
+        }
+        if (!fresh.isEmpty()) refusePublicationRetainedFacts(session, global.bindingVersion(), fresh.keySet().stream()
+                .map(key -> key.getString("namespace")).toList());
+        var owner = added.getFirst();
+        var fence = operator.getLong("noteWriteFence");
+        var filter = new Document("_id", owner.ownerId()).append("stateGeneration", owner.stateGeneration())
+                .append("phase", "ACTIVE").append("noteWriteFence", fence);
+        if (operators.updateOne(session, filter, new Document("$inc", new Document("noteWriteFence", (long) added.size())))
+                .getMatchedCount() != 1) throw unavailable();
+        if (!fresh.isEmpty()) scopes.insertMany(session, List.copyOf(fresh.values()));
+    }
+
+    private void refusePublicationRetainedFacts(ClientSession session, long binding, List<String> namespaces) {
+        var names = new Document("$in", namespaces);
+        var prefix = new Document("_id.bindingVersion", binding).append("_id.namespace", names);
+        var projection = new Document("_id", 1);
+        if (notes.find(session, prefix).projection(projection).first() != null
+                || origins.find(session, prefix).projection(projection).first() != null
+                || migrations.find(session, prefix).projection(projection).first() != null
+                || carryRows.find(session, new Document("$or", List.of(
+                        new Document("_id.sourceBindingVersion", binding).append("_id.sourceNamespace", names),
+                        new Document("_id.sharedBindingVersion", binding).append("_id.sharedNamespace", names))))
+                        .projection(projection).first() != null) throw unavailable();
+    }
+
     private void refuseRetainedFacts(ClientSession session, RequiredNoteOwner owner) {
         Document prefix = new Document("_id.bindingVersion", owner.bindingVersion())
                 .append("_id.namespace", owner.namespace());
@@ -903,6 +964,10 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
 
     private void checkBinding(ClientSession session, RequiredNoteOwner owner) {
         Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+        checkBinding(cluster, owner);
+    }
+
+    private void checkBinding(Document cluster, RequiredNoteOwner owner) {
         if (cluster == null || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
                 || !Long.valueOf(owner.bindingVersion()).equals(cluster.get("bindingVersion"))) throw unavailable();
         if (owner.kind() == RequiredNoteOwner.Kind.GLOBAL && !owner.ownerId().equals(cluster.get("clusterId"))) {

@@ -659,6 +659,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         if(recovery.isPresent() && !recovery.orElseThrow().targetScope().equals(scope))throw MongoCachePipelineAccess.fenced();
         return new AuthoringModels(this, scope, previous,recovery);
     }
+
+    public AuthoringModels publicationAuthoringModels(io.tapstate.spi.store.PipelineIntentScope scope) {
+        requireOpen();
+        var facts = ((MongoPipelineStatePreparations) preparations()).authoringFacts(scope);
+        return new AuthoringModels(this, scope, facts.predecessor(), facts.recovery());
+    }
     public static final class AuthoringModels {
         private final MongoConfigurationDomain owner;
         private final io.tapstate.spi.store.PipelineIntentScope scope;
@@ -676,6 +682,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             owner.requireOpen();
             if (!predecessor.equals(((MongoPipelineStatePreparations) owner.preparations()).authoringPredecessor(scope))
                     || !recovery.equals(owner.cacheRecoveries().read(scope.pipelineId())))
+                throw MongoCachePipelineAccess.fenced();
+        }
+        void requirePublicationActive() {
+            owner.requireOpen();
+            var current = ((MongoPipelineStatePreparations) owner.preparations()).authoringFacts(scope);
+            if (!predecessor.equals(current.predecessor()) || !recovery.equals(current.recovery()))
                 throw MongoCachePipelineAccess.fenced();
         }
         @Override public String toString() { return "AuthoringModels[original]"; }

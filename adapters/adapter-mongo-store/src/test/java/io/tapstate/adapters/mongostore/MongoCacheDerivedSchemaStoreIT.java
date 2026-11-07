@@ -142,6 +142,43 @@ class MongoCacheDerivedSchemaStoreIT {
         });
     }
 
+    @Test void publicationBatchKeepsHistoryAndPinsWithOneHistoryReadAndOneWrite() {
+        withFixture(f -> {
+            var writer = f.writer();
+            record(writer, "text");
+            writer.pin("orders", "source.orders", 0);
+            var historyReads = new java.util.concurrent.atomic.AtomicInteger();
+            var historyWrites = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database.getName())) return;
+                    var table = event.getCommand().get(event.getCommandName());
+                    if (table == null || !table.isString()
+                            || !table.asString().getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) return;
+                    if (event.getCommandName().equals("find")) historyReads.incrementAndGet();
+                    if (event.getCommandName().equals("update")) historyWrites.incrementAndGet();
+                }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var batch = new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client,
+                        client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE));
+                batch.recordMany("orders", List.of(
+                        new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("text"), "edited", "source", "v2")),
+                        new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("varchar"), "changed", "source", "v3")),
+                        new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("text"), "new", "source", "v1"))));
+            }
+            assertThat(historyReads).hasValue(1);
+            assertThat(historyWrites).hasValue(1);
+            assertThat(writer.pinned("orders", "source.orders").orElseThrow().derivedBy()).isEqualTo("v2");
+            assertThat(writer.latest("orders", "source.orders").orElseThrow().version()).isEqualTo(1);
+            assertThat(writer.latest("orders", "source.customers").orElseThrow().version()).isZero();
+        });
+    }
+
     @Test void readOnlyViewsAndUnknownPinsCannotMutateEitherTheClaimStateOrModels() {
         withFixture(f -> {
             var reader = f.domain.pipelineDerivedSchemas(SCOPE); var before = f.snapshot();

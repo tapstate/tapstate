@@ -55,6 +55,29 @@ final class ThreeLayerStorePort implements StorePort {
         if (control != null) control.active().run();
     }
     CacheBusinessScope business() { return bound.preparation().businessScope(); }
+
+    void requirePublishedGeneration(String pipelineId, long generation) {
+        bound.requireBusiness();
+        if (control == null || !control.scope().pipelineId().equals(pipelineId)
+                || control.scope().stateGeneration() != generation) throw refused();
+    }
+
+    /** For an unprepared publication, existence, generation and intent share one CONFIG snapshot. */
+    Optional<PipelineIntentScope> draftAuthoringScope(String pipelineId) {
+        bound.requireBusiness();
+        var header = configuration.pipelineDisplayHeaders(List.of(pipelineId), true).get(pipelineId);
+        if (header == null || header.recovering()
+                || header.preparation().phase() != PipelinePreparation.Phase.UNASSIGNED) return Optional.empty();
+        var scope = activeScope(pipelineId, header.mapping());
+        if (header.intentFailure().isPresent()) throw header.intentFailure().orElseThrow();
+        var desired = header.desired().orElse(null);
+        if (!io.tapstate.control.core.LivePipelines.isAtRest(null, desired)) {
+            throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
+                    Map.of("pipeline", scope.pipelineId(), "state", PipelineState.NEW.name(),
+                            "desired", desired.targetState().name()), null);
+        }
+        return Optional.of(scope);
+    }
     Runnable readingGuard(String pipeline) {
         active();long revision=configuration.configurationRevision();var original=scope(pipeline);
         return () -> {active();if(revision!=configuration.configurationRevision() || !original.equals(scope(pipeline)))throw refused();};

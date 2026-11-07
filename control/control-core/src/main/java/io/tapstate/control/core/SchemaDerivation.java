@@ -1,5 +1,10 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.model.Resource;
+import io.tapstate.spi.store.DiscoveredSourceModel;
+import java.util.Map;
+import java.util.Optional;
+
 /**
  * Works a pipeline's own model out again from the world it reads, and records it.
  *
@@ -31,6 +36,18 @@ public interface SchemaDerivation {
      * allowed, and the start that needs the model refuses on its own.
      */
     void derive(String pipelineId);
+
+    record PublishedInputs(Map<String, Resource> definitions, Map<String, Optional<DiscoveredSourceModel>> models,
+            Optional<String> managedSource) {
+        public PublishedInputs {
+            definitions = Map.copyOf(definitions);
+            models = Map.copyOf(models);
+        }
+    }
+
+    default void derivePublishedDraft(String pipelineId, PublishedInputs inputs, long stateGeneration) {
+        derive(pipelineId);
+    }
 
     /** Derives nothing, for an assembly that runs no derivation. Named, never defaulted. */
     static SchemaDerivation none() {

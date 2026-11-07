@@ -144,6 +144,11 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return trackInventory(delegate.readableInventory());
     }
 
+    @Override public synchronized Optional<ReadableInventory> draftPublicationInventory(
+            io.tapstate.core.model.PipelineResource candidate) {
+        return delegate.draftPublicationInventory(candidate).map(this::trackInventory);
+    }
+
     @Override public synchronized ReadableInventory readableInventory(String kind) {
         return trackInventory(delegate.readableInventory(kind));
     }

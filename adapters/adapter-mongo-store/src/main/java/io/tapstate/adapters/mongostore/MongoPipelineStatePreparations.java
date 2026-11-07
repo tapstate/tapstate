@@ -132,8 +132,22 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         transaction(session -> { requireCurrent(session,scope); verifyInputs(session,scope,inputs); return null; });
     }
     Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor(PipelineIntentScope scope) {
+        return transaction(session -> authoringPredecessor(scope, requireCurrent(session, scope)));
+    }
+
+    record AuthoringFacts(Optional<io.tapstate.spi.store.PipelineRetirementResult> predecessor,
+            Optional<io.tapstate.spi.store.PipelineCacheRecovery> recovery) {}
+
+    AuthoringFacts authoringFacts(PipelineIntentScope scope) {
         return transaction(session -> {
             Document row = requireCurrent(session, scope);
+            var recovery = MongoCacheRecoveryFacts.read(row);
+            if (recovery.isPresent() && !recovery.orElseThrow().targetScope().equals(scope)) throw fenced();
+            return new AuthoringFacts(authoringPredecessor(scope, row), recovery);
+        });
+    }
+
+    private Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor(PipelineIntentScope scope, Document row) {
             if (MongoPipelinePreparationFacts.decode(scope.pipelineId(), row, clusterId).phase() != PipelinePreparation.Phase.UNASSIGNED) throw fenced();
             if (MongoCacheRecoveryFacts.read(row).filter(value -> value.targetScope().equals(scope)).isPresent()) return Optional.empty();
             if (!row.containsKey("retirement")) {
@@ -145,7 +159,6 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
                     || !original.scope().pipelineId().equals(scope.pipelineId()) || !original.scope().clusterId().equals(scope.clusterId())
                     || original.scope().bindingVersion() != scope.bindingVersion()) throw fenced();
             return Optional.of(original);
-        });
     }
     void requireRetiredPredecessor(PipelineIntentScope scope, PipelineIntentScope earlier) {
         transaction(session -> {

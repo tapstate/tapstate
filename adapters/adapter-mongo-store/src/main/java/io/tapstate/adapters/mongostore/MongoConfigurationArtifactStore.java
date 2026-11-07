@@ -170,6 +170,56 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         reservePrivateScopes(session, before, requested);
     }
 
+    /** Draft publication changes one Pipeline and therefore only that Pipeline's private identities. */
+    long publishPipelineInTransaction(ClientSession session, PipelineResource pipeline, String expectedHash,
+            Map<String, String> dependencies) {
+        var snapshot = new LinkedHashMap<String, Optional<Document>>();
+        var ids = new java.util.LinkedHashSet<>(dependencies.keySet());
+        ids.add(pipeline.id());
+        if (ids.size() <= 128) publicationRows(session, ids, false, pipeline.id()).ifPresent(found ->
+                ids.forEach(id -> snapshot.put(id, Optional.ofNullable(found.get(id)))));
+        java.util.function.Function<String, Document> captured = id -> snapshot.computeIfAbsent(id,
+                key -> Optional.ofNullable(find(session, key))).orElse(null);
+        Document observed = captured.apply(pipeline.id());
+        Resource existing = observed == null ? null : decode(observed);
+        if (existing != null && !(existing instanceof PipelineResource)
+                || !Objects.equals(expectedHash, existing == null ? null : CanonicalHash.of(existing))) return 0;
+
+        ConfigurationVersion.advance(session, versions, client);
+        for (var expected : dependencies.entrySet()) {
+            Document row = captured.apply(expected.getKey());
+            if (row == null || !expected.getValue().equals(row.getString("contentHash")))
+                throw new Refused(expected.getKey(), ArtifactMutation.VERSION_CONFLICT);
+        }
+        requireRebuildDependenciesUnchanged(session, Set.of(pipeline.id()));
+        Set<PipelineConnectorNodes.Identity> before = existing instanceof PipelineResource old
+                ? privateNodes(old, captured) : Set.of();
+        var after = privateNodes(pipeline, captured);
+        ArtifactWrite write = expectedHash == null ? ArtifactWrite.createOnly(pipeline)
+                : ArtifactWrite.replaceOnly(pipeline, expectedHash);
+        write(session, write, observed);
+        return reservePublishedScopes(session, pipeline.id(), before, after);
+    }
+
+    private long reservePublishedScopes(ClientSession session, String pipeline,
+            Set<PipelineConnectorNodes.Identity> prior, Set<PipelineConnectorNodes.Identity> current) {
+        if (prior.isEmpty() && current.isEmpty()) return MongoPipelineStateMappings.decode(pipeline,
+                mappings.find(session, new Document("_id", pipeline)).first()).stateGeneration();
+        var cluster = identity.find(session, new Document("_id", "cluster")).first();
+        if (cluster == null || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
+                || !(cluster.get("bindingVersion") instanceof Long binding) || binding < 1
+                || !(cluster.get("clusterId") instanceof String clusterId) || clusterId.isBlank())
+            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+        var operator = stateMappings.requireActiveRow(session, pipeline);
+        long generation = MongoPipelineStateMappings.decode(pipeline, operator).stateGeneration();
+        var global = new RequiredNoteOwner(binding, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, clusterId, 0);
+        var known = prior.stream().map(node -> RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), generation)).toList();
+        var added = current.stream().filter(node -> !prior.contains(node))
+                .map(node -> RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), generation)).toList();
+        notes.reservePublication(session, cluster, operator, global, known, added);
+        return generation;
+    }
+
     boolean belongsTo(MongoClient expected,String database) {
         return client == expected && versions.getNamespace().getDatabaseName().equals(database);
     }
@@ -317,15 +367,19 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         Map<String, Set<PipelineConnectorNodes.Identity>> result = new LinkedHashMap<>();
         for (Document row : read(session, collection("pipeline"), "pipeline")) {
             PipelineResource pipeline = (PipelineResource) decode(row);
-            result.put(pipeline.id(), PipelineConnectorNodes.of(pipeline, id -> {
-                Document definition = find(session, id);
-                if (definition == null || !"serve".equals(definition.getString("kind"))) {
-                    throw unreadable(id, "serveDefinition");
-                }
-                return decode(definition);
-            }));
+            result.put(pipeline.id(), privateNodes(pipeline, id -> find(session, id)));
         }
         return result;
+    }
+
+    private Set<PipelineConnectorNodes.Identity> privateNodes(PipelineResource pipeline,
+            java.util.function.Function<String, Document> lookup) {
+        return PipelineConnectorNodes.of(pipeline, id -> {
+            Document definition = lookup.apply(id);
+            if (definition == null || !"serve".equals(definition.getString("kind")))
+                throw unreadable(id, "serveDefinition");
+            return decode(definition);
+        });
     }
 
     /** The first committed capture control reserves this known-new shared namespace in its CONFIG transaction. */
@@ -342,6 +396,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         Set<String> writtenPipelines = new HashSet<>();
         requested.stream().map(ArtifactWrite::resource).filter(PipelineResource.class::isInstance)
                 .forEach(resource -> writtenPipelines.add(resource.id()));
+        reservePrivateScopes(session, before, after, writtenPipelines);
+    }
+
+    private void reservePrivateScopes(ClientSession session, Map<String, Set<PipelineConnectorNodes.Identity>> before,
+            Map<String, Set<PipelineConnectorNodes.Identity>> after, Set<String> writtenPipelines) {
         for (var entry : after.entrySet()) {
             Set<PipelineConnectorNodes.Identity> prior = before.getOrDefault(entry.getKey(), Set.of());
             Set<PipelineConnectorNodes.Identity> current = entry.getValue();
@@ -371,8 +430,11 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     }
 
     private void write(ClientSession session, ArtifactWrite write) {
+        write(session, write, find(session, write.resource().id()));
+    }
+
+    private void write(ClientSession session, ArtifactWrite write, Document observed) {
         Resource resource = write.resource();
-        Document observed = find(session, resource.id());
         if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && observed != null) {
             throw new Refused(resource.id(), ArtifactMutation.ALREADY_EXISTS);
         }
@@ -484,6 +546,64 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     @Override
     public List<Resource> listReadable() {
         return readableInventory().resources();
+    }
+
+    @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
+        // A reused Serve may introduce more Source ids after the first lookup.
+        if (candidate.serve() instanceof io.tapstate.core.model.ServeBlock.Use) return Optional.empty();
+        var ids = new java.util.LinkedHashSet<String>();
+        ids.add(candidate.id());
+        io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> ids.add(edge.id()));
+        if (ids.size() > 128) return Optional.empty();
+        return readSnapshot(session -> {
+            var found = publicationRows(session, ids, true, null);
+            if (found.isEmpty()) return Optional.empty();
+            var resources = new ArrayList<Resource>();
+            for (var row : found.orElseThrow().values()) {
+                try {
+                    resources.add(decode(row));
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.DOCUMENT_UNREADABLE) throw failure;
+                    return Optional.empty();
+                }
+            }
+            return Optional.of(new ReadableInventory(resources, Optional.empty(), Optional.empty(),
+                    Set.copyOf(found.orElseThrow().keySet())));
+        });
+    }
+
+    /** Match the requested keys using each collection's own collation inside the same snapshot. */
+    private Optional<Map<String, Document>> publicationRows(ClientSession session, Set<String> ids, boolean includeStore,
+            String materializeId) {
+        var requested = List.copyOf(ids);
+        var result = new LinkedHashMap<String, Document>();
+        for (var entry : collections.entrySet()) {
+            Document filter = new Document("_id", new Document("$in", requested));
+            if (includeStore && "source".equals(entry.getKey())) filter = new Document("$or",
+                    List.of(filter, new Document("body.metadata.labels.store", "true")));
+            var matching = new Document("$filter", new Document("input", new Document("$literal", requested))
+                    .append("as", "requestedId").append("cond", new Document("$eq", List.of("$$requestedId", "$_id"))));
+            Object selectedRow = "$$ROOT";
+            if (materializeId != null && !"serve".equals(entry.getKey())) {
+                selectedRow = new Document("$cond", List.of(
+                        new Document("$eq", List.of("$_id", new Document("$literal", materializeId))),
+                        "$$ROOT", new Document("_id", "$_id").append("kind", "$kind").append("contentHash", "$contentHash")));
+            }
+            var projection = new Document("row", selectedRow).append("matches", matching);
+            try (var cursor = entry.getValue().aggregate(session, List.of(new Document("$match", filter),
+                    new Document("$project", projection))).batchSize(32).iterator()) {
+                while (cursor.hasNext()) {
+                    var selected = cursor.next();
+                    Document row = selected.get("row", Document.class);
+                    requireKind(row, entry.getKey());
+                    String id = row.getString("_id");
+                    var keys = selected.getList("matches", String.class);
+                    if (!keys.equals(ids.contains(id) ? List.of(id) : List.of())
+                            || result.putIfAbsent(id, row) != null) return Optional.empty();
+                }
+            }
+        }
+        return Optional.of(result);
     }
 
     @Override

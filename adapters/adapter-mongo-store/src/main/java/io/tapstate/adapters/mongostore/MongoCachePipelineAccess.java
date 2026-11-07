@@ -107,6 +107,32 @@ final class MongoCachePipelineAccess {
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
         return metadataTransaction(table, database, mutation, action);
     }
+
+    /** One bounded publication batch keeps the original proof at the transaction's write boundaries. */
+    <T> T publicationModelsTransaction(Function<ClientSession, T> action) {
+        if (!unpreparedModels || authoringModels == null)
+            return metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, action);
+        return StoreIo.call(() -> {
+            try (var session = client.startSession()) {
+                T result = session.withTransaction(() -> {
+                    requireActive.run();
+                    authoringModels.requirePublicationActive();
+                    verifyStateStructure();
+                    requireUnpreparedModels(session);
+                    new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(SystemCollections.CACHE_DERIVED_SCHEMAS);
+                    if (originalNode == null) throw fenced();
+                    var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+                    new MongoCacheBusinessIdentity(database, business).admitMetadataWrite(session);
+                    MongoCachePipelinePreparations.proveNode(session, database, business, originalNode);
+                    T value = action.apply(session);
+                    requireActive.run();
+                    return value;
+                }, TRANSACTION);
+                requireActive.run();
+                return result;
+            }
+        });
+    }
     /** Read-only control header access; never materializes Pipeline positions or operator bodies. */
     <T> T validationControlTransaction(SystemCollections table,Function<ClientSession,T> action){
         return validationControlTransaction(table,(session,state)->action.apply(session));

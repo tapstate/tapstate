@@ -272,16 +272,18 @@ public final class PipelineDraftService {
             return new PublishResult(PipelineDraftMutation.ARTIFACT_CONFLICT, null, null);
         }
         PipelineResource candidate = compile(pipelineId, draft);
-        ApplyPlan plan = validation == null ? null : validation.planDraftPublication(updatedBy, candidate);
+        var planned = validation == null ? null : validation.captureDraftPublication(updatedBy, candidate);
+        ApplyPlan plan = planned == null ? null : planned.plan();
         PipelineResource artifact = plan == null ? candidate
                 : (PipelineResource) plan.artifacts().getFirst().resource();
         String artifactHash = CanonicalHash.of(artifact);
         PipelineDraft.Publication publication = new PipelineDraft.Publication(
                 pipelineId, expectedDraftRevision, draft.baseArtifactHash(), artifact, artifactHash,
                 Instant.now(clock), updatedBy, plan == null ? java.util.Map.of() : plan.workspacePreconditions());
-        PipelineDraftMutation outcome = store.publish(publication);
-        List<ValidationDiagnostic> warnings = outcome == PipelineDraftMutation.PUBLISHED && validation != null
-                ? validation.refreshPublishedPipeline(pipelineId) : List.of();
+        var written = store.publishWithGeneration(publication);
+        PipelineDraftMutation outcome = written.mutation();
+        List<ValidationDiagnostic> warnings = outcome == PipelineDraftMutation.PUBLISHED && planned != null
+                ? validation.refreshPublishedPipeline(pipelineId, planned.inputs(), written.stateGeneration()) : List.of();
         return new PublishResult(outcome, outcome == PipelineDraftMutation.PUBLISHED ? artifact : null,
                 outcome == PipelineDraftMutation.PUBLISHED ? artifactHash : null, warnings);
     }

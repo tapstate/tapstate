@@ -131,6 +131,24 @@ class ReadableArtifactInventoryIT {
             assertThat(store.readableInventory().exactLookupIds()).containsExactly("item02");
         } finally {db.drop();}
     }
+
+    @Test void draftSliceReadsOnlyItsDependenciesAndFallsBackForCollatedAliases() {
+        withStore((store, db, codec) -> {
+            db.createCollection(SystemCollections.SOURCES.collectionName(),
+                    new com.mongodb.client.model.CreateCollectionOptions().collation(
+                            com.mongodb.client.model.Collation.builder().locale("en")
+                                    .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            Resource source = new SourceResource("orders", null, "mongodb", Map.of("uri", "mongodb://localhost/db"),
+                    null, null, null, null);
+            SystemCollections.SOURCES.on(db).insertOne(codec.encode(source));
+            SystemCollections.SERVE_DEFINITIONS.on(db).insertOne(codec.encode(serve("unrelated")));
+            var exact = (PipelineResource) parser.parse("version: tapstate/v1\nkind: pipeline\nid: draft\nsource: [orders]\n");
+            var alias = (PipelineResource) parser.parse("version: tapstate/v1\nkind: pipeline\nid: draft\nsource: [Orders]\n");
+            assertThat(store.draftPublicationInventory(exact)).hasValueSatisfying(inventory ->
+                    assertThat(inventory.resources()).containsExactly(source));
+            assertThat(store.draftPublicationInventory(alias)).isEmpty();
+        });
+    }
     @Test void mongoUsesHistoricalCollationAfterConcurrentCollectionRecreation() {
         withStore((unused,db,codec)->{
             db.createCollection(SystemCollections.SOURCES.collectionName());
