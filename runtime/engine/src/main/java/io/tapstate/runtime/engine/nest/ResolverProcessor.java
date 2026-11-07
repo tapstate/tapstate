@@ -494,7 +494,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!flush()) {
             return false;
         }
-        return bounds.advance(ordinal, watermark, this::tryEmit);
+        return (commitState() && bounds.advance(ordinal, watermark, this::tryEmit));
     }
 
     /**
@@ -766,7 +766,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!(collected || gaveUp) || bounds == null) {
             return true;
         }
-        return bounds.release(this::tryEmit);
+        return (commitState() && bounds.release(this::tryEmit));
     }
 
     /**
@@ -984,7 +984,18 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
     }
 
     /** Empties what is waiting to go out, reporting whether it all got out. */
+    /**
+     * Makes the state this processor has changed durable before anything that depends on it goes out:
+     * a document, a touch, or a position the frontier may pass. A no-op for stores that write through.
+     */
+    private boolean commitState() {
+        if (store != null) store.commit();
+        if (parking != null) parking.commit();
+        return true;
+    }
+
     private boolean flush() {
+        commitState();
         while (!outgoing.isEmpty()) {
             if (!tryEmit(outgoing.peek())) {
                 return false;

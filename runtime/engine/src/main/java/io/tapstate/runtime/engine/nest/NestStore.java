@@ -144,6 +144,22 @@ public interface NestStore<S> extends Serializable {
      * whether a parent is coming is not knowable from how much arrived before it. So this is published and
      * not judged. Doing nothing with it is the ordinary case, which is why it does nothing by default.
      */
+    /**
+     * Makes every change this store has accepted durable. A store that writes through on each call has
+     * nothing left to do here; one that groups writes does all of them now. Callers invoke it before
+     * anything that depends on those changes leaves the processor.
+     */
+    default void commit() {
+    }
+
+    /**
+     * Whether reading many keys ahead of the rows that will touch them is worth doing: true for a store
+     * that answers a batch read in one round trip and keeps what it read resident.
+     */
+    default boolean readsAhead() {
+        return false;
+    }
+
     default void holding(long pending) {
     }
 

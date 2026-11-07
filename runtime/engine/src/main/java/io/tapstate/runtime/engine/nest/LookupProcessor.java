@@ -583,7 +583,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         if (!flush()) {
             return false;
         }
-        return bounds.advance(ordinal, watermark, this::tryEmit);
+        return (commitState() && bounds.advance(ordinal, watermark, this::tryEmit));
     }
 
     /**
@@ -596,7 +596,18 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         return true;
     }
 
+    /**
+     * Makes the state this processor has changed durable before anything that depends on it goes out:
+     * a document, a touch, or a position the frontier may pass. A no-op for stores that write through.
+     */
+    private boolean commitState() {
+        if (store != null) store.commit();
+        if (references != null) references.commit();
+        return true;
+    }
+
     private boolean flush() {
+        commitState();
         while (!outgoing.isEmpty()) {
             if (!tryEmit(outgoing.peek())) {
                 return false;
