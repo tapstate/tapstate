@@ -35,7 +35,7 @@ public abstract class ValidationEvaluation implements AutoCloseable {
         }
     }
     /** Safe metadata projection, with no connector configuration, body values or driver objects. */
-    public record Field(String name,String type,String keyDomain,String unavailableReason) {}
+    public record Field(String name,String type,String keyDomain,String unavailableReason,String keyLogicalType) {}
     public record Candidate(String origin,List<String> fields,List<String> issues) {
         public Candidate { fields=List.copyOf(fields);issues=List.copyOf(issues); }
     }

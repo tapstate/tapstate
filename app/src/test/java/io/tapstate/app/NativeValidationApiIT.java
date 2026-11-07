@@ -45,13 +45,13 @@ class NativeValidationApiIT {
                 var artifact=Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it.mongodb-jar")));
                 var registered=child.getBean(ConnectorArtifactRegistrar.class).register(artifact,RegistrationSource.REGISTER);
                 var connector=registered.registration().connectorId();
-                var stableRow=new Document("id",1L).append("payload","same");
+                var stableRow=new Document("_id","order-1").append("id",1L).append("payload","same");
                 observer.getDatabase(sourceDb).getCollection("orders").insertOne(stableRow);
                 observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document(stableRow));
                 var artifacts=child.getBean(ArtifactStore.class);
                 artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"database",sourceDb,"isUri",true),
                         SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null));
-                artifacts.create(new SourceResource("validation_target",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(targetDb),"database",targetDb,"isUri",true),null,null,null,null));
+                artifacts.create(new SourceResource("validation_target",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(targetDb),"isUri",true),null,null,null,null));
                 artifacts.create(new PipelineResource("validation_flow",null,List.of(SourceRef.spec("validation_input",false)),null,null,
                         new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("validation_input.orders")),List.of(new SyncElement("out","validation_target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
                 var http=RestClient.create("http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort());
@@ -141,7 +141,8 @@ class NativeValidationApiIT {
                 }finally{occupied.forEach(ValidationMemberResources.Metadata::close);}
                 for(var method:List.of("UNIQUE_KEY","FULL_COLUMN")){
                     var task=method.equals("UNIQUE_KEY")?"validation_keys":"validation_columns";
-                    var confirmed=Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id"))));
+                    var key=method.equals("UNIQUE_KEY")?"_id":"id";
+                    var confirmed=Map.of("orders",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source",key,"target",key))));
                     var selected=new LinkedHashMap<String,Object>(input);selected.put("taskId",task);selected.put("taskGeneration",UUID.randomUUID().toString());
                     selected.put("method",method);selected.put("confirmations",confirmed);
                     var checked=http.post().uri("/api/validation:evaluate").header("Authorization","Bearer "+write).contentType(MediaType.APPLICATION_JSON).body(selected).retrieve().body(Map.class);
