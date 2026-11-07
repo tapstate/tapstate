@@ -80,9 +80,10 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
                 require();var declared=declarations.get(index);var table=source?declared.mapping().source():declared.mapping().target();
                 // Every decode owns its nested settings; plugin defaults cannot alter a later mapping.
                 SourceResource resource=StoredArtifacts.requireSource(saved.artifacts(),table.sourceId());
-                var connection=new ConnectionConfig(resource.id(),resource.connector(),resource.config());
-                var database=database(table,connection);var artifact=artifacts.get(resource.id());
+                var artifact=artifacts.get(resource.id());
                 if(artifact==null)throw invalid("artifactScope");
+                var connection=countConnection(resource,artifact);
+                var database=database(table,connection);
                 // Charge the independent context and its work before any native initialization.
                 var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(COUNT_WORK_BYTES,0,1,1));
                 PdkValidationCounts reader=null;
@@ -137,7 +138,21 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
         private TapstateException cancelled(){return new TapstateException(ValidationError.EXECUTION_CANCELLED,
                 Map.of("node",nodeId),null);}
     }
-    private static String database(ValidationTaskSpec.Table table,ConnectionConfig connection){
+    static ConnectionConfig countConnection(SourceResource resource, ConnectorRef artifact) {
+        var settings = resource.config();
+        if (artifact.className().equals("io.tapdata.mongodb.MongodbConnector")
+                && !Boolean.FALSE.equals(settings.get("isUri"))
+                && settings.get("uri") instanceof String uri && !uri.isEmpty()) {
+            var database = io.tapstate.adapters.mongostore.MongoConnection.databaseFromUri(uri);
+            var effective = new LinkedHashMap<String,Object>(settings);
+            if (database == null) effective.remove("database");
+            else effective.put("database", database);
+            settings = effective;
+        }
+        return new ConnectionConfig(resource.id(), resource.connector(), settings);
+    }
+
+    static String database(ValidationTaskSpec.Table table,ConnectionConfig connection){
         var configured=connection.settings().get("database");
         if(configured!=null&&!(configured instanceof String))throw invalid("database");
         if(configured instanceof String text&&text.isBlank())throw invalid("database");
