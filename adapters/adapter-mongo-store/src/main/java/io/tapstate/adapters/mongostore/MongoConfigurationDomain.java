@@ -566,7 +566,12 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
             Optional<io.tapstate.core.lifecycle.DesiredState> desired,
-            Optional<TapstateException> intentFailure, boolean recovering) {}
+            Optional<TapstateException> intentFailure, boolean recovering, Optional<IoError> startFailure) {
+        public PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+                Optional<io.tapstate.core.lifecycle.DesiredState> desired, Optional<TapstateException> intentFailure, boolean recovering) {
+            this(mapping, preparation, desired, intentFailure, recovering, Optional.empty());
+        }
+    }
 
     /** Batch display headers use one CONFIG snapshot and retain the original intent validation. */
     public Map<String, PipelineDisplayHeader> pipelineDisplayHeaders(List<String> ids, boolean includeIntents) {
@@ -606,6 +611,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         var preparation = MongoPipelinePreparationFacts.decode(id, row, clusterId);
                         Optional<io.tapstate.core.lifecycle.DesiredState> desired = Optional.empty();
                         Optional<TapstateException> failure = Optional.empty();
+                        Optional<IoError> startFailure = Optional.empty();
                         var intent = intentsById.get(id);
                         if (intent != null) {
                             try {
@@ -615,13 +621,17 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                                         new CacheBusinessScope(snapshot.scope().clusterId(), snapshot.scope().bindingVersion(),
                                                 snapshot.scope().cacheIncarnation())))
                                     throw MongoPipelineIntentStore.unreadable();
-                                if (!snapshot.deleted()) desired = Optional.of(snapshot.desired());
+                                if (!snapshot.deleted()) {
+                                    desired = Optional.of(snapshot.desired());
+                                    if (snapshot.scope().stateGeneration() == mapping.stateGeneration())
+                                        startFailure = MongoPipelineIntentStore.startFailure(intent);
+                                }
                             } catch (TapstateException malformed) {
                                 if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
                                 failure = Optional.of(malformed);
                             }
                         }
-                        result.put(id, new PipelineDisplayHeader(mapping, preparation, desired, failure, row.containsKey("cacheRecovery")));
+                        result.put(id, new PipelineDisplayHeader(mapping, preparation, desired, failure, row.containsKey("cacheRecovery"), startFailure));
                     }
                     return Map.copyOf(result);
                 }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)

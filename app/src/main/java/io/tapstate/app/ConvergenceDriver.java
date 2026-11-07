@@ -52,11 +52,18 @@ final class ConvergenceDriver {
     record ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable requireActive,
             Function<PipelineConvergencePass, LifecycleActuator> actuators,
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
-            Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts) {
+            Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
+            Consumer<PipelineIntentStore.PendingStart> prepareStart) {
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
-            this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none());
+            this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none(), null);
+        }
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, null);
         }
         ScopedPorts {
             Objects.requireNonNull(intents, "intents"); Objects.requireNonNull(stores, "stores");
@@ -150,7 +157,11 @@ final class ConvergenceDriver {
                     permit = actuation.permit(pipelineId);
                 } else {
                     var snapshot = scoped.intents().loadForActuation(pipelineId);
-                    if (snapshot.isEmpty() || snapshot.get().deleted()) continue;
+                    if (snapshot.isEmpty()) {
+                        if (scoped.prepareStart() != null) scoped.intents().pendingStart(pipelineId).ifPresent(this::prepareStart);
+                        continue;
+                    }
+                    if (snapshot.get().deleted()) continue;
                     if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
                         throw new TapstateException(
                                 IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
@@ -246,6 +257,17 @@ final class ConvergenceDriver {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void prepareStart(PipelineIntentStore.PendingStart pending) {
+        try {
+            scoped.requireActive().run();
+            scoped.prepareStart().accept(pending);
+        } catch (TapstateException failure) {
+            if (!(failure.code() instanceof IoError error) || (error != IoError.DOCUMENT_UNREADABLE
+                    && error != IoError.PIPELINE_STATE_REBUILD_REQUIRED && error != IoError.PIPELINE_INTENT_FENCED)) throw failure;
+            scoped.intents().failStart(pending, error);
+        }
     }
 
     private void alert(Runnable action) {

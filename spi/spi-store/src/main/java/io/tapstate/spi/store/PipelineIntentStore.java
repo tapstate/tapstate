@@ -24,6 +24,20 @@ public interface PipelineIntentStore {
     /** Expected zero means never written; a refusal leaves the latest value and all versions unchanged. */
     boolean compareAndSet(PipelineIntentScope scope, long expectedIntentRevision, DesiredState desired);
 
+    /** A durable request to prepare exactly the definition and intent that HTTP accepted. */
+    record PendingStart(PipelineIntentSnapshot intent, PipelinePreparationInputs inputs) {}
+
+    default boolean compareAndSetStart(PipelineIntentScope scope, long expected, DesiredState desired,
+            PipelinePreparationInputs inputs) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    default Optional<PendingStart> pendingStart(String pipelineId) { return Optional.empty(); }
+
+    default void failStart(PendingStart pending, IoError error) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
     /** Only the current native full-recovery permission may publish its first RUNNING intent. */
     default boolean startRecovered(CacheRecoveryStore.FullPreparation confirmation,long expectedIntentRevision,String pipelineHash) {
         throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);

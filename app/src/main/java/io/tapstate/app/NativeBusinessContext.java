@@ -65,7 +65,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline);
+        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline, true);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
@@ -461,7 +461,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ClusterProperties cluster, Clock clock) {
             var scope = owner.original.preparation().businessScope();
             return new PipelineFirstStatePreparer(scope, owner.configuration.preparations(),
-                    owner.original.cache().pipelinePreparations(scope, owner.memberStorage::requireNode), node::currentFence,
+                    owner.original.cache().admittedPipelinePreparations(scope, owner.memberStorage::requireNode), node::currentFence,
                     owner.memberStorage::requireNode, clock, cluster.getWorkloadClaimTtl());
         }
         @Bean(destroyMethod = "close") ValidationCaptureObservations validationCaptureObservations(
@@ -699,7 +699,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain, alerts));
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain, alerts, owner.context.getBean(PipelineFirstStatePreparer.class)::prepareDeferred));
         }
         @Bean PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership) {

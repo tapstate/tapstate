@@ -88,10 +88,20 @@ final class MongoStorageRecoveryStore {
     }
     private static Stored read(ClientSession session, MongoDatabase database, StorageBinding binding,
             java.util.function.Supplier<Document> setup) {
+        return read(session, database, binding.setup(), binding.mode(), binding.bindingVersion(), setup);
+    }
+
+    static Stored read(ClientSession session, MongoDatabase database, io.tapstate.spi.store.StorageSetupScope owner,
+            StorageBinding.Mode mode, long bindingVersion, Document setup) {
+        return read(session, database, owner, mode, bindingVersion, () -> setup);
+    }
+
+    private static Stored read(ClientSession session, MongoDatabase database, io.tapstate.spi.store.StorageSetupScope owner,
+            StorageBinding.Mode mode, long bindingVersion, java.util.function.Supplier<Document> setup) {
         var rows = SystemCollections.STORAGE_RECOVERY.on(database).find(session).limit(2).into(new java.util.ArrayList<>());
         if (rows.size() != 1) throw unreadable();
         Document row = rows.getFirst();
-        return read(row, binding.setup(), binding.mode(), binding.bindingVersion(), setup);
+        return read(row, owner, mode, bindingVersion, setup);
     }
 
     static Stored read(Document row, io.tapstate.spi.store.StorageSetupScope owner, StorageBinding.Mode mode,

@@ -229,6 +229,17 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return Optional.ofNullable(find(session, id)).map(this::decode);
     }
 
+    Map<String, Resource> preparationInputsInTransaction(ClientSession session, Set<String> ids) {
+        var rows = ids.size() <= 128 ? publicationRows(session, ids, false, null) : Optional.<Map<String, Document>>empty();
+        var result = new LinkedHashMap<String, Resource>();
+        if (rows.isPresent()) {
+            rows.orElseThrow().forEach((id, row) -> result.put(id, decode(row)));
+        } else {
+            for (String id : ids) getInTransaction(session, id).ifPresent(resource -> result.put(id, resource));
+        }
+        return result;
+    }
+
     record Version(String kind, String hash) {}
 
     /** Probe total stored bytes before materializing any selected resource body or decrypted secret. */

@@ -366,6 +366,37 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         return load(session).map(Loaded::cachePreparation);
     }
 
+    /** Rechecks the durable scope of a previously admitted runtime without reopening its connection. */
+    Optional<CachePreparation> admittedCachePreparation(ClientSession session) {
+        if (!MongoBindingReadFacts.supported(client)) return cachePreparationForTransaction(session);
+        var stored = bindings.find(session, new Document("_id", SINGLETON_ID))
+                .projection(new Document("cache", 0)).first();
+        var facts = MongoBindingReadFacts.read(session, null, identity, setup, noteScopes, List.of());
+        var cluster = facts.identity();
+        requireClusterIdentity(cluster);
+        String clusterId = cluster.getString("clusterId");
+        long version = cluster.getLong(BINDING_VERSION);
+        if (version == 0) return Optional.empty();
+        var state = facts.setup();
+        long generation = requireSetupIdentity(state, clusterId);
+        try {
+            if (stored == null || !clusterId.equals(stored.get("clusterId"))
+                    || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
+                    || !Long.valueOf(version).equals(stored.get(BINDING_VERSION))) throw unreadable();
+            var owner = new StorageSetupScope(clusterId, stored.getString("installationId"),
+                    stored.getString("operationId"), stored.getLong("generation"));
+            var mode = StorageBinding.Mode.valueOf(stored.getString("mode"));
+            String defaultId = stored.getString("defaultSourceId");
+            requireBoundSetup(state, owner, version, defaultId, generation);
+            if (!StorageBinding.defaultSourceId(mode).equals(defaultId)
+                    || !(stored.get("candidateHash") instanceof String candidate)
+                    || !candidate.equals(state.get("candidateHash"))) throw unreadable();
+            return Optional.of(MongoStorageRecoveryStore.read(session, database, owner, mode, version, state).preparation());
+        } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) {
+            throw unreadable();
+        }
+    }
+
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {
         return client == expectedClient && database.getName().equals(expectedDatabase);
     }
