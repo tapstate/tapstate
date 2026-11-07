@@ -515,6 +515,17 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         });
     }
 
+    @Override public ReadableInventory readableInventory(String kind, String id) {
+        return StoreIo.call(() -> {
+            var row = collection(kind).find(new Document("_id", id)).first();
+            if (row == null) return new ReadableInventory(List.of(), Optional.empty());
+            requireKind(row, kind);
+            var managed = "source".equals(kind) && MongoStorageBindingStore.DEFAULT_ROLE.equals(row.get("systemRole"))
+                    ? Optional.of(row.getString("_id")) : Optional.<String>empty();
+            return new ReadableInventory(List.of(decode(row)), Optional.empty(), managed);
+        });
+    }
+
     @Override public ReadableInventory readableInventory(String kind) {
         return StoreIo.call(() -> {
             var resources = new ArrayList<Resource>();

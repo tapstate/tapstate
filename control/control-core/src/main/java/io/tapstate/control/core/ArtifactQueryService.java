@@ -81,6 +81,16 @@ public final class ArtifactQueryService {
                 inventory.connectorCatalog(), inventory.managedDefaultSourceId());
     }
 
+    public Optional<StoredResource> getResource(String kind, String id) {
+        return resourceInventory(kind, id).resources().stream().findFirst();
+    }
+
+    public ResourceInventory resourceInventory(String kind, String id) {
+        var inventory = store.readableInventory(kind, id);
+        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
+                inventory.connectorCatalog(), inventory.managedDefaultSourceId());
+    }
+
     public ResourceInventory resourceInventory(String kind) {
         var inventory = store.readableInventory(kind);
         return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),

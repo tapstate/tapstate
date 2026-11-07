@@ -148,6 +148,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return trackInventory(delegate.readableInventory(kind));
     }
 
+    @Override public synchronized ReadableInventory readableInventory(String kind, String id) {
+        return trackInventory(delegate.readableInventory(kind, id));
+    }
+
     private ReadableInventory trackInventory(ReadableInventory inventory) {
         boolean hasSources = inventory.resources().stream().anyMatch(SourceResource.class::isInstance);
         if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }

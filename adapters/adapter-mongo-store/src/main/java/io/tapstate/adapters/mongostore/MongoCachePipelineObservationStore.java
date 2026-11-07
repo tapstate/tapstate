@@ -18,18 +18,21 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         return access.observationTransaction(session -> {
             access.state(session);
             Document current = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).find(session, new Document("_id", pipelineId)).first();
-            if (current == null) return Optional.empty();
-            access.requireScope(current);
-            try {
-                Observation decoded = MongoObservationStore.toObservation(current);
-                Document canonical = MongoObservationStore.toDocument(decoded).append("scope", current.get("scope"));
-                if (!canonical.equals(current)) throw access.unreadable("observation");
-                return Optional.of(decoded);
-            } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
-                // Stored values are untrusted; neither numeric coercion nor raw decoder causes escape.
-                throw access.unreadable("observation");
-            }
+            return decode(access, current);
         });
+    }
+
+    static Optional<Observation> decode(MongoCachePipelineAccess access, Document current) {
+        if (current == null) return Optional.empty();
+        access.requireScope(current);
+        try {
+            Observation decoded = MongoObservationStore.toObservation(current);
+            Document canonical = MongoObservationStore.toDocument(decoded).append("scope", current.get("scope"));
+            if (!canonical.equals(current)) throw access.unreadable("observation");
+            return Optional.of(decoded);
+        } catch (TapstateException | NullPointerException | ClassCastException | IllegalArgumentException invalid) {
+            throw access.unreadable("observation");
+        }
     }
 
     @Override public void save(Observation observation) {

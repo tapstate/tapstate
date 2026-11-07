@@ -26,6 +26,13 @@ public interface ObservationStore {
     /** Returns the current observation for a pipeline, or empty if none has been published. */
     Optional<Observation> read(String pipelineId);
 
+    /** Reads a page of observations, omitting unpublished rows. */
+    default java.util.Map<String, Observation> readAll(java.util.List<String> ids) {
+        var result = new java.util.HashMap<String, Observation>();
+        for (var id : ids) read(id).ifPresent(value -> result.put(id, value));
+        return java.util.Map.copyOf(result);
+    }
+
     /**
      * Removes a pipeline's observation, so the read faces stop projecting a pipeline that no longer
      * exists.

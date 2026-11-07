@@ -27,6 +27,7 @@ class ThreeLayerObservationTest {
         f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, "purge"));
         var artifacts = mock(ArtifactStore.class);
         when(artifacts.get("pipeline")).thenReturn(Optional.of(new PipelineResource("pipeline", null, List.of(), null, null, null, null, null)));
+        when(artifacts.readableInventory("pipeline", "pipeline")).thenCallRealMethod();
         var query = new ArtifactQueryService(artifacts);
         var drafts = mock(PipelineDraftService.class);
         when(drafts.find("pipeline")).thenReturn(Optional.empty());
@@ -74,6 +75,35 @@ class ThreeLayerObservationTest {
         var f = new Fixture();
         assertThat(f.port.observations().read("pipeline")).contains(f.observed);
         verify(f.cache).pipelineObservations(f.scope);
+    }
+
+    @Test void aBatchCannotPublishAnObservationAfterItsConfigurationFenceChanges() {
+        var f = new Fixture();
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),
+                f.preparations.read("pipeline").orElseThrow(), Optional.empty(), Optional.empty(), false);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, false))
+                .thenReturn(Map.of("pipeline", header), Map.of());
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any())).thenAnswer(call -> {
+            f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, "purge"));
+            return Map.of("pipeline", Optional.of(f.observed));
+        });
+
+        assertThat(f.port.observations().readAll(ids)).isEmpty();
+        verify(f.cache, never()).pipelineObservations(any());
+    }
+
+    @Test void aCoherentBatchKeepsTheObservedStateAndDoesNotRereadEachPipeline() {
+        var f = new Fixture();
+        var header = new MongoConfigurationDomain.PipelineDisplayHeader(f.mapping.get(),
+                f.preparations.read("pipeline").orElseThrow(), Optional.empty(), Optional.empty(), false);
+        var ids = List.of("pipeline");
+        when(f.configuration.pipelineDisplayHeaders(ids, false)).thenReturn(Map.of("pipeline", header));
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any()))
+                .thenReturn(Map.of("pipeline", Optional.of(f.observed)));
+
+        assertThat(f.port.observations().readAll(ids)).containsEntry("pipeline", f.observed);
+        verify(f.cache, never()).pipelineObservations(any());
     }
 
     @Test void aRebuildThatOvertakesAnObservationReadCannotPublishTheOldGeneration() {

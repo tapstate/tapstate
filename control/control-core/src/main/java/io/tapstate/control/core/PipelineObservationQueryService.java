@@ -144,7 +144,13 @@ public final class PipelineObservationQueryService {
                 status.observedAt(), null, List.of(), status.observedState()), item.id()));
     }
 
-    private PipelineStatus statusOf(Observation observation) {
+    Map<String, PipelineStatus> findStatuses(List<String> ids) {
+        var result = new java.util.HashMap<String, PipelineStatus>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, statusOf(value)));
+        return Map.copyOf(result);
+    }
+
+    PipelineStatus statusOf(Observation observation) {
         var stored = new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(), observation.observedAt());
         if (observation.failure() != null || (observation.state() != PipelineState.RUNNING
                 && observation.state() != PipelineState.PAUSED)) return stored;

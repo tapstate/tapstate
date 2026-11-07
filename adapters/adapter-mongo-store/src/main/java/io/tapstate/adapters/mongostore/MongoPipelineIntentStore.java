@@ -262,7 +262,7 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                 .append("bindingVersion", scope.bindingVersion()).append("cacheIncarnation", scope.cacheIncarnation())
                 .append("stateGeneration", scope.stateGeneration()).append("intentRevision", revision).append("deleted", deleted);
     }
-    private PipelineIntentSnapshot decode(Document row) {
+    PipelineIntentSnapshot decode(Document row) {
         try {
             if (!(row.get("deleted") instanceof Boolean deleted) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                     || !(row.get("intentRevision") instanceof Long revision) || !(row.get("bindingVersion") instanceof Long binding)
@@ -294,5 +294,5 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     private static void requireId(String id) { if (id == null || id.isBlank()) throw new IllegalArgumentException("Pipeline id must not be blank"); }
     private static TapstateException fenced() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null); }
-    private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-intent", "field", "intent"), null); }
+    static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "pipeline-intent", "field", "intent"), null); }
 }

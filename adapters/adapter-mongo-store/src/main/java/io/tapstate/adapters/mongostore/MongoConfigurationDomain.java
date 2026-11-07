@@ -25,7 +25,13 @@ import io.tapstate.spi.store.StorageBindingStore;
 import io.tapstate.spi.store.IoError;
 import org.bson.Document;
 
+import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.CachePreparation;
+import io.tapstate.spi.store.PipelinePreparation;
+import io.tapstate.spi.store.PipelineStateMapping;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Optional;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
@@ -556,6 +562,72 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     public RequiredNoteStore requiredNotes() {
         return requiredNotes;
+    }
+
+    public record PipelineDisplayHeader(PipelineStateMapping mapping, PipelinePreparation preparation,
+            Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+            Optional<TapstateException> intentFailure, boolean recovering) {}
+
+    /** Batch display headers use one CONFIG snapshot and retain the original intent validation. */
+    public Map<String, PipelineDisplayHeader> pipelineDisplayHeaders(List<String> ids, boolean includeIntents) {
+        requireOpen();
+        if (ids.isEmpty()) return Map.of();
+        var client = connection.client();
+        var database = connection.database();
+        var filter = new Document("_id", new Document("$in", ids));
+        return StoreIo.call(() -> {
+            try (var session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    var definitions = new java.util.HashSet<String>();
+                    for (var row : SystemCollections.PIPELINES.on(database).find(session, filter).projection(new Document("_id", 1)))
+                        definitions.add(row.getString("_id"));
+                    var intentsById = new java.util.HashMap<String, Document>();
+                    if (includeIntents) {
+                        for (var row : SystemCollections.PIPELINE_INTENTS.on(database).find(session, filter))
+                            intentsById.put(row.getString("_id"), row);
+                    }
+                    Optional<CachePreparation> intentScope = Optional.empty();
+                    TapstateException intentScopeFailure = null;
+                    if (!intentsById.isEmpty()) {
+                        try {
+                            intentScope = bindings.cachePreparationForTransaction(session);
+                        } catch (TapstateException malformed) {
+                            if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
+                            intentScopeFailure = malformed;
+                        }
+                    }
+                    var intentReader = new MongoPipelineIntentStore(client, database, clusterId, bindings);
+                    var result = new java.util.HashMap<String, PipelineDisplayHeader>();
+                    for (var row : SystemCollections.OPERATOR_GENERATIONS.on(database).find(session, filter)) {
+                        String id = row.getString("_id");
+                        if (!definitions.contains(id)) continue;
+                        var mapping = MongoPipelineStateMappings.decode(id, row);
+                        if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE) continue;
+                        var preparation = MongoPipelinePreparationFacts.decode(id, row, clusterId);
+                        Optional<io.tapstate.core.lifecycle.DesiredState> desired = Optional.empty();
+                        Optional<TapstateException> failure = Optional.empty();
+                        var intent = intentsById.get(id);
+                        if (intent != null) {
+                            try {
+                                if (intentScopeFailure != null) throw intentScopeFailure;
+                                var snapshot = intentReader.decode(intent);
+                                if (intentScope.isEmpty() || !intentScope.orElseThrow().businessScope().equals(
+                                        new CacheBusinessScope(snapshot.scope().clusterId(), snapshot.scope().bindingVersion(),
+                                                snapshot.scope().cacheIncarnation())))
+                                    throw MongoPipelineIntentStore.unreadable();
+                                if (!snapshot.deleted()) desired = Optional.of(snapshot.desired());
+                            } catch (TapstateException malformed) {
+                                if (malformed.code() != IoError.DOCUMENT_UNREADABLE) throw malformed;
+                                failure = Optional.of(malformed);
+                            }
+                        }
+                        result.put(id, new PipelineDisplayHeader(mapping, preparation, desired, failure, row.containsKey("cacheRecovery")));
+                    }
+                    return Map.copyOf(result);
+                }, com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY.withJournal(true)).build());
+            }
+        });
     }
 
     public PipelineStateMappings pipelineStates() {

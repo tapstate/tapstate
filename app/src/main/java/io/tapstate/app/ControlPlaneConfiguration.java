@@ -769,7 +769,7 @@ class ControlPlaneConfiguration {
             PipelineObservationQueryService observations,
             StorePort storePort) {
         return new PipelineCatalogService(
-                artifacts, pipelineDrafts, storePort.desired(), observations,storePort::pipelineRecoveryRequired);
+                artifacts, pipelineDrafts, observations, storePort);
     }
 
     @Bean

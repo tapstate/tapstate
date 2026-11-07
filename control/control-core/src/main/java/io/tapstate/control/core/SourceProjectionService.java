@@ -45,7 +45,16 @@ public final class SourceProjectionService {
     /** Returns a Source typed view or the stable Source not-found diagnostic. */
     public SourceView get(String id) {
         Objects.requireNonNull(id, "id");
-        return view(requireSource(id), artifacts.managedDefaultSourceId());
+        var inventory = artifacts.resourceInventory("source", id);
+        var stored = inventory.resources().stream().findFirst()
+                .orElseThrow(() -> error(SourceError.NOT_FOUND, Map.of("id", id)));
+        var managed = inventory.managedDefaultSourceId();
+        var metadata = stored.resource().metadata();
+        if (managed.isEmpty() && metadata != null && metadata.labels().containsKey("store")) {
+            managed = artifacts.managedDefaultSourceId();
+        }
+        return view(stored, managed,
+                inventory.connectorCatalog().map(representation::withCatalog).orElse(representation));
     }
 
     /** Maps structured input, plans the full artifact workspace, then creates the Source conditionally. */

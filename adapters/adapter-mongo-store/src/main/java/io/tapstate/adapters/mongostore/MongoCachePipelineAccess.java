@@ -217,13 +217,17 @@ final class MongoCachePipelineAccess {
 
     Document state(ClientSession session) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
+        validateState(state);
+        requirePreparedClaim(session);
+        return state;
+    }
+
+    void validateState(Document state) {
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);
         if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
                 || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
-        requirePreparedClaim(session);
-        return state;
     }
 
     private void requirePreparedClaim(ClientSession session) {
@@ -233,7 +237,7 @@ final class MongoCachePipelineAccess {
         Document row = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
         requirePreparedClaim(session,row);
     }
-    private void requirePreparedClaim(ClientSession session,Document row){
+    void requirePreparedClaim(ClientSession session,Document row){
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
         new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
         try {

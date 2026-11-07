@@ -4,6 +4,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -422,7 +424,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
     private MongoCacheMetadataAccess metadataAccess(CacheBusinessScope expected, SystemCollections table, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        var access = new MongoCacheMetadataAccess(client, database, expected, table, () -> { businessActive(); requireActive.run(); });
+        var access = new MongoCacheMetadataAccess(client, database, expected, table,
+                () -> { businessActive(); requireActive.run(); }, false);
         access.verify(); return access;
     }
 
@@ -559,6 +562,52 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+    }
+
+    /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
+    public java.util.Map<String, java.util.Optional<io.tapstate.core.lifecycle.Observation>> pipelineObservationBatch(
+            java.util.List<io.tapstate.spi.store.PipelineIntentScope> scopes, Runnable active) {
+        if (scopes.isEmpty()) return java.util.Map.of();
+        var first = scopes.getFirst();
+        var business = new CacheBusinessScope(first.clusterId(), first.bindingVersion(), first.cacheIncarnation());
+        if (scopes.stream().anyMatch(scope -> !business.equals(new CacheBusinessScope(
+                scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))))
+            throw MongoCachePipelineAccess.fenced();
+        var accesses = scopes.stream().map(scope -> pipelineAccess(scope, null, active)).toList();
+        var ids = scopes.stream().map(io.tapstate.spi.store.PipelineIntentScope::pipelineId).toList();
+        var keys = scopes.stream().map(scope -> MongoWorkloadClaimStore.id(observationClaim(scope))).toList();
+        return accesses.getFirst().observationTransaction(session -> {
+            MongoCacheWorkloadClaimStore.requireCollection(database);
+            var states = observationRows(session, SystemCollections.CACHE_PIPELINE_STATE, ids);
+            var claims = observationRows(session, SystemCollections.CACHE_WORKLOAD_CLAIMS, keys);
+            var observations = observationRows(session, SystemCollections.CACHE_PIPELINE_OBSERVATION, ids);
+            var result = new java.util.HashMap<String, java.util.Optional<io.tapstate.core.lifecycle.Observation>>();
+            for (var access : accesses) {
+                String id = access.scope.pipelineId();
+                try {
+                    access.validateState(states.get(id));
+                    access.requirePreparedClaim(session, claims.get(MongoWorkloadClaimStore.id(observationClaim(access.scope))));
+                    result.put(id, MongoCachePipelineObservationStore.decode(access, observations.get(id)));
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.CACHE_BUSINESS_FENCED
+                            && failure.code() != IoError.WORKLOAD_CLAIM_FENCED) throw failure;
+                    // The ordinary reader classifies a concurrently replaced scope.
+                }
+            }
+            return java.util.Map.copyOf(result);
+        });
+    }
+
+    private static WorkloadClaimKey observationClaim(io.tapstate.spi.store.PipelineIntentScope scope) {
+        return new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
+    }
+
+    private java.util.Map<Object, Document> observationRows(com.mongodb.client.ClientSession session,
+            SystemCollections table, java.util.List<?> ids) {
+        var result = new java.util.HashMap<Object, Document>();
+        for (var row : table.on(database).find(session, new Document("_id", new Document("$in", ids))))
+            result.put(row.get("_id"), row);
+        return result;
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */

@@ -27,6 +27,17 @@ final class MongoValidationSchema {
         validateMarker(result); return result;
     }
 
+    /** Logical migration marker validation for an already opened configuration domain. */
+    static boolean configurationDeclaresValidation(Document schema) {
+        if (schema == null || !(schema.get("installedVersion") instanceof Integer version)) throw unreadable("version");
+        if (version == 1 || version == VERSION && !schema.containsKey("validation")) {
+            if (schema.containsKey("validation")) throw unreadable("marker");
+            return false;
+        }
+        configurationMarker(schema);
+        return true;
+    }
+
     static Document configurationMarker(String operation, String phase, long initialized, CacheBusinessScope scope) {
         var result = marker(operation, phase, initialized, scope);
         result.put("formatVersion", 2);

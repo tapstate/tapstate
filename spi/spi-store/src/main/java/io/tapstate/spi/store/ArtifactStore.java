@@ -39,6 +39,13 @@ public interface ArtifactStore {
         return new ReadableInventory(listReadable(), Optional.empty());
     }
 
+    /** Typed point read with the same display facts as the daily inventory. */
+    default ReadableInventory readableInventory(String kind, String id) {
+        var resource = get(id).filter(value -> kind.equals(value.kind()));
+        return new ReadableInventory(resource.stream().toList(), Optional.empty(),
+                "source".equals(kind) && resource.isPresent() ? managedDefaultSourceId() : Optional.empty());
+    }
+
     /** Typed daily inventory; persistent adapters can select one physical collection directly. */
     default ReadableInventory readableInventory(String kind) {
         Objects.requireNonNull(kind, "kind");

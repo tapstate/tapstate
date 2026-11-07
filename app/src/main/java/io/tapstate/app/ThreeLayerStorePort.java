@@ -200,9 +200,57 @@ final class ThreeLayerStorePort implements StorePort {
             @Override public void delete(String pipeline) { throw refused(); }
         };
     }
+    @Override public Map<String, PipelineCatalogState> pipelineCatalogStates(List<String> ids) {
+        return displayStates(ids, true);
+    }
+
+    private Map<String, PipelineCatalogState> displayStates(List<String> ids, boolean includeIntents) {
+        if (pass != null || control != null || ids.isEmpty()) return Map.of();
+        active();
+        var result = new HashMap<String, PipelineCatalogState>();
+        for (int offset = 0; offset < ids.size(); offset += 200) {
+            var page = ids.subList(offset, Math.min(offset + 200, ids.size()));
+            var headers = configuration.pipelineDisplayHeaders(page, includeIntents);
+            var scopes = new ArrayList<PipelineIntentScope>();
+            for (var entry : headers.entrySet()) {
+                var header = entry.getValue();
+                if (includeIntents && header.recovering()) continue;
+                if (header.preparation().phase() == PipelinePreparation.Phase.COMPLETE) {
+                    var original = activeScope(entry.getKey(), header.mapping());
+                    if (original.equals(header.preparation().scope())) scopes.add(original);
+                } else {
+                    result.put(entry.getKey(), new PipelineCatalogState(Optional.empty(), header.desired(), header.intentFailure()));
+                }
+            }
+            if (!scopes.isEmpty()) {
+                var cached = bound.cache().pipelineObservationBatch(scopes, this::active);
+                var after = configuration.pipelineDisplayHeaders(scopes.stream().map(PipelineIntentScope::pipelineId).toList(), false);
+                for (var entry : cached.entrySet()) {
+                    var header = headers.get(entry.getKey());
+                    var current = after.get(entry.getKey());
+                    if (current != null && current.mapping().equals(header.mapping())
+                            && current.preparation().equals(header.preparation())) {
+                        result.put(entry.getKey(), new PipelineCatalogState(entry.getValue(), header.desired(), header.intentFailure()));
+                    }
+                }
+            }
+        }
+        active();
+        return Map.copyOf(result);
+    }
+
     @Override public ObservationStore observations() {
         if (pass != null) return pass.observations();
         return new ObservationStore() {
+            @Override public Map<String, Observation> readAll(List<String> ids) {
+                var batch = displayStates(ids, false);
+                var result = new HashMap<String, Observation>();
+                for (var id : ids) {
+                    var item = batch.get(id);
+                    (item == null ? read(id) : item.observation()).ifPresent(value -> result.put(id, value));
+                }
+                return Map.copyOf(result);
+            }
             @Override public Optional<Observation> read(String pipeline) {
                 if (control != null) return readObservation(pipeline, scope(pipeline));
                 active();
