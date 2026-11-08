@@ -104,6 +104,64 @@ final class MongoCachePipelineAccess {
         });
     }
 
+    /**
+     * A write under an already validated lease: one transaction holding the claim compare-and-set and the
+     * action, with no admission, structure, inventory or state reads. When {@code bumpState} is set the
+     * pipeline state's runtime write fence is also read and advanced, as every per-attempt mutation does.
+     * Any failure, including a refused claim, propagates unchanged; the caller decides the lease is lost.
+     */
+    <T> T leasedWrite(LeaseFence fence, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    return session.withTransaction(() -> {
+                        requireActive.run();
+                        leasedClaim(session, fence);
+                        if (fence == LeaseFence.CLAIM_AND_STATE) updateState(session, state(session), new Document(), false);
+                        T result = action.apply(session);
+                        requireActive.run();
+                        return result;
+                    }, TRANSACTION);
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+        });
+    }
+
+    /** What a write under a lease does to prove the claim still holds. */
+    enum LeaseFence {
+        /** Compare-and-set the live claim (a real write, so a concurrent takeover conflicts with this commit). */
+        CLAIM,
+        /** As {@link #CLAIM}, and also read and advance the pipeline state's runtime write fence. */
+        CLAIM_AND_STATE,
+        /** Read the live claim in the transaction snapshot only; cheaper, but a takeover racing the commit is not serialized. */
+        CLAIM_READ
+    }
+
+    /** The claim check of a leased write; the claims collection's structure was checked when the lease was proved. */
+    private void leasedClaim(ClientSession session, LeaseFence fence) {
+        if (original == null) throw fenced();
+        var filter = WorkloadClaimDocuments.live(original)
+                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+        var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        boolean live = fence == LeaseFence.CLAIM_READ
+                ? claims.find(session, filter).projection(new Document("_id", 1)).first() != null
+                : claims.updateOne(session, filter, new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() == 1;
+        if (!live) throw claimFenced();
+    }
+
+    /** A read under an already validated lease: a causally consistent session, no transaction, no preamble. */
+    <T> T leasedRead(Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().causallyConsistent(true).build())) {
+                T result = action.apply(session);
+                requireActive.run();
+                return result;
+            }
+        });
+    }
+
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
         return metadataTransaction(table, database, mutation, action);
     }

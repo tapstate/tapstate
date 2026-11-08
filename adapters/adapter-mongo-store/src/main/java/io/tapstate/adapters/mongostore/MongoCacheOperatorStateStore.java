@@ -31,6 +31,39 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     private final Document address;
     private final String mapName;
     private final long addressBytes;
+    private final Validation validation;
+    private volatile boolean leaseProved;
+    private volatile long leaseProvedAt;
+    private volatile boolean placementRemembered;
+    private volatile boolean leaseCoversWrites;
+
+    /** Selects how often this store validates its identity, claim and structure. Experimental. */
+    static final String VALIDATION_PROPERTY = "tapstate.state.validation";
+    /** How long one validation stands before the next operation repeats it, in milliseconds. */
+    static final String LEASE_PROPERTY = "tapstate.state.lease.millis";
+    /** Full validations performed by every lease-mode store in this process, for measurement. */
+    static final java.util.concurrent.atomic.AtomicLong LEASE_OPENS = new java.util.concurrent.atomic.AtomicLong();
+    /** Leases dropped after a failure, for measurement. */
+    static final java.util.concurrent.atomic.AtomicLong LEASE_LOSSES = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * {@code TRANSACTION} validates inside every transaction (the default). {@code LEASE} validates once per
+     * lease and fences each write with one claim compare-and-set. {@code LEASE_STATE} does the same and also
+     * advances the pipeline state's runtime write fence in every write, as {@code TRANSACTION} does.
+     * {@code LEASE_READ} only reads the live claim in each write, which does not serialize with a takeover.
+     */
+    enum Validation {
+        TRANSACTION, LEASE, LEASE_STATE, LEASE_READ;
+
+        static Validation selected() {
+            return switch (System.getProperty(VALIDATION_PROPERTY, "transaction")) {
+                case "lease" -> LEASE;
+                case "lease-state" -> LEASE_STATE;
+                case "lease-read" -> LEASE_READ;
+                default -> TRANSACTION;
+            };
+        }
+    }
 
     MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement) {
         this.access = Objects.requireNonNull(access, "access"); this.placement = Objects.requireNonNull(placement, "placement");
@@ -41,6 +74,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
                 .append("database", placement.database()).append("resource", placement.resource().name())
                 .append("stepId", OperatorStateText.encode(placement.stepId())).append("pathId", OperatorStateText.encode(placement.pathId())).append("namespace", OperatorStateText.encode(placement.namespace()));
         addressBytes = 1024L + 3L * address.toJson().length();
+        validation = Validation.selected();
     }
 
     static SystemCollections table(OperatorPlacement.Resource resource) {
@@ -55,14 +89,14 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
 
     @Override public Optional<byte[]> load(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
-        return transaction(false, session -> Optional.ofNullable(
-                table.on(target).find(session, new Document("_id", id)).first()).map(row -> decode(row, id)));
+        return read(session -> Optional.ofNullable(
+                rows().find(session, new Document("_id", id)).first()).map(row -> decode(row, id)));
     }
 
     @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
         requireNamespace(namespace); var captured = List.copyOf(keys);
         if (captured.isEmpty()) return Map.of();
-        return transaction(false, session -> {
+        return read(session -> {
             Map<String, byte[]> out = new LinkedHashMap<>(); var batch = new LinkedHashMap<Document, String>(); long size = 0;
             for (String key : captured) {
                 Document id = id(key); long bytes = addressBytes + 3L * key.length();
@@ -77,7 +111,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
 
     private void readBatch(ClientSession session, Map<Document, String> ids, Map<String, byte[]> out) {
         if (ids.isEmpty()) return;
-        for (Document row : table.on(target).find(session, new Document("_id", new Document("$in", List.copyOf(ids.keySet()))))) {
+        for (Document row : rows().find(session, new Document("_id", new Document("$in", List.copyOf(ids.keySet()))))) {
             Object stored = row.get("_id");
             if (!(stored instanceof Document id) || !ids.containsKey(id)) throw access.unreadable("operator-identity");
             out.put(ids.get(id), decode(row, id));
@@ -109,7 +143,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
 
     private void writeBatch(List<WriteModel<Document>> batch) {
         if (batch.isEmpty()) return;
-        transaction(true, session -> {
+        write(session -> {
             table.on(target).bulkWrite(session, batch, new BulkWriteOptions().ordered(true));
             return null;
         });
@@ -120,7 +154,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
         byte[] captured = Objects.requireNonNull(state, STATE_FIELD).clone();
         byte[] fixedKey = routingKey == null ? null : routingKey.clone();
         if (fixedKey != null && table != SystemCollections.CACHE_NEST_STATE) throw MongoCachePipelineAccess.fenced();
-        transaction(true, session -> {
+        write(session -> {
             var value = row(id, captured);
             if (fixedKey != null) value.append("pendingRelease", true).append("releaseKey", new Binary(fixedKey));
             table.on(target).replaceOne(session, new Document("_id", id), value, new ReplaceOptions().upsert(true)); return null;
@@ -160,7 +194,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     @Override public Optional<byte[]> saveIfAbsent(String namespace, String key, byte[] state) {
         requireNamespace(namespace); Document id = id(key);
         byte[] captured = Objects.requireNonNull(state, STATE_FIELD).clone();
-        return transaction(true, session -> {
+        return write(session -> {
             Document before = table.on(target).find(session, new Document("_id", id)).first();
             if (before != null) return Optional.of(decode(before, id));
             table.on(target).insertOne(session, row(id, captured)); return Optional.empty();
@@ -169,7 +203,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
 
     @Override public void delete(String namespace, String key) {
         requireNamespace(namespace); Document id = id(key);
-        transaction(true, session -> { table.on(target).deleteOne(session, new Document("_id", id)); return null; });
+        write(session -> { table.on(target).deleteOne(session, new Document("_id", id)); return null; });
     }
 
     /** Physical reclamation requires the separate exact retirement path, never an active MapStore. */
@@ -178,6 +212,59 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
     @Override public long count(String namespace) {
         requireNamespace(namespace);
         return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
+    }
+
+    private <T> T read(java.util.function.Function<ClientSession, T> action) {
+        if (validation == Validation.TRANSACTION) return transaction(false, action);
+        return leased(false, () -> access.leasedRead(action));
+    }
+
+    private <T> T write(java.util.function.Function<ClientSession, T> action) {
+        if (validation == Validation.TRANSACTION) return transaction(true, action);
+        var fence = switch (validation) {
+            case LEASE_STATE -> MongoCachePipelineAccess.LeaseFence.CLAIM_AND_STATE;
+            case LEASE_READ -> MongoCachePipelineAccess.LeaseFence.CLAIM_READ;
+            default -> MongoCachePipelineAccess.LeaseFence.CLAIM;
+        };
+        return leased(true, () -> access.leasedWrite(fence, action));
+    }
+
+    /** Reads under a lease see only majority-committed state, because they are not inside a snapshot transaction. */
+    private com.mongodb.client.MongoCollection<Document> rows() {
+        var rows = table.on(target);
+        return validation == Validation.TRANSACTION ? rows : rows.withReadConcern(com.mongodb.ReadConcern.MAJORITY);
+    }
+
+    /**
+     * Runs an operation under a proved lease, proving it first when none stands or the last proof is older
+     * than the lease. A proof is the full per-transaction validation plus a check that the original claim is
+     * still live. Any failure of the operation drops the lease, so the next operation proves again and fails
+     * closed if the claim, the identity or the structure no longer holds.
+     */
+    private <T> T leased(boolean writes, java.util.function.Supplier<T> operation) {
+        long now = System.nanoTime();
+        long lease = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Long.getLong(LEASE_PROPERTY, 10_000L));
+        if (!leaseProved || now - leaseProvedAt >= lease || (writes && !leaseCoversWrites)) {
+            leaseProved = false;
+            boolean claimed = writes || access.originalClaim() != null;
+            // A read-only view holds no claim and proves only identity and structure, as its reads always did.
+            transaction(writes && !placementRemembered, session -> {
+                if (claimed) access.verifyOriginalClaim(session);
+                return null;
+            });
+            if (writes) placementRemembered = true;
+            leaseCoversWrites = claimed;
+            leaseProvedAt = now;
+            leaseProved = true;
+            LEASE_OPENS.incrementAndGet();
+        }
+        try {
+            return operation.get();
+        } catch (RuntimeException failure) {
+            leaseProved = false;
+            LEASE_LOSSES.incrementAndGet();
+            throw failure;
+        }
     }
 
     private <T> T transaction(boolean mutation, java.util.function.Function<ClientSession, T> action) {
