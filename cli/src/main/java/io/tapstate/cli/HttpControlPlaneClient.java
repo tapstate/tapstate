@@ -1925,6 +1925,35 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
     }
 
+    @Override
+    public NestInspectOutcome nestInspect(URI baseUrl, String credential, String pipelineId, String step,
+            List<String> rootKey) {
+        StringBuilder path = new StringBuilder("/api/pipelines/").append(pipelineId).append("/nest/")
+                .append(java.net.URLEncoder.encode(step, StandardCharsets.UTF_8)).append("/documents");
+        char separator = '?';
+        for (String value : rootKey) {
+            path.append(separator).append("key=").append(java.net.URLEncoder.encode(value, StandardCharsets.UTF_8));
+            separator = '&';
+        }
+        HttpRequest request = authed(baseUrl, path.toString(), credential).GET().build();
+        try {
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                return JsonReader.parse(response.body()) instanceof Map<?, ?> view && view.get("step") != null
+                        ? new NestInspectOutcome.Found(view)
+                        : new NestInspectOutcome.Unreachable();
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new NestInspectOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new NestInspectOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new NestInspectOutcome.Unreachable();
+        }
+    }
+
     /** The progress decoded from a 200 body, or {@code null} when the body is not the promised shape. */
     private static NestProgressOutcome.Found nestProgressBody(String body) {
         if (!(JsonReader.parse(body) instanceof Map<?, ?> root)

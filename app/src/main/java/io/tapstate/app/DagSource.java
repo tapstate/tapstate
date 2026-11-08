@@ -5,6 +5,7 @@ import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.nest.NestSettings;
+import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.spi.store.ArtifactStore;
 
 import java.util.List;
@@ -161,6 +162,14 @@ interface DagSource {
      * and has no map to configure.
      */
     NestCapacity capacityOf(String pipelineId);
+
+    /**
+     * The compiled tree of {@code stepId}, a nest step of {@code pipelineId}, for a read of what the step
+     * holds; empty where the step is not a nest or this source compiles none.
+     */
+    default Optional<NestTopology> nestTopology(String pipelineId, String stepId) {
+        return Optional.empty();
+    }
 
     /** A pipeline's nest settings, and the state map namespaces they apply to. */
     record NestCapacity(Map<String, String> mapDatabases, NestSettings settings) {

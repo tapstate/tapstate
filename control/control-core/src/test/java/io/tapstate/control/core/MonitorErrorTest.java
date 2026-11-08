@@ -25,7 +25,12 @@ class MonitorErrorTest {
                 "monitor.query-budget-exceeded",
                 // a nest read of a pipeline with no nest step, or of a step that is not one
                 "monitor.no-nest-step",
-                "monitor.unknown-nest-step");
+                "monitor.unknown-nest-step",
+                // a nest inspect of a step not running here, or of a root key that is the wrong width or
+                // holds nothing
+                "monitor.nest-not-running",
+                "monitor.nest-root-key-width",
+                "monitor.nest-root-key-not-held");
     }
 
     @Test

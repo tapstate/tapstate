@@ -253,6 +253,27 @@ public final class OperatorMapBindings implements AutoCloseable {
         return held == null || !held.active.get() ? Optional.empty() : Optional.of(held.binding.placement());
     }
 
+    /**
+     * The live hot map holding one kind of a nest step's state at one level, for a read made from outside the
+     * run - an operator asking what one document holds. Empty where this member holds no such map live, which a
+     * reader reports as nothing held here rather than guessing a name.
+     */
+    public synchronized Optional<String> liveNestMap(String pipelineId, String stepId, List<String> path,
+            OperatorMapCoordinates.NestMap kind, String alias) {
+        String pathId = OperatorMapCoordinates.path(path);
+        String namespace = OperatorMapCoordinates.nestNamespace(kind, alias);
+        for (Map.Entry<String, Bound> entry : hotMaps.entrySet()) {
+            Bound held = entry.getValue();
+            OperatorPlacement placement = held.binding.placement();
+            if (held.active.get() && placement.resource() == OperatorPlacement.Resource.NEST_STATE
+                    && placement.scope().pipelineId().equals(pipelineId) && placement.stepId().equals(stepId)
+                    && placement.pathId().equals(pathId) && placement.namespace().equals(namespace)) {
+                return Optional.of(entry.getKey());
+            }
+        }
+        return Optional.empty();
+    }
+
     public synchronized boolean release(OperatorMapBinding original) {
         requireOpen(); Bound held = slots.get(original.placement().mapName());
         if (held == null || !held.binding.equals(original) || !held.active.get()) return false;

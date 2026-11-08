@@ -54,6 +54,7 @@ import io.tapstate.runtime.engine.nest.NestDeadLetter;
 import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
+import io.tapstate.runtime.engine.nest.NestTopology;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
@@ -3049,6 +3050,24 @@ final class StoreBackedDagSource implements DagSource {
      * same tree the topology and the teardown names come from, so a budget cannot end up on a namespace no
      * vertex writes to while the ones that are written to run on the deployment's number.
      */
+    @Override
+    public Optional<NestTopology> nestTopology(String pipelineId, String stepId) {
+        PipelineResource pipeline = PipelineInlining.inline(
+                StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
+        if (pipeline.transforms() == null) {
+            return Optional.empty();
+        }
+        for (Step step : pipeline.transforms()) {
+            if (step.id().equals(stepId) && step instanceof Step.Inline inline
+                    && inline.body() instanceof TransformBody.Nest nest) {
+                Map<String, NestTable> byAlias =
+                        nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices(pipeline)));
+                return Optional.of(NestTopology.compile(pipeline.id(), stepId, nest, byAlias::get));
+            }
+        }
+        return Optional.empty();
+    }
+
     @Override
     public NestCapacity capacityOf(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);

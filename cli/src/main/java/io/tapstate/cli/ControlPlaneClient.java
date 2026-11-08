@@ -332,6 +332,15 @@ interface ControlPlaneClient extends AutoCloseable {
     }
 
     /**
+     * Reads what {@code step} of {@code pipelineId} holds under {@code rootKey}, one value per root key column,
+     * via {@code GET {baseUrl}/api/pipelines/{pipelineId}/nest/{step}/documents?key=...}. Never throws.
+     */
+    default NestInspectOutcome nestInspect(URI baseUrl, String credential, String pipelineId, String step,
+            List<String> rootKey) {
+        return new NestInspectOutcome.Unreachable();
+    }
+
+    /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
      * {@code credential}: one report per derived step on success (empty for a pipeline with no join), a

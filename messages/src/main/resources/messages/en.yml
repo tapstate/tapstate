@@ -940,6 +940,15 @@ monitor.no-nest-step:
 monitor.unknown-nest-step:
   message: "Pipeline {pipeline} has no nest step named {step}."
   solution: "Name one of its nest steps instead: {steps}."
+monitor.nest-not-running:
+  message: "Pipeline {pipeline} is not running on this node, so step {step} has no live state to read."
+  solution: "Start it with 'tapstate start {pipeline}', or run the command against the node that runs it. 'tapstate nest progress {pipeline}' works while it is stopped."
+monitor.nest-root-key-width:
+  message: "Step {step} of pipeline {pipeline} has a root key of {columns}, but {given} value(s) were given."
+  solution: "Give one value per root key column, in that order: {columns}."
+monitor.nest-root-key-not-held:
+  message: "Step {step} of pipeline {pipeline} holds nothing under root key {key}."
+  solution: "Check the value of {columns}: no row with that key, and no row pointing at it, has reached the step yet."
 artifact.in-use:
   message: "Artifact `{id}` is still referenced by: {referrers}."
   solution: "Delete or rewrite those resources first, then delete `{id}`."

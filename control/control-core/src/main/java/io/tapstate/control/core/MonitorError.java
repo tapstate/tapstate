@@ -41,7 +41,25 @@ public enum MonitorError implements TapstateErrorCode {
      * and {@code steps} the nest steps the pipeline does have, comma-separated, so the refusal says what to
      * type instead.
      */
-    UNKNOWN_NEST_STEP("monitor.unknown-nest-step", Set.of("pipeline", "step", "steps"));
+    UNKNOWN_NEST_STEP("monitor.unknown-nest-step", Set.of("pipeline", "step", "steps")),
+
+    /**
+     * A read of what a nest step holds named a pipeline that is not running here, so there is no live state
+     * to read: {@code pipeline} and {@code step} are what was asked about.
+     */
+    NEST_NOT_RUNNING("monitor.nest-not-running", Set.of("pipeline", "step")),
+
+    /**
+     * A root key was given with a different number of values than the root key has columns: {@code columns}
+     * names them in order and {@code given} is how many values arrived.
+     */
+    NEST_ROOT_KEY_WIDTH("monitor.nest-root-key-width", Set.of("pipeline", "step", "columns", "given")),
+
+    /**
+     * Nothing is held under the root key given, read as a number or as text: {@code key} is the key as typed
+     * and {@code columns} the root key's columns.
+     */
+    NEST_ROOT_KEY_NOT_HELD("monitor.nest-root-key-not-held", Set.of("pipeline", "step", "key", "columns"));
 
     private final String code;
     private final Set<String> placeholders;

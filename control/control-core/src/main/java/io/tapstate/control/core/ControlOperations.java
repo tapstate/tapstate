@@ -386,6 +386,13 @@ public final class ControlOperations {
     public static final Operation PIPELINE_NEST_PROGRESS = new Operation(
             "pipeline.nest.progress", Scope.READ, false, null, CLI_ONLY);
 
+    /**
+     * What one nest step holds for one root key: its parts and their source orders, what waits for a parent,
+     * and the document as it stands. Row data, read like the data browser reads it.
+     */
+    public static final Operation PIPELINE_NEST_INSPECT = new Operation(
+            "pipeline.nest.inspect", Scope.READ, false, null, CLI_ONLY);
+
     public static final Operation PIPELINE_POSITION = new Operation(
             "pipeline.position", Scope.READ, false, null, CLI_ONLY);
     public static final Operation PIPELINE_SET_POSITION = new Operation(
@@ -504,6 +511,7 @@ public final class ControlOperations {
             PIPELINE_METRICS_HISTORY,
             PIPELINE_EXPLAIN,
             PIPELINE_NEST_PROGRESS,
+            PIPELINE_NEST_INSPECT,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

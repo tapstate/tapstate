@@ -97,6 +97,13 @@ class DataPlaneActuationConfiguration {
         return ClusterMembershipGate.dataMembers(member);
     }
 
+    /** What a running nest step holds for one root key, read off this member's engine for the nest inspect read. */
+    @Bean
+    io.tapstate.control.core.NestStateInspector nestStateInspector(Engine engine, DagSource dagSource,
+            HazelcastInstance hazelcastMember) {
+        return new EngineNestStateInspector(engine, dagSource, hazelcastMember);
+    }
+
     /** The plans of the runs the cluster is executing, written by whichever member submits each. */
     @Bean
     HazelcastExecutionPlans executionPlans(HazelcastInstance hazelcastMember) {

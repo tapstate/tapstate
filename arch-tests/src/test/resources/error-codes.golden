@@ -336,6 +336,9 @@ migration.data-newer-than-binary
 migration.lock-timeout
 monitor.cursor-expired
 monitor.invalid-cursor
+monitor.nest-not-running
+monitor.nest-root-key-not-held
+monitor.nest-root-key-width
 monitor.no-nest-step
 monitor.no-observation
 monitor.query-budget-exceeded
