@@ -22,7 +22,10 @@ class MonitorErrorTest {
                 "monitor.no-observation",
                 "monitor.invalid-cursor",
                 "monitor.cursor-expired",
-                "monitor.query-budget-exceeded");
+                "monitor.query-budget-exceeded",
+                // a nest read of a pipeline with no nest step, or of a step that is not one
+                "monitor.no-nest-step",
+                "monitor.unknown-nest-step");
     }
 
     @Test
@@ -35,5 +38,8 @@ class MonitorErrorTest {
         assertThat(MonitorError.CURSOR_EXPIRED.placeholders()).containsExactly("operation");
         assertThat(MonitorError.QUERY_BUDGET_EXCEEDED.placeholders())
                 .containsExactlyInAnyOrder("operation", "budget", "limit");
+        assertThat(MonitorError.NO_NEST_STEP.placeholders()).containsExactly("pipeline");
+        assertThat(MonitorError.UNKNOWN_NEST_STEP.placeholders())
+                .containsExactlyInAnyOrder("pipeline", "step", "steps");
     }
 }

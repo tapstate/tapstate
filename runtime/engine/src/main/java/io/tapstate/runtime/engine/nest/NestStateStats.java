@@ -73,13 +73,19 @@ public final class NestStateStats {
         counters(namespace).pendingHighWater.accumulate(pending);
     }
 
+    /** Counts {@code documents} whole documents sent from {@code namespace}'s level since the run began. */
+    public void rendered(String namespace, long documents) {
+        counters(namespace).rootsRendered.add(documents);
+    }
+
     /** How often {@code namespace} was reached for, how much of that went behind the map, at what cost. */
     public Counted counted(String namespace) {
         Counters counters = byNamespace.get(namespace);
         return counters == null
-                ? new Counted(0, 0, 0, 0, 0, 0)
+                ? new Counted(0, 0, 0, 0, 0, 0, 0, 0)
                 : new Counted(counters.accesses.sum(), counters.backfills.sum(), counters.backfillNanos.sum(),
-                        counters.pendingHighWater.get(), counters.keyAccesses.sum(), counters.coldKeys.sum());
+                        counters.pendingHighWater.get(), counters.keyAccesses.sum(), counters.coldKeys.sum(),
+                        counters.rootsRendered.sum(), counters.countingSinceMillis);
     }
 
     /** Whether anything has been counted for {@code namespace} at all - absence being distinct from zero. */
@@ -102,9 +108,14 @@ public final class NestStateStats {
 
     /** One namespace's counts, as read together. Nanoseconds, because the trips being timed are short. */
     public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater,
-            long keyAccesses, long coldKeys) {
+            long keyAccesses, long coldKeys, long rootsRendered, long countingSinceMillis) {
         public Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
-            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0);
+            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0, 0, 0);
+        }
+
+        public Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater,
+                long keyAccesses, long coldKeys) {
+            this(accesses, backfills, backfillNanos, pendingHighWater, keyAccesses, coldKeys, 0, 0);
         }
     }
 
@@ -120,6 +131,13 @@ public final class NestStateStats {
         private final LongAdder backfillNanos = new LongAdder();
         private final LongAdder keyAccesses = new LongAdder();
         private final LongAdder coldKeys = new LongAdder();
+        private final LongAdder rootsRendered = new LongAdder();
+
+        /**
+         * When these counts began, in epoch milliseconds: what a count of work done accumulates from, so a
+         * reader can tell a restart from a decrease. Fixed when the namespace is first counted on this member.
+         */
+        private final long countingSinceMillis = System.currentTimeMillis();
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
     }
 }

@@ -31,7 +31,17 @@ public enum MonitorError implements TapstateErrorCode {
     CURSOR_EXPIRED("monitor.cursor-expired", Set.of("operation")),
 
     /** A history query crossed one of its independently counted runtime budgets. */
-    QUERY_BUDGET_EXCEEDED("monitor.query-budget-exceeded", Set.of("operation", "budget", "limit"));
+    QUERY_BUDGET_EXCEEDED("monitor.query-budget-exceeded", Set.of("operation", "budget", "limit")),
+
+    /** A nest read named a pipeline that has no nest step at all: {@code pipeline} is the id asked about. */
+    NO_NEST_STEP("monitor.no-nest-step", Set.of("pipeline")),
+
+    /**
+     * A nest read named a step that is not one of the pipeline's nest steps: {@code step} is the name given
+     * and {@code steps} the nest steps the pipeline does have, comma-separated, so the refusal says what to
+     * type instead.
+     */
+    UNKNOWN_NEST_STEP("monitor.unknown-nest-step", Set.of("pipeline", "step", "steps"));
 
     private final String code;
     private final Set<String> placeholders;

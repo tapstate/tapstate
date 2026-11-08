@@ -84,6 +84,9 @@ public enum CardinalityBudget {
     NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE,
             1_000, Fold.HIGHEST),
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    /** Documents sent by each nest's root level; one series per nest step, so far below the budget. */
+    NEST_ROOTS_RENDERED("tapstate.pipeline.nest.roots.rendered", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     /** One reading per namespace naming where it comes from; overflow folds its origin labels with the namespace. */

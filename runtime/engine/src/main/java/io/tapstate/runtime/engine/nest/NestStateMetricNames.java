@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.lifecycle.NestStateReading;
+import java.time.Instant;
 import java.util.Map;
 import java.util.OptionalLong;
 
@@ -30,6 +31,12 @@ public final class NestStateMetricNames {
     /** Keys requested by completed cold loader callbacks, including absent stored values. */
     public static final String COLD_KEYS = "coldKeys";
 
+    /** Whole documents the root level has sent since the run began; only a rendering level has it. */
+    public static final String ROOTS_RENDERED = "rootsRendered";
+
+    /** When that count began, in epoch milliseconds, so it can travel as an accumulating count. */
+    public static final String ROOTS_RENDERED_SINCE = "rootsRenderedSince";
+
     /** How long those took in total. */
     public static final String BACKFILL_MILLIS = "backfillMillis";
 
@@ -56,8 +63,13 @@ public final class NestStateMetricNames {
                 kinds.getOrDefault(BACKFILL_MILLIS, 0L),
                 kinds.getOrDefault(PENDING_HIGH_WATER, 0L),
                 stored);
-        return kinds.containsKey(KEY_ACCESSES) && kinds.containsKey(COLD_KEYS)
-                ? reading.withKeyCounts(kinds.get(KEY_ACCESSES), kinds.get(COLD_KEYS)) : reading;
+        if (kinds.containsKey(KEY_ACCESSES) && kinds.containsKey(COLD_KEYS)) {
+            reading = reading.withKeyCounts(kinds.get(KEY_ACCESSES), kinds.get(COLD_KEYS));
+        }
+        return kinds.containsKey(ROOTS_RENDERED) && kinds.containsKey(ROOTS_RENDERED_SINCE)
+                ? reading.withRootsRendered(kinds.get(ROOTS_RENDERED),
+                        Instant.ofEpochMilli(kinds.get(ROOTS_RENDERED_SINCE)))
+                : reading;
     }
 
     /** The name a reading of {@code kind} about {@code namespace} is left under. */

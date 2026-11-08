@@ -122,6 +122,14 @@ public final class ObservationPublisher {
     private static final String NEST_STORED_PREFIX = "nestStateStored.";
 
     /**
+     * How many whole documents a nest's root level has sent since its count began. Published only for the
+     * root level, the one that renders, so every other namespace is absent rather than zero. It is the unit a
+     * reader of a load wants - documents, which is what the target counts - and the one this product's own
+     * progress view reads, so the two cannot disagree.
+     */
+    private static final String NEST_ROOTS_RENDERED_PREFIX = "nestRootsRendered.";
+
+    /**
      * How many changes the namespace could never place in a document. Published only for a namespace that
      * discarded any, so that nothing discarded is an absence rather than a zero - the one reading here whose
      * quiet state and whose unwired state would otherwise be spelled the same way.
@@ -161,6 +169,11 @@ public final class ObservationPublisher {
     private static final String NEST_BACKFILL_TIME_METRIC = "tapstate.pipeline.nest.backfill.time";
     private static final String NEST_PENDING_HIGH_WATER_METRIC = "tapstate.pipeline.nest.pending.high_water";
     private static final String NEST_STORED_METRIC = "tapstate.pipeline.nest.stored";
+    /**
+     * The one nest count that accumulates with a start: documents sent by a root level. A counter rather
+     * than a reading because the start travels with it, so a restart is a new series and not a decrease.
+     */
+    static final String NEST_ROOTS_RENDERED_METRIC = "tapstate.pipeline.nest.roots.rendered";
     /**
      * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
      * attributes are the step, level and map. A mapping rather than more attributes on the counts: names a
@@ -307,6 +320,7 @@ public final class ObservationPublisher {
             Map.entry(NEST_PENDING_HIGH_WATER_METRIC,
                     keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_STORED_METRIC, keyed(NEST_STORED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(NEST_ROOTS_RENDERED_METRIC, keyed(NEST_ROOTS_RENDERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_DEAD_LETTERED_METRIC, keyed(NEST_DEAD_LETTERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_METRIC, keyed(JOIN_RECOMPUTE_DONE_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
@@ -1032,6 +1046,7 @@ public final class ObservationPublisher {
                 pendingHighWater).ifPresent(facts::add);
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
+        rootsRendered(pipelineId, at, nestReadings).ifPresent(facts::add);
         nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
@@ -1053,6 +1068,18 @@ public final class ObservationPublisher {
         load(pipelineId, at, loaded).forEach(facts::add);
         runLoad(pipelineId, at, readThisRun).ifPresent(facts::add);
         return facts;
+    }
+
+    /** One accumulating point per root level that has sent anything, each from its own start. */
+    private static Optional<MetricFact> rootsRendered(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> points = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> reading.rootsRendered().ifPresent(rendered ->
+                points.add(MetricPoint.accumulated(
+                        Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace),
+                        reading.rootsRenderedSince(), at, rendered))));
+        return points.isEmpty() ? Optional.empty()
+                : Optional.of(new MetricFact(NEST_ROOTS_RENDERED_METRIC, MetricType.COUNTER, "{document}", points));
     }
 
     private static Optional<MetricFact> nestOrigins(String pipelineId, Instant at,

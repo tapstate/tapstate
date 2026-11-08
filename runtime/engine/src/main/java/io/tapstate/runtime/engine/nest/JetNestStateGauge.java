@@ -40,6 +40,12 @@ final class JetNestStateGauge implements NestStateGauge {
         metric(NestStateMetricNames.COLD_KEYS, namespace).set(coldKeys);
     }
 
+    @Override
+    public void rootsReading(String namespace, long rootsRendered, long countingSinceMillis) {
+        metric(NestStateMetricNames.ROOTS_RENDERED, namespace).set(rootsRendered);
+        metric(NestStateMetricNames.ROOTS_RENDERED_SINCE, namespace).set(countingSinceMillis);
+    }
+
     private Metric metric(String kind, String namespace) {
         return byName.computeIfAbsent(NestStateMetricNames.nameOf(kind, namespace), Metrics::metric);
     }

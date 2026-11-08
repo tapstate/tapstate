@@ -73,6 +73,9 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private final Map<String, NestStore<Map<String, Object>>> referenced;
     private final NestStore<RootAssembly> store;
+
+    /** Documents queued for sending since the count was last handed to the store, for the progress reading. */
+    private long renderedUnreported;
     private boolean snapshotRootsHaveHistory;
     private final String outputStream;
     private final Deque<Object> outgoing = new ArrayDeque<>();
@@ -1864,6 +1867,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private void documentSent(Object key, RootAssembly assembly) {
         assembly.documentSent();
+        renderedUnreported++;
         if (assembly.mayNeedReferenceUpdate()) {
             recentReferenceStates.remove(key);
         } else {
@@ -1888,6 +1892,12 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 return false;
             }
             outgoing.poll();
+        }
+        if (renderedUnreported > 0) {
+            // Reported once the outbox has taken them, and in one call per drain rather than one per
+            // document: what a reader wants is how far the load got, not a write per root.
+            store.rendered(renderedUnreported);
+            renderedUnreported = 0;
         }
         return true;
     }

@@ -1,5 +1,7 @@
 package io.tapstate.core.lifecycle;
 
+import java.time.Instant;
+import java.util.Objects;
 import java.util.OptionalLong;
 
 /**
@@ -42,10 +44,31 @@ import java.util.OptionalLong;
  *     could not say
  * @param keyAccesses the number of requested key accesses, where measured
  * @param coldKeys the number of keys requested by completed cold loaders, where measured
+ * @param rootsRendered whole documents sent from this namespace since {@code rootsRenderedSince}; present
+ *     only for the root level of a nest, which is the one level that renders documents
+ * @param rootsRenderedSince when that count began, present exactly when the count is
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
         long pendingHighWater, OptionalLong stored, NestOrigin origin,
-        OptionalLong keyAccesses, OptionalLong coldKeys) {
+        OptionalLong keyAccesses, OptionalLong coldKeys, OptionalLong rootsRendered,
+        Instant rootsRenderedSince) {
+
+    public NestStateReading {
+        rootsRendered = rootsRendered == null ? OptionalLong.empty() : rootsRendered;
+        if (rootsRendered.isPresent() != (rootsRenderedSince != null)) {
+            throw new IllegalArgumentException(
+                    "a count of documents sent says what it counts from: a count without a start hands every"
+                            + " reader a stream in which a restart and a decrease are the same observation");
+        }
+    }
+
+    /** A reading without a count of documents sent: every level but the root, and older readers. */
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestOrigin origin,
+            OptionalLong keyAccesses, OptionalLong coldKeys) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, origin, keyAccesses,
+                coldKeys, OptionalLong.empty(), null);
+    }
 
     /** Compatibility reading without key instrumentation. Missing counters are not measured zeroes. */
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
@@ -74,13 +97,19 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     /** The same reading, placed in the pipeline's definition. */
     public NestStateReading withOrigin(NestOrigin origin) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, keyAccesses, coldKeys);
+                origin, keyAccesses, coldKeys, rootsRendered, rootsRenderedSince);
     }
 
     /** The same reading with independently measured key counters. */
     public NestStateReading withKeyCounts(long keyAccesses, long coldKeys) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys));
+                origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys), rootsRendered, rootsRenderedSince);
+    }
+
+    /** The same reading with the count of whole documents the root level has sent. */
+    public NestStateReading withRootsRendered(long rendered, Instant since) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                origin, keyAccesses, coldKeys, OptionalLong.of(rendered), Objects.requireNonNull(since, "since"));
     }
 
     /** A decrease in either measured key counter identifies a new counting lifetime. */

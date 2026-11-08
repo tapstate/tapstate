@@ -1904,6 +1904,71 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     @Override
+    public NestProgressOutcome nestProgress(URI baseUrl, String credential, String pipelineId, String step) {
+        String path = "/api/pipelines/" + pipelineId + "/nest/progress"
+                + (step == null ? "" : "?step=" + java.net.URLEncoder.encode(step, StandardCharsets.UTF_8));
+        HttpRequest request = authed(baseUrl, path, credential).GET().build();
+        try {
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                NestProgressOutcome.Found found = nestProgressBody(response.body());
+                return found == null ? new NestProgressOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), "The server refused the read.");
+            return new NestProgressOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new NestProgressOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new NestProgressOutcome.Unreachable();
+        }
+    }
+
+    /** The progress decoded from a 200 body, or {@code null} when the body is not the promised shape. */
+    private static NestProgressOutcome.Found nestProgressBody(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> root)
+                || !(root.get("pipelineId") instanceof String pipelineId)
+                || !(root.get("steps") instanceof List<?> entries)) {
+            return null;
+        }
+        List<NestProgressOutcome.Step> steps = new ArrayList<>();
+        for (Object entry : entries) {
+            if (!(entry instanceof Map<?, ?> step) || !(step.get("step") instanceof String id)) {
+                return null;
+            }
+            List<NestProgressOutcome.Table> tables = new ArrayList<>();
+            if (step.get("tables") instanceof List<?> cells) {
+                for (Object cell : cells) {
+                    if (cell instanceof Map<?, ?> t && t.get("table") instanceof String table) {
+                        tables.add(new NestProgressOutcome.Table(table, string(t.get("path")),
+                                string(t.get("stage")), number(t.get("rowsRead")), number(t.get("rowsEstimate")),
+                                number(t.get("rowsStaged"))));
+                    }
+                }
+            }
+            List<String> waiting = new ArrayList<>();
+            if (step.get("waitingFor") instanceof List<?> names) {
+                for (Object name : names) {
+                    if (name instanceof String text) {
+                        waiting.add(text);
+                    }
+                }
+            }
+            steps.add(new NestProgressOutcome.Step(id, string(step.get("rootTable")),
+                    number(step.get("rootsRendered")), number(step.get("rootsEstimate")),
+                    string(step.get("activity")), waiting, tables));
+        }
+        return new NestProgressOutcome.Found(pipelineId, string(root.get("state")), string(root.get("phase")),
+                steps);
+    }
+
+    /** A JSON number as a long, or null where it is absent. */
+    private static Long number(Object value) {
+        return value instanceof Number n ? n.longValue() : null;
+    }
+
+    @Override
     public DerivedSchemaOutcome derivedSchema(URI baseUrl, String credential, String pipelineId) {
         HttpRequest.Builder request =
                 authed(baseUrl, "/api/pipelines/" + pipelineId + "/derived-schema", credential);

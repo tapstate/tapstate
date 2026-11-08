@@ -934,6 +934,12 @@ monitor.cursor-expired:
 monitor.query-budget-exceeded:
   message: "The {operation} query exceeded the {budget} budget of {limit}."
   solution: "Narrow the time range or select fewer table series, then start a new query."
+monitor.no-nest-step:
+  message: "Pipeline {pipeline} has no nest step, so there is no nest progress or document to show."
+  solution: "Run 'tapstate get {pipeline}' to see its steps; nest commands apply only to a step with 'type: nest'."
+monitor.unknown-nest-step:
+  message: "Pipeline {pipeline} has no nest step named {step}."
+  solution: "Name one of its nest steps instead: {steps}."
 artifact.in-use:
   message: "Artifact `{id}` is still referenced by: {referrers}."
   solution: "Delete or rewrite those resources first, then delete `{id}`."

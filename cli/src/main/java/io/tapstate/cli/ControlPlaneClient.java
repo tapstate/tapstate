@@ -323,6 +323,15 @@ interface ControlPlaneClient extends AutoCloseable {
     LogsOutcome logs(URI baseUrl, String credential, String pipelineId);
 
     /**
+     * Reads how far a pipeline's nest steps have got via
+     * {@code GET {baseUrl}/api/pipelines/{pipelineId}/nest/progress}, narrowed to {@code step} when it is not
+     * null, authenticated by the bearer {@code credential}. Never throws.
+     */
+    default NestProgressOutcome nestProgress(URI baseUrl, String credential, String pipelineId, String step) {
+        return new NestProgressOutcome.Unreachable();
+    }
+
+    /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
      * {@code credential}: one report per derived step on success (empty for a pipeline with no join), a

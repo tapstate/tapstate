@@ -217,6 +217,8 @@ class ApiExceptionHandler {
             Map.entry("monitor.invalid-cursor", HttpStatus.BAD_REQUEST),
             Map.entry("monitor.query-budget-exceeded", HttpStatus.BAD_REQUEST),
             Map.entry("monitor.cursor-expired", HttpStatus.GONE),
+            Map.entry("monitor.no-nest-step", HttpStatus.NOT_FOUND),
+            Map.entry("monitor.unknown-nest-step", HttpStatus.NOT_FOUND),
             Map.entry("data-browser.unknown-collection", HttpStatus.NOT_FOUND),
             Map.entry("data-browser.invalid-limit", HttpStatus.BAD_REQUEST),
             Map.entry("data-browser.connector-not-browsable", HttpStatus.BAD_REQUEST),

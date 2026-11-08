@@ -111,6 +111,22 @@ final class MapNestStore<S> implements NestStore<S> {
         gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
         gauge.keyReading(namespace, counted.keyAccesses(), counted.coldKeys());
+        if (counted.rootsRendered() > 0) {
+            gauge.rootsReading(namespace, counted.rootsRendered(), counted.countingSinceMillis());
+        }
+    }
+
+    /**
+     * Counts documents this level sent, per namespace rather than per store for the reason {@link #holding}
+     * gives, and leaves the reading at once: the count changes only here, and a document is the moment a
+     * reader watching a load wants it to move.
+     */
+    @Override
+    public void rendered(long documents) {
+        if (stats != null && documents > 0) {
+            stats.rendered(map.getName(), documents);
+            publishReading();
+        }
     }
 
     /**

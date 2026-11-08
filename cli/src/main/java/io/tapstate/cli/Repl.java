@@ -182,7 +182,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration");
+            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration", "nest");
 
     private final CommandLine commandLine;
 
@@ -886,6 +886,10 @@ final class Repl {
         // flag and leave the verb doing a plain read while reporting success.
         if (words.get(0).equals("derived-schema")) {
             return derivedSchemaOnline(words);
+        }
+        // `nest` names what it reads with a sub-verb before the pipeline, so it parses its own words.
+        if (words.get(0).equals("nest")) {
+            return nestOnline(words);
         }
         // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
         // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
@@ -4412,6 +4416,90 @@ final class Repl {
             return null;
         }
         return words.get(1);
+    }
+
+    static final String NEST_USAGE = "nest progress <pipeline-id> [<step>]";
+
+    /**
+     * {@code nest progress <pipeline-id> [<step>]}: how far each nest step's load has got and what it is
+     * waiting for, one block per step. Every number is one the pipeline already published, so this agrees
+     * with {@code snapshot} and {@code metrics}; a number the pipeline has not reported prints as {@code -}.
+     */
+    private int nestOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (words.size() < 3 || words.size() > 4 || !"progress".equals(words.get(1))
+                || words.subList(2, words.size()).stream().anyMatch(word -> word.isBlank() || word.startsWith("-"))) {
+            err.println("nest: usage: " + NEST_USAGE);
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = words.get(2);
+        String step = words.size() == 4 ? words.get(3) : null;
+        NestProgressOutcome outcome = withFailover(() ->
+                controlPlane.nestProgress(session.landingNode(), session.credential(), id, step),
+                o -> o instanceof NestProgressOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case NestProgressOutcome.Found found -> {
+                renderNestProgress(out, found);
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case NestProgressOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case NestProgressOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    static void renderNestProgress(PrintWriter out, NestProgressOutcome.Found found) {
+        out.println(found.pipelineId() + "  " + lowerOrDash(found.state())
+                + (found.phase() == null ? "" : "  initial load: " + lowerOrDash(found.phase())));
+        for (NestProgressOutcome.Step step : found.steps()) {
+            out.println();
+            out.println("step " + step.step() + ": " + nestActivityLine(found.state(), step));
+            out.println("  documents sent: " + dash(step.rootsRendered())
+                    + (step.rootsEstimate() == null ? "" : " of about " + step.rootsEstimate()
+                            + " " + step.rootTable() + " rows"));
+            List<String[]> rows = new ArrayList<>();
+            rows.add(new String[] {"TABLE", "PATH", "LOAD", "READ", "ESTIMATE"});
+            for (NestProgressOutcome.Table table : step.tables()) {
+                rows.add(new String[] {table.table(),
+                        table.path() == null || table.path().isEmpty() ? "(root)" : table.path(),
+                        lowerOrDash(table.stage()), dash(table.rowsRead()), dash(table.rowsEstimate())});
+            }
+            int[] widths = new int[5];
+            for (String[] row : rows) {
+                for (int i = 0; i < row.length; i++) {
+                    widths[i] = Math.max(widths[i], row[i].length());
+                }
+            }
+            for (String[] row : rows) {
+                StringBuilder line = new StringBuilder("  ");
+                for (int i = 0; i < row.length; i++) {
+                    line.append(i == row.length - 1 ? row[i] : String.format("%-" + widths[i] + "s  ", row[i]));
+                }
+                out.println(line.toString().stripTrailing());
+            }
+        }
+    }
+
+    /** One sentence naming what a step is doing and, when it is held, the tables to look at. */
+    private static String nestActivityLine(String state, NestProgressOutcome.Step step) {
+        String waiting = String.join(", ", step.waitingFor());
+        return switch (step.activity() == null ? "" : step.activity()) {
+            case "NOT_RUNNING" -> "not moving; the pipeline is " + lowerOrDash(state);
+            case "LOADING" -> "loading; waiting for " + waiting + " to be read";
+            case "LANDING" -> "every table read; waiting for the target to confirm " + waiting;
+            case "MAINTAINING" -> "load complete; applying changes as they arrive";
+            default -> "no load reported for its tables";
+        };
+    }
+
+    private static String dash(Long value) {
+        return value == null ? "-" : value.toString();
+    }
+
+    private static String lowerOrDash(String value) {
+        return value == null ? "-" : value.toLowerCase(Locale.ROOT);
     }
 
     /**
