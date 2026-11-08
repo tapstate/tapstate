@@ -1261,8 +1261,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner.physical!=null && !owner.physical.live.get())throw refused();
         if(owner.physical!=null && before.servingTables().containsAll(requested))return;
         var configured=owner.configured;
-        if(configured==null)configured=ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,owner::require,stores.recoveryPinned().test(owner.origin.scope()));
-        else {stores.notes().guardedBy(owner::require).origin(configured.primary());connectors.resolve(configured.connectorId(),configured.artifactHash());owner.require();}
+        if (configured == null) {
+            boolean recoveryPinned = stores.recoveryPinned().test(owner.origin.scope());
+            configured = admitted && !recoveryPinned
+                    ? ConfiguredCaptureRun.prepareStartup(owner.origin, owner.config, stores.notes(), connectors, owner::require)
+                    : ConfiguredCaptureRun.prepare(owner.origin, owner.config, stores.notes(), connectors, owner::require, recoveryPinned);
+        } else {
+            stores.notes().guardedBy(owner::require).origin(configured.primary());
+            connectors.resolve(configured.connectorId(), configured.artifactHash());
+            owner.require();
+        }
         if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
         SrsChainState opened;
@@ -1276,23 +1284,32 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             if (!current.chains().publishServingTables(chainId, epoch, before.requestedTables(), owner.fence)) throw refused();
             opened = current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         }
-        owner.configured=configured;
-        startPreparedTail(owner,opened);
+        owner.configured = configured.retained();
+        startPreparedTail(owner, opened, configured);
     }
-    private void startPreparedTail(Owner owner,SrsChainState opened) {
+
+    private void startPreparedTail(Owner owner, SrsChainState opened) {
+        startPreparedTail(owner, opened, owner.configured);
+    }
+
+    private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
         var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
-        try {physical.tail=runtime.startTail(stores.scope(),opened,owner.fence,config,start,writer -> {
-            CapturePort port=ports.open(notes,config,physical.guard,null,actual -> writer.prepare(actual,notes.modelComparison(config,stores.notes(),connectors,physical.guard)));
+        java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {
+            CapturePort port=ports.open(opening,config,physical.guard,null,actual -> writer.prepare(actual,notes.modelComparison(config,stores.notes(),connectors,physical.guard)));
             if(owner.identity!=null && port instanceof io.tapstate.adapters.pdk.PdkCapturePort pdk){
                 physical.reports=operations.open(owner.identity,owner.prepared.captureId()+":stream",physical::requireReport,physical::requireReportLocal);
                 return pdk.withOperationObserver(physical.reports);
             }
             return port;
-        },physical.guard,owner.positionEditsRestricted);}
-        catch(RuntimeException|Error failure) {
+        };
+        try {
+            physical.tail = opening.startupArtifact() == null
+                    ? runtime.startTail(stores.scope(), opened, owner.fence, config, start, open, physical.guard, owner.positionEditsRestricted)
+                    : runtime.startTail(stores.scope(), opened, owner.fence, config, start, open, physical.guard, owner.positionEditsRestricted, true);
+        } catch(RuntimeException|Error failure) {
             try {physical.close();owner.physical=null;}catch(RuntimeException|Error cleanup){if(cleanup!=failure)failure.addSuppressed(cleanup);}
             throw failure;
         }

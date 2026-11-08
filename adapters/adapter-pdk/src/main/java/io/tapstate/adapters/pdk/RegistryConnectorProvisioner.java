@@ -58,6 +58,23 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
         return materialize(connectorId, resolveRegistration(connectorId), false);
     }
 
+    @Override public ConnectorRef resolveCaptureStartup(String connectorId) {
+        return materialize(connectorId, selectRegistration(connectorId, registry.findAll(connectorId)), false);
+    }
+
+    @Override public ConnectorRef revalidateCaptureStartup(String connectorId, ConnectorRef captured) {
+        var hash = captured.contentHash();
+        if (hash == null || !hash.matches("[a-f0-9]{64}")) return ConnectorProvisioner.super.revalidateCaptureStartup(connectorId, captured);
+        var matches = registry.findAll(connectorId).stream()
+                .filter(row -> connectorId.equals(row.connectorId()) && hash.equals(row.contentHash())).toList();
+        if (matches.size() != 1) throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
+        var target = cacheDir.resolve(hash + ".jar");
+        if (!captured.classpath().equals(List.of(target)) || !Files.exists(target))
+            return materialize(connectorId, matches.getFirst(), true);
+        validatedCache(connectorId, hash, target);
+        return captured;
+    }
+
     @Override public ConnectorRef resolveDefaultTest(String connectorId) {
         return materialize(connectorId, resolveRegistration(connectorId), false, true);
     }
@@ -101,7 +118,11 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
 
     /** The single registration for the id, refusing with a code when none or more than one matches. */
     private ConnectorRegistration resolveRegistration(String connectorId) {
-        List<ConnectorRegistration> matches = registry.list().stream()
+        return selectRegistration(connectorId, registry.list());
+    }
+
+    private static ConnectorRegistration selectRegistration(String connectorId, List<ConnectorRegistration> registrations) {
+        List<ConnectorRegistration> matches = registrations.stream()
                 .filter(registration -> registration.connectorId().equals(connectorId)).toList();
         if (matches.isEmpty()) {
             throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);

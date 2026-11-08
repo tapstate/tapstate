@@ -736,7 +736,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             throw new IllegalArgumentException("invalid original consumer arrivals");
         var captured = Map.copyOf(sequences);
         return transaction(admitted, session -> {
-            prove(session, context, fence, admitted); var own = requireOwn(session,context);
+            prove(session, context, fence, admitted);
+            var own = requireOwn(session, context, admitted);
             if (!bound(own.member(),membershipRevision,fence)) return Optional.empty();
             if (!own.member().tables().containsAll(captured.keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var old = held.value();
@@ -986,7 +987,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return new Own(root,member,records.cursor(member,cursor));
     }
     private Own requireOwn(ClientSession session,SrsConsumerContext context) {
-        var own = own(session,context);
+        return requireOwn(session, context, false);
+    }
+
+    private Own requireOwn(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
+        var own = own(session, context, businessChecked);
         if (own == null || own.member().detached()) throw unavailable(context.key().miningChainId());
         validateSnapshot(session,context,own.cursor().snapshot());
         return own;

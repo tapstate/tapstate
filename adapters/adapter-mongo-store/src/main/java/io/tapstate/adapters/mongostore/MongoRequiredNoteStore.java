@@ -264,6 +264,20 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public CaptureScopes openCaptureScopes(RequiredNoteOwner primary, RequiredNoteOwner global) {
+        if (retirement != null || primary.kind() != RequiredNoteOwner.Kind.CHAIN || global.kind() != RequiredNoteOwner.Kind.GLOBAL)
+            return RequiredNoteStore.super.openCaptureScopes(primary, global);
+        return StoreIo.call(() -> transaction(session -> {
+            Document cluster = identity.find(session, new Document("_id", "cluster")).first();
+            checkBinding(cluster, primary);
+            checkBinding(cluster, global);
+            // Exact per-owner lookups keep each namespace's existing collation behavior.
+            return new CaptureScopes(scopeOf(primary, scopes.find(session, byScope(primary)).first()),
+                    scopeOf(global, scopes.find(session, byScope(global)).first()));
+        }));
+    }
+
+    @Override
     public RequiredNoteValue read(RequiredNoteScope scope, String key) {
         Objects.requireNonNull(key, "key");
         return StoreIo.call(() -> transaction(session -> {
@@ -293,6 +307,33 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
             if (scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation())
                             .append("originGeneration", 0L),
                     new Document("$set", new Document("originGeneration", scope.generation()))).getMatchedCount() != 1) throw unavailable();
+            return origin;
+        }));
+    }
+
+    @Override
+    public RequiredNoteOrigin prepareSharedOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        requireOrdinary();
+        requireShared(scope);
+        Objects.requireNonNull(origin, "origin");
+        return withOriginIndexes(() -> transaction(session -> {
+            SourceConfigCipher cipher = cipherForWrite(session);
+            Document metadata = verifyScope(session, scope, false);
+            long writeFence = metadata.getLong("writeFence");
+            if (writeFence >= Long.MAX_VALUE - 1) throw unreadable("writeFence");
+            RequiredNoteOrigin retained = retainedOrigin(session, scope, metadata);
+            if (retained != null && !retained.equals(origin)) throw originMismatch();
+            var filter = byScope(scope.owner()).append("generation", scope.generation()).append("writeFence", writeFence);
+            var update = new Document("$inc", new Document("writeFence", 1L));
+            if (retained == null) {
+                if (notes.find(session, new Document("_id.bindingVersion", scope.owner().bindingVersion())
+                        .append("_id.namespace", scope.owner().namespace()).append("_id.generation", scope.generation())).first() != null)
+                    throw unavailable();
+                origins.insertOne(session, originDocument(scope, origin, cipher));
+                filter.append("originGeneration", 0L);
+                update.append("$set", new Document("originGeneration", scope.generation()));
+            }
+            if (scopes.updateOne(session, filter, update).getMatchedCount() != 1) throw unavailable();
             return origin;
         }));
     }
@@ -435,16 +476,33 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         requireShared(shared);
         return withCarryIndexes(() -> transaction(session -> {
             Document metadata = verifyScope(session, shared, false);
-            List<RequiredNoteCarry> retained = outgoing(session, shared.owner(), metadata);
-            if (retained.stream().anyMatch(carry -> carry.shared().generation() > shared.generation())) throw unavailable();
-            List<RequiredNoteCarry> current = retained.stream().filter(carry -> carry.shared().equals(shared)).toList();
-            for (RequiredNoteCarry carry : current) {
-                Document source = verifyCarrySource(session, carry.source(), false);
-                compatibleOrigins(session, shared, metadata, carry.source(), source);
-                if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
-            }
-            return current;
+            return verifiedCarries(session, shared, metadata);
         }));
+    }
+
+    @Override
+    public SharedStartup sharedStartup(RequiredNoteScope shared) {
+        requireShared(shared);
+        return withCarryIndexes(() -> withOriginIndexes(() -> transaction(session -> {
+            Document metadata = verifyScope(session, shared, false);
+            var dependencies = verifiedCarries(session, shared, metadata);
+            var blocked = blocked(session, shared.owner(), ALL_KEYS);
+            var origin = retainedOrigin(session, shared, metadata);
+            if (origin == null) throw unavailable();
+            return new SharedStartup(dependencies, blocked, origin);
+        })));
+    }
+
+    private List<RequiredNoteCarry> verifiedCarries(ClientSession session, RequiredNoteScope shared, Document metadata) {
+        List<RequiredNoteCarry> retained = outgoing(session, shared.owner(), metadata);
+        if (retained.stream().anyMatch(carry -> carry.shared().generation() > shared.generation())) throw unavailable();
+        List<RequiredNoteCarry> current = retained.stream().filter(carry -> carry.shared().equals(shared)).toList();
+        for (RequiredNoteCarry carry : current) {
+            Document source = verifyCarrySource(session, carry.source(), false);
+            compatibleOrigins(session, shared, metadata, carry.source(), source);
+            if (!incoming(session, carry.source().owner(), source).contains(carry)) throw unavailable();
+        }
+        return current;
     }
 
     @Override
