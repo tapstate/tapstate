@@ -27,6 +27,13 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
     }
 
+    record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
+
+    /** Reads original progress and the boundaries for its missing rings from one snapshot. */
+    default Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {
+        throw new UnsupportedOperationException("Capture startup sampling is not supported");
+    }
+
     /** The exact progress committed by an admitted startup's conditional write. */
     default Optional<SrsConsumerProgress> startReadingAfterAndGet(SrsConsumerContext context, long membershipRevision,
             long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence) {

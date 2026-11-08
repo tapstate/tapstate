@@ -191,6 +191,29 @@ class MongoSrsChainStoreIT {
     }
 
     @Test
+    void combinedEpochOpeningKeepsWidenedRequestsAndRejectsTheOldClaim() {
+        withBusiness(f -> {
+            assertThat(f.chains().prepare(CHAIN, "retention", f.fence()).epoch()).isZero();
+            f.chains().requestTables(CHAIN, Set.of(QUIET), f.fence());
+            var opened = f.chains().openServingEpoch(CHAIN, 0, Set.of(ORDERS), f.fence()).orElseThrow();
+            assertThat(opened.epoch()).isOne();
+            assertThat(opened.requestedTables()).containsExactlyInAnyOrder(ORDERS, QUIET);
+            assertThat(opened.servingTables()).isEqualTo(opened.requestedTables());
+            assertThat(f.chains().openServingEpoch(CHAIN, 0, Set.of(ORDERS), f.fence())).contains(opened);
+            assertThat(f.chains().openServingEpoch(CHAIN, 0, Set.of("new-table"), f.fence())).isEmpty();
+            assertThatThrownBy(() -> f.chains().openServingEpoch(CHAIN, 1, Set.of(ORDERS), f.fence()))
+                    .satisfies(MongoSrsChainStoreIT::unproven);
+            var stale = f.fence();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(stale.key())),
+                    new Document("$inc", new Document("claimGeneration", 1L)));
+            assertThatThrownBy(() -> f.chains().openServingEpoch(CHAIN, 0, Set.of(ORDERS), stale))
+                    .satisfies(failure -> code(failure, IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(f.chains().load(CHAIN)).contains(opened);
+        });
+    }
+
+    @Test
     void wideningTheRequestStopsAnOldNarrowCallbackFromCertifyingASourcePosition() {
         withBusiness(f -> {
             prepare(f, Set.of(ORDERS));

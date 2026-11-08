@@ -613,6 +613,27 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
 
+    @Override public Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {
+        var selected = Map.copyOf(ringsByTable);
+        return transaction(session -> {
+            var original = own(session, context, true);
+            if (original == null || original.member().detached()) return Optional.empty();
+            var held = original.cursor();
+            validateSnapshot(session, context, held.snapshot());
+            var progress = new SrsConsumerProgress(context, original.member().revision(), held.revision(),
+                    held.value(), held.snapshot(), held.writerRun(), held.ringDoneThrough());
+            var missing = new java.util.HashSet<String>();
+            selected.forEach((table, ring) -> {
+                if (!held.ringDoneThrough().containsKey(table)) missing.add(ring);
+            });
+            var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+            var log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database),
+                    SystemCollections.SRS_LOG_BOUNDS.on(database), SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
+            var bounds = log.publishedBounds(session, context.key().miningChainId(), missing, original.root());
+            return Optional.of(new StartupArrivals(progress, bounds));
+        });
+    }
+
     @Override public boolean supportsReadEventVerification() { return true; }
 
     @Override public boolean supportsReadBatchVerification() { return true; }
@@ -944,10 +965,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     /** Hot progress never depends on another consumer's private cursor. Closure enumeration stays in control operations. */
     private Own own(ClientSession session,SrsConsumerContext context) {
+        return own(session, context, false);
+    }
+
+    private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
         String chain = context.key().miningChainId();
         var root = SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
         if (root == null) throw unavailable(chain);
-        var state = chains.state(session,root); var id = new Document("_id",records.id(context.key()));
+        var state = chains.state(session, root, businessChecked); var id = new Document("_id",records.id(context.key()));
         var row = SystemCollections.SRS_CONSUMERS.on(database).find(session,id).first();
         if (row == null) {
             // Prove absence through the complete dependency view before allowing a new caller to prepare.

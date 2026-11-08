@@ -695,8 +695,21 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             SrsChainState chain, boolean admitted) {
         var consumers = source.srs.consumers();
         var context = source.consumer.context();
-        var progress = consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        var arrivals = initialArrivals(session, source, pipeline, chain, progress, admitted);
+        var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
+        SrsConsumerProgress progress;
+        Optional<Map<String, SrsLogBounds>> bounds = Optional.empty();
+        if (admitted && source.selected.tables().size() > 1 && chain.pendingFreshFull() == null && !(start instanceof StartFrom.At)) {
+            var rings = new LinkedHashMap<String, String>();
+            source.selected.tables().forEach(table -> rings.put(table, source.selected.ringName(table)));
+            requireSession(session);
+            var sampled = consumers.startupArrivals(context, rings).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            requireSession(session);
+            progress = sampled.progress();
+            bounds = sampled.bounds();
+        } else {
+            progress = consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
+        var arrivals = initialArrivals(session, source, chain, progress, start, bounds);
         if (arrivals.isEmpty()) return progress;
         long memberRevision = source.consumer.membershipRevision();
         var original = claim(session.original);
@@ -803,30 +816,20 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private Map<String, Long> initialArrivals(
             Session session,
             Source source,
-            PipelineResource pipeline,
             SrsChainState chain,
-            SrsConsumerProgress progress, boolean admitted) {
+            SrsConsumerProgress progress,
+            StartFrom start,
+            Optional<Map<String, SrsLogBounds>> bounds) {
         var arrivals = new LinkedHashMap<String, Long>();
-        var missing = source.selected.tables().stream()
-                .filter(table -> !progress.ringDoneThrough().containsKey(table)).toList();
-        if (missing.isEmpty()) return arrivals;
-        var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
-        if (admitted && missing.size() > 1 && chain.pendingFreshFull() == null && !(start instanceof StartFrom.At)) {
-            var rings = new LinkedHashMap<String, String>();
-            missing.forEach(table -> rings.put(table, source.selected.ringName(table)));
-            requireSession(session);
-            var bounds = source.srs.log().publishedBounds(source.prepared.chainId(), Set.copyOf(rings.values()));
-            requireSession(session);
-            if (bounds.isPresent()) {
-                var held = bounds.orElseThrow();
-                rings.forEach((table, ring) -> {
-                    var boundary = held.get(ring);
-                    arrivals.put(table, start instanceof StartFrom.Latest ? boundary.largestSequence() : boundary.trimmedThrough());
-                });
-                return arrivals;
+        for (String table : source.selected.tables()) {
+            if (progress.ringDoneThrough().containsKey(table)) continue;
+            if (bounds.isEmpty()) {
+                arrivals.put(table, initialReadAfter(session, source, chain, table, start));
+            } else {
+                var boundary = bounds.orElseThrow().get(source.selected.ringName(table));
+                arrivals.put(table, start instanceof StartFrom.Latest ? boundary.largestSequence() : boundary.trimmedThrough());
             }
         }
-        for (String table : missing) arrivals.put(table, initialReadAfter(session, source, chain, table, start));
         return arrivals;
     }
 
@@ -1262,13 +1265,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         else {stores.notes().guardedBy(owner::require).origin(configured.primary());connectors.resolve(configured.connectorId(),configured.artifactHash());owner.require();}
         if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
-        before=current.chains().requestTables(owner.prepared.chainId(),requested,owner.fence);
-        long epoch=current.chains().openEpoch(owner.prepared.chainId(),before.epoch(),owner.fence).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         SrsChainState opened;
         if (admitted) {
-            opened = current.chains().publishServingTablesAndGet(chainId, epoch, before.requestedTables(), owner.fence)
+            opened = current.chains().openServingEpoch(chainId, before.epoch(), requested, owner.fence)
                     .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         } else {
+            before = current.chains().requestTables(chainId, requested, owner.fence);
+            long epoch = current.chains().openEpoch(chainId, before.epoch(), owner.fence)
+                    .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
             if (!current.chains().publishServingTables(chainId, epoch, before.requestedTables(), owner.fence)) throw refused();
             opened = current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         }

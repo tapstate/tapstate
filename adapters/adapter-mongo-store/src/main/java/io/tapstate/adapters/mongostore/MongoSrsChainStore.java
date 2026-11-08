@@ -121,6 +121,34 @@ public final class MongoSrsChainStore implements SrsChainStore {
             replace(session, row, replacement); return OptionalLong.of(expectedEpoch + 1);
         });
     }
+    @Override public Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
+        requireName(chain);
+        if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
+        Set<String> captured = tables(tables);
+        return transaction(session -> {
+            prove(session, fence);
+            Document row = requireRoot(session, chain);
+            requireCapture(row, fence);
+            var held = state(session, row);
+            var requested = new TreeSet<>(held.requestedTables());
+            requested.addAll(captured);
+            long epoch = expectedEpoch + 1;
+            if (held.epoch() == epoch) {
+                if (!WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)).equals(fence)
+                        || !held.requestedTables().equals(requested)) return Optional.empty();
+                if (held.servingTables().equals(requested)) return Optional.of(held);
+                if (!held.servingTables().isEmpty()) return Optional.empty();
+            } else {
+                if (held.epoch() != expectedEpoch) return Optional.empty();
+                if (held.epoch() > 0 && held.checkpoint() == null) throw unproven(chain);
+            }
+            var replacement = new Document(row).append("epoch", epoch).append("captureFence", WorkloadClaimDocuments.stored(fence))
+                    .append("requestedTables", sorted(requested)).append("servingTables", sorted(requested));
+            replace(session, row, replacement);
+            return Optional.of(decode(replacement));
+        });
+    }
+
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
         return publishServingTablesAndGet(chain, epoch, tables, fence).isPresent();
     }
@@ -176,6 +204,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing) {
+        validateCheckpoint(session, root, checkpoint, fence, writing, false);
+    }
+
+    private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
+                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked) {
         String chain = root.getString("_id");
         for (var at : checkpoint.tables().values()) {
             var key = at.model();
@@ -183,7 +216,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
         }
         var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-        var current = models.currentReferences(session, root, keys);
+        var current = models.currentReferences(session, root, keys, businessChecked);
         var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
                         .collect(java.util.stream.Collectors.toSet()));
@@ -204,8 +237,12 @@ public final class MongoSrsChainStore implements SrsChainStore {
         }
     }
     SrsChainState state(ClientSession session, Document row) {
+        return state(session, row, false);
+    }
+
+    SrsChainState state(ClientSession session, Document row, boolean businessChecked) {
         SrsChainState state = decode(row);
-        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false);
+        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked);
         if (state.pendingFreshFull() != null)
             models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
         return state;

@@ -466,8 +466,13 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** A current, single-context ring can share its exact model and anchor reads within this transaction. */
     Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys) {
+        return currentReferences(session, chain, keys, false);
+    }
+
+    Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys,
+            boolean businessChecked) {
         if (keys.size() < 2) return Optional.empty();
-        requireBusiness(session);
+        if (!businessChecked) requireBusiness(session);
         for (var key : keys) {
             requireScope(key); requireChain(chain, key);
             var head = contexts.head(chain, key.table());
@@ -571,6 +576,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
     /** Proves sole, current anchors and published model bodies for this batch in the caller's snapshot. */
     boolean provePublishedRings(ClientSession session, String chainId, Set<String> rings) {
         var root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chainId)).first();
+        return provePublishedRings(session, root, chainId, rings);
+    }
+
+    boolean provePublishedRings(ClientSession session, Document root, String chainId, Set<String> rings) {
         if (root == null || MongoSrsRecoveryControls.read(root).isPresent()) return false;
         var names = List.copyOf(rings);
         var selected = SystemCollections.SRS_MODEL_CONTEXTS.on(database).aggregate(session, List.of(
