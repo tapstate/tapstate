@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.RegistrationOutcome;
 import io.tapstate.spi.store.RegistrationSource;
 
 import java.io.IOException;
@@ -15,6 +16,7 @@ import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
 import java.util.stream.Stream;
+import java.util.function.Function;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutorCompletionService;
@@ -40,7 +42,7 @@ public final class SeedConnectorSweep {
 
     private static final String JAR_SUFFIX = ".jar";
 
-    private final ConnectorArtifactRegistrar registrar;
+    private final Function<Path, RegistrationOutcome> register;
     private final int parallelism;
 
     public SeedConnectorSweep(ConnectorArtifactRegistrar registrar) {
@@ -49,7 +51,12 @@ public final class SeedConnectorSweep {
 
     /** Bounds independent registrations; the assembly chooses the deployment-specific default. */
     public SeedConnectorSweep(ConnectorArtifactRegistrar registrar, int parallelism) {
-        this.registrar = Objects.requireNonNull(registrar, "registrar");
+        this(artifact -> registrar.register(artifact, RegistrationSource.SEED), parallelism);
+        Objects.requireNonNull(registrar, "registrar");
+    }
+
+    public SeedConnectorSweep(Function<Path, RegistrationOutcome> register, int parallelism) {
+        this.register = Objects.requireNonNull(register, "register");
         if (parallelism < 1) throw new IllegalArgumentException("parallelism must be positive");
         this.parallelism = parallelism;
     }
@@ -116,7 +123,7 @@ public final class SeedConnectorSweep {
         if (Thread.currentThread().isInterrupted())
             throw new UncheckedIOException(new InterruptedIOException("Connector seed sweep interrupted"));
         try {
-            return new SeedOutcome.Seeded(artifact, registrar.register(artifact, RegistrationSource.SEED));
+            return new SeedOutcome.Seeded(artifact, register.apply(artifact));
         } catch (TapstateException | UncheckedIOException failure) {
             return new SeedOutcome.Failed(artifact, failure);
         }

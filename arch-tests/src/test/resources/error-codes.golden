@@ -165,6 +165,7 @@ connector.artifact-unreadable
 connector.capability-missing
 connector.capture-failed
 connector.class-not-found
+connector.cloud-upload-disabled
 connector.config-type-mismatch
 connector.discover-failed
 connector.instance-limit-reached

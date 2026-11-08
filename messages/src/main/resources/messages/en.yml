@@ -700,6 +700,9 @@ connector.ambiguous-registration:
 connector.registration-conflict:
   message: "Connector '{connector}' is already registered under artifact {existing}; a different artifact {incoming} was refused."
   solution: "Keep a single registered artifact per connector id; unregister the existing artifact before registering a different one."
+connector.cloud-upload-disabled:
+  message: "Manual connector uploads are unavailable in Cloud clusters."
+  solution: "Use a connector bundled with the Cloud runtime image."
 connector.load-failed:
   message: "Connector '{connector}' could not be loaded."
   solution: "Check the connector jar and its dependencies are present and readable."
