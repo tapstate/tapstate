@@ -49,14 +49,9 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
     private static ValidationEvaluation.Side side(NativeValidationMetadata.Scope scope,ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed,boolean source){
         if(observed.model()==null)return new ValidationEvaluation.Side(table.nodeId(),table.sourceId(),table.database(),table.schema(),table.table(),null,null,
                 observed.countOperation().name(),List.of(),List.of(),!source);
-        var model=observed.model().model();var rules=ValidationKeyMetadata.describe(model, observed.model().keyOrder());
-        var fields=model.fields().stream().map(field->{
-            var rule = rules.fields().get(field.name());
-            var logicalType = rule != null && rule.domain() == ValidationKey.Kind.TEXT
-                    ? rule.logicalTypes().iterator().next() : null;
-            return new ValidationEvaluation.Field(field.name(), field.type().name(),
-                    rule == null ? null : rule.domain().name(), rules.unavailable().get(field.name()), logicalType);
-        }).toList();
+        var model=observed.model().model();var rules=ValidationKeyMetadata.describe(model,scope.nativeBson(table.sourceId()));
+        var fields=model.fields().stream().map(field->new ValidationEvaluation.Field(field.name(),field.type().name(),
+                rules.fields().containsKey(field.name())?rules.fields().get(field.name()).domain().name():null,rules.unavailable().get(field.name()))).toList();
         var domains=new HashMap<String,ValidationKey.Kind>();rules.fields().forEach((name,rule)->domains.put(name,rule.domain()));
         // Current independent metadata cannot establish the original production write-model binding.
         var recommended=ValidationKeyRecommendations.recommend("mapping",model,domains,model,domains,Optional.empty(),ValidationKeyRecommendations.Limits.defaults());

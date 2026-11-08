@@ -14,7 +14,7 @@ import java.util.concurrent.CompletionStage;
 
 /**
  * Independent native scalar reads for an already admitted, fixed connection and artifact. The
- * assembly selects the exact native operation from its semantics, never from a discovery estimate.
+ * reader uses the registered PDK count function in the connector's own connection context.
  * Construction is metadata-only. Call count on admitted blocking I/O and close on separate cleanup
  * I/O; neither method belongs on a cooperative processor or deadline thread. The caller reserves
  * connection and driver memory before count, retaining them through actual drain.
@@ -84,9 +84,7 @@ public final class PdkValidationCounts implements AutoCloseable {
                 var table = new TapTable(request.table());
                 requireTable(opened);
                 var function = opened.functions().getCountByPartitionFilterFunction();
-                if (function == null || !PdkValidationCapabilities.supports(artifact, PdkValidationCapabilities.EXACT_COUNT)) {
-                    throw missing(PdkValidationCapabilities.EXACT_COUNT);
-                }
+                if (function == null) throw missing("count-by-partition-filter");
                 if (metadataOnly) {
                     check();
                     return new Outcome(Operation.PARTITION_FILTER, null);

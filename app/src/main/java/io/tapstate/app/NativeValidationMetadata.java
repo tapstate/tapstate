@@ -77,7 +77,10 @@ final class NativeValidationMetadata {
         ValidationSelectedDeclarations declarations(){require();return selected;}
         ValidationMethod method(){require();return method;}
         Projection projection(String mapping){require();return projections.get(mapping);}
-
+        boolean nativeBson(String source){
+            require();var resource=StoredArtifacts.requireSource(selected.artifacts(),source);var ref=artifacts.get(resource.connector());
+            if(ref==null)throw invalid("unobservedArtifact");return ref.className().equals("io.tapdata.mongodb.MongodbConnector");
+        }
         List<Mapping> mappings(){require();return List.copyOf(results);}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         private ConnectorRef artifact(SourceResource source){
@@ -96,7 +99,7 @@ final class NativeValidationMetadata {
         private Side read(ValidationDirectMappings.Declared declared,boolean source,List<String> fields){
             require();var side=source?declared.mapping().source():declared.mapping().target();
             var resource=StoredArtifacts.requireSource(selected.artifacts(),side.sourceId());var artifact=artifact(resource);
-            var connection=method==ValidationMethod.COUNT?new ConnectionConfig(resource.id(), resource.connector(), resource.config()):NativeValidationPdkRows.rowConnection(resource,artifact);
+            var connection=method==ValidationMethod.COUNT?new ConnectionConfig(resource.id(),resource.connector(),resource.config()):NativeValidationPdkRows.rowConnection(resource,artifact);
             var probe=method==ValidationMethod.COUNT?member.admitProbe():member.admitProbeWithConsumer();
             synchronized(this){if(closed){probe.close();throw invalid("scopeClosed");}active.add(probe);}
             probe.released().whenComplete((ignored,failed)->{if(failed!=null)record(failed);synchronized(Scope.this){active.remove(probe);}releaseIfDone();});

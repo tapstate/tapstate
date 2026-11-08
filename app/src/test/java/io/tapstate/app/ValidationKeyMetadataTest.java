@@ -11,7 +11,7 @@ class ValidationKeyMetadataTest {
     @Test void exactAndApproximateModelsKeepSeparateNumericPoliciesWithoutNativeStringGuessing(){
         var model=model(new SourceField("whole","opaque spelling",TapstateType.INT64),new SourceField("decimal","opaque spelling",TapstateType.DECIMAL),
                 new SourceField("approximate","opaque spelling",TapstateType.DOUBLE),new SourceField("text","NUMBER",TapstateType.STRING),new SourceField("flag","opaque spelling",TapstateType.BOOLEAN));
-        var rules=ValidationKeyMetadata.describe(model,Map.of());
+        var rules=ValidationKeyMetadata.describe(model,false);
         assertThat(rules.fields().get("whole").numericPolicy()).isEqualTo(ValidationKeyBinding.NumericPolicy.EXACT_ONLY);
         assertThat(rules.fields().get("decimal").logicalTypes()).containsExactly("exact-number");
         assertThat(rules.fields().get("approximate").numericPolicy()).isEqualTo(ValidationKeyBinding.NumericPolicy.EXACT_BINARY_FLOAT);
@@ -22,14 +22,14 @@ class ValidationKeyMetadataTest {
     }
     @Test void nativeIdentifiersRequireThePinnedBsonProfileAndDoNotBecomeOrdinaryText(){
         var model=model(new SourceField("native_id","OBJECT_ID",TapstateType.STRING),new SourceField("ordinary","VARCHAR",TapstateType.STRING));
-        assertThat(ValidationKeyMetadata.describe(model,Map.of("native_id","object-id")).fields().get("native_id").logicalTypes()).containsExactly("object-id");
-        assertThat(ValidationKeyMetadata.describe(model,Map.of("native_id","object-id")).unavailable()).containsEntry("ordinary","native-text-ordering-unproven");
-        assertThat(ValidationKeyMetadata.describe(model,Map.of()).unavailable()).containsEntry("native_id","native-text-ordering-unproven");
+        assertThat(ValidationKeyMetadata.describe(model,true).fields().get("native_id").logicalTypes()).containsExactly("object-id");
+        assertThat(ValidationKeyMetadata.describe(model,true).unavailable()).containsEntry("ordinary","native-text-ordering-unproven");
+        assertThat(ValidationKeyMetadata.describe(model,false).unavailable()).containsEntry("native_id","native-text-ordering-unproven");
     }
     @Test void unknownTemporalBinarySubtypesAndContainersDoNotAcquireGuessedKeyDomains(){
         var model=model(new SourceField("binary","BINARY",TapstateType.BINARY),new SourceField("calendar","TIMESTAMP",TapstateType.DATETIME),
                 new SourceField("document","JSON",TapstateType.JSON),new SourceField("raw","NUMBER"),new SourceField("nested.path","VARCHAR",TapstateType.STRING));
-        var rules=ValidationKeyMetadata.describe(model,Map.of());
+        var rules=ValidationKeyMetadata.describe(model,false);
         assertThat(rules.fields()).isEmpty();assertThat(rules.unavailable()).containsOnlyKeys("binary","calendar","document","raw","nested.path");
         assertThat(rules.unavailable().get("raw")).isEqualTo("key-model-unknown");
         assertThat(rules.unavailable().get("binary")).isEqualTo("binary-key-subtype-unavailable");

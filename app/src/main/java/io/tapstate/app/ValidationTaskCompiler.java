@@ -37,18 +37,14 @@ final class ValidationTaskCompiler {
                         ||!projected.target().equals(confirmed.fields().stream().map(Pair::target).toList()))
                     throw unsupported(draft.mappingId(),"keys","key-confirmation-preflight-required");
             }
-            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model(),actual.source().model().keyOrder());
-            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model(),actual.target().model().keyOrder());
+            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model(),metadata.nativeBson(draft.source().sourceId()));
+            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model(),metadata.nativeBson(draft.target().sourceId()));
             var source=new ArrayList<ValidationKeyBinding.Component>();var target=new ArrayList<ValidationKeyBinding.Component>();
             for(var pair:confirmed.fields()){
                 var from=component(sourceRules,pair.source(),draft.mappingId());var to=component(targetRules,pair.target(),draft.mappingId());
                 if(from.domain()!=to.domain()||from.numericPolicy()!=to.numericPolicy())throw unsupported(draft.mappingId(),pair.source(),"key-domain-mismatch");
                 if((from.logicalTypes().contains("object-id")||to.logicalTypes().contains("object-id"))&&!from.logicalTypes().equals(to.logicalTypes()))
                     throw unsupported(draft.mappingId(),pair.source(),"native-object-id-domain-mismatch");
-                if (from.domain() == ValidationKey.Kind.TEXT && from.logicalTypes().equals(Set.of("text"))
-                        && confirmed.fields().size() != 1) {
-                    throw unsupported(draft.mappingId(), pair.source(), "native-text-ordering-unproven");
-                }
                 source.add(from);target.add(to);
             }
             mappings.add(new ValidationTaskSpec.Mapping(draft.mappingId(),draft.outputKind(),draft.outputId(),

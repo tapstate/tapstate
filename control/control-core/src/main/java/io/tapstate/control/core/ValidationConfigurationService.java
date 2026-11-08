@@ -18,7 +18,7 @@ public final class ValidationConfigurationService {
     public record Confirmation(String id,List<Pair> fields) {}
     public record Input(String pipelineId,String taskId,String taskGeneration,String expectedRevision,String method,
             List<Choice> mappings,Map<String,Confirmation> confirmations) {}
-    public record Field(String name,String type,String keyDomain,String unavailableReason,String keyLogicalType) {}
+    public record Field(String name,String type,String keyDomain,String unavailableReason) {}
     public record Candidate(String origin,List<String> fields,List<String> issues) {}
     public record Side(String nodeId,String sourceId,String database,String schema,String table,String modelVersion,String codecBinding,
             String countOperation,List<Field> fields,List<Candidate> candidates,boolean pipelineWriteKeyUnknown) {}
@@ -173,7 +173,7 @@ public final class ValidationConfigurationService {
                 checked.choices,checked.method,checked.confirmations,previous==null?null:previous.comparison(),clock.instant().plusSeconds(45));
     }
     private static Side side(ValidationEvaluation.Side side){return new Side(side.nodeId(),side.sourceId(),side.database(),side.schema(),side.table(),side.modelVersion(),side.codecBinding(),side.countOperation(),
-            side.fields().stream().map(field->new Field(field.name(),field.type(),field.keyDomain(),field.unavailableReason(),field.keyLogicalType())).toList(),
+            side.fields().stream().map(field->new Field(field.name(),field.type(),field.keyDomain(),field.unavailableReason())).toList(),
             side.candidates().stream().map(candidate->new Candidate(candidate.origin(),candidate.fields(),candidate.issues())).toList(),side.pipelineWriteKeyUnknown());}
     private static ValidationSchedule requiredSchedule(Schedule value){if(value==null)throw invalid("schedule");return schedule(value);}
     private static ValidationSchedule schedule(Schedule value){

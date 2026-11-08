@@ -94,11 +94,10 @@ class PdkValidationCountsTest {
                 public int tableCount(TapConnectionContext c) { return 1; }
             }
             """);
-        artifact = new ConnectorRef(List.of(jar), "synthetic.NativeCount", "2.0.8", null,
-                "{\"configOptions\":{\"capabilities\":[{\"id\":\"validation_exact_count_v1\"}]}}");
+        artifact = new ConnectorRef(List.of(jar), "synthetic.NativeCount", "2.0.8", null);
     }
     static Map<String,Object> settings(String mode) {
-        return Map.of("mode", mode,"database","db","counts",new AtomicInteger(),"metadata",new AtomicInteger(),
+        return Map.of("mode", mode,"counts",new AtomicInteger(),"metadata",new AtomicInteger(),
                 "inits",new AtomicInteger(),"stops",new AtomicInteger(),"entered",new CountDownLatch(1),"release",new CountDownLatch(1));
     }
     static PdkValidationCounts read(Map<String,Object> settings) {
@@ -130,7 +129,7 @@ class PdkValidationCountsTest {
             }
             """);
         var noCount=new ConnectorRef(List.of(jar),"synthetic.NoNativeCount","2.0.8",null);
-        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",Map.of("database","db")),noCount,
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",Map.of()),noCount,
                 new PdkValidationCounts.Request("records"),()->{})){
             assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
                     failed->assertThat(failed.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
@@ -156,7 +155,7 @@ class PdkValidationCountsTest {
         }
     }
 
-    @Test void exactNativeScalarHasNoBusinessRowsDiscoveryOrEstimateFallback() {
+    @Test void registeredPdkCountNeedsNoDatabaseSettingOrBusinessRowsDiscovery() {
         var settings = settings("large");
         try (var reader = read(settings)) {
             assertThat(reader.count()).isEqualTo(9007199254740993L);
