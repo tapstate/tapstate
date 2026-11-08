@@ -57,6 +57,12 @@ public final class DirectNestStore<S> implements NestStore<S> {
     /** When true, each member records which keys it committed, so a test can check who wrote what. */
     static final String TRACK_WRITERS_PROPERTY = "tapstate.nest.direct.track-writers";
 
+    /**
+     * How a commit reaches the store: {@code split} (the default) writes the group as several store calls,
+     * {@code atomic} hands the whole group to the store in one transaction when the store can do that.
+     */
+    static final String GROUP_COMMIT_PROPERTY = "tapstate.nest.direct.group-commit";
+
     private static final String USER_CONTEXT_KEY = "tapstate.nest.direct-stores";
     private static final byte[] ABSENT = new byte[0];
 
@@ -111,6 +117,14 @@ public final class DirectNestStore<S> implements NestStore<S> {
     @SuppressWarnings("unchecked")
     static <S> NestStore<S> readThrough(HazelcastInstance member, String namespace) {
         return (NestStore<S>) new ReadThrough(namespace, resolve(member, namespace));
+    }
+
+    /**
+     * A store over one namespace of an explicit backing store, with no member registry: what a process
+     * outside a cluster uses to drive the same commit path, as the kill test's member processes do.
+     */
+    public static <S> NestStore<S> over(KeyedStateStore store, String namespace, long generation) {
+        return new DirectNestStore<>(new Shared(namespace, store, generation));
     }
 
     /** Keys committed on this member to one namespace, when writer tracking is on; empty otherwise. */
@@ -244,6 +258,7 @@ public final class DirectNestStore<S> implements NestStore<S> {
         private final long generation;
         private final long bound;
         private final boolean trackWriters = Boolean.getBoolean(TRACK_WRITERS_PROPERTY);
+        private final boolean atomic = "atomic".equals(System.getProperty(GROUP_COMMIT_PROPERTY));
         private final Set<String> written = new LinkedHashSet<>();
         private final LinkedHashMap<String, byte[]> resident = new LinkedHashMap<>(16, 0.75f, true);
         private final Map<String, Object> keysByName = new LinkedHashMap<>();
@@ -317,6 +332,18 @@ public final class DirectNestStore<S> implements NestStore<S> {
 
         synchronized void commit() {
             if (dirty.isEmpty()) return;
+            if (atomic && store instanceof NestReleaseStore groups && groups.atomicGroups()) {
+                Map<String, NestReleaseStore.GroupWrite> writes = new LinkedHashMap<>();
+                List<String> deletes = new ArrayList<>();
+                dirty.forEach((name, bytes) -> {
+                    if (bytes == ABSENT) deletes.add(name);
+                    else writes.put(name, new NestReleaseStore.GroupWrite(bytes,
+                            releasing.contains(name) ? toBytes(keysByName.get(name)) : null));
+                });
+                groups.commitGroup(namespace, writes, deletes);
+                committed();
+                return;
+            }
             Map<String, byte[]> writes = new LinkedHashMap<>();
             List<String> deletes = new ArrayList<>();
             dirty.forEach((name, bytes) -> {
@@ -331,6 +358,10 @@ public final class DirectNestStore<S> implements NestStore<S> {
                 }
             }
             for (String name : deletes) store.delete(namespace, name);
+            committed();
+        }
+
+        private void committed() {
             COUNTERS.commits.increment();
             COUNTERS.keysCommitted.add(dirty.size());
             if (trackWriters) written.addAll(dirty.keySet());

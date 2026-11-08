@@ -83,6 +83,9 @@
             <include>**/*Bench.java</include>
           </includes>
           <redirectTestOutputToFile>false</redirectTestOutputToFile>
+          <!-- The kill bench starts member JVMs on the test classpath, so it has to be a real path list. -->
+          <useManifestOnlyJar>false</useManifestOnlyJar>
+          <useSystemClassLoader>true</useSystemClassLoader>
           <trimStackTrace>false</trimStackTrace>
         </configuration>
       </plugin>
