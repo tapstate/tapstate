@@ -22,6 +22,7 @@ import java.util.function.Function;
 
 /** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
 final class MongoCachePipelineAccess {
+    private static final String PIPELINE_SCOPE = "pipelineScope";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     final MongoDatabase database;
@@ -169,7 +170,7 @@ final class MongoCachePipelineAccess {
 
     private Document liveClaim() {
         return WorkloadClaimDocuments.live(original)
-                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+                .append(PIPELINE_SCOPE, MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
     }
 
     /** The latest operation a store committed, so its next out-of-transaction read observes it. */
@@ -178,9 +179,14 @@ final class MongoCachePipelineAccess {
         private org.bson.BsonTimestamp operationTime;
 
         synchronized void observe(ClientSession session) {
-            var cluster = session.getClusterTime(); var operation = session.getOperationTime();
-            if (cluster != null && (clusterTime == null || timestamp(cluster).compareTo(timestamp(clusterTime)) > 0)) clusterTime = cluster;
-            if (operation != null && (operationTime == null || operation.compareTo(operationTime) > 0)) operationTime = operation;
+            org.bson.BsonDocument cluster = session.getClusterTime();
+            if (later(timestamp(cluster), timestamp(clusterTime))) clusterTime = cluster;
+            org.bson.BsonTimestamp operation = session.getOperationTime();
+            if (later(operation, operationTime)) operationTime = operation;
+        }
+
+        private static boolean later(org.bson.BsonTimestamp candidate, org.bson.BsonTimestamp known) {
+            return candidate != null && (known == null || candidate.compareTo(known) > 0);
         }
 
         synchronized void advance(ClientSession session) {
@@ -188,7 +194,9 @@ final class MongoCachePipelineAccess {
             if (operationTime != null) session.advanceOperationTime(operationTime);
         }
 
-        private static org.bson.BsonTimestamp timestamp(org.bson.BsonDocument cluster) { return cluster.getTimestamp("clusterTime"); }
+        private static org.bson.BsonTimestamp timestamp(org.bson.BsonDocument cluster) {
+            return cluster == null ? null : cluster.getTimestamp("clusterTime");
+        }
     }
 
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
@@ -209,7 +217,7 @@ final class MongoCachePipelineAccess {
             MongoCacheWorkloadClaimStore.requireCollection(database);
             var key=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
             var claim=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),
-                    MongoValidationMetadata.claimProjection("pipelineScope","pipelinePreparation"),64*1024);
+                    MongoValidationMetadata.claimProjection(PIPELINE_SCOPE,"pipelinePreparation"),64*1024);
             requirePreparedClaim(session,claim);new MongoCacheMetadataStructure(database,rateRetention).verifyFacet(table);return action.apply(session,state);
         });
     }
@@ -324,7 +332,7 @@ final class MongoCachePipelineAccess {
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
         new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
         try {
-            if (!(row.get("pipelineScope") instanceof Document stored)) throw unreadable("pipeline-claim-scope");
+            if (!(row.get(PIPELINE_SCOPE) instanceof Document stored)) throw unreadable("pipeline-claim-scope");
             var decoded = MongoPipelinePreparationFacts.scope(stored);
             if (!scope.pipelineId().equals(decoded.pipelineId()) || !new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation())
                     .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable("pipeline-claim-scope");
@@ -349,9 +357,7 @@ final class MongoCachePipelineAccess {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var filter = WorkloadClaimDocuments.live(original)
-                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
-        Document row = table.find(session, filter).first();
+        Document row = table.find(session, liveClaim()).first();
         if (row == null) throw claimFenced();
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
     }
@@ -363,8 +369,7 @@ final class MongoCachePipelineAccess {
     private void proveClaim(ClientSession session,String counter) {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
-                        .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
                 new Document("$inc",new Document(counter,1L))).getMatchedCount() != 1) throw claimFenced();
     }
 
