@@ -82,14 +82,12 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
                 SourceResource resource=StoredArtifacts.requireSource(saved.artifacts(),table.sourceId());
                 var artifact=artifacts.get(resource.id());
                 if(artifact==null)throw invalid("artifactScope");
-                var connection=countConnection(resource,artifact);
-                var database=database(table,connection);
+                var connection = new ConnectionConfig(resource.id(), resource.connector(), resource.config());
                 // Charge the independent context and its work before any native initialization.
                 var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(COUNT_WORK_BYTES,0,1,1));
                 PdkValidationCounts reader=null;
                 try{
-                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table(),database,
-                            PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{require();guard.run();},actual->{
+                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table()),()->{require();guard.run();},actual->{
                         if(source)ValidationDirectMappings.requireObservedSourceTable(declared,actual);
                     });
                     current=new Owned(reader,lease);
@@ -137,28 +135,6 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
         }
         private TapstateException cancelled(){return new TapstateException(ValidationError.EXECUTION_CANCELLED,
                 Map.of("node",nodeId),null);}
-    }
-    static ConnectionConfig countConnection(SourceResource resource, ConnectorRef artifact) {
-        var settings = resource.config();
-        if (artifact.className().equals("io.tapdata.mongodb.MongodbConnector")
-                && !Boolean.FALSE.equals(settings.get("isUri"))
-                && settings.get("uri") instanceof String uri && !uri.isEmpty()) {
-            var database = io.tapstate.adapters.mongostore.MongoConnection.databaseFromUri(uri);
-            var effective = new LinkedHashMap<String,Object>(settings);
-            if (database == null) effective.remove("database");
-            else effective.put("database", database);
-            settings = effective;
-        }
-        return new ConnectionConfig(resource.id(), resource.connector(), settings);
-    }
-
-    static String database(ValidationTaskSpec.Table table,ConnectionConfig connection){
-        var configured=connection.settings().get("database");
-        if(configured!=null&&!(configured instanceof String))throw invalid("database");
-        if(configured instanceof String text&&text.isBlank())throw invalid("database");
-        if(table.database()!=null&&!table.database().equals(configured))throw invalid("databaseScope");
-        if(table.schema()!=null&&!table.schema().equals(connection.settings().get("schema")))throw invalid("schemaScope");
-        return (String)configured;
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","pdkPlan."+field),null);}
 }

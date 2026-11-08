@@ -95,7 +95,7 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
         dependencyHashes = Collections.unmodifiableMap(new TreeMap<>(dependencyHashes)); mappings = List.copyOf(mappings);
     }
 
-    /** COUNT needs an exact count-capability preflight, but never row keys, value models or codecs. */
+    /** COUNT uses a registered PDK count function and requires no row keys, value models or codecs. */
     public void requireFor(ValidationMethod method, ValidationMode mode) {
         Objects.requireNonNull(method); Objects.requireNonNull(mode);
         if (!method.supports(mode)) throw ValidationError.invalid("spec.methodMode");

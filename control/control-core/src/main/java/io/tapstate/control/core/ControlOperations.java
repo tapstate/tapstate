@@ -53,7 +53,7 @@ public final class ControlOperations {
     public static final Operation VALIDATION_HISTORY = new Operation("validation.history", Scope.READ, false, null,
             "Read bounded full validation history without creating a run or a missing report.", REST_ONLY);
     public static final Operation VALIDATION_REPORT = new Operation("validation.report", Scope.READ, false, null,
-            "Read one original full validation report with exact counts and its observation premise.", REST_ONLY);
+            "Read one original full validation report with PDK count results and its observation premise.", REST_ONLY);
     public static final Operation VALIDATION_ROOTS = new Operation("validation.roots", Scope.READ, false, null,
             "Read a bounded page of the original report root observations with explicit value types.", REST_ONLY);
     public static final Operation VALIDATION_ROOT = new Operation("validation.root", Scope.READ, false, null,
