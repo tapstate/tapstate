@@ -8,6 +8,7 @@ import io.tapstate.core.catalog.OfficialConnectors;
 import io.tapstate.core.catalog.SpecNormalizer;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.JsonReader;
+import io.tapstate.spi.store.BundledConnectorIcon;
 import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ConnectorCapabilities;
 import io.tapstate.spi.store.ConnectorCatalogStore;
@@ -29,6 +30,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
+import java.util.jar.JarFile;
 import java.util.UUID;
 
 /**
@@ -173,6 +176,46 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         persistCatalogRow(connectorId, introspected, specTree, specHash, outcome);
         phase(connectorId, "capabilities-and-catalog", catalogStarted);
         return outcome;
+    }
+
+    /** Publishes an image seed after the Cloud release gate has verified the local file. */
+    public RegistrationOutcome registerBundled(Path artifact, PdkCapabilityDeriver deriver) {
+        IntrospectedConnector introspected = introspector.introspect(List.of(artifact));
+        Object specTree = parseSpecTree(introspected, artifact);
+        String connectorId = declaredId(specTree, introspected, artifact);
+        rejectUnofficialConnector(connectorId);
+        String hash = hashOf(artifact);
+        synchronized (registrationLocks[Math.floorMod(connectorId.hashCode(), registrationLocks.length)]) {
+            if (Thread.currentThread().isInterrupted()) throw artifactUnreadable(artifact);
+            rejectConflictingArtifact(connectorId, hash);
+            String specHash = storeSpecSource(introspected);
+            var registration = new ConnectorRegistration(connectorId, hash, introspected.pdkApiVersion(),
+                    RegistrationSource.SEED);
+            if (catalogStore.bundledRegistration(connectorId).filter(registration::equals).isPresent()) {
+                return new RegistrationOutcome(registration, false);
+            }
+            var ref = new ConnectorRef(List.of(artifact), introspected.className(), introspected.pdkApiVersion(),
+                    null, introspected.spec(), hash, false);
+            var row = catalogRow(introspected, specTree, specHash, deriver.derive(connectorId, ref));
+            catalogStore.upsertBundled(row, registration, bundledIcon(artifact, row.icon()));
+            return new RegistrationOutcome(registration, true);
+        }
+    }
+
+    private static Optional<BundledConnectorIcon> bundledIcon(Path artifact, String declaredPath) {
+        if (declaredPath == null || declaredPath.isBlank()) return Optional.empty();
+        String path = declaredPath.startsWith("/") ? declaredPath.substring(1) : declaredPath;
+        try (JarFile jar = new JarFile(artifact.toFile())) {
+            var entry = jar.getJarEntry(path);
+            if (entry == null || entry.isDirectory()) return Optional.empty();
+            try (var input = jar.getInputStream(entry)) {
+                byte[] bytes = input.readNBytes(BundledConnectorIcon.MAX_BYTES + 1);
+                return bytes.length > BundledConnectorIcon.MAX_BYTES ? Optional.empty()
+                        : Optional.of(new BundledConnectorIcon(BundledConnectorIcon.mediaTypeFor(path), bytes));
+            }
+        } catch (IOException e) {
+            throw artifactUnreadable(artifact);
+        }
     }
 
     /**
@@ -330,11 +373,14 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
             // swallowed.
             return;
         }
+        catalogStore.upsert(catalogRow(introspected, specTree, specHash, capabilities));
+    }
+
+    private static ConnectorCatalogEntry catalogRow(IntrospectedConnector introspected, Object specTree,
+                                                    String specHash, ConnectorCapabilities capabilities) {
         NormalizedSpec normalized = SpecNormalizer.normalize(asSpecObject(specTree));
-        ConnectorCatalogEntry row = CatalogEntryAssembler.assemble(
-                normalized, capabilities.capabilityIds(), OVERLAY,
+        return CatalogEntryAssembler.assemble(normalized, capabilities.capabilityIds(), OVERLAY,
                 introspected.specPath(), specHash);
-        catalogStore.upsert(row);
     }
 
     @SuppressWarnings("unchecked")

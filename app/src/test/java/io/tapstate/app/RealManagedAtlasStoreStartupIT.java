@@ -10,6 +10,8 @@ import io.tapstate.core.lifecycle.RateSample;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.ConnectorRegistration;
+import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.RegistrationSource;
 import io.tapstate.spi.store.StorePort;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
@@ -25,12 +27,10 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -44,7 +44,6 @@ class RealManagedAtlasStoreStartupIT {
 
     private static final String NAMESPACE = "managed-atlas-bootstrap";
     private static final String COLLECTION = "bootstrap_proof";
-    private static final String ATLAS_CONNECTOR = "mongodb-atlas";
     private static final String AUTHORED_SOURCE = "authored-proof";
     private static final List<String> CONNECTORS = List.of(
             "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
@@ -225,27 +224,18 @@ class RealManagedAtlasStoreStartupIT {
     }
 
     private static List<ConnectorRegistration> assertConnectors(MongoDatabase metadata, StorePort store, Path seeds) throws Exception {
-        List<ConnectorRegistration> registrations = store.connectors().list();
+        List<ConnectorRegistration> registrations = store.connectorCatalog().bundledRegistrations();
         assertThat(registrations).extracting(ConnectorRegistration::connectorId)
                 .containsExactlyInAnyOrderElementsOf(CONNECTORS);
         for (ConnectorRegistration registration : registrations) {
-            assertThat(store.connectors().hasArtifact(registration.contentHash())).isTrue();
+            assertThat(registration.source()).isEqualTo(RegistrationSource.SEED);
+            Path seed = seeds.resolve(registration.connectorId() + "-connector.jar");
+            try (var input = Files.newInputStream(seed)) {
+                assertThat(registration.contentHash()).isEqualTo(ContentHash.of(input));
+            }
         }
-        ConnectorRegistration atlas = registrations.stream().filter(entry -> ATLAS_CONNECTOR.equals(entry.connectorId()))
-                .findFirst().orElseThrow();
-        byte[] stored = store.connectors().artifact(atlas.contentHash())
-                .orElseThrow(() -> new AssertionError("the persisted Atlas connector bytes are absent"));
-        Path seed = seeds.resolve(ATLAS_CONNECTOR + "-connector.jar");
-        assertThat(stored.length).isEqualTo(Files.size(seed));
-        assertThat(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(stored))).isEqualTo(atlas.contentHash());
-        MessageDigest expected = MessageDigest.getInstance("SHA-256");
-        try (var input = Files.newInputStream(seed)) {
-            byte[] buffer = new byte[8192];
-            for (int length; (length = input.read(buffer)) != -1;) expected.update(buffer, 0, length);
-        }
-        assertThat(HexFormat.of().formatHex(expected.digest())).isEqualTo(atlas.contentHash());
-        assertThat(metadata.getCollection("connector_artifacts.files").countDocuments()).isEqualTo(CONNECTORS.size());
-        assertThat(metadata.getCollection("connector_artifacts.chunks").countDocuments()).isGreaterThan(CONNECTORS.size());
+        assertThat(metadata.getCollection("connector_artifacts.files").countDocuments()).isZero();
+        assertThat(metadata.getCollection("connector_artifacts.chunks").countDocuments()).isZero();
         return registrations;
     }
 

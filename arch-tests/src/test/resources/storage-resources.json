@@ -25,6 +25,14 @@
         "Only verified whole-empty CACHE may obtain a new scope; partial loss and conflicting identity refuse."
       ]
     },
+    "connector-catalog": {
+      "goal": "Rebuild the derived connector catalog and Cloud bundled registration metadata and icons from verified artifacts.",
+      "entry": "SeedSweepRunner after CACHE admission for Cloud; normal connector registration or seed sweep for on-premises.",
+      "prerequisites": [
+        "Cloud uses the eight immutable image JARs and matching release lock. Store the existing content-addressed spec before publishing its catalog document.",
+        "On-premises derives the catalog from the existing connector registration path."
+      ]
+    },
     "derived-cache": {
       "goal": "Recreate derivable data from original definitions and verified artifacts after storage admission.",
       "entry": "Registered connector test/discovery, artifact registration or current runtime observation.",
@@ -3103,25 +3111,26 @@
     {
       "id": "mongo.cache.connector_catalog",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "connector_catalog"
       ],
-      "responsibility": "Derived connector catalog metadata.",
+      "responsibility": "Derived connector catalog metadata. Cloud rows also hold a bundledArtifact subdocument with the JAR SHA-256, PDK API version, SEED source and optional media type and binary icon. Each row is published atomically under its original CACHE scope after its spec is stored.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
       ],
-      "recovery": "derived-cache",
+      "recovery": "connector-catalog",
       "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "On-premises retains its existing one-row-per-connector behavior. Cloud is bounded to eight rows per CACHE scope and at most 1 MiB of icon bytes per row. Cloud stores no JAR bytes.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/CloudConnectorSeedReadinessIT.java"
       ]
     },
     {

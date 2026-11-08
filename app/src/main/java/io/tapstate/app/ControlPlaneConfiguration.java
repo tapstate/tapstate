@@ -4,6 +4,7 @@ import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.adapters.mongostore.MongoAuthStores;
 import io.tapstate.adapters.mongostore.MongoConnection;
 import io.tapstate.adapters.pdk.ConnectorArtifactRegistrar;
+import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.ConnectorIntrospector;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.adapters.pdk.PdkCapabilityDeriver;
@@ -507,8 +508,9 @@ class ControlPlaneConfiguration {
     // The PDK types stay inside the adapter-pdk beans; the runtime and control rings see only ports.
 
     @Bean
-    ConnectorRegistry connectorRegistry(StorePort storePort) {
-        return storePort.connectors();
+    ConnectorRegistry connectorRegistry(StorePort storePort, ConnectorCatalogStore catalog,
+                                        ConnectorPluginProperties properties, CloudRuntimeSettings cloud) {
+        return cloud.cloud() ? new BundledConnectorRegistry(catalog, properties.getSeedDir()) : storePort.connectors();
     }
 
     @Bean
@@ -522,18 +524,18 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    CapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
+    PdkCapabilityDeriver capabilityDeriver(ConnectorProvisioner provisioner) {
         return new PdkCapabilityDeriver(provisioner);
     }
 
     @Bean
     ConnectorCatalogView connectorCatalogView(
             ConnectorCatalogStore connectorCatalogStore, ConnectorSpecStore connectorSpecStore,
-            ConnectorRegistry connectorRegistry) {
+            ConnectorRegistry connectorRegistry, CloudRuntimeSettings cloud) {
         // The online catalog view = the bundled snapshot overlaid with the rows derived for registered
         // connectors, read live; the offline native CLI keeps reading only the bundled snapshot.
         return new ConnectorCatalogView(
-                TapstateCatalog.load(), connectorCatalogStore, connectorSpecStore, connectorRegistry);
+                TapstateCatalog.load(), connectorCatalogStore, connectorSpecStore, connectorRegistry, cloud.cloud());
     }
 
     @Bean
@@ -548,8 +550,10 @@ class ControlPlaneConfiguration {
 
     @Bean
     ConnectorProvisioner connectorProvisioner(
-            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties) {
-        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(), properties.getSeedDir());
+            ConnectorRegistry registry, ConnectorIntrospector introspector, ConnectorPluginProperties properties,
+            CloudRuntimeSettings cloud) {
+        return new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(),
+                properties.getSeedDir(), cloud.cloud());
     }
 
     // The startup seed sweep: the release's connectors/ directory goes through the same
@@ -566,8 +570,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar) {
-        return new SeedConnectorSweep(registrar, Math.max(1, Runtime.getRuntime().availableProcessors()));
+    SeedConnectorSweep seedConnectorSweep(ConnectorArtifactRegistrar registrar, PdkCapabilityDeriver deriver,
+                                         CloudRuntimeSettings cloud) {
+        int workers = Math.max(1, Runtime.getRuntime().availableProcessors());
+        return cloud.cloud() ? new SeedConnectorSweep(artifact -> registrar.registerBundled(artifact, deriver), workers)
+                : new SeedConnectorSweep(registrar, workers);
     }
 
     @Bean
@@ -577,7 +584,7 @@ class ControlPlaneConfiguration {
             org.springframework.core.env.Environment environment) {
         var readiness = cloud.cloud()
                 ? CloudConnectorSeedReadiness.checkedRelease(
-                        properties.getSeedDir(), properties.getPluginsDir(), registry, catalog, specs, deriver,
+                        properties.getSeedDir(), registry, catalog, specs, deriver,
                         "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY)))
                 : null;
         return new SeedSweepRunner(sweep, properties.getSeedDir(), readiness);
@@ -598,10 +605,11 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate) {
-        // The register verb reaches the distribution store through the same registrar the seed sweep uses; it
-        // implements the spi ingestion port, so control-core drives it without depending on the adapters ring.
-        return new ConnectorRegisterService(registrar, auditGate);
+    ConnectorRegisterService connectorRegisterService(ConnectorArtifactRegistrar registrar, AuditGate auditGate,
+                                                       CloudRuntimeSettings cloud) {
+        return new ConnectorRegisterService(cloud.cloud() ? (artifact, source) -> {
+            throw new io.tapstate.core.common.TapstateException(ConnectorError.CLOUD_UPLOAD_DISABLED, java.util.Map.of(), null);
+        } : registrar, auditGate);
     }
 
     @Bean

@@ -38,6 +38,7 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     private final ConnectorIntrospector introspector;
     private final Path cacheDir;
     private final Path seedDir;
+    private final boolean loadSeedInPlace;
 
     public RegistryConnectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir) {
@@ -47,10 +48,16 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     /** A verified release may supply the original bytes; registry ownership is still required. */
     public RegistryConnectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir, Path seedDir) {
+        this(registry, introspector, cacheDir, seedDir, false);
+    }
+
+    public RegistryConnectorProvisioner(ConnectorRegistry registry, ConnectorIntrospector introspector,
+                                         Path cacheDir, Path seedDir, boolean loadSeedInPlace) {
         this.registry = Objects.requireNonNull(registry, "registry");
         this.introspector = Objects.requireNonNull(introspector, "introspector");
         this.cacheDir = Objects.requireNonNull(cacheDir, "cacheDir");
         this.seedDir = seedDir;
+        this.loadSeedInPlace = loadSeedInPlace;
     }
 
     @Override
@@ -101,8 +108,8 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
 
     /** The single registration for the id, refusing with a code when none or more than one matches. */
     private ConnectorRegistration resolveRegistration(String connectorId) {
-        List<ConnectorRegistration> matches = registry.list().stream()
-                .filter(registration -> registration.connectorId().equals(connectorId)).toList();
+        List<ConnectorRegistration> matches = loadSeedInPlace ? registry.findAll(connectorId)
+                : registry.list().stream().filter(registration -> registration.connectorId().equals(connectorId)).toList();
         if (matches.isEmpty()) {
             throw new TapstateException(ConnectorError.NOT_REGISTERED, Map.of("connector", connectorId), null);
         }
@@ -127,6 +134,15 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
      * rather than renamed over.
      */
     private Path stage(String connectorId, String contentHash) {
+        if (loadSeedInPlace) {
+            try {
+                Path seed = seedFile(connectorId, contentHash);
+                if (seed != null) return seed;
+            } catch (IOException e) {
+                throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+            }
+            throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
+        }
         Path target = cacheDir.resolve(contentHash + ".jar");
         if (Files.exists(target)) {
             return validatedCache(connectorId, contentHash, target);
