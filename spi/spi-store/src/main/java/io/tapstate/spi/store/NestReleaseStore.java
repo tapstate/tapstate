@@ -1,6 +1,8 @@
 package io.tapstate.spi.store;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Arrays;
 
@@ -31,4 +33,32 @@ public interface NestReleaseStore extends KeyedStateStore {
      * An empty page ends this pass; the cursor is in memory and is never a new durable acknowledgement.
      */
     List<PendingKey> pendingReleases(String namespace, String afterKey);
+
+    /** One key's write in a commit group: its state and, when it carries a pending release, the routing key. */
+    record GroupWrite(byte[] state, byte[] routingKey) {
+        public GroupWrite {
+            state = Objects.requireNonNull(state, "state").clone();
+            routingKey = routingKey == null ? null : routingKey.clone();
+        }
+    }
+
+    /**
+     * Writes and deletes a group of keys of one namespace. The default issues them as separate calls, so
+     * a process that dies part way leaves some of the group in the store and some not; a store that can
+     * do better commits the whole group in one transaction and says so through {@link #atomicGroups()}.
+     */
+    default void commitGroup(String namespace, Map<String, GroupWrite> writes, Collection<String> deletes) {
+        Map<String, byte[]> plain = new java.util.LinkedHashMap<>();
+        writes.forEach((key, write) -> { if (write.routingKey() == null) plain.put(key, write.state()); });
+        if (!plain.isEmpty()) saveAll(namespace, plain);
+        writes.forEach((key, write) -> {
+            if (write.routingKey() != null) saveWithRelease(namespace, key, write.state(), write.routingKey());
+        });
+        for (String key : deletes) delete(namespace, key);
+    }
+
+    /** True when {@link #commitGroup} lands a group as a unit or not at all. */
+    default boolean atomicGroups() {
+        return false;
+    }
 }

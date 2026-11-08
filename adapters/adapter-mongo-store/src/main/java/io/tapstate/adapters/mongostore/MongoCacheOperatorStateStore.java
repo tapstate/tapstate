@@ -115,6 +115,32 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore {
         });
     }
 
+    /**
+     * The whole group in one transaction: the claim proof and the runtime fence increment run first in it,
+     * as for every mutation here, and every write and delete of the group follows. A process that dies or is
+     * fenced part way leaves the store exactly as the previous group left it.
+     */
+    @Override public void commitGroup(String namespace, Map<String, GroupWrite> writes, Collection<String> deletes) {
+        requireNamespace(namespace);
+        if (writes.isEmpty() && deletes.isEmpty()) return;
+        List<WriteModel<Document>> group = new ArrayList<>();
+        for (var entry : writes.entrySet()) {
+            Document id = id(entry.getKey());
+            GroupWrite write = entry.getValue();
+            if (write.routingKey() != null && table != SystemCollections.CACHE_NEST_STATE) throw MongoCachePipelineAccess.fenced();
+            Document value = row(id, write.state());
+            if (write.routingKey() != null) value.append("pendingRelease", true).append("releaseKey", new Binary(write.routingKey()));
+            group.add(new ReplaceOneModel<>(new Document("_id", id), value, new ReplaceOptions().upsert(true)));
+        }
+        for (String key : deletes) group.add(new com.mongodb.client.model.DeleteOneModel<>(new Document("_id", id(key))));
+        transaction(true, session -> {
+            table.on(target).bulkWrite(session, group, new BulkWriteOptions().ordered(true));
+            return null;
+        });
+    }
+
+    @Override public boolean atomicGroups() { return true; }
+
     @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
         requireNamespace(namespace); Document id = id(key);
         byte[] captured = Objects.requireNonNull(state, STATE_FIELD).clone();

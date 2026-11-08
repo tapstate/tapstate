@@ -225,6 +225,12 @@ public final class OperatorMapBindings implements AutoCloseable {
         @Override public List<PendingKey> pendingReleases(String namespace, String afterKey) {
             return releases(namespace).pendingReleases(namespace, afterKey);
         }
+        @Override public void commitGroup(String namespace, Map<String, GroupWrite> writes, Collection<String> deletes) {
+            releases(namespace).commitGroup(namespace, writes, deletes);
+        }
+        @Override public boolean atomicGroups() {
+            return nest && delegate(name) instanceof NestReleaseStore releases && releases.atomicGroups();
+        }
         @Override public Optional<byte[]> load(String namespace, String key) { return delegate(namespace).load(namespace, key); }
         @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { return delegate(namespace).loadAll(namespace, keys); }
         @Override public void save(String namespace, String key, byte[] value) { delegate(namespace).save(namespace, key, value); }
@@ -274,6 +280,12 @@ public final class OperatorMapBindings implements AutoCloseable {
                 if (!(cold instanceof NestReleaseStore releases)) throw fenced();
                 return releases.pendingReleases(coldName, afterKey);
             }
+            @Override public void commitGroup(String namespace, Map<String, GroupWrite> writes, Collection<String> deletes) {
+                check(namespace);
+                if (cold instanceof NestReleaseStore releases) releases.commitGroup(coldName, writes, deletes);
+                else NestReleaseStore.super.commitGroup(namespace, writes, deletes);
+            }
+            @Override public boolean atomicGroups() { return cold instanceof NestReleaseStore releases && releases.atomicGroups(); }
             @Override public Optional<byte[]> load(String namespace, String key) { check(namespace); return cold.load(coldName, key); }
             @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) { check(namespace); return cold.loadAll(coldName, keys); }
             @Override public void save(String namespace, String key, byte[] value) { check(namespace); cold.save(coldName, key, value); }
