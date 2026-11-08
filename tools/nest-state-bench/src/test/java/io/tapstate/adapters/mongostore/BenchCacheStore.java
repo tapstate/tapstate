@@ -139,6 +139,14 @@ public final class BenchCacheStore implements AutoCloseable {
         return out;
     }
 
+    /** The prepared cache database, for checks that change it underneath the store. */
+    MongoDatabase database() { return database; }
+
+    /** Full validations taken by lease-mode stores in this process, and leases dropped after a failure. */
+    public static Map<String, Long> leases() {
+        return Map.of("opens", MongoCacheOperatorStateStore.LEASE_OPENS.get(), "losses", MongoCacheOperatorStateStore.LEASE_LOSSES.get());
+    }
+
     /** Store calls by operation and namespace suffix, each one a transaction (or more, past 256 keys). */
     public Map<String, Long> calls() {
         Map<String, Long> out = new TreeMap<>();
