@@ -14,10 +14,11 @@ anyone re-running a query.
 teaches the rule that decides which document shapes a nest can express:
 [Assembling one document out of many tables](../tutorials/nest-document-assembly/).
 
-The pages here answer the two questions that come next, once something is running:
+The pages here answer what comes next, once something is running:
 
 | Page | Answers |
 |---|---|
+| [What a view is](semantics.md) | What a nest promises in plain words, the two shapes and two directions, the limits it refuses on, and how to read `nest progress`, `nest inspect` and the state metrics. |
 | [Flat embeds](flat-embeds.md) | Merge one related row directly into its parent, including one-to-one and many-to-one direction, collision checks, one-to-many refusal, and a complete multi-flat example. |
 | [Structural key changes](structural-key-changes.md) | A row's key was *edited* - it did not just change, it changed **where it belongs**. What that costs, what you switch on for it to work, what happens when you leave it off, and what it needs from the source. |
 | [Throughput limits](throughput-limits.md) | The unit a nest sends is the **whole document**, so any row feeding a root rewrites that root in full. Arithmetic you can do on your own numbers, before you run it, to see whether your data shape fits. |
