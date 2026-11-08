@@ -1180,6 +1180,9 @@ class MongoCachePipelineRebuildsIT {
                 assertThat(cleanup.find(f.scope)).contains(original);assertThat(cleanup.list("flow",1,128)).isEmpty();
             }
             assertThat(f.domain.operatorState(replacement).load(replacement.mapName(),"keep")).contains(new byte[]{2});
+            // Under its lease the late write is refused by the claim compare-and-set; that refusal ends the lease,
+            // and the next attempt fails closed at the proof on the replaced scope.
+            assertCode(() -> writer.save(old.mapName(),"late",new byte[]{3}),IoError.WORKLOAD_CLAIM_FENCED);
             assertCode(() -> writer.save(old.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
             assertThat(f.claim().getLong("executionGeneration")).isEqualTo(2);
         });
@@ -1313,6 +1316,9 @@ class MongoCachePipelineRebuildsIT {
             assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isOne();
             assertThat(f.domain.operatorState(neighbor).load(neighbor.mapName(),"keep")).contains(new byte[]{9});
             try(var session=f.cacheClient.startSession()){session.withTransaction(() -> {MongoOperatorInventory.requireRetired(session,f.cache,pending);return null;});}
+            // Under its lease the late write is refused by the claim compare-and-set; that refusal ends the lease,
+            // and the next attempt fails closed at the proof on the replaced scope.
+            assertCode(() -> writer.save(location.mapName(),"late",new byte[]{3}),IoError.WORKLOAD_CLAIM_FENCED);
             assertCode(() -> writer.save(location.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
             f.configuration.rebuilds().complete(receipt);assertThat(f.rebuilds().reclaim(receipt)).isZero();
             var claims=f.domain.workloadClaims(f.business);
@@ -1385,6 +1391,9 @@ class MongoCachePipelineRebuildsIT {
                 session.withTransaction(() -> { assertThat(MongoOperatorInventory.requireRetired(session,f.cache,original).getList("placements",Document.class)).hasSize(1); return null; });
             }
             assertThat(SystemCollections.CACHE_JOIN_FACTS.on(f.cache).countDocuments()).isEqualTo(1);
+            // Under its lease the late write is refused by the claim compare-and-set; that refusal ends the lease,
+            // and the next attempt fails closed at the proof on the replaced scope.
+            assertCode(() -> writer.save(placement.mapName(),"late",new byte[]{3}),IoError.WORKLOAD_CLAIM_FENCED);
             assertCode(() -> writer.save(placement.mapName(),"late",new byte[]{3}),IoError.CACHE_BUSINESS_FENCED);
             var again=f.rebuilds().prepare(original,f.node,TTL,AT.plusSeconds(1));
             assertThat(again.claim()).isEqualTo(receipt.claim()); assertThat(again.checkpointEpoch()).isEqualTo(receipt.checkpointEpoch());
