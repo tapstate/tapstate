@@ -146,7 +146,8 @@ class MongoSrsChainStoreIT {
             assertThat(f.chains().openEpoch(CHAIN, 1, f.fence())).hasValue(2);
             assertThat(f.chains().load(CHAIN).orElseThrow().checkpoint()).isEqualTo(batch);
             f.models().publish(model(ORDERS, 2, 0, 1), f.fence()); f.models().publish(model(QUIET, 2, 0, 0), f.fence());
-            assertThat(f.chains().publishServingTables(CHAIN, 2, Set.of(ORDERS, QUIET), f.fence())).isTrue();
+            var serving = f.chains().publishServingTablesAndGet(CHAIN, 2, Set.of(ORDERS, QUIET), f.fence()).orElseThrow();
+            assertThat(f.chains().load(CHAIN)).contains(serving);
             var next = checkpoint(2, SourceOrder.SNAPSHOT_SEQ, "opaque-batch", Map.of(ORDERS, 0L, QUIET, -1L));
             assertThat(f.chains().checkpoint(CHAIN, 2, next, f.fence()).orElseThrow().checkpoint()).isEqualTo(next);
             assertThat(SystemCollections.SRS_CHAINS.on(f.database()).find().first().keySet())
@@ -200,7 +201,15 @@ class MongoSrsChainStoreIT {
             assertThat(root(f)).isEqualTo(before); assertThat(claim(f)).isEqualTo(claim);
             assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of(ORDERS, QUIET), f.fence())).isFalse();
             assertThat(f.chains().openEpoch(CHAIN, 1, f.fence())).hasValue(2);
-            assertThat(f.chains().publishServingTables(CHAIN, 2, Set.of(ORDERS), f.fence())).isFalse();
+            assertThat(f.chains().publishServingTablesAndGet(CHAIN, 2, Set.of(ORDERS), f.fence())).isEmpty();
+            var stale = f.fence();
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(stale.key())),
+                    new Document("$inc", new Document("claimGeneration", 1L)));
+            var held = root(f);
+            assertThatThrownBy(() -> f.chains().publishServingTablesAndGet(CHAIN, 2, Set.of(ORDERS, QUIET), stale))
+                    .satisfies(failure -> code(failure, IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(root(f)).isEqualTo(held);
         });
     }
 

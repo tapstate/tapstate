@@ -932,8 +932,12 @@ class MongoSrsConsumerStoreIT {
             f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
             var other = cursor(f,B); var chain = root(f);
             var arrivals = Map.of("orders",10L,"items",20L);
-            assertThat(f.consumers().startReadingAfter(A,1,0,arrivals,f.fenceA())).isTrue();
-            var initialized = f.consumers().progress(A).orElseThrow();
+            var startup = runtimeConsumer(f.client(), f.database());
+            var attached = startup.attachedWithChain(CHAIN);
+            assertThat(attached.topology()).isEqualTo(f.consumers().attached(CHAIN));
+            assertThat(attached.chain()).isEqualTo(f.chains().load(CHAIN).orElseThrow());
+            var initialized = startup.startReadingAfterAndGet(A, 1, 0, arrivals, f.fenceA()).orElseThrow();
+            assertThat(f.consumers().progress(A)).contains(initialized);
             assertThat(initialized.revision()).isOne();
             assertThat(initialized.ringDoneThrough()).isEqualTo(arrivals);
             assertThat(initialized.cursor().perTableSeq()).isEqualTo(arrivals);
@@ -948,13 +952,23 @@ class MongoSrsConsumerStoreIT {
 
     @Test void aBatchRefusesStaleRevisionsWrongClaimsAndUnselectedTablesWithoutPartialProgress() {
         withBusiness(f -> {
-            f.consumers().attach(A,0,Set.of("orders","items"),f.fenceA()).orElseThrow();
+            var tables = Set.of("orders", "items");
+            var old = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            var current = f.consumers().attach(A, old.revision(), tables, f.fenceA()).orElseThrow();
+            var startup = runtimeConsumer(f.client(), f.database());
+            var held = startup.startReadingAfterAndGet(A, current.revision(), 0, Map.of("orders", 10L), f.fenceA()).orElseThrow();
             var before = cursor(f,A); var arrivals = Map.of("orders",10L,"items",20L);
-            assertThat(f.consumers().startReadingAfter(A,2,0,arrivals,f.fenceA())).isFalse();
-            assertThat(f.consumers().startReadingAfter(A,1,9,arrivals,f.fenceA())).isFalse();
-            assertThatThrownBy(() -> f.consumers().startReadingAfter(A,1,0,arrivals,f.fenceB())).satisfies(MongoSrsConsumerStoreIT::fenced);
-            assertThatThrownBy(() -> f.consumers().startReadingAfter(A,1,0,Map.of("orders",10L,"outside",20L),f.fenceA()))
+            assertThat(startup.startReadingAfterAndGet(A, old.revision(), held.revision(), arrivals, f.fenceA())).isEmpty();
+            assertThat(startup.startReadingAfterAndGet(A, current.revision(), 0, arrivals, f.fenceA())).isEmpty();
+            assertThatThrownBy(() -> startup.startReadingAfterAndGet(A, current.revision(), held.revision(), arrivals, f.fenceB()))
+                    .satisfies(MongoSrsConsumerStoreIT::fenced);
+            assertThatThrownBy(() -> startup.startReadingAfterAndGet(A, current.revision(), held.revision(), Map.of("orders",10L,"outside",20L),f.fenceA()))
                     .satisfies(MongoSrsConsumerStoreIT::unavailable);
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(
+                    new Document("_id", MongoWorkloadClaimStore.id(f.fenceA().key())),
+                    new Document("$inc", new Document("executionGeneration", 1L)));
+            assertThatThrownBy(() -> startup.startReadingAfterAndGet(A, current.revision(), held.revision(), arrivals, f.fenceA()))
+                    .satisfies(MongoSrsConsumerStoreIT::fenced);
             assertThat(cursor(f,A)).isEqualTo(before);
         });
     }

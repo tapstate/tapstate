@@ -122,14 +122,19 @@ public final class MongoSrsChainStore implements SrsChainStore {
         });
     }
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
+        return publishServingTablesAndGet(chain, epoch, tables, fence).isPresent();
+    }
+
+    @Override public Optional<SrsChainState> publishServingTablesAndGet(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
         return transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCurrent(row, epoch, fence);
             SrsChainState held = state(session, row);
-            if (!captured.containsAll(held.requestedTables())) return false;
-            if (!held.servingTables().isEmpty()) return held.servingTables().equals(captured);
+            if (!captured.containsAll(held.requestedTables())) return Optional.empty();
+            if (!held.servingTables().isEmpty()) return held.servingTables().equals(captured) ? Optional.of(held) : Optional.empty();
             var replacement = new Document(row).append("servingTables", sorted(captured));
-            replace(session, row, replacement); return true;
+            replace(session, row, replacement);
+            return Optional.of(decode(replacement));
         });
     }
     @Override public Optional<SrsChainState> checkpoint(String chain, long expectedRevision, SrsCaptureCheckpoint checkpoint, WorkloadClaimFence fence) {

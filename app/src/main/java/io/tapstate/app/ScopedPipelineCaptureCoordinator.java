@@ -673,27 +673,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         // live tail.
         // A later owner still requires the existing checkpoint before it can open another capture
         // epoch.
-        var progress =
-                source.srs
-                        .consumers()
-                        .progress(source.consumer.context())
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        var arrivals = initialArrivals(session, source, pipeline, chain, progress);
-        if (!arrivals.isEmpty()) {
-            if (!source.srs
-                    .consumers()
-                    .startReadingAfter(
-                            source.consumer.context(),
-                            source.consumer.membershipRevision(),
-                            progress.revision(),
-                            arrivals,
-                            claim(session.original))) throw refused();
-            progress =
-                    source.srs
-                            .consumers()
-                            .progress(source.consumer.context())
-                            .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        }
+        var progress = stores.sources().supportsAdmittedCaptureStartup()
+                ? stores.sources().withCaptureStartup(stores.scope(), () -> prepareInitialArrivals(session, source, pipeline, chain, true))
+                : prepareInitialArrivals(session, source, pipeline, chain, false);
         waiting.remove(source.consumer.context().key());
         long originalEpoch =
                 progress.snapshot() != null
@@ -707,6 +689,23 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         originalEpoch,
                         progress.ringDoneThrough(),
                         source.prepared.canonicalChainId()));
+    }
+
+    private SrsConsumerProgress prepareInitialArrivals(Session session, Source source, PipelineResource pipeline,
+            SrsChainState chain, boolean admitted) {
+        var consumers = source.srs.consumers();
+        var context = source.consumer.context();
+        var progress = consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        var arrivals = initialArrivals(session, source, pipeline, chain, progress, admitted);
+        if (arrivals.isEmpty()) return progress;
+        long memberRevision = source.consumer.membershipRevision();
+        var original = claim(session.original);
+        if (admitted) {
+            return consumers.startReadingAfterAndGet(context, memberRevision, progress.revision(), arrivals, original)
+                    .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
+        if (!consumers.startReadingAfter(context, memberRevision, progress.revision(), arrivals, original)) throw refused();
+        return consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
     }
 
     private void requirePublishedTables(Source source, SrsChainState chain) {
@@ -768,7 +767,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                     new SharedNotes(source.prepared.canonicalChainId(), List.of()));
         }
         try {
-            ensureTail(source.owner);
+            if (stores.sources().supportsAdmittedCaptureStartup()) {
+                stores.sources().withCaptureStartup(stores.scope(), () -> {
+                    ensureTail(source.owner, true);
+                    return null;
+                });
+            } else ensureTail(source.owner);
         } catch (SrsBaselineModelMismatch mismatch) {
             if (!session.snapshot
                     || retained.snapshot() != null
@@ -801,14 +805,28 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             Source source,
             PipelineResource pipeline,
             SrsChainState chain,
-            SrsConsumerProgress progress) {
+            SrsConsumerProgress progress, boolean admitted) {
         var arrivals = new LinkedHashMap<String, Long>();
-        for (String table : source.selected.tables()) {
-            if (!progress.ringDoneThrough().containsKey(table)) {
-                var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
-                arrivals.put(table, initialReadAfter(session, source, chain, table, start));
+        var missing = source.selected.tables().stream()
+                .filter(table -> !progress.ringDoneThrough().containsKey(table)).toList();
+        if (missing.isEmpty()) return arrivals;
+        var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
+        if (admitted && missing.size() > 1 && chain.pendingFreshFull() == null && !(start instanceof StartFrom.At)) {
+            var rings = new LinkedHashMap<String, String>();
+            missing.forEach(table -> rings.put(table, source.selected.ringName(table)));
+            requireSession(session);
+            var bounds = source.srs.log().publishedBounds(source.prepared.chainId(), Set.copyOf(rings.values()));
+            requireSession(session);
+            if (bounds.isPresent()) {
+                var held = bounds.orElseThrow();
+                rings.forEach((table, ring) -> {
+                    var boundary = held.get(ring);
+                    arrivals.put(table, start instanceof StartFrom.Latest ? boundary.largestSequence() : boundary.trimmedThrough());
+                });
+                return arrivals;
             }
         }
+        for (String table : missing) arrivals.put(table, initialReadAfter(session, source, chain, table, start));
         return arrivals;
     }
 
@@ -1225,13 +1243,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             return observed.consumers();
         }
     }
-    private void ensureTail(Owner owner) {
+    private void ensureTail(Owner owner) { ensureTail(owner, false); }
+
+    private void ensureTail(Owner owner, boolean admitted) {
         if(owner.drainingReports())throw new RingNotOpenYet(new CaptureId(owner.prepared.captureId()));
         owner.require();if(owner.config==null || owner.origin==null)throw refused();
-        var current=stores.sources().srs(stores.scope(),owner::require);var topology=current.consumers().attached(owner.prepared.chainId());
+        var current=stores.sources().srs(stores.scope(),owner::require);
+        String chainId = owner.prepared.chainId();
+        var attached = admitted ? current.consumers().attachedWithChain(chainId) : null;
+        var topology = admitted ? attached.topology() : current.consumers().attached(chainId);
         var requested=new TreeSet<String>();topology.consumers().forEach(member -> requested.addAll(member.tables()));
         if(requested.isEmpty())return;
-        var before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        var before = admitted ? attached.chain() : current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         if(owner.physical!=null && !owner.physical.live.get())throw refused();
         if(owner.physical!=null && before.servingTables().containsAll(requested))return;
         var configured=owner.configured;
@@ -1241,8 +1264,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
         before=current.chains().requestTables(owner.prepared.chainId(),requested,owner.fence);
         long epoch=current.chains().openEpoch(owner.prepared.chainId(),before.epoch(),owner.fence).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        if(!current.chains().publishServingTables(owner.prepared.chainId(),epoch,before.requestedTables(),owner.fence))throw refused();
-        var opened=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        SrsChainState opened;
+        if (admitted) {
+            opened = current.chains().publishServingTablesAndGet(chainId, epoch, before.requestedTables(), owner.fence)
+                    .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        } else {
+            if (!current.chains().publishServingTables(chainId, epoch, before.requestedTables(), owner.fence)) throw refused();
+            opened = current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
         owner.configured=configured;
         startPreparedTail(owner,opened);
     }

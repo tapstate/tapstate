@@ -23,6 +23,10 @@ public interface SrsChainStore {
     /** Publishes an immutable callback selection only when it covers every current request. */
     boolean publishServingTables(String miningChainId, long epoch, Set<String> tables, WorkloadClaimFence originalCaptureFence);
 
+    default Optional<SrsChainState> publishServingTablesAndGet(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("Capture serving-state receipt is not supported");
+    }
+
     /** Original expected revision is fixed across retries; conflict never adopts a newer checkpoint. */
     Optional<SrsChainState> checkpoint(String miningChainId, long expectedRevision,
                                       SrsCaptureCheckpoint checkpoint, WorkloadClaimFence originalCaptureFence);

@@ -514,14 +514,20 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
     @Override public SrsConsumerTopology attached(String chain) {
+        return attachedWithChain(chain).topology();
+    }
+
+    @Override public AttachedChain attachedWithChain(String chain) {
         requireChainName(chain);
         return transaction(session -> {
             var view = view(session, chain);
             List<SrsConsumerMembership> active = view.members().values().stream().filter(member -> !member.detached())
                     .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
-            return new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
+            var topology = new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
+            return new AttachedChain(topology, view.state());
         });
     }
+
     /** Limits a fixed requested cut and serializes actual deletion with membership replacement. */
     long limitTrimToConfirmed(ClientSession session,String chain,String table,long requested) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("consumer trim protection requires the original CACHE transaction");
@@ -692,25 +698,36 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     @Override public boolean startReadingAfter(SrsConsumerContext context,long membershipRevision,long expectedProgressRevision,
             Map<String,Long> sequences,WorkloadClaimFence fence) {
+        return startReadingAfter(context, membershipRevision, expectedProgressRevision, sequences, fence, false).isPresent();
+    }
+
+    @Override public Optional<SrsConsumerProgress> startReadingAfterAndGet(SrsConsumerContext context, long membershipRevision,
+            long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence) {
+        return startReadingAfter(context, membershipRevision, expectedProgressRevision, sequences, fence, runtimeStructure);
+    }
+
+    private Optional<SrsConsumerProgress> startReadingAfter(SrsConsumerContext context, long membershipRevision,
+            long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence, boolean admitted) {
         Objects.requireNonNull(context,"context"); requireRevision(membershipRevision); requireRevision(expectedProgressRevision);
         Objects.requireNonNull(sequences,"sequences");
         if (sequences.isEmpty() || sequences.entrySet().stream().anyMatch(entry -> entry.getKey() == null || entry.getKey().isBlank()
                 || entry.getValue() == null || entry.getValue() < -1 || entry.getValue() == Long.MAX_VALUE))
             throw new IllegalArgumentException("invalid original consumer arrivals");
         var captured = Map.copyOf(sequences);
-        return transaction(session -> {
-            prove(session,context,fence); var own = requireOwn(session,context);
-            if (!bound(own.member(),membershipRevision,fence)) return false;
+        return transaction(admitted, session -> {
+            prove(session, context, fence, admitted); var own = requireOwn(session,context);
+            if (!bound(own.member(),membershipRevision,fence)) return Optional.empty();
             if (!own.member().tables().containsAll(captured.keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var old = held.value();
             var missing = new HashMap<String,Long>();
             for (var entry : captured.entrySet()) {
                 var confirmed = held.ringDoneThrough().get(entry.getKey());
                 if (confirmed == null) missing.put(entry.getKey(),entry.getValue());
-                else if (entry.getValue() > confirmed) return false;
+                else if (entry.getValue() > confirmed) return Optional.empty();
             }
-            if (missing.isEmpty()) return true;
-            if (held.revision() != expectedProgressRevision) return false;
+            if (missing.isEmpty()) return Optional.of(new SrsConsumerProgress(context, membershipRevision, held.revision(),
+                    old, held.snapshot(), held.writerRun(), held.ringDoneThrough()));
+            if (held.revision() != expectedProgressRevision) return Optional.empty();
             // Validate every new arrival before replacing any part of the consumer's original cursor.
             if (missing.keySet().stream().anyMatch(table -> old.perTableSeq().get(table) != -1L))
                 throw unavailable(context.key().miningChainId());
@@ -718,7 +735,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             var read = new HashMap<>(old.perTableSeq()); read.putAll(missing);
             var next = new ConsumerOffset(old.pipelineId(),read,old.sinkAcked(),old.snapshotCompletedTables(),old.cdcStartPosition(),
                     old.snapshotEpoch(),old.sinkAckedByTable(),old.progressKind());
-            replaceProgress(session,own,next,held.writerRun(),done); return true;
+            var committed = MongoSrsConsumerRecords.confirmedFloors(next, done, held.writerRun());
+            replaceProgress(session, own, next, held.writerRun(), done);
+            return Optional.of(new SrsConsumerProgress(context, membershipRevision, held.revision() + 1,
+                    next, held.snapshot(), held.writerRun(), committed));
         });
     }
 

@@ -568,6 +568,49 @@ public final class MongoSrsModelStore implements SrsModelStore {
         return true;
     }
 
+    /** Proves sole, current anchors and published model bodies for this batch in the caller's snapshot. */
+    boolean provePublishedRings(ClientSession session, String chainId, Set<String> rings) {
+        var root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chainId)).first();
+        if (root == null || MongoSrsRecoveryControls.read(root).isPresent()) return false;
+        var names = List.copyOf(rings);
+        var selected = SystemCollections.SRS_MODEL_CONTEXTS.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("cacheIncarnation", scope.cacheIncarnation())
+                        .append("ringName", new Document("$in", names))),
+                new Document("$limit", rings.size() + 1),
+                new Document("$project", new Document("row", "$$ROOT").append("matches", exactMatches(names, "$ringName")))))
+                .into(new java.util.ArrayList<>());
+        if (selected.size() != rings.size()) return false;
+        var controls = new java.util.HashMap<SrsModelKey, MongoSrsModelContexts.Context>();
+        var remaining = new HashSet<>(rings);
+        for (var row : selected) {
+            var control = contexts.decode(row.get("row", Document.class));
+            if (!remaining.remove(control.ring()) || !List.of(control.ring()).equals(row.get("matches"))
+                    || !chainId.equals(control.key().miningChainId()) || !scope.cacheIncarnation().equals(control.key().cacheIncarnation())
+                    || control.nextId() != null || !Long.valueOf(control.key().captureEpoch()).equals(root.get("epoch"))) return false;
+            requireChain(root, control.key());
+            var head = contexts.head(root, control.key().table());
+            if (head == null || !control.id().equals(head.get("contextId"))) return false;
+            contexts.requireAnchor(root, control, control);
+            if (controls.putIfAbsent(version(control, control.publishedVersion()), control) != null) return false;
+        }
+        var ids = controls.keySet().stream().map(MongoSrsModelStore::key).toList();
+        for (var row : SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", new Document("$in", ids)))
+                .limit(rings.size() + 1)) {
+            requireActive.run();
+            var model = decode(row);
+            var control = controls.remove(model.key());
+            if (control == null) return false;
+            requirePublished(control, model);
+        }
+        return controls.isEmpty();
+    }
+
+    /** Verifies which requested keys match under the collection's own collation. */
+    static Document exactMatches(List<String> keys, String field) {
+        return new Document("$filter", new Document("input", new Document("$literal", keys))
+                .append("as", "requested").append("cond", new Document("$eq", List.of("$$requested", field))));
+    }
+
     /** An unseen ring may be inspected only when no published ordering anchor or retained data contradicts it. */
     void checkRing(ClientSession session, String ring) {
         var control = contexts.firstOnRing(session, ring);
