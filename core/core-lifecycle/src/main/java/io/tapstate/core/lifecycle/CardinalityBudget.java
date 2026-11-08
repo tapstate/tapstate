@@ -93,6 +93,20 @@ public enum CardinalityBudget {
     NEST_NAMESPACE_INFO("tapstate.pipeline.nest.namespace.info", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.HIGHEST, Set.of(MetricAttributes.NEST_NAMESPACE, MetricAttributes.NEST_STEP,
                     MetricAttributes.NEST_PATH, MetricAttributes.NEST_MAP)),
+    /**
+     * Operator-state facts the shared state layer reports, today per nest namespace: commit groups, what
+     * each carried and cost, and entries let go of. Named under {@code state} rather than {@code nest} so an
+     * operator moved onto the same layer reports them under the same names.
+     */
+    STATE_COMMIT_GROUPS("tapstate.pipeline.state.commit.groups", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_COMMIT_KEYS("tapstate.pipeline.state.commit.keys", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_COMMIT_ROUND_TRIPS("tapstate.pipeline.state.commit.round_trips", MetricAttributes.NEST_NAMESPACE,
+            1_000, Fold.ADDED),
+    STATE_COMMIT_DURATION("tapstate.pipeline.state.commit.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_EVICTIONS("tapstate.pipeline.state.evictions", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,

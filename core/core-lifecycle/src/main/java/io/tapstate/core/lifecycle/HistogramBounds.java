@@ -34,17 +34,51 @@ public enum HistogramBounds {
     /** How long one stage of the graph spent on one unit of its work. */
     PROCESS_DURATION("tapstate.pipeline.process.duration", List.of(
             0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5,
-            5.0, 10.0));
+            5.0, 10.0)),
 
-    /** The one unit every histogram here is measured in; the bounds above are in it. */
+    /**
+     * How long one commit group of operator state took to become durable: one store transaction, from the
+     * moment it was issued to the moment the store acknowledged it. Starts where a local commit does and
+     * ends where a commit has stopped being a cost and become a stall.
+     */
+    STATE_COMMIT_DURATION("tapstate.pipeline.state.commit.duration", List.of(
+            0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)),
+
+    /**
+     * How many keys one commit group carried. Powers of two up to the largest group the writer will form,
+     * so a pipeline committing one key at a time and one committing in full groups land at opposite ends.
+     */
+    STATE_COMMIT_KEYS("tapstate.pipeline.state.commit.keys", "{key}", List.of(
+            1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1000.0)),
+
+    /**
+     * How many store round trips one commit group cost, every command the store sent for it included.
+     * Finest around twenty, the ceiling a group is held to, so a group just over it is told apart from one
+     * just under.
+     */
+    STATE_COMMIT_ROUND_TRIPS("tapstate.pipeline.state.commit.round_trips", "{round_trip}", List.of(
+            1.0, 2.0, 4.0, 8.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0, 64.0));
+
+    /** The unit every duration histogram here is measured in; their bounds are in it. */
     public static final String UNIT = "s";
 
     private final String instrument;
+    private final String unit;
     private final List<Double> bounds;
 
     HistogramBounds(String instrument, List<Double> bounds) {
+        this(instrument, UNIT, bounds);
+    }
+
+    HistogramBounds(String instrument, String unit, List<Double> bounds) {
         this.instrument = instrument;
+        this.unit = unit;
         this.bounds = bounds;
+    }
+
+    /** The unit this instrument's bounds are given in: seconds for a duration, a count's own unit otherwise. */
+    public String unit() {
+        return unit;
     }
 
     /** The bounds registered for {@code instrument}, or empty for a name that publishes no distribution. */

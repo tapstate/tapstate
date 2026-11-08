@@ -49,6 +49,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
     private NestStateIo stateIo;
 
     private NestStateStats stats;
+    private NestStateIo.Committed committed = NestStateIo.Committed.NONE;
 
     NestStateMapStore(String namespace) {
         this(namespace, null);
@@ -74,8 +75,10 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             String resolved = database == null ? stores.defaultDatabase() : database;
             this.store = stores.inDatabase(resolved).state();
         }
-        this.stateIo = new NestStateIo(store, namespace);
         this.stats = NestStateStats.of(member);
+        NestStateStats counted = this.stats;
+        this.committed = (keys, roundTrips, nanos) -> counted.committed(namespace, keys, roundTrips, nanos);
+        this.stateIo = new NestStateIo(store, namespace, committed);
     }
 
     @Override
@@ -144,7 +147,8 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         if (store instanceof io.tapstate.spi.store.NestReleaseStore releases
                 && value instanceof ResolverState resolver) {
             byte[] originalKey = resolver.releases().isEmpty() ? null : toBytes(key);
-            releases.saveWithRelease(namespace, NestStateKeys.nameOf(key), toBytes(value), originalKey);
+            NestStateIo.commit(committed, 1, () -> releases.saveWithRelease(namespace,
+                    NestStateKeys.nameOf(key), toBytes(value), originalKey));
         } else stateIo.saveAll(Map.of(NestStateKeys.nameOf(key), toBytes(value)));
     }
 
@@ -162,7 +166,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
 
     @Override
     public void delete(Object key) {
-        store.delete(namespace, NestStateKeys.nameOf(key));
+        NestStateIo.commit(committed, 1, () -> store.delete(namespace, NestStateKeys.nameOf(key)));
     }
 
     @Override

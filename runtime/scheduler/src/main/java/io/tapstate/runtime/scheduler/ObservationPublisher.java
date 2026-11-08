@@ -20,6 +20,7 @@ import io.tapstate.core.lifecycle.InitialLoad;
 import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
+import io.tapstate.core.lifecycle.StateCommitReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
@@ -130,6 +131,14 @@ public final class ObservationPublisher {
     private static final String NEST_ROOTS_RENDERED_PREFIX = "nestRootsRendered.";
 
     /**
+     * How many commit groups a namespace's state became durable in, and how many entries memory let go of
+     * to be read back later. The three per-group distributions beside them have no flat spelling, as no
+     * distribution on this face does.
+     */
+    private static final String STATE_COMMIT_GROUPS_PREFIX = "stateCommitGroups.";
+    private static final String STATE_EVICTIONS_PREFIX = "stateEvictions.";
+
+    /**
      * How many changes the namespace could never place in a document. Published only for a namespace that
      * discarded any, so that nothing discarded is an absence rather than a zero - the one reading here whose
      * quiet state and whose unwired state would otherwise be spelled the same way.
@@ -174,6 +183,16 @@ public final class ObservationPublisher {
      * than a reading because the start travels with it, so a restart is a new series and not a decrease.
      */
     static final String NEST_ROOTS_RENDERED_METRIC = "tapstate.pipeline.nest.roots.rendered";
+    /**
+     * How operator state is made durable, named for the state rather than for the operator: the same facts
+     * describe any stateful step's state, so a later stateful operator reports under the same names. All
+     * accumulate from one start per namespace.
+     */
+    static final String STATE_COMMIT_GROUPS_METRIC = "tapstate.pipeline.state.commit.groups";
+    static final String STATE_COMMIT_KEYS_METRIC = "tapstate.pipeline.state.commit.keys";
+    static final String STATE_COMMIT_ROUND_TRIPS_METRIC = "tapstate.pipeline.state.commit.round_trips";
+    static final String STATE_COMMIT_DURATION_METRIC = "tapstate.pipeline.state.commit.duration";
+    static final String STATE_EVICTIONS_METRIC = "tapstate.pipeline.state.evictions";
     /**
      * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
      * attributes are the step, level and map. A mapping rather than more attributes on the counts: names a
@@ -321,6 +340,8 @@ public final class ObservationPublisher {
                     keyed(NEST_PENDING_HIGH_WATER_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_STORED_METRIC, keyed(NEST_STORED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_ROOTS_RENDERED_METRIC, keyed(NEST_ROOTS_RENDERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(STATE_COMMIT_GROUPS_METRIC, keyed(STATE_COMMIT_GROUPS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
+            Map.entry(STATE_EVICTIONS_METRIC, keyed(STATE_EVICTIONS_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(NEST_DEAD_LETTERED_METRIC, keyed(NEST_DEAD_LETTERED_PREFIX, NEST_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_METRIC, keyed(JOIN_RECOMPUTE_DONE_PREFIX, JOIN_NAMESPACE_ATTRIBUTE)),
             Map.entry(JOIN_RECOMPUTE_ROWS_TOTAL_METRIC,
@@ -1047,6 +1068,7 @@ public final class ObservationPublisher {
         readingsAt(pipelineId, NEST_STORED_METRIC, "{entry}", at, NEST_NAMESPACE_ATTRIBUTE, stored)
                 .ifPresent(facts::add);
         rootsRendered(pipelineId, at, nestReadings).ifPresent(facts::add);
+        facts.addAll(stateCommits(pipelineId, at, nestReadings));
         nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
@@ -1080,6 +1102,45 @@ public final class ObservationPublisher {
                         reading.rootsRenderedSince(), at, rendered))));
         return points.isEmpty() ? Optional.empty()
                 : Optional.of(new MetricFact(NEST_ROOTS_RENDERED_METRIC, MetricType.COUNTER, "{document}", points));
+    }
+
+    /**
+     * The state facts, one point per namespace whose reporter measured its commits: two counters and three
+     * distributions, every one from that namespace's own start. Nothing at all for a pipeline with none.
+     */
+    private static List<MetricFact> stateCommits(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> groups = new ArrayList<>();
+        List<MetricPoint> keys = new ArrayList<>();
+        List<MetricPoint> trips = new ArrayList<>();
+        List<MetricPoint> took = new ArrayList<>();
+        List<MetricPoint> evicted = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            StateCommitReading commits = reading.commits();
+            if (commits == null) {
+                return;
+            }
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace);
+            Instant since = commits.countingSince();
+            groups.add(MetricPoint.accumulated(attributes, since, at, commits.groups()));
+            keys.add(MetricPoint.distribution(attributes, since, at, commits.keys()));
+            trips.add(MetricPoint.distribution(attributes, since, at, commits.roundTrips()));
+            took.add(MetricPoint.distribution(attributes, since, at, commits.duration()));
+            evicted.add(MetricPoint.accumulated(attributes, since, at, commits.evictions()));
+        });
+        if (groups.isEmpty()) {
+            return List.of();
+        }
+        return List.of(
+                new MetricFact(STATE_COMMIT_GROUPS_METRIC, MetricType.COUNTER, "{group}", groups),
+                new MetricFact(STATE_COMMIT_KEYS_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_KEYS.unit(), keys),
+                new MetricFact(STATE_COMMIT_ROUND_TRIPS_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_ROUND_TRIPS.unit(), trips),
+                new MetricFact(STATE_COMMIT_DURATION_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_DURATION.unit(), took),
+                new MetricFact(STATE_EVICTIONS_METRIC, MetricType.COUNTER, "{entry}", evicted));
     }
 
     private static Optional<MetricFact> nestOrigins(String pipelineId, Instant at,

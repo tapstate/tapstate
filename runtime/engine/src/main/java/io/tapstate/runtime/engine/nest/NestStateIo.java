@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.StoreRoundTrips;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -34,9 +35,39 @@ final class NestStateIo {
     private final Batcher reads = new Batcher(false);
     private final Batcher writes = new Batcher(true);
 
+    private final Committed committed;
+
     NestStateIo(KeyedStateStore store, String namespace) {
+        this(store, namespace, Committed.NONE);
+    }
+
+    NestStateIo(KeyedStateStore store, String namespace, Committed committed) {
         this.store = Objects.requireNonNull(store, "store");
         this.namespace = Objects.requireNonNull(namespace, "namespace");
+        this.committed = Objects.requireNonNull(committed, "committed");
+    }
+
+    /**
+     * Told of every commit group once the store has made it durable: how many keys it carried, how many
+     * store round trips it cost, and how long it took from issue to acknowledgement. A group that failed is
+     * not a commit and is not reported.
+     */
+    @FunctionalInterface
+    interface Committed {
+        Committed NONE = (keys, roundTrips, nanos) -> { };
+
+        void group(long keys, long roundTrips, long nanos);
+    }
+
+    /** Runs one store write as one commit group, reporting it once it succeeded. */
+    static void commit(Committed committed, long keys, Runnable write) {
+        long began = System.nanoTime();
+        long roundTrips;
+        try (StoreRoundTrips.Count count = StoreRoundTrips.count()) {
+            write.run();
+            roundTrips = count.roundTrips();
+        }
+        committed.group(keys, roundTrips, System.nanoTime() - began);
     }
 
     Map<String, byte[]> loadAll(Collection<String> keys) {
@@ -184,12 +215,14 @@ final class NestStateIo {
         }
 
         private void write(Map<String, byte[]> combined) {
-            if (combined.size() == 1) {
-                Map.Entry<String, byte[]> only = combined.entrySet().iterator().next();
-                store.save(namespace, only.getKey(), only.getValue());
-            } else {
-                store.saveAll(namespace, combined);
-            }
+            commit(committed, combined.size(), () -> {
+                if (combined.size() == 1) {
+                    Map.Entry<String, byte[]> only = combined.entrySet().iterator().next();
+                    store.save(namespace, only.getKey(), only.getValue());
+                } else {
+                    store.saveAll(namespace, combined);
+                }
+            });
         }
     }
 

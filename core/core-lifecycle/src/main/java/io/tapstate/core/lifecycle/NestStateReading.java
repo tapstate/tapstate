@@ -47,11 +47,12 @@ import java.util.OptionalLong;
  * @param rootsRendered whole documents sent from this namespace since {@code rootsRenderedSince}; present
  *     only for the root level of a nest, which is the one level that renders documents
  * @param rootsRenderedSince when that count began, present exactly when the count is
+ * @param commits how the namespace's state was made durable, or null where the reporter does not measure it
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
         long pendingHighWater, OptionalLong stored, NestOrigin origin,
         OptionalLong keyAccesses, OptionalLong coldKeys, OptionalLong rootsRendered,
-        Instant rootsRenderedSince) {
+        Instant rootsRenderedSince, StateCommitReading commits) {
 
     public NestStateReading {
         rootsRendered = rootsRendered == null ? OptionalLong.empty() : rootsRendered;
@@ -60,6 +61,15 @@ public record NestStateReading(long entries, long accesses, long backfills, long
                     "a count of documents sent says what it counts from: a count without a start hands every"
                             + " reader a stream in which a restart and a decrease are the same observation");
         }
+    }
+
+    /** A reading without commit measurements. */
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestOrigin origin,
+            OptionalLong keyAccesses, OptionalLong coldKeys, OptionalLong rootsRendered,
+            Instant rootsRenderedSince) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, origin, keyAccesses,
+                coldKeys, rootsRendered, rootsRenderedSince, null);
     }
 
     /** A reading without a count of documents sent: every level but the root, and older readers. */
@@ -97,19 +107,28 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     /** The same reading, placed in the pipeline's definition. */
     public NestStateReading withOrigin(NestOrigin origin) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, keyAccesses, coldKeys, rootsRendered, rootsRenderedSince);
+                origin, keyAccesses, coldKeys, rootsRendered, rootsRenderedSince, commits);
     }
 
     /** The same reading with independently measured key counters. */
     public NestStateReading withKeyCounts(long keyAccesses, long coldKeys) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys), rootsRendered, rootsRenderedSince);
+                origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys), rootsRendered, rootsRenderedSince,
+                commits);
     }
 
     /** The same reading with the count of whole documents the root level has sent. */
     public NestStateReading withRootsRendered(long rendered, Instant since) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, keyAccesses, coldKeys, OptionalLong.of(rendered), Objects.requireNonNull(since, "since"));
+                origin, keyAccesses, coldKeys, OptionalLong.of(rendered), Objects.requireNonNull(since, "since"),
+                commits);
+    }
+
+    /** The same reading with how the namespace's state was made durable. */
+    public NestStateReading withCommits(StateCommitReading measured) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                origin, keyAccesses, coldKeys, rootsRendered, rootsRenderedSince,
+                Objects.requireNonNull(measured, "measured"));
     }
 
     /** A decrease in either measured key counter identifies a new counting lifetime. */

@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAccumulator;
@@ -73,6 +74,37 @@ public final class NestStateStats {
         counters(namespace).pendingHighWater.accumulate(pending);
     }
 
+    /**
+     * Counts one commit group of {@code namespace}'s state that became durable: {@code keys} keys in one store
+     * transaction, costing {@code roundTrips} store round trips and {@code nanos} from issue to acknowledgement.
+     * Called on the thread that made the commit, which is not the one that publishes it.
+     */
+    public void committed(String namespace, long keys, long roundTrips, long nanos) {
+        Counters counters = counters(namespace);
+        counters.keys.observe(keys, keys);
+        counters.roundTrips.observe(roundTrips, roundTrips);
+        counters.commitDuration.observe(nanos / 1_000_000_000.0, nanos);
+    }
+
+    /** How {@code namespace}'s commits have gone so far, or null when it has committed nothing yet. */
+    public Commits commits(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        if (counters == null || counters.keys.count() == 0) {
+            return null;
+        }
+        return new Commits(counters.keys.count(), counters.keys.read(), counters.keys.sum(),
+                counters.roundTrips.read(), counters.roundTrips.sum(), counters.commitDuration.read(),
+                counters.commitDuration.sum(), counters.countingSinceMillis);
+    }
+
+    /**
+     * One namespace's commits as read together: the number of groups, then per instrument the bucket counts
+     * over its registered bounds and the sum of what was observed - keys, round trips, and nanoseconds.
+     */
+    public record Commits(long groups, long[] keyBuckets, long keySum, long[] roundTripBuckets, long roundTripSum,
+            long[] durationBuckets, long durationNanos, long countingSinceMillis) {
+    }
+
     /** Counts {@code documents} whole documents sent from {@code namespace}'s level since the run began. */
     public void rendered(String namespace, long documents) {
         counters(namespace).rootsRendered.add(documents);
@@ -132,6 +164,9 @@ public final class NestStateStats {
         private final LongAdder keyAccesses = new LongAdder();
         private final LongAdder coldKeys = new LongAdder();
         private final LongAdder rootsRendered = new LongAdder();
+        private final Distribution keys = new Distribution(HistogramBounds.STATE_COMMIT_KEYS);
+        private final Distribution roundTrips = new Distribution(HistogramBounds.STATE_COMMIT_ROUND_TRIPS);
+        private final Distribution commitDuration = new Distribution(HistogramBounds.STATE_COMMIT_DURATION);
 
         /**
          * When these counts began, in epoch milliseconds: what a count of work done accumulates from, so a
@@ -139,5 +174,53 @@ public final class NestStateStats {
          */
         private final long countingSinceMillis = System.currentTimeMillis();
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
+    }
+
+    /**
+     * Bucket counts over one instrument's registered bounds, and the sum of what was observed in the unit the
+     * caller keeps it in. Adders, for the reason the other counters are: written on every commit, read only
+     * when a reading is left.
+     */
+    private static final class Distribution {
+
+        private final java.util.List<Double> bounds;
+        private final LongAdder[] buckets;
+        private final LongAdder count = new LongAdder();
+        private final LongAdder sum = new LongAdder();
+
+        private Distribution(HistogramBounds instrument) {
+            this.bounds = instrument.bounds();
+            this.buckets = new LongAdder[instrument.buckets()];
+            for (int i = 0; i < buckets.length; i++) {
+                buckets[i] = new LongAdder();
+            }
+        }
+
+        /** One observation: {@code value} decides the bucket, in the bounds' unit; {@code kept} is summed. */
+        private void observe(double value, long kept) {
+            int bucket = 0;
+            while (bucket < bounds.size() && value > bounds.get(bucket)) {
+                bucket++;
+            }
+            buckets[bucket].increment();
+            count.increment();
+            sum.add(kept);
+        }
+
+        private long count() {
+            return count.sum();
+        }
+
+        private long sum() {
+            return sum.sum();
+        }
+
+        private long[] read() {
+            long[] read = new long[buckets.length];
+            for (int i = 0; i < buckets.length; i++) {
+                read[i] = buckets[i].sum();
+            }
+            return read;
+        }
     }
 }

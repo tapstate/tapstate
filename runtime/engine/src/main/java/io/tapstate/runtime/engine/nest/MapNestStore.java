@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
+import com.hazelcast.map.LocalMapStats;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
@@ -108,8 +109,13 @@ final class MapNestStore<S> implements NestStore<S> {
         }
         String namespace = map.getName();
         NestStateStats.Counted counted = stats.counted(namespace);
-        gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
+        LocalMapStats local = map.getLocalMapStats();
+        gauge.reading(namespace, local.getOwnedEntryCount(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
+        NestStateStats.Commits commits = stats.commits(namespace);
+        if (commits != null) {
+            gauge.commitReading(namespace, commits, local.getEvictionCount());
+        }
         gauge.keyReading(namespace, counted.keyAccesses(), counted.coldKeys());
         if (counted.rootsRendered() > 0) {
             gauge.rootsReading(namespace, counted.rootsRendered(), counted.countingSinceMillis());
