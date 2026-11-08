@@ -51,7 +51,7 @@ public final class KillMember {
                 Long.getLong("kill.claim"), Long.getLong("kill.execution"), Long.getLong("kill.topology"));
         long renewTtl = Long.getLong("kill.renew.ttl", 0L);
 
-        try (KillRig rig = KillRig.attach(url, db); MongoClient client = MongoClients.create(url)) {
+        try (KillRig rig = KillRig.attach(url, db); MongoClient client = registering(rig, member, url)) {
             if (renewTtl > 0) renewer(rig, fence, Duration.ofMillis(renewTtl)).start();
             NestStore<String> store = DirectNestStore.over(rig.store(client, fence), rig.mapName(), fence.executionGeneration());
             List<Object> owned = new ArrayList<>();
@@ -75,6 +75,22 @@ public final class KillMember {
             }
         }
         System.exit(0);
+    }
+
+    /**
+     * The member's client, which registers every server session it sees before that session's first
+     * command is sent, so nothing can be left open under a session the takeover does not know about.
+     */
+    private static MongoClient registering(KillRig rig, String member, String url) {
+        java.util.Set<org.bson.BsonDocument> known = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        com.mongodb.event.CommandListener listener = new com.mongodb.event.CommandListener() {
+            @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                org.bson.BsonDocument lsid = event.getCommand().getDocument("lsid", null);
+                if (lsid != null && known.add(lsid)) rig.registerSession(member, lsid);
+            }
+        };
+        return MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                .applyConnectionString(new com.mongodb.ConnectionString(url)).addCommandListener(listener).build());
     }
 
     /** What a new owner finds for its keys on its first read, through the fenced store (read concern snapshot). */

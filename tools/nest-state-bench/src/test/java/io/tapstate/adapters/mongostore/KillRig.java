@@ -163,6 +163,36 @@ public final class KillRig implements AutoCloseable {
         return out;
     }
 
+    /**
+     * Records a server session a member is about to use, before its first command goes out, so that a
+     * node taking over after the member dies can end that session's open transaction. Stands in for the
+     * session ids a member would publish next to its claim.
+     */
+    public void registerSession(String member, org.bson.BsonDocument lsid) {
+        raw.getDatabase(database).getCollection("kill_sessions", org.bson.BsonDocument.class).updateOne(
+                new org.bson.BsonDocument("_id", new org.bson.BsonString(member)),
+                new org.bson.BsonDocument("$addToSet", new org.bson.BsonDocument("lsids", lsid)),
+                new com.mongodb.client.model.UpdateOptions().upsert(true));
+    }
+
+    /**
+     * Ends every server session a member registered, which aborts any transaction it left open and
+     * releases the locks that transaction holds. Returns how many sessions were named.
+     */
+    public int killSessionsOf(String member) {
+        org.bson.BsonDocument row = raw.getDatabase(database).getCollection("kill_sessions", org.bson.BsonDocument.class)
+                .find(new org.bson.BsonDocument("_id", new org.bson.BsonString(member))).first();
+        if (row == null) return 0;
+        org.bson.BsonArray lsids = row.getArray("lsids");
+        raw.getDatabase("admin").runCommand(new org.bson.BsonDocument("killSessions", lsids));
+        return lsids.size();
+    }
+
+    /** Milliseconds left on the pipeline claim's lease; negative once it has lapsed. */
+    public long leaseRemainingMillis() {
+        return claims().readPipeline(SCOPE).orElseThrow().leaseRemaining().toMillis();
+    }
+
     /** The pipeline's runtime write fence as the store holds it. */
     public long runtimeWriteFence() {
         return SystemCollections.CACHE_PIPELINE_STATE.on(raw.getDatabase(database)).find(new Document("_id", "kill")).first()

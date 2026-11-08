@@ -49,6 +49,12 @@ class NestKillNineBench {
     private static final int PAD = Integer.getInteger("kill.pad", 1024);
     private static final Path OUT = Path.of("target", "kill-nine.jsonl");
 
+    /**
+     * When true ({@code -Dkill.takeover=kill-sessions}), the node taking over ends the dead member's
+     * registered sessions once its lease has lapsed, instead of waiting for the server to reap them.
+     */
+    private static final boolean KILL_SESSIONS = "kill-sessions".equals(System.getProperty("kill.takeover"));
+
     @Test
     void killNineMidGroup() throws Exception {
         String given = System.getProperty("kill.mongo.url");
@@ -273,6 +279,18 @@ class NestKillNineBench {
     private static long[] takeOver(KillRig rig, WorkloadClaim old, long since) {
         WorkloadOwner b = new WorkloadOwner("node-b", UUID.randomUUID().toString());
         long attempts = 0;
+        if (KILL_SESSIONS) {
+            // Only once the old owner's lease has lapsed: before that it may be alive and working.
+            while (rig.leaseRemainingMillis() >= 0) {
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException stop) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException(stop);
+                }
+            }
+            rig.killSessionsOf("a");
+        }
         while (true) {
             WorkloadClaimAttempt attempt = rig.claims().acquirePipeline(KillRig.SCOPE, b, old.topologyRevision(), LEASE.multipliedBy(100));
             if (attempt.acquired()) {
@@ -294,6 +312,7 @@ class NestKillNineBench {
     private static void record(String scenario, String mode, int trial, Map<String, ?> values) throws Exception {
         StringBuilder json = new StringBuilder("{\"scenario\":\"").append(scenario).append("\",\"mode\":\"").append(mode)
                 .append("\",\"trial\":").append(trial);
+        json.append(",\"takeover\":\"").append(KILL_SESSIONS ? "kill-sessions" : "wait").append('"');
         new TreeMap<>(values).forEach((key, value) -> json.append(",\"").append(key).append("\":").append(jsonValue(value)));
         json.append('}');
         System.out.println("KILL-NINE " + json);
