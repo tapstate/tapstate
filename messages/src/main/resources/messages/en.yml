@@ -1128,7 +1128,7 @@ nest.tombstone-limit-exceeded:
   solution: "A record of a deletion is kept only until a restart could no longer replay the deletion, so this many means the durable position is not advancing - find what is holding the frontier back rather than raising the limit, which only buys time."
 nest.parent-absent:
   message: "An event of chain {chain} in {bucket} at {order} hangs from a row that is gone, and was handed over after {heldFor} rather than placed in a document."
-  solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving."
+  solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving. Leave a short wait alone; for a long one, check the source for the parent row the event points at."
 nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident})."
   solution: "Raise this pipeline's in-memory entry budget so more of its working set stays resident, or accept the round trips if the throughput they allow is enough."
