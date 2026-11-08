@@ -218,6 +218,12 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         });
     }
     PipelinePreparationInputs verifyInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
+        return verifiedInputs(session, scope, requested).inputs();
+    }
+
+    record VerifiedInputs(PipelinePreparationInputs inputs, PipelineResource pipeline, Map<String, SourceResource> sources) {}
+
+    VerifiedInputs verifiedInputs(ClientSession session,PipelineIntentScope scope,PipelinePreparationInputs requested) {
         var ids = new java.util.LinkedHashSet<String>();
         ids.add(scope.pipelineId());
         if (requested != null) ids.addAll(requested.sourceHashes().keySet());
@@ -256,7 +262,7 @@ final class MongoPipelineStatePreparations implements PipelineStatePreparations 
         try { actual = PipelinePreparationInputs.of(scope,pipeline,sources,selected); }
         catch (IllegalArgumentException invalid) { throw fenced(); }
         if (requested != null && !actual.equals(requested)) throw fenced();
-        return actual;
+        return new VerifiedInputs(actual, pipeline, sources);
     }
 
     @Override public void requireIssued(PipelineIntentScope scope, String preparationId) {

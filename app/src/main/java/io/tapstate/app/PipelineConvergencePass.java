@@ -46,6 +46,15 @@ final class PipelineConvergencePass {
         @Override public java.time.Duration retention() { requirePipeline(scope().pipelineId()); return views.pipelineRateHistory(scope()).retention(); }
     };
     private final io.tapstate.spi.store.DerivedSchemaStore derivedSchemas = new io.tapstate.spi.store.DerivedSchemaStore() {
+        @Override public boolean supportsStartupBatch() { return true; }
+        @Override public Map<String, io.tapstate.spi.store.DerivedSchema> latestMany(String id, java.util.Set<String> steps) {
+            requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latestMany(id, steps);
+        }
+        @Override public void recordAndPinMany(String id, java.util.List<Change> changes) {
+            WorkloadClaimFence original = claim.get();
+            requirePipeline(id);
+            views.pipelineDerivedSchemas(scope(), original, requireActive).recordAndPinMany(id, changes);
+        }
         @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String id, String step) {
             requirePipeline(id); return views.pipelineDerivedSchemas(scope()).latest(id, step);
         }

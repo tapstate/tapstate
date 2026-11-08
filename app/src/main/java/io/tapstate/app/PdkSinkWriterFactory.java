@@ -165,9 +165,16 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
     @Override
     public SinkWriter getEx() {return forWriter(0,0);}
     @Override public SinkWriter forWriter(int memberIndex,int localIndex) {
+        return forWriter(memberIndex, localIndex, new ScopedSinkStateProvider.WriterStartup());
+    }
+    @Override public Opening opening() {
+        var startup = new ScopedSinkStateProvider.WriterStartup();
+        return (member, local) -> forWriter(member, local, startup);
+    }
+    private SinkWriter forWriter(int memberIndex,int localIndex,ScopedSinkStateProvider.WriterStartup startup) {
         if(memberIndex<0 || localIndex<0)throw new IllegalArgumentException("invalid writer coordinates");
         HazelcastInstance member = localMember();
-        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member),"writer:"+memberIndex+":"+localIndex)
+        if(configured!=null)return ScopedSinkStateProvider.of(member).open(member,configured,config(),provisioner(member),sharing(member),"writer:"+memberIndex+":"+localIndex,startup)
                 .withTargetIdentities(identities).openPrepared(config(),targets);
         return new PdkSinkPort(provisioner(member), stateStore(member), sharing(member), purpose)
                 .openPrepared(config(), targets);

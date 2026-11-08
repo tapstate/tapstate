@@ -726,10 +726,17 @@ final class StoreBackedDagSource implements DagSource {
         // sees one shape rather than having to know a reference from a body.
         Map<String, SourceVertex> sourceVertices = sourceVertices(pipeline);
         if (operators == null) refuseProgressNoSinkCanAnswerFor(pipelineId, pipeline, sourceVertices);
+        StartModels staged = null;
+        if (operators != null && modelRecords.supportsStartupBatch()) {
+            var needed = new LinkedHashSet<>(operators.joins().keySet());
+            for (var vertex : sourceVertices.values()) needed.add(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()));
+            staged = new StartModels(needed.isEmpty() ? Map.of() : modelRecords.latestMany(pipelineId, needed));
+        }
         // The pipeline takes its own copy of what discovery found for each table it reads, before anything
         // downstream is worked out from it. Reading the discovery directly instead would let a
         // re-discovery change the shape of this run's input while the run is already using it.
-        List<String> derivedSteps = new ArrayList<>(copySourceSchemas(pipelineId, sourceVertices));
+        var copy = staged == null ? sourceSchemaCopy : new SourceSchemaCopy(staged);
+        List<String> derivedSteps = new ArrayList<>(copySourceSchemas(pipelineId, sourceVertices, copy));
         Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
         Set<String> stepIds = stepIds(pipeline);
@@ -741,12 +748,16 @@ final class StoreBackedDagSource implements DagSource {
         // twice would mean two answers to the same question with nothing comparing them.
         Map<String, CompiledJoin> compiledJoins =
                 operators == null ? compiledJoins(pipeline,sourceTablesByName(sourceVertices)) : operators.joins();
+        var drift = staged == null ? joinSchemaDrift : new JoinSchemaDrift(staged);
+        var stepRecorder = staged == null ? stepSchemaRecord : new StepSchemaRecord(staged);
+        var assemblyRecords = staged == null ? modelRecords : staged;
+        Function<SourceVertex, NodeColumns> sourceColumns = vertex -> copiedColumns(pipelineId, vertex, assemblyRecords);
         // Held to the columns it was last recorded producing, before anything is built out of them. A
         // join's output columns follow from the SELECT and from what the sources say their columns are,
         // so the same pipeline can start one day producing a differently shaped row than the day before
         // - and every write of that row succeeds, which is why the difference has to be caught here or
         // not at all.
-        compiledJoins.forEach((stepId, compiled) -> joinSchemaDrift.checkAndRecord(
+        compiledJoins.forEach((stepId, compiled) -> drift.checkAndRecord(
                 pipelineId, stepId, compiled.body(), compiled.plan(), compiled.tables()));
         // What this run will be holding on to, written down now that every step's shape is recorded and
         // the gate above has let the start through. Nothing re-reads a derived schema once the job is
@@ -760,8 +771,9 @@ final class StoreBackedDagSource implements DagSource {
         // was never derived from a step that could not be described.
         derivedSteps.addAll(recordStepSchemas(pipelineId,
                 deriveSteps(pipeline, sourceVertices, sourceKeyByTable, sourceKeysById, stepIds,
-                        compiledJoins, vertex -> copiedColumns(pipelineId, vertex))));
-        pinWhatThisRunHolds(pipelineId, derivedSteps);
+                        compiledJoins, sourceColumns), stepRecorder));
+        if (staged == null) pinWhatThisRunHolds(pipelineId, derivedSteps);
+        else modelRecords.recordAndPinMany(pipelineId, staged.changes);
         // A nest or a join emits under the id of the step that produced it rather than under a table name,
         // so the resolution above - which answers per source table - says nothing about it. Registering it
         // here is what lets the sink key its upsert and name the table it writes; without it the sink falls
@@ -771,10 +783,10 @@ final class StoreBackedDagSource implements DagSource {
         TerminalTargets serving = terminalTargets(pipelineId, pipeline,
                 pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null && !serve.sync().isEmpty()
                         ? serve.from() : null,
-                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+                bySourceTable, assembled, sourceVertices, sourceColumns);
         TerminalTargets viewing = terminalTargets(pipelineId, pipeline,
                 pipeline.view() instanceof ViewBlock.Inline view ? FromClause.list(view.from()) : null,
-                bySourceTable, assembled, sourceVertices, vertex -> copiedColumns(pipelineId, vertex));
+                bySourceTable, assembled, sourceVertices, sourceColumns);
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serving.streams());
         Map<String, TargetTable> targets = serving.targets();
         Map<String, TargetTable> viewTargets = viewing.targets();
@@ -1125,13 +1137,17 @@ final class StoreBackedDagSource implements DagSource {
      * undiscovered source is allowed, and a start that actually needs the model refuses by name before it
      * binds anything.
      */
-    private List<String> copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices) {
+    private List<String> copySourceSchemas(String pipelineId, Map<String, SourceVertex> sourceVertices, SourceSchemaCopy copy) {
         List<String> copied = new ArrayList<>();
+        var discoveredBySource = new LinkedHashMap<String, Map<String, SourceTable>>();
         for (SourceVertex vertex : sourceVertices.values()) {
-            SourceResource source = StoredArtifacts.requireSource(artifacts(), vertex.sourceId());
-            SourceModel discovered = modelInputs.apply(source);
-            if (sourceSchemaCopy.copy(pipelineId, vertex.sourceId(), vertex.table(),
-                    discovered == null ? null : discoveredTable(discovered, vertex.table()))) {
+            var tables = discoveredBySource.computeIfAbsent(vertex.sourceId(), id -> {
+                SourceModel discovered = modelInputs.apply(StoredArtifacts.requireSource(artifacts(), id));
+                var byName = new LinkedHashMap<String, SourceTable>();
+                if (discovered != null) discovered.tables().forEach(table -> byName.putIfAbsent(table.name(), table));
+                return byName;
+            });
+            if (copy.copy(pipelineId, vertex.sourceId(), vertex.table(), tables.get(vertex.table()))) {
                 copied.add(SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()));
             }
         }
@@ -1773,9 +1789,13 @@ final class StoreBackedDagSource implements DagSource {
      * the walk because the read face runs the same walk and must write nothing.
      */
     private List<String> recordStepSchemas(String pipelineId, StepDerivations derived) {
+        return recordStepSchemas(pipelineId, derived, stepSchemaRecord);
+    }
+
+    private List<String> recordStepSchemas(String pipelineId, StepDerivations derived, StepSchemaRecord recorder) {
         List<String> recorded = new ArrayList<>();
         derived.recordable().forEach((nodeId, node) -> {
-            if (stepSchemaRecord.record(pipelineId, nodeId, derived.columns().get(nodeId),
+            if (recorder.record(pipelineId, nodeId, derived.columns().get(nodeId),
                     node.inputs(), node.authored(), node.carried())) {
                 recorded.add(nodeId);
             }
@@ -1832,10 +1852,39 @@ final class StoreBackedDagSource implements DagSource {
 
     /** This pipeline's own copy of one source table's model, as a node's columns. */
     private NodeColumns copiedColumns(String pipelineId, SourceVertex vertex) {
-        return modelRecords
+        return copiedColumns(pipelineId, vertex, modelRecords);
+    }
+
+    private NodeColumns copiedColumns(String pipelineId, SourceVertex vertex, io.tapstate.spi.store.DerivedSchemaStore records) {
+        return records
                 .latest(pipelineId, SourceSchemaCopy.nodeId(vertex.sourceId(), vertex.table()))
                 .map(recorded -> NodeColumns.known(recorded.schema()))
                 .orElse(null);
+    }
+
+    /** Holds one assembly's derivations until the original claim can record and pin them. */
+    private static final class StartModels implements io.tapstate.spi.store.DerivedSchemaStore {
+        private final Map<String, io.tapstate.spi.store.DerivedSchema> values;
+        private final List<Change> changes = new ArrayList<>();
+
+        StartModels(Map<String, io.tapstate.spi.store.DerivedSchema> captured) {
+            values = new LinkedHashMap<>(captured);
+        }
+
+        @Override public Optional<io.tapstate.spi.store.DerivedSchema> latest(String pipeline, String step) {
+            return Optional.ofNullable(values.get(step));
+        }
+        @Override public void record(String pipeline, String step, Map<String, String> columns,
+                String statement, String from, String by) {
+            var previous = values.get(step);
+            var selected = previous != null && previous.schema().equals(columns) ? previous.schema() : columns;
+            var model = new io.tapstate.spi.store.DerivedSchema(0, selected, statement, from, by);
+            values.put(step, model);
+            changes.add(new Change(step, model));
+        }
+        @Override public void pin(String pipeline, String step, long version) { throw new UnsupportedOperationException(); }
+        @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String pipeline, String step) { throw new UnsupportedOperationException(); }
+        @Override public void delete(String pipeline) { throw new UnsupportedOperationException(); }
     }
 
     /**

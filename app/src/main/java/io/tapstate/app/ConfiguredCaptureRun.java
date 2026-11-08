@@ -104,6 +104,13 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
     }
 
     /** Current discovery cannot grant a source policy without the original configuration and artifact. */
+    SourceModelComparison preparedModelComparison(CaptureConfig config, RequiredNoteStore notes,
+            ConnectorProvisioner provisioner, Runnable requireRun) {
+        if (startupArtifact == null) return modelComparison(config, notes, provisioner, requireRun);
+        requireRun.run();
+        return PdkSourceModelComparison.forVerifiedArtifact(connectorId, startupArtifact);
+    }
+
     SourceModelComparison modelComparison(CaptureConfig config, RequiredNoteStore notes,
             ConnectorProvisioner provisioner, Runnable requireRun) {
         requireRun.run();

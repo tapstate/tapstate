@@ -71,6 +71,15 @@ public interface DerivedSchemaStore {
         }
     }
 
+    /** Records the run's derivations and pins the versions just recorded. */
+    default void recordAndPinMany(String pipelineId, List<Change> changes) {
+        recordMany(pipelineId, changes);
+        for (Change change : changes)
+            latest(pipelineId, change.stepId()).ifPresent(value -> pin(pipelineId, change.stepId(), value.version()));
+    }
+
+    default boolean supportsStartupBatch() { return false; }
+
     /**
      * Notes which version of a step's history a run is holding on to. Written by the assembly a run is
      * built from, once per step, and overwritten by the next assembly of the same pipeline.

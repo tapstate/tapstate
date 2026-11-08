@@ -67,7 +67,10 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
                 java.util.Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
     }
     @Override public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
-        var held = progress(member);
+        return confirmedPosition(progress(member));
+    }
+
+    private Optional<ChainPosition> confirmedPosition(io.tapstate.spi.store.SrsConsumerProgress held) {
         return Optional.ofNullable(held.cursor().sinkAckedByTable().get(table))
                 .filter(position -> position.order().epoch() > 0 && position.order().seq() >= 0 && position.order().seq() < Long.MAX_VALUE);
     }
@@ -77,8 +80,17 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
         return held;
     }
     @Override public OptionalLong recoverySequence(HazelcastInstance member) {
-        var held = progress(member); var floor = held.ringDoneThrough().get(table);
+        return recoverySequence(progress(member));
+    }
+
+    private OptionalLong recoverySequence(io.tapstate.spi.store.SrsConsumerProgress held) {
+        var floor = held.ringDoneThrough().get(table);
         if (floor == null) throw ScopedSrsConsumerAccess.refused(run);
         return OptionalLong.of(floor);
+    }
+
+    @Override public RecoveryProgress recoveryProgress(HazelcastInstance member) {
+        var held = progress(member);
+        return new RecoveryProgress(recoverySequence(held), confirmedPosition(held));
     }
 }

@@ -158,12 +158,24 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         Document existing = scopes.find(session, byScope(owner)).first();
         if (existing == null) {
             refuseRetainedFacts(session, owner);
-            existing = new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
-                    .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
-                    .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
+            existing = newScope(owner);
             scopes.insertOne(session, existing);
         }
         return scopeOf(owner, existing);
+    }
+
+    private static Document newScope(RequiredNoteOwner owner) {
+        return new Document("_id", scopeId(owner)).append("ownerKind", owner.kind().name())
+                .append("ownerId", owner.ownerId()).append("generation", 1L).append("writeFence", 0L)
+                .append("outgoingCarries", 0L).append("incomingCarries", 0L).append("originGeneration", 0L);
+    }
+
+    void reserveSharedCapture(ClientSession session, RequiredNoteOwner owner, boolean known) {
+        inspectSharedOrigin(session, owner, known);
+        if (!known) {
+            cipherForWrite(session);
+            scopes.insertOne(session, newScope(owner));
+        }
     }
 
     /** CONFIG authoring may preserve or reserve a name, but this method never exposes its old values or origin. */

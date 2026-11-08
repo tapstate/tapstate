@@ -65,6 +65,15 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
     }
 
     @Override public void recordMany(String pipelineId, List<Change> changes) {
+        recordMany(pipelineId, changes, false);
+    }
+
+    @Override public void recordAndPinMany(String pipelineId, List<Change> changes) {
+        access.requireModelPin();
+        recordMany(pipelineId, changes, true);
+    }
+
+    private void recordMany(String pipelineId, List<Change> changes, boolean pinLatest) {
         var batch = new ArrayList<Change>();
         long bytes = 0;
         for (Change change : List.copyOf(changes)) {
@@ -73,17 +82,17 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
             validateChange(pipelineId, key, value);
             long size = bytes(MongoDerivedSchemaStore.toDocument(value)) + 4L * key.length();
             if (!batch.isEmpty() && (batch.size() >= 64 || bytes + size > 4 * 1024 * 1024)) {
-                writeBatch(pipelineId, batch);
+                writeBatch(pipelineId, batch, pinLatest);
                 batch.clear();
                 bytes = 0;
             }
             batch.add(change);
             bytes += size;
         }
-        if (!batch.isEmpty()) writeBatch(pipelineId, batch);
+        if (!batch.isEmpty()) writeBatch(pipelineId, batch, pinLatest);
     }
 
-    private void writeBatch(String pipelineId, List<Change> batch) {
+    private void writeBatch(String pipelineId, List<Change> batch, boolean pinLatest) {
         access.publicationModelsTransaction(session -> {
             // A non-simple collection can resolve a key to an alias. Keep its original point semantics.
             var collection = access.database.listCollections()
@@ -93,7 +102,7 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
                 for (var change : batch) {
                     String key = key(pipelineId, change.stepId());
                     var updated = applyChange(read(session, key), change.derivation());
-                    write(session, key, updated.versions(), updated.pin());
+                    write(session, key, updated.versions(), selectedPin(updated, pinLatest));
                 }
                 return null;
             }
@@ -110,18 +119,23 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
                     var changes = pending.remove(key);
                     if (changes == null) throw unreadable();
                     var updated = applyChanges(decode(key, row), changes);
-                    var replacement = document(key, updated.versions(), updated.pin());
+                    var replacement = document(key, updated.versions(), selectedPin(updated, pinLatest));
                     writeBytes = addWrite(session, writes, writeBytes, key, replacement);
                 }
             }
             for (var entry : pending.entrySet()) {
                 var updated = applyChanges(null, entry.getValue());
                 writeBytes = addWrite(session, writes, writeBytes, entry.getKey(),
-                        document(entry.getKey(), updated.versions(), updated.pin()));
+                        document(entry.getKey(), updated.versions(), selectedPin(updated, pinLatest)));
             }
             if (!writes.isEmpty()) rows.bulkWrite(session, writes);
             return null;
         });
+    }
+
+    private static Long selectedPin(Stored updated, boolean pinLatest) {
+        if (pinLatest) return updated.versions().getLast().version();
+        return updated.pin();
     }
 
     private long addWrite(ClientSession session, List<ReplaceOneModel<Document>> writes, long used,

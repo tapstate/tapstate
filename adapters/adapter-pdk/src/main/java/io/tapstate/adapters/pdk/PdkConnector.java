@@ -146,16 +146,22 @@ final class PdkConnector implements AutoCloseable {
     static PdkConnector open(String connectorId, ConnectorRef ref, Map<String, Object> settings,
                              PipelineNode node, KeyedStateStore stateStore, SharedNotes notes,
                              ConnectorNoteScopes noteScopes, PipelineNode.Purpose purpose) {
-        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false);
+        return open(connectorId, ref, settings, node, stateStore, notes, noteScopes, purpose, false, null);
     }
 
     static PdkConnector openDefaultTest(String connectorId, ConnectorRef ref, Map<String,Object> settings) {
-        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true);
+        return open(connectorId, ref, settings, null, null, null, null, PipelineNode.Purpose.CAPTURE, true, null);
+    }
+
+    static PdkConnector openSink(String connectorId, ConnectorRef ref, Map<String, Object> settings,
+            PipelineNode node, KeyedStateStore stateStore, ConnectorNoteScopes scopes,
+            PipelineNode.Purpose purpose, SharedSinkConnectors.NoteIdentity verified) {
+        return open(connectorId, ref, settings, node, stateStore, null, scopes, purpose, false, verified);
     }
 
     private static PdkConnector open(String connectorId, ConnectorRef ref, Map<String,Object> settings,
             PipelineNode node, KeyedStateStore stateStore, SharedNotes notes, ConnectorNoteScopes noteScopes,
-            PipelineNode.Purpose purpose, boolean strictDefaultTest) {
+            PipelineNode.Purpose purpose, boolean strictDefaultTest, SharedSinkConnectors.NoteIdentity verified) {
         java.util.Objects.requireNonNull(purpose, "purpose");
         if (notes != null && purpose != PipelineNode.Purpose.CAPTURE) {
             throw new IllegalArgumentException("shared notes require capture purpose");
@@ -202,7 +208,8 @@ final class PdkConnector implements AutoCloseable {
             }
             var earlier = blocked ? List.<io.tapstate.spi.store.RequiredNoteScope>of()
                     : prepared.stream().map(RequiredNoteCarry::source).toList();
-            var origin = startup != null ? startup.origin() : captured.store().origin(primary);
+            var origin = verified != null && verified.primary().equals(primary) ? verified.origin()
+                    : startup != null ? startup.origin() : captured.store().origin(primary);
             var requestedOrigin = ConnectorNoteOrigin.capture(connectorId, ref.contentHash(), settings);
             if (!origin.equals(requestedOrigin)) {
                 throw new TapstateException(io.tapstate.spi.store.IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);

@@ -59,6 +59,20 @@ class MongoCacheDerivedSchemaStoreIT {
     }
     private static void record(DerivedSchemaStore store, String type) { store.record("orders", "source.orders", columns(type), "statement", "sources", "derivation"); }
 
+    @Test void aStartupBatchPinsTheVersionsItRecords() {
+        withFixture(f -> {
+            var store = f.writer();
+            record(store, "text");
+            store.recordAndPinMany("orders", List.of(
+                    new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(0, columns("bigint"), "statement", "sources", "derivation")),
+                    new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(0, columns("text"), "statement", "sources", "derivation"))));
+            assertThat(store.pinned("orders", "source.orders")).hasValueSatisfying(pin -> assertThat(pin.version()).isEqualTo(1));
+            assertThat(store.pinned("orders", "source.customers")).hasValueSatisfying(pin -> assertThat(pin.version()).isZero());
+            record(store, "text");
+            assertThat(store.pinned("orders", "source.orders")).hasValueSatisfying(pin -> assertThat(pin.schema()).isEqualTo(columns("bigint")));
+        });
+    }
+
     @Test void aWideModelReadUsesOneOriginalMetadataTransactionAndOneExactKeyQuery() {
         withFixture(f -> {
             var steps = java.util.stream.IntStream.range(0,12).mapToObj(i -> "source.table-"+i).collect(java.util.stream.Collectors.toSet());

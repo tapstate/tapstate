@@ -52,9 +52,20 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
     @Override
     public SinkWriter getEx() throws Exception {return forWriter(0,0);}
     @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception {
+        return open((member, local) -> delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
+                ? indexed.forWriter(member, local) : delegate.get(), memberIndex, localIndex);
+    }
+
+    @Override public Opening opening() {
+        Opening batch = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
+                ? indexed.opening() : (member, local) -> delegate.get();
+        return (member, local) -> open(batch, member, local);
+    }
+
+    private SinkWriter open(Opening opening, int memberIndex, int localIndex) throws Exception {
         ExecutionAuthorization authorization = ExecutionAuthorization.local();
         authorization.require(fence);
-        SinkWriter opened = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):delegate.get();
+        SinkWriter opened = opening.open(memberIndex, localIndex);
         try {
             authorization.require(fence);
             return guarded(opened, fence, authorization);
@@ -83,6 +94,7 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
             return writers.getEx();
         }
         @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception{return writers.forWriter(memberIndex,localIndex);}
+        @Override public Opening opening() { return writers.opening(); }
 
         @Override
         public void prepareTargets(HazelcastInstance coordinator) {

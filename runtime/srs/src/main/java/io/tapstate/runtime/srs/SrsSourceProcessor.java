@@ -205,13 +205,14 @@ public final class SrsSourceProcessor extends AbstractProcessor implements Stage
             Ringbuffer<SrsItem> rb = context.hazelcastInstance().getRingbuffer(ringName);
             ring = new SrsRingbuffer(rb);
             cursor = ringTail.publisherFactory().resolve(context.hazelcastInstance());
-            var recovery = ringTail.publisherFactory().recoverySequence(context.hazelcastInstance());
+            var progress = ringTail.publisherFactory().recoveryProgress(context.hazelcastInstance());
+            var recovery = progress.sequence();
             recoveryAfter = ringTail.resumeAfter();
             if (recovery.isPresent()) recoveryAfter = recovery.getAsLong();
             if (recovery.isPresent() && ringTail.resumeAfter() != null && recovery.getAsLong() < ringTail.resumeAfter())
                 throw new TapstateException(CaptureError.RECOVERY_LOG_GAP,Map.of("ring",ringName,"sequence",recovery.getAsLong(),
                         "reason","the original saved recovery floor moved backwards"),null);
-            confirmed = ringTail.publisherFactory().confirmedPosition(context.hazelcastInstance()).orElse(null);
+            confirmed = progress.confirmed().orElse(null);
         }
         Object observer = context.hazelcastInstance().getUserContext().get(SourceInitialLoadObserver.USER_CONTEXT_KEY);
         if (observer instanceof SourceInitialLoadObserver receipt) {
