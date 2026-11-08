@@ -104,6 +104,93 @@ final class MongoCachePipelineAccess {
         });
     }
 
+    /**
+     * A write under an already proved lease: one transaction holding the claim compare-and-set, the caller's
+     * own conditions and the action, with no admission, structure, state or inventory decoding. The
+     * compare-and-set is a real write to the claim document, so a takeover committing concurrently either
+     * conflicts with this transaction or leaves it matching nothing. The pipeline state's runtime write fence
+     * is not advanced: every ownership change it would catch also rewrites the claim document. Any failure,
+     * including a refused claim, propagates unchanged; the caller decides the lease is lost.
+     */
+    <T> T leasedWrite(LeasedClock committed, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    T written = session.withTransaction(() -> {
+                        requireActive.run();
+                        if (original == null || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
+                                new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
+                        T result = action.apply(session);
+                        requireActive.run();
+                        return result;
+                    }, TRANSACTION);
+                    committed.observe(session);
+                    return written;
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+        });
+    }
+
+    /**
+     * A read under an already proved lease: no transaction and no preamble, read concern {@code majority}
+     * (set by the caller on the collection), in a causally consistent session that starts no earlier than
+     * {@code after}, the last write this store committed.
+     */
+    <T> T leasedRead(LeasedClock after, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().causallyConsistent(true).build())) {
+                after.advance(session);
+                T result = action.apply(session);
+                requireActive.run();
+                return result;
+            }
+        });
+    }
+
+    /**
+     * The claim liveness half of a lease proof, inside the proof's transaction: the original claim is live
+     * and prepared under this scope. Answers how long its lease still runs on the store's own clock, in
+     * milliseconds, so the caller can count it down on its monotonic clock without reading a deadline.
+     */
+    long proveLease(ClientSession session) {
+        if (original == null) throw fenced();
+        MongoCacheWorkloadClaimStore.requireCollection(database);
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        Document row = table.find(session, liveClaim()).first();
+        if (row == null) throw claimFenced();
+        new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+        Document remaining = table.find(session, new Document("_id", row.get("_id")))
+                .projection(new Document("_id", 0).append("remaining", new Document("$subtract", List.of("$leaseUntil", "$$NOW")))).first();
+        if (remaining == null || !(remaining.get("remaining") instanceof Number millis)) throw claimFenced();
+        return Math.max(0L, millis.longValue());
+    }
+
+    private Document liveClaim() {
+        return WorkloadClaimDocuments.live(original)
+                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+    }
+
+    /** The latest operation a store committed, so its next out-of-transaction read observes it. */
+    static final class LeasedClock {
+        private org.bson.BsonDocument clusterTime;
+        private org.bson.BsonTimestamp operationTime;
+
+        synchronized void observe(ClientSession session) {
+            var cluster = session.getClusterTime(); var operation = session.getOperationTime();
+            if (cluster != null && (clusterTime == null || timestamp(cluster).compareTo(timestamp(clusterTime)) > 0)) clusterTime = cluster;
+            if (operation != null && (operationTime == null || operation.compareTo(operationTime) > 0)) operationTime = operation;
+        }
+
+        synchronized void advance(ClientSession session) {
+            if (clusterTime != null) session.advanceClusterTime(clusterTime);
+            if (operationTime != null) session.advanceOperationTime(operationTime);
+        }
+
+        private static org.bson.BsonTimestamp timestamp(org.bson.BsonDocument cluster) { return cluster.getTimestamp("clusterTime"); }
+    }
+
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
         return metadataTransaction(table, database, mutation, action);
     }

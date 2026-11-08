@@ -5,6 +5,7 @@ import io.tapstate.runtime.engine.OperatorMapBinding;
 import io.tapstate.runtime.engine.OperatorMapBindings;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.LeasedStateStore;
 import io.tapstate.spi.store.PipelineStoreViews;
 import java.util.Map;
 import java.util.Objects;
@@ -20,6 +21,9 @@ final class ScopedOperatorStateProvider implements OperatorMapBindings.Provider 
         if (!(original.executionIdentity() instanceof ExecutionFence fence) || fence.scope() == null
                 || !original.placement().scope().equals(fence.scope()) || !original.executionKey().equals(fence.operatorExecutionKey())) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
         requireBindingActive.run(); var claim = authorization.require(fence);
-        return stores.operatorState(original.placement(), claim, () -> { requireBindingActive.run(); authorization.require(fence); });
+        var store = stores.operatorState(original.placement(), claim, () -> { requireBindingActive.run(); authorization.require(fence); });
+        // A store that validates once per lease loses that lease with this member's claim reading.
+        if (store instanceof LeasedStateStore leased) authorization.holdLease(fence, leased);
+        return store;
     }
 }
