@@ -204,7 +204,16 @@ public final class NestInspector {
                             lookup.alias(), namespace);
             map.ifPresent(name -> {
                 IMap<Object, Map<String, Object>> rows = member.getMap(name);
-                resolved.put(namespace, new LinkedHashMap<>(rows.getAll(new LinkedHashSet<>(keys))));
+                // One key at a time: this is a person reading one document, and a key-set read is kept to
+                // the store that resolves references while documents are assembled.
+                Map<Object, Map<String, Object>> found = new LinkedHashMap<>();
+                for (Object key : new LinkedHashSet<>(keys)) {
+                    Map<String, Object> row = rows.get(key);
+                    if (row != null) {
+                        found.put(key, row);
+                    }
+                }
+                resolved.put(namespace, found);
             });
         });
         return resolved;
