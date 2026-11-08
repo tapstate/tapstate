@@ -341,6 +341,14 @@ interface ControlPlaneClient extends AutoCloseable {
     }
 
     /**
+     * Reads what nest step {@code step} of {@code pipelineId} compiles to, and what a sample of its sources warns
+     * about, via {@code GET {baseUrl}/api/pipelines/{pipelineId}/nest/{step}/explain}. Never throws.
+     */
+    default NestExplainOutcome nestExplain(URI baseUrl, String credential, String pipelineId, String step) {
+        return new NestExplainOutcome.Unreachable();
+    }
+
+    /**
      * Reads what a pipeline's join steps derive their output columns to be via
      * {@code GET {baseUrl}/api/pipelines/{pipelineId}/derived-schema}, authenticated by the bearer
      * {@code credential}: one report per derived step on success (empty for a pipeline with no join), a

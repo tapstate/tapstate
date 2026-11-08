@@ -6,8 +6,8 @@ target: https://tapstate.dev/docs/nest/semantics
 
 # What a nest view is, and how to read one
 
-This page is the reference for what a `nest` step promises, in plain words, and for the two commands that
-show you what one is doing. Read it once before running a nest on your own data; come back to it when a
+This page is the reference for what a `nest` step promises, in plain words, and for the three commands that
+show you what one will do and is doing. Read it once before running a nest on your own data; come back to it when a
 document looks wrong.
 
 ## What a view is
@@ -87,6 +87,49 @@ with a code that names the key and the limit, so you can tell a data problem fro
 | `nest.pending-limit-exceeded` | changes held for a parent that has not arrived | parents are very late, or a reference is broken for good |
 | `nest.tombstone-limit-exceeded` | records of deletions kept in one document | the resume position is not advancing; find what holds it back |
 | `nest.flat-cardinality-violation` | live rows matched by a `flat` embed | the relationship is one-to-many; use `as: array` |
+
+## Before it runs: `explain` on a nest step
+
+```text
+tapstate explain <pipeline> <step>
+```
+
+Compiles the step as a start would and prints what compiling it decided, then reads a small sample of
+each table it embeds (200 rows and the table's row count, through the same read-only probes the data
+browser uses) and warns about the shapes that would fail the run later. It writes nothing and needs no
+running pipeline.
+
+```text
+order_doc  step order_doc  root o  key id
+  at most 20000 elements per document
+  build: not available: this version has no build phase, so the whole load runs through change assembly, one row at a time
+  embeds:
+    items  from i  as array  owned, gathered: each row names its one parent  on order_id = parent id
+      sample: shop.order_items, 1000 rows; at most 4 under one parent in 200 rows read; about 3.3 per document
+    customer  from c  as object  shared, referenced: the parent names the row, at most 100000 documents per row  on id = parent customer_id
+      sample: shop.customers, 40 rows; at most 9 parents on one row in 200 rows read; about 7.5 documents per row
+  warnings: none from the sample
+```
+
+- **owned / shared** - whether each row belongs to the one document it names, or is a row many documents
+  point at. The direction (gathered or referenced, above) is the one the compiler resolved from `on:`.
+- **at most ... per document / per row** - the limits the run will be failed at, as this deployment and the
+  nest's own `max_elements_per_document` set them.
+- **sample** - where the embed was read from and what the sample counted. A table the data browser cannot
+  read, an alias that names an upstream step or a pattern, or a table more than one source could hold, prints
+  `not sampled` with the reason; qualify an ambiguous table as `source.table` in `from:`.
+
+A sample is a sample: no warning means the 200 rows read raised none, not that none can happen. The
+warnings, each naming the embed, the count it was estimated from and what to change:
+
+| Warning | Raised when |
+|---|---|
+| `monitor.nest-object-key-not-unique` | an `object` or `flat` embed matched more than one sampled row under one parent |
+| `monitor.nest-near-element-limit` | an `array` embed is estimated at 80% or more of the per-document element limit |
+| `monitor.nest-reference-widely-shared` | one shared row is estimated to be pointed at by 80% or more of the per-row limit |
+
+An estimate is the larger of the most found under one parent in the sample and the average from the two
+tables' row counts.
 
 ## Reading what a step is doing: `nest progress`
 

@@ -14,6 +14,7 @@ import io.tapstate.core.dsl.PipelineInputs;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
+import io.tapstate.core.lifecycle.NestTree;
 import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
@@ -55,6 +56,7 @@ import io.tapstate.runtime.engine.nest.NestStateLedger;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
+import io.tapstate.runtime.engine.nest.NestExplainer;
 import io.tapstate.runtime.srs.CaptureRunUnit;
 import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.runtime.srs.SrsSourceProcessor;
@@ -3046,12 +3048,30 @@ final class StoreBackedDagSource implements DagSource {
      * resumed.
      */
     /**
-     * The numbers this pipeline's nests are held to, and the maps they apply to. Compiled here from the
-     * same tree the topology and the teardown names come from, so a budget cannot end up on a namespace no
-     * vertex writes to while the ones that are written to run on the deployment's number.
+     * The compiled tree of one nest step, built as a start builds it: the pipeline inlined, and each alias
+     * resolved to the table behind it.
      */
     @Override
     public Optional<NestTopology> nestTopology(String pipelineId, String stepId) {
+        return compiledNest(pipelineId, stepId).map(CompiledNest::topology);
+    }
+
+    /**
+     * What one nest step compiles to, with what compiling it inferred and the limits it will run under -
+     * the same settings a start hands its vertices - for a read made before the pipeline runs.
+     */
+    @Override
+    public Optional<NestTree> nestTree(String pipelineId, String stepId) {
+        return compiledNest(pipelineId, stepId).map(compiled -> NestExplainer.tree(pipelineId, stepId,
+                compiled.nest(), compiled.topology(),
+                PipelineDagBuilder.nestSettings(compiled.pipeline(), compiled.byAlias()::get, nestSettings)));
+    }
+
+    private record CompiledNest(PipelineResource pipeline, TransformBody.Nest nest, Map<String, NestTable> byAlias,
+            NestTopology topology) {
+    }
+
+    private Optional<CompiledNest> compiledNest(String pipelineId, String stepId) {
         PipelineResource pipeline = PipelineInlining.inline(
                 StoredArtifacts.requirePipeline(artifacts(), pipelineId), artifacts());
         if (pipeline.transforms() == null) {
@@ -3062,12 +3082,18 @@ final class StoreBackedDagSource implements DagSource {
                     && inline.body() instanceof TransformBody.Nest nest) {
                 Map<String, NestTable> byAlias =
                         nestTablesByAlias(pipeline, sourceTablesByName(sourceVertices(pipeline)));
-                return Optional.of(NestTopology.compile(pipeline.id(), stepId, nest, byAlias::get));
+                return Optional.of(new CompiledNest(pipeline, nest, byAlias,
+                        NestTopology.compile(pipeline.id(), stepId, nest, byAlias::get)));
             }
         }
         return Optional.empty();
     }
 
+    /**
+     * The numbers this pipeline's nests are held to, and the maps they apply to. Compiled here from the
+     * same tree the topology and the teardown names come from, so a budget cannot end up on a namespace no
+     * vertex writes to while the ones that are written to run on the deployment's number.
+     */
     @Override
     public NestCapacity capacityOf(String pipelineId) {
         PipelineResource pipeline = StoredArtifacts.requirePipeline(artifacts(), pipelineId);

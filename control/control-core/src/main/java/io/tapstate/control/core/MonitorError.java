@@ -59,14 +59,42 @@ public enum MonitorError implements TapstateErrorCode {
      * Nothing is held under the root key given, read as a number or as text: {@code key} is the key as typed
      * and {@code columns} the root key's columns.
      */
-    NEST_ROOT_KEY_NOT_HELD("monitor.nest-root-key-not-held", Set.of("pipeline", "step", "key", "columns"));
+    NEST_ROOT_KEY_NOT_HELD("monitor.nest-root-key-not-held", Set.of("pipeline", "step", "key", "columns")),
+
+    /**
+     * A warning from sampling before a run: an {@code object} or {@code flat} embed matched {@code count}
+     * sampled rows of {@code table} under one parent, out of {@code sampled} rows read, so its rows are not
+     * one per parent.
+     */
+    NEST_OBJECT_KEY_NOT_UNIQUE("monitor.nest-object-key-not-unique", Set.of("embed", "table", "count", "sampled"),
+            Severity.WARNING),
+
+    /**
+     * A warning from sampling before a run: documents are estimated to hold {@code count} elements under
+     * {@code embed}, near the per-document {@code limit}.
+     */
+    NEST_NEAR_ELEMENT_LIMIT("monitor.nest-near-element-limit", Set.of("embed", "table", "count", "limit"),
+            Severity.WARNING),
+
+    /**
+     * A warning from sampling before a run: one row of {@code table} behind {@code embed} is estimated to be
+     * pointed at by {@code count} documents, near the per-row {@code limit}.
+     */
+    NEST_REFERENCE_WIDELY_SHARED("monitor.nest-reference-widely-shared", Set.of("embed", "table", "count", "limit"),
+            Severity.WARNING);
 
     private final String code;
     private final Set<String> placeholders;
+    private final Severity severity;
 
     MonitorError(String code, Set<String> placeholders) {
+        this(code, placeholders, Severity.ERROR);
+    }
+
+    MonitorError(String code, Set<String> placeholders, Severity severity) {
         this.code = code;
         this.placeholders = placeholders;
+        this.severity = severity;
     }
 
     @Override
@@ -76,7 +104,7 @@ public enum MonitorError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return Severity.ERROR;
+        return severity;
     }
 
     @Override

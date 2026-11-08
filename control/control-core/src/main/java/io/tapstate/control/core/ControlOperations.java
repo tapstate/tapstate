@@ -393,6 +393,13 @@ public final class ControlOperations {
     public static final Operation PIPELINE_NEST_INSPECT = new Operation(
             "pipeline.nest.inspect", Scope.READ, false, null, CLI_ONLY);
 
+    /**
+     * What one nest step compiles to, and what a sample of its sources says about the shapes it assumes.
+     * Reads a few rows of each table it embeds, through the data browser's own read-only probes.
+     */
+    public static final Operation PIPELINE_NEST_EXPLAIN = new Operation(
+            "pipeline.nest.explain", Scope.READ, false, null, CLI_ONLY);
+
     public static final Operation PIPELINE_POSITION = new Operation(
             "pipeline.position", Scope.READ, false, null, CLI_ONLY);
     public static final Operation PIPELINE_SET_POSITION = new Operation(
@@ -512,6 +519,7 @@ public final class ControlOperations {
             PIPELINE_EXPLAIN,
             PIPELINE_NEST_PROGRESS,
             PIPELINE_NEST_INSPECT,
+            PIPELINE_NEST_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

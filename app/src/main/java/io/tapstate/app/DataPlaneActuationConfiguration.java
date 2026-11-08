@@ -104,6 +104,13 @@ class DataPlaneActuationConfiguration {
         return new EngineNestStateInspector(engine, dagSource, hazelcastMember);
     }
 
+    /** What a nest step compiles to, for explaining it before it runs; a step that is not one is a defect here. */
+    @Bean
+    io.tapstate.control.core.NestTreeReader nestTreeReader(DagSource dags) {
+        return (pipelineId, step) -> dags.nestTree(pipelineId, step).orElseThrow(() -> new IllegalStateException(
+                "step " + step + " of " + pipelineId + " was checked to be a nest step but compiles to none"));
+    }
+
     /** The plans of the runs the cluster is executing, written by whichever member submits each. */
     @Bean
     HazelcastExecutionPlans executionPlans(HazelcastInstance hazelcastMember) {

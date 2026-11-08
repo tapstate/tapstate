@@ -171,6 +171,14 @@ interface DagSource {
         return Optional.empty();
     }
 
+    /**
+     * What nest step {@code stepId} of {@code pipelineId} compiles to, with what compiling it inferred and the
+     * limits it will run under; empty where the step is not a nest or this source compiles none.
+     */
+    default Optional<io.tapstate.core.lifecycle.NestTree> nestTree(String pipelineId, String stepId) {
+        return Optional.empty();
+    }
+
     /** A pipeline's nest settings, and the state map namespaces they apply to. */
     record NestCapacity(Map<String, String> mapDatabases, NestSettings settings) {
 

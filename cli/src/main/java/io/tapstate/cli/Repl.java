@@ -4032,6 +4032,9 @@ final class Repl {
     }
 
     private int explainOnline(List<String> words) {
+        if (words.size() == 3 && !words.get(2).isBlank() && !words.get(2).startsWith("-")) {
+            return nestExplainOnline(words.get(1), words.get(2));
+        }
         String id = readTargetId(words);
         if (id == null) {
             return Cli.EXIT_USAGE;
@@ -4483,6 +4486,114 @@ final class Repl {
             case NestInspectOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
             case NestInspectOutcome.Unreachable ignored -> reportRequestFailed();
         };
+    }
+
+    /**
+     * {@code explain <pipeline> <step>} on a nest step: the tree it compiles to - for each embed whether the
+     * document owns its rows or points at a shared one, which way the join resolved and the limit it runs
+     * under - whether its load can take the build path, what a sample of each table said, and the warnings
+     * that sample raised, each with what to change.
+     */
+    private int nestExplainOnline(String id, String step) {
+        NestExplainOutcome outcome = withFailover(() ->
+                controlPlane.nestExplain(session.landingNode(), session.credential(), id, step),
+                o -> o instanceof NestExplainOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case NestExplainOutcome.Found found -> {
+                renderNestExplain(out, found.view());
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case NestExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case NestExplainOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** What {@code explain <pipeline> <step>} prints for a nest step. */
+    static void renderNestExplain(PrintWriter out, Map<?, ?> view) {
+        Map<?, ?> tree = (Map<?, ?>) view.get("tree");
+        out.println(tree.get("pipelineId") + "  step " + tree.get("step") + "  root " + tree.get("rootAlias")
+                + "  key " + joined(tree.get("rootKey")));
+        out.println("  at most " + tree.get("elementLimit") + " elements per document");
+        out.println("  build: " + view.get("build"));
+        Map<String, Map<?, ?>> samples = new LinkedHashMap<>();
+        if (view.get("samples") instanceof List<?> list) {
+            for (Object entry : list) {
+                if (entry instanceof Map<?, ?> sample) {
+                    samples.put(sample.get("path") + "|" + sample.get("alias"), sample);
+                }
+            }
+        }
+        out.println("  embeds:");
+        if (tree.get("embeds") instanceof List<?> embeds && !embeds.isEmpty()) {
+            renderNestLevels(out, embeds, samples, "    ");
+        } else {
+            out.println("    none");
+        }
+        if (view.get("warnings") instanceof List<?> warnings && !warnings.isEmpty()) {
+            out.println("  warnings:");
+            for (Object entry : warnings) {
+                if (entry instanceof Map<?, ?> warning) {
+                    out.println("    " + warning.get("code") + "  " + warning.get("embed"));
+                    out.println("      " + warning.get("message"));
+                    if (warning.get("solution") != null) {
+                        out.println("      " + warning.get("solution"));
+                    }
+                }
+            }
+        } else {
+            out.println("  warnings: none from the sample");
+        }
+    }
+
+    private static void renderNestLevels(PrintWriter out, List<?> levels, Map<String, Map<?, ?>> samples,
+            String indent) {
+        for (Object entry : levels) {
+            if (!(entry instanceof Map<?, ?> level)) {
+                continue;
+            }
+            boolean owned = Boolean.TRUE.equals(level.get("owned"));
+            StringBuilder join = new StringBuilder();
+            if (level.get("on") instanceof Map<?, ?> on) {
+                for (Map.Entry<?, ?> pair : on.entrySet()) {
+                    join.append(join.isEmpty() ? "" : ", ").append(pair.getKey()).append(" = parent ")
+                            .append(pair.getValue());
+                }
+            }
+            out.println(indent + level.get("path") + "  from " + level.get("alias") + "  as " + level.get("as")
+                    + "  " + (owned ? "owned, gathered: each row names its one parent"
+                            : "shared, referenced: the parent names the row, at most " + level.get("referrerLimit")
+                                    + " documents per row")
+                    + (join.isEmpty() ? "" : "  on " + join));
+            Map<?, ?> sample = samples.get(level.get("path") + "|" + level.get("alias"));
+            if (sample != null) {
+                out.println(indent + "  sample: " + nestSampleLine(sample, owned));
+            }
+            if (level.get("children") instanceof List<?> children && !children.isEmpty()) {
+                renderNestLevels(out, children, samples, indent + "  ");
+            }
+        }
+    }
+
+    private static String nestSampleLine(Map<?, ?> sample, boolean owned) {
+        if (sample.get("notSampled") != null) {
+            return "not sampled: " + sample.get("notSampled");
+        }
+        String where = sample.get("source") + "." + sample.get("table") + ", "
+                + (sample.get("tableRows") == null ? "row count unknown" : sample.get("tableRows") + " rows");
+        String largest = owned
+                ? "at most " + sample.get("largestInSample") + " under one parent"
+                : "at most " + sample.get("largestInSample") + " parents on one row";
+        String average = !(sample.get("averagePerParent") instanceof Number mean) ? ""
+                : "; about " + String.format(Locale.ROOT, "%.1f", mean.doubleValue())
+                        + (owned ? " per document" : " documents per row");
+        return where + "; " + largest + " in " + sample.get("sampledRows") + " rows read" + average;
+    }
+
+    private static String joined(Object values) {
+        return values instanceof List<?> list
+                ? String.join(", ", list.stream().map(String::valueOf).toList()) : String.valueOf(values);
     }
 
     /**

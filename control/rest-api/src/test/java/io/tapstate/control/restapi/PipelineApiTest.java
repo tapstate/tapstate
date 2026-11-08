@@ -1458,7 +1458,7 @@ class PipelineApiTest {
                         "pipeline.resume",
                         "pipeline.status", "pipeline.metrics", "pipeline.snapshot", "pipeline.logs",
                         "pipeline.metrics.history", "pipeline.explain", "pipeline.nest.progress",
-                        "pipeline.nest.inspect",
+                        "pipeline.nest.inspect", "pipeline.nest.explain",
                         "pipeline.position", "pipeline.set-position",
                         "pipeline.derived-schema", "pipeline.accept-derived-schema");
 

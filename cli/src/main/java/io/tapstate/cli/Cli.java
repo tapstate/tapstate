@@ -167,6 +167,7 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.explain", "explain"),
             Map.entry("pipeline.nest.progress", "nest"),
             Map.entry("pipeline.nest.inspect", "nest"),
+            Map.entry("pipeline.nest.explain", "explain"),
             Map.entry("pipeline.position", "position"),
             Map.entry("pipeline.set-position", "position"),
             // Both on one verb, as the three token operations are: what a reader is doing is looking at

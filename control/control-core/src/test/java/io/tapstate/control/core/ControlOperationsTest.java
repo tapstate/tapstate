@@ -80,6 +80,7 @@ class ControlOperationsTest {
                         "pipeline.snapshot",
                         "pipeline.nest.progress",
                         "pipeline.nest.inspect",
+                        "pipeline.nest.explain",
                         "pipeline.logs",
                         "pipeline.metrics.history",
                         "pipeline.explain",
@@ -222,6 +223,7 @@ class ControlOperationsTest {
                 "pipeline.explain",
                 "pipeline.nest.progress",
                 "pipeline.nest.inspect",
+                "pipeline.nest.explain",
                 "pipeline.start-checks")) {
             assertThat(registry.resolve(id).audited()).as(id).isFalse();
         }
@@ -231,7 +233,7 @@ class ControlOperationsTest {
     void theRegistryOpensEveryUsableOperationOnCliAndKeepsTheRevealReservationClosed() {
         // The cluster context is REST-only. The reveal reservation stays unpublished until its
         // dedicated authorizer exists.
-        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(87);
+        assertThat(registry.exposedOn(Frontend.CLI)).hasSize(88);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
