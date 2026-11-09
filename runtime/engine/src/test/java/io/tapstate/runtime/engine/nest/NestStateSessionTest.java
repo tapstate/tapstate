@@ -137,6 +137,36 @@ class NestStateSessionTest {
     }
 
     @Test
+    void aGroupStagedPastItsBoundsIsSplitIntoGroupsThatFitAndNoValueIsSplit() {
+        var store = new Recording();
+        var session = new NestStateSession("assembler/0", name -> store, BOUNDS);
+        NestStore<String> state = session.view("state", 1 << 20);
+        NestStore<String> parking = session.view("parking", 1 << 20);
+        for (int i = 0; i < 7; i++) state.save("s" + i, "x".repeat(250));
+        parking.save("p", "y".repeat(250));
+        parking.remove("gone");
+        state.commit();
+        assertThat(store.commits).as("nine keys, at most four keys or 1,024 bytes a group").hasSizeGreaterThan(2);
+        Set<String> written = new LinkedHashSet<>();
+        for (var group : store.commits) {
+            long keys = 0, bytes = 0;
+            for (var part : group.values()) {
+                keys += part.writes().size() + part.removals().size();
+                for (byte[] value : part.writes().values()) bytes += value.length;
+            }
+            assertThat(keys).isLessThanOrEqualTo(BOUNDS.maxKeys());
+            assertThat(bytes).isLessThanOrEqualTo(BOUNDS.maxBytes());
+            group.forEach((namespace, part) -> {
+                part.writes().keySet().forEach(key -> assertThat(written.add(namespace + "/" + key)).as("written once").isTrue());
+                part.removals().forEach(key -> written.add(namespace + "/-" + key));
+            });
+        }
+        assertThat(written).hasSize(9);
+        assertThat(state.hasUncommitted()).isFalse();
+        assertThat(state.load("s6")).isEqualTo("x".repeat(250));
+    }
+
+    @Test
     void setsGrowAndShrinkThroughTheSession() {
         var store = new Recording();
         var session = new NestStateSession("lookup/0", name -> store, BOUNDS);

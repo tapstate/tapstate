@@ -181,8 +181,11 @@ public final class NestStateSession {
             if (namespace.values.hasStaged()) changes.put(namespace.name, namespace.changes());
         }
         try {
-            if (group != null) group.commit(changes);
-            else commitWithoutGroup(changes);
+            for (Map<String, StateGroup.Changes> part : split(changes, bounds)) {
+                if (group != null) group.commit(part);
+                else commitWithoutGroup(part);
+                COUNTERS.commits.increment();
+            }
         } catch (RuntimeException failure) {
             failed = failure;
             namespaces.values().forEach(Namespace::abandon);
@@ -192,9 +195,81 @@ public final class NestStateSession {
         }
         namespaces.values().forEach(Namespace::committed);
         namespaces.values().forEach(Namespace::publish);
-        COUNTERS.commits.increment();
         COUNTERS.keysCommitted.add(stagedKeys);
         resetGroup();
+    }
+
+    /**
+     * What was staged, as groups that each fit the bounds, in staging order. Staging can pass a bound inside one
+     * drain, because the bounds are only checked between drains; a group past them is split here rather than
+     * sent as one transaction too large for the store. A key's value is never split, and a value can never be
+     * over the byte bound alone, because one that is was refused when it was staged.
+     *
+     * <p>Splitting is safe because every value is written whole and carries the order it came from: if the
+     * member dies between two of the parts, the replay rewrites the first part's keys with the same bytes. The
+     * output that depends on the parts is still held until the last of them has committed.
+     */
+    static List<Map<String, StateGroup.Changes>> split(Map<String, StateGroup.Changes> changes, NestCommitBounds bounds) {
+        List<Map<String, StateGroup.Changes>> parts = new ArrayList<>();
+        Part current = new Part();
+        for (Map.Entry<String, StateGroup.Changes> entry : changes.entrySet()) {
+            String namespace = entry.getKey();
+            StateGroup.Changes all = entry.getValue();
+            for (Map.Entry<String, byte[]> write : all.writes().entrySet()) {
+                byte[] routing = all.releaseKeys().get(write.getKey());
+                long weight = write.getValue().length + (routing == null ? 0 : routing.length);
+                if (current.full(weight, bounds)) {
+                    parts.add(current.changes());
+                    current = new Part();
+                }
+                current.write(namespace, write.getKey(), write.getValue(), routing, weight);
+            }
+            for (String removed : all.removals()) {
+                if (current.full(0, bounds)) {
+                    parts.add(current.changes());
+                    current = new Part();
+                }
+                current.remove(namespace, removed);
+            }
+        }
+        if (current.keys > 0) parts.add(current.changes());
+        return parts;
+    }
+
+    /** One group being filled by {@link #split}. */
+    private static final class Part {
+        private final Map<String, Map<String, byte[]>> writes = new LinkedHashMap<>();
+        private final Map<String, Map<String, byte[]>> releases = new LinkedHashMap<>();
+        private final Map<String, Set<String>> removals = new LinkedHashMap<>();
+        private int keys;
+        private long bytes;
+
+        boolean full(long weight, NestCommitBounds bounds) {
+            return keys > 0 && (keys + 1 > bounds.maxKeys() || bytes + weight > bounds.maxBytes());
+        }
+
+        void write(String namespace, String key, byte[] value, byte[] routing, long weight) {
+            writes.computeIfAbsent(namespace, ignored -> new LinkedHashMap<>()).put(key, value);
+            if (routing != null) releases.computeIfAbsent(namespace, ignored -> new LinkedHashMap<>()).put(key, routing);
+            keys++;
+            bytes += weight;
+        }
+
+        void remove(String namespace, String key) {
+            removals.computeIfAbsent(namespace, ignored -> new LinkedHashSet<>()).add(key);
+            keys++;
+        }
+
+        Map<String, StateGroup.Changes> changes() {
+            Map<String, StateGroup.Changes> out = new LinkedHashMap<>();
+            Set<String> names = new LinkedHashSet<>(writes.keySet());
+            names.addAll(removals.keySet());
+            for (String name : names) {
+                out.put(name, new StateGroup.Changes(writes.getOrDefault(name, Map.of()),
+                        releases.getOrDefault(name, Map.of()), removals.getOrDefault(name, Set.of())));
+            }
+            return out;
+        }
     }
 
     private void resetGroup() {
