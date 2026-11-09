@@ -440,7 +440,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         forgetDeletionsReplayCannotReach();
         // Only after the documents above have gone out, for the usual reason: a bound offered ahead of what is
         // queued behind it would say it had left.
-        return !forgetHandOversThatHaveLanded() || bounds == null || (settled() && bounds.release(this::tryEmit));
+        return !forgetHandOversThatHaveLanded() || bounds == null || (bounds.release(this::behindGroup) && flush());
     }
 
     /**
@@ -850,7 +850,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (bounds == null) {
             return true;
         }
-        return (settled() && bounds.advance(ordinal, watermark, this::tryEmit));
+        return (bounds.advance(ordinal, watermark, this::behindGroup) && flush());
     }
 
     private void observeLookupSnapshots(int ordinal, Watermark watermark) {
@@ -911,7 +911,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return false;
         }
         snapshotWaiters = null;
-        return bounds == null || (settled() && bounds.release(this::tryEmit));
+        return bounds == null || (bounds.release(this::behindGroup) && flush());
     }
 
     /**
@@ -1695,7 +1695,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         writes.flush();
         if (!flush()) return false;
         // A bound follows the actual output; queued documents must never be overtaken.
-        return !letGo || bounds == null || (settled() && bounds.release(this::tryEmit));
+        return !letGo || bounds == null || (bounds.release(this::behindGroup) && flush());
     }
 
     private boolean sendWindow(Map.Entry<Object, Window> entry, Iterator<Map.Entry<Object, Window>> open,
@@ -1934,6 +1934,26 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (!(store.hasUncommitted() || (parking != null && parking.hasUncommitted()))) return true;
         if (!(store.commitDue() && (parking == null || parking.commitDue()))) return false;
         return commitState();
+    }
+
+    /**
+     * Queues a bound behind whatever is waiting to go out, so it leaves after them and only once the open
+     * commit group they belong to has committed. Forcing the group to commit at every bound would cut it
+     * to the handful of changes that arrived since the last one, and a change stream carries a bound with
+     * nearly every change. A bound still queued on the same axis is replaced rather than followed: the new
+     * one promises at least as much, and nothing queued after the old one would have left without it.
+     * Never refuses, so the bounds it is handed are never kept back to be offered again.
+     */
+    private boolean behindGroup(Watermark bound) {
+        for (java.util.Iterator<Object> queued = outgoing.descendingIterator(); queued.hasNext(); ) {
+            if (!(queued.next() instanceof Watermark earlier)) break;
+            if (earlier.key() == bound.key()) {
+                queued.remove();
+                break;
+            }
+        }
+        outgoing.add(bound);
+        return true;
     }
 
     /**

@@ -77,7 +77,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
     private final NestStore<Set<Object>> references;
     private final long referrersAllowed;
     private final LevelBounds bounds;
-    private final Queue<Object> outgoing = new ArrayDeque<>();
+    private final java.util.Deque<Object> outgoing = new ArrayDeque<>();
     private final Queue<FiledRow> filedRows = new ArrayDeque<>();
     // The highest position per chain among the rows this drain filed that woke nothing, folded as they are
     // met and said in one word when the drain ends. Kept across a drain that stopped early on a full
@@ -584,7 +584,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         if (!flush()) {
             return false;
         }
-        return (settled() && bounds.advance(ordinal, watermark, this::tryEmit));
+        return (bounds.advance(ordinal, watermark, this::behindGroup) && flush());
     }
 
     /**
@@ -617,6 +617,26 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         if (!(store.hasUncommitted() || (references != null && references.hasUncommitted()))) return true;
         if (!(store.commitDue() && (references == null || references.commitDue()))) return false;
         return commitState();
+    }
+
+    /**
+     * Queues a bound behind whatever is waiting to go out, so it leaves after them and only once the open
+     * commit group they belong to has committed. Forcing the group to commit at every bound would cut it
+     * to the handful of changes that arrived since the last one, and a change stream carries a bound with
+     * nearly every change. A bound still queued on the same axis is replaced rather than followed: the new
+     * one promises at least as much, and nothing queued after the old one would have left without it.
+     * Never refuses, so the bounds it is handed are never kept back to be offered again.
+     */
+    private boolean behindGroup(Watermark bound) {
+        for (java.util.Iterator<Object> queued = outgoing.descendingIterator(); queued.hasNext(); ) {
+            if (!(queued.next() instanceof Watermark earlier)) break;
+            if (earlier.key() == bound.key()) {
+                queued.remove();
+                break;
+            }
+        }
+        outgoing.add(bound);
+        return true;
     }
 
     /**
