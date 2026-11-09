@@ -23,7 +23,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * the proof, and the configured maximum. Within a lease, a fenced write is one transaction holding the claim
  * compare-and-set and its payload. Any failed fenced transaction ends that facet's lease; every chain change
  * the owner makes itself (a model publication, a new epoch, a table request, a serving selection, a model
- * reclaim) ends both, so the next write proves against the changed chain. Writes stay fenced whatever stands
+ * reclaim that removed a model) ends both, so the next write proves against the changed chain. Writes stay fenced whatever stands
  * here: every commit still compares and sets the live claim. What a lease bounds is how long a store trusts
  * the structure, identity and model relationships it last checked; a change made underneath a running lease
  * by something that does not hold the claim is seen at the next proof.

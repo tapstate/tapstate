@@ -66,7 +66,16 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if(chainId==null || chainId.isBlank())throw new IllegalArgumentException("blank mining chain");
         Objects.requireNonNull(fence,"originalCapture");
         if(fence.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId()))throw claimFenced();
-        return changingTheModels(() -> transaction(session -> {
+        // A reclaim runs on every retention pass; one that removes nothing changes no model the leases were proved
+        // against, so only a reclaim that removed a model, or failed, ends them.
+        boolean changed = true;
+        try {
+            long deleted = transaction(session -> reclaimInSession(session, chainId, fence));
+            changed = deleted > 0;
+            return deleted;
+        } finally { if (changed) lease.drop(); }
+    }
+    private long reclaimInSession(ClientSession session, String chainId, WorkloadClaimFence fence) {
             requireBusiness(session);
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
@@ -101,7 +110,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 }
             }
             return deleted;
-        }));
     }
     private void requireBudget(ClientSession session,SrsModel proposed,Document captured) {
         long bytes=captured.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
