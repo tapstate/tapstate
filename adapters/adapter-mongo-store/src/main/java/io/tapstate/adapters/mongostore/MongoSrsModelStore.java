@@ -38,6 +38,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private final Runnable requireActive;
     private final Runnable requireStructure;
     private final MongoSrsModelContexts contexts;
+    private final MongoSrsLease lease;
 
     public MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -46,20 +47,26 @@ public final class MongoSrsModelStore implements SrsModelStore {
         this(client, database, scope, requireActive, () -> {});
     }
     MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
+        this(client, database, scope, requireActive, requireStructure, MongoSrsLease.perTransaction());
+    }
+    /** The capture assembly's store: a model change here ends the capture's append and checkpoint leases. */
+    MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure,
+                       MongoSrsLease lease) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
+        this.lease = Objects.requireNonNull(lease, "lease");
         this.contexts = new MongoSrsModelContexts(database, scope);
     }
     @Override public MongoSrsModelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, lease);
     }
     @Override public long reclaim(String chainId,WorkloadClaimFence fence) {
         if(chainId==null || chainId.isBlank())throw new IllegalArgumentException("blank mining chain");
         Objects.requireNonNull(fence,"originalCapture");
         if(fence.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId()))throw claimFenced();
-        return transaction(session -> {
+        return changingTheModels(() -> transaction(session -> {
             requireBusiness(session);
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
@@ -94,7 +101,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 }
             }
             return deleted;
-        });
+        }));
     }
     private void requireBudget(ClientSession session,SrsModel proposed,Document captured) {
         long bytes=captured.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
@@ -159,9 +166,14 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) {
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
-        return transaction(session -> publishInSession(session, model, fence));
+        return changingTheModels(() -> transaction(session -> publishInSession(session, model, fence)));
+    }
+    /** A model change by the owner ends the capture's leases, however it ends: the next append proves against it. */
+    private <T> T changingTheModels(java.util.function.Supplier<T> change) {
+        try { return change.get(); } finally { lease.drop(); }
     }
     SrsModel publishInSession(ClientSession session, SrsModel model, WorkloadClaimFence fence) {
+        lease.drop();
         if (!session.hasActiveTransaction()) throw new IllegalStateException("model publication requires its original CACHE transaction");
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
         requireScope(model.key());
