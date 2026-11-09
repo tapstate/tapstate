@@ -66,6 +66,51 @@ class GroupCommitKillIT {
                 .isPositive();
     }
 
+    /**
+     * An owner frozen with SIGSTOP inside a group, past its lease, holds its transaction open on its fence row.
+     * The successor's proof has to rewrite that row, so without the frozen owner's transactions being ended
+     * before the takeover, the proof would wait for the server to abort them after their transaction lifetime.
+     * Taken over and proved within about one lease instead; thawed, the old owner's group is refused and none
+     * of it lands.
+     */
+    @Test
+    void anOwnerFrozenInsideAGroupIsTakenOverAndProvedWithinAboutOneLease() {
+        String url = MONGO.getReplicaSetUrl();
+        Duration lease = Duration.ofSeconds(3);
+        WorkloadOwner taker = new WorkloadOwner("node-b", "boot-taker");
+        var prepared = CachePipelineRig.prepare(url, OWNER, lease, Set.of("node-a", "node-b"));
+        try (var rig = prepared.rig();
+             var member = MemberProcess.start("frozen-committer", GroupCommitter.class, Map.of(),
+                     url, rig.database(), OWNER.bootId(), "hold");
+             var successor = CachePipelineRig.attach(url, rig.database(), taker.bootId());
+             var client = CachePipelineRig.clientOf(CachePipelineRig.withDatabase(url, rig.database()), taker.bootId())) {
+            member.awaitLine("PAYLOAD 2", Duration.ofSeconds(60));
+            member.freeze();
+            assertThat(rig.transactionsOpenBy(OWNER.bootId())).hasSize(1);
+            while (successor.leaseRemainingMillis() > 0) sleep(100);
+
+            long started = System.nanoTime();
+            var taken = successor.claims().acquirePipeline(CachePipelineRig.SCOPE, taker, 1, lease);
+            assertThat(taken.acquired()).isTrue();
+            var running = successor.claims().advanceExecution(taken.claim(), 1, Set.of("node-a", "node-b")).orElseThrow();
+            var named = GroupCommitter.namespaces(client, rig.database(), running);
+            var group = named.get(0).store().openGroup("assembler/0", named);
+            Duration took = Duration.ofNanos(System.nanoTime() - started);
+
+            assertThat(took).as("takeover and the successor's proof").isLessThan(lease.plusSeconds(5));
+            assertThat(rig.transactionsOpenBy(OWNER.bootId())).isEmpty();
+            assertThat(keysByGroup(rig)).doesNotContainKey("g2");
+
+            member.thaw();
+            member.send("commit");
+            assertThat(member.awaitLine("", Duration.ofSeconds(30))).startsWith("REFUSED");
+            assertThat(keysByGroup(rig)).as("nothing of the frozen group landed").doesNotContainKey("g2");
+            group.commit(Map.of(named.get(0).namespace(), new io.tapstate.spi.store.StateGroup.Changes(
+                    Map.of("s0-0", new byte[8]), Map.of(), Set.of())));
+            assertThat(keysByGroup(rig)).containsEntry("s0", 1);
+        }
+    }
+
     /** Keys the store holds per group, across every namespace, the fence rows left out. */
     private static Map<String, Integer> keysByGroup(CachePipelineRig rig) {
         Map<String, Integer> byGroup = new TreeMap<>();
