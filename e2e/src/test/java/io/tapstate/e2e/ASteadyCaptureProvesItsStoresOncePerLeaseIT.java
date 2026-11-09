@@ -21,15 +21,20 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 /**
- * A steady change stream proves the capture stores once per lease, not once per source batch.
+ * A steady change stream proves its stores once per lease, not once per source batch and not once
+ * per change read.
  *
  * <p>Every source batch is made durable by two fenced store transactions: the append of its events
- * and the checkpoint of the chain. Each proof of the stores (structure, identity, models and the
- * checkpoint's frontier) is a long chain of round trips, and paying it inside every batch is what
- * capped the applied change rate. This case drives thirty changes through a real pipeline one at a
- * time, so each is its own batch, and reads the cache database's profiler: the batches must be
- * there, only a few of the appends may carry the proof, and most of the checkpoints must run on the
- * lease. With the proof paid per batch again, every append carries it and no checkpoint is leased.
+ * and the checkpoint of the chain. Every change the pipeline then reads is verified against the
+ * consumer's membership, snapshot and model, and its read position is written down. Each proof of
+ * the stores (structure, identity, membership, models and the checkpoint's frontier) is a long chain
+ * of round trips, and paying it inside every batch and again on every change read is what capped the
+ * applied change rate. This case drives thirty changes through a real pipeline one at a time, so
+ * each is its own batch, and reads the cache database's profiler: the batches must be there, only a
+ * few of the appends may carry the proof, most of the checkpoints must run on the lease, only a few
+ * of the consumer's transactions may prove its membership, and most of its progress writes must run
+ * on the lease. With a proof paid per transaction again, every append and every read carries it and
+ * nothing is leased.
  *
  * <p>No specification word reaches this: the vocabulary says what crossed and in what state, never
  * what the product's own store spent to carry it.
@@ -44,7 +49,11 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
     private static final Duration WRITE_EVERY = Duration.ofMillis(500);
     private static final String PROFILE = "system.profile";
     private static final long PROFILE_BYTES = 256L << 20;
-    private static final Set<String> CONSUMER_COLLECTIONS = Set.of("srs_consumers", "srs_consumer_offsets");
+    /** The identity row is read only by a proof; a progress write inside a standing lease never touches it. */
+    private static final String PROOF_MARKER = "cache_identity";
+    private static final String MEMBERSHIP = "srs_consumers";
+    private static final String OFFSETS = "srs_consumer_offsets";
+    private static final Set<String> CONSUMER_COLLECTIONS = Set.of(MEMBERSHIP, OFFSETS);
 
     @BeforeAll
     static void requireDockerAndTheRealConnector() {
@@ -53,7 +62,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
     }
 
     @Test
-    void thirtySingleChangesCarryAtMostAFewProofs() {
+    void thirtySingleChangesCarryAtMostAFewProofsOnEitherSide() {
         String sourceUri = SharedMongo.replicaSetUrl(DATABASE);
         String targetUri = SharedMongo.replicaSetUrl(TARGET_DATABASE);
         // Surefire also carries the MCP sidecar's non-web configuration; this witness hosts the REST server.
@@ -128,22 +137,36 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             // that resolves a model does so for an event it loaded (a checkpoint proof's frontier, a log read's
             // batch), the retention pass reads the models by table once a second, and the consumer's own reads
             // read its membership. A leased checkpoint reads the chain root and nothing else.
-            int provingAppends = 0, leasedCheckpoints = 0;
+            // Every read of the consumer's membership row resolves one model, the chain frontier's, through the
+            // checkpoint it validates: the sink's and the replay floor's progress reads do, per change. A read
+            // verification proof resolves the event's own model on top of that, so it is the membership read
+            // that resolves two or more. A progress write within a standing lease reads its offsets row and the
+            // pipeline state row, never the membership or identity rows.
+            int provingAppends = 0, leasedCheckpoints = 0, provingConsumer = 0, leasedProgressWrites = 0;
             for (List<Document> reads : transactions(profiled).values()) {
                 Set<String> read = new java.util.HashSet<>();
                 for (Document op : reads) read.add(collection(op));
-                if (reads.stream().anyMatch(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel)
-                        && !read.contains("srs_events") && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
+                long resolving = reads.stream().filter(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel).count();
+                if (resolving > 0 && !read.contains("srs_events") && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
                 if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
+                if (resolving >= 2 && read.contains(MEMBERSHIP)) provingConsumer++;
+                if (read.contains(OFFSETS) && !read.contains(MEMBERSHIP) && !read.contains(PROOF_MARKER)) leasedProgressWrites++;
             }
-            String reading = "appends %d (proving %d), checkpoint writes %d (leased %d) over %d profiled operations"
-                    .formatted(appends, provingAppends, checkpointWrites, leasedCheckpoints, profiled.size());
+            long progressWrites = profiled.stream().filter(op -> isUpdate(op, OFFSETS)).count();
+            String reading = ("appends %d (proving %d), checkpoint writes %d (leased %d), consumer proofs %d, "
+                    + "progress writes %d (leased %d) over %d profiled operations").formatted(appends, provingAppends,
+                    checkpointWrites, leasedCheckpoints, provingConsumer, progressWrites, leasedProgressWrites, profiled.size());
             reading += "; transactions by what they read: " + shapes(profiled);
             assertThat(appends).as("every change was its own durable batch: " + reading).isGreaterThanOrEqualTo(CHANGES);
             assertThat(checkpointWrites).as("every batch was checkpointed: " + reading).isGreaterThanOrEqualTo(CHANGES);
             // A proof per lease over a window of a few seconds is a handful; a proof per batch is all thirty.
             assertThat(provingAppends).as("appends proving the stores: " + reading).isLessThanOrEqualTo(CHANGES / 4);
             assertThat(leasedCheckpoints).as("checkpoints within a lease: " + reading).isGreaterThanOrEqualTo(CHANGES / 2);
+            // Each change read is verified and its position written down; a proof per read is at least sixty
+            // consumer transactions reading the membership row, a proof per lease a handful.
+            assertThat(progressWrites).as("every change read advanced the consumer: " + reading).isGreaterThanOrEqualTo(CHANGES);
+            assertThat(provingConsumer).as("consumer transactions proving the stores: " + reading).isLessThanOrEqualTo(CHANGES / 4);
+            assertThat(leasedProgressWrites).as("progress writes within a lease: " + reading).isGreaterThanOrEqualTo(CHANGES / 2);
         } finally {
             if (previousWebType == null) {
                 System.clearProperty("spring.main.web-application-type");
