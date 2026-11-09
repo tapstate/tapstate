@@ -1,5 +1,6 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapdata.entity.schema.value.TapNumberValue;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationKey;
@@ -37,6 +38,7 @@ class PdkValidationLookupTest {
                 import io.tapdata.entity.schema.TapTable;
                 import io.tapdata.entity.schema.TapField;
                 import io.tapdata.entity.schema.type.TapNumber;
+                import io.tapdata.entity.schema.value.TapNumberValue;
                 import java.util.List;
                 import java.util.Map;
                 import java.util.Set;
@@ -44,7 +46,9 @@ class PdkValidationLookupTest {
                 import java.util.concurrent.atomic.AtomicReference;
                 import java.util.function.Consumer;
                 public class EqualityLookup implements TapConnector {
+                    private TapCodecsRegistry registry;
                     public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {
+                        registry = codecs;
                         functions.supportQueryByAdvanceFilter((context, filter, table, consumer) -> {
                             ((AtomicInteger)context.getConnectionConfig().get("queries")).incrementAndGet();
                             if (filter.getLimit() != null || filter.getSkip() != null || filter.getBatchSize() != 2
@@ -68,6 +72,22 @@ class PdkValidationLookupTest {
                     }
                     public void init(TapConnectionContext context) {
                         ((AtomicReference<ClassLoader>)context.getConnectionConfig().get("loader")).set(getClass().getClassLoader());
+                        String mode = context.getConnectionConfig().getString("mode");
+                        if (mode.equals("codec-v1") || mode.equals("codec-v2")) {
+                            registry.registerFromTapValue(TapNumberValue.class, value -> {
+                                if (mode.equals("codec-v2")) throw new IllegalStateException("V2 must win");
+                                return value.getValue().longValue() - 1000;
+                            });
+                        }
+                        if (mode.equals("codec-v2")) {
+                            registry.registerFromTapValueV2(TapNumberValue.class, (value, field) -> {
+                                if (field == null || !Set.of("tenant", "parent").contains(field.getName())
+                                        || !field.getDataType().equals("bigint")
+                                        || Thread.currentThread().getContextClassLoader() != getClass().getClassLoader())
+                                    throw new IllegalStateException("missing lookup field or connector loader");
+                                return value.getValue().longValue() - 1000;
+                            });
+                        }
                     }
                     public void stop(TapConnectionContext context) {
                         ((AtomicInteger)context.getConnectionConfig().get("stops")).incrementAndGet();
@@ -110,6 +130,26 @@ class PdkValidationLookupTest {
         assertThat(encoded).containsEntry("tenant", 7L);
         assertThat(probe.queries).hasValue(1);
         assertThat(probe.stops).hasValue(1);
+    }
+
+    @Test @Timeout(10) void tapValuePredicatesUseConnectorV2ThenV1ThenDefault() {
+        for (String mode : List.of("codec-v2", "codec-v1", "codec-default")) {
+            var probe = new Probe(mode);
+            double offset = mode.equals("codec-default") ? 0 : 1000;
+            var tenant = new TapNumberValue(7 + offset);
+            var parent = new TapNumberValue(102 + offset);
+            try (var query = Executors.newSingleThreadExecutor(); var decode = Executors.newSingleThreadExecutor();
+                 var cursor = PdkValidationSession.lookup("fixture", artifact, probe.settings(), "binding", lookup(),
+                         (model, codecs) -> row -> ValidationValues.ownRow(row, ROW),
+                         (model, codecs, logical) -> Map.of("tenant", tenant, "parent", parent),
+                         () -> {}, query, decode, 1, ROW)) {
+                try (var row = cursor.next().orElseThrow()) {
+                    assertThat(row.values().fields()).containsEntry("tenant", 7L).containsEntry("parent", 102L);
+                }
+                assertThat(cursor.next()).isEmpty();
+            }
+            assertThat(probe.queries).hasValue(1);
+        }
     }
 
     @Test @Timeout(10) void wrongMissingAndSwallowedReturnKeysNeverBecomeMatchingFacts() {

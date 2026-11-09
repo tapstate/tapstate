@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.schema.value.TapValue;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapdata.pdk.apis.entity.Projection;
@@ -44,7 +45,9 @@ final class PdkValidationSession {
         PdkValidationCursor.Decoder prepare(TapTable model, PdkValidationCodecs codecs);
     }
 
-    /** Supplies session-owned native equality values under this connector's loader and fixed model. */
+    /** Supplies session-owned equality values under this connector's loader and fixed model.
+     * TapValues are converted using the queried fields and registry. Native values are already encoded.
+     */
     @FunctionalInterface interface MatchEncoding {
         Map<String, ?> encode(TapTable model, PdkValidationCodecs codecs, ValidationKey logicalKey);
     }
@@ -391,6 +394,13 @@ final class PdkValidationSession {
             if (value == null) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "lookup.nullMatch"), null);
             // The admitted encoder owns nested/native values. Never expose its map to connector mutation.
             values.put(field, value);
+        }
+        if (values.values().stream().anyMatch(TapValue.class::isInstance)) {
+            codecs.encodeLookupMatch(model, values);
+            for (String field : fields) {
+                Object value = values.get(field);
+                if (value == null || value instanceof TapValue<?, ?>) throw codecs.unavailable(field);
+            }
         }
         checkActive();
         return values;

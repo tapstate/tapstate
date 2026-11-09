@@ -84,9 +84,9 @@ class PdkValidationModelVersionTest {
             return new io.tapdata.entity.schema.value.TapStringValue("custom:"+value);
         });
         var codecs=new PdkValidationCodecs("mongo",expected.codecBinding(),registry);
-        var method=PdkValidationReads.class.getDeclaredMethod("decoder",TapTable.class,PdkValidationCodecs.class,ConnectorRef.class,String.class,PdkValidationReads.Binding.class,List.class,io.tapstate.core.validation.ValidationValues.Limits.class);method.setAccessible(true);
+        var method=PdkValidationReads.class.getDeclaredMethod("decoder",TapTable.class,PdkValidationCodecs.class,ConnectorRef.class,String.class,PdkValidationReads.Binding.class,List.class,io.tapstate.core.validation.ValidationValues.Limits.class,boolean.class);method.setAccessible(true);
         var keys=List.of(new io.tapstate.core.validation.ValidationKeyBinding.Component(List.of("id"),io.tapstate.core.validation.ValidationKey.Kind.EXACT_NUMBER,java.util.Set.of("exact-number")));
-        var decoder=(PdkValidationCursor.Decoder)method.invoke(null,model,codecs,artifact,configuration,expected,keys,new io.tapstate.core.validation.ValidationValues.Limits(8192,100,12));
+        var decoder=(PdkValidationCursor.Decoder)method.invoke(null,model,codecs,artifact,configuration,expected,keys,new io.tapstate.core.validation.ValidationValues.Limits(8192,100,12),true);
         assertThatThrownBy(()->decoder.decode(Map.of("id",1L,"value","same"))).isInstanceOfSatisfying(TapstateException.class,
                 changed->{assertThat(changed.code()).isEqualTo(ValidationError.INVALID_CONTRACT);assertThat(changed.args()).containsEntry("field","pdkRead.modelChanged.afterRow.records");});
         assertThat(calls).hasValue(1);
