@@ -53,6 +53,8 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     private final long addressBytes;
     private final Validation validation;
     private final AtomicReference<Lease> lease = new AtomicReference<>();
+    /** Moves on every {@link #dropLease()}, so a proof that a drop overtook is never kept. */
+    private final AtomicLong leaseEpoch = new AtomicLong();
     private final Object proving = new Object();
     private final MongoCachePipelineAccess.LeasedClock committed = new MongoCachePipelineAccess.LeasedClock();
 
@@ -231,7 +233,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
     }
 
-    @Override public void dropLease() { lease.set(null); }
+    @Override public void dropLease() { leaseEpoch.incrementAndGet(); lease.set(null); }
 
     /**
      * Proves a lease now, as an explicit open: for a store holding a claim this registers its placement and
@@ -289,12 +291,23 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             long startedAt = System.nanoTime();
             long maximum = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
             boolean claimed = access.originalClaim() != null;
-            Lease proved = validated(writes, (session, inventory) -> {
-                long held = claimed && writes ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
-                return new Lease(startedAt + held, writes, inventory.getString("preparationId"), inventory.getLong("revision"));
-            });
-            lease.set(proved);
+            long epoch = leaseEpoch.get();
+            Lease proved;
+            try {
+                proved = validated(writes, (session, inventory) -> {
+                    long held = claimed && writes ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
+                    return new Lease(startedAt + held, writes, inventory.getString("preparationId"), inventory.getLong("revision"));
+                });
+            } catch (RuntimeException failure) {
+                // A failed proof also ends a standing read lease, which an upgrade to a write would otherwise leave behind.
+                lease.set(null);
+                throw failure;
+            }
             LEASE_OPENS.incrementAndGet();
+            // A proof that ran out while validating, or that a drop overtook, serves only the operation it was
+            // proved for: it is never kept for the next one, which proves again.
+            if (System.nanoTime() - proved.deadlineNanos() < 0 && leaseEpoch.get() == epoch) lease.set(proved);
+            else lease.set(null);
             return proved;
         }
     }

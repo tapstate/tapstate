@@ -153,6 +153,19 @@ class LeaseValidationFencingIT {
         });
     }
 
+    @Test void aFailedWriteProofAlsoEndsTheReadLeaseItWasUpgrading() {
+        withFixture(f -> {
+            System.setProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY, "600000");
+            f.writer().saveAll(f.at.mapName(), keys("a", 10));
+            var store = f.writer();
+            assertThat(store.loadAll(f.at.mapName(), List.of("a1"))).containsKey("a1");
+            f.addTtlIndex();
+            code(() -> store.save(f.at.mapName(), "b", new byte[]{1}), IoError.DOCUMENT_UNREADABLE);
+            code(() -> store.loadAll(f.at.mapName(), List.of("a1")), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.stored()).isEqualTo(10);
+        });
+    }
+
     @Test void perTransactionValidationRemainsSelectableAndSeesTheStructureChangeAtOnce() {
         withFixture(f -> {
             System.setProperty(MongoCacheOperatorStateStore.VALIDATION_PROPERTY, "transaction");

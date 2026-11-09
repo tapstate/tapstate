@@ -211,9 +211,18 @@ final class ExecutionAuthorization implements AutoCloseable {
     void holdLease(ExecutionFence fence, LeasedStateStore store) {
         Objects.requireNonNull(fence); Objects.requireNonNull(store);
         if (!fenced) return;
-        var held = leases.computeIfAbsent(ReadKey.of(fence), ignored -> new CopyOnWriteArrayList<>());
-        held.removeIf(reference -> reference.get() == null);
-        held.add(new WeakReference<>(store));
+        // Sweeps every key, not only this one: a reading that ended keeps no entry to trigger its own cleanup.
+        for (var key : leases.keySet()) {
+            leases.computeIfPresent(key, (ignored, registered) -> {
+                registered.removeIf(reference -> reference.get() == null);
+                return registered.isEmpty() ? null : registered;
+            });
+        }
+        leases.compute(ReadKey.of(fence), (key, registered) -> {
+            var held = registered == null ? new CopyOnWriteArrayList<WeakReference<LeasedStateStore>>() : registered;
+            held.add(new WeakReference<>(store));
+            return held;
+        });
         if (closed.get()) dropLeases(ReadKey.of(fence));
     }
 
