@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.NestInspection;
 import io.tapstate.runtime.engine.OperatorMapBindings;
@@ -181,6 +182,7 @@ public final class NestInspector {
         }
         Map<String, Object> document = assembly.render(topology.slots(),
                 referenced(member, bindings, pipelineId, step, topology, assembly))
+                .map(NestInspector::readable)
                 .orElse(null);
         return new NestInspection(NestInspection.VERSION, pipelineId, step, columns, key,
                 inspected.rootPresent(), order(inspected.rootOrder()), parts, waiting, missing,
@@ -219,7 +221,24 @@ public final class NestInspector {
         return resolved;
     }
 
-    private static String order(SourceOrder order) {
-        return order == null ? null : order.epoch() + ":" + order.seq();
+    /**
+     * The document with every connector-converted value shown as the value it carries, not as the carrier
+     * with its conversion metadata. A time is shown as its ISO-8601 text, so a reader sees a date whatever
+     * the transport serializes a time value as.
+     */
+    static Map<String, Object> readable(Map<String, Object> document) {
+        return ConvertedValue.unwrapRow(document,
+                carrier -> carrier.value() instanceof java.time.temporal.Temporal time ? time.toString() : carrier.value());
+    }
+
+    /**
+     * An order as {@code epoch:seq}. A row read by a snapshot carries a reserved sequence below every change,
+     * and is written {@code epoch:snapshot} rather than as that number, which reads as a defect.
+     */
+    static String order(SourceOrder order) {
+        if (order == null) {
+            return null;
+        }
+        return order.epoch() + ":" + (order.seq() == SourceOrder.SNAPSHOT_SEQ ? "snapshot" : order.seq());
     }
 }

@@ -107,7 +107,7 @@ order_doc  step order_doc  root o  key id
     items  from i  as array  owned, gathered: each row names its one parent  on order_id = parent id
       sample: shop.order_items, 1000 rows; at most 4 under one parent in 200 rows read; about 3.3 per document
     customer  from c  as object  shared, referenced: the parent names the row, at most 100000 documents per row  on id = parent customer_id
-      sample: shop.customers, 40 rows; at most 9 parents on one row in 200 rows read; about 7.5 documents per row
+      sample: shop.customers, 40 rows; at most 9 parent(s) on one row in 200 rows read; about 7.5 documents per row
   warnings: none from the sample
 ```
 
@@ -179,7 +179,7 @@ order_doc  step order_doc  root key id=1
     PATH      KEY   ORDER  STATE
     items     [1]   1:4    in document
     items     [2]   1:5    in document
-  document, as last sent:
+  document, as the step last rendered it:
     {
       "id": 1,
       "customer_id": 1,
@@ -190,11 +190,13 @@ order_doc  step order_doc  root key id=1
 
 - **root row** - `present` with its order; `not arrived`, when only rows under it have come; or `deleted`.
 - **parts** - every row held under the root, at every depth, with the position it was taken at (`epoch:seq`;
-  higher wins). `deleted` marks a record of a deletion; `held` marks a row under a root that is absent.
+  higher wins; `epoch:snapshot` for a row the initial load read, which is below every change). `deleted` marks a record of a deletion; `held` marks a row under a root that is absent.
 - **waiting for a parent row** - rows held under a deeper parent that has not arrived, and how many.
 - **references with no row** - shared rows the document points at that were not found.
-- **document** - as last sent when nothing is unsent, otherwise as it will next be sent, with the count of
-  changes not yet sent. While the root row is absent there is no document.
+- **document** - as the step last rendered it when nothing is unsent, otherwise as it will next render it,
+  with the count of changes not yet sent. While the root row is absent there is no document. This is what the
+  step hands the target, not what the target stores: a target that writes by another key keeps its own `_id`,
+  and a converted value is shown as the value it carries, a date as ISO-8601 text.
 
 A line pointing at order 99, which does not exist, shows up like this:
 

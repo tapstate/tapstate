@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * What {@code nest inspect} prints: the key by column, whether the root row is in and at what order, a row
- * per part with its own order, what waits for a parent, and the document - labelled as last sent or as about
+ * per part with its own order, what waits for a parent, and the document - labelled as last rendered or as about
  * to be sent, since the two differ exactly when changes are unsent.
  */
 class NestInspectRenderingTest {
@@ -27,7 +27,7 @@ class NestInspectRenderingTest {
 
         assertThat(text).contains("order_doc  step doc  root key id=1", "root row: present, order 1:3",
                 "items     [\"L1\"]  1:4    in document", "customer  [\"C1\"]  1:2    in document",
-                "document, as last sent:");
+                "document, as the step last rendered it:");
     }
 
     @Test

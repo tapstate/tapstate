@@ -5,12 +5,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.hazelcast.config.Config;
 import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.NestInspection;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
+import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -123,6 +125,25 @@ class WhatADocumentHoldsCanBeReadByItsRootKeyTest {
         assertThat(NestInspector.readings(List.of("17"))).containsExactly(
                 List.of(17L), List.of(17), List.of(new java.math.BigDecimal("17")), List.of("17"));
         assertThat(NestInspector.readings(List.of("A-1"))).containsExactly(List.of("A-1"));
+    }
+
+    @Test
+    void aRowTheInitialLoadReadIsShownAtSnapshotNotAtItsSentinel() {
+        assertThat(NestInspector.order(new SourceOrder(1L, SourceOrder.SNAPSHOT_SEQ))).isEqualTo("1:snapshot");
+        assertThat(NestInspector.order(at(4))).isEqualTo("1:4");
+        assertThat(NestInspector.order(null)).isNull();
+    }
+
+    @Test
+    void aConvertedValueIsShownAsWhatItCarriesAndATimeAsItsIsoText() {
+        Map<String, Object> document = new LinkedHashMap<>();
+        document.put("id", 7L);
+        document.put("placed", new ConvertedValue(Instant.parse("2024-03-01T10:15:30Z"), "date", "datetime",
+                "{}", "{}"));
+        document.put("items", List.of(Map.of("sku", new ConvertedValue("A-1", "string"))));
+
+        assertThat(NestInspector.readable(document)).isEqualTo(Map.of("id", 7L,
+                "placed", "2024-03-01T10:15:30Z", "items", List.of(Map.of("sku", "A-1"))));
     }
 
     private void file(long customer, RootAssembly assembly) {

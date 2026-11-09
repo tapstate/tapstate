@@ -4584,7 +4584,7 @@ final class Repl {
                 + (sample.get("tableRows") == null ? "row count unknown" : sample.get("tableRows") + " rows");
         String largest = owned
                 ? "at most " + sample.get("largestInSample") + " under one parent"
-                : "at most " + sample.get("largestInSample") + " parents on one row";
+                : "at most " + sample.get("largestInSample") + " parent(s) on one row";
         String average = !(sample.get("averagePerParent") instanceof Number mean) ? ""
                 : "; about " + String.format(Locale.ROOT, "%.1f", mean.doubleValue())
                         + (owned ? " per document" : " documents per row");
@@ -4599,7 +4599,8 @@ final class Repl {
     /**
      * What {@code nest inspect} prints: the key, whether the root row is in and at what order, one row per
      * part with its order and whether it is a record of a deletion, what waits for a parent, the references
-     * found missing, and the document - as last sent, or as it will next go out when changes are unsent.
+     * found missing, and the document - as the step last rendered it, or as it will next render it when changes
+     * are unsent.
      */
     static void renderNestInspect(PrintWriter out, Map<?, ?> view) {
         out.println(view.get("pipelineId") + "  step " + view.get("step") + "  root key "
@@ -4651,8 +4652,8 @@ final class Repl {
         if (document == null) {
             out.println("  document: none while the root row is absent; " + unsent + " change(s) held");
         } else {
-            out.println(unsent == 0 ? "  document, as last sent:"
-                    : "  document, as it will next be sent (" + unsent + " change(s) not yet sent):");
+            out.println(unsent == 0 ? "  document, as the step last rendered it:"
+                    : "  document, as the step will next render it (" + unsent + " change(s) not yet sent):");
             for (String line : JsonOut.write(document).split("\n", -1)) {
                 out.println("    " + line);
             }
