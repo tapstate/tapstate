@@ -633,6 +633,47 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @Test void pinReservesTheChainBeforeReadingProgressAndReplaysDoNotAdvanceFences() {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "seam", refs);
+            var commands = new java.util.ArrayList<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    var body = event.getCommand();
+                    if (!event.getDatabaseName().equals(f.database().getName()) || !body.containsKey("autocommit")) return;
+                    String command = event.getCommandName();
+                    var collection = body.get(command);
+                    commands.add(command + "/" + (collection != null && collection.isString() ? collection.asString().getValue() : "-"));
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                var original = new MongoSrsConsumerStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                var before = root(f).getLong("modelWriteFence");
+                assertThat(original.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                assertThat(commands).startsWith("update/workload_claims", "findAndModify/srs_chains")
+                        .contains("update/srs_consumer_offsets").doesNotContain("update/srs_chains");
+                var root = root(f);
+                var offset = cursor(f, A);
+                var pipeline = SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id", A.key().pipelineId())).first();
+                var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(
+                        new Document("_id", MongoWorkloadClaimStore.id(f.fenceA().key()))).first();
+                assertThat(root.getLong("modelWriteFence")).isEqualTo(before + 1);
+                assertThat(original.pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+                assertThat(original.pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "different", refs), f.fenceA())).isFalse();
+                assertThat(root(f)).isEqualTo(root);
+                assertThat(cursor(f, A)).isEqualTo(offset);
+                assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).find(new Document("_id", A.key().pipelineId())).first())
+                        .isEqualTo(pipeline);
+                assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(
+                        new Document("_id", MongoWorkloadClaimStore.id(f.fenceA().key()))).first()).isEqualTo(claim);
+            }
+        });
+    }
+
     @Test
     void independentClientsCannotPinDifferentSnapshotSeamsAtOneOriginalRevision() {
         withBusiness(f -> {

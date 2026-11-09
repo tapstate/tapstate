@@ -274,6 +274,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
         requireCapture(row, fence);
         if (!Long.valueOf(epoch).equals(row.get("epoch")) || !fence.equals(WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)))) throw fenced();
     }
+    /** A pin takes the chain write fence early and validates this exact preimage before commit. */
+    Document reserveSnapshotPin(ClientSession session, String chain) {
+        var available = new Document("$type", "long").append("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
+        return SystemCollections.SRS_CHAINS.on(database).findOneAndUpdate(session,
+                new Document("_id", chain).append("cacheIncarnation", scope.cacheIncarnation()).append("modelWriteFence", available),
+                new Document("$inc", new Document("modelWriteFence", 1L)));
+    }
+
     void replace(ClientSession session, Document expected, Document replacement) {
         long revision = expected.getLong("modelWriteFence");
         if (revision >= Long.MAX_VALUE - 1) throw unproven(expected.getString("_id"));

@@ -46,12 +46,18 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 
 /** Membership, its cursor and minimal chain dependency facts change in one cache transaction. */
 public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+    private static final TransactionOptions PIN_TRANSACTION = TransactionOptions.builder()
+            .readConcern(TRANSACTION.getReadConcern()).writeConcern(TRANSACTION.getWriteConcern())
+            .timeout(15L, TimeUnit.SECONDS).build();
     private final MongoClient client;
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
@@ -803,19 +809,38 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                                           SrsSnapshotPin snapshot, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
-        return transaction(session -> {
-            prove(session,context,fence); var view = view(session, chain); var member = view.members().get(context.key().consumerId());
+        var pipeline = pipelineAccess(context, fence);
+        return pinTransaction(pipeline, session -> {
+            // Retain the claim-before-chain write order. Take the chain fence before
+            // a checkpoint can invalidate a snapshot held through the model and cursor reads.
+            var business = new MongoCacheBusinessIdentity(database, scope);
+            try {
+                pipeline.proveConsumerClaim(session, true);
+            } catch (TapstateException refusal) {
+                if (refusal.code() == IoError.WORKLOAD_CLAIM_FENCED) {
+                    // Preserve the original stale-scope diagnostic without delaying a live claim.
+                    business.requireReady(session);
+                    pipeline.state(session, true);
+                }
+                throw refusal;
+            }
+            var root = chains.reserveSnapshotPin(session, chain);
+            business.requireReady(session);
+            var state = pipeline.state(session, true);
+            pipeline.updateState(session, state, new Document(), false);
+            var view = root == null ? view(session, chain) : relations(session, chain, root, chains.state(session, root));
+            var member = view.members().get(context.key().consumerId());
             if (member == null || member.detached() || !member.context().equals(context)) throw unavailable(chain);
-            if (member.revision() != membershipRevision) return false;
+            if (member.revision() != membershipRevision) throw new UnchangedPin(false);
             if (!member.commandFence().equals(fence)) throw fenced();
             var held = view.cursors().get(context.key().consumerId()); var before = held.snapshot();
-            if (!snapshot.equals(before) && held.revision() != expectedProgressRevision) return false;
+            if (!snapshot.equals(before) && held.revision() != expectedProgressRevision) throw new UnchangedPin(false);
             var required = new java.util.HashSet<>(member.tables()); if (before != null) required.addAll(before.models().keySet());
             if (!snapshot.models().keySet().equals(required)) throw unavailable(chain);
             if (before != null && (before.snapshotEpoch() != snapshot.snapshotEpoch() || !before.sourcePosition().equals(snapshot.sourcePosition())
                     || before.models().entrySet().stream().anyMatch(entry -> !entry.getValue().equals(snapshot.models().get(entry.getKey()))))) throw unavailable(chain);
             validateSnapshot(session, context, snapshot);
-            if (snapshot.equals(before)) return true;
+            if (snapshot.equals(before)) throw new UnchangedPin(true);
             if (held.revision() >= Long.MAX_VALUE - 1) throw unavailable(chain);
             ConsumerOffset old = held.value();
             var progress = new ConsumerOffset(old.pipelineId(), old.perTableSeq(), old.sinkAcked(), old.snapshotCompletedTables(),
@@ -824,10 +849,59 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
                     new Document("_id", records.id(context.key())).append("membershipRevision", membershipRevision)
                             .append("progressRevision", expectedProgressRevision), row).getMatchedCount() != 1) throw unavailable(chain);
-            chains.replace(session, view.root(), new Document(view.root()));
+            // An exhausted chain fence can still answer a replay above, but cannot publish a new pin.
+            if (root == null) chains.replace(session, view.root(), new Document(view.root()));
             return true;
         });
     }
+    private boolean pinTransaction(MongoCachePipelineAccess pipeline, Function<ClientSession, Boolean> action) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            var attempts = new AtomicInteger();
+            try (var session = client.startSession()) {
+                return session.withTransaction(() -> {
+                    int attempt = attempts.getAndIncrement();
+                    // Only a transient transaction reruns this callback. An ambiguous commit
+                    // retries the commit itself, so it does not repeat the reservation.
+                    if (attempt > 0) waitForPinRetry(attempt);
+                    requireActive.run();
+                    requireStructure.run();
+                    pipeline.verifyStateStructure();
+                    MongoCacheWorkloadClaimStore.requireCollection(database);
+                    requireActive.run();
+                    boolean result = action.apply(session);
+                    requireActive.run();
+                    return result;
+                }, PIN_TRANSACTION);
+            } catch (UnchangedPin result) {
+                requireActive.run();
+                return result.accepted;
+            } catch (RuntimeException failure) {
+                requireActive.run();
+                throw failure;
+            }
+        });
+    }
+
+    private static void waitForPinRetry(int attempt) {
+        long ceiling = Math.min(50, 5L << Math.min(attempt - 1, 4));
+        try {
+            Thread.sleep(ThreadLocalRandom.current().nextLong(1, ceiling + 1));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "snapshot pin retry interrupted"), null);
+        }
+    }
+
+    /** A replay or revision mismatch rolls back the early reservation. */
+    private static final class UnchangedPin extends RuntimeException {
+        private final boolean accepted;
+        private UnchangedPin(boolean accepted) {
+            super(null, null, false, false);
+            this.accepted = accepted;
+        }
+    }
+
     private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
         if (snapshot == null) return;
         var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
@@ -1082,16 +1156,21 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         prove(session, context, fence, false);
     }
     private void prove(ClientSession session, SrsConsumerContext context, WorkloadClaimFence fence, boolean structureChecked) {
-        Objects.requireNonNull(fence,"originalPipelineFence");
-        if (fence.executionGeneration() < 1 || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION || !scope.clusterId().equals(fence.key().clusterId())
-                || !context.key().pipelineId().equals(fence.key().resourceId())) throw fenced();
-        var physical = new io.tapstate.spi.store.PipelineIntentScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation(),
-                context.key().pipelineId(),context.stateGeneration());
-        var pipeline = new MongoCachePipelineAccess(client,database,physical,fence,requireActive);
+        var pipeline = pipelineAccess(context, fence);
         if (!structureChecked) pipeline.verifyStateStructure();
         Document current = pipeline.state(session, structureChecked);
         pipeline.proveConsumerClaim(session, structureChecked);
-        pipeline.updateState(session,current,new Document(),false);
+        pipeline.updateState(session, current, new Document(), false);
+    }
+
+    private MongoCachePipelineAccess pipelineAccess(SrsConsumerContext context, WorkloadClaimFence fence) {
+        Objects.requireNonNull(fence, "originalPipelineFence");
+        if (fence.executionGeneration() < 1 || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
+                || !scope.clusterId().equals(fence.key().clusterId())
+                || !context.key().pipelineId().equals(fence.key().resourceId())) throw fenced();
+        var physical = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(),
+                context.key().pipelineId(), context.stateGeneration());
+        return new MongoCachePipelineAccess(client, database, physical, fence, requireActive);
     }
     private <T> T transaction(Function<ClientSession, T> action) {
         return transaction(false, action);
