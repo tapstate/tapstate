@@ -177,13 +177,19 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
                 () -> copied.countDocuments(new Document("_id", id)) == 1, () -> "the change has not crossed");
     }
 
-    /** Groups the profiled reads by the transaction that issued them; reads outside one are left out. */
+    /**
+     * Groups the profiled reads by the transaction that issued them; reads outside one are left out. The
+     * profiler records the session and transaction number inside the command it profiled, as the driver sent
+     * them, not at the top of the entry.
+     */
     private static Map<String, List<Document>> transactions(List<Document> profiled) {
         var result = new LinkedHashMap<String, List<Document>>();
         for (Document op : profiled) {
-            Document session = op.get("lsid", Document.class);
-            Object transaction = op.get("txnNumber");
-            if (!"query".equals(op.getString("op")) || session == null || transaction == null) continue;
+            Document command = op.get("command", Document.class);
+            if (!"query".equals(op.getString("op")) || command == null) continue;
+            Document session = command.get("lsid", Document.class);
+            Object transaction = command.get("txnNumber");
+            if (session == null || transaction == null) continue;
             result.computeIfAbsent(session.get("id") + "/" + transaction, key -> new ArrayList<>()).add(op);
         }
         return result;
