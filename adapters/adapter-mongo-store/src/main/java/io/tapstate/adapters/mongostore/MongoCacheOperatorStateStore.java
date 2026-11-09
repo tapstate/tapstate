@@ -231,11 +231,14 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
     }
 
+    @Override public void dropLease() { lease.set(ended()); }
+
     /**
-     * Replaces the lease with a fresh, already expired marker rather than {@code null}: a proof in flight
-     * publishes only over the exact lease it started from, so a drop at any point of that proof wins.
+     * A fresh, already expired marker that every way of ending a lease installs, never {@code null}: a proof in
+     * flight publishes only over the exact lease it started from, so any end at any point of that proof wins,
+     * and no two ends can ever look like the same lease.
      */
-    @Override public void dropLease() { lease.set(new Lease(System.nanoTime(), false, null, 0L)); }
+    private static Lease ended() { return new Lease(System.nanoTime(), false, null, 0L); }
 
     /**
      * Proves a lease now, as an explicit open: for a store holding a claim this registers its placement and
@@ -275,7 +278,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         try {
             return operation.apply(current);
         } catch (RuntimeException failure) {
-            if (lease.compareAndSet(current, null)) LEASE_LOSSES.incrementAndGet();
+            if (lease.compareAndSet(current, ended())) LEASE_LOSSES.incrementAndGet();
             throw failure;
         }
     }
@@ -302,7 +305,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
                 });
             } catch (RuntimeException failure) {
                 // A failed proof also ends a standing read lease, which an upgrade to a write would otherwise leave behind.
-                lease.set(null);
+                lease.set(ended());
                 throw failure;
             }
             LEASE_OPENS.incrementAndGet();
@@ -333,7 +336,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         try {
             return validated(mutation, (session, inventory) -> action.apply(session));
         } catch (RuntimeException failure) {
-            lease.set(null);
+            lease.set(ended());
             throw failure;
         }
     }
