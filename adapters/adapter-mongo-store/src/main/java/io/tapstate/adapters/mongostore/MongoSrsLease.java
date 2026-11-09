@@ -118,12 +118,12 @@ final class MongoSrsLease {
 
     /**
      * How long the live claim {@code fence} names still runs, in milliseconds on the store's own clock, read
-     * inside the proof's transaction after the claim compare-and-set matched; the caller counts it down on its
-     * monotonic clock without ever reading a deadline.
+     * inside the proof's transaction; the caller counts it down on its monotonic clock without ever reading a
+     * deadline. Read from the claim as the fence names it, never by its key alone: a claim another owner holds,
+     * or one that ran out, bounds nothing here, and a proof that only reads is fenced by it like a write.
      */
     static long remainingMillis(MongoCollection<Document> claims, ClientSession session, WorkloadClaimFence fence) {
-        Document live = WorkloadClaimDocuments.live(fence);
-        Document remaining = claims.find(session, new Document("_id", live.get("_id")))
+        Document remaining = claims.find(session, WorkloadClaimDocuments.live(fence))
                 .projection(new Document("_id", 0).append("remaining", new Document("$subtract", List.of("$leaseUntil", "$$NOW")))).first();
         if (remaining == null || !(remaining.get("remaining") instanceof Number millis)) {
             throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);

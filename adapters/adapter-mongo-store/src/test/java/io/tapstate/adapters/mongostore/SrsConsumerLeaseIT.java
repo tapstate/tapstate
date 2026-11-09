@@ -79,8 +79,8 @@ class SrsConsumerLeaseIT {
             // The proofs: structure, identity, membership and the model were read by the first verification and the first write.
             assertThat(f.commands).anyMatch(command -> command.startsWith("listIndexes "));
             assertThat(f.commands).anyMatch(command -> command.equals("find cache_identity")).anyMatch(command -> command.equals("find srs_models"));
-            f.commands.clear();
-            assertThat(f.verify(1)).isEqualTo(f.model(0));
+            var version0 = f.model(0); f.commands.clear();
+            assertThat(f.verify(1)).isEqualTo(version0);
             assertThat(f.commands).as("a leased verification").isEmpty();
             f.advance(1);
             assertThat(f.commands).as("a leased read advance").containsExactlyElementsOf(LEASED_WRITE);
@@ -136,10 +136,11 @@ class SrsConsumerLeaseIT {
         withConsumer(f -> {
             f.verify(0); f.commands.clear();
             // The capture owner publishes version 1 from sequence 100 through its own stores, which share nothing with this lease.
-            f.models.publish(model(1, 100), f.captureFence()); f.commands.clear();
-            assertThat(f.verify(50)).isEqualTo(f.model(0));
+            f.models.publish(model(1, 100), f.captureFence());
+            var version0 = f.model(0); var version1 = f.model(1); f.commands.clear();
+            assertThat(f.verify(50)).isEqualTo(version0);
             assertThat(f.commands).as("the window the lease accepts: version 0 is still open-ended here").isEmpty();
-            assertThat(f.verify(100, 1)).isEqualTo(f.model(1));
+            assertThat(f.verify(100, 1)).isEqualTo(version1);
             assertThat(f.commands).as("the first event of the new version proves").anyMatch(command -> command.equals("find srs_models"));
             f.commands.clear();
             // That proof read version 0 again, so the lease now holds it closed at 100: the refusal is a proof's, not the lease's.
@@ -147,7 +148,7 @@ class SrsConsumerLeaseIT {
             assertThat(f.commands).anyMatch(command -> command.equals("find srs_models"));
             f.commands.clear();
             f.verify(0); f.commands.clear();
-            assertThat(f.verify(99, 0)).isEqualTo(f.model(0)); assertThat(f.verify(101, 1)).isEqualTo(f.model(1));
+            assertThat(f.verify(99, 0)).isEqualTo(version0); assertThat(f.verify(101, 1)).isEqualTo(version1);
             assertThat(f.commands).as("both versions leased").isEmpty();
         });
     }
