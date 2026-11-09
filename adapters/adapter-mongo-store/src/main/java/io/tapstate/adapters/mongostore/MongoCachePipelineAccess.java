@@ -23,6 +23,8 @@ import java.util.function.Function;
 /** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
 final class MongoCachePipelineAccess {
     private static final String PIPELINE_SCOPE = "pipelineScope";
+    /** SPIKE: when set, writes fence on this per-vertex document instead of compare-and-setting the claim. */
+    volatile String spikeFenceId;
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     final MongoDatabase database;
@@ -120,7 +122,13 @@ final class MongoCachePipelineAccess {
                 try (var session = client.startSession()) {
                     T written = session.withTransaction(() -> {
                         requireActive.run();
-                        if (original == null || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
+                        if (spikeFenceId != null) {
+                            // SPIKE: compare-and-set this vertex instance's own fence document, read the claim in the snapshot.
+                            if (database.getCollection("spike_fences").updateOne(session, new Document("_id", spikeFenceId).append("claimGeneration", original.claimGeneration()),
+                                    new Document("$inc", new Document("writes", 1L))).getMatchedCount() != 1
+                                    || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, liveClaim()).first() == null) throw claimFenced();
+                        } else if (Boolean.getBoolean("spike.cas.read")) { if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, liveClaim()).first() == null) throw claimFenced(); }
+                        else if (original == null || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
                                 new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
                         T result = action.apply(session);
                         requireActive.run();

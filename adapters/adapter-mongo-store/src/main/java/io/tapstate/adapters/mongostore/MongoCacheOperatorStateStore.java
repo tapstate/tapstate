@@ -5,6 +5,7 @@ import com.mongodb.client.model.ReplaceOptions;
 import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.WriteModel;
+import com.mongodb.client.MongoCollection;
 import java.util.ArrayList;
 import io.tapstate.spi.store.LeasedStateStore;
 import io.tapstate.spi.store.NestReleaseStore;
@@ -232,6 +233,71 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     }
 
     @Override public void dropLease() { lease.set(null); }
+
+    /** SPIKE: the namespace name this store accepts. */
+    String placementName() { return mapName; }
+
+    /** SPIKE: one namespace's share of a vertex group. */
+    record GroupPart(MongoCacheOperatorStateStore store, Map<String, byte[]> writes, Collection<String> deletes) {}
+
+    /** SPIKE: how many claim compare-and-set attempts group commits made, retries included. */
+    static final AtomicLong GROUP_ATTEMPTS = new AtomicLong();
+    /** SPIKE: called inside the transaction after each part's payload; a test throws from it to stand in for a crash. */
+    static volatile java.util.function.IntConsumer afterPart = i -> {};
+
+    /**
+     * SPIKE: every namespace of one vertex group in one transaction, with one claim compare-and-set, one inventory
+     * check that names every placement, and one bulk write per table. Every part must stand on the same claim and
+     * the same cache; each proves its own lease first if it holds none.
+     */
+    static void commitGroup(List<GroupPart> parts) {
+        if (parts.isEmpty()) return;
+        var first = parts.get(0).store();
+        for (var part : parts) {
+            if (part.store().access != first.access && (part.store().access.database != first.access.database
+                    || !part.store().access.scope.equals(first.access.scope))) throw MongoCachePipelineAccess.fenced();
+            if (part.store().validation != Validation.LEASE) throw new IllegalStateException("group commit needs the lease mode");
+        }
+        List<Lease> proved = new ArrayList<>();
+        for (var part : parts) {
+            Lease current = part.store().lease.get();
+            if (current == null || System.nanoTime() - current.deadlineNanos() >= 0 || !current.writes()) current = part.store().prove(true);
+            proved.add(current);
+        }
+        String preparation = proved.get(0).preparationId(); long revision = 0;
+        for (Lease l : proved) { if (!l.preparationId().equals(preparation)) throw first.access.unreadable("operator-inventory"); revision = Math.max(revision, l.inventoryRevision()); }
+        Map<String, Map.Entry<MongoCollection<Document>, List<WriteModel<Document>>>> byTable = new LinkedHashMap<>();
+        List<Document> locations = new ArrayList<>();
+        for (var part : parts) {
+            var store = part.store(); locations.add(MongoOperatorInventory.location(store.placement));
+            var collection = store.table.on(store.target);
+            var models = byTable.computeIfAbsent(collection.getNamespace().getFullName(), n -> Map.entry(collection, new ArrayList<>())).getValue();
+            part.writes().forEach((key, value) -> { Document id = store.id(key);
+                models.add(new ReplaceOneModel<>(new Document("_id", id), store.row(id, value.clone()), new ReplaceOptions().upsert(true))); });
+            for (String key : part.deletes()) models.add(new com.mongodb.client.model.DeleteOneModel<>(new Document("_id", store.id(key))));
+        }
+        long minimum = revision;
+        try {
+            first.access.leasedWrite(first.committed, session -> {
+                GROUP_ATTEMPTS.incrementAndGet();
+                var filter = new Document("_id", MongoPipelinePreparationFacts.scope(first.placement.scope()))
+                        .append("preparationId", preparation).append("revision", new Document("$gte", minimum))
+                        .append("placements", new Document("$all", locations)).append("retirement", new Document("$exists", false));
+                if (SystemCollections.CACHE_OPERATOR_CLEANUP.on(first.access.database).find(session, filter).projection(new Document("_id", 1)).first() == null)
+                    throw first.access.unreadable("operator-inventory");
+                int i = 0;
+                for (var entry : byTable.entrySet()) {
+                    if (!entry.getValue().getValue().isEmpty()) entry.getValue().getKey().bulkWrite(session, entry.getValue().getValue(), new BulkWriteOptions().ordered(true));
+                    afterPart.accept(i++);
+                }
+                return null;
+            });
+        } catch (RuntimeException failure) {
+            for (var part : parts) if (part.store().lease.getAndSet(null) != null) LEASE_LOSSES.incrementAndGet();
+            throw failure;
+        }
+    }
+
 
     /**
      * Proves a lease now, as an explicit open: for a store holding a claim this registers its placement and
