@@ -26,4 +26,19 @@ interface NestStateGauge {
     /** Additional key-unit instruments; existing gauges may continue to publish only legacy readings. */
     default void keyReading(String namespace, long keyAccesses, long coldKeys) {
     }
+
+    /**
+     * How many whole documents the root level has sent since the run began. Only a level that renders
+     * documents ever leaves one; every other namespace leaves none, which is absence rather than zero.
+     * {@code countingSinceMillis} is when the count began, in epoch milliseconds.
+     */
+    /**
+     * How the namespace's state has been made durable since its counting began, and how many entries memory
+     * has let go of. Left only once the namespace has committed something.
+     */
+    default void commitReading(String namespace, NestStateStats.Commits commits, long evictions) {
+    }
+
+    default void rootsReading(String namespace, long rootsRendered, long countingSinceMillis) {
+    }
 }

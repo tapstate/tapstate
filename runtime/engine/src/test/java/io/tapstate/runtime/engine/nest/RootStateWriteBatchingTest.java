@@ -39,6 +39,19 @@ class RootStateWriteBatchingTest {
                 .containsExactlyElementsOf(java.util.stream.IntStream.range(0, 32).boxed().toList());
     }
 
+    @Test void everyDocumentSentIsCountedAndADocumentHeldBackIsNot() throws Exception {
+        Fixture f = new Fixture(NestSendPolicy.within(50), 128);
+        f.customers.remove(List.of("C1"));
+        f.feed(32, false);
+        assertThat(f.drain()).isEmpty();
+        assertThat(f.roots.rendered).isZero();
+
+        Fixture sent = new Fixture(NestSendPolicy.everyChange(), 128);
+        sent.feed(32, false);
+        assertThat(sent.drain()).hasSize(32);
+        assertThat(sent.roots.rendered).isEqualTo(32);
+    }
+
     @Test void independentSnapshotRootsUseBatchReadsOnTheFoldingPolicyToo() throws Exception {
         Fixture f = new Fixture(NestSendPolicy.within(0), 128);
         f.feed(32, false);
@@ -383,6 +396,7 @@ class RootStateWriteBatchingTest {
         int singleWrites;
         int singleReads;
         int batchReads;
+        long rendered;
         boolean failBatch;
         int failuresLeft;
         @Override public RootAssembly load(Object key) { singleReads++; return read(key); }
@@ -417,5 +431,6 @@ class RootStateWriteBatchingTest {
         }
         @Override public void remove(Object key) { durable.remove(key); }
         @Override public long count() { return durable.size(); }
+        @Override public void rendered(long documents) { rendered += documents; }
     }
 }

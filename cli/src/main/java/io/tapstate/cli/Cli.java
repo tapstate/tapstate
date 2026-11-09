@@ -165,6 +165,9 @@ public final class Cli implements Runnable {
             Map.entry("pipeline.snapshot", "snapshot"),
             Map.entry("pipeline.logs", "logs"),
             Map.entry("pipeline.explain", "explain"),
+            Map.entry("pipeline.nest.progress", "nest"),
+            Map.entry("pipeline.nest.inspect", "nest"),
+            Map.entry("pipeline.nest.explain", "explain"),
             Map.entry("pipeline.position", "position"),
             Map.entry("pipeline.set-position", "position"),
             // Both on one verb, as the three token operations are: what a reader is doing is looking at
@@ -283,6 +286,8 @@ public final class Cli implements Runnable {
                     "Show current counters, or bounded history with paired --from/--to.")),
             Map.entry("snapshot", new VerbHelp("<pipeline-id>",
                     "Show a pipeline's per-table snapshot progress.")),
+            Map.entry("nest", new VerbHelp("progress <pipeline-id> [<step>] | inspect <pipeline-id> <step> <root-key>...",
+                    "Show a nest step's load progress, or what it holds for one document.")),
             Map.entry("derived-schema", new VerbHelp("<pipeline-id> [--accept]",
                     "Compare a join's recorded and current columns; --accept re-reads the sources.")),
             Map.entry("logs", new VerbHelp("<pipeline-id> [--follow]",

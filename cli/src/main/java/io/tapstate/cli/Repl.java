@@ -182,7 +182,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration");
+            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration", "nest");
 
     private final CommandLine commandLine;
 
@@ -886,6 +886,10 @@ final class Repl {
         // flag and leave the verb doing a plain read while reporting success.
         if (words.get(0).equals("derived-schema")) {
             return derivedSchemaOnline(words);
+        }
+        // `nest` names what it reads with a sub-verb before the pipeline, so it parses its own words.
+        if (words.get(0).equals("nest")) {
+            return nestOnline(words);
         }
         // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
         // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
@@ -4028,6 +4032,9 @@ final class Repl {
     }
 
     private int explainOnline(List<String> words) {
+        if (words.size() == 3 && !words.get(2).isBlank() && !words.get(2).startsWith("-")) {
+            return nestExplainOnline(words.get(1), words.get(2));
+        }
         String id = readTargetId(words);
         if (id == null) {
             return Cli.EXIT_USAGE;
@@ -4412,6 +4419,328 @@ final class Repl {
             return null;
         }
         return words.get(1);
+    }
+
+    static final String NEST_USAGE =
+            "nest progress <pipeline-id> [<step>] | nest inspect <pipeline-id> <step> <root-key>...";
+
+    /**
+     * {@code nest progress <pipeline-id> [<step>]}: how far each nest step's load has got and what it is
+     * waiting for, one block per step. Every number is one the pipeline already published, so this agrees
+     * with {@code snapshot} and {@code metrics}; a number the pipeline has not reported prints as {@code -}.
+     */
+    private int nestOnline(List<String> words) {
+        if (words.size() >= 2 && "inspect".equals(words.get(1))) {
+            return nestInspectOnline(words);
+        }
+        PrintWriter err = commandLine.getErr();
+        if (words.size() < 3 || words.size() > 4 || !"progress".equals(words.get(1))
+                || words.subList(2, words.size()).stream().anyMatch(word -> word.isBlank() || word.startsWith("-"))) {
+            err.println("nest: usage: " + NEST_USAGE);
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = words.get(2);
+        String step = words.size() == 4 ? words.get(3) : null;
+        NestProgressOutcome outcome = withFailover(() ->
+                controlPlane.nestProgress(session.landingNode(), session.credential(), id, step),
+                o -> o instanceof NestProgressOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case NestProgressOutcome.Found found -> {
+                renderNestProgress(out, found);
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case NestProgressOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
+            case NestProgressOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /**
+     * {@code nest inspect <pipeline> <step> <root key>...}: what one nest step holds for one document, one
+     * value per root key column. Words after the step are the key, so a key value that begins with a dash is
+     * still refused: it reads as a flag this verb does not take.
+     */
+    private int nestInspectOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (words.size() < 5 || words.get(2).isBlank() || words.get(3).isBlank()
+                || words.get(2).startsWith("-") || words.get(3).startsWith("-")) {
+            err.println("nest: usage: " + NEST_USAGE);
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = words.get(2);
+        String step = words.get(3);
+        List<String> key = List.copyOf(words.subList(4, words.size()));
+        NestInspectOutcome outcome = withFailover(() ->
+                controlPlane.nestInspect(session.landingNode(), session.credential(), id, step, key),
+                o -> o instanceof NestInspectOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case NestInspectOutcome.Found found -> {
+                renderNestInspect(out, found.view());
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case NestInspectOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
+            case NestInspectOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /**
+     * {@code explain <pipeline> <step>} on a nest step: the tree it compiles to - for each embed whether the
+     * document owns its rows or points at a shared one, which way the join resolved and the limit it runs
+     * under - whether its load can take the build path, what a sample of each table said, and the warnings
+     * that sample raised, each with what to change.
+     */
+    private int nestExplainOnline(String id, String step) {
+        NestExplainOutcome outcome = withFailover(() ->
+                controlPlane.nestExplain(session.landingNode(), session.credential(), id, step),
+                o -> o instanceof NestExplainOutcome.Unreachable);
+        PrintWriter out = commandLine.getOut();
+        return switch (outcome) {
+            case NestExplainOutcome.Found found -> {
+                renderNestExplain(out, found.view());
+                out.flush();
+                yield Cli.EXIT_OK;
+            }
+            case NestExplainOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
+            case NestExplainOutcome.Unreachable ignored -> reportRequestFailed();
+        };
+    }
+
+    /** What {@code explain <pipeline> <step>} prints for a nest step. */
+    static void renderNestExplain(PrintWriter out, Map<?, ?> view) {
+        Map<?, ?> tree = (Map<?, ?>) view.get("tree");
+        out.println(tree.get("pipelineId") + "  step " + tree.get("step") + "  root " + tree.get("rootAlias")
+                + "  key " + joined(tree.get("rootKey")));
+        out.println("  at most " + tree.get("elementLimit") + " elements per document");
+        out.println("  build: " + view.get("build"));
+        Map<String, Map<?, ?>> samples = new LinkedHashMap<>();
+        if (view.get("samples") instanceof List<?> list) {
+            for (Object entry : list) {
+                if (entry instanceof Map<?, ?> sample) {
+                    samples.put(sample.get("path") + "|" + sample.get("alias"), sample);
+                }
+            }
+        }
+        out.println("  embeds:");
+        if (tree.get("embeds") instanceof List<?> embeds && !embeds.isEmpty()) {
+            renderNestLevels(out, embeds, samples, "    ");
+        } else {
+            out.println("    none");
+        }
+        if (view.get("warnings") instanceof List<?> warnings && !warnings.isEmpty()) {
+            out.println("  warnings:");
+            for (Object entry : warnings) {
+                if (entry instanceof Map<?, ?> warning) {
+                    out.println("    " + warning.get("code") + "  " + warning.get("embed"));
+                    out.println("      " + warning.get("message"));
+                    if (warning.get("solution") != null) {
+                        out.println("      " + warning.get("solution"));
+                    }
+                }
+            }
+        } else {
+            out.println("  warnings: none from the sample");
+        }
+    }
+
+    private static void renderNestLevels(PrintWriter out, List<?> levels, Map<String, Map<?, ?>> samples,
+            String indent) {
+        for (Object entry : levels) {
+            if (!(entry instanceof Map<?, ?> level)) {
+                continue;
+            }
+            boolean owned = Boolean.TRUE.equals(level.get("owned"));
+            StringBuilder join = new StringBuilder();
+            if (level.get("on") instanceof Map<?, ?> on) {
+                for (Map.Entry<?, ?> pair : on.entrySet()) {
+                    join.append(join.isEmpty() ? "" : ", ").append(pair.getKey()).append(" = parent ")
+                            .append(pair.getValue());
+                }
+            }
+            out.println(indent + level.get("path") + "  from " + level.get("alias") + "  as " + level.get("as")
+                    + "  " + (owned ? "owned, gathered: each row names its one parent"
+                            : "shared, referenced: the parent names the row, at most " + level.get("referrerLimit")
+                                    + " documents per row")
+                    + (join.isEmpty() ? "" : "  on " + join));
+            Map<?, ?> sample = samples.get(level.get("path") + "|" + level.get("alias"));
+            if (sample != null) {
+                out.println(indent + "  sample: " + nestSampleLine(sample, owned));
+            }
+            if (level.get("children") instanceof List<?> children && !children.isEmpty()) {
+                renderNestLevels(out, children, samples, indent + "  ");
+            }
+        }
+    }
+
+    private static String nestSampleLine(Map<?, ?> sample, boolean owned) {
+        if (sample.get("notSampled") != null) {
+            return "not sampled: " + sample.get("notSampled");
+        }
+        String where = sample.get("source") + "." + sample.get("table") + ", "
+                + (sample.get("tableRows") == null ? "row count unknown" : sample.get("tableRows") + " rows");
+        String largest = owned
+                ? "at most " + sample.get("largestInSample") + " under one parent"
+                : "at most " + sample.get("largestInSample") + " parent(s) on one row";
+        String average = !(sample.get("averagePerParent") instanceof Number mean) ? ""
+                : "; about " + String.format(Locale.ROOT, "%.1f", mean.doubleValue())
+                        + (owned ? " per document" : " documents per row");
+        return where + "; " + largest + " in " + sample.get("sampledRows") + " rows read" + average;
+    }
+
+    private static String joined(Object values) {
+        return values instanceof List<?> list
+                ? String.join(", ", list.stream().map(String::valueOf).toList()) : String.valueOf(values);
+    }
+
+    /**
+     * What {@code nest inspect} prints: the key, whether the root row is in and at what order, one row per
+     * part with its order and whether it is a record of a deletion, what waits for a parent, the references
+     * found missing, and the document - as the step last rendered it, or as it will next render it when changes
+     * are unsent.
+     */
+    static void renderNestInspect(PrintWriter out, Map<?, ?> view) {
+        out.println(view.get("pipelineId") + "  step " + view.get("step") + "  root key "
+                + pairs(view.get("rootKeyColumns"), view.get("rootKey")));
+        boolean present = Boolean.TRUE.equals(view.get("rootPresent"));
+        Object rootOrder = view.get("rootOrder");
+        out.println("  root row: " + (present ? "present, order " + rootOrder
+                : rootOrder == null ? "not arrived; what is below waits for it"
+                        : "deleted at order " + rootOrder + "; what is below is kept for a replay"));
+        List<String[]> rows = new ArrayList<>();
+        rows.add(new String[] {"PATH", "KEY", "ORDER", "STATE"});
+        if (view.get("parts") instanceof List<?> parts) {
+            for (Object entry : parts) {
+                if (entry instanceof Map<?, ?> part) {
+                    rows.add(new String[] {String.valueOf(part.get("path")), JsonOut.compact(part.get("key")),
+                            String.valueOf(part.get("order")),
+                            Boolean.TRUE.equals(part.get("deleted")) ? "deleted" : present ? "in document" : "held"});
+                }
+            }
+        }
+        out.println("  parts:");
+        if (rows.size() == 1) {
+            out.println("    (none)");
+        } else {
+            printColumns(out, rows, "    ");
+        }
+        if (view.get("waiting") instanceof List<?> waiting && !waiting.isEmpty()) {
+            out.println("  waiting for a parent row:");
+            for (Object entry : waiting) {
+                if (entry instanceof Map<?, ?> held) {
+                    out.println("    " + held.get("held") + " change(s) under " + held.get("path")
+                            + " " + held.get("parentKey") + ", which has not arrived");
+                }
+            }
+        }
+        if (view.get("missing") instanceof List<?> missing && !missing.isEmpty()) {
+            out.println("  references with no row:");
+            for (Object entry : missing) {
+                if (entry instanceof Map<?, ?> reference) {
+                    out.println("    " + reference.get("path") + " -> " + JsonOut.compact(reference.get("key")));
+                }
+            }
+        }
+        if (Boolean.TRUE.equals(view.get("inTransit"))) {
+            out.println("  a subtree is being moved between this document and another");
+        }
+        long unsent = view.get("unsent") instanceof Number n ? n.longValue() : 0L;
+        Object document = view.get("document");
+        if (document == null) {
+            out.println("  document: none while the root row is absent; " + unsent + " change(s) held");
+        } else {
+            out.println(unsent == 0 ? "  document, as the step last rendered it:"
+                    : "  document, as the step will next render it (" + unsent + " change(s) not yet sent):");
+            for (String line : JsonOut.write(document).split("\n", -1)) {
+                out.println("    " + line);
+            }
+        }
+    }
+
+    private static String pairs(Object columns, Object values) {
+        if (!(columns instanceof List<?> names) || !(values instanceof List<?> key) || names.size() != key.size()) {
+            return JsonOut.compact(values);
+        }
+        List<String> pairs = new ArrayList<>();
+        for (int i = 0; i < names.size(); i++) {
+            pairs.add(names.get(i) + "=" + key.get(i));
+        }
+        return String.join(", ", pairs);
+    }
+
+    private static void printColumns(PrintWriter out, List<String[]> rows, String indent) {
+        int[] widths = new int[rows.getFirst().length];
+        for (String[] row : rows) {
+            for (int i = 0; i < row.length; i++) {
+                widths[i] = Math.max(widths[i], row[i].length());
+            }
+        }
+        for (String[] row : rows) {
+            StringBuilder line = new StringBuilder(indent);
+            for (int i = 0; i < row.length; i++) {
+                line.append(i == row.length - 1 ? row[i] : String.format("%-" + widths[i] + "s  ", row[i]));
+            }
+            out.println(line.toString().stripTrailing());
+        }
+    }
+
+    static void renderNestProgress(PrintWriter out, NestProgressOutcome.Found found) {
+        out.println(found.pipelineId() + "  " + lowerOrDash(found.state())
+                + (found.phase() == null ? "" : "  initial load: " + lowerOrDash(found.phase())));
+        for (NestProgressOutcome.Step step : found.steps()) {
+            out.println();
+            out.println("step " + step.step() + ": " + nestActivityLine(found.state(), step));
+            out.println("  documents sent: " + dash(step.rootsRendered())
+                    + (step.rootsEstimate() == null ? "" : " of about " + step.rootsEstimate()
+                            + " " + step.rootTable() + " rows"));
+            List<String[]> rows = new ArrayList<>();
+            rows.add(new String[] {"TABLE", "PATH", "LOAD", "READ", "ESTIMATE"});
+            for (NestProgressOutcome.Table table : step.tables()) {
+                rows.add(new String[] {table.table(),
+                        table.path() == null || table.path().isEmpty() ? "(root)" : table.path(),
+                        lowerOrDash(table.stage()), dash(table.rowsRead()), dash(table.rowsEstimate())});
+            }
+            int[] widths = new int[5];
+            for (String[] row : rows) {
+                for (int i = 0; i < row.length; i++) {
+                    widths[i] = Math.max(widths[i], row[i].length());
+                }
+            }
+            for (String[] row : rows) {
+                StringBuilder line = new StringBuilder("  ");
+                for (int i = 0; i < row.length; i++) {
+                    line.append(i == row.length - 1 ? row[i] : String.format("%-" + widths[i] + "s  ", row[i]));
+                }
+                out.println(line.toString().stripTrailing());
+            }
+        }
+    }
+
+    /** One sentence naming what a step is doing and, when it is held, the tables to look at. */
+    private static String nestActivityLine(String state, NestProgressOutcome.Step step) {
+        String waiting = String.join(", ", step.waitingFor());
+        return switch (step.activity() == null ? "" : step.activity()) {
+            case "NOT_RUNNING" -> "not moving; the pipeline is " + lowerOrDash(state);
+            case "LOADING" -> "loading; waiting for " + waiting + " to be read";
+            case "LANDING" -> "every table read; waiting for the target to confirm " + waiting;
+            case "MAINTAINING" -> "load complete; applying changes as they arrive";
+            case "COMPLETED" -> "load complete; the pipeline has finished";
+            default -> "no load reported for some or all of its tables";
+        };
+    }
+
+    private static String dash(Long value) {
+        return value == null ? "-" : value.toString();
+    }
+
+    private static String lowerOrDash(String value) {
+        return value == null ? "-" : value.toLowerCase(Locale.ROOT);
     }
 
     /**

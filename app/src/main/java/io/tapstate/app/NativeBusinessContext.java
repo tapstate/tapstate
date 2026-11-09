@@ -487,6 +487,16 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 HazelcastInstance member, NestSettings nests, Clock clock) {
             return new BoundedPipelinePreviewExecutor(store, connectors, member, nests, clock);
         }
+        @Bean io.tapstate.control.core.NestStateInspector nestStateInspector(Engine engine, DagSource dags, HazelcastInstance member) {
+            return new EngineNestStateInspector(engine, dags, member);
+        }
+        /** What a nest step compiles to, for explaining it before it runs; a step that is not one is a defect here. */
+        @Bean
+        io.tapstate.control.core.NestTreeReader nestTreeReader(DagSource dags) {
+            return (pipelineId, step) -> dags.nestTree(pipelineId, step).orElseThrow(() -> new IllegalStateException(
+                    "step " + step + " of " + pipelineId + " was checked to be a nest step but compiles to none"));
+        }
+
         @Bean HazelcastExecutionPlans executionPlans(HazelcastInstance member) { return new HazelcastExecutionPlans(member); }
         @Bean EngineLifecycleActuator lifecycleActuator(NativeBusinessContext owner, Engine engine, DagSource dags,
                 PipelineCaptureCoordinator captures, PipelineActuationOwnership ownership, HazelcastExecutionPlans plans,

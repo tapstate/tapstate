@@ -380,6 +380,26 @@ public final class ControlOperations {
     // own reason to be there mostly goes with it: the two things it adds over the metrics face -- who
     // else reads the chain, and when the position was recorded -- are what you look at before editing.
     // Where a pipeline stands is on that face already.
+    // A nest step's view of its own load and documents, read off what the pipeline already published plus
+    // its definition. CLI-first: the progress reading is a projection over the same observation the
+    // snapshot and metrics faces read, and the model-facing surface can reach those already.
+    public static final Operation PIPELINE_NEST_PROGRESS = new Operation(
+            "pipeline.nest.progress", Scope.READ, false, null, CLI_ONLY);
+
+    /**
+     * What one nest step holds for one root key: its parts and their source orders, what waits for a parent,
+     * and the document as it stands. Row data, read like the data browser reads it.
+     */
+    public static final Operation PIPELINE_NEST_INSPECT = new Operation(
+            "pipeline.nest.inspect", Scope.READ, false, null, CLI_ONLY);
+
+    /**
+     * What one nest step compiles to, and what a sample of its sources says about the shapes it assumes.
+     * Reads a few rows of each table it embeds, through the data browser's own read-only probes.
+     */
+    public static final Operation PIPELINE_NEST_EXPLAIN = new Operation(
+            "pipeline.nest.explain", Scope.READ, false, null, CLI_ONLY);
+
     public static final Operation PIPELINE_POSITION = new Operation(
             "pipeline.position", Scope.READ, false, null, CLI_ONLY);
     public static final Operation PIPELINE_SET_POSITION = new Operation(
@@ -497,6 +517,9 @@ public final class ControlOperations {
             PIPELINE_LOGS,
             PIPELINE_METRICS_HISTORY,
             PIPELINE_EXPLAIN,
+            PIPELINE_NEST_PROGRESS,
+            PIPELINE_NEST_INSPECT,
+            PIPELINE_NEST_EXPLAIN,
             PIPELINE_POSITION,
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,

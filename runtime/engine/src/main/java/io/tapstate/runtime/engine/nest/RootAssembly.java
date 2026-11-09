@@ -966,6 +966,48 @@ public final class RootAssembly implements Serializable {
         return deletionsIn(children);
     }
 
+    /**
+     * What this document holds, read for a person rather than for the next change: the root's order, every
+     * part beneath it depth first, the parts waiting for a parent, and the references found missing. A
+     * rendered view built fresh on each call; nothing in it reaches back into this state.
+     */
+    Inspected inspect() {
+        List<Inspected.Part> parts = new ArrayList<>();
+        partsIn(children, "", parts);
+        List<Inspected.Waiting> waits = new ArrayList<>();
+        waiting.forEach((on, held) -> waits.add(
+                new Inspected.Waiting(String.join(".", on.pathId()), String.valueOf(on.identity()), held.size())));
+        List<Inspected.Missing> missing = new ArrayList<>();
+        if (missingObjectReferences != null) {
+            for (MissingObjectReference reference : missingObjectReferences) {
+                missing.add(new Inspected.Missing(String.join(".", reference.path()), reference.key()));
+            }
+        }
+        // A change to the root, or to a row it points at, waits for its send beside the parked parts: it is
+        // folded into one rewrite, so however many arrived it counts once.
+        long unsent = pending() + (fromRoot.lowest.isEmpty() ? 0 : 1);
+        return new Inspected(rootPresent, rootOrder, parts, waits, missing, unsent);
+    }
+
+    /** This document as {@link #inspect} reads it; parts carry their source order and whether they are gone. */
+    record Inspected(boolean rootPresent, SourceOrder rootOrder, List<Part> parts, List<Waiting> waiting,
+            List<Missing> missing, long unsent) {
+        record Part(String path, List<Object> key, SourceOrder order, boolean deleted) { }
+        record Waiting(String path, String parentKey, int held) { }
+        record Missing(String path, List<Object> key) { }
+    }
+
+    private static void partsIn(Map<String, Map<List<Object>, ElementNode>> nodes, String above,
+            List<Inspected.Part> into) {
+        nodes.forEach((field, elements) -> {
+            String path = above.isEmpty() ? field : above + "." + field;
+            elements.forEach((key, node) -> {
+                into.add(new Inspected.Part(path, key, node.order(), node.deleted()));
+                partsIn(node.children(), path, into);
+            });
+        });
+    }
+
     /** Logical root payload retained even when an embed shadows a raw field in the rendered document. */
     long rootPayloadBytes() {
         return io.tapstate.core.event.PayloadBytes.ofRow(rootFields);

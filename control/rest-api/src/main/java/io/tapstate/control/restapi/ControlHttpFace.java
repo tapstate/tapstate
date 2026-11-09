@@ -60,6 +60,7 @@ import java.util.List;
         PipelinePreviewController.class, ValidationConfigurationController.class, ValidationReportController.class,
         SourceDraftController.class,
         DerivedSchemaController.class,
+        NestController.class,
         ApiExceptionHandler.class})
 public class ControlHttpFace {
 

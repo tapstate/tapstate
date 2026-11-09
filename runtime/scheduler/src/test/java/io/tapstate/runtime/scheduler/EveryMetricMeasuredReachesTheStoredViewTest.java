@@ -2,6 +2,8 @@ package io.tapstate.runtime.scheduler;
 
 import io.tapstate.core.lifecycle.FlatMetricProjection;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.HistogramBounds;
+import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.MetricAttributes;
 import io.tapstate.core.lifecycle.MetricFact;
 import io.tapstate.core.lifecycle.MetricPoint;
@@ -11,6 +13,7 @@ import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
+import io.tapstate.core.lifecycle.StateCommitReading;
 import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.DisplayName;
@@ -19,6 +22,8 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -58,7 +63,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 id -> Map.of("chain-a", 4L),
                 id -> Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
-                                .withKeyCounts(1_200L, 60L)),
+                                .withKeyCounts(1_200L, 60L).withRootsRendered(250L, LOAD_BEGAN)
+                                .withCommits(commits())),
                 new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
                 id -> Map.of("chain-b", 61_000L),
                 new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
@@ -66,6 +72,21 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 id -> Map.of("orders.region", 120L),
                 id -> Map.of("orders.region", 1_000L),
                 Clock.fixed(AT, ZoneOffset.UTC));
+    }
+
+    /** Two commit groups of one key each, every one a single round trip, and one entry let go of. */
+    private static StateCommitReading commits() {
+        return new StateCommitReading(2L,
+                histogram(HistogramBounds.STATE_COMMIT_KEYS, 2L, 2.0, 0),
+                histogram(HistogramBounds.STATE_COMMIT_ROUND_TRIPS, 2L, 2.0, 0),
+                histogram(HistogramBounds.STATE_COMMIT_DURATION, 2L, 0.002, 1),
+                1L, LOAD_BEGAN);
+    }
+
+    private static HistogramValue histogram(HistogramBounds bounds, long count, double sum, int bucket) {
+        List<Long> counts = new ArrayList<>(Collections.nCopies(bounds.buckets(), 0L));
+        counts.set(bucket, count);
+        return bounds.value(count, sum, counts);
     }
 
     /** One table's finished load, with a total, so both of the load's measurements are in play. */
@@ -84,7 +105,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         List<MetricFact> measured = publisher.facts("orders", PipelineState.RUNNING, AT,
                 Map.of("nest.orders.doc.$root",
                         new NestStateReading(4_000L, 900L, 30L, 210L, 9_512L, OptionalLong.of(400_000L))
-                                .withKeyCounts(1_200L, 60L)),
+                                .withKeyCounts(1_200L, 60L).withRootsRendered(250L, LOAD_BEGAN)
+                                .withCommits(commits())),
                 Map.of("chain-a", 4L), Map.of("chain-b", 61_000L),
                 Map.of("nest.orders.doc.$root", 3L), Map.of("orders.region", 120L),
                 Map.of("orders.region", 1_000L), loaded());
@@ -92,14 +114,18 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
         // empty set: the count is asserted before the two are compared. Failures are the one family with
         // no source to wire -- they are counted from a cause handed over on a witnessing pass, so they are
         // absent here and are covered by the case that feeds one.
-        assertThat(measured).hasSize(16);
+        assertThat(measured).hasSize(22);
         FlatMetricProjection flat = FlatMetricProjection.of(measured, ObservationPublisher.FLAT_REDUCTIONS);
         // The load's two measurements are the only ones this face cannot carry, and it says so rather than
         // letting them go missing. They are not lost with them: the same observation carries the same load
         // as its own snapshot dataset, asserted below, which is the face this drop points at. Putting them
         // on this one as well would spell one number two ways in one document.
+        // The three commit distributions have no flat spelling, as no distribution does; the facts carry
+        // them whole.
         assertThat(flat.dropped()).containsExactlyInAnyOrder(
-                "tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total");
+                "tapstate.pipeline.snapshot.rows", "tapstate.pipeline.snapshot.rows.total",
+                "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips",
+                "tapstate.pipeline.state.commit.duration");
         // The families that carry a chain or a namespace as an attribute reach this face squeezed back to
         // one key per value, and the projection says so: a reader of this face is told what they are
         // reading, and a family added with an attribute and no flat spelling lands in the list above.
@@ -109,7 +135,8 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "tapstate.pipeline.nest.backfills", "tapstate.pipeline.nest.backfill.time",
                 "tapstate.pipeline.nest.key.accesses", "tapstate.pipeline.nest.cold.keys",
                 "tapstate.pipeline.nest.pending.high_water", "tapstate.pipeline.nest.stored",
-                "tapstate.pipeline.nest.dead_lettered",
+                "tapstate.pipeline.nest.dead_lettered", "tapstate.pipeline.nest.roots.rendered",
+                "tapstate.pipeline.state.commit.groups", "tapstate.pipeline.state.evictions",
                 "tapstate.pipeline.join.recompute.rows", "tapstate.pipeline.join.recompute.rows.total",
                 "tapstate.pipeline.records.driven");
 
@@ -131,6 +158,9 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 "nestStatePendingHighWater.nest.orders.doc.$root",
                 "nestStateStored.nest.orders.doc.$root",
                 "nestDeadLettered.nest.orders.doc.$root",
+                "nestRootsRendered.nest.orders.doc.$root",
+                "stateCommitGroups.nest.orders.doc.$root",
+                "stateEvictions.nest.orders.doc.$root",
                 "joinRecomputeRowsDone.orders.region",
                 "joinRecomputeRowsExpected.orders.region");
         assertThat(published.metrics())

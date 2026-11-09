@@ -934,6 +934,36 @@ monitor.cursor-expired:
 monitor.query-budget-exceeded:
   message: "The {operation} query exceeded the {budget} budget of {limit}."
   solution: "Narrow the time range or select fewer table series, then start a new query."
+monitor.no-nest-step:
+  message: "Pipeline {pipeline} has no nest step, so there is no nest progress or document to show."
+  solution: "Run 'tapstate get {pipeline}' to see its steps; nest commands apply only to a step with 'type: nest'."
+monitor.unknown-nest-step:
+  message: "Pipeline {pipeline} has no nest step named {step}."
+  solution: "Name one of its nest steps instead: {steps}."
+monitor.nest-not-running:
+  message: "Pipeline {pipeline} is not running on this node, so step {step} has no live state to read."
+  solution: "Start it with 'tapstate start {pipeline}', or run the command against the node that runs it. 'tapstate nest progress {pipeline}' works while it is stopped."
+monitor.nest-root-key-width:
+  message: "Step {step} of pipeline {pipeline} has a root key of {columns}, but {given} value(s) were given."
+  solution: "Give one value per root key column, in that order: {columns}."
+monitor.nest-root-key-not-held:
+  message: "Step {step} of pipeline {pipeline} holds nothing under root key {key}."
+  solution: "Check the value of {columns}: no row with that key, and no row pointing at it, has reached the step yet."
+monitor.nest-root-key-not-resolved:
+  message: "Step {step} of pipeline {pipeline} holds nothing under root key {key} as tried, but its columns {columns} could be stored as too many combinations of number and text types to try them all."
+  solution: "Check the target for the document by {columns} instead; this step cannot tell whether the key is held under a type combination it did not try."
+monitor.nest-object-key-not-unique:
+  message: "Embed {embed} is one row per parent, but {count} sampled rows of {table} matched one parent ({sampled} rows sampled)."
+  solution: "Use as: array if a parent really has several, or join on columns that match one row. Until then, as: object shows only the row changed most recently and drops the rest, and as: flat stops the run when a second live row arrives."
+monitor.nest-near-element-limit:
+  message: "Documents are estimated to hold about {count} elements under {embed} from {table}, near the per-document limit of {limit}."
+  solution: "Raise max_elements_per_document on the nest if documents really are this wide, or narrow what the embed takes in."
+monitor.nest-document-near-element-limit:
+  message: "No one embed is near the per-document limit of {limit}, but together {embeds} are estimated to put about {count} elements in one document."
+  solution: "Raise max_elements_per_document on the nest if documents really are this wide, or narrow what those embeds take in."
+monitor.nest-reference-widely-shared:
+  message: "One row of {table} behind {embed} is estimated to be pointed at by about {count} documents, near the per-row limit of {limit}."
+  solution: "Embed it from the other side so one change rewrites one document, or accept that each change to that row rewrites them all."
 artifact.in-use:
   message: "Artifact `{id}` is still referenced by: {referrers}."
   solution: "Delete or rewrite those resources first, then delete `{id}`."
@@ -1113,7 +1143,7 @@ nest.tombstone-limit-exceeded:
   solution: "A record of a deletion is kept only until a restart could no longer replay the deletion, so this many means the durable position is not advancing - find what is holding the frontier back rather than raising the limit, which only buys time."
 nest.parent-absent:
   message: "An event of chain {chain} in {bucket} at {order} hangs from a row that is gone, and was handed over after {heldFor} rather than placed in a document."
-  solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving."
+  solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving. Leave a short wait alone; for a long one, check the source for the parent row the event points at."
 nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident})."
   solution: "Raise this pipeline's in-memory entry budget so more of its working set stays resident, or accept the round trips if the throughput they allow is enough."
