@@ -146,8 +146,13 @@ class SrsConsumerLeaseIT {
             // That proof read version 0 again, so the lease now holds it closed at 100: the refusal is a proof's, not the lease's.
             code(() -> f.verify(100, 0), IoError.SRS_EVENT_MODEL_UNAVAILABLE);
             assertThat(f.commands).anyMatch(command -> command.equals("find srs_models"));
+            // The refusal ended the lease, so nothing carries: each version proves once more, then both are leased.
+            f.commands.clear(); f.verify(0);
+            assertThat(f.commands).as("the refusal ended the lease").anyMatch(command -> command.startsWith("listIndexes "));
+            f.commands.clear(); f.verify(101, 1);
+            assertThat(f.commands).as("a version the new lease has not proved proves").anyMatch(command -> command.equals("find srs_models"))
+                    .noneMatch(command -> command.startsWith("listIndexes "));
             f.commands.clear();
-            f.verify(0); f.commands.clear();
             assertThat(f.verify(99, 0)).isEqualTo(version0); assertThat(f.verify(101, 1)).isEqualTo(version1);
             assertThat(f.commands).as("both versions leased").isEmpty();
         });
