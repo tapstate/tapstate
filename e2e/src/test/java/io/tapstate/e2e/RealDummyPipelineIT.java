@@ -58,14 +58,18 @@ class RealDummyPipelineIT {
         Path published = published();
         Path seeds = Files.createDirectory(work.resolve("seed"));
         Files.copy(published, seeds.resolve("dummy-connector.jar"));
-        writeWorkspace(SNAPSHOT, "snapshot_only", 32, "[1]");
+        Path example = Path.of(System.getProperty("tapstate.e2e.dummy-example"));
+        for (String file : List.of("src_dummy.tap.yml", "tgt_dummy.tap.yml", "pipeline.tap.yml")) {
+            Files.copy(example.resolve(file), work.resolve(file));
+        }
         try (var storage = PreparedNativeStore.create(); var server = start(storage, seeds)) {
             var control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
             applyAndStart(server, storage, SNAPSHOT);
             awaitState(control, SNAPSHOT, PipelineState.COMPLETED);
             String observed = cli(server, storage, "status dummy_op_smoke\nmetrics dummy_op_smoke\nexit\n");
-            assertThat(observed).contains("dummy_op_smoke  completed", "snapshot.rowsDone = 32");
+            assertThat(observed).contains("dummy_op_smoke  completed", "stage=LANDED",
+                    "snapshot.rows.read.dummy_orders  32");
             assertThat(control.initialLoad(SNAPSHOT)).hasValueSatisfying(load -> {
                 assertThat(load.get("phase")).isEqualTo("COMPLETED");
                 assertThat(((Number) load.get("landedTables")).intValue()).isEqualTo(1);
@@ -75,17 +79,21 @@ class RealDummyPipelineIT {
             assertThat(control.errorCount(SNAPSHOT)).contains(0L);
             System.out.println(control.metrics(SNAPSHOT));
             String cdc = "dummy_op_cdc";
-            Files.writeString(work.resolve("pipeline.tap.yml"), pipeline(cdc, "cdc_only"));
+            Files.writeString(work.resolve("pipeline.tap.yml"), Files.readString(example.resolve("pipeline.tap.yml"))
+                    .replace(SNAPSHOT, cdc).replace("snapshot_only", "cdc_only"));
             cli(server, storage, "apply\nstart " + cdc + "\nexit\n");
             Await.until("target-confirmed Dummy CDC progress", Duration.ofSeconds(25),
-                    () -> recordsOut(control, cdc) > 0 && control.metrics(cdc).contains("targetAckedPosition"),
+                    () -> recordsOut(control, cdc) > 0 && control.durablePosition(cdc, "dummy_orders").isPresent(),
                     () -> control.state(cdc) + " " + control.metrics(cdc));
             assertThat(control.state(cdc)).contains(PipelineState.RUNNING);
             long first = recordsOut(control, cdc);
+            assertThat(cli(server, storage, "status " + cdc + "\nmetrics " + cdc + "\nexit\n"))
+                    .contains("dummy_op_cdc  running", "records.out  ", "targetAckedPosition.dummy_orders  ");
             Await.until("target-confirmed output to increase", Duration.ofSeconds(12),
                     () -> recordsOut(control, cdc) > first, () -> control.metrics(cdc));
             assertThat(control.errorCount(cdc)).contains(0L);
             System.out.printf("Raw Dummy CDC records.out: %d -> %d%n", first, recordsOut(control, cdc));
+            cli(server, storage, "metrics " + cdc + "\nexit\n");
 
             String failing = "dummy_op_failure";
             Files.writeString(work.resolve("src_failure.tap.yml"),
@@ -111,6 +119,7 @@ class RealDummyPipelineIT {
             assertThat(control.errorCount(cdc)).contains(0L);
             cli(server, storage, "metrics " + cdc + "\nposition " + cdc + "\nstop " + cdc + " --keep-state\nexit\n");
             awaitState(control, cdc, PipelineState.STOPPED);
+            assertThat(cli(server, storage, "status " + cdc + "\nexit\n")).contains("dummy_op_cdc  stopped");
             System.out.println("OP server log: " + server.output());
         }
     }

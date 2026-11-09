@@ -1,0 +1,21 @@
+{
+  "id": "dummy-op-smoke-v1",
+  "connectorRelease": "connectors-preview",
+  "connectorLock": "../../../deploy/cloud/connectors.lock.json",
+  "connectorId": "dummy",
+  "files": {
+    "src_dummy.tap.yml": "b7b1f1d6d5d1f52af629a468e3e11956d6a38bb9e1a75a3fc5e3bf8c191fb6d5",
+    "tgt_dummy.tap.yml": "bac49a9275ef91c71edb8cf817dfa3fe5c2a64d7f94cd3a763e64a0b9e0d46e6",
+    "pipeline.tap.yml": "53c4d779dc4d36d8f600804071de98fda7c918bbca6e30a1b2759399fcd7d22b"
+  },
+  "table": "dummy_orders",
+  "primaryKey": ["id"],
+  "snapshot": {"pipelineId": "dummy_op_smoke", "readMode": "snapshot_only", "rows": 32},
+  "liveCdc": {
+    "pipelineId": "dummy_op_cdc",
+    "readMode": "cdc_only",
+    "operation": "insert",
+    "configuredRowsPerInterval": 1,
+    "intervalMillis": 1000
+  }
+}

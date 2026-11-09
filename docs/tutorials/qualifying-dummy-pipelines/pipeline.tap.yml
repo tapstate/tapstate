@@ -1,0 +1,11 @@
+version: tapstate/v1
+kind: pipeline
+id: dummy_op_smoke
+source: src_dummy
+settings: {read_mode: snapshot_only}
+transforms:
+  - {id: pass_rows, from: [dummy_orders], type: filter, expr: "true"}
+serve:
+  from: pass_rows
+  sync:
+    - source: tgt_dummy
