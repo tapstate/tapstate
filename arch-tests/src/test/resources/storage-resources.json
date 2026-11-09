@@ -1285,6 +1285,10 @@
     "composed-validation-alert-source-schema-v1": {
       "atomicDomain": "CONFIG",
       "fencing": "Same CONFIG client/session with resource revision/CAS, original scope and configuration_version where applicable; never a runtime lease mirror. Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed. The alert version-1 to version-2 upgrade conditionally changes only its bounded component slot and the original configuration_version singleton in one actual CONFIG transaction; preserve all Source preparation and other component facts, and reconcile unknown commits by the original operation. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences. Operational evidence, lifecycle state, episode transitions and required planning share the original CONFIG CAS transaction. Original Source UUID/binding revision or CONFIG-held CACHE/MASTER binding fences the observation. External I/O precedes the transaction; local guards remain pure. Node lifecycle capability 5 adds the separate CONFIG alert_node_lifecycles collection and one non-unique ascending scope/phase/node/boot index. Controlled same-version preparation stops old writers, marks the existing bounded query preparation as PREPARING for index-contract version 2, preserves original installation/authority/query operation identities, creates/verifies the new namespace and sixth query index outside document transactions, and publishes capability 5 with READY cursor 6 by CONFIG CAS. Interrupted preparation resumes only that original operation/phase/cursor; unmarked partial namespaces are refused. The entire alerting marker remains at most 2 KiB; ordinary opening performs no migration. Global schema, Source slot, key, authoring revision and alert counter are preserved. Explicit same-version preparation with old writers stopped conditionally advances only installed alert capability 5 to operation-domain capability 6 by CONFIG CAS. Preserve the existing original query/node preparation operation, index-contract version 2 and READY cursor 6; no DDL, extra preparation history or global/Source/key/authoring-revision/alert-counter changes. The whole component marker stays at most 2 KiB. Ordinary opening never rewrites alarm qualifiers or splits legacy heads. Unsupported older binaries pause writes and takeover. Rule evaluation revisions refer to the durable semantic binding of the original rule, independently of its authoring CAS revision. Names and severity-only edits keep the same active episode, occurrence, input frontier, timers and original frozen deliveries; actual criteria, selector, enabled-state or type changes advance the semantic binding, including semantic ABA. Numerically equal bounded decimal parameters compare by value. An evaluation command carries its expected authoring revision only in memory and checks it in the same CONFIG transaction; an older command may use its embedded rule revision only when that value actually equals the current authoring revision. Missing expected authority is not replaced with the latest value. Retain lawful original late results and never revive canceled work. Controlled same-version maintenance with old writers quiescent advances only the existing alerting marker from capability 6 to capability 7 by CONFIG CAS after verifying original CONFIG/key and exact indexes. Preserve original operation identities, READY cursor 6, index-contract version 2, global schema, Source slot, configuration revision and alert counter. The whole marker remains at most 2 KiB; no new slot, collection, index, DDL or business-row migration. New installations publish the same capability; ordinary opening never enrolls or rewrites rules."
+    },
+    "cache-nest-vertex-group-v1": {
+      "atomicDomain": "CACHE",
+      "fencing": "CACHE, one vertex instance's group per transaction: every key it changed in every namespace it writes, at most 256 keys or 8 MiB, a value never split and one over the bound refused. The transaction holds the payload, a compare-and-set on the instance's own commit fence row conditioned on the tenure its group was proved under, a read of the live claim in the same snapshot, and the operator inventory check; it does not write the claim, and these commits do not advance the pipeline state's runtime write fence. Store structure, placement and claim are validated once per lease proof, not per transaction; a proof under a new tenure, and every transaction that ends a tenure (release, cache-domain stop, pipeline retirement), rewrites every fence row of the pipeline in that same transaction, so an old-tenure group either collides with it or matches nothing. Reads are outside transactions with majority read concern in a causally consistent session. No cross-vertex, cross-pipeline or cross-domain transaction; CONFIG cannot supply a CACHE fence. Source progress does not substitute for target confirmation."
     }
   },
   "resources": [
@@ -3274,14 +3278,14 @@
     {
       "id": "mongo.cache.nest_state",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "nest_state"
       ],
-      "responsibility": "Write-through Nest payload state including pending parents and a v1 sparse set of slot paths, lookup namespaces and composite keys absent from the last emitted root document.",
+      "responsibility": "Write-through Nest payload state including pending parents and a v1 sparse set of slot paths, lookup namespaces and composite keys absent from the last emitted root document, committed one vertex group per transaction; plus one commit fence row per vertex instance under one reserved operator placement per pipeline scope, registered in the operator inventory, and the per-table staged-complete and per-step build-done markers in the existing namespaces.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
       ],
@@ -3289,14 +3293,19 @@
         "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
       ],
       "recovery": "cache-nest-missing-objects-v1",
-      "consistency": "cache-nest-single-root-v1",
-      "growth": "Existing Nest state growth and storage limits are retained. The added set is proportional to currently missing references of each root, contains identities rather than copied customer rows, and is cleared or recomputed after completion, retargeting, deletion or subsequent root output; no extra per-event or per-run history.",
+      "consistency": "cache-nest-vertex-group-v1",
+      "growth": "Existing Nest state growth and storage limits are retained per root. The sparse missing-reference set is proportional to currently missing references of each root, contains identities rather than copied customer rows, and is cleared or recomputed after completion, retargeting, deletion or subsequent root output. Fence rows are one per vertex instance per pipeline (tens), created by the next lease proof and reclaimed with the pipeline's placements at retirement; rows left by a parallelism change stay until then. Markers are one document per pipeline, step and table plus one per step. No extra per-event or per-run history.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheOperatorStateStoreIT.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/RootAssembly.java",
         "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/AssemblerProcessor.java",
         "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/AMissingObjectReferenceKeepsTheRootDocumentTest.java",
-        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java"
+        "arch-tests/src/test/java/io/tapstate/archtests/NestStateSerialFormGatesTest.java",
+        "adapters/adapter-mongo-store/src/main/java/io/tapstate/adapters/mongostore/MongoCommitFence.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/StateGroupCommitIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/GroupCommitKillIT.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/nest/NestStateSession.java",
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/nest/CarrierSwitchEncodingTest.java"
       ]
     },
     {
