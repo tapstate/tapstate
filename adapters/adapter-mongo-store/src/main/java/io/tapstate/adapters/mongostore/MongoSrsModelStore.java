@@ -233,6 +233,17 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     SrsModel requireEventInSession(ClientSession session,SrsModelKey expected,String ring,long sequence,WorkloadClaimFence originalCapture) {
+        var reference=requireEventReference(session,expected,ring,originalCapture);
+        reference.range().requireAt(sequence,ring,expected.captureEpoch(),expected.modelVersion());
+        requireActive.run();return reference.model();
+    }
+
+    /**
+     * The published model an event under {@code originalCapture} names and the exact sequence range it governs,
+     * proved in this read transaction; holding a sequence to that range is the caller's, here or later against
+     * what this transaction read.
+     */
+    ModelReference requireEventReference(ClientSession session,SrsModelKey expected,String ring,WorkloadClaimFence originalCapture) {
         // Both callers have verified the business identity in this same read transaction.
         requireScope(expected);requireActive.run();
         try {
@@ -241,8 +252,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             var chain=requireChain(session,expected);
             var reference=eventReference(session,ring,expected.captureEpoch(),expected.modelVersion(),originalCapture,false,chain);
             if(!expected.equals(reference.model().key()))throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
-            reference.range().requireAt(sequence,ring,expected.captureEpoch(),expected.modelVersion());
-            requireActive.run();return reference.model();
+            requireActive.run();return reference;
         }catch(TapstateException missing){
             if(missing.code()==IoError.SRS_MODEL_UNAVAILABLE)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
             throw missing;
@@ -594,13 +604,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     record EventModelRange(long firstSequence, Long nextSequence) {
+        boolean covers(long sequence) { return sequence >= firstSequence && (nextSequence == null || sequence < nextSequence); }
         void requireAt(long sequence, String ring, SrsLogRecord event) {
             requireAt(sequence, ring, event.epoch(), event.schemaVer());
         }
         void requireAt(long sequence, String ring, long epoch, long version) {
-            if (sequence < firstSequence || (nextSequence != null && sequence >= nextSequence)) {
-                throw eventUnavailable(ring, epoch, version);
-            }
+            if (!covers(sequence)) throw eventUnavailable(ring, epoch, version);
         }
     }
 
