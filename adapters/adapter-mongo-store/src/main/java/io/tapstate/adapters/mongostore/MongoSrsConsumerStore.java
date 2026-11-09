@@ -1040,18 +1040,24 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (fence.executionGeneration() < 1 || fence.key().type() != WorkloadClaimType.PIPELINE_ACTUATION || !scope.clusterId().equals(fence.key().clusterId())
                 || !context.key().pipelineId().equals(fence.key().resourceId())) throw fenced();
     }
-    /** The claim compare-and-set alone, the write every progress write within a lease still carries. */
-    private void proveClaim(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
-        requirePipelineFence(context,fence);
+    /**
+     * What a progress write within a lease still carries: the pipeline state row as stored, the claim
+     * compare-and-set (a write to the live claim), and the state fence advance every consumer mutation makes.
+     * The structure and prepared-claim checks of the full proof were paid when the lease was.
+     */
+    private void proveUnderLease(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
+        var pipeline = pipelineAccess(context,fence); Document current = pipeline.stateRow(session);
         if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),
                 new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount() != 1) throw fenced();
+        pipeline.updateState(session,current,new Document(),false);
     }
     /**
-     * A progress write: the claim is proved first, by a write to it, on every call. Structure, identity, the
-     * pipeline state's structure and the consumer's membership and snapshot are proved on the first write after
-     * the progress lease ran out and skipped under a standing lease, where the write reads its offsets row as it
-     * stands and compares and sets on the membership and progress revisions it found there. A membership that
-     * moved on under the lease is read again in full, as before the lease, and ends it.
+     * A progress write: the claim is proved first, by a write to it, and the pipeline state fence advanced, on
+     * every call. Structure, identity, the pipeline state's structure, the claim's preparation and the consumer's
+     * membership and snapshot are proved on the first write after the progress lease ran out and skipped under a
+     * standing lease, where the write reads its offsets row as it stands and compares and sets on the membership
+     * and progress revisions it found there. A membership that moved on under the lease is read again in full,
+     * as before the lease, and ends it.
      */
     private <T> T progressTransaction(SrsConsumerContext context,WorkloadClaimFence fence,BiFunction<ClientSession,Own,T> action) {
         var before = lease.observe(MongoSrsLease.Facet.PROGRESS); var known = provenProgress.get();
@@ -1061,7 +1067,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             Own own;
             if (proving) { prove(session,context,fence); own = requireOwn(session,context); proven[0] = own.member(); }
             else {
-                proveClaim(session,context,fence);
+                proveUnderLease(session,context,fence);
                 var row = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session,new Document("_id",records.id(context.key()))).first();
                 if (row != null && Long.valueOf(known.member().revision()).equals(row.get("membershipRevision"))) own = new Own(known.member(),records.cursor(known.member(),row));
                 else { lease.drop(MongoSrsLease.Facet.PROGRESS); own = requireOwn(session,context); }

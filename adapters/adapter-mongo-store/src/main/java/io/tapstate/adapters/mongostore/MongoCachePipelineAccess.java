@@ -352,13 +352,22 @@ final class MongoCachePipelineAccess {
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {
+        Document state = stateRow(session);
+        requirePreparedClaim(session);
+        return state;
+    }
+
+    /**
+     * The state row as stored, without the prepared-claim check: for a fenced write within a standing lease, whose
+     * claim was proved prepared when the lease was and is compared and set again by the write itself.
+     */
+    Document stateRow(ClientSession session) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);
         if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
                 || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
-        requirePreparedClaim(session);
         return state;
     }
 

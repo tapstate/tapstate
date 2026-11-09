@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * writes validate once per lease. Each case proves a lease with a first verification and a first progress
  * write, changes the cache underneath it the way a takeover, the capture owner's publication, the consumer's
  * own snapshot pin or an operator's index change would, and reads the next operation: a verification within the
- * lease costs no round trip and a progress write is the claim compare-and-set and its row; whatever the lease
+ * lease costs no round trip and a progress write is the claim compare-and-set, the state fence and its row; whatever the lease
  * cannot vouch for proves, and whatever a proof refuses lands nowhere.
  */
 @RequiresDocker
@@ -63,7 +63,9 @@ class SrsConsumerLeaseIT {
     private static final String ORDERS = "orders";
     private static final String PIPELINE = "pipeline-a";
     private static final SrsConsumerContext A = new SrsConsumerContext(new SrsConsumerKey(CHAIN, PIPELINE, "source-a"), 1);
-    private static final List<String> LEASED_WRITE = List.of("update workload_claims", "find srs_consumer_offsets", "update srs_consumer_offsets");
+    /** The state row, the claim compare-and-set, the state fence advance, the offsets row and its replace. */
+    private static final List<String> LEASED_WRITE = List.of("find pipeline_state", "update workload_claims", "update pipeline_state",
+            "find srs_consumer_offsets", "update srs_consumer_offsets");
     private static final Runnable ACTIVE = () -> {};
 
     @AfterEach void clearProperties() {
@@ -134,7 +136,7 @@ class SrsConsumerLeaseIT {
         withConsumer(f -> {
             f.verify(0); f.commands.clear();
             // The capture owner publishes version 1 from sequence 100 through its own stores, which share nothing with this lease.
-            f.models.publish(model(1, 100), f.captureFence());
+            f.models.publish(model(1, 100), f.captureFence()); f.commands.clear();
             assertThat(f.verify(50)).isEqualTo(f.model(0));
             assertThat(f.commands).as("the window the lease accepts: version 0 is still open-ended here").isEmpty();
             assertThat(f.verify(100, 1)).isEqualTo(f.model(1));
@@ -152,8 +154,8 @@ class SrsConsumerLeaseIT {
 
     @Test void theConsumersOwnSnapshotPinEndsTheLeaseSoTheNextOperationsProveAgainstIt() {
         withConsumer(f -> {
-            f.verify(0); f.advance(0);
-            assertThat(f.consumers.pinSnapshot(A, f.member.revision(), 1, new SrsSnapshotPin(1, "seam", Map.of(ORDERS, key(0))), f.fence())).isTrue();
+            f.verify(0); f.advance(0); long revision = f.consumers.progress(A).orElseThrow().revision();
+            assertThat(f.consumers.pinSnapshot(A, f.member.revision(), revision, new SrsSnapshotPin(1, "seam", Map.of(ORDERS, key(0))), f.fence())).isTrue();
             f.commands.clear(); f.verify(1);
             assertThat(f.commands).as("the verification after a pin proves").anyMatch(command -> command.equals("find srs_models"));
             f.commands.clear(); f.advance(1);
@@ -236,6 +238,8 @@ class SrsConsumerLeaseIT {
                 var lease = MongoSrsLease.selected();
                 var consumers = new MongoSrsConsumerStore(client, database, SCOPE, ACTIVE, structure::verifySrs, lease);
                 var member = consumers.attach(A, 0, Set.of(ORDERS), WorkloadClaimFence.from(pipeline)).orElseThrow();
+                // The reader's arrival, as the coordinator records it before the first read: the table's confirmed floor.
+                assertThat(consumers.startReadingAfter(A, member.revision(), 0, ORDERS, -1L, WorkloadClaimFence.from(pipeline))).isTrue();
                 var scope = new PipelineIntentScope(SCOPE.clusterId(), SCOPE.bindingVersion(), SCOPE.cacheIncarnation(), PIPELINE, A.stateGeneration());
                 var fixture = new Fixture(database, consumers, models, lease, capture, pipeline, member, SrsConsumerRun.of(scope, member), commands);
                 commands.clear();
