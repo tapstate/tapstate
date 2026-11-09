@@ -277,9 +277,10 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     }
 
     /**
-     * The lease proof: today's full validation and the original claim's liveness in one transaction, which
-     * for writes also registers the placement and compare-and-sets the claim. A store without a claim is a
-     * read-only view and proves identity and structure only, as its reads always did.
+     * The lease proof: today's full validation in one transaction, and for writes the original claim's
+     * liveness, which also registers the placement and bounds the lease by what remains of the claim. Reads
+     * prove identity and structure only, as they always did: a member that no longer holds the claim may
+     * still read the state it wrote, and only its writes are refused.
      */
     private Lease prove(boolean writes) {
         synchronized (proving) {
@@ -289,7 +290,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             long maximum = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
             boolean claimed = access.originalClaim() != null;
             Lease proved = validated(writes, (session, inventory) -> {
-                long held = claimed ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
+                long held = claimed && writes ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
                 return new Lease(startedAt + held, writes, inventory.getString("preparationId"), inventory.getLong("revision"));
             });
             lease.set(proved);

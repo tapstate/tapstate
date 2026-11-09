@@ -75,9 +75,12 @@ class LeaseValidationFencingIT {
             f.onClaim(new Document("$inc", new Document("claimGeneration", 1L)));
             code(() -> store.saveAll(f.at.mapName(), keys("b", GROUP)), IoError.WORKLOAD_CLAIM_FENCED);
             assertThat(f.stored()).as("nothing of the refused group lands").isEqualTo(before);
-            // The refusal ended the lease, so the next operation proves again and fails closed, reads included.
-            code(() -> store.loadAll(f.at.mapName(), List.of("a1")), IoError.WORKLOAD_CLAIM_FENCED);
+            // The refusal ended the lease; every later write proves again and is refused, while reads stay what
+            // they always were: a former owner may still read what it wrote, as a successor's recovery needs.
             code(() -> store.save(f.at.mapName(), "c", new byte[]{1}), IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(store.loadAll(f.at.mapName(), List.of("a1"))).containsKey("a1");
+            assertThat(f.writer().loadAll(f.at.mapName(), List.of("a1"))).as("a store opened after the takeover reads too").containsKey("a1");
+            code(() -> store.save(f.at.mapName(), "d", new byte[]{1}), IoError.WORKLOAD_CLAIM_FENCED);
             assertThat(f.stored()).isEqualTo(before);
         });
     }
