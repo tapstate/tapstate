@@ -33,11 +33,10 @@ Applications · APIs · AI agents
 
 > **Product status:** The current open-source release is an Alpha
 > preview. It captures changes from MySQL, PostgreSQL, Oracle and
-> SQL Server (with Db2 in preview), incrementally transforms and
+> SQL Server, DB2 etc, incrementally transforms and
 > assembles data across sources, and materializes the resulting state in
-> MongoDB. Stable state-consumption APIs, push/subscription delivery,
-> and production-grade high availability are not yet part of the
-> preview. See [What Works Today](#what-works-today) for the current
+> a central data store(First reference store: MongoDB).  
+> See [What Works Today](#what-works-today) for the current
 > scope and limitations.
 
 ## Why Operational State?
