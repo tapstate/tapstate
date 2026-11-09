@@ -35,6 +35,9 @@ import java.util.Optional;
 import java.util.Base64;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Opens an already initialized configuration domain without opening any cache or business resource.
@@ -59,6 +62,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final int installedSchemaVersion;
     private MongoValidationPreparations validationPreparations;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+    private record VerifiedAlertSchema(Document marker, long verifiedAt) {}
+    private volatile VerifiedAlertSchema verifiedAlertSchema;
+    private ScheduledExecutorService alertSchemaVerifier;
 
     MongoConfigurationDomain(MongoConnection connection, String clusterId) {
         this.connection = connection;
@@ -163,6 +169,50 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
     }
 
+    private synchronized void startAlertSchemaVerification() {
+        requireOpen();
+        if (alertSchemaVerifier == null) {
+            verifyAlertSchema();
+            alertSchemaVerifier = Executors.newSingleThreadScheduledExecutor(task -> {
+                Thread thread = new Thread(task, "alert-schema-verifier");
+                thread.setDaemon(true);
+                return thread;
+            });
+            alertSchemaVerifier.scheduleWithFixedDelay(this::recheckAlertSchema, 5, 5, TimeUnit.SECONDS);
+        }
+        currentAlertSchema();
+    }
+
+    private void verifyAlertSchema() {
+        var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
+        Document marker = new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadVerifiedMarker(budget);
+        if (marker == null || marker.getInteger("installedVersion") != MongoAlertStorageSchema.VERSION)
+            throw unreadable("alert-store", "schema-capability");
+        verifiedAlertSchema = new VerifiedAlertSchema(marker, System.nanoTime());
+    }
+
+    private void recheckAlertSchema() {
+        try {
+            verifyAlertSchema();
+        } catch (RuntimeException unavailable) {
+            verifiedAlertSchema = null;
+        }
+    }
+
+    Document currentAlertSchema() {
+        requireOpen();
+        var verified = verifiedAlertSchema;
+        // Allow the scheduled check its own read budget, but fail closed if it stops progressing.
+        if (verified == null || System.nanoTime() - verified.verifiedAt() >= TimeUnit.SECONDS.toNanos(15))
+            throw unreadable("alert-store", "schema-capability");
+        return verified.marker();
+    }
+
+    void requireVerifiedAlertSchema(Document marker) {
+        if (!currentAlertSchema().equals(marker)) throw unreadable("alert-store", "schema-capability");
+    }
+
     /** Explicit additive preparation; ordinary opens and reads never repair lost alert resources. */
     public int prepareAlertStorage(String operationId) {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(30));
@@ -195,7 +245,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             io.tapstate.core.alerting.AlarmTypeCatalog catalog,java.time.Clock clock) {
         requireOpen();
         if(!clusterId.equals(host.scope().clusterId()))throw unreadable("alert-store","scope");
-        if(alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-store","capability");
+        startAlertSchemaVerification();
         return new MongoAlertCoordinator(this,connection.database(),configurationKey,artifacts,security,bindings,host,catalog,clock);
     }
 
@@ -203,7 +253,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public io.tapstate.spi.store.AlertNodeLifecycleStore alertNodeLifecycles(io.tapstate.core.alerting.AlarmKey.Scope scope,
             io.tapstate.spi.store.StorageSetupScope setup,Runnable locallyActive) {
         requireOpen();
-        if(!clusterId.equals(scope.clusterId()) || alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("alert-node-lifecycle","capability");
+        if(!clusterId.equals(scope.clusterId()))throw unreadable("alert-node-lifecycle","capability");
+        startAlertSchemaVerification();
         return new MongoAlertNodeLifecycleStore(this,connection.database(),configurationKey,bindings,scope,setup,locallyActive);
     }
 
@@ -1234,7 +1285,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     @Override
     public void close() {
-        closed.set(true);
+        synchronized (this) {
+            closed.set(true);
+            if (alertSchemaVerifier != null) alertSchemaVerifier.shutdownNow();
+        }
         connection.close();
     }
 
