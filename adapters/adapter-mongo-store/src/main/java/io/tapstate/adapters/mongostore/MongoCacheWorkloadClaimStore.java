@@ -175,8 +175,13 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(Objects.requireNonNull(expected, "expected").key());
         return transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
-            storedScope(session, expected.key());
-            return store.release(expected);
+            var retained = storedScope(session, expected.key());
+            boolean released = store.release(expected);
+            // A release ends the tenure with no proof to follow: an operator-state commit still in flight under
+            // it has to collide with this transaction rather than land after it.
+            if (released && retained != null && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION)
+                MongoCommitFence.end(session, database, retained);
+            return released;
         });
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
