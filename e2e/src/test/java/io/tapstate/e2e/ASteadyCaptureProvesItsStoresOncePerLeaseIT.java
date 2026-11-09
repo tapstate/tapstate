@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.CreateCollectionOptions;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
@@ -45,6 +46,8 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
     private static final int CHANGES = 30;
     private static final Duration OPENING = Duration.ofSeconds(90);
     private static final Duration WRITE_EVERY = Duration.ofMillis(500);
+    private static final String PROFILE = "system.profile";
+    private static final long PROFILE_BYTES = 256L << 20;
     /** The identity row is read only by a proof; a batch inside a standing lease never touches it. */
     private static final String PROOF_MARKER = "cache_identity";
     private static final String MEMBERSHIP = "srs_consumers";
@@ -111,13 +114,20 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             }, () -> "warm changes written=" + warm[0] + ", state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
 
             MongoDatabase cache = cacheObserver.getDatabase(storage.cacheDatabase());
-            cache.runCommand(new Document("profile", 1).append("slowms", 0).append("sampleRate", 1.0));
+            // The profiler's own collection is capped at a megabyte by default: a window of thirty changes
+            // outgrows it and the first batches fall off the front, so it is remade to hold the whole window,
+            // and only the writes and reads the witness counts are kept, not the stream's own commands.
+            cache.runCommand(new Document("profile", 0));
+            cache.getCollection(PROFILE).drop();
+            cache.createCollection(PROFILE, new CreateCollectionOptions().capped(true).sizeInBytes(PROFILE_BYTES));
+            cache.runCommand(new Document("profile", 1)
+                    .append("filter", new Document("op", new Document("$in", List.of("update", "query")))));
             try {
                 for (int i = 1; i <= CHANGES; i++) writeAndAwait(orders, copied, "change_" + i);
             } finally {
                 cache.runCommand(new Document("profile", 0));
             }
-            var profiled = cache.getCollection("system.profile").find().into(new ArrayList<>());
+            var profiled = cache.getCollection(PROFILE).find().into(new ArrayList<>());
             // The writes themselves count ungrouped: the profiler does not tie an update to its transaction.
             long appends = profiled.stream().filter(op -> isUpdate(op, "srs_events")).count();
             long checkpointWrites = profiled.stream().filter(op -> isUpdate(op, "srs_chains")).count();
