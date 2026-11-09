@@ -103,6 +103,34 @@ public final class NestStateStats {
      */
     public record Commits(long groups, long[] keyBuckets, long keySum, long[] roundTripBuckets, long roundTripSum,
             long[] durationBuckets, long durationNanos, long countingSinceMillis) {
+
+        /** Two readings are equal when every bucket is: arrays compare by identity unless told otherwise. */
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Commits that && groups == that.groups && keySum == that.keySum
+                    && roundTripSum == that.roundTripSum && durationNanos == that.durationNanos
+                    && countingSinceMillis == that.countingSinceMillis
+                    && java.util.Arrays.equals(keyBuckets, that.keyBuckets)
+                    && java.util.Arrays.equals(roundTripBuckets, that.roundTripBuckets)
+                    && java.util.Arrays.equals(durationBuckets, that.durationBuckets);
+        }
+
+        @Override
+        public int hashCode() {
+            int hash = java.util.Objects.hash(groups, keySum, roundTripSum, durationNanos, countingSinceMillis);
+            hash = 31 * hash + java.util.Arrays.hashCode(keyBuckets);
+            hash = 31 * hash + java.util.Arrays.hashCode(roundTripBuckets);
+            return 31 * hash + java.util.Arrays.hashCode(durationBuckets);
+        }
+
+        @Override
+        public String toString() {
+            return "Commits[groups=" + groups + ", keyBuckets=" + java.util.Arrays.toString(keyBuckets)
+                    + ", keySum=" + keySum + ", roundTripBuckets=" + java.util.Arrays.toString(roundTripBuckets)
+                    + ", roundTripSum=" + roundTripSum + ", durationBuckets="
+                    + java.util.Arrays.toString(durationBuckets) + ", durationNanos=" + durationNanos
+                    + ", countingSinceMillis=" + countingSinceMillis + "]";
+        }
     }
 
     /** Counts {@code documents} whole documents sent from {@code namespace}'s level since the run began. */
