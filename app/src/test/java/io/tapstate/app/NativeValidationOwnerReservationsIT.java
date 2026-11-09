@@ -316,6 +316,25 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
+    @Test void aSlowPreparationKeepsTheFullHandoffWindowAfterAcceptance() {
+        var now = new AtomicLong(System.nanoTime());
+        try (var f = new Fixture(64, 2, now::get)) {
+            var request = f.request("FULL", 1);
+            f.startup = (saved, spec) -> {
+                now.addAndGet(Duration.ofSeconds(31).toNanos());
+                f.owners.expire();
+                return NativeValidationOwnerReservations.StartupGate.ready();
+            };
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            now.addAndGet(Duration.ofSeconds(29).toNanos());
+            f.owners.expire();
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            now.addAndGet(Duration.ofSeconds(2).toNanos());
+            f.owners.expire();
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.REJECTED);
+        }
+    }
+
     @Test void expiredAcceptedHandoffCannotResurrectItsOriginalWithoutAConfigTicket() {
         var now = new AtomicLong(System.nanoTime());
         try (var f = new Fixture(64, 2, now::get)) {

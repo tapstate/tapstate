@@ -231,10 +231,18 @@ final class ValidationOwnerRouter implements AutoCloseable {
                             : new Attempt(new Reply(Outcome.CAPACITY,request.command(),null,0,0,0,null),null,false);
                 }
                 tried.add(selected);
-                var attempt = invoke(request, selected, before.revision, before.members.get(selected.node), deadline);var reply=attempt.reply();
+                var destination = before.members.get(selected.node);
+                var attempt = before.members.size() == 1 && destination.localMember()
+                        ? invokeLocal(request, selected, before.revision)
+                        : invoke(request, selected, before.revision, destination, deadline);
+                var reply=attempt.reply();
                 var retained = attempt.dispatched() ? attempt : lastCapacity;
                 try { requireActive(); if (!before.same(roster())) return uncertain(request,selected,reply.reasonCode(),retained); }
                 catch (TapstateException unavailable) { return uncertain(request,selected,unavailable.code().code(),retained); }
+                catch (CancellationException | RejectedExecutionException | HazelcastInstanceNotActiveException
+                        | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
+                    return uncertain(request, selected, null, retained);
+                }
                 if (reply.outcome() == Outcome.CAPACITY && !owned) {
                     // The original receiver still owns the cleanup receipt after the candidate list is exhausted.
                     lastCapacity = attempt;
@@ -254,6 +262,20 @@ final class ValidationOwnerRouter implements AutoCloseable {
     private static Attempt uncertain(Request request,Identity target,String reason,Attempt retained) {
         var receiver=retained==null?null:retained.receiver();
         return new Attempt(unknown(request,receiver==null?target:receiver.identity(),reason),receiver,retained!=null&&retained.dispatched());
+    }
+
+    private Attempt invokeLocal(Request request, Identity target, long revision) {
+        // The entry already owns a paid control worker. Local storage preparation can outlast
+        // the member RPC deadline, so reserve locally under the same identity and roster checks.
+        Receiver receiver = null;
+        try {
+            receiver = probe(target, revision);
+            if (receiver == null) return new Attempt(rejected(request, target, null), null, false);
+            return new Attempt(receive(request, target, revision), receiver, true);
+        } catch (CancellationException | RejectedExecutionException | HazelcastInstanceNotActiveException
+                | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
+            return new Attempt(unknown(request, target, null), receiver, receiver != null);
+        }
     }
 
     private Attempt invoke(Request request, Identity target, long revision, Member destination, long deadline) {

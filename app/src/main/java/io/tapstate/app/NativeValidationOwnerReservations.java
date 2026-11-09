@@ -486,7 +486,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         long now = handoffClock.getAsLong();
         var failures = new ValidationFailureLatch();
         for (var pipeline : pipelines.values()) {
-            for (var entry : pipeline.operations.values()) if (!entry.activated && now - entry.created >= HANDOFF_NANOS) attempt(failures, entry::close);
+            for (var entry : pipeline.operations.values()) attempt(failures, () -> entry.expireHandoff(now));
             var owner = pipeline.owner;
             if (owner != null && !owner.retired.get() && now - owner.created >= HANDOFF_NANOS && pipeline.operations.values().stream().allMatch(value -> value.cancelled.get())) {
                 attempt(failures, () -> { try { owner.retire(); } finally { process.cleanup(owner.lease::close); } });
@@ -502,6 +502,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
 
     final class Reservation implements AutoCloseable {
         final Pipeline pipeline; final Request request; final long created = handoffClock.getAsLong();
+        private long acceptedAt;
         final AtomicBoolean cancelled = new AtomicBoolean(), stopSignalled = new AtomicBoolean();
         volatile boolean preparing, activated, accepted, superseded, completed, locallyDisposed, claimUncertain, unknown, reportPending; volatile String reason;
         // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
@@ -625,11 +626,22 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                     && (!accepted || completed || locallyDisposed || superseded) && (bound == null || bound.fullyReleased());
         }
         private boolean closedHandoff() { return accepted && (!activated || completed&&terminalWithoutReport) && !unknown && cancelled.get() && metadata == null && bound != null && bound.fullyReleased(); }
-        private Result reply() {
+        private synchronized void expireHandoff(long now) {
+            // Preparation owns its own metadata deadline. The activation window starts only
+            // after the reservation is ready for the caller to take it.
+            if (!preparing && !activated && now - (accepted ? acceptedAt : created) >= HANDOFF_NANOS) close();
+        }
+
+        private synchronized Result reply() {
             if (unknown) return new Result(Outcome.UNKNOWN, null, reason);
             if (cancelled.get()) return new Result(Outcome.REJECTED, null, reason);
             if (bound == null) return new Result(Outcome.UNKNOWN, null, reason);
-            requireReserved(); accepted = true; return new Result(Outcome.ACCEPTED, owner.lease.owner(), null);
+            requireReserved();
+            if (!accepted) {
+                acceptedAt = handoffClock.getAsLong();
+                accepted = true;
+            }
+            return new Result(Outcome.ACCEPTED, owner.lease.owner(), null);
         }
         private Result reject() { cancelled.set(true); return new Result(Outcome.REJECTED, null, reason); }
         private Result redirect() { cancelled.set(true); return new Result(Outcome.REDIRECT, null, reason); }
