@@ -228,12 +228,14 @@ public final class NestSettings implements Serializable {
     private final Map<String, Long> migrationProtections;
     private final long entriesHeldInMemory;
     private final Map<String, Long> referenceFanoutLimits;
+    /** Per namespace, what its step wrote for memory and how many namespaces that step shares it between. */
+    private final Map<String, StepMemory> stepMemory;
 
     private NestSettings(Map<String, Long> elementLimits, Map<String, Long> pendingLimits,
             Map<String, Long> tombstoneLimits, Map<String, Long> sendWindows,
             Map<String, Long> migrationBatches, Map<String, Long> parkingLimits,
             Map<String, Long> migrationProtections, long entriesHeldInMemory,
-            Map<String, Long> referenceFanoutLimits) {
+            Map<String, Long> referenceFanoutLimits, Map<String, StepMemory> stepMemory) {
         this.elementLimits = Map.copyOf(elementLimits);
         this.pendingLimits = Map.copyOf(pendingLimits);
         this.tombstoneLimits = Map.copyOf(tombstoneLimits);
@@ -243,19 +245,20 @@ public final class NestSettings implements Serializable {
         this.migrationProtections = Map.copyOf(migrationProtections);
         this.entriesHeldInMemory = entriesHeldInMemory;
         this.referenceFanoutLimits = Map.copyOf(referenceFanoutLimits);
+        this.stepMemory = Map.copyOf(stepMemory);
     }
 
     /** Every level on the default limit, which is what a deployment that configured nothing gets. */
     public static NestSettings defaults() {
         return new NestSettings(Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(),
-                DEFAULT_ENTRIES_HELD_IN_MEMORY, Map.of());
+                DEFAULT_ENTRIES_HELD_IN_MEMORY, Map.of(), Map.of());
     }
 
     /** These settings, with each document of the nest at {@code namespace} allowed {@code limit} elements. */
     public NestSettings withElementLimit(String namespace, long limit) {
         return new NestSettings(with(elementLimits, namespace, limit, "elements"), pendingLimits,
                 tombstoneLimits, sendWindows, migrationBatches, parkingLimits, migrationProtections,
-                entriesHeldInMemory, referenceFanoutLimits);
+                entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /**
@@ -265,7 +268,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withPendingLimit(String namespace, long limit) {
         return new NestSettings(elementLimits, with(pendingLimits, namespace, limit, "pending changes"),
                 tombstoneLimits, sendWindows, migrationBatches, parkingLimits, migrationProtections,
-                entriesHeldInMemory, referenceFanoutLimits);
+                entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /**
@@ -275,7 +278,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withTombstoneLimit(String namespace, long limit) {
         return new NestSettings(elementLimits, pendingLimits,
                 with(tombstoneLimits, namespace, limit, "records of deletion"), sendWindows,
-                migrationBatches, parkingLimits, migrationProtections, entriesHeldInMemory, referenceFanoutLimits);
+                migrationBatches, parkingLimits, migrationProtections, entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /**
@@ -289,7 +292,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withMigrationBatchSize(String namespace, long changes) {
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows,
                 with(migrationBatches, namespace, changes, "changes a batch"), parkingLimits,
-                migrationProtections, entriesHeldInMemory, referenceFanoutLimits);
+                migrationProtections, entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /**
@@ -309,7 +312,7 @@ public final class NestSettings implements Serializable {
         Map<String, Long> widened = new LinkedHashMap<>(sendWindows);
         widened.put(namespace, millis);
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, widened, migrationBatches,
-                parkingLimits, migrationProtections, entriesHeldInMemory, referenceFanoutLimits);
+                parkingLimits, migrationProtections, entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /**
@@ -332,7 +335,46 @@ public final class NestSettings implements Serializable {
                             "partitions", (long) NestMaps.SMALLEST_MEANINGFUL_MEMORY_BUDGET), null);
         }
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows, migrationBatches,
-                parkingLimits, migrationProtections, entries, referenceFanoutLimits);
+                parkingLimits, migrationProtections, entries, referenceFanoutLimits, stepMemory);
+    }
+
+    /**
+     * These settings, with a step whose state lives in {@code namespaces} keeping {@code bytes} of it resident,
+     * shared evenly between them; null {@code bytes} records the step as writing no memory of its own, so it
+     * gets the default share of the member's heap. Read where nests keep their state through the state
+     * session; the map carrier holds its namespaces to {@link #entriesHeldInMemory()} instead.
+     */
+    public NestSettings withStepMemory(java.util.Collection<String> namespaces, Long bytes) {
+        Objects.requireNonNull(namespaces, "namespaces");
+        if (bytes != null && bytes <= 0) {
+            throw new IllegalArgumentException("a step's memory must be positive: " + bytes);
+        }
+        if (namespaces.isEmpty()) {
+            return this;
+        }
+        StepMemory step = new StepMemory(bytes == null ? 0L : bytes, namespaces.size());
+        Map<String, StepMemory> widened = new LinkedHashMap<>(stepMemory);
+        for (String namespace : namespaces) {
+            widened.put(Objects.requireNonNull(namespace, "namespace"), step);
+        }
+        return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows, migrationBatches,
+                parkingLimits, migrationProtections, entriesHeldInMemory, referenceFanoutLimits, widened);
+    }
+
+    /**
+     * The bytes of state {@code namespace} keeps resident on a member whose heap may grow to {@code maxHeap}:
+     * its share of what its step wrote, or of {@link ResidencyBudget#defaultStepBytes} where the step wrote
+     * nothing. A namespace no step was recorded for is treated as a step of its own.
+     */
+    public long residentBytesIn(String namespace, long maxHeap) {
+        StepMemory step = stepMemory.getOrDefault(Objects.requireNonNull(namespace, "namespace"),
+                new StepMemory(0L, 1));
+        long stepBytes = step.bytes() > 0 ? step.bytes() : ResidencyBudget.defaultStepBytes(maxHeap);
+        return ResidencyBudget.perNamespace(stepBytes, step.namespaces());
+    }
+
+    /** What one step wrote for memory, zero for nothing, and how many namespaces it shares it between. */
+    record StepMemory(long bytes, int namespaces) implements Serializable {
     }
 
     /** How many entries each namespace keeps in memory before the rest is left to the layer behind it. */
@@ -381,7 +423,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withParkingLimit(String namespace, long changes) {
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows, migrationBatches,
                 with(parkingLimits, namespace, changes, "parked changes"), migrationProtections,
-                entriesHeldInMemory, referenceFanoutLimits);
+                entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /** How many changes one hand-over out of {@code namespace} may park before the job is failed. */
@@ -396,7 +438,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withReferenceFanoutLimit(String namespace, long referrers) {
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows, migrationBatches,
                 parkingLimits, migrationProtections, entriesHeldInMemory,
-                with(referenceFanoutLimits, namespace, referrers, "rows pointing at one"));
+                with(referenceFanoutLimits, namespace, referrers, "rows pointing at one"), stepMemory);
     }
 
     /** How many rows may point at one row of {@code namespace} before the job is failed. */
@@ -411,7 +453,7 @@ public final class NestSettings implements Serializable {
     public NestSettings withMigrationProtection(String namespace, long millis) {
         return new NestSettings(elementLimits, pendingLimits, tombstoneLimits, sendWindows, migrationBatches,
                 parkingLimits, with(migrationProtections, namespace, millis, "milliseconds of protection"),
-                entriesHeldInMemory, referenceFanoutLimits);
+                entriesHeldInMemory, referenceFanoutLimits, stepMemory);
     }
 
     /** How long a hand-over out of {@code namespace} is protected before it is given up on. */

@@ -217,6 +217,8 @@ public final class PipelineRepresentation {
                     integerOrNull(value(payload, "entries_in_memory", "entriesInMemory"), path + ".entries_in_memory"),
                     integerOrNull(value(payload, "max_elements_per_document", "maxElementsPerDocument"),
                             path + ".max_elements_per_document"),
+                    null,
+                    byteSizeOrNull(value(payload, "memory"), path + ".memory"),
                     nestRoot(requiredObject(payload, "root", path), path + ".root"));
             case "join" -> new TransformBody.Join(
                     enumValue(value(payload, "engine"), JoinEngine.values(), JoinEngine::yaml, path + ".engine"),
@@ -386,6 +388,9 @@ public final class PipelineRepresentation {
                 value.put("order", nest.order() == null ? null : nest.order().name());
                 value.put("entriesInMemory", nest.entriesInMemory());
                 value.put("maxElementsPerDocument", nest.maxElementsPerDocument());
+                if (nest.memory() != null) {
+                    value.put("memory", nest.memory());
+                }
                 value.put("root", nestRootValue(nest.root()));
             }
             case TransformBody.Join join -> {
@@ -939,6 +944,20 @@ public final class PipelineRepresentation {
             throw malformed(path + " must be a string");
         }
         return result;
+    }
+
+    private static String byteSizeOrNull(Object value, String path) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof String) && !(value instanceof Number)) {
+            throw malformed(path + " must be a size such as 256MiB");
+        }
+        long bytes = io.tapstate.core.model.ByteSize.bytes(String.valueOf(value));
+        if (bytes <= 0) {
+            throw malformed(path + " must be a size above zero, such as 256MiB");
+        }
+        return io.tapstate.core.model.ByteSize.written(bytes);
     }
 
     private static Integer integerOrNull(Object value, String path) {

@@ -2,6 +2,7 @@ package io.tapstate.core.dsl;
 
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.model.BatchSpec;
+import io.tapstate.core.model.ByteSize;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
@@ -523,7 +524,7 @@ public final class DslParser {
             case "union" -> Set.of();
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
-                    "state", "root");
+                    "state", "memory", "root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
         };
@@ -570,6 +571,7 @@ public final class DslParser {
                     positiveIntValue(s, "entries_in_memory"),
                     positiveIntValue(s, "max_elements_per_document"),
                     nestStateStorage(s.mapping("state")),
+                    byteSizeValue(s, "memory"),
                     nestRoot(s.require("root", s.mapping("root"))));
             case "join" -> {
                 JoinEngine engine =
@@ -1109,6 +1111,20 @@ public final class DslParser {
      * it admits nothing at all, so it fails every run rather than some, and the author is told where the
      * number was written rather than where it is later enforced.
      */
+    private static String byteSizeValue(YamlMap m, String key) {
+        Object value = m.node(key) == null ? null : YamlMap.nodeValue(m.node(key));
+        if (value == null) {
+            return null;
+        }
+        long bytes = ByteSize.bytes(String.valueOf(value));
+        if (bytes <= 0) {
+            throw m.errorAt(key, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, String.valueOf(value), EXPECTED_TOKEN,
+                            "a size above zero: a whole number of B, KiB, MiB or GiB, such as 256MiB"));
+        }
+        return ByteSize.written(bytes);
+    }
+
     private static Integer positiveIntValue(YamlMap m, String key) {
         Integer value = intValue(m, key);
         if (value != null && value <= 0) {

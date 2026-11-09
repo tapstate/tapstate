@@ -250,6 +250,10 @@ public final class PipelineDagBuilder {
             if (nest.entriesInMemory() != null) {
                 settings = settings.withEntriesHeldInMemory(nest.entriesInMemory());
             }
+            // Per step, unlike the count above: a step's memory is shared between its own namespaces, so
+            // each nest step holds to what it wrote whatever the others write.
+            settings = settings.withStepMemory(
+                    NestTopology.compile(pipeline.id(), step.id(), nest, tables).stateNamespaces(), nest.memoryBytes());
             if (nest.maxElementsPerDocument() != null) {
                 // The document level of this nest and no other. The name comes from the compiler rather
                 // than from anything spelled out here, for the same reason the namespaces do: two places

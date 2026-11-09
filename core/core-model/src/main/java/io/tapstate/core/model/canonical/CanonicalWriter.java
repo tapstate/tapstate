@@ -339,6 +339,7 @@ public final class CanonicalWriter {
                 if (n.state() != null) {
                     b.put("state", nestStateStorage(n.state()));
                 }
+                b.scalar("memory", n.memory());
                 b.put("root", nestRoot(n.root()));
             }
             case TransformBody.Join j -> {
