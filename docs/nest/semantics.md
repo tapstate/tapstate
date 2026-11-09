@@ -29,6 +29,9 @@ is kept equal to what the view says.
       - { from: c, on: { id: customer_id }, as: object, path: customer }
 ```
 
+`o`, `i` and `c` are aliases you choose: `from:` names each table the step reads once, and the rest of the
+step refers to it by that alias. Any short name works; there is no naming rule.
+
 The **root key** (`id` above) is the document's identity. It is what the target is written by and what
 `nest inspect` asks for.
 
@@ -63,8 +66,11 @@ Each embed is one of two shapes, chosen with `as:`.
 | `array` | every matching row, keyed by `arrayKey` | an empty array |
 | `object` | one row | the field is left out |
 
-A third shape, `flat`, merges one row's fields into its parent instead of under a field; it has a page of
-its own: [Flat embeds](flat-embeds.md).
+A third shape, `flat`, merges one row's fields into its parent instead of under a field: with `as: flat`
+the example's order would carry `name` at its top level, not `customer.name`. Use it when the documents'
+readers expect one level of fields, for example when replacing a denormalized table; keep `object` when
+the fields should stay apart, because a flat field may not share a name with any field already in the
+parent, and a second matching row stops the run. It has a page of its own: [Flat embeds](flat-embeds.md).
 
 Independently of shape, an embed joins in one of two **directions**, read from which side of `on:`
 identifies a row:
@@ -75,18 +81,42 @@ identifies a row:
   The child row is shared: one customer under many orders. Changing that customer rewrites every order that
   points at it.
 
+With the example's rows, orders 1 and 2 both placed by customer 7, the two directions produce:
+
+```text
+orders:       { id: 1, customer_id: 7 }   { id: 2, customer_id: 7 }
+order_items:  { id: 10, order_id: 1 }     { id: 11, order_id: 1 }     { id: 12, order_id: 2 }
+customers:    { id: 7, name: "Ann" }
+```
+
+```json
+{ "id": 1, "customer_id": 7,
+  "items":    [ { "id": 10, "order_id": 1 }, { "id": 11, "order_id": 1 } ],
+  "customer": { "id": 7, "name": "Ann" } }
+
+{ "id": 2, "customer_id": 7,
+  "items":    [ { "id": 12, "order_id": 2 } ],
+  "customer": { "id": 7, "name": "Ann" } }
+```
+
+`items` is gathered: each item lands under the one order it names, and appears once. `customer` is
+referenced: the same customer row is copied into both orders, so renaming Ann rewrites both documents.
+
 ## Limits
 
 A nest refuses to hold some things rather than absorbing them silently. When one is reached the run stops
 with a code that names the key and the limit, so you can tell a data problem from a sizing problem.
 
-| Code | What reached the limit | Usually means |
-|---|---|---|
-| `nest.root-fanout-limit-exceeded` | elements in one document | the data really is this wide, or the embed is too broad |
-| `nest.reference-fanout-limit-exceeded` | documents pointing at one shared row | one edit would rewrite too many documents; embed from the other side |
-| `nest.pending-limit-exceeded` | changes held for a parent that has not arrived | parents are very late, or a reference is broken for good |
-| `nest.tombstone-limit-exceeded` | records of deletions kept in one document | the resume position is not advancing; find what holds it back |
-| `nest.flat-cardinality-violation` | live rows matched by a `flat` embed | the relationship is one-to-many; use `as: array` |
+| Code | What reached the limit | Usually means | What to do |
+|---|---|---|---|
+| `nest.root-fanout-limit-exceeded` | elements in one document | the data really is this wide, or the embed is too broad | narrow the embed with a `filter` step before the nest, or raise `max_elements_per_document` if documents this large are what you want |
+| `nest.reference-fanout-limit-exceeded` | documents pointing at one shared row | one edit to that row would rewrite too many documents | stop copying the shared row into every document: drop the embed and keep only its key (`customer_id`), or make the shared table the root and gather the others under it; raise the limit only if every one of those rewrites is what you want |
+| `nest.pending-limit-exceeded` | changes held for a parent that has not arrived | parents are very late, or a reference is broken for good | `nest inspect` the parent key the error names; if that parent will never exist, filter its children out before the nest; if it is only late, raise the limit |
+| `nest.tombstone-limit-exceeded` | records of deletions kept in one document | the resume position is not advancing | find what holds the resume position back, usually a target that is not confirming writes |
+| `nest.flat-cardinality-violation` | live rows matched by a `flat` embed | the relationship is one-to-many | use `as: array` |
+
+Changing `as:` does not change a reference's fan-out: the direction comes from `on:`, and a shared row is
+copied into every document that points at it whatever the shape.
 
 ## Before it runs: `explain` on a nest step
 
@@ -225,17 +255,6 @@ state, so it stays the same when the way state is stored changes.
 
 ## Metrics
 
-Each nest state namespace (one per level of each nest step) publishes these, with the namespace as the
-`tapstate.nest.namespace` attribute. They count from when the run began; a restart starts a new count.
-
-| Metric | Type | What it counts |
-|---|---|---|
-| `tapstate.pipeline.nest.roots.rendered` | counter | whole documents sent by a step's root level |
-| `tapstate.pipeline.state.commit.groups` | counter | durable writes of the namespace's state |
-| `tapstate.pipeline.state.commit.keys` | histogram | keys per durable write |
-| `tapstate.pipeline.state.commit.round_trips` | histogram | store round trips per durable write |
-| `tapstate.pipeline.state.commit.duration` | histogram | seconds per durable write |
-| `tapstate.pipeline.state.evictions` | counter | entries let go of from memory, to be read back when next needed |
-
-The share of reads that had to go to the store is `tapstate.pipeline.nest.cold.keys` divided by
-`tapstate.pipeline.nest.key.accesses` over the same window.
+The counters a nest step publishes (documents sent, state writes, evictions, and how often state had to be
+read back from the store) are listed with the other pipeline metrics in
+[Observe a pipeline](../observability/README.md#nest-state-metrics).

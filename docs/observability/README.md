@@ -89,6 +89,24 @@ The cold-layer alert still requires at least 100 logical accesses and a cold sha
 Small samples accumulate, missing key measurements do not establish recovery, and notifications describe
 pressure and recovery transitions.
 
+## Nest state metrics
+
+Each nest state namespace (one per level of each nest step) publishes these, with the namespace as the
+`tapstate.nest.namespace` attribute. They count from when the run began; a restart starts a new count.
+What a nest step is and how to read one is in [What a nest view is](../nest/semantics.md).
+
+| Metric | Type | What it counts |
+|---|---|---|
+| `tapstate.pipeline.nest.roots.rendered` | counter | whole documents sent by a step's root level |
+| `tapstate.pipeline.state.commit.groups` | counter | durable writes of the namespace's state |
+| `tapstate.pipeline.state.commit.keys` | histogram | keys per durable write |
+| `tapstate.pipeline.state.commit.round_trips` | histogram | store round trips per durable write |
+| `tapstate.pipeline.state.commit.duration` | histogram | seconds per durable write |
+| `tapstate.pipeline.state.evictions` | counter | entries let go of from memory, to be read back when next needed |
+
+The share of reads that had to go to the store is `tapstate.pipeline.nest.cold.keys` divided by
+`tapstate.pipeline.nest.key.accesses` over the same window (see the cold-layer counters above).
+
 ## Current-run initial-load display
 
 The snapshot response can additionally carry `initialLoad`. Its `runKey` binds the reading to the
