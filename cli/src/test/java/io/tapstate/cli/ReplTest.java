@@ -5452,6 +5452,55 @@ class ReplTest {
     }
 
     @Test
+    void explainWithAStepPrintsTheTreeTheServerExplained() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, Object> tree = new java.util.LinkedHashMap<>();
+        tree.put("pipelineId", "order_doc");
+        tree.put("step", "doc");
+        tree.put("rootAlias", "o");
+        tree.put("rootKey", List.of("id"));
+        tree.put("elementLimit", 20000);
+        tree.put("embeds", List.of());
+        client.nestExplainOutcome = new NestExplainOutcome.Found(Map.of("tree", tree, "build", "not available",
+                "samples", List.of(), "warnings", List.of()));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("explain order_doc doc")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("order_doc  step doc  root o  key id",
+                "build: not available", "embeds:", "none", "warnings: none from the sample");
+    }
+
+    @Test
+    void aNestReadWithNobodyAnsweringSaysTheRequestFailed() {
+        for (String command : List.of("nest progress order_doc", "nest inspect order_doc doc 1",
+                "explain order_doc doc")) {
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Harness h = onlineSession(Path.of("tap-work"), client);
+            client.healthy.clear();
+
+            assertThat(h.repl().dispatch(command)).as(command).isTrue();
+
+            assertThat(client.nestCalls).as(command).hasSize(1);
+        }
+    }
+
+    @Test
+    void aRefusedNestProgressOrInspectPrintsTheServersMessage() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.nestProgressOutcome = new NestProgressOutcome.Rejected("monitor.no-nest-step", "No nest step here.");
+        client.nestInspectOutcome = new NestInspectOutcome.Rejected("monitor.nest-not-running", "Not running here.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("nest progress order_doc")).isTrue();
+        assertThat(h.repl().dispatch("nest inspect order_doc doc 1")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("No nest step here.", "Not running here.");
+    }
+
+    @Test
     void nestRefusesAShapeItDoesNotKnowBeforeAskingAnything() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         Harness h = onlineSession(Path.of("tap-work"), client);

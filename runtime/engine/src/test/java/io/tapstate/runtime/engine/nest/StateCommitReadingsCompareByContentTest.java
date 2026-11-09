@@ -25,6 +25,8 @@ class StateCommitReadingsCompareByContentTest {
 
     @Test
     void oneBucketApartIsADifferentReading() {
-        assertThat(reading(2)).isNotEqualTo(reading(3)).isNotEqualTo("a reading");
+        assertThat(reading(2)).isNotEqualTo(reading(3));
+        assertThat(reading(2)).isNotEqualTo(new NestStateStats.Commits(4, new long[] {2, 1}, 7, new long[] {2, 0},
+                2, new long[] {0, 3}, 1_500, 42));
     }
 }
