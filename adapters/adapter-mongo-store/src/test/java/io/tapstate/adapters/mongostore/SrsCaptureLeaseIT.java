@@ -60,6 +60,7 @@ class SrsCaptureLeaseIT {
     private static final CacheBusinessScope SCOPE = new CacheBusinessScope("cluster-a", 1, "cache-a");
     private static final String CHAIN = "chain-a";
     private static final String ORDERS = "orders";
+    private static final String ITEMS = "items";
     private static final Runnable ACTIVE = () -> {};
 
     @AfterEach void clearProperties() {
@@ -144,15 +145,41 @@ class SrsCaptureLeaseIT {
     @Test void theOwnersOwnModelPublicationEndsTheLeaseSoTheNextAppendProvesAgainstTheNewModel() {
         withCapture(f -> {
             f.append(0); f.checkpoint(0, 1, 0L); f.append(1); f.commands.clear();
-            // Under the standing lease, an event naming a model nobody published would land unchecked; a lease that
-            // did not end on publication would still take it after the publication below.
+            // The proof saw version 0 as the published head, so its range was open-ended; the publication below
+            // closes it at sequence 2. A lease that did not end on publication would still take a version 0
+            // event at sequence 2 under that stale range.
             f.models.publish(model(ORDERS, 1, 1, 2), f.fence()); f.commands.clear();
-            code(() -> f.log.storeAll(ring(ORDERS), 2, List.of(event(5, 1, f.fence()))), IoError.SRS_MODEL_UNAVAILABLE);
+            code(() -> f.append(2), IoError.SRS_EVENT_MODEL_UNAVAILABLE);
             assertThat(f.commands).as("the append after a publication proves").anyMatch(command -> command.equals("find srs_models"));
             assertThat(f.events()).isEqualTo(2);
             f.log.storeAll(ring(ORDERS), 2, List.of(event(1, 1, f.fence()))); f.commands.clear();
             f.log.storeAll(ring(ORDERS), 3, List.of(event(1, 1, f.fence())));
             assertThat(f.commands).as("leased again under the new model").containsExactly("update workload_claims", "update srs_events", "update srs_log_bounds");
+            assertThat(f.events()).isEqualTo(4);
+        });
+    }
+
+    @Test void anEventNamingAModelTheLeaseHasNotProvedForcesAProofOfItsOwnAndIsRefusedWhenNonePublishedIt() {
+        withCapture(f -> {
+            f.append(0); f.checkpoint(0, 1, 0L); f.append(1); f.commands.clear();
+            code(() -> f.log.storeAll(ring(ORDERS), 2, List.of(event(5, 1, f.fence()))), IoError.SRS_EVENT_MODEL_UNAVAILABLE);
+            assertThat(f.commands).as("an unproved model is never taken on the lease's word").anyMatch(command -> command.equals("find srs_models"));
+            assertThat(f.events()).as("nothing of the refused append lands").isEqualTo(2);
+            f.commands.clear(); f.append(2);
+            assertThat(f.commands).as("the refusal ended the lease").anyMatch(command -> command.startsWith("listIndexes "));
+            assertThat(f.events()).isEqualTo(3);
+        });
+    }
+
+    @Test void twoRingsShareOneLeaseOnceEachHasProvedItsModel() {
+        withCapture(Set.of(ORDERS, ITEMS), f -> {
+            f.append(0); f.commands.clear();
+            f.log.storeAll(ring(ITEMS), 0, List.of(event(0, 1, f.fence())));
+            assertThat(f.commands).as("the first append of a second ring proves its model").anyMatch(command -> command.equals("find srs_models"));
+            f.commands.clear(); f.append(1);
+            assertThat(f.commands).as("the first ring stays proved").containsExactly("update workload_claims", "update srs_events", "update srs_log_bounds");
+            f.commands.clear(); f.log.storeAll(ring(ITEMS), 1, List.of(event(0, 1, f.fence())));
+            assertThat(f.commands).as("and so does the second").containsExactly("update workload_claims", "update srs_events", "update srs_log_bounds");
             assertThat(f.events()).isEqualTo(4);
         });
     }
@@ -185,7 +212,9 @@ class SrsCaptureLeaseIT {
     }
     private static String ring(String table) { return "srs." + CHAIN + "." + table; }
 
-    private static void withCapture(Scenario scenario) {
+    private static void withCapture(Scenario scenario) { withCapture(Set.of(ORDERS), scenario); }
+
+    private static void withCapture(Set<String> tables, Scenario scenario) {
         var commands = new CopyOnWriteArrayList<String>();
         String name = "srs_lease_" + UUID.randomUUID().toString().replace("-", "");
         var listener = new CommandListener() {
@@ -225,7 +254,7 @@ class SrsCaptureLeaseIT {
                 var log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease);
                 var fixture = new Fixture(database, chains, models, log, lease, claim, commands);
-                fixture.prepare();
+                fixture.prepare(tables);
                 commands.clear();
                 scenario.run(fixture);
             } catch (Exception failure) { throw new AssertionError(failure); }
@@ -236,12 +265,12 @@ class SrsCaptureLeaseIT {
     private record Fixture(MongoDatabase database, MongoSrsChainStore chains, MongoSrsModelStore models, MongoSrsLogStore log,
                            MongoSrsLease lease, WorkloadClaim claim, List<String> commands) {
         WorkloadClaimFence fence() { return WorkloadClaimFence.from(claim); }
-        void prepare() {
+        void prepare(Set<String> tables) {
             assertThat(chains.prepare(CHAIN, "retention", fence()).epoch()).isZero();
-            chains.requestTables(CHAIN, Set.of(ORDERS), fence());
+            chains.requestTables(CHAIN, tables, fence());
             assertThat(chains.openEpoch(CHAIN, 0, fence())).hasValue(1);
-            models.publish(model(ORDERS, 1, 0, 0), fence());
-            assertThat(chains.publishServingTables(CHAIN, 1, Set.of(ORDERS), fence())).isTrue();
+            for (String table : tables) models.publish(model(table, 1, 0, 0), fence());
+            assertThat(chains.publishServingTables(CHAIN, 1, tables, fence())).isTrue();
         }
         void append(long sequence) { log.storeAll(ring(ORDERS), sequence, List.of(event(0, 1, fence()))); }
         void checkpoint(long expectedRevision, long order, long frontier) {

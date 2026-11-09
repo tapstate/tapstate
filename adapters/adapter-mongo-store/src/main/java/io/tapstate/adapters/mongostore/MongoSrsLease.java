@@ -77,13 +77,16 @@ final class MongoSrsLease {
      * Publishes the lease a proof established: it began at {@code startedNanos} while {@code before} stood, and
      * the claim had {@code claimRemainingMillis} of lease left on the store's clock. Published only over the
      * exact lease the proof started from, so a drop at any point of the proof wins and the next write proves
-     * again; a proof that ran out while validating serves only the write it was proved for.
+     * again; a proof that ran out while validating serves only the write it was proved for. Answers the lease
+     * now standing, or null when none was published.
      */
-    void proved(Facet facet, Lease before, long startedNanos, long claimRemainingMillis) {
-        if (!leased) return;
+    Lease proved(Facet facet, Lease before, long startedNanos, long claimRemainingMillis) {
+        if (!leased) return null;
         long held = Math.min(maximumNanos, TimeUnit.MILLISECONDS.toNanos(Math.max(0L, claimRemainingMillis)));
         var lease = new Lease(startedNanos + held);
-        if (System.nanoTime() - lease.deadlineNanos < 0 && slot(facet).compareAndSet(before, lease)) LEASE_OPENS.incrementAndGet();
+        if (System.nanoTime() - lease.deadlineNanos >= 0 || !slot(facet).compareAndSet(before, lease)) return null;
+        LEASE_OPENS.incrementAndGet();
+        return lease;
     }
 
     /** Ends one facet's lease, after a failed fenced transaction. Cheap, idempotent, no IO. */
