@@ -182,6 +182,15 @@ class ScopedConvergenceTest {
         assertThat(published.metrics()).containsEntry("reconcileFailuresInARow", 4L);
     }
 
+    @Test void aFailedStopPassCannotPublishThatStoppingFinished() {
+        prepare(PipelineState.STOPPED);
+        var observations = new MemoryObservations();
+        publisher.publishReconcileFailureScoped(SCOPE, state, observations, 1);
+        assertThat(observations.read("orders")).isEmpty();
+        assertThat(publisher.publishScoped(SCOPE, state, observations, null).orElseThrow().state())
+                .isEqualTo(PipelineState.STOPPED);
+    }
+
     @Test void aFailedPassPreservesItsLastProjectionReasonAndPositions() {
         prepare(PipelineState.FAILED);
         var observations = new MemoryObservations();

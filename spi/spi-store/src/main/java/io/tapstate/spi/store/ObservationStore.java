@@ -14,14 +14,22 @@ import java.util.Optional;
  * upserts the observation for its pipeline; {@link #read} returns the current observation for a
  * pipeline, or empty when none has been published.
  *
- * <p>A scope-bound business view also checks its fixed physical state and the original live claim on
- * every mutation. Last-write-wins applies only inside that admitted scope; a stale scope or run cannot
- * overwrite its replacement. Ordinary business views refuse physical removal.
+ * <p>A scope-bound business view isolates writes by the original execution and the measured
+ * checkpoint epoch. Its read view chooses the observation that matches the current execution and
+ * checkpoint. Ordinary business views refuse physical removal.
  */
 public interface ObservationStore {
 
     /** Upserts the observation for its pipeline id (last write wins). */
     void save(Observation observation);
+
+    /** Publishes a sample measured against the given checkpoint, without adopting a newer epoch. */
+    default void save(Observation observation, long checkpointEpoch) { save(observation); }
+
+    /** Final data measured immediately before the bounded execution completed. */
+    default Optional<Observation> beforeCompletion(String pipelineId, long checkpointEpoch) {
+        return read(pipelineId);
+    }
 
     /** Returns the current observation for a pipeline, or empty if none has been published. */
     Optional<Observation> read(String pipelineId);

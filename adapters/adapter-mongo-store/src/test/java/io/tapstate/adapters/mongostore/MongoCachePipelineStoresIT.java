@@ -58,20 +58,22 @@ class MongoCachePipelineStoresIT {
 
     @Test void initialLoadDisplayRoundTripsAndNewRunReplacesOnlyItsOwnCurrentFacts() {
         withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
             var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
             var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
             var load = new io.tapstate.core.lifecycle.InitialLoad("execution:orders:2:at", AT, "snapshot_and_cdc", Map.of(
                     "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(io.tapstate.core.lifecycle.InitialLoad.Stage.READING, 3L, null)));
             var first = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT, List.of(), load);
-            observations.save(first);
+            observations.save(first, 1);
             assertThat(observations.read("orders")).contains(first);
             var next = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT.plusSeconds(1), List.of(),
                     new io.tapstate.core.lifecycle.InitialLoad("execution:orders:3:next", AT.plusSeconds(1), "snapshot_and_cdc", Map.of(
                             "orders", new io.tapstate.core.lifecycle.InitialLoad.Table(io.tapstate.core.lifecycle.InitialLoad.Stage.PENDING, null, null))));
-            observations.save(next);
+            observations.save(next, 1);
+            observations.save(first, 1);
             assertThat(collection.countDocuments()).isEqualTo(1);
             assertThat(observations.read("orders")).contains(next);
-            collection.updateOne(new Document("_id", "orders"), new Document("$unset", new Document("initialLoad", "")));
+            collection.updateOne(new Document("_id", collection.find().first().get("_id")), new Document("$unset", new Document("initialLoad", "")));
             assertThat(observations.read("orders").orElseThrow().initialLoad()).isNull();
         });
     }
@@ -87,49 +89,52 @@ class MongoCachePipelineStoresIT {
             assertThat(states.compareAndSwap("orders", 0, "PAUSED", AT)).isEqualTo(new CasOutcome.Fenced(1));
             assertThat(state(f.database())).isEqualTo(before);
             var observation = observation(PipelineState.RUNNING);
-            observations.save(observation);
+            observations.save(observation, 1);
             assertThat(observations.read("orders")).contains(observation);
             assertThat(f.domain().pipelineStates(SCOPE).read("orders").orElseThrow().stateJson()).isEqualTo("RUNNING");
-            assertThat(state(f.database())).containsEntry("epoch", 1L).containsEntry("runtimeWriteFence", 4L);
+            assertThat(state(f.database())).isEqualTo(before);
             assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(1);
             f.domain().advanceAuthGeneration(new CacheAuthScope("cluster-a", 1, StorageBinding.Mode.OP, "incarnation-a", 1), 2, "reset-auth", ACTIVE);
-            observations.save(observation(PipelineState.PAUSED));
+            assertThat(states.compareAndSwap("orders", 1, "PAUSED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            observations.save(observation(PipelineState.PAUSED), 2);
             assertThat(observations.read("orders").orElseThrow().state()).isEqualTo(PipelineState.PAUSED);
         });
     }
 
     @Test void aCurrentRunInitialLoadSurvivesTheStrictCacheCodec() {
         withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
             var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
-            observations.save(observation(PipelineState.RUNNING));
+            observations.save(observation(PipelineState.RUNNING), 1);
             Document load = new Document("runKey", "run-1").append("observedAt", java.util.Date.from(AT))
                     .append("readMode", "snapshot_and_cdc")
                     .append("tables", new Document("orders", new Document("stage", "READING")
                             .append("rowsRead", 7L).append("rowsTotalEstimate", 10L))
                             .append("customers", new Document("stage", "PENDING")));
             var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
-            collection.updateOne(new Document("_id", "orders"), new Document("$set", new Document("initialLoad", load)));
+            collection.updateOne(new Document("_id", collection.find().first().get("_id")), new Document("$set", new Document("initialLoad", load)));
             Observation decoded = observations.read("orders").orElseThrow();
-            observations.save(decoded);
-            assertThat(collection.find(new Document("_id", "orders")).first().get("initialLoad")).isEqualTo(load);
+            observations.save(decoded, 1);
+            assertThat(collection.find().first().get("initialLoad")).isEqualTo(load);
         });
     }
 
     @Test void malformedInitialLoadCannotBeCoercedOrRepairedByARead() {
         withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
             var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
-            observations.save(observation(PipelineState.RUNNING));
+            observations.save(observation(PipelineState.RUNNING), 1);
             var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
             Document original = collection.find().first();
             for (var mutation : List.of(new Document("initialLoad.tables.orders.rowsRead", 7.5d),
                     new Document("initialLoad.tables.orders.rowsRead", -1L),
                     new Document("initialLoad.tables.orders.stage", "UNRECOGNIZED"),
                     new Document("initialLoad.unexpected", "private-sentinel"))) {
-                collection.updateOne(new Document("_id", "orders"), new Document("$set", mutation));
+                collection.updateOne(new Document("_id", collection.find().first().get("_id")), new Document("$set", mutation));
                 var before = snapshot(f.database());
                 assertCode(() -> observations.read("orders"), IoError.DOCUMENT_UNREADABLE);
                 assertThat(snapshot(f.database())).isEqualTo(before);
-                collection.replaceOne(new Document("_id", "orders"), original);
+                collection.replaceOne(new Document("_id", original.get("_id")), original);
             }
         });
     }
@@ -139,7 +144,7 @@ class MongoCachePipelineStoresIT {
             var before = snapshot(f.database());
             var read = f.domain().pipelineStates(SCOPE); var observations = f.domain().pipelineObservations(SCOPE);
             assertCode(() -> read.compareAndSwap("orders", 0, "RUNNING", AT), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> observations.save(observation(PipelineState.RUNNING)), IoError.CACHE_BUSINESS_FENCED);
+            assertCode(() -> observations.save(observation(PipelineState.RUNNING), 1), IoError.CACHE_BUSINESS_FENCED);
             var writer = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
             assertCode(() -> writer.create("orders", "NEW", AT), IoError.CACHE_BUSINESS_FENCED);
             assertCode(() -> writer.delete("orders"), IoError.CACHE_BUSINESS_FENCED);
@@ -157,7 +162,7 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> writer.read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertCode(() -> writer.compareAndSwap("orders", 0, "RUNNING", AT), IoError.DOCUMENT_UNREADABLE);
             assertCode(() -> writer.create("orders", "NEW", AT), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING)), IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(snapshot(f.database())).isEqualTo(before);
         });
     }
@@ -177,7 +182,7 @@ class MongoCachePipelineStoresIT {
             var stale = f.domain().pipelineStates(SCOPE, fresh, ACTIVE);
             assertCode(() -> stale.read("orders"), IoError.CACHE_BUSINESS_FENCED);
             assertCode(() -> stale.compareAndSwap("orders", 0, "RUNNING", AT), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> f.domain().pipelineObservations(SCOPE, fresh, ACTIVE).save(observation(PipelineState.RUNNING)), IoError.CACHE_BUSINESS_FENCED);
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.CACHE_BUSINESS_FENCED);
             assertThat(snapshot(f.database())).isEqualTo(before);
             assertThat(f.domain().pipelineStates(scope(2), fresh, ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT))
                     .isInstanceOf(CasOutcome.Applied.class);
@@ -192,9 +197,14 @@ class MongoCachePipelineStoresIT {
             var advanced = claims.advanceExecution(claims.read(KEY).orElseThrow().claim(), 1, Set.of("node-a")).orElseThrow();
             var before = snapshot(f.database());
             assertCode(() -> oldStates.compareAndSwap("orders", 0, "RUNNING", AT), IoError.WORKLOAD_CLAIM_FENCED);
-            assertCode(() -> oldObservations.save(observation(PipelineState.RUNNING)), IoError.WORKLOAD_CLAIM_FENCED);
             assertThat(snapshot(f.database())).isEqualTo(before);
-            f.domain().pipelineObservations(SCOPE, WorkloadClaimFence.from(advanced), ACTIVE).save(observation(PipelineState.FAILED));
+            var next = WorkloadClaimFence.from(advanced);
+            var states = f.domain().pipelineStates(SCOPE, next, ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            oldObservations.save(observation(PipelineState.RUNNING), 1);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).isEmpty();
+            assertThat(states.compareAndSwap("orders", 1, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, next, ACTIVE).save(observation(PipelineState.FAILED), 2);
             assertThat(f.domain().pipelineObservations(SCOPE).read("orders").orElseThrow().state()).isEqualTo(PipelineState.FAILED);
         });
     }
@@ -229,45 +239,84 @@ class MongoCachePipelineStoresIT {
         });
     }
 
-    @Test void anObservationPausedAfterReadingTheOldScopeCannotCommitAcrossReplacement() {
+    @Test void delayedObservationCanWriteItsOwnRecordButCannotCrossAStopOrReplacement() {
         withFixture(f -> {
-            var paused = new CountDownLatch(1); var proceed = new CountDownLatch(1); var once = new AtomicBoolean();
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var paused = new CountDownLatch(1); var proceed = new CountDownLatch(1);
+            var writes = new java.util.concurrent.CopyOnWriteArrayList<String>();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
-                    if (isUpdate(event, "pipeline_state") && once.compareAndSet(false, true)) { paused.countDown(); await(proceed); }
+                    if (event.getCommandName().equals("update")) {
+                        writes.add(event.getCommand().getString("update").getValue());
+                        if (isUpdate(event, "pipeline_observation")) { paused.countDown(); await(proceed); }
+                    }
                 }
             };
             try (var observed = client(listener); var workers = Executors.newSingleThreadExecutor()) {
                 var store = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
                         observed.getDatabase(f.database().getName()), SCOPE, f.fence(), ACTIVE));
-                var result = workers.submit(() -> store.save(observation(PipelineState.RUNNING)));
+                var result = workers.submit(() -> store.save(observation(PipelineState.RUNNING), 1));
                 try {
                     assertThat(paused.await(10, TimeUnit.SECONDS)).isTrue();
-                    // Deliberately keep the claim live: the state header's own write must close this race.
-                    replaceScope(f.database(), scope(2));
+                    assertThat(states.compareAndSwap("orders", 1, "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
                 } finally { proceed.countDown(); }
-                assertThatThrownBy(() -> result.get(15, TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class)
-                        .satisfies(error -> assertThat(((TapstateException) error.getCause()).code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
-                assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isZero();
-                assertThat(state(f.database())).containsEntry("scope", header(scope(2))).containsEntry("runtimeWriteFence", 2L);
-                assertThat(claim(f.database())).doesNotContainKey("fencedPipelineWrites");
+                result.get(15, TimeUnit.SECONDS);
+                assertThat(writes).containsExactly("pipeline_observation");
+                assertThat(store.read("orders")).isEmpty();
+                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders")).isEmpty();
+                store.save(observation(PipelineState.STOPPED), 2);
+                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders").orElseThrow().state())
+                        .isEqualTo(PipelineState.STOPPED);
+                replaceScope(f.database(), scope(2));
+                assertCode(() -> store.read("orders"), IoError.CACHE_BUSINESS_FENCED);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                        new Document("$set", new Document("pipelineScope", header(scope(2)))));
+                store.save(observation(PipelineState.RUNNING), 1);
+                assertThat(f.domain().pipelineObservations(scope(2)).read("orders")).isEmpty();
+                assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isEqualTo(2);
             }
         });
     }
 
-    @Test void guardRevocationAfterWritesRollsBackClaimStateAndObservationTogether() {
+    @Test void anInactiveLocalOwnerCannotOpenANewObservationWrite() {
         withFixture(f -> {
-            var active = new AtomicBoolean(true);
-            var listener = new CommandListener() {
-                @Override public void commandStarted(CommandStartedEvent event) { if (isUpdate(event, "pipeline_observation")) active.set(false); }
-            };
             var before = snapshot(f.database());
-            try (var observed = client(listener)) {
-                var store = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
-                        observed.getDatabase(f.database().getName()), SCOPE, f.fence(), () -> { if (!active.get()) throw MongoCachePipelineAccess.fenced(); }));
-                assertCode(() -> store.save(observation(PipelineState.RUNNING)), IoError.CACHE_BUSINESS_FENCED);
-            }
+            var store = f.domain().pipelineObservations(SCOPE, f.fence(), () -> { throw MongoCachePipelineAccess.fenced(); });
+            assertCode(() -> store.save(observation(PipelineState.RUNNING), 1), IoError.CACHE_BUSINESS_FENCED);
             assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void terminalPayloadStaysVisibleAcrossAClaimChangeAndNeverCrossesTheNextEpoch() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var running = observation(PipelineState.RUNNING);
+            observations.save(running, 1);
+            assertThat(states.compareAndSwap("orders", 1, "COMPLETED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            assertThat(observations.beforeCompletion("orders", 2)).contains(running);
+            var completed = observation(PipelineState.COMPLETED);
+            observations.save(completed, 2);
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var next = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
+                    1, Set.of("node-a")).orElseThrow());
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(completed);
+            var nextStates = f.domain().pipelineStates(SCOPE, next, ACTIVE);
+            assertThat(nextStates.compareAndSwap("orders", 2, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var failed = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("test.failure", Map.of()), AT, List.of());
+            f.domain().pipelineObservations(SCOPE, next, ACTIVE).save(failed, 3);
+            assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders")).contains(failed);
+            var takeover = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
+                    1, Set.of("node-a")).orElseThrow());
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(failed);
+            assertThat(f.domain().pipelineStates(SCOPE, takeover, ACTIVE).compareAndSwap("orders", 3, "STOPPED", AT))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).isEmpty();
+            f.domain().pipelineObservations(SCOPE, takeover, ACTIVE).save(observation(PipelineState.STOPPED), 4);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(observation(PipelineState.STOPPED));
         });
     }
 
@@ -320,29 +369,29 @@ class MongoCachePipelineStoresIT {
         });
     }
 
-    @Test void existingWrongScopeObservationIsNotAdoptedOrOverwritten() {
+    @Test void observationsFromAnotherScopeAreInvisibleAndCannotBlockTheCurrentProjection() {
         withFixture(f -> {
-            var document = MongoObservationStore.toDocument(observation(PipelineState.RUNNING)).append("scope", header(scope(2)));
-            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).insertOne(document);
-            var before = snapshot(f.database());
-            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.PAUSED)), IoError.CACHE_BUSINESS_FENCED);
-            assertThat(snapshot(f.database())).isEqualTo(before);
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(scope(2), f.fence(), ACTIVE).save(observation(PipelineState.RUNNING), 1);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).isEmpty();
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING), 1);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(observation(PipelineState.RUNNING));
+            assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isEqualTo(2);
         });
     }
 
-    @Test void saturationRetirementAndClosedOwnersRefuseAllCapturedWriteViews() {
+    @Test void saturatedRetiredAndClosedStateRefusesBusinessAccessAndHidesOldObservations() {
         withFixture(f -> {
             var writer = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
             var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document("_id", "orders"), new Document("$set", new Document("runtimeWriteFence", Long.MAX_VALUE - 1)));
             var before = snapshot(f.database());
             assertCode(() -> writer.compareAndSwap("orders", 0, "RUNNING", AT), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> observations.save(observation(PipelineState.RUNNING)), IoError.CACHE_BUSINESS_FENCED);
             assertThat(snapshot(f.database())).isEqualTo(before);
             f.domain().retireBusiness(BUSINESS, "retire-business", ACTIVE);
             assertCode(() -> writer.read("orders"), IoError.CACHE_BUSINESS_FENCED);
-            assertCode(() -> observations.save(observation(PipelineState.RUNNING)), IoError.CACHE_BUSINESS_FENCED);
+            observations.save(observation(PipelineState.RUNNING), 1);
+            assertCode(() -> observations.read("orders"), IoError.CACHE_BUSINESS_FENCED);
             f.domain().close();
             assertCode(() -> writer.read("orders"), IoError.CACHE_BUSINESS_FENCED);
         });
@@ -350,8 +399,9 @@ class MongoCachePipelineStoresIT {
 
     @Test void fractionalStoredMetricsAreDiagnosedInsteadOfTruncated() {
         withFixture(f -> {
-            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING));
-            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).updateOne(new Document("_id", "orders"),
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING), 1);
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).updateOne(new Document("pipelineId", "orders"),
                     new Document("$set", new Document("metrics.rows", 1.75d)));
             var before = snapshot(f.database());
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
@@ -361,8 +411,9 @@ class MongoCachePipelineStoresIT {
 
     @Test void malformedStoredStateNeverRetainsItsRawTextInAnExceptionCause() {
         withFixture(f -> {
-            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING));
-            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).updateOne(new Document("_id", "orders"),
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING), 1);
+            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).updateOne(new Document("pipelineId", "orders"),
                     new Document("$set", new Document("state", "private-sentinel-state")));
             assertThatThrownBy(() -> f.domain().pipelineObservations(SCOPE).read("orders"))
                     .isInstanceOfSatisfying(TapstateException.class, error -> {
@@ -389,7 +440,8 @@ class MongoCachePipelineStoresIT {
                     Map.of("table-a", new io.tapstate.core.lifecycle.TableSnapshot(2L, 2L, 100, true)), Map.of("table-a", "position-a"),
                     new io.tapstate.core.lifecycle.ObservationFailure("engine.job-failed", Map.of("pipeline", "orders")), AT, List.of(fact));
             var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
-            writer.save(expected);
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            writer.save(expected, 1);
             assertThat(writer.read("orders")).contains(expected);
         });
     }

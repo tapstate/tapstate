@@ -618,31 +618,31 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             throw MongoCachePipelineAccess.fenced();
         var accesses = scopes.stream().map(scope -> pipelineAccess(scope, null, active)).toList();
         var ids = scopes.stream().map(io.tapstate.spi.store.PipelineIntentScope::pipelineId).toList();
-        var keys = scopes.stream().map(scope -> MongoWorkloadClaimStore.id(observationClaim(scope))).toList();
+        var keys = accesses.stream().map(MongoCachePipelineObservationStore::claimKey).toList();
         return accesses.getFirst().observationTransaction(session -> {
-            MongoCacheWorkloadClaimStore.requireCollection(database);
             var states = observationRows(session, SystemCollections.CACHE_PIPELINE_STATE, ids);
-            var claims = observationRows(session, SystemCollections.CACHE_WORKLOAD_CLAIMS, keys);
-            var observations = observationRows(session, SystemCollections.CACHE_PIPELINE_OBSERVATION, ids);
+            var claims = MongoCachePipelineObservationStore.claims(session, accesses.getFirst(), keys);
+            var readings = new java.util.ArrayList<MongoCachePipelineObservationStore.Reading>();
             var result = new java.util.HashMap<String, java.util.Optional<io.tapstate.core.lifecycle.Observation>>();
             for (var access : accesses) {
-                String id = access.scope.pipelineId();
                 try {
-                    access.validateState(states.get(id));
-                    access.requirePreparedClaim(session, claims.get(MongoWorkloadClaimStore.id(observationClaim(access.scope))));
-                    result.put(id, MongoCachePipelineObservationStore.decode(access, observations.get(id)));
+                    readings.add(MongoCachePipelineObservationStore.reading(session, access, states.get(access.scope.pipelineId()),
+                            claims.get(MongoCachePipelineObservationStore.claimKey(access))));
                 } catch (TapstateException failure) {
                     if (failure.code() != IoError.CACHE_BUSINESS_FENCED
                             && failure.code() != IoError.WORKLOAD_CLAIM_FENCED) throw failure;
                     // The ordinary reader classifies a concurrently replaced scope.
                 }
             }
+            if (!readings.isEmpty()) {
+                var observationKeys = readings.stream().map(MongoCachePipelineObservationStore.Reading::key).toList();
+                var observations = observationRows(session, SystemCollections.CACHE_PIPELINE_OBSERVATION, observationKeys);
+                var terminal = MongoCachePipelineObservationStore.terminalDetails(session, accesses.getFirst(), readings, observations);
+                for (var reading : readings) result.put(reading.pipeline(),
+                        MongoCachePipelineObservationStore.select(reading, observations.get(reading.key()), terminal.get(reading.pipeline())));
+            }
             return java.util.Map.copyOf(result);
         });
-    }
-
-    private static WorkloadClaimKey observationClaim(io.tapstate.spi.store.PipelineIntentScope scope) {
-        return new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
     }
 
     private java.util.Map<Object, Document> observationRows(com.mongodb.client.ClientSession session,

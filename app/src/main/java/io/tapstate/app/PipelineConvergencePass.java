@@ -111,6 +111,9 @@ final class PipelineConvergencePass {
     WorkloadClaimFence claim() { return claim.get(); }
     StateStore state() { return state; }
     ObservationStore observations() { return observations; }
+    ObservationStore observationSample() {
+        return views.pipelineObservations(scope(), claim(), requireActive);
+    }
     io.tapstate.spi.store.DerivedSchemaStore derivedSchemas() { return derivedSchemas; }
     io.tapstate.spi.store.RateHistoryStore rateHistory() { return rateHistory; }
 

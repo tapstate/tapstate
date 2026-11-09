@@ -186,7 +186,7 @@ final class ConvergenceDriver {
                 ConvergeResult result = scoped == null ? converger.converge(pipelineId)
                         : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
                                 scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
-                                        originalPass.state(), originalPass.observations(), null),
+                                        originalPass.state(), originalPass.observationSample(), null),
                                 () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
@@ -200,7 +200,7 @@ final class ConvergenceDriver {
                             failure.code(), result.failure().orElse(null));
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observations(), failure);
+                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
                 PipelineConvergencePass sampledPass = pass;
                 projection.ifPresent(published -> {
                     if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
@@ -225,7 +225,7 @@ final class ConvergenceDriver {
                 try {
                     if (scoped == null) publisher.publishReconcileFailure(pipelineId, failures);
                     else if (pass != null) publisher.publishReconcileFailureScoped(
-                            pass.scope(), pass.state(), pass.observations(), failures);
+                            pass.scope(), pass.state(), pass.observationSample(), failures);
                 } catch (RuntimeException unpublishable) {
                     // The read face is unreachable too (e.g. the same store backs both), so nothing can be
                     // surfaced this tick; the warning above is the only record.

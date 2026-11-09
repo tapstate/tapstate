@@ -238,6 +238,7 @@ final class MongoCachePipelineAccess {
     }
 
     WorkloadClaimFence originalClaim() { return original; }
+    void requireObservationActive() { requireActive.run(); }
 
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
@@ -336,6 +337,7 @@ final class MongoCachePipelineAccess {
     void verifyStructures() {
         verifyStateStructure(); verifyStructure(SystemCollections.CACHE_PIPELINE_OBSERVATION);
     }
+    void verifyObservationStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_OBSERVATION); }
 
     void verifyStateStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE); }
     void verifyStateStructure(MongoReadBudget budget) { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE,budget); }
