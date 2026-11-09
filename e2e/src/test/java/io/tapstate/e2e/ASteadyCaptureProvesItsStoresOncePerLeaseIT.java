@@ -6,6 +6,7 @@ import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.lifecycle.LifecycleVerb;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -37,6 +38,8 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
     private static final String PIPELINE = "lease_capture";
     /** Single changes, each confirmed at the target before the next is written, so each is one batch. */
     private static final int CHANGES = 30;
+    private static final Duration OPENING = Duration.ofSeconds(90);
+    private static final Duration WRITE_EVERY = Duration.ofMillis(500);
     /** The identity row is read only by a proof; a batch inside a standing lease never touches it. */
     private static final String PROOF_MARKER = "cache_identity";
     private static final Set<String> CONSUMER_COLLECTIONS = Set.of("srs_consumers", "srs_consumer_offsets");
@@ -84,8 +87,21 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
                             """));
             control.discoverSchema("src_mongo", "mongodb", Map.of("uri", sourceUri, "database", DATABASE));
             control.lifecycle(PIPELINE, LifecycleVerb.START);
-            // The first change opens the stream and pays the first proof outside the measured window.
-            writeAndAwait(orders, copied, "warm");
+            Await.until(PIPELINE + " to run", OPENING, () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent(),
+                    () -> String.valueOf(control.state(PIPELINE)));
+            // A pipeline marked RUNNING is not necessarily on the stream yet, and a cdc-only pipeline never sees a
+            // change made before it is: changes keep being written until one crosses. They open the stream and pay
+            // the first proof outside the measured window.
+            int[] warm = {0};
+            long[] lastWrite = {System.nanoTime() - WRITE_EVERY.toNanos()};
+            Await.until("a change made after the pipeline started to reach the target", OPENING, () -> {
+                if (copied.countDocuments(new Document("_id", new Document("$regex", "^warm_"))) > 0) return true;
+                if (System.nanoTime() - lastWrite[0] >= WRITE_EVERY.toNanos()) {
+                    orders.insertOne(new Document("_id", "warm_" + (++warm[0])).append("value", 1));
+                    lastWrite[0] = System.nanoTime();
+                }
+                return false;
+            }, () -> "warm changes written=" + warm[0] + ", state=" + control.state(PIPELINE) + ", logs=" + control.logs(PIPELINE));
 
             MongoDatabase cache = cacheObserver.getDatabase(storage.cacheDatabase());
             cache.runCommand(new Document("profile", 1).append("slowms", 0).append("sampleRate", 1.0));
