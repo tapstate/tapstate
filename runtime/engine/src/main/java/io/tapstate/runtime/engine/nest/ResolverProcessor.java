@@ -1040,7 +1040,10 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
      * open commit group stay queued, in order, until the group commits: drain, mutate, commit, emit.
      */
     private boolean flush() {
-        if (!outgoing.isEmpty() && !groupClosed()) {
+        // Asked even with nothing queued: a group whose changes produce no output yet - documents waiting on
+        // a reference, a snapshot still arriving - is otherwise closed by nothing but the input ending, and
+        // grows with the input until then.
+        if (!groupClosed() && !outgoing.isEmpty()) {
             return true;
         }
         while (!outgoing.isEmpty()) {

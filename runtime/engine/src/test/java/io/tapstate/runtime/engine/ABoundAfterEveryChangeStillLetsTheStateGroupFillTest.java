@@ -110,7 +110,7 @@ class ABoundAfterEveryChangeStillLetsTheStateGroupFillTest {
         byAlias.put("c", dag.newVertex(CUSTOMERS, source(CUSTOMERS, customers)));
         Map<String, String> chainOfAlias = Map.of("o", ORDERS, "c", CUSTOMERS);
         Map<Vertex, Integer> outbound = new HashMap<>();
-        Vertex assembled = NestDag.attach(dag, NestTopology.compile("p", "doc", body, tables::get), "doc", "o", "doc",
+        Vertex assembled = NestDag.attach(dag, NestTopology.compile("p-bound-per-change", "doc", body, tables::get), "doc", "o", "doc",
                 alias -> List.of(byAlias.get(alias)),
                 new NestBinding(tables::get, NestBinding.onMap(), (from, released) -> { }),
                 vertex -> outbound.merge(vertex, 1, Integer::sum) - 1,
