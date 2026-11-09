@@ -124,16 +124,16 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             long appends = profiled.stream().filter(op -> isUpdate(op, "srs_events")).count();
             long checkpointWrites = profiled.stream().filter(op -> isUpdate(op, "srs_chains")).count();
             // The reads do carry their transaction, and a proof shows in what it reads. An append proof resolves
-            // the event's model by ring, epoch and version, a query nothing else in this window makes: not the
-            // checkpoint, whose proof reads the models it names by key, and not the retention pass, which reads
-            // them by table once a second. The consumer's own reads resolve the model the same way and read its
-            // membership, and are left out here. A leased checkpoint reads the chain root and nothing else.
+            // the event's model by ring, epoch and version without reading any event: every other transaction
+            // that resolves a model does so for an event it loaded (a checkpoint proof's frontier, a log read's
+            // batch), the retention pass reads the models by table once a second, and the consumer's own reads
+            // read its membership. A leased checkpoint reads the chain root and nothing else.
             int provingAppends = 0, leasedCheckpoints = 0;
             for (List<Document> reads : transactions(profiled).values()) {
                 Set<String> read = new java.util.HashSet<>();
                 for (Document op : reads) read.add(collection(op));
                 if (reads.stream().anyMatch(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel)
-                        && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
+                        && !read.contains("srs_events") && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
                 if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
             }
             String reading = "appends %d (proving %d), checkpoint writes %d (leased %d) over %d profiled operations"
@@ -186,8 +186,10 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
         long start = profiled.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(0L);
         var counts = new java.util.TreeMap<String, long[]>();
         for (List<Document> reads : transactions(profiled).values()) {
-            String shape = reads.stream().map(op -> resolvesEventModel(op) ? "srs_models(event)" : collection(op)).distinct().sorted()
-                    .collect(java.util.stream.Collectors.joining("+"));
+            long resolving = reads.stream().filter(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel).count();
+            String shape = reads.stream().map(ASteadyCaptureProvesItsStoresOncePerLeaseIT::collection).distinct().sorted()
+                    .collect(java.util.stream.Collectors.joining("+"))
+                    + (resolving == 0 ? "" : resolving == 1 ? "+srs_models(event)" : "+srs_models(event x" + resolving + ")");
             long at = reads.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(start);
             long[] entry = counts.computeIfAbsent(shape, key -> new long[] {0L, Long.MAX_VALUE, Long.MIN_VALUE});
             entry[0]++; entry[1] = Math.min(entry[1], at); entry[2] = Math.max(entry[2], at);
