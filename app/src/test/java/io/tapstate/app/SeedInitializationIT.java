@@ -28,7 +28,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Paired local replica-set measurements over the actual immutable eight-artifact release. */
+/** Paired local replica-set measurements over the actual immutable connector release. */
 @RequiresDocker
 class SeedInitializationIT {
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -69,8 +69,8 @@ class SeedInitializationIT {
                         long registered = System.nanoTime();
                         gate.verifyRegistrations(outcomes);
                         long ready = System.nanoTime();
-                        assertThat(outcomes).hasSize(8).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
-                        assertThat(registry.list()).hasSize(8);
+                        assertThat(outcomes).hasSize(9).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
+                        assertThat(registry.list()).hasSize(9);
                         long expectedRead = switch (state) {
                             case "cold" -> bytes * (reuseSeed ? 1 : 2);
                             case "warm" -> bytes * 2;

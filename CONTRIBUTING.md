@@ -47,7 +47,7 @@ The Real connectors workflow runs the same ten witness shards with two input pol
   specification against `deploy/cloud/connectors.lock.json`, and reports `real-connectors-release`.
   Every shard and the aggregate must agree on the actual input identities. A missing or changed
   asset fails; the workflow does not substitute an upstream build. The Cloud image staging path
-  retains its separate eight-connector and companion-license contract.
+  retains its separate contract for locked connectors and companion licenses.
 - **Upstream compatibility:** schedules and default manual dispatches build current upstream
   source and SNAPSHOT inputs and report `real-connectors`. This detects new compatibility work;
   its result does not substitute for shipping acceptance on a different connector set.

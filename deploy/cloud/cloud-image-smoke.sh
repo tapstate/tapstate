@@ -329,4 +329,4 @@ for sentinel in image-runtime-static-token-sentinel image-runtime-one-time-code-
   fi
 done
 [[ "$FAILED" = 0 ]] || exit 1
-echo 'PASS: real Cloud/onprem images, eight locked registrations, restart/session/C2, shutdown and five fail-closed scenarios'
+echo 'PASS: real Cloud/onprem images, locked registrations, restart/session/C2, shutdown and five fail-closed scenarios'

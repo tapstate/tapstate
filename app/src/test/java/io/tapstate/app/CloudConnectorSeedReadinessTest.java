@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class CloudConnectorSeedReadinessTest {
 
     private static final List<String> IDS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final JsonMapper JSON = new JsonMapper();
     private static final String VERSION = "2.0.5-SNAPSHOT";
     private static final String REVISION = "a".repeat(40);

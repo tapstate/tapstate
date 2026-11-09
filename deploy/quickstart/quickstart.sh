@@ -513,9 +513,7 @@ main() {
     fi
 
     # Fetch the stack into this directory, each asset only if absent, so a re-run neither re-downloads a
-    # verified asset nor overwrites an edit the user made to it. The seed dir is created empty on purpose:
-    # a registered jar's bytes live in the store, and the demo registers over the CLI upload path, so the
-    # seed stays the documented empty convenience rather than the route registration depends on.
+    # verified asset nor overwrites an edit the user made to it.
     #
     # Both seed directories are fetched, not just the one the demo pipeline reads. The compose file
     # mounts each of them, and a missing mount source is not an error Docker reports - it creates an
@@ -571,8 +569,7 @@ main() {
         esac
     fi
 
-    # The demo connector jars. These three are what this release registers, and they are fetched so the
-    # demo runs without the user choosing. They sit outside connectors/ so the seed dir stays empty.
+    # The demo registers three jars explicitly. Dummy is staged for the startup seed sweep.
     #
     # The postgres one is fetched for the same reason its seed is: the compose file has run a postgres
     # service with a seeded shipments table since the second engine was added, and a demo that fetches
@@ -582,6 +579,7 @@ main() {
     [ -f ./mysql-connector.jar ]    || fetch "${cbase}/mysql-connector.jar" ./mysql-connector.jar
     [ -f ./mongodb-connector.jar ]  || fetch "${cbase}/mongodb-connector.jar" ./mongodb-connector.jar
     [ -f ./postgres-connector.jar ] || fetch "${cbase}/postgres-connector.jar" ./postgres-connector.jar
+    [ -f ./connectors/dummy-connector.jar ] || fetch "${cbase}/dummy-connector.jar" ./connectors/dummy-connector.jar
 
     # A random admin password replaces the shipped admin/admin default so a stack left running is not
     # trivially reachable. It is written only to .env (readable by this user alone) and announced once

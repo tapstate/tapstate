@@ -36,9 +36,10 @@ public final class OfficialConnectors {
      * Supported ids that belong to no verified database kind: a server accepts them at registration,
      * but no release lane exercises their database against a live instance, so they are previews
      * rather than certified support. Kept apart from the kinds so that accepting a connector and
-     * promising its database is verified stay two separate decisions.
+     * promising its database is verified stay two separate decisions. Dummy is for internal
+     * performance diagnostics.
      */
-    public static final List<String> PREVIEW_IDS = List.of("db2", "db2i");
+    public static final List<String> PREVIEW_IDS = List.of("db2", "db2i", "dummy");
 
     /** The supported ids, in the order a message naming them should read: the kinds', then previews. */
     public static final List<String> IDS = Stream.concat(

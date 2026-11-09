@@ -57,6 +57,7 @@ cp "$REPO/deploy/quickstart/postgres-init/01-shipments.sql" "$QS_STUB/deploy/qui
 printf 'fake-mysql-connector-jar\n'   > "$QS_STUB/connectors-preview/mysql-connector.jar"
 printf 'fake-mongodb-connector-jar\n' > "$QS_STUB/connectors-preview/mongodb-connector.jar"
 printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-connector.jar"
+printf 'fake-dummy-connector-jar\n'    > "$QS_STUB/connectors-preview/dummy-connector.jar"
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
@@ -134,12 +135,10 @@ have mysql-init/01-orders.sql         "fetches the demo seed SQL"
 have postgres-init/01-shipments.sql   "fetches the second engine's seed SQL"
 have mysql-connector.jar              "fetches the mysql connector jar"
 have mongodb-connector.jar            "fetches the mongodb connector jar"
-# The connector seed dir must exist (compose bind-mounts it) but stay empty: registration goes through
-# the CLI upload path, and an empty seed dir is the documented expected case.
-if [ -d "$PREP/connectors" ] && [ -z "$(ls -A "$PREP/connectors" 2>/dev/null)" ]; then
-  ok "creates an empty connectors/ seed dir (registration is via the CLI, not the seed)"
+if cmp -s "$PREP/connectors/dummy-connector.jar" "$QS_STUB/connectors-preview/dummy-connector.jar"; then
+  ok "stages the downloaded Dummy bytes in the connectors/ seed dir"
 else
-  bad "connectors/ seed dir missing or non-empty: $(ls -A "$PREP/connectors" 2>/dev/null)"
+  bad "connectors/ seed dir is missing the downloaded Dummy bytes"
 fi
 
 # --- the pinned CLI version: it must resolve with TAPSTATE_VERSION unset, and match the build ---------

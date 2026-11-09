@@ -148,7 +148,7 @@ services:
       # starts is registered once at boot, through the very same register-if-absent path that `tapstate
       # register` uploads to -- staging a jar here is a convenience, never a precondition for registering
       # one. Registration needs no mount at all: the CLI uploads the jar's bytes over HTTP and the server
-      # never reads this directory for it. Leaving ./connectors empty is the normal case. Read-only,
+      # never reads this directory for it. Quickstart stages Dummy here. Read-only,
       # because the sweep only ever reads it.
       - ./connectors:/var/lib/tapstate/connectors:ro
     ports:

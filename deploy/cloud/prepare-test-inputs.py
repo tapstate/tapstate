@@ -87,7 +87,7 @@ def main() -> int:
     except STAGE.StageError as failure:
         print(f"Cloud test inputs refused: {failure}", file=sys.stderr)
         return 1
-    kind = "the verified MongoDB test dependency" if args.mongodb_only else "eight verified public connector inputs"
+    kind = "the verified MongoDB test dependency" if args.mongodb_only else "verified locked connector inputs"
     print(f"Prepared {kind} in {args.output}")
     return 0
 
