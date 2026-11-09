@@ -108,16 +108,37 @@ public final class PdkValidationReads {
         public CompletionStage<Void> cleanupCompleted(){return PdkValidationReads.cleanupCompleted(reader);}
     }
 
+    public enum ModelScope {
+        LEGACY, STRUCTURAL;
+
+        public static ModelScope forSavedVersion(String version) {
+            return version.startsWith(PdkValidationModelVersion.STRUCTURAL_SCOPE_PROFILE + ":") ? STRUCTURAL : LEGACY;
+        }
+
+        private String version(TapTable model, ConnectorRef artifact) {
+            return this == STRUCTURAL ? PdkValidationModelVersion.structuralScopeVersion(model, artifact)
+                    : PdkValidationModelVersion.scopeVersion(model, artifact);
+        }
+    }
+
     private PdkValidationReads(){}
 
     /** Projection is empty for the complete model, or the exact confirmed keys for key-only reads. */
     public static MetadataRead inspect(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
             String table, List<String> projection, Runnable requireCurrent, ExecutorService query,
             ExecutorService decode, ValidationValues.Limits rowLimits) {
+        return inspect(connection, artifact, configurationHash, table, projection, ModelScope.LEGACY,
+                requireCurrent, query, decode, rowLimits);
+    }
+
+    public static MetadataRead inspect(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
+            String table, List<String> projection, ModelScope scope, Runnable requireCurrent, ExecutorService query,
+            ExecutorService decode, ValidationValues.Limits rowLimits) {
         inputs(connection,artifact,configurationHash);
+        Objects.requireNonNull(scope, "model scope");
         var result=new AtomicReference<Metadata>();
         var reader=deferred(table,query,decode,submit->PdkValidationSession.inspect(connection.connectorId(),artifact,connection.settings(),table,projection,model->{
-            String version=PdkValidationModelVersion.scopeVersion(model,artifact);
+            String version=scope.version(model,artifact);
             var structural=PdkSchemaDiscoverer.structuralModel(List.of(model)).tables().getFirst();
             if(!table.equals(structural.name()))throw invalid("metadata.tableScope");
             var described=new Metadata(structural,new Binding(version,
@@ -261,7 +282,7 @@ public final class PdkValidationReads {
     }
 
     private static void requireModel(TapTable model, ConnectorRef artifact, String configurationHash, Binding expected,String phase){
-        String actual=PdkValidationModelVersion.scopeVersion(model,artifact);
+        String actual=ModelScope.forSavedVersion(expected.modelVersion()).version(model,artifact);
         if(!actual.equals(expected.modelVersion()))throw invalid("modelChanged."+phase+"."+model.getId());
         if(!PdkValidationModelVersion.codecBinding(artifact,configurationHash,actual)
                 .equals(expected.codecBinding()))throw invalid("codecChanged."+phase+"."+model.getId());
