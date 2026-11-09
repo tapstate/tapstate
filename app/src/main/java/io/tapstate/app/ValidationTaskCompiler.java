@@ -37,8 +37,8 @@ final class ValidationTaskCompiler {
                         ||!projected.target().equals(confirmed.fields().stream().map(Pair::target).toList()))
                     throw unsupported(draft.mappingId(),"keys","key-confirmation-preflight-required");
             }
-            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model(),metadata.nativeBson(draft.source().sourceId()));
-            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model(),metadata.nativeBson(draft.target().sourceId()));
+            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model());
+            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model());
             var source=new ArrayList<ValidationKeyBinding.Component>();var target=new ArrayList<ValidationKeyBinding.Component>();
             for(var pair:confirmed.fields()){
                 var from=component(sourceRules,pair.source(),draft.mappingId());var to=component(targetRules,pair.target(),draft.mappingId());

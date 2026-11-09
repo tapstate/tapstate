@@ -3665,6 +3665,30 @@
       ]
     },
     {
+      "id": "temporary.validation-sort",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "TEMPORARY_FILES",
+      "layer": "TEMPORARY",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${java.io.tmpdir}/tapstate-validation-*.rows"
+      ],
+      "responsibility": "Private process-owned sorted runs of converted validation rows for a single table side. The comparison starts after both complete reads are sorted. Each run is published to its reader only after its bytes have been flushed. Close releases files on exhaustion, success, error and cancellation. A retry starts a new PDK read.",
+      "writers": [
+        "io.tapstate.app.ValidationSortedRows"
+      ],
+      "readers": [
+        "io.tapstate.app.ValidationSortedRows"
+      ],
+      "recovery": "temporary-files",
+      "consistency": "file-cache",
+      "growth": "Local sorting is selected only when the PDK count for the side is below ten million rows. Memory is bounded by a chunk and a logarithmic set of runs. Disk use scales with the encoded input and temporary merge output without a fixed byte cap. Disk write failures abort validation.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ValidationSortedRowsTest.java"
+      ]
+    },
+    {
       "id": "user.cli-context",
       "resourceVersion": 1,
       "proposalVersion": 1,

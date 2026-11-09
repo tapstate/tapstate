@@ -9,6 +9,7 @@ import io.tapstate.spi.store.ConnectionConfig;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 
@@ -56,17 +57,23 @@ public final class PdkValidationCounts implements AutoCloseable {
     }
 
     /** One original count attempt. Failure, cancellation or a missing table never becomes a zero count. */
-    public long count() { return attempt(false).count(); }
+    public long count() { return attempt(false, false).count(); }
+
+    /** An absent native count function leaves the scan on the PDK-ordered path. */
+    public OptionalLong countIfSupported() {
+        Long count = attempt(false, true).count();
+        return count == null ? OptionalLong.empty() : OptionalLong.of(count);
+    }
 
     /**
      * Independent metadata/capability inspection only: never invokes count, query or value discovery.
      * Method presence and native table enumeration are observations, not proof of a successful future
      * scalar read. The original handle still owns initialization/cleanup and may be attempted once.
      */
-    public Operation inspect() { return attempt(true).operation(); }
+    public Operation inspect() { return attempt(true, false).operation(); }
 
     private record Outcome(Operation operation,Long count) {}
-    private Outcome attempt(boolean metadataOnly) {
+    private Outcome attempt(boolean metadataOnly, boolean optional) {
         synchronized (state) {
             if(cancelled)throw new TapstateException(ValidationError.READ_CANCELLED,Map.of("table",request.table()),null);
             if (started || returned) throw invalid("alreadyAttempted");
@@ -82,16 +89,19 @@ public final class PdkValidationCounts implements AutoCloseable {
                 check(); opened.connector().init(opened.context()); check();
                 // COUNT never discovers value models: schema discovery may sample business rows.
                 var table = new TapTable(request.table());
-                requireTable(opened);
+                if (!optional) requireTable(opened);
                 var function = opened.functions().getCountByPartitionFilterFunction();
-                if (function == null) throw missing("count-by-partition-filter");
+                if (function == null) {
+                    if (optional) return new Outcome(null, null);
+                    throw missing("count-by-partition-filter");
+                }
                 if (metadataOnly) {
                     check();
                     return new Outcome(Operation.PARTITION_FILTER, null);
                 }
                 long count = PdkValidationCounter.direct(request.table(),
                         () -> function.countByPartitionFilter(opened.context(), table, TapAdvanceFilter.create()), this::check);
-                requireTable(opened);
+                if (!optional) requireTable(opened);
                 check();
                 return new Outcome(Operation.PARTITION_FILTER, count);
             });

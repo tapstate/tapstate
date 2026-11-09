@@ -25,8 +25,8 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
             var actual=new HashMap<String,NativeValidationMetadata.Mapping>();scope.mappings().forEach(value->actual.put(value.id(),value));
             for(var declared:scope.declarations().mappings()){
                 var observed=actual.get(declared.mapping().mappingId());
-                var source=side(scope,declared.mapping().source(),observed.source(),true);
-                var target=side(scope,declared.mapping().target(),observed.target(),false);
+                var source=side(declared.mapping().source(),observed.source(),true);
+                var target=side(declared.mapping().target(),observed.target(),false);
                 projected+=projectionBytes(source)+projectionBytes(target);
                 if(projected>8L*1024*1024)throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.evaluationProjection"),null);
                 mappings.add(new ValidationEvaluation.Mapping(declared.mapping().mappingId(),source,target));
@@ -46,10 +46,10 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
         @Override public void requireCurrent(){scope.require();}
         @Override public void close(){retained=null;comparison=null;scope.close();}
     }
-    private static ValidationEvaluation.Side side(NativeValidationMetadata.Scope scope,ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed,boolean source){
+    private static ValidationEvaluation.Side side(ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed,boolean source){
         if(observed.model()==null)return new ValidationEvaluation.Side(table.nodeId(),table.sourceId(),table.database(),table.schema(),table.table(),null,null,
                 observed.countOperation().name(),List.of(),List.of(),!source);
-        var model=observed.model().model();var rules=ValidationKeyMetadata.describe(model,scope.nativeBson(table.sourceId()));
+        var model=observed.model().model();var rules=ValidationKeyMetadata.describe(model);
         var fields=model.fields().stream().map(field->new ValidationEvaluation.Field(field.name(),field.type().name(),
                 rules.fields().containsKey(field.name())?rules.fields().get(field.name()).domain().name():null,rules.unavailable().get(field.name()))).toList();
         var domains=new HashMap<String,ValidationKey.Kind>();rules.fields().forEach((name,rule)->domains.put(name,rule.domain()));
