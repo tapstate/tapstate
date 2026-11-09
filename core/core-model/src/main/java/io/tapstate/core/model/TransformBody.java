@@ -155,21 +155,45 @@ public sealed interface TransformBody {
             Integer maxElementsPerDocument,
             @Doc("Durable state placement for this nest; absent inherits the deployment default.")
             NestStateStorage state,
+            @Doc(value = "How much memory this nest keeps its state in, in bytes: a whole number followed by "
+                    + "B, KiB, MiB or GiB, shared evenly between its levels. What is beyond it is kept on the "
+                    + "layer behind them and read back as it is asked for. Applies where nests keep their state "
+                    + "through the state session; absent leaves a share of the member's heap.",
+                    key = "memory")
+            String memory,
             @Doc(value = "The root stream whose documents receive the nested children.", required = true)
             NestRoot root) implements TransformBody {
         public Nest {
             Objects.requireNonNull(root, "root");
+            if (memory != null) {
+                long bytes = ByteSize.bytes(memory);
+                if (bytes <= 0) {
+                    throw new IllegalArgumentException("not a size in bytes: " + memory);
+                }
+                memory = ByteSize.written(bytes);
+            }
+        }
+
+        /** A nest with capacity fields and a state placement, but no byte budget of its own. */
+        public Nest(String primaryKey, NestOrder order, Integer entriesInMemory,
+                Integer maxElementsPerDocument, NestStateStorage state, NestRoot root) {
+            this(primaryKey, order, entriesInMemory, maxElementsPerDocument, state, null, root);
+        }
+
+        /** The bytes {@link #memory} states, or null where the nest writes none. */
+        public Long memoryBytes() {
+            return memory == null ? null : ByteSize.bytes(memory);
         }
 
         /** A nest with capacity fields but no state-placement override. */
         public Nest(String primaryKey, NestOrder order, Integer entriesInMemory,
                 Integer maxElementsPerDocument, NestRoot root) {
-            this(primaryKey, order, entriesInMemory, maxElementsPerDocument, null, root);
+            this(primaryKey, order, entriesInMemory, maxElementsPerDocument, null, null, root);
         }
 
         /** A nest that writes down no capacity of its own, and so runs on whatever the deployment set. */
         public Nest(String primaryKey, NestOrder order, NestRoot root) {
-            this(primaryKey, order, null, null, null, root);
+            this(primaryKey, order, null, null, null, null, root);
         }
 
         @Override

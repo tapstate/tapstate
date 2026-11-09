@@ -78,6 +78,16 @@ public interface StorePort {
     }
 
     /**
+     * How long the store lets a transaction stay open before it ends the transaction by itself, when the store
+     * says. A pipeline claim taken over from an owner that stopped inside a write waits at most this long for
+     * what that owner left open, wherever that owner's transactions could not be ended first; empty when the
+     * store has no such limit or will not report it.
+     */
+    default java.util.Optional<java.time.Duration> transactionLifetimeLimit() {
+        return java.util.Optional.empty();
+    }
+
+    /**
      * The SRS change log: every change that entered a chain's per-table ring, so the changes outlive the
      * process that read them and a ring can be rebuilt where it left off.
      */

@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
@@ -508,6 +509,22 @@ public final class MongoConnection implements AutoCloseable {
      */
     public int endTransactionsLeftOpenBy(String processId) {
         return endTransactionsLeftOpenBy(processId, () -> client().getDatabase("admin"), () -> {});
+    }
+
+    /**
+     * The server's {@code transactionLifetimeLimitSeconds}: how long it lets a transaction stay open before
+     * aborting it by itself. Empty where the deployment does not let this user read server parameters, as
+     * managed services commonly do not; nothing depends on it but a startup warning.
+     */
+    public Optional<Duration> transactionLifetimeLimit() {
+        try {
+            Document answer = client().getDatabase("admin").runCommand(
+                    new Document("getParameter", 1).append("transactionLifetimeLimitSeconds", 1));
+            return answer.get("transactionLifetimeLimitSeconds") instanceof Number seconds
+                    ? Optional.of(Duration.ofSeconds(seconds.longValue())) : Optional.empty();
+        } catch (MongoException refused) {
+            return Optional.empty();
+        }
     }
 
     /** The discovery cursor and exact session-ending command share one remaining read allowance. */

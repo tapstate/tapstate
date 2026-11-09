@@ -1235,6 +1235,10 @@
           "description": "Durable state placement for this nest; absent inherits the deployment default.",
           "$ref": "#/$defs/NestStateStorage"
         },
+        "memory": {
+          "description": "How much memory this nest keeps its state in, in bytes: a whole number followed by B, KiB, MiB or GiB, shared evenly between its levels. What is beyond it is kept on the layer behind them and read back as it is asked for. Applies where nests keep their state through the state session; absent leaves a share of the member's heap.",
+          "type": "string"
+        },
         "root": {
           "description": "The root stream whose documents receive the nested children.",
           "$ref": "#/$defs/NestRoot"
