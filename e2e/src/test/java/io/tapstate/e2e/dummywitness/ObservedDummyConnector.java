@@ -114,8 +114,11 @@ public final class ObservedDummyConnector implements TapConnector {
 
     private static String normalized(Map<String, Object> row) {
         if (row == null) return "null";
-        if (!(row.get("id") instanceof Number)) {
+        if (!(row.get("id") instanceof Number) && !(row.get("_id") instanceof Number)) {
             throw new AssertionError("Expected a numeric Dummy key: " + row);
+        }
+        if (row.containsKey("payload") && !(row.get("payload") instanceof String)) {
+            throw new AssertionError("Expected a string payload: " + row);
         }
         return new TreeMap<>(row).toString();
     }

@@ -1,8 +1,16 @@
 package io.tapstate.e2e;
 
+import com.mongodb.TransactionOptions;
+import com.mongodb.WriteConcern;
+import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoCursor;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import io.tapstate.adapters.pdk.ConnectorError;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,16 +22,22 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-/** The release-backed process and CLI witness is opt-in via -Dtapstate.dummy.jar. */
+/**
+ * The release-backed process and CLI witnesses require -Dtapstate.dummy.jar.
+ * The MongoDB backlog witness also requires -Dtapstate.e2e.connectors-dir.
+ */
 @RequiresDocker
 class RealDummyPipelineIT {
     private static final String SHA256 = "fb8bb372cd1fedc0ec43e27dd839b91feee36a70a89adfaae6b6fd788c3352f3";
@@ -159,6 +173,288 @@ class RealDummyPipelineIT {
         }
     }
 
+    @Test
+    void fixedDummyInputsRepeatAcrossIndependentRuns() throws Exception {
+        var first = qualifyInputs(1);
+        var second = qualifyInputs(2);
+        assertThat(second.left()).isEqualTo(first.left());
+        assertThat(second.right()).isEqualTo(first.right());
+        assertThat(second.inserts()).isEqualTo(first.inserts());
+        assertThat(second.firstEventTime()).isGreaterThan(first.firstEventTime());
+        assertThat(second.randomValues()).doesNotContainAnyElementsOf(first.randomValues());
+    }
+
+    private InputRun qualifyInputs(int run) throws Exception {
+        Path seeds = Files.createDirectory(work.resolve("seed-" + run));
+        Path witness = work.resolve("inputs-" + run + ".tsv");
+        Files.write(seeds.resolve("dummy-connector.jar"),
+                ObservedDummyConnectorJar.build(Files.readAllBytes(published()), witness));
+        try (var storage = PreparedNativeStore.create(); var server = start(storage, seeds)) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            try {
+                control.apply(Map.of("target.tap.yml", source("tgt_dummy", 1, false, "[1]")));
+                discoverDummyTarget(control);
+                var left = inputSnapshot(control, witness, "left", 1, false);
+                var right = inputSnapshot(control, witness, "right", 2, false);
+                assertThat(left).filteredOn(right::contains).containsExactly(2, 3);
+                assertThat(left).filteredOn(key -> !right.contains(key)).containsExactly(1);
+                assertThat(right).filteredOn(key -> !left.contains(key)).containsExactly(4);
+                int randomStart = rows(witness, "WRITE").size();
+                inputSnapshot(control, witness, "random", 1, true);
+                var randomValues = rows(witness, "WRITE").subList(randomStart, randomStart + 3)
+                        .stream().map(row -> row[5].substring(row[5].indexOf("sample=") + 7, row[5].length() - 1))
+                        .toList();
+                assertThat(randomValues).allSatisfy(value -> assertThat(value).hasSize(36)
+                        .matches("[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}")).doesNotHaveDuplicates();
+
+                String id = "fixed_inserts";
+                control.apply(inputWorkspace(id, "cdc_only", "left_source", inputFields(1, false)));
+                control.lifecycle(id, LifecycleVerb.START);
+                Await.until("the first three generated Dummy inserts to be acknowledged", Duration.ofSeconds(25),
+                        () -> confirmedInputCohort(witness), () -> control.logs(id));
+                assertThat(control.errorCount(id)).contains(0L);
+                control.stop(id, false);
+                awaitState(control, id, PipelineState.STOPPED);
+                var cdc = rows(witness, "CDC").subList(0, 3);
+                var written = inputCohortWrites(witness, cdc);
+                var expected = fixedRows(1);
+                assertFixedRows(cdc, expected);
+                assertSnapshotRows(written, expected);
+                var stamps = cdc.stream().map(row -> Long.parseLong(row[6])).toList();
+                assertThat(stamps).allSatisfy(stamp -> assertThat(stamp).isPositive()).isSorted().doesNotHaveDuplicates();
+                assertThat(written).extracting(row -> List.of(row[5], row[6]))
+                        .containsExactlyInAnyOrderElementsOf(cdc.stream().map(row -> List.of(row[5], row[6])).toList());
+                assertThat(written).allSatisfy(row -> assertThat(rows(witness, "ACK"))
+                        .anySatisfy(ack -> assertThat(ack[5]).isEqualTo(row[7])));
+                return new InputRun(left, right, cdc.stream().map(row -> row[5]).toList(),
+                        stamps.getFirst(), randomValues);
+            } finally {
+                if (Files.exists(witness)) System.out.println(Files.readString(witness));
+                System.out.println("OP server log: " + server.output());
+            }
+        }
+    }
+
+    private static boolean confirmedInputCohort(Path witness) {
+        var first = rows(witness, "CDC").stream().limit(3).toList();
+        if (first.size() < 3) return false;
+        var writes = inputCohortWrites(witness, first);
+        var acknowledgements = rows(witness, "ACK");
+        return first.stream().allMatch(event -> writes.stream().anyMatch(write ->
+                write[5].equals(event[5]) && write[6].equals(event[6])
+                        && acknowledgements.stream().anyMatch(ack -> ack[5].equals(write[7]))));
+    }
+
+    private static List<String[]> inputCohortWrites(Path witness, List<String[]> events) {
+        var stamps = events.stream().map(row -> row[6]).toList();
+        return rows(witness, "WRITE").stream().filter(row -> stamps.contains(row[6])).toList();
+    }
+
+    private static List<Integer> inputSnapshot(
+            ControlPlane control, Path witness, String id, int first, boolean random) {
+        String sourceId = id + "_source";
+        int start = rows(witness, "WRITE").size();
+        int sourceStart = rows(witness, "SNAPSHOT").size();
+        long acknowledgedInserts = acked(witness)[0];
+        var fields = inputFields(first, random);
+        var workspace = inputWorkspace(id, "snapshot_only", sourceId, fields);
+        control.apply(Map.of("input.tap.yml", workspace.get("input.tap.yml")));
+        control.discoverSchema(sourceId, "dummy", Map.of("table_name", "dummy_orders", "table_fields", fields));
+        assertThat(control.sourceSchemaTables(sourceId)).containsExactly("dummy_orders");
+        assertThat(control.sourceSchemaFields(sourceId, "dummy_orders")).containsExactlyElementsOf(
+                fields.stream().map(field -> (String) field.get("name")).toList());
+        control.apply(workspace);
+        control.lifecycle(id, LifecycleVerb.START);
+        awaitState(control, id, PipelineState.COMPLETED);
+        var written = rows(witness, "WRITE").subList(start, rows(witness, "WRITE").size());
+        assertThat(acked(witness)).containsExactly(acknowledgedInserts + 3, 0L, 0L);
+        if (random) {
+            assertThat(written).hasSize(3).allSatisfy(row -> assertThat(row[5]).contains("sample="));
+        } else {
+            assertFixedRows(rows(witness, "SNAPSHOT").subList(sourceStart, sourceStart + 3), fixedRows(first));
+            assertSnapshotRows(written, fixedRows(first));
+            if (first == 2) {
+                assertThatThrownBy(() -> assertSnapshotRows(written, fixedRows(1)))
+                        .isInstanceOf(AssertionError.class);
+            }
+        }
+        return written.stream().map(row -> Integer.parseInt(row[5].substring(4, row[5].indexOf(',')))).sorted().toList();
+    }
+
+    private static List<Map<String, Object>> inputFields(int first, boolean random) {
+        var fields = new ArrayList<Map<String, Object>>();
+        fields.add(Map.of("name", "id", "type", "serial(" + first + ",1)", "pri", true));
+        fields.add(Map.of("name", "payload", "type", "string(8)", "def", "fixed123"));
+        if (random) fields.add(Map.of("name", "sample", "type", "uuid"));
+        return fields;
+    }
+
+    private static Map<String, String> inputWorkspace(
+            String pipelineId, String mode, String sourceId, List<Map<String, Object>> fields) {
+        var input = source(sourceId, 3, true, "[1]").replace(
+                "table_fields:\n    - {name: id, type: serial, pri: true}",
+                "table_fields: " + JsonWriter.write(fields));
+        return Map.of("input.tap.yml", input, "target.tap.yml", source("tgt_dummy", 1, false, "[1]"),
+                "pipeline.tap.yml", pipeline(pipelineId, mode).replace("source: src_dummy", "source: " + sourceId));
+    }
+
+    private static void discoverDummyTarget(ControlPlane control) {
+        control.discoverSchema("tgt_dummy", "dummy", Map.of("table_name", "dummy_orders",
+                "table_fields", List.of(Map.of("name", "id", "type", "serial", "pri", true)),
+                "initial_totals", 1, "write_interval_totals", 0, "write_log", false));
+    }
+
+    private static List<String> fixedRows(int first) {
+        return IntStream.range(first, first + 3).mapToObj(key -> "{id=" + key + ", payload=fixed123}").toList();
+    }
+
+    private static void assertFixedRows(List<String[]> rows, List<String> expected) {
+        assertThat(rows).allSatisfy(row -> {
+            assertThat(row[2]).isEqualTo("dummy_orders");
+            assertThat(row[3]).isEqualTo("I");
+            assertThat(row[4]).isEqualTo("null");
+        }).extracting(row -> row[5]).containsExactlyElementsOf(expected);
+    }
+
+    private record InputRun(List<Integer> left, List<Integer> right, List<String> inserts,
+            long firstEventTime, List<String> randomValues) {}
+
+    @Test
+    void replaysTheSamePrewrittenMongoBatchThroughRealDummy() throws Exception {
+        RealConnectorGate.require("mongodb");
+        Path mongoJar = ConnectorJars.pathFor("mongodb");
+        System.out.printf("MongoDB source artifact: %s SHA-256 %s%n", mongoJar.getFileName(), digest(mongoJar));
+        String database = "dummy_backlog_" + UUID.randomUUID().toString().replace("-", "");
+        String uri = SharedMongo.replicaSetUrl(database);
+        try (var client = MongoClients.create(uri)) {
+            var db = client.getDatabase(database).withWriteConcern(WriteConcern.MAJORITY);
+            String table = "dummy_orders";
+            try {
+                db.createCollection(table);
+                db.runCommand(new Document("collMod", table)
+                        .append("changeStreamPreAndPostImages", new Document("enabled", true)));
+                var orders = db.getCollection(table);
+                try (var changes = orders.watch().maxAwaitTime(200, TimeUnit.MILLISECONDS).cursor();
+                        var session = client.startSession()) {
+                    orders.insertOne(new Document("_id", 1).append("payload", "outside"));
+                    var earlier = readChanges(changes, 1).getFirst();
+                    int earlierSecond = earlier.getClusterTime().getTime();
+                    Await.until("MongoDB server time past the earlier controls", Duration.ofSeconds(5),
+                            () -> db.runCommand(new Document("hello", 1)).getDate("localTime").toInstant()
+                                    .getEpochSecond() > earlierSecond, () -> "earlier second " + earlierSecond);
+
+                    long prewriteStart = System.nanoTime();
+                    session.withTransaction(() -> {
+                        orders.insertOne(session, new Document("_id", 2).append("payload", "inserted"));
+                        orders.updateOne(session, new Document("_id", 2),
+                                new Document("$set", new Document("payload", "after")));
+                        orders.deleteOne(session, new Document("_id", 2));
+                        return null;
+                    }, TransactionOptions.builder().writeConcern(WriteConcern.MAJORITY).build());
+                    long prewriteMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - prewriteStart);
+                    var batch = readChanges(changes, 3);
+                    var batchTime = batch.getFirst().getClusterTime();
+                    assertThat(batchTime.getTime()).isGreaterThan(earlierSecond);
+                    assertThat(batch).extracting(ChangeStreamDocument::getClusterTime).containsOnly(batchTime);
+                    assertThat(batch).extracting(change -> change.getOperationType().getValue())
+                            .containsExactly("insert", "update", "delete");
+                    assertThat(batch).extracting(change -> change.getDocumentKey().getInt32("_id").getValue())
+                            .containsExactly(2, 2, 2);
+                    assertThat(batch).extracting(ChangeStreamDocument::getResumeToken).doesNotHaveDuplicates();
+                    Instant cutoff = Instant.ofEpochSecond(batchTime.getTime());
+                    System.out.printf("MongoDB earlier control: %s; cutoff: %s; prewrite: %d ms%n",
+                            earlier.getClusterTime(), cutoff, prewriteMillis);
+                    batch.forEach(change -> System.out.printf("MongoDB event: %s %s %s token=%s%n",
+                            change.getOperationType(), change.getDocumentKey(), change.getClusterTime(),
+                            change.getResumeToken()));
+
+                    replayMongoBatch(uri, cutoff, 1);
+                    replayMongoBatch(uri, cutoff, 2);
+                }
+            } finally {
+                db.drop();
+            }
+        }
+    }
+
+    private void replayMongoBatch(String uri, Instant cutoff, int run) throws Exception {
+        Path seeds = Files.createDirectory(work.resolve("mongo-seed-" + run));
+        Path witness = work.resolve("mongo-backlog-" + run + ".tsv");
+        Files.write(seeds.resolve("dummy-connector.jar"),
+                ObservedDummyConnectorJar.build(Files.readAllBytes(published()), witness));
+        String id = "dummy_backlog";
+        try (var storage = PreparedNativeStore.create(); var server = start(storage, seeds)) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            try {
+                // Direct capture positions against MongoDB's history. A fresh shared ring has no history.
+                var source = """
+                        version: tapstate/v1
+                        kind: source
+                        id: src_mongo
+                        connector: mongodb
+                        mode: cdc
+                        tables: [dummy_orders]
+                        srs: {enabled: false}
+                        config: { uri: "%s", preImage: true }
+                        """.formatted(uri);
+                var target = source("tgt_dummy", 1, false, "[1]");
+                control.apply(Map.of("mongo.tap.yml", source, "target.tap.yml", target));
+                control.discoverSchema("src_mongo", "mongodb", Map.of("uri", uri, "preImage", true));
+                discoverDummyTarget(control);
+                var pipeline = pipeline(id, "cdc_only").replace("source: src_dummy", "source: src_mongo")
+                        .replace("read_mode: cdc_only}", "read_mode: cdc_only, start_from: '" + cutoff + "'}");
+                control.apply(Map.of("mongo.tap.yml", source, "target.tap.yml", target, "pipeline.tap.yml", pipeline));
+                long startMillis = System.currentTimeMillis();
+                control.lifecycle(id, LifecycleVerb.START);
+                Await.until("the prewritten MongoDB delete acknowledgement", Duration.ofSeconds(30),
+                        () -> acked(witness)[2] > 0 || control.state(id).filter(PipelineState.FAILED::equals).isPresent(),
+                        () -> control.state(id) + " " + control.logs(id));
+                assertThat(control.state(id)).as(control.logs(id)).contains(PipelineState.RUNNING);
+                assertThat(control.errorCount(id)).contains(0L);
+                String position = Await.answered("MongoDB backlog durable target position", Duration.ofSeconds(10),
+                        () -> control.durablePosition(id, "dummy_orders"));
+                control.stop(id, false);
+                awaitState(control, id, PipelineState.STOPPED);
+                var written = rows(witness, "WRITE");
+                assertThat(written).allSatisfy(row -> {
+                    assertThat(row[1]).isEqualTo("dummy_orders");
+                    assertThat(row[2]).isEqualTo("dummy_orders");
+                    assertThat(Long.parseLong(row[6])).isEqualTo(cutoff.toEpochMilli());
+                }).extracting(row -> List.of(row[3], row[4], row[5])).containsExactly(
+                        List.of("I", "null", "{_id=2, payload=inserted}"),
+                        List.of("U", "{_id=2, payload=inserted}", "{_id=2, payload=after}"),
+                        List.of("D", "{_id=2, payload=after}", "null"));
+                assertThat(acked(witness)).containsExactly(1L, 1L, 1L);
+                var acks = rows(witness, "ACK");
+                assertThat(written).allSatisfy(row -> assertThat(acks)
+                        .anySatisfy(ack -> assertThat(ack[5]).isEqualTo(row[7])));
+                var lastAck = acks.stream().filter(ack -> ack[5].equals(written.getLast()[7])).findFirst().orElseThrow();
+                assertThat(lastAck[3]).isEqualTo("1");
+                long catchupMillis = Long.parseLong(lastAck[4]) - startMillis;
+                assertThat(catchupMillis).isPositive();
+                System.out.printf("MongoDB backlog run %d: %d rows, start-to-last-ack %d ms, position %s%n",
+                        run, written.size(), catchupMillis, position);
+            } finally {
+                if (Files.exists(witness)) System.out.println(Files.readString(witness));
+                System.out.println("OP server log: " + server.output());
+            }
+        }
+    }
+
+    private static List<ChangeStreamDocument<Document>> readChanges(
+            MongoCursor<ChangeStreamDocument<Document>> cursor, int count) {
+        var changes = new ArrayList<ChangeStreamDocument<Document>>();
+        Await.until(count + " MongoDB change stream events", Duration.ofSeconds(10), () -> {
+            var change = cursor.tryNext();
+            if (change != null) changes.add(change);
+            return changes.size() == count;
+        }, changes::toString);
+        return changes;
+    }
+
     private static void assertSnapshotRows(List<String[]> written, List<String> expected) {
         assertThat(written).allSatisfy(row -> {
             assertThat(row[1]).isEqualTo("dummy_orders");
@@ -275,9 +571,12 @@ class RealDummyPipelineIT {
 
     private static Path published() throws Exception {
         Path published = Path.of(System.getProperty("tapstate.dummy.jar"));
-        assertThat(HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
-                .digest(Files.readAllBytes(published)))).isEqualTo(SHA256);
+        assertThat(digest(published)).isEqualTo(SHA256);
         return published;
+    }
+
+    private static String digest(Path artifact) throws Exception {
+        return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(artifact)));
     }
 
     private void writeWorkspace(String id, String mode, int snapshotRows, String operations) throws Exception {
