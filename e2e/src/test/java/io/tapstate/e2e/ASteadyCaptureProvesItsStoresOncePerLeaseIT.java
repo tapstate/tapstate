@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
@@ -151,6 +152,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             String reading = ("appends %d (proving %d), checkpoint writes %d (leased %d), consumer proofs %d, "
                     + "progress writes %d (leased %d) over %d profiled operations").formatted(appends, provingAppends,
                     checkpointWrites, leasedCheckpoints, provingConsumer, progressWrites, leasedProgressWrites, profiled.size());
+            reading += "; transactions by what they read: " + shapes(profiled);
             assertThat(appends).as("every change was its own durable batch: " + reading).isGreaterThanOrEqualTo(CHANGES);
             assertThat(checkpointWrites).as("every batch was checkpointed: " + reading).isGreaterThanOrEqualTo(CHANGES);
             // A proof per lease over a window of a few seconds is a handful; a proof per batch is all thirty.
@@ -193,6 +195,26 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             result.computeIfAbsent(session.get("id") + "/" + transaction, key -> new ArrayList<>()).add(op);
         }
         return result;
+    }
+
+    /**
+     * The transactions of the window by the set of collections each read, most frequent first, with the seconds
+     * into the window at which the first and last of each shape began: what a failing count was made of.
+     */
+    private static String shapes(List<Document> profiled) {
+        long start = profiled.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(0L);
+        var counts = new java.util.TreeMap<String, long[]>();
+        for (List<Document> reads : transactions(profiled).values()) {
+            String shape = reads.stream().map(ASteadyCaptureProvesItsStoresOncePerLeaseIT::collection).distinct().sorted()
+                    .collect(java.util.stream.Collectors.joining("+"));
+            long at = reads.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(start);
+            long[] entry = counts.computeIfAbsent(shape, key -> new long[] {0L, Long.MAX_VALUE, Long.MIN_VALUE});
+            entry[0]++; entry[1] = Math.min(entry[1], at); entry[2] = Math.max(entry[2], at);
+        }
+        return counts.entrySet().stream().sorted((a, b) -> Long.compare(b.getValue()[0], a.getValue()[0])).limit(12)
+                .map(e -> "%s x%d [%.1f..%.1f s]".formatted(e.getKey(), e.getValue()[0],
+                        (e.getValue()[1] - start) / 1000.0, (e.getValue()[2] - start) / 1000.0))
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 
     private static boolean isUpdate(Document op, String collection) {
