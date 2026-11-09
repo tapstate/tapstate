@@ -91,6 +91,34 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         };
     }
 
+    /** A previous RUNNING observation can witness progress, without serving its stale payload. */
+    static java.util.Set<String> unavailableRunning(ClientSession session, MongoCachePipelineAccess access,
+            List<Reading> readings, Map<Object, Document> current) {
+        var unavailable = new java.util.HashSet<String>();
+        var previousRuns = new java.util.ArrayList<Document>();
+        for (var reading : readings) {
+            if (reading.actual() != PipelineState.RUNNING) continue;
+            var exact = current.get(reading.key());
+            if (exact != null && PipelineState.RUNNING.name().equals(exact.get("state"))) {
+                if (!reading.live()) unavailable.add(reading.pipeline());
+            } else {
+                var prefix = new Document("scope", MongoPipelinePreparationFacts.scope(reading.access().scope))
+                        .append("epoch", reading.epoch());
+                previousRuns.add(new Document("_id", new Document("$gte",
+                        new Document(prefix).append("claimGeneration", new org.bson.types.MinKey()))
+                        .append("$lt", new Document(prefix).append("claimGeneration", new org.bson.types.MaxKey()))));
+            }
+        }
+        if (!previousRuns.isEmpty()) {
+            for (var row : SystemCollections.CACHE_PIPELINE_OBSERVATION.on(access.database).aggregate(session, List.of(
+                    new Document("$match", new Document("$or", previousRuns).append("state", PipelineState.RUNNING.name())),
+                    new Document("$group", new Document("_id", "$pipelineId"))))) {
+                unavailable.add(row.getString("_id"));
+            }
+        }
+        return unavailable;
+    }
+
     static Map<String, Document> terminalDetails(ClientSession session, MongoCachePipelineAccess access,
             List<Reading> readings, Map<Object, Document> current) {
         var filters = new java.util.ArrayList<Document>();

@@ -608,8 +608,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
-    public java.util.Map<String, java.util.Optional<io.tapstate.core.lifecycle.Observation>> pipelineObservationBatch(
-            java.util.List<io.tapstate.spi.store.PipelineIntentScope> scopes, Runnable active) {
+    public record PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+            boolean runningObservationUnavailable) {}
+
+    public java.util.Map<String, PipelineObservationReading> pipelineObservationBatch(
+            java.util.List<io.tapstate.spi.store.PipelineIntentScope> scopes, Runnable active, boolean includeDisplayState) {
         if (scopes.isEmpty()) return java.util.Map.of();
         var first = scopes.getFirst();
         var business = new CacheBusinessScope(first.clusterId(), first.bindingVersion(), first.cacheIncarnation());
@@ -623,7 +626,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             var states = observationRows(session, SystemCollections.CACHE_PIPELINE_STATE, ids);
             var claims = MongoCachePipelineObservationStore.claims(session, accesses.getFirst(), keys);
             var readings = new java.util.ArrayList<MongoCachePipelineObservationStore.Reading>();
-            var result = new java.util.HashMap<String, java.util.Optional<io.tapstate.core.lifecycle.Observation>>();
+            var result = new java.util.HashMap<String, PipelineObservationReading>();
             for (var access : accesses) {
                 try {
                     readings.add(MongoCachePipelineObservationStore.reading(session, access, states.get(access.scope.pipelineId()),
@@ -638,8 +641,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 var observationKeys = readings.stream().map(MongoCachePipelineObservationStore.Reading::key).toList();
                 var observations = observationRows(session, SystemCollections.CACHE_PIPELINE_OBSERVATION, observationKeys);
                 var terminal = MongoCachePipelineObservationStore.terminalDetails(session, accesses.getFirst(), readings, observations);
-                for (var reading : readings) result.put(reading.pipeline(),
-                        MongoCachePipelineObservationStore.select(reading, observations.get(reading.key()), terminal.get(reading.pipeline())));
+                var unavailable = includeDisplayState
+                        ? MongoCachePipelineObservationStore.unavailableRunning(session, accesses.getFirst(), readings, observations)
+                        : java.util.Set.<String>of();
+                for (var reading : readings) {
+                    var observation = MongoCachePipelineObservationStore.select(
+                            reading, observations.get(reading.key()), terminal.get(reading.pipeline()));
+                    result.put(reading.pipeline(), new PipelineObservationReading(
+                            observation, observation.isEmpty() && unavailable.contains(reading.pipeline())));
+                }
             }
             return java.util.Map.copyOf(result);
         });

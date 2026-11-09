@@ -84,9 +84,9 @@ class ThreeLayerObservationTest {
         var ids = List.of("pipeline");
         when(f.configuration.pipelineDisplayHeaders(ids, false))
                 .thenReturn(Map.of("pipeline", header), Map.of());
-        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any())).thenAnswer(call -> {
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(false))).thenAnswer(call -> {
             f.mapping.set(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, "purge"));
-            return Map.of("pipeline", Optional.of(f.observed));
+            return Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(Optional.of(f.observed), false));
         });
 
         assertThat(f.port.observations().readAll(ids)).isEmpty();
@@ -99,8 +99,8 @@ class ThreeLayerObservationTest {
                 f.preparations.read("pipeline").orElseThrow(), Optional.empty(), Optional.empty(), false);
         var ids = List.of("pipeline");
         when(f.configuration.pipelineDisplayHeaders(ids, false)).thenReturn(Map.of("pipeline", header));
-        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any()))
-                .thenReturn(Map.of("pipeline", Optional.of(f.observed)));
+        when(f.cache.pipelineObservationBatch(eq(List.of(f.scope)), any(), eq(false)))
+                .thenReturn(Map.of("pipeline", new MongoCacheDomain.PipelineObservationReading(Optional.of(f.observed), false)));
 
         assertThat(f.port.observations().readAll(ids)).containsEntry("pipeline", f.observed);
         verify(f.cache, never()).pipelineObservations(any());

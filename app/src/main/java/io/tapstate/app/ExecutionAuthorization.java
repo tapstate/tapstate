@@ -318,6 +318,30 @@ final class ExecutionAuthorization implements AutoCloseable {
                 : claims.readPipeline(key.scope());
     }
 
+    private Optional<WorkloadClaimReading> readExecutionProof(ReadKey key, long startedAt) {
+        if (!(claims instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded)) return readStore(key);
+        long deadline = System.nanoTime() + windowNanos;
+        return bounded.withDeadline(deadline, () -> {
+            try {
+                return readStore(key);
+            } catch (TapstateException failed) {
+                if (!proofReadTimedOut(failed) || nanoTime.getAsLong() - startedAt >= windowNanos
+                        || System.nanoTime() - deadline >= 0) throw failed;
+                return readStore(key);
+            }
+        });
+    }
+
+    private static boolean proofReadTimedOut(TapstateException failure) {
+        if (failure.code() != io.tapstate.spi.store.IoError.STORE_UNAVAILABLE
+                || !(failure.args().get("detail") instanceof String detail)) return false;
+        // The Mongo adapter exposes only a sanitized driver type and optional numeric code.
+        return switch (detail.split(" ", 2)[0]) {
+            case "MongoTimeoutException", "MongoOperationTimeoutException", "MongoExecutionTimeoutException" -> true;
+            default -> false;
+        };
+    }
+
     /**
      * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
      * the store advances the pair: taking a claim over takes the next claim generation and carries the
@@ -378,7 +402,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         long startedAt = nanoTime.getAsLong();
         Optional<WorkloadClaimReading> current;
         try {
-            current = readStore(key);
+            current = key.scope() == null ? readStore(key) : readExecutionProof(key, startedAt);
         } catch (RuntimeException unreachable) {
             nextReadNanos.put(key, startedAt + refreshIntervalNanos);
             entries.remove(key);

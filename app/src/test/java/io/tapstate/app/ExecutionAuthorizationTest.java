@@ -13,7 +13,12 @@ import io.tapstate.runtime.engine.SinkAck;
 import io.tapstate.runtime.engine.SinkAckFactory;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
+import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ClusterMembership;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
+import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
 import io.tapstate.spi.store.WorkloadClaimKey;
@@ -61,6 +66,34 @@ class ExecutionAuthorizationTest {
     private final InMemoryWorkloadClaimStore claims = new InMemoryWorkloadClaimStore();
     private final ClusterMembershipGate membership = eligibleGate();
     private final AtomicLong nanos = new AtomicLong();
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+            "success,2,true", "twice,2,false", "budget,1,false", "fenced,1,false"})
+    void scopedProofRetriesOnlyOneTimeoutInsideTheOriginalWindow(
+            String outcome, int expectedReads, boolean authorized) {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var store = mock(DeadlineWorkloadClaimStore.class);
+        when(store.withDeadline(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any()))
+                .thenAnswer(call -> call.<java.util.function.Supplier<?>>getArgument(1).get());
+        var reads = new AtomicInteger();
+        when(store.readPipeline(scope)).thenAnswer(call -> {
+            int attempt = reads.incrementAndGet();
+            if (attempt == 2 && outcome.equals("success")) return Optional.of(reading);
+            if (outcome.equals("budget")) nanos.addAndGet(WINDOW.toNanos());
+            if (outcome.equals("fenced")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoTimeoutException"), null);
+        });
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, WINDOW, nanos::get, () -> true)) {
+            assertThat(guard.authorized(fence)).isEqualTo(authorized);
+            assertThat(reads).hasValue(expectedReads);
+        }
+    }
 
     @Test void aLocalCompletionCheckNeverRefreshesAnAbsentOrExpiredProof() {
         var fence=submittedRun();var observed=org.mockito.Mockito.spy(claims);

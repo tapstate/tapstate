@@ -20,7 +20,7 @@ public interface StorePort {
 
     record PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
             java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
-            java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure) {}
+            java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable) {}
 
     /** Batched ordinary display states. Absent ids use the original per-Pipeline read path. */
     default java.util.Map<String, PipelineCatalogState> pipelineCatalogStates(java.util.List<String> ids) {

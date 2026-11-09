@@ -264,9 +264,9 @@ class MongoCachePipelineStoresIT {
                 result.get(15, TimeUnit.SECONDS);
                 assertThat(writes).containsExactly("pipeline_observation");
                 assertThat(store.read("orders")).isEmpty();
-                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders")).isEmpty();
+                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders").observation()).isEmpty();
                 store.save(observation(PipelineState.STOPPED), 2);
-                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders").orElseThrow().state())
+                assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders").observation().orElseThrow().state())
                         .isEqualTo(PipelineState.STOPPED);
                 replaceScope(f.database(), scope(2));
                 assertCode(() -> store.read("orders"), IoError.CACHE_BUSINESS_FENCED);
@@ -285,6 +285,31 @@ class MongoCachePipelineStoresIT {
             var store = f.domain().pipelineObservations(SCOPE, f.fence(), () -> { throw MongoCachePipelineAccess.fenced(); });
             assertCode(() -> store.save(observation(PipelineState.RUNNING), 1), IoError.CACHE_BUSINESS_FENCED);
             assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void aMissingCurrentObservationKeepsOnlyTheRunningWitnessInTheSameEpoch() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var first = f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders");
+            assertThat(first.observation()).isEmpty();
+            assertThat(first.runningObservationUnavailable()).isFalse();
+
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(observation(PipelineState.RUNNING), 1);
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var next = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
+                    1, Set.of("node-a")).orElseThrow());
+            var replaced = f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders");
+            assertThat(replaced.observation()).isEmpty();
+            assertThat(replaced.runningObservationUnavailable()).isTrue();
+
+            var nextStates = f.domain().pipelineStates(SCOPE, next, ACTIVE);
+            assertThat(nextStates.compareAndSwap("orders", 1, "STOPPED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            assertThat(nextStates.compareAndSwap("orders", 2, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var restarted = f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders");
+            assertThat(restarted.observation()).isEmpty();
+            assertThat(restarted.runningObservationUnavailable()).isFalse();
         });
     }
 
@@ -308,7 +333,7 @@ class MongoCachePipelineStoresIT {
             var failed = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
                     new io.tapstate.core.lifecycle.ObservationFailure("test.failure", Map.of()), AT, List.of());
             f.domain().pipelineObservations(SCOPE, next, ACTIVE).save(failed, 3);
-            assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE).get("orders")).contains(failed);
+            assertThat(f.domain().pipelineObservationBatch(List.of(SCOPE), ACTIVE, true).get("orders").observation()).contains(failed);
             var takeover = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
                     1, Set.of("node-a")).orElseThrow());
             assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(failed);

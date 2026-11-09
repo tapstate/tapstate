@@ -150,7 +150,9 @@ public final class PipelineCatalogService {
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
                 ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
-                : displayState(target, effective, intentReadFailure == null);
+                : target == PipelineState.RUNNING && stateFacts != null && stateFacts.runningObservationUnavailable()
+                        ? PipelineCatalogItem.DisplayState.UNAVAILABLE
+                        : displayState(target, effective, intentReadFailure == null);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -171,7 +173,9 @@ public final class PipelineCatalogService {
                 hasArtifact,
                 new PipelineCatalogItem.Status(
                         runtimeState,
-                        recoveryAtRest?PipelineCatalogItem.UiState.RECOVERY_REQUIRED:PipelineCatalogItem.UiState.of(state, hasArtifact),
+                        recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
+                                : state == PipelineCatalogItem.DisplayState.UNAVAILABLE && !recoveryAtRest
+                                        ? PipelineCatalogItem.UiState.UNAVAILABLE : PipelineCatalogItem.UiState.of(state, hasArtifact),
                         target,
                         observed,
                         observation == null ? null : observation.failure(),

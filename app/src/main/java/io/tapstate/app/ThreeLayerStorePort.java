@@ -348,18 +348,19 @@ final class ThreeLayerStorePort implements StorePort {
                     var original = activeScope(entry.getKey(), header.mapping());
                     if (original.equals(header.preparation().scope())) scopes.add(original);
                 } else {
-                    result.put(entry.getKey(), new PipelineCatalogState(startFailure(entry.getKey(), header), header.desired(), header.intentFailure()));
+                    result.put(entry.getKey(), new PipelineCatalogState(startFailure(entry.getKey(), header), header.desired(), header.intentFailure(), false));
                 }
             }
             if (!scopes.isEmpty()) {
-                var cached = bound.cache().pipelineObservationBatch(scopes, this::active);
+                var cached = bound.cache().pipelineObservationBatch(scopes, this::active, includeIntents);
                 var after = configuration.pipelineDisplayHeaders(scopes.stream().map(PipelineIntentScope::pipelineId).toList(), false);
                 for (var entry : cached.entrySet()) {
                     var header = headers.get(entry.getKey());
                     var current = after.get(entry.getKey());
                     if (current != null && current.mapping().equals(header.mapping())
                             && current.preparation().equals(header.preparation())) {
-                        result.put(entry.getKey(), new PipelineCatalogState(entry.getValue(), header.desired(), header.intentFailure()));
+                        result.put(entry.getKey(), new PipelineCatalogState(entry.getValue().observation(),
+                                header.desired(), header.intentFailure(), entry.getValue().runningObservationUnavailable()));
                     }
                 }
             }
