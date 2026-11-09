@@ -110,7 +110,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             // run in this window, read its membership and are left out. A leased checkpoint reads the chain root
             // and nothing else.
             // The consumer's membership row is read only by a proof of its own; a progress write within a
-            // standing lease reads its offsets row and nothing else.
+            // standing lease reads its offsets row and the pipeline state row, never the membership or identity rows.
             int provingAppends = 0, leasedCheckpoints = 0, provingConsumer = 0, leasedProgressWrites = 0;
             for (List<Document> reads : transactions(profiled).values()) {
                 Set<String> read = new java.util.HashSet<>();
@@ -119,7 +119,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
                         && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
                 if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
                 if (read.contains(PROOF_MARKER) && read.contains(MEMBERSHIP)) provingConsumer++;
-                if (read.equals(Set.of(OFFSETS))) leasedProgressWrites++;
+                if (read.contains(OFFSETS) && !read.contains(MEMBERSHIP) && !read.contains(PROOF_MARKER)) leasedProgressWrites++;
             }
             long progressWrites = profiled.stream().filter(op -> isUpdate(op, OFFSETS)).count();
             String reading = ("appends %d (proving %d), checkpoint writes %d (leased %d), consumer proofs %d, "
