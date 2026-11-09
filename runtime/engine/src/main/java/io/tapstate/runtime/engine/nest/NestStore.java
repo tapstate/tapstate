@@ -177,6 +177,15 @@ public interface NestStore<S> extends Serializable {
     }
 
     /**
+     * Brings {@code keys} into memory in one round trip, ahead of the rows that will reach for them. Not a
+     * reach for the state itself: the rows still reach for it one by one, and find it resident. Only called
+     * on a store that {@link #readsAhead() reads ahead}; the default is the plain batch read.
+     */
+    default void readAhead(Collection<Object> keys) {
+        loadAll(keys);
+    }
+
+    /**
      * How many keys this vertex holds. It is asked of the state itself every time rather than counted up as
      * entries are written, because state outlives the run that wrote it: a tally started with the process
      * would report an almost empty vertex on the way back from a restart, and report it least accurately in

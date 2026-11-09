@@ -12,7 +12,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -127,7 +127,7 @@ class WhatIsKeptWhenTheLastReferrerIsDeletedTest {
                         + "that the row is not coming: an entry taken away instead is indistinguishable "
                         + "from one that has not arrived, and that order's document then waits for the "
                         + "life of the job with nothing thrown and no count moved")
-                .containsExactly(Map.entry(List.of(CUSTOMER), Map.of()));
+                .containsExactly(Map.entry(NestStateInspection.keyOf(List.of(CUSTOMER)), Map.of()));
     }
 
     @Test
@@ -147,29 +147,23 @@ class WhatIsKeptWhenTheLastReferrerIsDeletedTest {
                         + "live row dropped here is one no later document can ever be given, and such a "
                         + "document renders with the field missing - the same document a customer that "
                         + "never existed produces")
-                .containsExactly(Map.entry(List.of(CUSTOMER), row("customer_id", CUSTOMER, "name", "Ada")));
+                .containsExactly(Map.entry(NestStateInspection.keyOf(List.of(CUSTOMER)), row("customer_id", CUSTOMER, "name", "Ada")));
     }
 
     // ---- what the state was left holding ----------------------------------------------
 
     /** The rows the lookup namespace still holds, by the key each is filed under. */
     private List<Map.Entry<Object, Object>> rowsHeldIn(String pipeline) {
-        IMap<Object, Object> lookup = member.getMap("nest." + pipeline + "." + STEP + ".customer");
-        List<Map.Entry<Object, Object>> held = new ArrayList<>();
-        for (Object key : lookup.keySet()) {
-            held.add(Map.entry(key, lookup.get(key)));
-        }
-        return held;
+        return new ArrayList<>(NestStateInspection.<Object>entries(member,
+                "nest." + pipeline + "." + STEP + ".customer").entrySet());
     }
 
     /** How many referring rows are still recorded against the customer, across every bucket. */
     private int referrersRecordedFor(String pipeline) {
-        IMap<Object, java.util.Collection<Object>> index =
-                member.getMap("nest." + pipeline + "." + STEP + ".customer.refs");
         int recorded = 0;
-        for (Object key : index.keySet()) {
-            java.util.Collection<Object> bucket = index.get(key);
-            recorded += bucket == null ? 0 : bucket.size();
+        for (java.util.Collection<Object> bucket : NestStateInspection.<java.util.Collection<Object>>entries(member,
+                "nest." + pipeline + "." + STEP + ".customer.refs").values()) {
+            recorded += bucket.size();
         }
         return recorded;
     }

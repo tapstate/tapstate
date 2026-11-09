@@ -73,6 +73,24 @@ public final class NestStateStats {
         counters(namespace).pendingHighWater.accumulate(pending);
     }
 
+    /**
+     * Records how many of {@code namespace}'s keys one vertex instance holds in memory. Kept per instance and
+     * replaced rather than added to, so an instance rebuilt after a restart takes over its own number instead
+     * of counting its keys twice; {@link #held} sums the instances, the way a map counts what its member owns.
+     */
+    public void held(String namespace, String vertexInstance, long entries) {
+        counters(namespace).heldByInstance.put(vertexInstance, entries);
+    }
+
+    /** How many of {@code namespace}'s keys the vertex instances on this member hold in memory together. */
+    public long held(String namespace) {
+        Counters counters = byNamespace.get(namespace);
+        if (counters == null) return 0;
+        long sum = 0;
+        for (long entries : counters.heldByInstance.values()) sum += entries;
+        return sum;
+    }
+
     /** How often {@code namespace} was reached for, how much of that went behind the map, at what cost. */
     public Counted counted(String namespace) {
         Counters counters = byNamespace.get(namespace);
@@ -121,5 +139,6 @@ public final class NestStateStats {
         private final LongAdder keyAccesses = new LongAdder();
         private final LongAdder coldKeys = new LongAdder();
         private final LongAccumulator pendingHighWater = new LongAccumulator(Math::max, 0L);
+        private final Map<String, Long> heldByInstance = new ConcurrentHashMap<>();
     }
 }

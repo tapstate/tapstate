@@ -99,4 +99,24 @@ class ResidencyBytesTest {
         assertThatThrownBy(() -> ResidencyBudget.perNamespace(0, 1)).isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new ResidentValues<String>(0)).isInstanceOf(IllegalArgumentException.class);
     }
+
+    @Test
+    void theKeysCountedPresentAreTheOnesHoldingAValueStagedOrClean() {
+        ResidentValues<String> values = new ResidentValues<>(1024);
+        values.putClean("a", new byte[] {1});
+        values.putClean("gone", null);
+        assertThat(values.presentCount()).as("a known absence is not a key").isEqualTo(1);
+        values.stage("b", new byte[] {2});
+        values.stage("a", new byte[] {3});
+        assertThat(values.presentCount()).isEqualTo(2);
+        values.stageRemoval("a");
+        assertThat(values.presentCount()).isEqualTo(1);
+        values.committed();
+        assertThat(values.presentCount()).isEqualTo(1);
+        values.stage("c", new byte[] {4});
+        values.abandonStaged();
+        assertThat(values.presentCount()).isEqualTo(1);
+        values.putClean("big", new byte[2048]);
+        assertThat(values.presentCount()).as("evicted to the budget, so not held").isZero();
+    }
 }

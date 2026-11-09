@@ -359,7 +359,10 @@ public record NestBinding(
          */
         private <S> NestStore<S> stateOf(String askedFor, String name, String settingsName) {
             if (session == null) return metered(mapNamed(askedFor, name));
-            return session.view(name, settings.residentBytesIn(settingsName, Runtime.getRuntime().maxMemory()));
+            NestStateGauge gauge = gauges.get();
+            long residentBytes = settings.residentBytesIn(settingsName, Runtime.getRuntime().maxMemory());
+            return gauge == NestStateGauge.NONE ? session.view(name, residentBytes)
+                    : session.view(name, residentBytes, NestStateStats.of(member), gauge);
         }
 
         /**

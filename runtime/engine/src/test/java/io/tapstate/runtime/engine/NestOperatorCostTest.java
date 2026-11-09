@@ -29,6 +29,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.nest.NestBinding;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStateMapStoreFactory;
+import io.tapstate.runtime.engine.nest.NestStateSession;
 import io.tapstate.runtime.engine.nest.NestStateStats;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.spi.sink.SinkWriter;
@@ -303,11 +304,22 @@ class NestOperatorCostTest {
                         + "key still exceeds this ceiling",
                         ROOTS, REFERENCED_ROWS, batches.coldLoads())
                 .isPositive().isLessThanOrEqualTo(REFERENCED_ROWS);
-        assertThat(batches.coldBatchedKeys())
-                .describedAs("the batches asked for %d keys to fetch %d distinct rows, so a key was asked "
-                        + "for more than once - the batch is being formed per document rather than per "
-                        + "drain", batches.coldBatchedKeys(), REFERENCED_ROWS)
-                .isEqualTo(REFERENCED_ROWS);
+        if (NestStateSession.selected()) {
+            // The session reads another vertex's rows through to the store on every drain and keeps none of
+            // them, because the copy the lookup writes is the only one that is always current. So a row is
+            // fetched once per drain that needs it rather than once in all: never fewer keys than there are
+            // rows, and never more than one per document.
+            assertThat(batches.coldBatchedKeys())
+                    .describedAs("the batches asked for %d keys for %d documents pointing at %d rows",
+                            batches.coldBatchedKeys(), ROOTS, REFERENCED_ROWS)
+                    .isBetween((long) REFERENCED_ROWS, (long) ROOTS);
+        } else {
+            assertThat(batches.coldBatchedKeys())
+                    .describedAs("the batches asked for %d keys to fetch %d distinct rows, so a key was asked "
+                            + "for more than once - the batch is being formed per document rather than per "
+                            + "drain", batches.coldBatchedKeys(), REFERENCED_ROWS)
+                    .isEqualTo(REFERENCED_ROWS);
+        }
         assertThat(batches.coldBatches())
                 .describedAs("%d keys were fetched in %d calls, which is more calls than keys - a batch "
                         + "that asks for less than one key is not a batch. This is a ceiling and not a "
@@ -327,11 +339,19 @@ class NestOperatorCostTest {
                         + "of the index. One row, one registration - more means a referring row is being "
                         + "written into the index more than once", ROOTS, indexEntries.accesses())
                 .isEqualTo(ROOTS);
-        assertThat(indexEntries.coldSaves())
-                .describedAs("%d registrations wrote behind the map %d times. One write each; the entry "
-                        + "being rewritten twice per row is how this grows with fanout without anything "
-                        + "else changing", ROOTS, indexEntries.coldSaves())
-                .isEqualTo(ROOTS);
+        if (NestStateSession.selected()) {
+            // Registrations into one bucket inside one group leave as one write.
+            assertThat(indexEntries.coldSaves())
+                    .describedAs("%d registrations wrote behind memory %d times. At most one write each; "
+                            + "more is an entry rewritten per row", ROOTS, indexEntries.coldSaves())
+                    .isPositive().isLessThanOrEqualTo(ROOTS);
+        } else {
+            assertThat(indexEntries.coldSaves())
+                    .describedAs("%d registrations wrote behind the map %d times. One write each; the entry "
+                            + "being rewritten twice per row is how this grows with fanout without anything "
+                            + "else changing", ROOTS, indexEntries.coldSaves())
+                    .isEqualTo(ROOTS);
+        }
         assertThat(indexEntries.coldLoads())
                 .describedAs("the index read behind the map %d times over %d touches, which is more reads "
                         + "than touches. How many of the touches find their entry resident is the run's "
@@ -554,6 +574,10 @@ class NestOperatorCostTest {
                         + "threshold that only claims to be exact", namespace,
                         (double) delta.accesses() / events)
                 .isEqualTo(2 * events);
+        if (NestStateSession.selected()) {
+            assertOneRowPerEventInGroups(delta, namespace, events, coldReadsPerEvent);
+            return;
+        }
         assertThat(delta.coldSaves())
                 .describedAs("[%s] one event wrote behind the map %.3f times. One state, one write out; "
                         + "two means the same state was written twice in one event", namespace,
@@ -568,6 +592,60 @@ class NestOperatorCostTest {
     }
 
     /**
+     * Folding on the state session. A drain is still one read out and one write back, but the write lands in
+     * the session's group, and a group writes a key once however many drains changed it, so the drains are
+     * counted off the touches rather than off the writes.
+     */
+    private static void assertFoldedIntoDrainsInGroups(Report report, String namespace, Counters delta) {
+        assertThat(delta.accesses())
+                .describedAs("[%s] nothing touched the state, so there were no drains to reason about", namespace)
+                .isPositive();
+        assertThat(delta.accesses() % 2)
+                .describedAs("[%s] %d touches is not a whole number of drains: a drain is one read out and "
+                        + "one write back, and the rows folding into it add none", namespace, delta.accesses())
+                .isZero();
+        long drains = delta.accesses() / 2;
+        assertThat(delta.coldSaves())
+                .describedAs("[%s] %d drains wrote behind memory %d times; a group writes a key once",
+                        namespace, drains, delta.coldSaves())
+                .isPositive().isLessThanOrEqualTo(drains);
+        assertThat(delta.coldLoads())
+                .describedAs("[%s] a fold read behind memory, which it cannot legitimately do: the root "
+                        + "these rows fold into was landed and left resident by the phase before", namespace)
+                .isZero();
+        assertThat(drains * 2)
+                .describedAs("[%s] %d rows took %d drains, so folding bought less than the factor of two "
+                        + "this bound allows", namespace, report.events(), drains)
+                .isLessThanOrEqualTo(report.events());
+    }
+
+    /**
+     * The same price on the state session, where writes leave in commit groups and the keys a drain reaches
+     * for are read ahead in one batch. The touches are unchanged. A group writes each key it changed once,
+     * however many events changed it, so an event costs at most one write out and never more; and the keys
+     * fetched from behind memory are the same keys the per-key carrier fetches, while the trips that fetch
+     * them can only be fewer.
+     */
+    private static void assertOneRowPerEventInGroups(Counters delta, String namespace, long events,
+            long coldReadsPerEvent) {
+        assertThat(delta.coldSaves())
+                .describedAs("[%s] %d events wrote behind memory %d times. A group writes a key once however "
+                        + "often it changed, so more writes than events is one state written twice",
+                        namespace, events, delta.coldSaves())
+                .isPositive().isLessThanOrEqualTo(events);
+        assertThat(delta.coldKeysLoaded())
+                .describedAs("[%s] %d events fetched %d keys from behind memory, where this phase costs %d "
+                        + "each. More is a resident key fetched anyway; fewer is a phase not walking the path "
+                        + "it names", namespace, events, delta.coldKeysLoaded(), coldReadsPerEvent)
+                .isEqualTo(coldReadsPerEvent * events);
+        assertThat(delta.coldLoads())
+                .describedAs("[%s] %d keys took %d trips to fetch: a read ahead fetches a drain's keys "
+                        + "together, so there are never more trips than keys", namespace,
+                        delta.coldKeysLoaded(), delta.coldLoads())
+                .isLessThanOrEqualTo(delta.coldKeysLoaded());
+    }
+
+    /**
      * That the rows of one drain were folded, and that the drain cost the same whatever folded into it.
      * Asserted as a ratio and a bound rather than as values, because the absolute counts move with how
      * many drains the run happened to take - measured over reruns of one unchanged tree, 404/202/201 one
@@ -576,6 +654,10 @@ class NestOperatorCostTest {
      */
     private static void assertFoldedIntoDrains(Report report, String namespace) {
         Counters delta = report.namespaces().get(namespace);
+        if (NestStateSession.selected()) {
+            assertFoldedIntoDrainsInGroups(report, namespace, delta);
+            return;
+        }
         assertThat(delta.coldSaves())
                 .describedAs("[%s] nothing was written, so there were no drains to reason about and the "
                         + "ratio below would be over zero", namespace)
@@ -973,6 +1055,11 @@ class NestOperatorCostTest {
             long coldSaves, long coldDeletes, long coldBytes, long coldBatches, long coldBatchedKeys) {
 
         static final Counters NONE = new Counters(0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        /** Keys fetched from behind memory: one per single-key trip, and every key a batch carried. */
+        long coldKeysLoaded() {
+            return coldLoads - coldBatches + coldBatchedKeys;
+        }
 
         Counters minus(Counters earlier) {
             return new Counters(accesses - earlier.accesses, backfills - earlier.backfills,

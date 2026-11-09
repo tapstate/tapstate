@@ -34,6 +34,8 @@ public final class ResidentValues<K> {
     private final LinkedHashMap<K, byte[]> values = new LinkedHashMap<>(16, 0.75f, true);
     private final LinkedHashMap<K, byte[]> staged = new LinkedHashMap<>();
     private long residentBytes;
+    /** How many keys have a value here, staged or clean; a removal or a known absence is not one. */
+    private int present;
 
     public ResidentValues(long budgetBytes) {
         if (budgetBytes <= 0) {
@@ -73,18 +75,25 @@ public final class ResidentValues<K> {
         if (staged.containsKey(key)) {
             return;
         }
+        boolean before = holds(key);
         replace(key, value == null ? REMOVED : value);
+        present += (holds(key) ? 1 : 0) - (before ? 1 : 0);
         evictToBudget();
     }
 
     /** Stages {@code value} as what the next commit writes for {@code key}. */
     public void stage(K key, byte[] value) {
-        staged.put(Objects.requireNonNull(key, "key"), Objects.requireNonNull(value, "value"));
+        Objects.requireNonNull(value, "value");
+        boolean before = holds(Objects.requireNonNull(key, "key"));
+        staged.put(key, value);
+        if (!before) present++;
     }
 
     /** Stages the removal of {@code key} for the next commit. */
     public void stageRemoval(K key) {
-        staged.put(Objects.requireNonNull(key, "key"), REMOVED);
+        boolean before = holds(Objects.requireNonNull(key, "key"));
+        staged.put(key, REMOVED);
+        if (before) present--;
     }
 
     /** Whether {@code key} has a value or a removal staged. */
@@ -128,6 +137,7 @@ public final class ResidentValues<K> {
      */
     public void abandonStaged() {
         for (K key : staged.keySet()) {
+            if (holds(key)) present--;
             byte[] gone = values.remove(key);
             if (gone != null) {
                 residentBytes -= cost(gone);
@@ -141,11 +151,20 @@ public final class ResidentValues<K> {
         values.clear();
         staged.clear();
         residentBytes = 0;
+        present = 0;
     }
 
     /** The bytes held by clean resident values. */
     public long residentBytes() {
         return residentBytes;
+    }
+
+    /**
+     * How many keys hold a value here, staged or clean: what this copy knows to exist without asking the
+     * store. A removal staged or an absence remembered is not counted, and neither is a key evicted.
+     */
+    public int presentCount() {
+        return present;
     }
 
     /** How many clean values are resident. */
@@ -164,9 +183,18 @@ public final class ResidentValues<K> {
     private void evictToBudget() {
         Iterator<Map.Entry<K, byte[]>> oldest = values.entrySet().iterator();
         while (residentBytes > budgetBytes && oldest.hasNext()) {
-            residentBytes -= cost(oldest.next().getValue());
+            Map.Entry<K, byte[]> evicted = oldest.next();
+            residentBytes -= cost(evicted.getValue());
+            if (evicted.getValue() != REMOVED && !staged.containsKey(evicted.getKey())) present--;
             oldest.remove();
         }
+    }
+
+    private boolean holds(K key) {
+        byte[] pending = staged.get(key);
+        if (pending != null) return pending != REMOVED;
+        byte[] value = values.get(key);
+        return value != null && value != REMOVED;
     }
 
     private static long cost(byte[] value) {

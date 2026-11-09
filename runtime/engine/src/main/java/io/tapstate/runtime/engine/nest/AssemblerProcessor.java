@@ -681,7 +681,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             }
         }
         keys.removeIf(key -> recentReferenceStates.get(key) == ReferenceState.ABSENT);
-        if (!keys.isEmpty()) store.loadAll(keys);
+        if (!keys.isEmpty()) store.readAhead(keys);
     }
 
     private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched) {

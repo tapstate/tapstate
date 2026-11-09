@@ -103,6 +103,25 @@ public final class NestStateSession {
         return COUNTERS;
     }
 
+    /**
+     * What an unbacked namespace of {@code member}'s cluster holds, by stored key name, for a test to inspect
+     * the way it would read a map. Empty when nothing was ever committed there.
+     */
+    static Map<String, byte[]> unbacked(HazelcastInstance member, String namespace) {
+        Unbacked held = UNBACKED.get(member.getConfig().getClusterName() + "/" + namespace);
+        return held == null ? Map.of() : Map.copyOf(held.held);
+    }
+
+    /** The unbacked namespaces of {@code member}'s cluster that anything was committed to. */
+    static Set<String> unbackedNamespaces(HazelcastInstance member) {
+        String prefix = member.getConfig().getClusterName() + "/";
+        Set<String> names = new LinkedHashSet<>();
+        UNBACKED.forEach((name, held) -> {
+            if (name.startsWith(prefix) && !held.held.isEmpty()) names.add(name.substring(prefix.length()));
+        });
+        return names;
+    }
+
     /** Forgets every unbacked namespace, so one test's state does not reach the next. */
     public static void forgetUnbacked() {
         UNBACKED.clear();
@@ -113,9 +132,18 @@ public final class NestStateSession {
      * state; a view asked for later would be a namespace the proof did not cover.
      */
     <S> NestStore<S> view(String namespace, long residentBytes) {
+        return view(namespace, residentBytes, null, NestStateGauge.NONE);
+    }
+
+    /**
+     * The same view, leaving the namespace's readings where the run's statistics are collected: every reach
+     * for the state counted as the map carrier counts it, every read the store had to serve counted as a
+     * backfill, and how many keys the instance holds in memory as the namespace's entries.
+     */
+    <S> NestStore<S> view(String namespace, long residentBytes, NestStateStats stats, NestStateGauge gauge) {
         if (opened) throw new IllegalStateException("a state session's namespaces are fixed once it is open: " + namespace);
         Namespace held = namespaces.computeIfAbsent(Objects.requireNonNull(namespace, "namespace"),
-                name -> new Namespace(name, residentBytes));
+                name -> new Namespace(name, residentBytes, stats, Objects.requireNonNull(gauge, "gauge")));
         return new View<>(held);
     }
 
@@ -126,7 +154,7 @@ public final class NestStateSession {
      */
     @SuppressWarnings("unchecked")
     static <S> NestStore<S> readThrough(HazelcastInstance member, String namespace) {
-        return (NestStore<S>) new ReadThrough(namespace, resolve(member, namespace));
+        return (NestStore<S>) new ReadThrough(namespace, resolve(member, namespace), NestStateStats.of(member));
     }
 
     /** Whether anything is staged and not yet committed. */
@@ -158,10 +186,12 @@ public final class NestStateSession {
         } catch (RuntimeException failure) {
             failed = failure;
             namespaces.values().forEach(Namespace::abandon);
+            namespaces.values().forEach(Namespace::publish);
             resetGroup();
             throw failure;
         }
         namespaces.values().forEach(Namespace::committed);
+        namespaces.values().forEach(Namespace::publish);
         COUNTERS.commits.increment();
         COUNTERS.keysCommitted.add(stagedKeys);
         resetGroup();
@@ -227,11 +257,42 @@ public final class NestStateSession {
         private final ResidentValues<String> values;
         private final Map<String, Object> keysByName = new HashMap<>();
         private final Set<String> releasing = new LinkedHashSet<>();
+        private final NestStateStats stats;
+        private final NestStateGauge gauge;
         private KeyedStateStore store;
 
-        Namespace(String name, long residentBytes) {
+        Namespace(String name, long residentBytes, NestStateStats stats, NestStateGauge gauge) {
             this.name = name;
             this.values = new ResidentValues<>(residentBytes);
+            this.stats = stats;
+            this.gauge = gauge;
+        }
+
+        /** One reach for the state, over {@code keys} keys, counted as the map carrier counts one. */
+        void access(long keys) {
+            if (stats == null) return;
+            stats.access(name);
+            stats.accessKeys(name, keys);
+        }
+
+        private void backfilled(long began, long keys) {
+            if (stats == null) return;
+            stats.backfill(name, System.nanoTime() - began);
+            stats.coldKeys(name, keys);
+        }
+
+        void holding(long pending) {
+            if (stats != null) stats.holding(name, pending);
+        }
+
+        /** Leaves the namespace's current readings, after whatever changed them, as the map carrier does. */
+        void publish() {
+            if (stats == null) return;
+            stats.held(name, vertexInstance, values.presentCount());
+            NestStateStats.Counted counted = stats.counted(name);
+            gauge.reading(name, stats.held(name), counted.accesses(), counted.backfills(),
+                    counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
+            gauge.keyReading(name, counted.keyAccesses(), counted.coldKeys());
         }
 
         Object load(Object key) {
@@ -243,7 +304,9 @@ public final class NestStateSession {
                 return resident.get().map(NestStateSession::fromBytes).orElse(null);
             }
             COUNTERS.storeReads.increment();
+            long began = System.nanoTime();
             byte[] found = store.load(name, id).orElse(null);
+            backfilled(began, 1);
             values.putClean(id, found);
             return found == null ? null : fromBytes(found);
         }
@@ -261,7 +324,9 @@ public final class NestStateSession {
             });
             if (!missing.isEmpty()) {
                 COUNTERS.storeReads.increment();
+                long began = System.nanoTime();
                 Map<String, byte[]> found = store.loadAll(name, missing);
+                backfilled(began, missing.size());
                 for (String id : missing) {
                     byte[] bytes = found.get(id);
                     values.putClean(id, bytes);
@@ -353,56 +418,96 @@ public final class NestStateSession {
         @Override
         @SuppressWarnings("unchecked")
         public S load(Object key) {
-            return (S) namespace.load(key);
+            namespace.access(1);
+            S state = (S) namespace.load(key);
+            namespace.publish();
+            return state;
         }
 
+        /** One reach for however many keys, as the map carrier counts a batch read. */
         @Override
         @SuppressWarnings("unchecked")
         public Map<Object, S> loadAll(Collection<Object> keys) {
-            return (Map<Object, S>) (Map<Object, ?>) namespace.loadAll(keys);
+            if (keys.isEmpty()) return Map.of();
+            Set<Object> distinct = new LinkedHashSet<>(keys);
+            namespace.access(distinct.size());
+            Map<Object, S> loaded = (Map<Object, S>) (Map<Object, ?>) namespace.loadAll(distinct);
+            namespace.publish();
+            return loaded;
         }
 
         @Override
         public void save(Object key, S state) {
+            namespace.access(1);
             namespace.save(key, state);
+            namespace.publish();
         }
 
         @Override
         public void saveAll(Map<Object, S> states, Set<Object> firstFilings) {
-            states.forEach(namespace::save);
+            if (states.isEmpty()) return;
+            states.forEach((key, state) -> {
+                namespace.access(1);
+                namespace.save(key, state);
+            });
+            namespace.publish();
         }
 
+        /** One reach, as the map carrier counts growing a set at its key. */
         @Override
         @SuppressWarnings("unchecked")
         public void add(Object key, Object element) {
+            namespace.access(1);
             Set<Object> held = (Set<Object>) namespace.load(key);
             Set<Object> grown = held == null ? new LinkedHashSet<>() : held;
             if (grown.add(element)) namespace.save(key, grown);
+            namespace.publish();
         }
 
         @Override
         @SuppressWarnings("unchecked")
         public void addAll(Map<Object, Set<Object>> additions) {
+            if (additions.isEmpty()) return;
+            additions.keySet().forEach(ignored -> namespace.access(1));
             Map<Object, Object> held = namespace.loadAll(additions.keySet());
             additions.forEach((key, elements) -> {
                 Set<Object> current = (Set<Object>) held.get(key);
                 Set<Object> grown = current == null ? new LinkedHashSet<>() : current;
                 if (grown.addAll(elements)) namespace.save(key, grown);
             });
+            namespace.publish();
         }
 
         @Override
         @SuppressWarnings("unchecked")
         public void remove(Object key, Object element) {
+            namespace.access(1);
             Set<Object> held = (Set<Object>) namespace.load(key);
-            if (held == null || !held.remove(element)) return;
-            if (held.isEmpty()) namespace.remove(key);
-            else namespace.save(key, held);
+            if (held != null && held.remove(element)) {
+                if (held.isEmpty()) namespace.remove(key);
+                else namespace.save(key, held);
+            }
+            namespace.publish();
         }
 
         @Override
         public void remove(Object key) {
+            namespace.access(1);
             namespace.remove(key);
+            namespace.publish();
+        }
+
+        /** The trip behind memory is counted as a backfill; the reach is counted when a row makes it. */
+        @Override
+        public void readAhead(Collection<Object> keys) {
+            if (keys.isEmpty()) return;
+            namespace.loadAll(new LinkedHashSet<>(keys));
+            namespace.publish();
+        }
+
+        @Override
+        public void holding(long pending) {
+            namespace.holding(pending);
         }
 
         @Override
@@ -439,10 +544,12 @@ public final class NestStateSession {
         private static final long serialVersionUID = 1L;
         private final String namespace;
         private final transient KeyedStateStore store;
+        private final transient NestStateStats stats;
 
-        ReadThrough(String namespace, KeyedStateStore store) {
+        ReadThrough(String namespace, KeyedStateStore store, NestStateStats stats) {
             this.namespace = Objects.requireNonNull(namespace, "namespace");
             this.store = Objects.requireNonNull(store, "store");
+            this.stats = stats;
         }
 
         @Override
@@ -454,8 +561,19 @@ public final class NestStateSession {
         public Map<Object, Object> loadAll(Collection<Object> keys) {
             Map<String, Object> ids = new LinkedHashMap<>();
             for (Object key : keys) ids.put(NestStateKeys.nameOf(key), key);
+            if (ids.isEmpty()) return Map.of();
             COUNTERS.readThroughCalls.increment();
+            // One reach, and always a trip behind memory: nothing read here is kept.
+            if (stats != null) {
+                stats.access(namespace);
+                stats.accessKeys(namespace, ids.size());
+            }
+            long began = System.nanoTime();
             Map<String, byte[]> found = store.loadAll(namespace, List.copyOf(ids.keySet()));
+            if (stats != null) {
+                stats.backfill(namespace, System.nanoTime() - began);
+                stats.coldKeys(namespace, ids.size());
+            }
             Map<Object, Object> loaded = new LinkedHashMap<>();
             ids.forEach((id, key) -> {
                 byte[] bytes = found.get(id);
@@ -563,7 +681,7 @@ public final class NestStateSession {
         return bytes.toByteArray();
     }
 
-    private static Object fromBytes(byte[] bytes) {
+    static Object fromBytes(byte[] bytes) {
         try (ObjectInputStream in = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
             return in.readObject();
         } catch (IOException | ClassNotFoundException malformed) {
