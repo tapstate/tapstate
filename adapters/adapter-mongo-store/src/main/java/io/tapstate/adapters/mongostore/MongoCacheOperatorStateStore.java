@@ -306,8 +306,14 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             LEASE_OPENS.incrementAndGet();
             // A proof that ran out while validating, or that a drop overtook, serves only the operation it was
             // proved for: it is never kept for the next one, which proves again.
-            if (System.nanoTime() - proved.deadlineNanos() < 0 && leaseEpoch.get() == epoch) lease.set(proved);
-            else lease.set(null);
+            // Publish first and then look for a drop: a drop that lands after the publish clears the lease
+            // itself, and one that landed before it is seen here, so no interleaving keeps a dropped proof.
+            if (System.nanoTime() - proved.deadlineNanos() < 0) {
+                lease.set(proved);
+                if (leaseEpoch.get() != epoch) lease.compareAndSet(proved, null);
+            } else {
+                lease.set(null);
+            }
             return proved;
         }
     }

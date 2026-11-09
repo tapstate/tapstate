@@ -412,6 +412,17 @@ class MongoCacheOperatorStateStoreIT {
     }
 
     @Test void aNewStableGenerationUsesDifferentHotAndColdAddressesAndDoesNotAdoptOldBytes() {
+        // The old writer's first read and write below rely on its standing lease; a lease longer than any
+        // fixture keeps that from depending on how long the setup took.
+        System.setProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY, "600000");
+        try {
+            aNewStableGenerationUnderAStandingLease();
+        } finally {
+            System.clearProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY);
+        }
+    }
+
+    private static void aNewStableGenerationUnderAStandingLease() {
         withFixture(f -> {
             var oldAt = f.at(OperatorPlacement.Resource.NEST_STATE); var old = f.writer(oldAt); old.save(oldAt.mapName(), "key", new byte[]{1});
             var next = new PipelineIntentScope("cluster-a",1,"cache-a","orders",2);
