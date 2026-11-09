@@ -26,7 +26,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
@@ -319,6 +321,155 @@ class RealDummyPipelineIT {
 
     private record InputRun(List<Integer> left, List<Integer> right, List<String> inserts,
             long firstEventTime, List<String> randomValues) {}
+
+    @Test
+    void qualifiesSourceAndSinkLimitsWithoutAnObserver() throws Exception {
+        Path seeds = Files.createDirectory(work.resolve("rate-seed"));
+        Files.copy(published(), seeds.resolve("dummy-connector.jar"));
+        try (var storage = PreparedNativeStore.create(); var documents = new NativeSrsDocuments(storage);
+                var server = start(storage, seeds)) {
+            var control = new ControlPlane(server.baseUrl());
+            storage.loginAndAwaitBusiness(control);
+            try {
+                var limited = sampleCdcRate(control, documents, "source_limited", 10, 0);
+                var unrestricted = sampleCdcRate(control, documents, "source_unrestricted", 0, 0);
+                var sinkLimited = sampleCdcRate(control, documents, "sink_limited", 10, 1);
+                assertThat(limited.sourcePerSecond()).isBetween(5.0, 15.0);
+                // An unrestricted source can fill the bounded direct channel during warm-up.
+                assertThat(unrestricted.sourceFrom()).isGreaterThan(2 * limited.sourceFrom());
+                assertThat(unrestricted.outputPerSecond()).isGreaterThan(2 * limited.outputPerSecond());
+                assertThat(sinkLimited.sourcePerSecond()).isBetween(5.0, 15.0);
+                assertThat(sinkLimited.outputPerSecond()).isLessThan(limited.outputPerSecond());
+                assertThat(sinkLimited.unconfirmedGrowth()).as("extra rows waiting for target confirmation")
+                        .isPositive();
+            } finally {
+                System.out.println("OP server log: " + server.output());
+            }
+        }
+    }
+
+    private static CdcRate sampleCdcRate(ControlPlane control, NativeSrsDocuments documents,
+            String id, int sourceLimit, int sinkLimit) {
+        applyRatePipeline(control, id, sourceLimit, sinkLimit);
+        long startRequested = System.nanoTime();
+        control.lifecycle(id, LifecycleVerb.START);
+        var from = Await.answered(id + " warm-up with acknowledged output", Duration.ofSeconds(20),
+                () -> rateReading(control, id));
+        long sourceFrom = capturedRows(documents, id);
+        long warmupMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startRequested);
+        // The observation publisher can re-publish the same underlying job counters.
+        var to = Await.answered(id + " fresh counters after the measurement window", Duration.ofSeconds(15),
+                () -> rateReading(control, id).filter(reading ->
+                        !reading.at().isBefore(from.at().plusSeconds(3)) && reading.output() > from.output()));
+        var rate = new CdcRate(from, to, sourceFrom, capturedRows(documents, id));
+        long stopRequested = System.nanoTime();
+        control.stop(id, false);
+        awaitState(control, id, PipelineState.STOPPED);
+        long stopMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - stopRequested);
+        assertThat(control.errorCount(id)).contains(0L);
+        System.out.printf(Locale.ROOT,
+                "%s: source quota %d/1000 ms, sink quota %d/250 ms, source flush 250 ms, "
+                        + "one sink writer with batches of up to 8 rows, from %s to %s, "
+                        + "warm-up %d ms, source %d -> %d (%.2f/s), input %.2f/s, driven %.2f/s, confirmed %.2f/s, "
+                        + "unconfirmed growth %d, average source-to-confirmation %.1f ms, stop %d ms, errors 0%n",
+                id, sourceLimit, sinkLimit, rate.from(), rate.to(), warmupMillis, rate.sourceFrom(), rate.sourceTo(),
+                rate.sourcePerSecond(), rate.inputPerSecond(), rate.perSecond(rate.to().driven() - rate.from().driven()),
+                rate.outputPerSecond(), rate.unconfirmedGrowth(), to.delivery().averageMillisSince(from.delivery()),
+                stopMillis);
+        System.out.printf(Locale.ROOT, "%s stages: transform %.3f ms/row, sink processor %.3f ms/call%n", id,
+                to.transform().averageMillisSince(from.transform()), to.target().averageMillisSince(from.target()));
+        return rate;
+    }
+
+    private static long capturedRows(NativeSrsDocuments documents, String id) {
+        var window = documents.directChannel(id, id + "_source").get("current", Document.class);
+        long lastSequence = window.get("lastBoundary", Document.class).getLong("sequence");
+        // The direct capture numbers rows and batch boundaries consecutively, starting at zero.
+        return lastSequence + 1 - window.getLong("recordedThrough");
+    }
+
+    private static Optional<RateReading> rateReading(ControlPlane control, String id) {
+        var state = control.state(id);
+        if (state.filter(PipelineState.FAILED::equals).isPresent()) {
+            throw new AssertionError(id + " failed while measuring rates: " + control.logs(id));
+        }
+        var facts = control.metricFacts(id);
+        var movement = metricPoints(facts, "tapstate.pipeline.records");
+        var drivenPoints = metricPoints(facts, "tapstate.pipeline.records.driven");
+        var deliveries = metricPoints(facts, "tapstate.pipeline.record.delivery.duration");
+        var stages = metricPoints(facts, "tapstate.pipeline.process.duration");
+        long input = movement.stream().filter(point -> "in".equals(metricAttribute(point, "direction")))
+                .mapToLong(point -> ((Number) point.get("value")).longValue()).sum();
+        long output = movement.stream().filter(point -> "out".equals(metricAttribute(point, "direction")))
+                .mapToLong(point -> ((Number) point.get("value")).longValue()).sum();
+        if (input <= 0 || output <= 0 || drivenPoints.isEmpty() || deliveries.isEmpty()) {
+            return Optional.empty();
+        }
+        var driven = drivenPoints.getFirst();
+        return Optional.of(new RateReading(Instant.parse((String) driven.get("observedAt")), input,
+                ((Number) driven.get("value")).longValue(), output, Timing.of(deliveries.getFirst()),
+                stageTiming(stages, "transform"), stageTiming(stages, "sink")));
+    }
+
+    private static Object metricAttribute(Map<?, ?> point, String name) {
+        return ((Map<?, ?>) point.get("attributes")).get(name);
+    }
+
+    private static Timing stageTiming(List<Map<?, ?>> stages, String name) {
+        return stages.stream().filter(point -> name.equals(metricAttribute(point, "stage")))
+                .map(Timing::of).findFirst().orElseThrow(() -> new AssertionError("Missing stage timing: " + name));
+    }
+
+    private static List<Map<?, ?>> metricPoints(List<Map<String, Object>> facts, String name) {
+        return facts.stream().filter(fact -> name.equals(fact.get("name")))
+                .flatMap(fact -> ((List<?>) fact.get("points")).stream())
+                .<Map<?, ?>>map(point -> (Map<?, ?>) point).toList();
+    }
+
+    private record Timing(long count, double seconds) {
+        static Timing of(Map<?, ?> point) {
+            return new Timing(((Number) point.get("count")).longValue(), ((Number) point.get("sum")).doubleValue());
+        }
+
+        double averageMillisSince(Timing earlier) {
+            assertThat(count).isGreaterThan(earlier.count);
+            return 1_000 * (seconds - earlier.seconds) / (count - earlier.count);
+        }
+    }
+
+    private record RateReading(Instant at, long input, long driven, long output,
+            Timing delivery, Timing transform, Timing target) {}
+
+    private record CdcRate(RateReading from, RateReading to, long sourceFrom, long sourceTo) {
+        double sourcePerSecond() { return perSecond(sourceTo - sourceFrom); }
+        double inputPerSecond() { return perSecond(to.input() - from.input()); }
+        double outputPerSecond() { return perSecond(to.output() - from.output()); }
+        long unconfirmedGrowth() { return (to.input() - from.input()) - (to.output() - from.output()); }
+        double perSecond(long records) { return 1_000.0 * records / Duration.between(from.at(), to.at()).toMillis(); }
+    }
+
+    private static void applyRatePipeline(ControlPlane control, String id, int sourceLimit, int sinkLimit) {
+        String sourceId = id + "_source";
+        String targetId = id + "_target";
+        var input = source(sourceId, 32, true, "[1]")
+                .replace("tables: [dummy_orders]\n", "tables: [dummy_orders]\nsrs: {enabled: false}\n")
+                .replace("incremental_interval_totals: 1", "incremental_interval_totals: " + sourceLimit)
+                + "  batch_timeouts: '250'\n";
+        var target = source(targetId, 1, false, "[1]")
+                .replace("write_interval: 1000", "write_interval: 250")
+                .replace("write_interval_totals: 0", "write_interval_totals: " + sinkLimit);
+        var sources = Map.of("source.tap.yml", input, "target.tap.yml", target);
+        control.apply(sources);
+        var fields = List.of(Map.of("name", "id", "type", "serial", "pri", true));
+        var schema = Map.<String, Object>of("table_name", "dummy_orders", "table_fields", fields);
+        control.discoverSchema(sourceId, "dummy", schema);
+        control.discoverSchema(targetId, "dummy", schema);
+        control.apply(Map.of("source.tap.yml", input, "target.tap.yml", target,
+                "pipeline.tap.yml", pipeline(id, "cdc_only")
+                .replace("source: src_dummy", "source: " + sourceId)
+                .replace("source: tgt_dummy", "source: " + targetId
+                        + "\n      execution: {parallelism: 1, batch: {max_records: 8}}")));
+    }
 
     @Test
     void replaysTheSamePrewrittenMongoBatchThroughRealDummy() throws Exception {
