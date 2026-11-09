@@ -252,7 +252,14 @@ public enum NestError implements TapstateErrorCode {
      * reference count that was never real.
      */
     REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.reference-tracking-requires-before-image", Set.of("alias", "refPath"));
+            "nest.reference-tracking-requires-before-image", Set.of("alias", "refPath")),
+
+    /**
+     * Running: one state value is larger than one commit group may carry. A group is one store transaction,
+     * and a value is never split across two, because a reader between them would see half of it; so the
+     * value is refused and the vertex stops rather than writing something no crash could leave whole.
+     */
+    STATE_VALUE_TOO_LARGE("nest.state-value-too-large", Set.of("namespace", "bytes", "limit"));
 
     private final String code;
     private final Set<String> placeholders;

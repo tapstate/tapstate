@@ -440,7 +440,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         forgetDeletionsReplayCannotReach();
         // Only after the documents above have gone out, for the usual reason: a bound offered ahead of what is
         // queued behind it would say it had left.
-        return !forgetHandOversThatHaveLanded() || bounds == null || bounds.release(this::tryEmit);
+        return !forgetHandOversThatHaveLanded() || bounds == null || (settled() && bounds.release(this::tryEmit));
     }
 
     /**
@@ -634,6 +634,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         }
         NestInbound edge = vertex.inbound().get(ordinal);
         Map<Object, Touched> touched = new LinkedHashMap<>();
+        readAhead(edge, inbox);
         boolean snapshotWaves = canUseSnapshotWaves(edge);
         try {
             for (Object item; (item = inbox.peek()) != null; ) {
@@ -651,6 +652,36 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         // else is coming for.
         collectWhatIsOwed();
         sendWhatWindowsHaveRunOutOn();
+    }
+
+    /**
+     * Reads the documents an inbox will touch in one batch, where the store answers a batch in one round trip
+     * and keeps what it read resident. The inbox is already bounded by the engine, so the whole of it is read;
+     * anything this cannot key is left to be read where it is handled.
+     */
+    private void readAhead(NestInbound edge, Inbox inbox) {
+        if (!store.readsAhead() || edge.carriesDepartures()) return;
+        Set<Object> keys = new LinkedHashSet<>();
+        for (Object item : inbox) {
+            if (item instanceof NestTouch word) {
+                keys.add(word.key());
+                continue;
+            }
+            if (item instanceof KeyedElement arrived) {
+                keys.add(arrived.key());
+                continue;
+            }
+            if (edge.isCascade() || !(item instanceof Envelope event)) continue;
+            try {
+                Map<String, Object> row = NestKeys.rowOf(event);
+                keys.add(edge.pathId().isEmpty() ? NestKeys.valuesOf(row, vertex.partitionKey(), vertex.mapName())
+                        : NestKeys.valuesOf(row, edge.keyFields(), vertex.mapName()));
+            } catch (TapstateException unkeyable) {
+                // Reported where the row is handled.
+            }
+        }
+        keys.removeIf(key -> recentReferenceStates.get(key) == ReferenceState.ABSENT);
+        if (!keys.isEmpty()) store.loadAll(keys);
     }
 
     private boolean processArrival(NestInbound edge, Object item, Inbox inbox, Map<Object, Touched> touched) {
@@ -819,7 +850,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         if (bounds == null) {
             return true;
         }
-        return bounds.advance(ordinal, watermark, this::tryEmit);
+        return (settled() && bounds.advance(ordinal, watermark, this::tryEmit));
     }
 
     private void observeLookupSnapshots(int ordinal, Watermark watermark) {
@@ -880,7 +911,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             return false;
         }
         snapshotWaiters = null;
-        return bounds == null || bounds.release(this::tryEmit);
+        return bounds == null || (settled() && bounds.release(this::tryEmit));
     }
 
     /**
@@ -1615,7 +1646,8 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         flushingCompletedReferenceBatch = false;
         // Flush each bounded batch before taking in another. The last send can clear a window's hold
         // without going through sendFolded, so release its bound here too, retrying a refused offer.
-        return settledMissingReferencesOnComplete && (bounds == null || bounds.release(this::tryEmit));
+        // Nothing may stay in an open group once input has ended: no later turn would ever close it.
+        return settledMissingReferencesOnComplete && settled() && (bounds == null || bounds.release(this::tryEmit));
     }
 
     private void waitForReference(Object key, long ts, RootAssembly assembly,
@@ -1663,7 +1695,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         writes.flush();
         if (!flush()) return false;
         // A bound follows the actual output; queued documents must never be overtaken.
-        return !letGo || bounds == null || bounds.release(this::tryEmit);
+        return !letGo || bounds == null || (settled() && bounds.release(this::tryEmit));
     }
 
     private boolean sendWindow(Map.Entry<Object, Window> entry, Iterator<Map.Entry<Object, Window>> open,
@@ -1882,7 +1914,45 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         ABSENT, COMPLETE
     }
 
+    /**
+     * Makes this instance's changed state durable now: the open commit group, every namespace of it. Called
+     * before anything that says a change has left, which is every bound this vertex offers; a no-op where
+     * the store writes through.
+     */
+    private boolean commitState() {
+        store.commit();
+        if (parking != null) parking.commit();
+        return true;
+    }
+
+    /**
+     * Whether the changes waiting to go out may leave now: nothing they depend on is uncommitted, or the open
+     * group has reached a bound and is committed here. Otherwise they wait for the group, and the vertex
+     * keeps taking input into it, so a group is not cut at every drain.
+     */
+    private boolean groupClosed() {
+        if (!(store.hasUncommitted() || (parking != null && parking.hasUncommitted()))) return true;
+        if (!(store.commitDue() && (parking == null || parking.commitDue()))) return false;
+        return commitState();
+    }
+
+    /**
+     * Commits the open group and then empties what is waiting to go out, answering whether it all got out:
+     * what a bound has to wait for, since a bound offered ahead of the changes queued behind it would say
+     * they had left.
+     */
+    private boolean settled() {
+        return commitState() && flush();
+    }
+
+    /**
+     * Empties what is waiting to go out, reporting whether it all got out. Changes whose state is still in an
+     * open commit group stay queued, in order, until the group commits: drain, mutate, commit, emit.
+     */
     private boolean flush() {
+        if (!outgoing.isEmpty() && !groupClosed()) {
+            return true;
+        }
         while (!outgoing.isEmpty()) {
             if (!tryEmit(outgoing.peek())) {
                 return false;

@@ -148,6 +148,35 @@ public interface NestStore<S> extends Serializable {
     }
 
     /**
+     * Makes every change this store has accepted durable. A store that writes through on each call has
+     * nothing left to do; one that groups writes commits them all now. A vertex calls it before anything
+     * that depends on those changes leaves it: a document, a touch, or a bound the frontier may pass.
+     */
+    default void commit() {
+    }
+
+    /** Whether this store holds changes a {@link #commit()} has not yet made durable. */
+    default boolean hasUncommitted() {
+        return false;
+    }
+
+    /**
+     * Whether the changes held here have reached one of the bounds their group closes at, so the vertex
+     * should commit now rather than hold its output for more input.
+     */
+    default boolean commitDue() {
+        return true;
+    }
+
+    /**
+     * Whether reading many keys ahead of the rows that touch them is worth doing: true for a store that
+     * answers a batch read in one round trip and keeps what it read resident.
+     */
+    default boolean readsAhead() {
+        return false;
+    }
+
+    /**
      * How many keys this vertex holds. It is asked of the state itself every time rather than counted up as
      * entries are written, because state outlives the run that wrote it: a tally started with the process
      * would report an almost empty vertex on the way back from a restart, and report it least accurately in

@@ -87,6 +87,11 @@ public final class ResidentValues<K> {
         staged.put(Objects.requireNonNull(key, "key"), REMOVED);
     }
 
+    /** Whether {@code key} has a value or a removal staged. */
+    public boolean isStaged(K key) {
+        return staged.containsKey(key);
+    }
+
     /** Whether anything is staged. */
     public boolean hasStaged() {
         return !staged.isEmpty();
