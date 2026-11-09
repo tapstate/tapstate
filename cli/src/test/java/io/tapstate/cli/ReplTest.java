@@ -199,6 +199,10 @@ class ReplTest {
         /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
         DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
         final List<String> derivedSchemaCalls = new ArrayList<>();
+        NestProgressOutcome nestProgressOutcome = new NestProgressOutcome.Unreachable();
+        NestInspectOutcome nestInspectOutcome = new NestInspectOutcome.Unreachable();
+        NestExplainOutcome nestExplainOutcome = new NestExplainOutcome.Unreachable();
+        final List<String> nestCalls = new ArrayList<>();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
         /**
          * Per-verb outcomes, falling back to {@link #lifecycleOutcome}. A composed verb drives
@@ -579,6 +583,25 @@ class ReplTest {
             derivedSchemaCalls.add("accept " + credential + "@" + baseUrl + "/" + pipelineId);
             return healthy.contains(baseUrl)
                     ? derivedSchemaOutcome : new DerivedSchemaOutcome.Unreachable();
+        }
+
+        @Override
+        public NestProgressOutcome nestProgress(URI baseUrl, String credential, String pipelineId, String step) {
+            nestCalls.add("progress " + pipelineId + " " + step);
+            return healthy.contains(baseUrl) ? nestProgressOutcome : new NestProgressOutcome.Unreachable();
+        }
+
+        @Override
+        public NestInspectOutcome nestInspect(URI baseUrl, String credential, String pipelineId, String step,
+                List<String> rootKey) {
+            nestCalls.add("inspect " + pipelineId + " " + step + " " + rootKey);
+            return healthy.contains(baseUrl) ? nestInspectOutcome : new NestInspectOutcome.Unreachable();
+        }
+
+        @Override
+        public NestExplainOutcome nestExplain(URI baseUrl, String credential, String pipelineId, String step) {
+            nestCalls.add("explain " + pipelineId + " " + step);
+            return healthy.contains(baseUrl) ? nestExplainOutcome : new NestExplainOutcome.Unreachable();
         }
 
         @Override
@@ -5372,6 +5395,73 @@ class ReplTest {
         assertThat(h.repl().dispatch("derived-schema pl1")).isTrue();
 
         assertThat(h.sink().toString().substring(mark)).contains("target columns unknown");
+    }
+
+    @Test
+    void nestProgressReadsTheStepAndPrintsWhatItWaitsFor() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.nestProgressOutcome = new NestProgressOutcome.Found("order_doc", "RUNNING", "initial load",
+                List.of(new NestProgressOutcome.Step("doc", "orders", null, 300L, "LOADING", List.of("orders"),
+                        List.of(new NestProgressOutcome.Table("orders", "", "pending", null, 300L, null)))));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("nest progress order_doc doc")).isTrue();
+
+        assertThat(client.nestCalls).containsExactly("progress order_doc doc");
+        assertThat(h.sink().toString().substring(mark)).contains("waiting for orders to be read");
+    }
+
+    @Test
+    void nestInspectSendsEveryWordAfterTheStepAsTheKeyAndPrintsTheView() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, Object> view = new java.util.LinkedHashMap<>();
+        view.put("pipelineId", "order_doc");
+        view.put("step", "doc");
+        view.put("rootKeyColumns", List.of("id", "region"));
+        view.put("rootKey", List.of(1, "eu"));
+        view.put("rootPresent", true);
+        view.put("rootOrder", "1:3");
+        view.put("parts", List.of());
+        view.put("waiting", List.of());
+        view.put("missingReferences", List.of());
+        view.put("unsent", 0);
+        view.put("document", Map.of("id", 1));
+        client.nestInspectOutcome = new NestInspectOutcome.Found(view);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("nest inspect order_doc doc 1 eu")).isTrue();
+
+        assertThat(client.nestCalls).containsExactly("inspect order_doc doc [1, eu]");
+        assertThat(h.sink().toString().substring(mark)).contains("root row: present, order 1:3");
+    }
+
+    @Test
+    void explainWithAStepExplainsTheNestStepAndARefusalIsPrinted() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.nestExplainOutcome = new NestExplainOutcome.Rejected("monitor.unknown-nest-step",
+                "Step tidy is not a nest step of order_doc; its nest steps are doc.");
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("explain order_doc tidy")).isTrue();
+
+        assertThat(client.nestCalls).containsExactly("explain order_doc tidy");
+        assertThat(h.sink().toString().substring(mark)).contains("its nest steps are doc");
+    }
+
+    @Test
+    void nestRefusesAShapeItDoesNotKnowBeforeAskingAnything() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("nest progres order_doc")).isTrue();
+        assertThat(h.repl().dispatch("nest inspect order_doc doc")).isTrue();
+
+        assertThat(client.nestCalls).isEmpty();
+        assertThat(h.sink().toString().substring(mark)).contains("nest: usage: " + Repl.NEST_USAGE);
     }
 
     @Test

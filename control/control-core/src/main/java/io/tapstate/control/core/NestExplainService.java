@@ -103,47 +103,61 @@ public final class NestExplainService {
         }
 
         private void check(NestTree.Level level, Located parent, Located root, Located child) {
-            // A shared row is counted from its parents' rows, so it needs the parent read as well.
-            String unavailable = child.why() != null ? child.why()
-                    : level.owned() ? null : parent.why() == null ? null : "parent not sampled: " + parent.why();
+            String unavailable = unavailable(level, parent, child);
             if (unavailable != null) {
                 samples.add(new NestExplanation.Sampled(level.path(), level.alias(), child.source(), child.table(),
                         child.sample() == null ? null : child.sample().tableRows(), 0, null, null, unavailable));
-                return;
+            } else if (level.owned()) {
+                checkOwned(level, root, child);
+            } else {
+                checkShared(level, parent, root, child);
             }
+        }
+
+        /** Why nothing can be counted for {@code level}, or null when it can. */
+        private static String unavailable(NestTree.Level level, Located parent, Located child) {
+            if (child.why() != null) {
+                return child.why();
+            }
+            // A shared row is counted from its parents' rows, so it needs the parent read as well.
+            if (!level.owned() && parent.why() != null) {
+                return "parent not sampled: " + parent.why();
+            }
+            return null;
+        }
+
+        /** Rows of an owned embed under one parent, by the child side of the join. */
+        private void checkOwned(NestTree.Level level, Located root, Located child) {
             NestSampler.Sample rows = child.sample();
-            if (level.owned()) {
-                // Rows of this embed under one parent, by the child side of the join.
-                long largest = largestGroup(rows.rows(), List.copyOf(level.on().keySet()));
-                Double average = ratio(rows.tableRows(), root.sample() == null ? null : root.sample().tableRows());
-                samples.add(new NestExplanation.Sampled(level.path(), level.alias(), child.source(), child.table(),
-                        rows.tableRows(), rows.rows().size(), largest, average, null));
-                if (!"array".equals(level.as())) {
-                    if (largest > 1) {
-                        warnings.add(new NestExplanation.Warning(MonitorError.NEST_OBJECT_KEY_NOT_UNIQUE,
-                                level.path(), Map.of("embed", level.path(), "table", child.table(),
-                                        "count", largest, "sampled", rows.rows().size())));
-                    }
-                    return;
-                }
-                long estimate = Math.max(largest, average == null ? 0 : Math.round(average));
-                if (tree.elementLimit() > 0 && estimate >= NEAR * tree.elementLimit()) {
-                    warnings.add(new NestExplanation.Warning(MonitorError.NEST_NEAR_ELEMENT_LIMIT, level.path(),
-                            Map.of("embed", level.path(), "table", child.table(), "count", estimate,
-                                    "limit", tree.elementLimit())));
+            long largest = largestGroup(rows.rows(), List.copyOf(level.on().keySet()));
+            Double average = ratio(rows.tableRows(), rowsOf(root));
+            samples.add(new NestExplanation.Sampled(level.path(), level.alias(), child.source(), child.table(),
+                    rows.tableRows(), rows.rows().size(), largest, average, null));
+            if (!"array".equals(level.as())) {
+                if (largest > 1) {
+                    warnings.add(warning(MonitorError.NEST_OBJECT_KEY_NOT_UNIQUE, level, child, largest,
+                            "sampled", rows.rows().size()));
                 }
                 return;
             }
-            // A shared row: parents pointing at one row, by the parent side of the join.
+            long estimate = estimate(largest, average);
+            if (tree.elementLimit() > 0 && estimate >= NEAR * tree.elementLimit()) {
+                warnings.add(warning(MonitorError.NEST_NEAR_ELEMENT_LIMIT, level, child, estimate,
+                        LIMIT, tree.elementLimit()));
+            }
+        }
+
+        /** Parents pointing at one shared row, by the parent side of the join. */
+        private void checkShared(NestTree.Level level, Located parent, Located root, Located child) {
+            NestSampler.Sample rows = child.sample();
             long largest = largestGroup(parent.sample().rows(), List.copyOf(level.on().values()));
-            Double average = ratio(root.sample() == null ? null : root.sample().tableRows(), rows.tableRows());
+            Double average = ratio(rowsOf(root), rows.tableRows());
             samples.add(new NestExplanation.Sampled(level.path(), level.alias(), child.source(), child.table(),
                     rows.tableRows(), parent.sample().rows().size(), largest, average, null));
-            long estimate = Math.max(largest, average == null ? 0 : Math.round(average));
+            long estimate = estimate(largest, average);
             if (level.referrerLimit() > 0 && estimate >= NEAR * level.referrerLimit()) {
-                warnings.add(new NestExplanation.Warning(MonitorError.NEST_REFERENCE_WIDELY_SHARED, level.path(),
-                        Map.of("embed", level.path(), "table", child.table(), "count", estimate,
-                                "limit", level.referrerLimit())));
+                warnings.add(warning(MonitorError.NEST_REFERENCE_WIDELY_SHARED, level, child, estimate,
+                        LIMIT, level.referrerLimit()));
             }
         }
 
@@ -201,6 +215,23 @@ public final class NestExplainService {
                     }))
                     .orElse(false);
         }
+    }
+
+    private static final String LIMIT = "limit";
+
+    private static NestExplanation.Warning warning(MonitorError code, NestTree.Level level, Located child,
+            long count, String boundName, Object bound) {
+        return new NestExplanation.Warning(code, level.path(), Map.of("embed", level.path(), "table", child.table(),
+                "count", count, boundName, bound));
+    }
+
+    /** The larger of the most found under one parent and the average from the two tables' row counts. */
+    private static long estimate(long largest, Double average) {
+        return Math.max(largest, average == null ? 0 : Math.round(average));
+    }
+
+    private static Long rowsOf(Located located) {
+        return located.sample() == null ? null : located.sample().tableRows();
     }
 
     /** Where an alias was read from, and what was read; {@code why} says why nothing was. */
