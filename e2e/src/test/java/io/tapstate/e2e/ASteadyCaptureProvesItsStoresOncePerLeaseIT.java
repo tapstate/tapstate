@@ -133,22 +133,23 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             long appends = profiled.stream().filter(op -> isUpdate(op, "srs_events")).count();
             long checkpointWrites = profiled.stream().filter(op -> isUpdate(op, "srs_chains")).count();
             // The reads do carry their transaction, and a proof shows in what it reads. An append proof resolves
-            // the event's model by ring, epoch and version, a query nothing else in this window makes: not the
-            // checkpoint, whose proof reads the models it names by key, and not the retention pass, which reads
-            // them by table once a second. A leased checkpoint reads the chain root and nothing else.
-            // The consumer's read verification resolves the event's model the same way and reads its membership
-            // row, which is what tells the two proofs apart; its other reads of the membership (the sink's and
-            // the replay floor's progress reads, the retention pass) resolve no event model. A progress write
-            // within a standing lease reads its offsets row and the pipeline state row, never the membership or
-            // identity rows.
+            // the event's model by ring, epoch and version without reading any event: every other transaction
+            // that resolves a model does so for an event it loaded (a checkpoint proof's frontier, a log read's
+            // batch), the retention pass reads the models by table once a second, and the consumer's own reads
+            // read its membership. A leased checkpoint reads the chain root and nothing else.
+            // Every read of the consumer's membership row resolves one model, the chain frontier's, through the
+            // checkpoint it validates: the sink's and the replay floor's progress reads do, per change. A read
+            // verification proof resolves the event's own model on top of that, so it is the membership read
+            // that resolves two or more. A progress write within a standing lease reads its offsets row and the
+            // pipeline state row, never the membership or identity rows.
             int provingAppends = 0, leasedCheckpoints = 0, provingConsumer = 0, leasedProgressWrites = 0;
             for (List<Document> reads : transactions(profiled).values()) {
                 Set<String> read = new java.util.HashSet<>();
                 for (Document op : reads) read.add(collection(op));
-                boolean resolvesModel = reads.stream().anyMatch(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel);
-                if (resolvesModel && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
+                long resolving = reads.stream().filter(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel).count();
+                if (resolving > 0 && !read.contains("srs_events") && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
                 if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
-                if (resolvesModel && read.contains(MEMBERSHIP)) provingConsumer++;
+                if (resolving >= 2 && read.contains(MEMBERSHIP)) provingConsumer++;
                 if (read.contains(OFFSETS) && !read.contains(MEMBERSHIP) && !read.contains(PROOF_MARKER)) leasedProgressWrites++;
             }
             long progressWrites = profiled.stream().filter(op -> isUpdate(op, OFFSETS)).count();
@@ -208,8 +209,10 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
         long start = profiled.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(0L);
         var counts = new java.util.TreeMap<String, long[]>();
         for (List<Document> reads : transactions(profiled).values()) {
-            String shape = reads.stream().map(op -> resolvesEventModel(op) ? "srs_models(event)" : collection(op)).distinct().sorted()
-                    .collect(java.util.stream.Collectors.joining("+"));
+            long resolving = reads.stream().filter(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel).count();
+            String shape = reads.stream().map(ASteadyCaptureProvesItsStoresOncePerLeaseIT::collection).distinct().sorted()
+                    .collect(java.util.stream.Collectors.joining("+"))
+                    + (resolving == 0 ? "" : resolving == 1 ? "+srs_models(event)" : "+srs_models(event x" + resolving + ")");
             long at = reads.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(start);
             long[] entry = counts.computeIfAbsent(shape, key -> new long[] {0L, Long.MAX_VALUE, Long.MIN_VALUE});
             entry[0]++; entry[1] = Math.min(entry[1], at); entry[2] = Math.max(entry[2], at);
