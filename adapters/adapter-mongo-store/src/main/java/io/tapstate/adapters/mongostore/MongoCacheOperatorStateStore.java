@@ -53,8 +53,6 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     private final long addressBytes;
     private final Validation validation;
     private final AtomicReference<Lease> lease = new AtomicReference<>();
-    /** Moves on every {@link #dropLease()}, so a proof that a drop overtook is never kept. */
-    private final AtomicLong leaseEpoch = new AtomicLong();
     private final Object proving = new Object();
     private final MongoCachePipelineAccess.LeasedClock committed = new MongoCachePipelineAccess.LeasedClock();
 
@@ -233,7 +231,11 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
     }
 
-    @Override public void dropLease() { leaseEpoch.incrementAndGet(); lease.set(null); }
+    /**
+     * Replaces the lease with a fresh, already expired marker rather than {@code null}: a proof in flight
+     * publishes only over the exact lease it started from, so a drop at any point of that proof wins.
+     */
+    @Override public void dropLease() { lease.set(new Lease(System.nanoTime(), false, null, 0L)); }
 
     /**
      * Proves a lease now, as an explicit open: for a store holding a claim this registers its placement and
@@ -291,7 +293,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             long startedAt = System.nanoTime();
             long maximum = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
             boolean claimed = access.originalClaim() != null;
-            long epoch = leaseEpoch.get();
+            Lease before = lease.get();
             Lease proved;
             try {
                 proved = validated(writes, (session, inventory) -> {
@@ -304,16 +306,10 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
                 throw failure;
             }
             LEASE_OPENS.incrementAndGet();
-            // A proof that ran out while validating, or that a drop overtook, serves only the operation it was
-            // proved for: it is never kept for the next one, which proves again.
-            // Publish first and then look for a drop: a drop that lands after the publish clears the lease
-            // itself, and one that landed before it is seen here, so no interleaving keeps a dropped proof.
-            if (System.nanoTime() - proved.deadlineNanos() < 0) {
-                lease.set(proved);
-                if (leaseEpoch.get() != epoch) lease.compareAndSet(proved, null);
-            } else {
-                lease.set(null);
-            }
+            // Published only over the exact lease this proof started from. A proof that ran out while validating,
+            // or whose starting lease a drop replaced meanwhile, serves only the operation it was proved for and
+            // is never visible to another one, which proves again.
+            if (System.nanoTime() - proved.deadlineNanos() < 0) lease.compareAndSet(before, proved);
             return proved;
         }
     }
