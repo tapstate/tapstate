@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorRef;
+import io.tapstate.adapters.pdk.PdkValidationCounts;
 import io.tapstate.adapters.pdk.PdkValidationReads;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
@@ -11,8 +12,10 @@ import io.tapstate.runtime.engine.validation.*;
 import io.tapstate.spi.store.ConnectionConfig;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.ValidationReadHandle;
+import io.tapstate.spi.store.ValidationRowCursor;
 import java.time.Clock;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionStage;
 import java.util.concurrent.atomic.*;
 
@@ -20,6 +23,7 @@ import java.util.concurrent.atomic.*;
 final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private static final System.Logger LOG=System.getLogger(NativeValidationPdkRows.class.getName());
     private static final ValidationValues.Limits ROW=new ValidationValues.Limits(64L*1024,8192,32);
+    private static final long LOCAL_SORT_ROW_THRESHOLD = 10_000_000;
     static final long POSTGRES_RESULT_BYTES=PdkValidationReads.POSTGRES_RESULT_BYTES;
     private static final long METADATA_BYTES=16L*1024*1024+PdkValidationReads.decodingWorkBytes(ROW)+2*ROW.bytes();
     private final NativeValidationOwnerReservations.Reservation original;
@@ -29,6 +33,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private List<ValidationDirectMappings.Declared> declarations;
     private Map<String,ConnectorRef> artifacts;
     private final List<ValidationFullScan.Mapping> mappings;
+    private final long sortBytes;
     private final Set<Read> reads=new HashSet<>();
     private final AtomicInteger consumers=new AtomicInteger();
     private final AtomicReference<ValidationLocalBudget.Reservation> working=new AtomicReference<>();
@@ -50,8 +55,9 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             var keys=declared.mapping().keys();
             for(int component=0;component<keys.source().size();component++){
                 var from=keys.source().get(component);var to=keys.target().get(component);
-                for(var key:List.of(from,to))if(key.domain()==ValidationKey.Kind.TEXT&&!key.logicalTypes().equals(Set.of("object-id")))
-                    throw unsupported("keys",String.join(".",key.path()),"native-text-ordering-unproven");
+                for(var key:List.of(from,to))if(key.domain()==ValidationKey.Kind.TEXT
+                        &&!key.logicalTypes().equals(Set.of("object-id"))&&!key.logicalTypes().equals(Set.of("text")))
+                    throw unsupported("keys",String.join(".",key.path()),"key-text-domain-unavailable");
                 if((from.logicalTypes().contains("object-id")||to.logicalTypes().contains("object-id"))
                         &&(!from.logicalTypes().equals(Set.of("object-id"))||!to.logicalTypes().equals(Set.of("object-id"))
                             ||from.domain()!=ValidationKey.Kind.TEXT||to.domain()!=ValidationKey.Kind.TEXT))
@@ -61,6 +67,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
                     (observation,pair,guard)->check(selected,observation,pair,guard)));
         }
         this.mappings=List.copyOf(mappings);
+        sortBytes=declarations.stream().anyMatch(declared->portableSort(declared.mapping()))
+                ?2*ValidationSortedRows.WORK_BYTES:0;
         long pairedBytes=0;
         for(var declared:declarations){
             var mapping=declared.mapping();
@@ -78,7 +86,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         try{
             require();guard.run();var previous=active.getAndSet(null);if(previous!=null)previous.close();awaitClosed(guard);
             if(working.get()==null){
-                var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(2L*1024*1024,0,0,0));
+                var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(2L*1024*1024+sortBytes,0,0,0));
                 if(!working.compareAndSet(null,lease))lease.close();
             }
             var from=metadata(index,true,guard);var to=metadata(index,false,guard);
@@ -86,7 +94,9 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             growPaired(Math.addExact(rowReadBytes(artifacts.get(mapping.source().sourceId()),from.model().fields().size()),
                     rowReadBytes(artifacts.get(mapping.target().sourceId()),to.model().fields().size())));
             require();guard.run();current=new Table(index,from,to);
-            source=groups(index,true,guard);target=groups(index,false,guard);
+            boolean sortSource = portableSort(mapping) && shouldSortLocally(count(mapping.source(), guard));
+            boolean sortTarget = portableSort(mapping) && shouldSortLocally(count(mapping.target(), guard));
+            source=groups(index,true,guard,sortSource);target=groups(index,false,guard,sortTarget);
             var merge=new ValidationOrderedMerge(source,target);active.set(merge);
             require();guard.run();return merge;
         }catch(RuntimeException|Error failed){
@@ -136,10 +146,42 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         }
     }
 
-    private ValidationOrderedGroups groups(int index,boolean source,Runnable guard){
+    private OptionalLong count(ValidationTaskSpec.Table table, Runnable guard) {
+        require();
+        guard.run();
+        awaitClosed(guard);
+        var resource = resource(table);
+        var connection = new ConnectionConfig(resource.id(), resource.connector(), resource.config());
+        var counter = new PdkValidationCounts(connection, artifact(resource),
+                new PdkValidationCounts.Request(table.table()), () -> { require(); guard.run(); });
+        var read = admit(METADATA_BYTES);
+        var cleanup = new CompletableFuture<Void>();
+        try {
+            var exited = counter.callExited();
+            exited.whenComplete((ignored, error) -> {
+                if (counter.drained()) cleanup.complete(null);
+            });
+            read.attach(() -> {
+                counter.close();
+                if (counter.drained()) cleanup.complete(null);
+            }, exited, CompletableFuture.completedFuture(null), cleanup);
+            return counter.countIfSupported();
+        } finally {
+            try { read.close(); } finally { read.opened(); }
+        }
+    }
+
+    static boolean shouldSortLocally(OptionalLong count) {
+        return count.isPresent() && count.getAsLong() < LOCAL_SORT_ROW_THRESHOLD;
+    }
+
+    private ValidationOrderedGroups groups(int index,boolean source,Runnable guard,boolean sortLocally){
         var mapping=declarations.get(index).mapping();var side=source?mapping.source():mapping.target();
         var keys=keyBinding(mapping,source);
-        return new ValidationOrderedGroups(UUID.randomUUID().toString(),reader(index,source,guard),row->{
+        ValidationRowCursor rows=reader(index,source,guard);
+        if(sortLocally)rows=new ValidationSortedRows(rows,row->bound(keys,row),ROW,
+                ()->{require();guard.run();},ValidationSortedRows.CHUNK_BYTES);
+        return new ValidationOrderedGroups(UUID.randomUUID().toString(),rows,row->{
             require();guard.run();var key=bound(keys,row);
             return new ValidationOrderedGroups.Key(key,physical(side,keys,key));
         },ROW.bytes(),clock);
@@ -193,7 +235,7 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     }
 
     private void growPaired(long pairedBytes){
-        var envelope=original.resources().budget().envelope();long needed=Math.addExact(16L*1024*1024,pairedBytes);
+        var envelope=original.resources().budget().envelope();long needed=Math.addExact(16L*1024*1024+sortBytes,pairedBytes);
         if(needed>envelope.bytes())original.resources().growTo(new ValidationLocalBudget.Amount(needed,envelope.workers(),envelope.connections(),envelope.reads()),1);
     }
     static long rowReadBytes(ConnectorRef artifact){return rowReadBytes(artifact,PdkValidationReads.POSTGRES_NATIVE_FIELDS);}
@@ -288,6 +330,10 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         return config;
     }
     private static PdkValidationReads.Binding binding(ValidationTaskSpec.Table table){return new PdkValidationReads.Binding(table.modelVersion(),table.codecBinding());}
+    private static boolean portableSort(ValidationTaskSpec.Mapping mapping){
+        return mapping.keys().source().stream().anyMatch(key->key.domain()==ValidationKey.Kind.TEXT
+                &&key.logicalTypes().equals(Set.of("text")));
+    }
     private static List<ValidationKeyBinding.Component> components(ValidationTaskSpec.Mapping mapping,boolean source){return source?mapping.keys().source():mapping.keys().target();}
     private static ValidationKeyBinding keyBinding(ValidationTaskSpec.Mapping mapping,boolean source){
         return new ValidationKeyBinding(source?"direct-source-key":"direct-target-key",components(mapping,source),Set.of(),ROW);

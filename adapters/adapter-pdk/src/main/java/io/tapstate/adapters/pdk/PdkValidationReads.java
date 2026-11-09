@@ -225,17 +225,25 @@ public final class PdkValidationReads {
             ConnectorRef artifact, String configurationHash, Binding expected,
             List<ValidationKeyBinding.Component> keys, ValidationValues.Limits rowLimits) {
         requireModel(model,artifact,configurationHash,expected,"beforeQuery");
+        var portableTextFields=new java.util.HashSet<String>();
         for(var component:keys){
             String field=component.path().getFirst();var actual=model.getNameFieldMap().get(field);
             if(actual==null||actual.getTapType()==null||actual.getTapType().getClass()==TapRaw.class)
                 throw unsupported(field,"key-model-unknown");
+            if(component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("text"))){
+                if(!(actual.getTapType() instanceof io.tapdata.entity.schema.type.TapString))
+                    throw unsupported(field,"key-model-unknown");
+                portableTextFields.add(field);
+                continue;
+            }
             boolean nativeId=artifact.className().equals("io.tapdata.mongodb.MongodbConnector")&&actual.getDataType()!=null
                     &&actual.getDataType().replace("_","").equalsIgnoreCase("OBJECTID");
             boolean idDomain=component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("object-id"));
             if(nativeId!=idDomain)
                 throw unsupported(field,"native-object-id-key-domain");
         }
-        var decoder=new PdkValidationRows(model,codecs,path->PdkValidationRows.Rule.AUTO,rowLimits,
+        var decoder=new PdkValidationRows(model,codecs,path->path.size()==1&&portableTextFields.contains(path.getFirst())
+                ?PdkValidationRows.Rule.PORTABLE_TEXT:PdkValidationRows.Rule.AUTO,rowLimits,
                 artifact.className().equals("io.tapdata.mongodb.MongodbConnector"));
         String currentModel=PdkValidationModelVersion.of(model,artifact);
         return raw->{

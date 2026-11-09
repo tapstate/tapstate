@@ -22,7 +22,7 @@ class ValidationNativeCountGatewayIT {
     private static final String DB="validation_counts", PASSWORD="count-fixture-only";
     @Test @Timeout(120) void mysqlAndMongoUsePdkCountsWithoutValueDiscovery()throws Exception { verify(true); }
     @Test @Timeout(120) void postgresAndMongoUsePdkCountsWithoutValueDiscovery()throws Exception { verify(false); }
-    @Test @Timeout(60) void nativeIdentifierKeysRequireTheirOwnConfirmedDomain()throws Exception{
+    @Test @Timeout(60) void nativeIdentifierKeysRetainLegacyAndPortableTextBindings()throws Exception{
         var artifact=artifact("mongodb");var identifier=new org.bson.types.ObjectId("0123456789abcdef01234567");
         var limits=new io.tapstate.core.validation.ValidationValues.Limits(64*1024,8192,32);
         try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))){
@@ -50,8 +50,11 @@ class ValidationNativeCountGatewayIT {
                     assertThat(reader.next()).isEmpty();
                 }
                 try(var reader=PdkValidationReads.scan(connection,artifact,configurationHash,"identifiers",binding,textKeys,false,()->{},query,decode,2,limits)){
-                    assertThatThrownBy(reader::next).isInstanceOfSatisfying(TapstateException.class,
-                            failure->assertThat(failure.code()).isEqualTo(io.tapstate.core.validation.ValidationError.RULE_UNSUPPORTED));
+                    try(var row=reader.next().orElseThrow()){
+                        assertThat((io.tapstate.core.validation.ValidationValues.Typed)row.values().fields().get("_id"))
+                                .satisfies(value->{assertThat(value.logicalType()).isEqualTo("text");assertThat(value.value()).isEqualTo(identifier.toHexString());});
+                    }
+                    assertThat(reader.next()).isEmpty();
                 }
             }
         }

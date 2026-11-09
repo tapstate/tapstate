@@ -77,10 +77,6 @@ final class NativeValidationMetadata {
         ValidationSelectedDeclarations declarations(){require();return selected;}
         ValidationMethod method(){require();return method;}
         Projection projection(String mapping){require();return projections.get(mapping);}
-        boolean nativeBson(String source){
-            require();var resource=StoredArtifacts.requireSource(selected.artifacts(),source);var ref=artifacts.get(resource.connector());
-            if(ref==null)throw invalid("unobservedArtifact");return ref.className().equals("io.tapdata.mongodb.MongodbConnector");
-        }
         List<Mapping> mappings(){require();return List.copyOf(results);}
         CompletionStage<Void> released(){return released.minimalCompletionStage();}
         private ConnectorRef artifact(SourceResource source){
