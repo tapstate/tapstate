@@ -44,6 +44,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -135,7 +136,7 @@ class LeaseValidationFencingIT {
             f.addTtlIndex();
             store.saveAll(f.at.mapName(), keys("b", 10));
             assertThat(f.stored()).as("within the lease the structure is not looked at").isEqualTo(20);
-            Thread.sleep(1_700);
+            outlive(Duration.ofMillis(1_700));
             code(() -> store.saveAll(f.at.mapName(), keys("c", GROUP)), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.stored()).isEqualTo(20);
         });
@@ -266,4 +267,10 @@ class LeaseValidationFencingIT {
     }
 
     @FunctionalInterface private interface Scenario { void run(Fixture f) throws Exception; }
+
+    /** Waits out a lease on the monotonic clock, so the next operation must prove a new one. */
+    private static void outlive(Duration lease) {
+        long until = System.nanoTime() + lease.toNanos();
+        for (long left; (left = until - System.nanoTime()) > 0; ) LockSupport.parkNanos(left);
+    }
 }
