@@ -49,7 +49,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
     private static final Duration WRITE_EVERY = Duration.ofMillis(500);
     private static final String PROFILE = "system.profile";
     private static final long PROFILE_BYTES = 256L << 20;
-    /** The identity row is read only by a proof; a batch inside a standing lease never touches it. */
+    /** The identity row is read only by a proof; a progress write inside a standing lease never touches it. */
     private static final String PROOF_MARKER = "cache_identity";
     private static final String MEMBERSHIP = "srs_consumers";
     private static final String OFFSETS = "srs_consumer_offsets";
@@ -132,20 +132,23 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             // The writes themselves count ungrouped: the profiler does not tie an update to its transaction.
             long appends = profiled.stream().filter(op -> isUpdate(op, "srs_events")).count();
             long checkpointWrites = profiled.stream().filter(op -> isUpdate(op, "srs_chains")).count();
-            // The reads do carry their transaction, and a proof shows in what it reads. An append proof reads
-            // the identity row and the ring bounds without reading events; the consumer's own reads, which also
-            // run in this window, read its membership and are left out. A leased checkpoint reads the chain root
-            // and nothing else.
-            // The consumer's membership row is read only by a proof of its own; a progress write within a
-            // standing lease reads its offsets row and the pipeline state row, never the membership or identity rows.
+            // The reads do carry their transaction, and a proof shows in what it reads. An append proof resolves
+            // the event's model by ring, epoch and version, a query nothing else in this window makes: not the
+            // checkpoint, whose proof reads the models it names by key, and not the retention pass, which reads
+            // them by table once a second. A leased checkpoint reads the chain root and nothing else.
+            // The consumer's read verification resolves the event's model the same way and reads its membership
+            // row, which is what tells the two proofs apart; its other reads of the membership (the sink's and
+            // the replay floor's progress reads, the retention pass) resolve no event model. A progress write
+            // within a standing lease reads its offsets row and the pipeline state row, never the membership or
+            // identity rows.
             int provingAppends = 0, leasedCheckpoints = 0, provingConsumer = 0, leasedProgressWrites = 0;
             for (List<Document> reads : transactions(profiled).values()) {
                 Set<String> read = new java.util.HashSet<>();
                 for (Document op : reads) read.add(collection(op));
-                if (read.contains(PROOF_MARKER) && read.contains("srs_log_bounds") && !read.contains("srs_events")
-                        && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
+                boolean resolvesModel = reads.stream().anyMatch(ASteadyCaptureProvesItsStoresOncePerLeaseIT::resolvesEventModel);
+                if (resolvesModel && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
                 if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
-                if (read.contains(PROOF_MARKER) && read.contains(MEMBERSHIP)) provingConsumer++;
+                if (resolvesModel && read.contains(MEMBERSHIP)) provingConsumer++;
                 if (read.contains(OFFSETS) && !read.contains(MEMBERSHIP) && !read.contains(PROOF_MARKER)) leasedProgressWrites++;
             }
             long progressWrites = profiled.stream().filter(op -> isUpdate(op, OFFSETS)).count();
@@ -205,7 +208,7 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
         long start = profiled.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(0L);
         var counts = new java.util.TreeMap<String, long[]>();
         for (List<Document> reads : transactions(profiled).values()) {
-            String shape = reads.stream().map(ASteadyCaptureProvesItsStoresOncePerLeaseIT::collection).distinct().sorted()
+            String shape = reads.stream().map(op -> resolvesEventModel(op) ? "srs_models(event)" : collection(op)).distinct().sorted()
                     .collect(java.util.stream.Collectors.joining("+"));
             long at = reads.stream().map(op -> op.getDate("ts")).filter(Objects::nonNull).mapToLong(java.util.Date::getTime).min().orElse(start);
             long[] entry = counts.computeIfAbsent(shape, key -> new long[] {0L, Long.MAX_VALUE, Long.MIN_VALUE});
@@ -215,6 +218,14 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
                 .map(e -> "%s x%d [%.1f..%.1f s]".formatted(e.getKey(), e.getValue()[0],
                         (e.getValue()[1] - start) / 1000.0, (e.getValue()[2] - start) / 1000.0))
                 .collect(java.util.stream.Collectors.joining(", "));
+    }
+
+    /** A query resolving an event's model by its ring, capture epoch and version: the model half of a proof. */
+    private static boolean resolvesEventModel(Document op) {
+        Document command = op.get("command", Document.class);
+        Document filter = command == null ? null : command.get("filter", Document.class);
+        return "srs_models".equals(collection(op)) && filter != null && filter.containsKey("ringName")
+                && filter.containsKey("_id.modelVersion");
     }
 
     private static boolean isUpdate(Document op, String collection) {
