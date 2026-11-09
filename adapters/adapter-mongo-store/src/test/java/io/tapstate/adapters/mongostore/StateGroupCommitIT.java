@@ -223,6 +223,86 @@ class StateGroupCommitIT {
         });
     }
 
+    /**
+     * The same race against a transaction that ends the tenure with no proof to follow. A release, a stop of the
+     * cache domain and a pipeline retirement all end fence rows the same way, so a release stands for the three.
+     */
+    @Test void anOldGroupInFlightNeverLandsAfterTheReleaseThatEndsItsTenure() throws Exception {
+        withFixture(f -> {
+            var old = f.group(f.client, f.claim, "assembler/0");
+            old.commit(changes("a", 1, 8));
+            var held = new CountDownLatch(1); var release = new CountDownLatch(1);
+            MongoStateGroup.afterPayload = () -> {
+                held.countDown();
+                try { release.await(30, TimeUnit.SECONDS); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+            };
+            var inFlight = CompletableFuture.runAsync(() -> old.commit(changes("late", 4, 8)));
+            assertThat(held.await(30, TimeUnit.SECONDS)).isTrue();
+            MongoStateGroup.afterPayload = () -> {};
+            var ended = CompletableFuture.supplyAsync(() -> f.domain.workloadClaims(BUSINESS).release(f.claim));
+            Thread.sleep(1_000);
+            assertThat(ended).as("the release waits on the old group's fence row").isNotDone();
+            release.countDown();
+            inFlight.handle((ok, failure) -> null).get(60, TimeUnit.SECONDS);
+            assertThat(ended.get(60, TimeUnit.SECONDS)).isTrue();
+            long late = f.storedWithPrefix("late");
+            assertThat(late).as("the old group is whole or absent").isIn(0L, 12L);
+            assertThat(f.fenceRows()).allSatisfy(row -> assertThat(row.getLong("claimGeneration")).isZero());
+            code(() -> old.commit(changes("after", 1, 8)), IoError.WORKLOAD_CLAIM_FENCED);
+            assertThat(f.storedWithPrefix("after")).isZero();
+        });
+    }
+
+    /**
+     * Six vertex instances of one pipeline committing at once do not contend: each fences on its own row and only
+     * reads the claim. A fence on the shared claim document serializes them, and every collision aborts a
+     * transaction, so the server's abort count is what tells the two apart, and throughput is the effect.
+     */
+    @Test void sixInstancesOfOnePipelineCommitWithoutContendingOnTheClaim() throws Exception {
+        withFixture(f -> {
+            int groups = 200;
+            long claimWrites = f.claimWrites();
+            double alone = rate(f, 1, groups);
+            long abortedBefore = aborted(f.client);
+            double together = rate(f, 6, groups);
+            long aborted = aborted(f.client) - abortedBefore;
+            assertThat(aborted)
+                    .as("%d commits by six instances aborted %d transactions on the server", 6 * groups, aborted)
+                    .isLessThanOrEqualTo(6L * groups / 20);
+            assertThat(together)
+                    .as("six instances committed %.0f groups/s, one alone %.0f groups/s", together, alone)
+                    .isGreaterThan(2 * alone);
+            System.out.printf("group commit: one instance %.0f groups/s, six %.0f groups/s, %d aborted%n", alone, together, aborted);
+            // The proofs that open the groups write the claim; the commits never do.
+            assertThat(f.claimWrites() - claimWrites).as("claim writes across 1,400 commits").isLessThanOrEqualTo(7);
+        });
+    }
+
+    /** Groups per second committed by {@code instances} vertex instances, each committing {@code groups} groups. */
+    private static double rate(Fixture f, int instances, int groups) throws Exception {
+        var opened = new ArrayList<StateGroup>();
+        String round = UUID.randomUUID().toString().substring(0, 8);
+        for (int i = 0; i < instances; i++) opened.add(f.group(f.client, f.claim, "vertex-" + round + "/" + i));
+        var start = new CountDownLatch(1);
+        var running = new ArrayList<CompletableFuture<Void>>();
+        for (int i = 0; i < instances; i++) {
+            var group = opened.get(i); String prefix = round + "-" + i + "-";
+            running.add(CompletableFuture.runAsync(() -> {
+                try { start.await(); } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                for (int g = 0; g < groups; g++) group.commit(changes(prefix + g + "-", 2, 64));
+            }, java.util.concurrent.Executors.newSingleThreadExecutor()));
+        }
+        long began = System.nanoTime();
+        start.countDown();
+        CompletableFuture.allOf(running.toArray(CompletableFuture[]::new)).get(5, TimeUnit.MINUTES);
+        return instances * groups / ((System.nanoTime() - began) / 1e9);
+    }
+
+    private static long aborted(MongoClient client) {
+        Document transactions = client.getDatabase("admin").runCommand(new Document("serverStatus", 1)).get("transactions", Document.class);
+        return ((Number) transactions.get("totalAborted")).longValue();
+    }
+
     private static Map<String, StateGroup.Changes> changes(String prefix, int perNamespace, int bytes) {
         Map<String, StateGroup.Changes> out = new LinkedHashMap<>();
         for (String namespace : NAMESPACES) {
