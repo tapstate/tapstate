@@ -54,7 +54,8 @@ public final class NestInspectService {
                     MonitorError.NEST_ROOT_KEY_WIDTH, Map.of("pipeline", pipelineId, "step", step,
                             "columns", String.join(", ", wrong.columns()), "given", rootKey.size()), null);
             case NestStateInspector.Result.NotHeld none -> throw new TapstateException(
-                    MonitorError.NEST_ROOT_KEY_NOT_HELD, Map.of("pipeline", pipelineId, "step", step,
+                    none.everyReading() ? MonitorError.NEST_ROOT_KEY_NOT_HELD
+                            : MonitorError.NEST_ROOT_KEY_NOT_RESOLVED, Map.of("pipeline", pipelineId, "step", step,
                             "key", String.join(", ", rootKey), "columns", String.join(", ", none.columns())),
                     null);
         };

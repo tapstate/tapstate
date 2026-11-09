@@ -35,6 +35,7 @@ class MonitorErrorTest {
                 "monitor.nest-not-running",
                 "monitor.nest-root-key-width",
                 "monitor.nest-root-key-not-held",
+                "monitor.nest-root-key-not-resolved",
                 // warnings from sampling a nest's sources before it runs
                 "monitor.nest-object-key-not-unique",
                 "monitor.nest-near-element-limit",

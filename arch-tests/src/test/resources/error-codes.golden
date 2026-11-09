@@ -342,6 +342,7 @@ monitor.nest-not-running
 monitor.nest-object-key-not-unique
 monitor.nest-reference-widely-shared
 monitor.nest-root-key-not-held
+monitor.nest-root-key-not-resolved
 monitor.nest-root-key-width
 monitor.no-nest-step
 monitor.no-observation

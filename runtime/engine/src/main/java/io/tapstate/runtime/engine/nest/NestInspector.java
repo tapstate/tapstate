@@ -34,11 +34,12 @@ import java.util.Optional;
 public final class NestInspector {
 
     /**
-     * More root key columns than this and every combination of readings is too many to be worth trying; a
-     * wider key is tried one way per rank instead - every column as its most likely type, then each as its
-     * next - which still finds a numeric column held as a number.
+     * The most lookups one inspection makes. A key whose columns, each read every way it may have been
+     * filed, combine into no more than this is tried every way, so not finding it rules every reading out.
+     * A key with more combinations is tried one way per rank instead - every column as its most likely type,
+     * then each as its next - and not finding it there is reported as inconclusive, never as absent.
      */
-    static final int MOST_KEY_COLUMNS = 4;
+    static final int MOST_READINGS = 256;
 
     private NestInspector() {
     }
@@ -51,8 +52,12 @@ public final class NestInspector {
         /** The number of values given is not the number of columns the root key is made of. */
         record WrongArity(List<String> columns) implements Outcome { }
 
-        /** Nothing is held under any reading of the key. */
-        record NotHeld(List<String> columns) implements Outcome { }
+        /**
+         * Nothing is held under the readings of the key that were tried. {@code everyReading} says whether
+         * those were all the ways the key may have been filed, or only the bounded subset a key with too
+         * many combinations is tried by.
+         */
+        record NotHeld(List<String> columns, boolean everyReading) implements Outcome { }
 
         /** This member holds no live state map for the step. */
         record NotLive() implements Outcome { }
@@ -95,7 +100,7 @@ public final class NestInspector {
                         assembly, inTransit));
             }
         }
-        return new Outcome.NotHeld(columns);
+        return new Outcome.NotHeld(columns, triesEveryReading(keyText));
     }
 
     private static Optional<String> mapFor(OperatorMapBindings bindings, String pipelineId, String step,
@@ -125,9 +130,24 @@ public final class NestInspector {
         return NestKeys.valuesOf(row, columns, namespace);
     }
 
-    /** Every typed reading of the key's text, one value per column, most likely first. */
+    /** Whether the key's text combines into few enough readings that every one of them is tried. */
+    static boolean triesEveryReading(List<String> keyText) {
+        long combinations = 1;
+        for (String text : keyText) {
+            combinations *= valuesOf(text).size();
+            if (combinations > MOST_READINGS) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * The typed readings of the key's text that are tried, one value per column, most likely first: every
+     * combination when there are few enough, otherwise one per rank.
+     */
     static List<List<Object>> readings(List<String> keyText) {
-        if (keyText.size() > MOST_KEY_COLUMNS) {
+        if (!triesEveryReading(keyText)) {
             List<List<Object>> perColumn = keyText.stream().map(NestInspector::valuesOf).toList();
             int deepest = perColumn.stream().mapToInt(List::size).max().orElse(1);
             java.util.LinkedHashSet<List<Object>> ranked = new java.util.LinkedHashSet<>();

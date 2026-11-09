@@ -37,8 +37,11 @@ public interface NestStateInspector {
             }
         }
 
-        /** Nothing is held under any reading of the key. */
-        record NotHeld(List<String> columns) implements Result {
+        /**
+         * Nothing is held under the readings of the key that were tried; {@code everyReading} says whether
+         * that was every way the key may have been filed, or only a bounded subset of them.
+         */
+        record NotHeld(List<String> columns, boolean everyReading) implements Result {
             public NotHeld {
                 columns = List.copyOf(columns);
             }

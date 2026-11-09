@@ -949,6 +949,9 @@ monitor.nest-root-key-width:
 monitor.nest-root-key-not-held:
   message: "Step {step} of pipeline {pipeline} holds nothing under root key {key}."
   solution: "Check the value of {columns}: no row with that key, and no row pointing at it, has reached the step yet."
+monitor.nest-root-key-not-resolved:
+  message: "Step {step} of pipeline {pipeline} holds nothing under root key {key} as tried, but its columns {columns} could be stored as too many combinations of number and text types to try them all."
+  solution: "Look the document up in the target by {columns} instead; this step cannot tell whether the key is held under a type combination it did not try."
 monitor.nest-object-key-not-unique:
   message: "Embed {embed} is one row per parent, but {count} sampled rows of {table} matched one parent ({sampled} rows sampled)."
   solution: "Use as: array if a parent really has several, or join on columns that match one row. Until then, as: object shows only the row changed most recently and drops the rest, and as: flat stops the run when a second live row arrives."

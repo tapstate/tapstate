@@ -130,7 +130,7 @@ class WhatADocumentHoldsCanBeReadByItsRootKeyTest {
     @Test
     void aKeyNothingIsFiledUnderAndAKeyOfTheWrongWidthAreToldApart() {
         assertThat(NestInspector.inspect(member, PIPELINE, STEP, topology, List.of("404")))
-                .isInstanceOf(NestInspector.Outcome.NotHeld.class);
+                .isEqualTo(new NestInspector.Outcome.NotHeld(List.of("customer_id"), true));
         assertThat(NestInspector.inspect(member, PIPELINE, STEP, topology, List.of("1", "2")))
                 .isEqualTo(new NestInspector.Outcome.WrongArity(List.of("customer_id")));
     }
@@ -140,10 +140,18 @@ class WhatADocumentHoldsCanBeReadByItsRootKeyTest {
         assertThat(NestInspector.readings(List.of("17"))).containsExactly(
                 List.of(17L), List.of(17), List.of(new java.math.BigDecimal("17")), List.of("17"));
         assertThat(NestInspector.readings(List.of("A-1"))).containsExactly(List.of("A-1"));
-        // Five columns are past the cap on combinations, yet a numeric column is still tried as a number.
-        assertThat(NestInspector.readings(List.of("a", "b", "c", "d", "7")))
-                .contains(List.of("a", "b", "c", "d", 7L))
-                .last().isEqualTo(List.of("a", "b", "c", "d", "7"));
+        // A wide key with few numeric columns is still tried every way, mixed types included.
+        assertThat(NestInspector.triesEveryReading(List.of("17", "18", "a", "b", "c"))).isTrue();
+        assertThat(NestInspector.readings(List.of("17", "18", "a", "b", "c")))
+                .hasSize(16)
+                .contains(List.of(17L, "18", "a", "b", "c"), List.of(17, new java.math.BigDecimal("18"), "a", "b", "c"));
+        // Past the cap on combinations a numeric column is still tried as a number, and the search says
+        // it did not try everything.
+        List<String> wide = List.of("1", "2", "3", "4", "5");
+        assertThat(NestInspector.triesEveryReading(wide)).isFalse();
+        assertThat(NestInspector.readings(wide))
+                .startsWith(List.of(1L, 2L, 3L, 4L, 5L))
+                .last().isEqualTo(wide.stream().map(Object.class::cast).toList());
     }
 
     @Test

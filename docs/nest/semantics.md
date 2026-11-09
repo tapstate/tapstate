@@ -257,6 +257,7 @@ state, so it stays the same when the way state is stored changes.
 | `monitor.nest-not-running` | the pipeline is not running on the node you asked |
 | `monitor.nest-root-key-width` | the number of key values does not match the root key's columns |
 | `monitor.nest-root-key-not-held` | nothing has reached the step under that key yet |
+| `monitor.nest-root-key-not-resolved` | nothing was found, but the key has too many numeric columns for every way it may be stored to be tried, so it may still be held |
 
 ## Metrics
 

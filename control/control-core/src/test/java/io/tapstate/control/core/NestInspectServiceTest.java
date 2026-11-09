@@ -77,11 +77,20 @@ class NestInspectServiceTest {
 
     @Test
     void aKeyNothingIsHeldUnderSaysSo() {
-        TapstateException refused = refusal((p, s, k) -> new NestStateInspector.Result.NotHeld(List.of("id")),
+        TapstateException refused = refusal((p, s, k) -> new NestStateInspector.Result.NotHeld(List.of("id"), true),
                 "doc", List.of("404"));
 
         assertThat(refused.code()).isEqualTo(MonitorError.NEST_ROOT_KEY_NOT_HELD);
         assertThat(refused.args()).containsEntry("key", "404");
+    }
+
+    @Test
+    void aKeyNotFoundAmongOnlySomeOfItsReadingsIsNotCalledAbsent() {
+        TapstateException refused = refusal((p, s, k) -> new NestStateInspector.Result.NotHeld(List.of("a", "b"),
+                false), "doc", List.of("1", "2"));
+
+        assertThat(refused.code()).isEqualTo(MonitorError.NEST_ROOT_KEY_NOT_RESOLVED);
+        assertThat(refused.args()).containsEntry("key", "1, 2").containsEntry("columns", "a, b");
     }
 
     @Test

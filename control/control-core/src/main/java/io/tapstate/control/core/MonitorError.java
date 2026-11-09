@@ -62,6 +62,13 @@ public enum MonitorError implements TapstateErrorCode {
     NEST_ROOT_KEY_NOT_HELD("monitor.nest-root-key-not-held", Set.of("pipeline", "step", "key", "columns")),
 
     /**
+     * Nothing was found under the root key given, but its columns combine into too many possible types for
+     * every one to be tried, so the key may still be held under a combination that was not: {@code key} is
+     * the key as typed and {@code columns} the root key's columns.
+     */
+    NEST_ROOT_KEY_NOT_RESOLVED("monitor.nest-root-key-not-resolved", Set.of("pipeline", "step", "key", "columns")),
+
+    /**
      * A warning from sampling before a run: an {@code object} or {@code flat} embed matched {@code count}
      * sampled rows of {@code table} under one parent, out of {@code sampled} rows read, so its rows are not
      * one per parent.

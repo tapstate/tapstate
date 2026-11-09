@@ -39,7 +39,7 @@ final class EngineNestStateInspector implements NestStateInspector {
         return switch (NestInspector.inspect(member, pipelineId, step, topology.get(), rootKey)) {
             case NestInspector.Outcome.Held held -> new Result.Held(held.inspection());
             case NestInspector.Outcome.WrongArity wrong -> new Result.WrongWidth(wrong.columns());
-            case NestInspector.Outcome.NotHeld none -> new Result.NotHeld(none.columns());
+            case NestInspector.Outcome.NotHeld none -> new Result.NotHeld(none.columns(), none.everyReading());
             case NestInspector.Outcome.NotLive ignored -> new Result.NotRunning();
         };
     }
