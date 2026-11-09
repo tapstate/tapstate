@@ -133,6 +133,10 @@ final class PdkSinkWriterFactory implements io.tapstate.runtime.engine.IndexedSi
         }).assess(config(),targets);
         return forRun(run,unchanged);
     }
+    boolean guardsWritesFor(ExecutionFence fence) {
+        return configured != null && configured.original().equals(fence);
+    }
+
     PdkSinkWriterFactory withTargets(Map<String,TargetTable> restored) {
         return new PdkSinkWriterFactory(connectorId,settings,writeMode,ddl,restored,node,onFullLoad,fullLoad,purpose,null,null);
     }

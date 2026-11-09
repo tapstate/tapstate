@@ -303,7 +303,7 @@ final class PdkSinkWriter implements SinkWriter {
             TapTable table = target != null
                     ? tableModel(entry.getKey(), target)
                     : TargetTapTable.bare(rows.get(0).getTableId());
-            preparation.prepare(target, table);
+            preparation.prepareForWrite(target, table);
             if (target != null) {
                 // The connector receives both a table model and record events; its write path may
                 // route by the event table id, so both must name the resolved target collection.
