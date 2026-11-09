@@ -115,7 +115,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         try{
             var resource=resource(side);var connection=connection(side,resource);
             handle=PdkValidationReads.inspect(connection,artifact(resource),CanonicalHash.of(resource),side.table(),
-                    full()?List.of():fields,()->{require();guard.run();},original.resources().queryExecutor(),
+                    full()?List.of():fields,PdkValidationReads.ModelScope.forSavedVersion(side.modelVersion()),
+                    ()->{require();guard.run();},original.resources().queryExecutor(),
                     original.resources().decodeExecutor(),ROW);
             read.attach(handle::close,handle.workersExited(),handle.rowsReleased(),handle.cleanupCompleted());read.opened();
             require();guard.run();var observed=handle.result();

@@ -38,6 +38,30 @@ class PdkValidationModelVersionTest {
         assertThatThrownBy(()->PdkValidationModelVersion.scopeVersion(first,artifact)).isInstanceOf(TapstateException.class);
     }
 
+    @Test void structuralScopeIgnoresStatisticsButRetainsFieldAndKeyChanges(){
+        var artifact = new ConnectorRef(List.of(),"example.Connector","2.0.8",null,null,"a".repeat(64),false);
+        var first = table();
+        var second = table();
+        first.setTableAttr(Map.of("storageSize", 1L));
+        second.setTableAttr(Map.of("storageSize", 2L));
+        var saved = PdkValidationModelVersion.structuralScopeVersion(first, artifact);
+        var legacy = PdkValidationModelVersion.scopeVersion(first, artifact);
+        assertThat(PdkValidationReads.ModelScope.forSavedVersion(saved)).isEqualTo(PdkValidationReads.ModelScope.STRUCTURAL);
+        assertThat(PdkValidationReads.ModelScope.forSavedVersion(legacy)).isEqualTo(PdkValidationReads.ModelScope.LEGACY);
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isEqualTo(saved);
+        assertThat(PdkValidationModelVersion.scopeVersion(second, artifact)).isNotEqualTo(legacy);
+        second.setTableAttr(null);
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isEqualTo(saved);
+        second.setTableAttr(Map.of("storageSize", 2L, "timeField", "eventTime"));
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isNotEqualTo(saved);
+        second.setTableAttr(Map.of("storageSize", 2L));
+        second.getNameFieldMap().get("id").primaryKeyPos(2);
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isNotEqualTo(saved);
+        second.getNameFieldMap().get("id").primaryKeyPos(1);
+        second.getNameFieldMap().get("value").tapType(new TapNumber().bit(64));
+        assertThat(PdkValidationModelVersion.structuralScopeVersion(second, artifact)).isNotEqualTo(saved);
+    }
+
     @Test void documentCollectionDefinitionsRemainBoundEvenWithoutFixedColumnDdl(){
         var artifact=new ConnectorRef(List.of(),"io.tapdata.mongodb.MongodbConnector","2.0.8",null,null,"a".repeat(64),false);
         var first=table();var second=table();
