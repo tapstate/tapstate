@@ -207,6 +207,14 @@ class ThreeLayerRestartContinuationIT {
                 var first=RealProcessServer.startCloudFixture(configUri,cluster,seeds);
                 try(first) {
                     var control=cloudLogin(first);
+                    var cloudCache = cacheClient.getDatabase(cacheDb);
+                    assertThat(cloudCache.getCollection("connector_artifacts.files").countDocuments())
+                            .as("Cloud startup does not store connector JAR files").isZero();
+                    assertThat(cloudCache.getCollection("connector_artifacts.chunks").countDocuments())
+                            .as("Cloud startup does not store connector JAR chunks").isZero();
+                    assertThat(cloudCache.getCollection("connector_catalog")
+                            .countDocuments(new Document("bundledArtifact.source", "SEED")))
+                            .as("all eight bundled connectors are registered in CACHE").isEqualTo(8);
                     var resources=resources(sourceUri,false,targetId);
                     resources.put(targetId+".tap.yml",control.artifact(targetId).orElseThrow().canonicalForm());
                     resources.put(stoppedTargetId+".tap.yml","""
