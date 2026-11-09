@@ -25,8 +25,8 @@ import org.junit.jupiter.api.Test;
  * checkpoint's frontier) is a long chain of round trips, and paying it inside every batch is what
  * capped the applied change rate. This case drives thirty changes through a real pipeline one at a
  * time, so each is its own batch, and reads the cache database's profiler: the batches must be
- * there, and only a few of them may carry the proof. With the proof paid per batch again, every one
- * of the thirty carries it.
+ * there, only a few of the appends may carry the proof, and most of the checkpoints must run on the
+ * lease. With the proof paid per batch again, every append carries it and no checkpoint is leased.
  *
  * <p>No specification word reaches this: the vocabulary says what crossed and in what state, never
  * what the product's own store spent to carry it.
@@ -94,24 +94,29 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
             } finally {
                 cache.runCommand(new Document("profile", 0));
             }
-            var transactions = transactions(cache.getCollection("system.profile").find().into(new ArrayList<>()));
-            int appends = 0, provingAppends = 0, checkpoints = 0, provingCheckpoints = 0;
-            for (List<Document> operations : transactions.values()) {
-                boolean proving = operations.stream().anyMatch(op -> collection(op).equals(PROOF_MARKER));
-                if (operations.stream().anyMatch(op -> isUpdate(op, "srs_events"))) {
-                    appends++; if (proving) provingAppends++;
-                } else if (operations.stream().anyMatch(op -> isUpdate(op, "srs_chains"))
-                        && operations.stream().noneMatch(op -> CONSUMER_COLLECTIONS.contains(collection(op)))) {
-                    checkpoints++; if (proving) provingCheckpoints++;
-                }
+            var profiled = cache.getCollection("system.profile").find().into(new ArrayList<>());
+            // The writes themselves count ungrouped: the profiler does not tie an update to its transaction.
+            long appends = profiled.stream().filter(op -> isUpdate(op, "srs_events")).count();
+            long checkpointWrites = profiled.stream().filter(op -> isUpdate(op, "srs_chains")).count();
+            // The reads do carry their transaction, and a proof shows in what it reads. An append proof reads
+            // the identity row and the ring bounds without reading events; the consumer's own reads, which also
+            // run in this window, read its membership and are left out. A leased checkpoint reads the chain root
+            // and nothing else.
+            int provingAppends = 0, leasedCheckpoints = 0;
+            for (List<Document> reads : transactions(profiled).values()) {
+                Set<String> read = new java.util.HashSet<>();
+                for (Document op : reads) read.add(collection(op));
+                if (read.contains(PROOF_MARKER) && read.contains("srs_log_bounds") && !read.contains("srs_events")
+                        && CONSUMER_COLLECTIONS.stream().noneMatch(read::contains)) provingAppends++;
+                if (read.equals(Set.of("srs_chains"))) leasedCheckpoints++;
             }
-            String reading = "appends %d (proving %d), checkpoints %d (proving %d) over %d profiled transactions"
-                    .formatted(appends, provingAppends, checkpoints, provingCheckpoints, transactions.size());
+            String reading = "appends %d (proving %d), checkpoint writes %d (leased %d) over %d profiled operations"
+                    .formatted(appends, provingAppends, checkpointWrites, leasedCheckpoints, profiled.size());
             assertThat(appends).as("every change was its own durable batch: " + reading).isGreaterThanOrEqualTo(CHANGES);
-            assertThat(checkpoints).as("every batch was checkpointed: " + reading).isGreaterThanOrEqualTo(CHANGES);
+            assertThat(checkpointWrites).as("every batch was checkpointed: " + reading).isGreaterThanOrEqualTo(CHANGES);
             // A proof per lease over a window of a few seconds is a handful; a proof per batch is all thirty.
             assertThat(provingAppends).as("appends proving the stores: " + reading).isLessThanOrEqualTo(CHANGES / 4);
-            assertThat(provingCheckpoints).as("checkpoints proving the stores: " + reading).isLessThanOrEqualTo(CHANGES / 4);
+            assertThat(leasedCheckpoints).as("checkpoints within a lease: " + reading).isGreaterThanOrEqualTo(CHANGES / 2);
         } finally {
             if (previousWebType == null) {
                 System.clearProperty("spring.main.web-application-type");
@@ -128,13 +133,13 @@ class ASteadyCaptureProvesItsStoresOncePerLeaseIT {
                 () -> copied.countDocuments(new Document("_id", id)) == 1, () -> "the change has not crossed");
     }
 
-    /** Groups the profiled operations by the transaction that issued them; operations outside one are left out. */
+    /** Groups the profiled reads by the transaction that issued them; reads outside one are left out. */
     private static Map<String, List<Document>> transactions(List<Document> profiled) {
         var result = new LinkedHashMap<String, List<Document>>();
         for (Document op : profiled) {
             Document session = op.get("lsid", Document.class);
             Object transaction = op.get("txnNumber");
-            if (session == null || transaction == null) continue;
+            if (!"query".equals(op.getString("op")) || session == null || transaction == null) continue;
             result.computeIfAbsent(session.get("id") + "/" + transaction, key -> new ArrayList<>()).add(op);
         }
         return result;
