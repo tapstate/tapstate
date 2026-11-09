@@ -33,7 +33,11 @@ import java.util.Optional;
  */
 public final class NestInspector {
 
-    /** More root key columns than this and the readings to try are too many to be worth trying. */
+    /**
+     * More root key columns than this and every combination of readings is too many to be worth trying; a
+     * wider key is tried one way per rank instead - every column as its most likely type, then each as its
+     * next - which still finds a numeric column held as a number.
+     */
     static final int MOST_KEY_COLUMNS = 4;
 
     private NestInspector() {
@@ -124,8 +128,17 @@ public final class NestInspector {
     /** Every typed reading of the key's text, one value per column, most likely first. */
     static List<List<Object>> readings(List<String> keyText) {
         if (keyText.size() > MOST_KEY_COLUMNS) {
-            List<Object> asText = new ArrayList<>(keyText);
-            return List.of(asText);
+            List<List<Object>> perColumn = keyText.stream().map(NestInspector::valuesOf).toList();
+            int deepest = perColumn.stream().mapToInt(List::size).max().orElse(1);
+            java.util.LinkedHashSet<List<Object>> ranked = new java.util.LinkedHashSet<>();
+            for (int rank = 0; rank < deepest; rank++) {
+                List<Object> reading = new ArrayList<>(perColumn.size());
+                for (List<Object> values : perColumn) {
+                    reading.add(values.get(Math.min(rank, values.size() - 1)));
+                }
+                ranked.add(reading);
+            }
+            return List.copyOf(ranked);
         }
         List<List<Object>> readings = new ArrayList<>();
         readings.add(new ArrayList<>());

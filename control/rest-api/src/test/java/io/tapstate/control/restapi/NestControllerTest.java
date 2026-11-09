@@ -17,6 +17,9 @@ import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.StaticListableBeanFactory;
 import org.springframework.http.ResponseEntity;
+import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.util.LinkedMultiValueMap;
 
 import java.util.List;
 import java.util.Map;
@@ -24,6 +27,8 @@ import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowableOfType;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
  * The nest reads as the controller serves them: never cached, the inspect view handed back as the step's
@@ -63,10 +68,28 @@ class NestControllerTest {
                 List.of(1L), true, "1:3", List.of(), List.of(), List.of(), 0L, false, Map.of("id", 1L));
         NestController controller = controller((p, s, k) -> new NestStateInspector.Result.Held(held), null);
 
-        ResponseEntity<NestInspection> answer = controller.inspect("order_doc", "doc", List.of("1"));
+        ResponseEntity<NestInspection> answer = controller.inspect("order_doc", "doc",
+                new LinkedMultiValueMap<>(Map.of("key", List.of("1"))));
 
         assertThat(answer.getBody()).isSameAs(held);
         assertThat(answer.getHeaders().getCacheControl()).isEqualTo("no-store");
+    }
+
+    @Test
+    void aKeyValueHoldingACommaReachesTheInspectorAsOneColumn() throws Exception {
+        List<List<String>> asked = new java.util.ArrayList<>();
+        NestInspection held = new NestInspection(NestInspection.VERSION, "order_doc", "doc", List.of("id"),
+                List.of("north,west"), true, "1:3", List.of(), List.of(), List.of(), 0L, false, Map.of());
+        NestController controller = controller((p, s, k) -> {
+            asked.add(List.copyOf(k));
+            return new NestStateInspector.Result.Held(held);
+        }, null);
+        MockMvc mvc = MockMvcBuilders.standaloneSetup(controller).build();
+
+        mvc.perform(get("/pipelines/order_doc/nest/doc/documents").param("key", "north,west"))
+                .andExpect(status().isOk());
+
+        assertThat(asked).containsExactly(List.of("north,west"));
     }
 
     @Test

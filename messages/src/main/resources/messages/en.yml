@@ -951,10 +951,13 @@ monitor.nest-root-key-not-held:
   solution: "Check the value of {columns}: no row with that key, and no row pointing at it, has reached the step yet."
 monitor.nest-object-key-not-unique:
   message: "Embed {embed} is one row per parent, but {count} sampled rows of {table} matched one parent ({sampled} rows sampled)."
-  solution: "Use as: array if a parent really has several, or join on columns that match one row; otherwise the run stops when the second live row arrives."
+  solution: "Use as: array if a parent really has several, or join on columns that match one row. Until then, as: object shows only the row changed most recently and drops the rest, and as: flat stops the run when a second live row arrives."
 monitor.nest-near-element-limit:
   message: "Documents are estimated to hold about {count} elements under {embed} from {table}, near the per-document limit of {limit}."
   solution: "Raise max_elements_per_document on the nest if documents really are this wide, or narrow what the embed takes in."
+monitor.nest-document-near-element-limit:
+  message: "No one embed is near the per-document limit of {limit}, but together {embeds} are estimated to put about {count} elements in one document."
+  solution: "Raise max_elements_per_document on the nest if documents really are this wide, or narrow what those embeds take in."
 monitor.nest-reference-widely-shared:
   message: "One row of {table} behind {embed} is estimated to be pointed at by about {count} documents, near the per-row limit of {limit}."
   solution: "Embed it from the other side so one change rewrites one document, or accept that each change to that row rewrites them all."

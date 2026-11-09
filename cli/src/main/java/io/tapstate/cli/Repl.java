@@ -4452,7 +4452,8 @@ final class Repl {
                 out.flush();
                 yield Cli.EXIT_OK;
             }
-            case NestProgressOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case NestProgressOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
             case NestProgressOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
@@ -4464,7 +4465,7 @@ final class Repl {
      */
     private int nestInspectOnline(List<String> words) {
         PrintWriter err = commandLine.getErr();
-        if (words.size() < 5 || words.subList(2, words.size()).stream().anyMatch(String::isBlank)
+        if (words.size() < 5 || words.get(2).isBlank() || words.get(3).isBlank()
                 || words.get(2).startsWith("-") || words.get(3).startsWith("-")) {
             err.println("nest: usage: " + NEST_USAGE);
             err.flush();
@@ -4483,7 +4484,8 @@ final class Repl {
                 out.flush();
                 yield Cli.EXIT_OK;
             }
-            case NestInspectOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case NestInspectOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
             case NestInspectOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
@@ -4505,7 +4507,8 @@ final class Repl {
                 out.flush();
                 yield Cli.EXIT_OK;
             }
-            case NestExplainOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case NestExplainOutcome.Rejected rejected ->
+                    renderRejection(rejected.code(), rejected.message(), rejected.params());
             case NestExplainOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
@@ -4727,7 +4730,8 @@ final class Repl {
             case "LOADING" -> "loading; waiting for " + waiting + " to be read";
             case "LANDING" -> "every table read; waiting for the target to confirm " + waiting;
             case "MAINTAINING" -> "load complete; applying changes as they arrive";
-            default -> "no load reported for its tables";
+            case "COMPLETED" -> "load complete; the pipeline has finished";
+            default -> "no load reported for some or all of its tables";
         };
     }
 

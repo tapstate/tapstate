@@ -90,6 +90,21 @@ class WhatADocumentHoldsCanBeReadByItsRootKeyTest {
     }
 
     @Test
+    void aRootChangeNotYetSentShowsTheDocumentAsItWillNextGoOut() {
+        RootAssembly assembly = new RootAssembly();
+        assembly.applyRoot(Map.of("customer_id", 8L, "name", "Ann"), at(3));
+        assembly.documentSent();
+        assembly.applyRoot(Map.of("customer_id", 8L, "name", "Annie"), at(4),
+                Map.of("customers", new io.tapstate.core.event.ChainPosition(at(4), "c4")));
+        file(8L, assembly);
+
+        NestInspection seen = held(NestInspector.inspect(member, PIPELINE, STEP, topology, List.of("8")));
+
+        assertThat(seen.unsent()).isOne();
+        assertThat(seen.document()).containsEntry("name", "Annie");
+    }
+
+    @Test
     void partsUnderARootThatNeverArrivedAreHeldAndNoDocumentExists() {
         RootAssembly orphaned = new RootAssembly();
         orphaned.applyElement(new ElementRef(List.of("policies"), null, List.of("P9"), "P9"),
@@ -125,6 +140,10 @@ class WhatADocumentHoldsCanBeReadByItsRootKeyTest {
         assertThat(NestInspector.readings(List.of("17"))).containsExactly(
                 List.of(17L), List.of(17), List.of(new java.math.BigDecimal("17")), List.of("17"));
         assertThat(NestInspector.readings(List.of("A-1"))).containsExactly(List.of("A-1"));
+        // Five columns are past the cap on combinations, yet a numeric column is still tried as a number.
+        assertThat(NestInspector.readings(List.of("a", "b", "c", "d", "7")))
+                .contains(List.of("a", "b", "c", "d", 7L))
+                .last().isEqualTo(List.of("a", "b", "c", "d", "7"));
     }
 
     @Test

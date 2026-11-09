@@ -30,7 +30,8 @@ import java.util.Objects;
  * @param parts every part held beneath the root, depth first
  * @param waiting parts held for a parent row that has not arrived, by the parent they wait for
  * @param missing references the document points at whose row was not found
- * @param unsent how many changes taken in have not yet gone out in a document
+ * @param unsent how many changes taken in have not yet gone out in a document; changes to the root row, or to a
+ *     row it points at, are folded into one rewrite and count once together
  * @param inTransit whether a subtree is being handed between this document and another
  * @param document the document as it last went out when {@code unsent} is zero, or as it will next go out
  *     otherwise; null while the root is absent, since no document exists then

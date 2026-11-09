@@ -1905,10 +1905,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public NestProgressOutcome nestProgress(URI baseUrl, String credential, String pipelineId, String step) {
-        String path = "/api/pipelines/" + pipelineId + "/nest/progress"
-                + (step == null ? "" : "?step=" + java.net.URLEncoder.encode(step, StandardCharsets.UTF_8));
-        HttpRequest request = authed(baseUrl, path, credential).GET().build();
         try {
+            String path = "/api/pipelines/" + urlSegment(pipelineId) + "/nest/progress"
+                    + (step == null ? "" : "?step=" + URLEncoder.encode(step, StandardCharsets.UTF_8));
+            HttpRequest request = authed(baseUrl, path, credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -1916,7 +1916,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                 return found == null ? new NestProgressOutcome.Unreachable() : found;
             }
             Rejection r = rejection(response.body(), "The server refused the read.");
-            return new NestProgressOutcome.Rejected(r.code(), r.message());
+            return new NestProgressOutcome.Rejected(r.code(), r.message(), r.params());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new NestProgressOutcome.Unreachable();
@@ -1928,15 +1928,15 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public NestInspectOutcome nestInspect(URI baseUrl, String credential, String pipelineId, String step,
             List<String> rootKey) {
-        StringBuilder path = new StringBuilder("/api/pipelines/").append(pipelineId).append("/nest/")
-                .append(java.net.URLEncoder.encode(step, StandardCharsets.UTF_8)).append("/documents");
-        char separator = '?';
-        for (String value : rootKey) {
-            path.append(separator).append("key=").append(java.net.URLEncoder.encode(value, StandardCharsets.UTF_8));
-            separator = '&';
-        }
-        HttpRequest request = authed(baseUrl, path.toString(), credential).GET().build();
         try {
+            StringBuilder path = new StringBuilder("/api/pipelines/").append(urlSegment(pipelineId))
+                    .append("/nest/").append(urlSegment(step)).append("/documents");
+            char separator = '?';
+            for (String value : rootKey) {
+                path.append(separator).append("key=").append(URLEncoder.encode(value, StandardCharsets.UTF_8));
+                separator = '&';
+            }
+            HttpRequest request = authed(baseUrl, path.toString(), credential).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -1945,7 +1945,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         : new NestInspectOutcome.Unreachable();
             }
             Rejection r = rejection(response.body(), "The server refused the read.");
-            return new NestInspectOutcome.Rejected(r.code(), r.message());
+            return new NestInspectOutcome.Rejected(r.code(), r.message(), r.params());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new NestInspectOutcome.Unreachable();
@@ -1956,10 +1956,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
 
     @Override
     public NestExplainOutcome nestExplain(URI baseUrl, String credential, String pipelineId, String step) {
-        String path = "/api/pipelines/" + pipelineId + "/nest/"
-                + java.net.URLEncoder.encode(step, StandardCharsets.UTF_8) + "/explain";
-        HttpRequest request = authed(baseUrl, path, credential).GET().build();
         try {
+            // Explain samples the sources it reads from, so it is given the time a heavy read is.
+            String path = "/api/pipelines/" + urlSegment(pipelineId) + "/nest/" + urlSegment(step) + "/explain";
+            HttpRequest request = authed(baseUrl, path, credential, heavyTimeout).GET().build();
             HttpResponse<String> response =
                     send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
             if (response.statusCode() == 200) {
@@ -1968,7 +1968,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         : new NestExplainOutcome.Unreachable();
             }
             Rejection r = rejection(response.body(), "The server refused the read.");
-            return new NestExplainOutcome.Rejected(r.code(), r.message());
+            return new NestExplainOutcome.Rejected(r.code(), r.message(), r.params());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return new NestExplainOutcome.Unreachable();

@@ -1,5 +1,7 @@
 package io.tapstate.cli;
 
+import java.util.Map;
+
 import java.util.List;
 
 /**
@@ -19,7 +21,15 @@ sealed interface NestProgressOutcome {
     }
 
     /** The server refused with a coded reason already rendered to a message. */
-    record Rejected(String code, String message) implements NestProgressOutcome {
+    record Rejected(String code, String message, Map<String, Object> params) implements NestProgressOutcome {
+
+        public Rejected {
+            params = params == null ? Map.of() : Map.copyOf(params);
+        }
+
+        public Rejected(String code, String message) {
+            this(code, message, Map.of());
+        }
     }
 
     /** The server could not be reached (connection refused, timeout, or a malformed answer). */

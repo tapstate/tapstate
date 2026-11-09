@@ -16,6 +16,7 @@ import io.tapstate.messages.MessageCatalog;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.MultiValueMap;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -55,11 +56,16 @@ class NestController {
                 .body(progress.progress(id, step == null || step.isBlank() ? null : step));
     }
 
-    /** What {@code step} holds under the root key, one {@code key} parameter per root key column, in order. */
+    /**
+     * What {@code step} holds under the root key, one {@code key} parameter per root key column, in order. The
+     * parameters are read as sent: bound to a list, a single {@code key=north,west} would be split at the
+     * comma into two columns, and a one-column key that holds a comma could never be asked for.
+     */
     @Verb("pipeline.nest.inspect")
     @GetMapping("/pipelines/{id}/nest/{step}/documents")
     ResponseEntity<NestInspection> inspect(@PathVariable("id") String id, @PathVariable("step") String step,
-            @RequestParam(name = "key") List<String> key) {
+            @RequestParam MultiValueMap<String, String> parameters) {
+        List<String> key = parameters.getOrDefault("key", List.of());
         return ResponseEntity.ok()
                 .cacheControl(CacheControl.noStore())
                 .body(inspect.inspect(id, step, key));

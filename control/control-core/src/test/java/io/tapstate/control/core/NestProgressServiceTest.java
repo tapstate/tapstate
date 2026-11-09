@@ -125,6 +125,28 @@ class NestProgressServiceTest {
     }
 
     @Test
+    void anEmbedWithNoReportedLoadLeavesTheStepUnknownEvenWhenTheRootHasLanded() {
+        NestProgress progress = service(load(Map.of(
+                "orders", new InitialLoad.Table(InitialLoad.Stage.LANDED, 300L, 300L),
+                "customers", new InitialLoad.Table(InitialLoad.Stage.LANDED, 12L, 12L))), List.of())
+                .progress("order_doc", null);
+
+        assertThat(progress.steps().getFirst().activity()).isEqualTo(NestProgress.Activity.UNKNOWN);
+    }
+
+    @Test
+    void aCompletedPipelineWithEveryTableLandedIsReportedCompleteNotMaintaining() {
+        NestProgress progress = service(load(Map.of(
+                "orders", new InitialLoad.Table(InitialLoad.Stage.LANDED, 300L, 300L),
+                "order_items", new InitialLoad.Table(InitialLoad.Stage.LANDED, 600L, 600L),
+                "customers", new InitialLoad.Table(InitialLoad.Stage.LANDED, 12L, 12L))), List.of(),
+                PipelineState.COMPLETED).progress("order_doc", null);
+
+        assertThat(progress.steps().getFirst().activity()).isEqualTo(NestProgress.Activity.COMPLETED);
+        assertThat(progress.steps().getFirst().waitingFor()).isEmpty();
+    }
+
+    @Test
     void aStepThatIsNotANestIsRefusedNamingTheOnesThereAre() {
         TapstateException refused = catchThrowableOfType(TapstateException.class,
                 () -> service(load(Map.of()), List.of()).progress("order_doc", "tidy"));
@@ -152,7 +174,11 @@ class NestProgressServiceTest {
     }
 
     private static NestProgressService service(InitialLoad load, List<MetricFact> facts) {
-        Observation observation = new Observation("order_doc", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+        return service(load, facts, PipelineState.RUNNING);
+    }
+
+    private static NestProgressService service(InitialLoad load, List<MetricFact> facts, PipelineState state) {
+        Observation observation = new Observation("order_doc", state, Map.of(), Map.of(), Map.of(),
                 null, NOW, facts, load);
         ObservationStore observations = new ObservationStore() {
             @Override

@@ -46,4 +46,19 @@ class NestProgressRenderingTest {
         assertThat(text.toString()).contains("step doc: load complete; applying changes as they arrive",
                 "documents sent: 300 of about 300 orders rows");
     }
+
+    @Test
+    void aFinishedRunAndAPartlyReportedLoadEachSayWhatTheyAre() {
+        NestProgressOutcome.Found found = new NestProgressOutcome.Found("order_doc", "COMPLETED", "DONE",
+                List.of(new NestProgressOutcome.Step("doc", "orders", 300L, 300L, "COMPLETED", List.of(),
+                                List.of(new NestProgressOutcome.Table("orders", "", "LANDED", 300L, 300L, null))),
+                        new NestProgressOutcome.Step("lines", "orders", null, 300L, "UNKNOWN", List.of(),
+                                List.of(new NestProgressOutcome.Table("orders", "", "LANDED", 300L, 300L, null)))));
+
+        StringWriter text = new StringWriter();
+        Repl.renderNestProgress(new PrintWriter(text, true), found);
+
+        assertThat(text.toString()).contains("step doc: load complete; the pipeline has finished",
+                "step lines: no load reported for some or all of its tables");
+    }
 }

@@ -11,6 +11,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -46,12 +47,11 @@ class NestProgressIT {
     @Test
     void aStepHeldByItsRootTableNamesItAndCountsTheLinesRead(@TempDir Path temporary) throws Exception {
         Path source = Files.createDirectory(temporary.resolve("source"));
-        EndpointAddress address = EndpointAddress.uri(source.toString());
-        FileEndpoints files = new FileEndpoints();
-        files.seed(address, "orders", LongStream.rangeClosed(1, 10)
-                .mapToObj(id -> Map.<String, Object>of("id", id)).toList());
-        files.seed(address, "items", LongStream.rangeClosed(1, LINES)
-                .mapToObj(id -> Map.<String, Object>of("id", id, "order_id", 1 + id % 10)).toList());
+        // Written as whole tables: the seeded shape is exactly id and seq, and the join needs order_id.
+        FileEndpoints.replaceTable(source.resolve("orders.csv"), "id\n" + LongStream.rangeClosed(1, 10)
+                .mapToObj(id -> id + "\n").collect(Collectors.joining()));
+        FileEndpoints.replaceTable(source.resolve("items.csv"), "id,order_id\n" + LongStream.rangeClosed(1, LINES)
+                .mapToObj(id -> id + "," + (1 + id % 10) + "\n").collect(Collectors.joining()));
         Holds holds = new Holds(temporary.resolve("holds"));
         holds.read("orders");
         String target = SharedMongo.replicaSetUrl("nest_progress_target");

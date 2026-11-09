@@ -10,7 +10,8 @@ class MonitorErrorTest {
     @Test
     void everyCodeIsInTheMonitorDomainAndErrorSeverity() {
         java.util.Set<MonitorError> warnings = java.util.EnumSet.of(MonitorError.NEST_OBJECT_KEY_NOT_UNIQUE,
-                MonitorError.NEST_NEAR_ELEMENT_LIMIT, MonitorError.NEST_REFERENCE_WIDELY_SHARED);
+                MonitorError.NEST_NEAR_ELEMENT_LIMIT, MonitorError.NEST_DOCUMENT_NEAR_ELEMENT_LIMIT,
+                MonitorError.NEST_REFERENCE_WIDELY_SHARED);
         for (MonitorError e : MonitorError.values()) {
             assertThat(e.code()).startsWith("monitor.");
             // The pre-run shape checks warn and refuse nothing; every other code is a refusal.
@@ -37,6 +38,7 @@ class MonitorErrorTest {
                 // warnings from sampling a nest's sources before it runs
                 "monitor.nest-object-key-not-unique",
                 "monitor.nest-near-element-limit",
+                "monitor.nest-document-near-element-limit",
                 "monitor.nest-reference-widely-shared");
     }
 

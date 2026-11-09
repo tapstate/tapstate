@@ -248,7 +248,11 @@ public final class NestProgressService {
         if (tables.stream().anyMatch(table -> table.stage() == InitialLoad.Stage.LANDING)) {
             return NestProgress.Activity.LANDING;
         }
-        return NestProgress.Activity.MAINTAINING;
+        // A table with no reported load may still be unread: the load is complete only when every one says so.
+        if (tables.stream().anyMatch(table -> table.stage() == null)) {
+            return NestProgress.Activity.UNKNOWN;
+        }
+        return state == PipelineState.COMPLETED ? NestProgress.Activity.COMPLETED : NestProgress.Activity.MAINTAINING;
     }
 
     /**

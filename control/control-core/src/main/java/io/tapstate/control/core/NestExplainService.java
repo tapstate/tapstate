@@ -79,6 +79,12 @@ public final class NestExplainService {
         private final Map<String, Located> located = new HashMap<>();
         private final List<NestExplanation.Sampled> samples = new ArrayList<>();
         private final List<NestExplanation.Warning> warnings = new ArrayList<>();
+        /** Estimated elements one document holds, summed over every owned embed at every depth. */
+        private double perDocument;
+        /** The owned embeds that put an estimated element in a document, by path. */
+        private final List<String> counted = new ArrayList<>();
+        /** Whether one embed was already warned near the limit on its own, which says it better. */
+        private boolean nearAlone;
 
         Run(PipelineResource pipeline, Map<String, FromRef> aliases, NestTree tree) {
             this.pipeline = pipeline;
@@ -89,29 +95,59 @@ public final class NestExplainService {
         NestExplanation explain() {
             Located root = locate(tree.rootAlias());
             for (NestTree.Level level : tree.embeds()) {
-                walk(level, root, root);
+                walk(level, root, root, 1.0);
             }
+            warnOnTheWholeDocument();
             return new NestExplanation(tree, BUILD, samples, warnings);
         }
 
-        private void walk(NestTree.Level level, Located parent, Located root) {
+        /**
+         * {@code perParent} is how many of the parent level one document holds: an embed's elements under one
+         * parent are counted once per parent, so siblings add up and a nested array multiplies.
+         */
+        private void walk(NestTree.Level level, Located parent, Located root, double perParent) {
             Located child = locate(level.alias());
-            check(level, parent, root, child);
+            Long under = check(level, parent, root, child);
+            double here = perParent;
+            if (under != null) {
+                here = perParent * under;
+                perDocument += here;
+                if (under > 0) {
+                    counted.add(level.path());
+                }
+            }
             for (NestTree.Level below : level.children()) {
-                walk(below, child, root);
+                walk(below, child, root, here);
             }
         }
 
-        private void check(NestTree.Level level, Located parent, Located root, Located child) {
+        /**
+         * The limit is on everything one document holds, not on one embed: two arrays each well under it can
+         * still pass it together. Said only when no embed was near the limit alone, which already names the
+         * one to change.
+         */
+        private void warnOnTheWholeDocument() {
+            long whole = Math.round(perDocument);
+            if (!nearAlone && counted.size() > 1 && tree.elementLimit() > 0 && whole >= NEAR * tree.elementLimit()) {
+                warnings.add(new NestExplanation.Warning(MonitorError.NEST_DOCUMENT_NEAR_ELEMENT_LIMIT,
+                        String.join(", ", counted), Map.of("embeds", String.join(", ", counted), "count", whole,
+                        LIMIT, tree.elementLimit())));
+            }
+        }
+
+        /** Checks one level; returns the elements estimated under one parent when owned and counted, else null. */
+        private Long check(NestTree.Level level, Located parent, Located root, Located child) {
             String unavailable = unavailable(level, parent, child);
             if (unavailable != null) {
                 samples.add(new NestExplanation.Sampled(level.path(), level.alias(), child.source(), child.table(),
                         child.sample() == null ? null : child.sample().tableRows(), 0, null, null, unavailable));
-            } else if (level.owned()) {
-                checkOwned(level, root, child);
-            } else {
-                checkShared(level, parent, root, child);
+                return null;
             }
+            if (level.owned()) {
+                return checkOwned(level, root, child);
+            }
+            checkShared(level, parent, root, child);
+            return null;
         }
 
         /** Why nothing can be counted for {@code level}, or null when it can. */
@@ -126,8 +162,8 @@ public final class NestExplainService {
             return null;
         }
 
-        /** Rows of an owned embed under one parent, by the child side of the join. */
-        private void checkOwned(NestTree.Level level, Located root, Located child) {
+        /** Rows of an owned embed under one parent, by the child side of the join; returns the estimate. */
+        private long checkOwned(NestTree.Level level, Located root, Located child) {
             NestSampler.Sample rows = child.sample();
             long largest = largestGroup(rows.rows(), List.copyOf(level.on().keySet()));
             Double average = ratio(rows.tableRows(), rowsOf(root));
@@ -138,13 +174,16 @@ public final class NestExplainService {
                     warnings.add(warning(MonitorError.NEST_OBJECT_KEY_NOT_UNIQUE, level, child, largest,
                             "sampled", rows.rows().size()));
                 }
-                return;
+                // One row per parent is what it renders, however many matched.
+                return 1;
             }
             long estimate = estimate(largest, average);
             if (tree.elementLimit() > 0 && estimate >= NEAR * tree.elementLimit()) {
+                nearAlone = true;
                 warnings.add(warning(MonitorError.NEST_NEAR_ELEMENT_LIMIT, level, child, estimate,
                         LIMIT, tree.elementLimit()));
             }
+            return estimate;
         }
 
         /** Parents pointing at one shared row, by the parent side of the join. */

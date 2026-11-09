@@ -156,8 +156,9 @@ warnings, each naming the embed, the count it was estimated from and what to cha
 
 | Warning | Raised when |
 |---|---|
-| `monitor.nest-object-key-not-unique` | an `object` or `flat` embed matched more than one sampled row under one parent |
+| `monitor.nest-object-key-not-unique` | an `object` or `flat` embed matched more than one sampled row under one parent; at run time `object` shows only the row changed most recently, and `flat` stops the run |
 | `monitor.nest-near-element-limit` | an `array` embed is estimated at 80% or more of the per-document element limit |
+| `monitor.nest-document-near-element-limit` | no embed is near the limit alone, but the owned embeds together (siblings added, nested arrays multiplied) are estimated at 80% or more of it |
 | `monitor.nest-reference-widely-shared` | one shared row is estimated to be pointed at by 80% or more of the per-row limit |
 
 An estimate is the larger of the most found under one parent in the sample and the average from the two
@@ -191,6 +192,8 @@ The sentence is the line to read first:
 | `loading; waiting for <tables> to be read` | those tables are still being read; embeds are named before the root |
 | `every table read; waiting for the target to confirm <tables>` | everything is read; the target has not confirmed these yet |
 | `load complete; applying changes as they arrive` | the load is done and the view is being kept current |
+| `load complete; the pipeline has finished` | a snapshot-only pipeline read and landed everything and stopped |
+| `no load reported for some or all of its tables` | the pipeline has not reported a load for a table the step reads, so whether it is read through cannot be said |
 | `not moving; the pipeline is <state>` | the pipeline is stopped, paused or failed |
 
 `nest progress` reads what the pipeline last published, so it works while the pipeline is stopped.

@@ -91,6 +91,17 @@ class NestExplainServiceTest {
     }
 
     @Test
+    void embedsEachUnderTheLimitAreWarnedAboutWhenTogetherTheyNearIt() {
+        // 10 items and 1 shipment per order: neither is near 13 alone (80% is 10.4), but 11 together are.
+        NestExplanation explained = service(tree(13, 100_000), sampler(new ArrayList<>())).explain("order_doc", "doc");
+
+        assertThat(explained.warnings()).extracting(NestExplanation.Warning::code).containsExactly(
+                MonitorError.NEST_OBJECT_KEY_NOT_UNIQUE, MonitorError.NEST_DOCUMENT_NEAR_ELEMENT_LIMIT);
+        assertThat(explained.warnings().getLast().args()).containsEntry("embeds", "items, shipment")
+                .containsEntry("count", 11L).containsEntry("limit", 13L);
+    }
+
+    @Test
     void documentsNearTheElementLimitAndARowSharedByNearlyAsManyAsAllowedAreWarnedAbout() {
         NestExplanation explained = service(tree(12, 11), sampler(new ArrayList<>())).explain("order_doc", "doc");
 

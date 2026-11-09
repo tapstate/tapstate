@@ -983,7 +983,10 @@ public final class RootAssembly implements Serializable {
                 missing.add(new Inspected.Missing(String.join(".", reference.path()), reference.key()));
             }
         }
-        return new Inspected(rootPresent, rootOrder, parts, waits, missing, pending());
+        // A change to the root, or to a row it points at, waits for its send beside the parked parts: it is
+        // folded into one rewrite, so however many arrived it counts once.
+        long unsent = pending() + (fromRoot.lowest.isEmpty() ? 0 : 1);
+        return new Inspected(rootPresent, rootOrder, parts, waits, missing, unsent);
     }
 
     /** This document as {@link #inspect} reads it; parts carry their source order and whether they are gone. */

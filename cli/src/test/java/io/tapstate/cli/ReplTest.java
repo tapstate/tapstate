@@ -5479,11 +5479,29 @@ class ReplTest {
             FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
             Harness h = onlineSession(Path.of("tap-work"), client);
             client.healthy.clear();
+            int mark = h.sink().toString().length();
 
             assertThat(h.repl().dispatch(command)).as(command).isTrue();
 
             assertThat(client.nestCalls).as(command).hasSize(1);
+            assertThat(h.sink().toString().substring(mark)).as(command).contains("connection lost");
+            assertThat(h.repl().lastExitCode()).as(command).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         }
+    }
+
+    @Test
+    void aRefusedNestReadRendersTheRemedyFromTheParametersTheServerSent() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.nestProgressOutcome = new NestProgressOutcome.Rejected("monitor.unknown-nest-step",
+                "No nest step tidy.", java.util.Map.of("pipeline", "order_doc", "step", "tidy", "steps", "doc, lines"));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("nest progress order_doc tidy")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("No nest step tidy.",
+                "Name one of its nest steps instead: doc, lines.");
+        assertThat(h.repl().lastExitCode()).isNotZero();
     }
 
     @Test

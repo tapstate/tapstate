@@ -336,6 +336,7 @@ migration.data-newer-than-binary
 migration.lock-timeout
 monitor.cursor-expired
 monitor.invalid-cursor
+monitor.nest-document-near-element-limit
 monitor.nest-near-element-limit
 monitor.nest-not-running
 monitor.nest-object-key-not-unique

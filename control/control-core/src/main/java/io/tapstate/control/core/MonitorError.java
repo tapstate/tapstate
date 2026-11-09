@@ -77,6 +77,13 @@ public enum MonitorError implements TapstateErrorCode {
             Severity.WARNING),
 
     /**
+     * A warning from sampling before a run: no single embed is near the per-document {@code limit}, but the
+     * embeds named in {@code embeds} together are estimated to put {@code count} elements in one document.
+     */
+    NEST_DOCUMENT_NEAR_ELEMENT_LIMIT("monitor.nest-document-near-element-limit",
+            Set.of("embeds", "count", "limit"), Severity.WARNING),
+
+    /**
      * A warning from sampling before a run: one row of {@code table} behind {@code embed} is estimated to be
      * pointed at by {@code count} documents, near the per-row {@code limit}.
      */

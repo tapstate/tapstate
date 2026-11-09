@@ -47,12 +47,12 @@ class NestInspectIT {
     void anOrderListsItsLinesAndAnOrphansParentKeyReportsItHeld(@TempDir Path temporary) throws Exception {
         Path source = Files.createDirectory(temporary.resolve("source"));
         Path holds = Files.createDirectory(temporary.resolve("holds"));
-        EndpointAddress address = EndpointAddress.uri(source.toString());
-        FileEndpoints files = new FileEndpoints();
-        files.seed(address, "orders", List.of(order(1), order(2), order(3)));
-        files.seed(address, "items", List.of(item(1, 1), item(2, 1), item(3, 2), item(4, 2), item(5, 3), item(6, 3),
-                item(7, MISSING_ORDER)));
-        files.seed(address, "customers", List.of(Map.of("id", 1L, "name", "Ann")));
+        // Written as whole tables: the seeded shape is exactly id and seq, and a join needs its own columns.
+        // The connector reads every column as text, so the keys below are text too.
+        FileEndpoints.replaceTable(source.resolve("orders.csv"), "id,customer_id\n1,1\n2,1\n3,1\n");
+        FileEndpoints.replaceTable(source.resolve("items.csv"),
+                "id,order_id\n1,1\n2,1\n3,2\n4,2\n5,3\n6,3\n7," + MISSING_ORDER + "\n");
+        FileEndpoints.replaceTable(source.resolve("customers.csv"), "id,name\n1,Ann\n");
         String target = SharedMongo.replicaSetUrl("nest_inspect_target");
         try (PreparedNativeStore storage = PreparedNativeStore.create(USER, PASSWORD);
                 ServerHandle server = Tiers.IN_PROCESS.launch(storage);
@@ -80,7 +80,7 @@ class NestInspectIT {
             assertThat(order.exitCode()).as("stdout:%n%s%nstderr:%n%s", order.stdout(), order.stderr()).isZero();
             assertThat(order.stdout())
                     .contains("root key id=1", "root row: present, order ")
-                    .contains("[1]", "[2]")
+                    .contains("[\"1\"]", "[\"2\"]")
                     .contains("document, as the step last rendered it:")
                     .contains("\"customer\"", "\"Ann\"");
             assertThat(order.stdout().lines().filter(line -> line.trim().startsWith("items ")).count())
@@ -90,12 +90,12 @@ class NestInspectIT {
             assertThat(orphan.exitCode()).as("stdout:%n%s%nstderr:%n%s", orphan.stdout(), orphan.stderr()).isZero();
             assertThat(orphan.stdout())
                     .contains("root row: not arrived; what is below waits for it")
-                    .contains("[7]")
+                    .contains("[\"7\"]")
                     .contains("held")
                     .contains("document: none while the root row is absent");
             assertThat(mongo.documents(EndpointAddress.uri(target), "orders"))
                     .as("the target has nothing for the missing order, which is why inspect reads the state")
-                    .noneMatch(document -> Long.valueOf(MISSING_ORDER).equals(document.get("id")));
+                    .noneMatch(document -> String.valueOf(MISSING_ORDER).equals(String.valueOf(document.get("id"))));
 
             CliOnce.Run nothing = inspect(server, "404");
             assertThat(nothing.exitCode()).isNotZero();
@@ -106,14 +106,6 @@ class NestInspectIT {
     private static CliOnce.Run inspect(ServerHandle server, String key) {
         return CliOnce.runSession(PASSWORD, "nest inspect " + PIPELINE + " " + STEP + " " + key + "\nexit\n",
                 "-c", server.baseUrl().toString(), "-u", USER);
-    }
-
-    private static Map<String, Object> order(long id) {
-        return Map.of("id", id, "customer_id", 1L);
-    }
-
-    private static Map<String, Object> item(long id, long order) {
-        return Map.of("id", id, "order_id", order);
     }
 
     private static Map<String, String> workspace(Path source, Path holds, String target) {

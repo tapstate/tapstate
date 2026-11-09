@@ -41,8 +41,13 @@ public record NestProgress(String pipelineId, PipelineState state, InitialLoad.P
         LANDING,
         /** Every table's load has landed; the step applies changes as they arrive. */
         MAINTAINING,
-        /** The pipeline reported no load for the step's tables, so there is nothing to wait for or count. */
-        UNKNOWN
+        /**
+         * The pipeline reported no load for some or all of the step's tables, so whether they are read through
+         * cannot be said.
+         */
+        UNKNOWN,
+        /** The pipeline has completed with every table landed; nothing more will arrive. */
+        COMPLETED
     }
 
     /**
