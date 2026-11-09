@@ -159,6 +159,21 @@ class SrsCaptureLeaseIT {
         });
     }
 
+    @Test void aReclaimThatRemovesNoModelLeavesBothLeasesStanding() {
+        withCapture(f -> {
+            f.append(0); f.checkpoint(0, 1, 0L); f.append(1); f.commands.clear();
+            // The retention pass reclaims on every tick; with nothing to remove, the models the leases were proved
+            // against are unchanged, and the next append and checkpoint still run on them.
+            assertThat(f.models.reclaim(CHAIN, f.fence())).isZero(); f.commands.clear();
+            f.append(2);
+            assertThat(f.commands).as("the append after an empty reclaim is leased")
+                    .containsExactly("update workload_claims", "update srs_events", "update srs_log_bounds");
+            f.commands.clear(); f.checkpoint(1, 2, 2L);
+            assertThat(f.commands).as("the checkpoint after an empty reclaim is leased")
+                    .containsExactly("update workload_claims", "find srs_chains", "update srs_chains");
+        });
+    }
+
     @Test void anEventNamingAModelTheLeaseHasNotProvedForcesAProofOfItsOwnAndIsRefusedWhenNonePublishedIt() {
         withCapture(f -> {
             f.append(0); f.checkpoint(0, 1, 0L); f.append(1); f.commands.clear();
