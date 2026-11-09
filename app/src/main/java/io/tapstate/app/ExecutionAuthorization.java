@@ -7,17 +7,21 @@ import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.LeasedStateStore;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 
+import java.lang.ref.WeakReference;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -90,6 +94,8 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Map<ReadKey, Entry> entries = new ConcurrentHashMap<>();
     private final Map<ReadKey, Long> nextReadNanos = new ConcurrentHashMap<>();
+    /** State stores whose lease was proved under one pipeline's reading; held weakly, never kept alive from here. */
+    private final Map<ReadKey, List<WeakReference<LeasedStateStore>>> leases = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
 
     private ExecutionAuthorization(boolean denied) {
@@ -194,6 +200,50 @@ final class ExecutionAuthorization implements AutoCloseable {
                     EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
         }
         return authorized.claim();
+    }
+
+    /**
+     * Ties {@code store}'s lease to this member's reading of {@code fence}'s claim: the lease is dropped the
+     * moment a refresh cannot reach the store, finds the claim gone, moved to other generations or with no
+     * lease left, or a newer scope replaces the reading, and when this guard closes. The store proves a new
+     * lease at its next operation, which fails closed while the claim is not this member's.
+     */
+    void holdLease(ExecutionFence fence, LeasedStateStore store) {
+        Objects.requireNonNull(fence); Objects.requireNonNull(store);
+        if (!fenced) return;
+        sweepLeases();
+        leases.compute(ReadKey.of(fence), (key, registered) -> {
+            var held = registered == null ? new CopyOnWriteArrayList<WeakReference<LeasedStateStore>>() : registered;
+            held.add(new WeakReference<>(store));
+            return held;
+        });
+        if (closed.get()) dropLeases(ReadKey.of(fence));
+    }
+
+    private void dropLeases(ReadKey key) {
+        var held = leases.get(key);
+        if (held == null) return;
+        for (var reference : held) {
+            var store = reference.get();
+            if (store != null) store.dropLease();
+        }
+        pruneLeases(key);
+    }
+
+    /**
+     * Sweeps every key, not only one being registered or dropped: a reading that ended keeps no entry to
+     * trigger its own cleanup. Runs on every registration and every background refresh.
+     */
+    private void sweepLeases() {
+        for (var key : leases.keySet()) pruneLeases(key);
+    }
+
+    /** Forgets collected stores under {@code key}, and the key once none is left, atomically with registration. */
+    private void pruneLeases(ReadKey key) {
+        leases.computeIfPresent(key, (ignored, registered) -> {
+            registered.removeIf(reference -> reference.get() == null);
+            return registered.isEmpty() ? null : registered;
+        });
     }
 
     /** A physical source uses the same bounded proof cache, independently of all Pipeline executions. */
@@ -349,6 +399,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 nextReadNanos.remove(key, deadline);
             }
         });
+        sweepLeases();
     }
 
     /**
@@ -363,6 +414,38 @@ final class ExecutionAuthorization implements AutoCloseable {
      * with no reading in hand to say so and no reading allowed until the floor runs out.
      */
     private synchronized Entry read(ReadKey key, boolean evenIfStillLive) {
+        Entry before = entries.get(key);
+        try {
+            return readStoreEntry(key, evenIfStillLive);
+        } finally {
+            Entry after = entries.get(key);
+            if (before != null && (after == null || !after.claim().equals(before.claim()))) dropLeases(key);
+        }
+    }
+
+    /**
+     * A proved replacement ends every older positive answer for this Pipeline immediately, and the leases
+     * held under them. Reads are serialized, and the scoped store refuses a scope that is no longer current.
+     * Returns false, replacing nothing, when a newer scope than {@code key}'s is already known.
+     */
+    private boolean replaceOlderScopes(ReadKey key) {
+        boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.type() == key.type() && other.scope() != null && other.pipelineId().equals(key.pipelineId())
+                && other.scope().stateGeneration() > key.scope().stateGeneration());
+        if (newerKnown) return false;
+        for (ReadKey other : Set.copyOf(entries.keySet())) {
+            if (sibling(key, other)) {
+                entries.remove(other); dropLeases(other); leases.remove(other);
+            }
+        }
+        nextReadNanos.keySet().removeIf(other -> sibling(key, other));
+        return true;
+    }
+
+    private static boolean sibling(ReadKey key, ReadKey other) {
+        return other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key);
+    }
+
+    private Entry readStoreEntry(ReadKey key, boolean evenIfStillLive) {
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(key);
         if (entry != null && !evenIfStillLive && now - entry.deadlineNanos() < 0) {
@@ -385,15 +468,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             return null;
         }
         nextReadNanos.remove(key);
-        if (key.scope() != null && !entries.containsKey(key)) {
-            // A proved replacement ends every older positive answer for this Pipeline immediately.
-            // Reads are serialized, and the scoped store refuses a scope that is no longer current.
-            boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.type() == key.type() && other.scope() != null && other.pipelineId().equals(key.pipelineId())
-                    && other.scope().stateGeneration() > key.scope().stateGeneration());
-            if (newerKnown) return null;
-            entries.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
-            nextReadNanos.keySet().removeIf(other -> other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key));
-        }
+        if (key.scope() != null && !entries.containsKey(key) && !replaceOlderScopes(key)) return null;
         if (current.isEmpty()) {
             entries.remove(key);
             return null;
@@ -418,6 +493,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true); entries.clear(); nextReadNanos.clear();
+        leases.keySet().forEach(this::dropLeases);
         if (refresher != null) {
             refresher.shutdownNow();
         }

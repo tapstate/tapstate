@@ -71,7 +71,7 @@ class MongoCacheOperatorStateStoreIT {
     @Test void aBatchCannotCommitAfterItsOriginalGuardIsLost() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE);
-            var before = f.snapshot(); var lost = new AtomicBoolean();
+            var lost = new AtomicBoolean(); Map<String,List<Document>> before;
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
                 if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("update")
                         && event.getCommand().getString("update").getValue().equals("nest_state")) lost.set(true);
@@ -81,6 +81,8 @@ class MongoCacheOperatorStateStoreIT {
                         SCOPE, WorkloadClaimFence.from(f.claim), () -> {
                             if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
                         }), at);
+                // The lease's own bookkeeping (placement, claim proof) belongs to the open, not to the refused write.
+                writer.openLease(); before = f.snapshot();
                 code(() -> writer.saveAll(at.mapName(), Map.of("first", new byte[]{1}, "second", new byte[]{2})),
                         IoError.WORKLOAD_CLAIM_FENCED);
             }
@@ -144,13 +146,14 @@ class MongoCacheOperatorStateStoreIT {
     @Test void aPendingMarkerAndPayloadRollBackTogetherAfterTheOriginalGuardIsLost() {
         withFixture(f -> {
             var at = f.at(OperatorPlacement.Resource.NEST_STATE); f.writer(at).save(at.mapName(),"key",new byte[]{1});
-            var before = f.snapshot(); var lost = new AtomicBoolean();
+            var lost = new AtomicBoolean();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
                 if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("nest_state")) lost.set(true);
             }};
             try (var client = observed(listener)) {
                 var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),SCOPE,
                         WorkloadClaimFence.from(f.claim),() -> { if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); }),at);
+                writer.openLease(); var before = f.snapshot();
                 code(() -> writer.saveWithRelease(at.mapName(),"key",new byte[]{2},new byte[]{9}),IoError.WORKLOAD_CLAIM_FENCED);
                 assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
             }
@@ -242,8 +245,14 @@ class MongoCacheOperatorStateStoreIT {
             var table = SystemCollections.CACHE_OPERATOR_CLEANUP.on(f.database); Document original = table.find().first();
             var at = f.at(OperatorPlacement.Resource.JOIN_FACTS); var writer = f.writer(at); writer.save(at.mapName(),"key",new byte[]{1});
             table.replaceOne(new Document(),original); var before = f.snapshot();
+            // Reads are not fenced within a lease: the writer still reads back its own bytes until its next proof.
+            assertThat(writer.load(at.mapName(),"key")).hasValue(new byte[]{1});
+            ((LeasedStateStore) writer).dropLease();
             code(() -> writer.load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
             code(() -> writer.loadAll(at.mapName(),List.of("key")),IoError.DOCUMENT_UNREADABLE);
+            var fresh = f.writer(at);
+            code(() -> fresh.load(at.mapName(),"key"),IoError.DOCUMENT_UNREADABLE);
+            code(() -> fresh.loadAll(at.mapName(),List.of("key")),IoError.DOCUMENT_UNREADABLE);
             assertThat(f.snapshot()).isEqualTo(before);
         });
     }
@@ -403,6 +412,17 @@ class MongoCacheOperatorStateStoreIT {
     }
 
     @Test void aNewStableGenerationUsesDifferentHotAndColdAddressesAndDoesNotAdoptOldBytes() {
+        // The old writer's first read and write below rely on its standing lease; a lease longer than any
+        // fixture keeps that from depending on how long the setup took.
+        System.setProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY, "600000");
+        try {
+            aNewStableGenerationUnderAStandingLease();
+        } finally {
+            System.clearProperty(MongoCacheOperatorStateStore.LEASE_PROPERTY);
+        }
+    }
+
+    private static void aNewStableGenerationUnderAStandingLease() {
         withFixture(f -> {
             var oldAt = f.at(OperatorPlacement.Resource.NEST_STATE); var old = f.writer(oldAt); old.save(oldAt.mapName(), "key", new byte[]{1});
             var next = new PipelineIntentScope("cluster-a",1,"cache-a","orders",2);
@@ -414,6 +434,10 @@ class MongoCacheOperatorStateStoreIT {
             var current = f.domain.operatorState(nextAt,WorkloadClaimFence.from(f.claim),ACTIVE);
             assertThat(nextAt.mapName()).isNotEqualTo(oldAt.mapName()); assertThat(current.load(nextAt.mapName(),"key")).isEmpty();
             current.save(nextAt.mapName(),"key",new byte[]{2}); var before = f.snapshot();
+            // Within its lease the old writer may still read its own old address; its next write is refused by
+            // the claim compare-and-set, and that refusal ends the lease, so everything after it proves again.
+            assertThat(old.load(oldAt.mapName(),"key")).hasValue(new byte[]{1});
+            code(() -> old.save(oldAt.mapName(),"key",new byte[]{99}),IoError.WORKLOAD_CLAIM_FENCED);
             code(() -> old.load(oldAt.mapName(),"key"),IoError.CACHE_BUSINESS_FENCED);
             code(() -> old.save(oldAt.mapName(),"key",new byte[]{99}),IoError.CACHE_BUSINESS_FENCED);
             code(() -> old.delete(oldAt.mapName(),"key"),IoError.CACHE_BUSINESS_FENCED);
@@ -447,7 +471,7 @@ class MongoCacheOperatorStateStoreIT {
 
     @Test void losingTheGuardAfterPayloadWriteRollsBackClaimCheckpointAndPayloadTogether() {
         withFixture(f -> {
-            var at = f.at(OperatorPlacement.Resource.JOIN_INDEXES); var before = f.snapshot(); var lost = new AtomicBoolean();
+            var at = f.at(OperatorPlacement.Resource.JOIN_INDEXES); var lost = new AtomicBoolean();
             var listener = new CommandListener() { @Override public void commandStarted(CommandStartedEvent event) {
                 if (event.getCommandName().equals("update") && event.getCommand().getString("update").getValue().equals("join_indexes")) lost.set(true);
             }};
@@ -455,6 +479,7 @@ class MongoCacheOperatorStateStoreIT {
                 var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(observed,observed.getDatabase(f.database.getName()),SCOPE,WorkloadClaimFence.from(f.claim),() -> {
                     if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
                 }),at);
+                writer.openLease(); var before = f.snapshot();
                 code(() -> writer.save(at.mapName(),"key",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
                 assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
             }
@@ -664,7 +689,7 @@ class MongoCacheOperatorStateStoreIT {
             bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,UUID.randomUUID().toString(),ACTIVE);
             bound.nestShapes(SCOPE,target.getName(),fence,ACTIVE).recordIfAbsent("extra-step",Set.of("root"));
             var at = new OperatorPlacement(SCOPE,target.getName(),OperatorPlacement.Resource.NEST_STATE,"extra-step","root","logical");
-            var before = f.snapshot(); var lost = new AtomicBoolean(); var writing = new AtomicBoolean();
+            var lost = new AtomicBoolean(); var writing = new AtomicBoolean(); Map<String,List<Document>> before;
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     if (event.getDatabaseName().equals(target.getName()) && event.getCommandName().equals("update")
@@ -679,6 +704,7 @@ class MongoCacheOperatorStateStoreIT {
                 var writer = new MongoCacheOperatorStateStore(new MongoCachePipelineAccess(client,client.getDatabase(f.database.getName()),
                         SCOPE,fence,() -> { if (lost.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); },
                         MongoRateHistoryStore.DEFAULT_RETENTION,policy),at);
+                writer.openLease(); before = f.snapshot();
                 code(() -> writer.save(at.mapName(),"late",new byte[]{1}),IoError.WORKLOAD_CLAIM_FENCED);
             }
             assertThat(lost).isTrue(); assertThat(f.snapshot()).isEqualTo(before);
