@@ -65,7 +65,7 @@ public final class NestExplainService {
                     "step", step, "steps", String.join(", ", nests.keySet())), null);
         }
         NestTree tree = trees.tree(pipelineId, step);
-        Step declared = pipeline.transforms().stream().filter(s -> s.id().equals(step)).findFirst().orElseThrow();
+        Step declared = NestProgressService.steps(pipeline).stream().filter(s -> s.id().equals(step)).findFirst().orElseThrow();
         Map<String, FromRef> aliases = declared.from() instanceof FromClause.Aliases named ? named.aliases()
                 : Map.of();
         return new Run(pipeline, aliases, tree).explain();
@@ -172,7 +172,7 @@ public final class NestExplainService {
                         : "the alias names a pattern, not one table");
             }
             String name = literal.ref();
-            if (pipeline.transforms().stream().anyMatch(s -> s.id().equals(name))) {
+            if (NestProgressService.steps(pipeline).stream().anyMatch(s -> s.id().equals(name))) {
                 return Located.none("the alias reads step " + name + ", not a source table");
             }
             List<String> sources = pipeline.sources().stream().map(SourceRef::id).toList();

@@ -54,8 +54,10 @@ These hold whatever order the rows arrive in, across restarts, and while a load 
    A row whose parent never comes stays held; `nest inspect` on the parent's key shows it.
 5. **A deletion stays deleted.** Deleting a row leaves a record of the deletion behind, so an older insert
    replayed after a restart cannot bring it back. The record is dropped once no replay can reach it.
-6. **Nothing is shown before it is safe to resume from.** The position the pipeline resumes from after a
-   restart never moves past a change that is held and not yet in a sent document.
+6. **Nothing is lost across a restart.** The position the pipeline resumes from never moves past a change
+   that is neither in a sent document nor kept in the step's own durable state. A row waiting for its parent
+   is kept in that state, so the resume position can move past it: it survives the restart and is placed
+   when the parent arrives.
 
 ## The two shapes
 

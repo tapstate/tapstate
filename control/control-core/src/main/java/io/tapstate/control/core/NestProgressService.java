@@ -91,10 +91,15 @@ public final class NestProgressService {
                         Map.of("pipeline", pipelineId), null));
     }
 
+    /** The definition's steps; a pipeline that declares no transforms has none. */
+    static List<Step> steps(PipelineResource pipeline) {
+        return pipeline.transforms() == null ? List.of() : pipeline.transforms();
+    }
+
     /** Each nest step by id, in the order the definition declares them. */
     static Map<String, TransformBody.Nest> nests(PipelineResource pipeline) {
         Map<String, TransformBody.Nest> nests = new LinkedHashMap<>();
-        for (Step step : pipeline.transforms()) {
+        for (Step step : steps(pipeline)) {
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
                 nests.put(step.id(), nest);
             }
@@ -129,7 +134,7 @@ public final class NestProgressService {
     }
 
     private static Step stepNamed(PipelineResource pipeline, String id) {
-        return pipeline.transforms().stream().filter(step -> step.id().equals(id)).findFirst().orElseThrow();
+        return steps(pipeline).stream().filter(step -> step.id().equals(id)).findFirst().orElseThrow();
     }
 
     private static void collect(PipelineResource pipeline, Map<String, FromRef> aliases, List<Embed> embeds,
@@ -182,7 +187,7 @@ public final class NestProgressService {
             return;
         }
         String name = ((FromRef.Literal) ref).ref();
-        Step upstream = pipeline.transforms().stream().filter(step -> step.id().equals(name)).findFirst()
+        Step upstream = steps(pipeline).stream().filter(step -> step.id().equals(name)).findFirst()
                 .orElse(null);
         if (upstream != null) {
             if (visited.add(name)) {

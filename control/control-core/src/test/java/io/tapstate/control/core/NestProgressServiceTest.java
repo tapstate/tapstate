@@ -10,7 +10,9 @@ import io.tapstate.core.lifecycle.MetricPoint;
 import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.SourceRef;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ObservationStore;
 import org.junit.jupiter.api.Test;
@@ -129,6 +131,15 @@ class NestProgressServiceTest {
 
         assertThat(refused.code()).isEqualTo(MonitorError.UNKNOWN_NEST_STEP);
         assertThat(refused.args()).containsEntry("steps", "doc").containsEntry("step", "tidy");
+    }
+
+    @Test
+    void aPipelineThatDeclaresNoTransformsHasNoNestStep() {
+        PipelineResource bare = new PipelineResource("bare", null, List.of(SourceRef.bare("shop_core")),
+                null, null, null, null, null);
+
+        assertThat(NestProgressService.steps(bare)).isEmpty();
+        assertThat(NestProgressService.nests(bare)).isEmpty();
     }
 
     private static Map<String, String> origin(String namespace, String step, String path, String map) {

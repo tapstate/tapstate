@@ -104,8 +104,9 @@ What a nest step is and how to read one is in [What a nest view is](../nest/sema
 | `tapstate.pipeline.state.commit.duration` | histogram | seconds per durable write |
 | `tapstate.pipeline.state.evictions` | counter | entries let go of from memory, to be read back when next needed |
 
-The share of reads that had to go to the store is `tapstate.pipeline.nest.cold.keys` divided by
-`tapstate.pipeline.nest.key.accesses` over the same window (see the cold-layer counters above).
+The share of key accesses that had to go to the store is `tapstate.pipeline.nest.cold.keys` divided by
+`tapstate.pipeline.nest.key.accesses` over the same window (see the cold-layer counters above). Both count
+writes as well as reads, so on a write-heavy pipeline this is not a read cache-miss rate.
 
 ## Current-run initial-load display
 

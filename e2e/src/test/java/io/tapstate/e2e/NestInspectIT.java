@@ -81,7 +81,7 @@ class NestInspectIT {
             assertThat(order.stdout())
                     .contains("root key id=1", "root row: present, order ")
                     .contains("[1]", "[2]")
-                    .contains("document, as last sent:")
+                    .contains("document, as the step last rendered it:")
                     .contains("\"customer\"", "\"Ann\"");
             assertThat(order.stdout().lines().filter(line -> line.trim().startsWith("items ")).count())
                     .as("the order's own two lines, and no other order's").isEqualTo(2);
