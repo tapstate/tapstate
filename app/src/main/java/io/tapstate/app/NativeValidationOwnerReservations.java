@@ -111,6 +111,20 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         var reading=existing.claims().read(ValidationClaims.key(scope.clusterId(),pipeline));requireActive();return reading;
     }
 
+    io.tapstate.runtime.probe.ValidationOperation.OwnerLease observeOwner(ValidationOwner original) {
+        requireActive();
+        Pipeline pipeline;
+        synchronized (pipelines) { pipeline = pipelines.get(original.pipelineId()); }
+        var current = pipeline == null ? null : pipeline.owner;
+        if (current != null && original.equals(current.lease.owner()) && !current.retired.get()
+                && current.lease.observesLive() && pipeline.owner == current && !current.retired.get()) {
+            return io.tapstate.runtime.probe.ValidationOperation.OwnerLease.LIVE;
+        }
+        var reading = configuration.observeValidationClaim(original.pipelineId(), scope, cache, this::requireActive);
+        requireActive();
+        return ValidationOwnerRouter.projectOwnerLease(original, reading);
+    }
+
     @Override public Result reserve(Request request) {
         requireActive();var attempt=new ReserveAttempt(request);var failures=new ValidationFailureLatch();
         var local=pipeline(request.pipeline());attempt.local=local;

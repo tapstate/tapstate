@@ -197,6 +197,9 @@ final class ValidationOwnerRouter implements AutoCloseable {
     Reply reserve(Request request) {return reserveAttempt(request).reply();}
     OwnerLease ownerLease(ValidationOwner original) {
         requireActive();var reading=Objects.requireNonNull(readPreparedOwner.apply(original.pipelineId()));requireActive();
+        return projectOwnerLease(original, reading);
+    }
+    static OwnerLease projectOwnerLease(ValidationOwner original, Optional<WorkloadClaimReading> reading) {
         if(reading.isEmpty())return OwnerLease.UNKNOWN;
         var value=reading.orElseThrow();var claim=value.claim();
         if(!claim.key().equals(ValidationClaims.key(original.clusterId(),original.pipelineId()))

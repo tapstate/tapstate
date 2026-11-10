@@ -383,8 +383,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new io.tapstate.control.core.ValidationReportService(owner.configuration.validationReports(owner.memberStorage::requireNode),budget);
         }
         @Bean(destroyMethod="close") @Lazy NativeValidationStartCoordinator nativeValidationStartCoordinator(NativeBusinessContext owner,HazelcastInstance member,
-                ValidationOwnerRouter router,ValidationMemberResources.Member resources,ValidationMemberResources process,Clock clock){
-            return new NativeValidationStartCoordinator(member,owner.configuration,router,resources,process,owner.memberStorage::requireNode,Duration.ofSeconds(12),clock);
+                ValidationOwnerRouter router,ValidationMemberResources.Member resources,ValidationMemberResources process,Clock clock,
+                NativeValidationOwnerReservations owners){
+            return new NativeValidationStartCoordinator(member,owner.configuration,router,resources,process,
+                    owner.memberStorage::requireNode,Duration.ofSeconds(12),clock,owners::observeOwner);
         }
         @Bean(destroyMethod="close") @Lazy NativeValidationScheduler nativeValidationScheduler(NativeBusinessContext owner,
                 ValidationMemberResources.Member resources,ValidationMemberResources process,org.springframework.beans.factory.ObjectProvider<NativeValidationStartCoordinator> coordinators,

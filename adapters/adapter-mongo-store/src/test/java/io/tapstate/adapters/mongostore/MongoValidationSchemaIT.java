@@ -851,6 +851,57 @@ class MongoValidationSchemaIT {
         }
     }
 
+    @Test void validationOwnerObservationUsesThreeCommandsAcrossIndependentDatabases() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var node = f.node("node");
+            var access = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            var key = ValidationClaims.key("cluster", "flow0");
+            var claims = access.claims();
+            var held = claims.acquire(key, node.owner(), 1, TTL).claim();
+            var running = claims.advanceExecution(held, 1, Set.of(node.owner().nodeId())).orElseThrow();
+
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                var observed = f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}).orElseThrow();
+                assertThat(observed.claim()).isEqualTo(running);
+                assertThat(observed.leased()).isTrue();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate", "aggregate");
+
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb);
+            var mappingId = new Document("_id", "flow0");
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            assertThat(f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {
+                if (calls.incrementAndGet() == 2)
+                    mappings.updateOne(mappingId,
+                            new Document("$set", new Document("validationPreparation.generation", UUID.randomUUID().toString())));
+            })).isEmpty();
+            assertThatThrownBy(() -> f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            mappings.updateOne(mappingId,
+                    new Document("$set", new Document("validationPreparation.generation", access.generation().toString())));
+
+            var recovery = SystemCollections.STORAGE_RECOVERY.on(f.configDb);
+            var recoveryId = new Document("_id", "cluster");
+            calls.set(0);
+            assertThat(f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {
+                if (calls.incrementAndGet() == 2)
+                    recovery.updateOne(recoveryId,
+                            new Document("$set", new Document("cacheIncarnation", UUID.randomUUID().toString())));
+            })).isEmpty();
+            recovery.updateOne(recoveryId, new Document("$set", new Document("cacheIncarnation", f.scope.cacheIncarnation())));
+
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cacheDb).updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+            var expired = f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}).orElseThrow();
+            assertThat(expired.leased()).isFalse();
+        }
+    }
+
     @Test void publicNativeValidationAccessRejectsAnotherCacheBeforeIssuingItsFirstPreparation() {
         try (var f = new Fixture(1); var wrong = new Fixture(0)) {
             f.upgrade(); var node = f.node("node"); var before = f.configuration.validationPreparations().read("flow0");

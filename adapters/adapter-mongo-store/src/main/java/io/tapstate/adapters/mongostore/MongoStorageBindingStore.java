@@ -1,5 +1,7 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.spi.store.CacheBusinessScope;
+
 import com.mongodb.ReadConcern;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
@@ -212,6 +214,27 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
             } catch (NullPointerException | IllegalArgumentException | ClassCastException malformed) { throw unreadable(); }
             budget.requireRemaining(); requireActive.run();
         });
+    }
+
+    StorageBinding observationBinding(CacheBusinessScope expected, Document bound, Document stage, Document recovery) {
+        try {
+            long version = expected.bindingVersion();
+            String cluster = expected.clusterId();
+            if (!cluster.equals(bound.get("clusterId")) || !MongoConfigurationDomain.LAYOUT.equals(bound.get("layoutId"))
+                    || !Long.valueOf(version).equals(bound.get(BINDING_VERSION))) throw refused();
+            var owner = new StorageSetupScope(cluster, bound.getString("installationId"),
+                    bound.getString("operationId"), bound.getLong("generation"));
+            var mode = StorageBinding.Mode.valueOf(bound.getString("mode"));
+            String defaultId = StorageBinding.defaultSourceId(mode);
+            requireBoundSetup(stage, owner, version, defaultId, requireSetupIdentity(stage, cluster));
+            if (!defaultId.equals(bound.get("defaultSourceId"))
+                    || !MongoStorageRecoveryStore.read(recovery, owner, mode, version, () -> stage)
+                            .preparation().businessScope().equals(expected)) throw refused();
+            String json = ciphers.current().decrypt(bindingContext(cluster), "cache-binding", bound.getString("cache"));
+            String hash = fingerprint(mode, json, bound.getString("sourceHash"));
+            if (!hash.equals(bound.get("candidateHash")) || !hash.equals(stage.get("candidateHash"))) throw refused();
+            return new StorageBinding(owner, mode, version, defaultId, decodeConnection(json));
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException malformed) { throw unreadable(); }
     }
 
     private static Document authorityLookup(SystemCollections table, String field, Document projection) {

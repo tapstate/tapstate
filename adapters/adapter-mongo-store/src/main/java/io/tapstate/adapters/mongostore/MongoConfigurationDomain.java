@@ -1183,6 +1183,24 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var completed = configuration.complete(original, cachePreparation.prepare(original, node));
         local.run(); requireOpen(); return new ValidationAccess(this, cache, completed, local);
     }
+    /** Observes a lease for task status without issuing a preparation or obtaining mutation authority. */
+    public java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(String pipeline,
+            io.tapstate.spi.store.CacheBusinessScope scope, MongoCacheDomain cache, Runnable local) {
+        var observation = new MongoValidationClaimObservation(connection.database(), bindings, scope, pipeline);
+        return StoreIo.call(() -> {
+            requireOpen(); local.run();
+            if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client()) || cache.lacksSnapshotRead()) {
+                var access = loadValidationAccess(pipeline, scope, cache, local);
+                return access.claims().read(io.tapstate.spi.store.ValidationClaims.key(scope.clusterId(), pipeline));
+            }
+            var original = observation.configuration();
+            cache.requireRecoveryTarget(observation.target(original));
+            var reading = cache.observeValidationClaim(observation, original.subject());
+            local.run(); requireOpen();
+            return observation.stillCurrent(original) ? reading : java.util.Optional.empty();
+        });
+    }
+
     /** Read-only access to an already completed original. Missing preparation is never initialized. */
     public ValidationAccess loadValidationAccess(String pipeline,io.tapstate.spi.store.CacheBusinessScope expected,MongoCacheDomain cache,Runnable local){
         Objects.requireNonNull(local).run();requireOpen();Objects.requireNonNull(expected);Objects.requireNonNull(cache);

@@ -30,6 +30,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     private final HazelcastInstance member;
     private final MongoConfigurationDomain configuration;
     private final ValidationOwnerRouter router;
+    private final java.util.function.Function<ValidationOwner, OwnerLease> observeOwner;
     private final ValidationMemberResources.Member resources;
     private final Runnable active;private final long ioTimeoutNanos;private final java.time.Clock clock;
     private final Context context;
@@ -48,6 +49,12 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
             ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout,java.time.Clock clock){
+        this(member,configuration,router,resources,process,active,ioTimeout,clock,router::ownerLease);
+    }
+    NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
+            ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout,
+            java.time.Clock clock,java.util.function.Function<ValidationOwner, OwnerLease> observeOwner){
+        this.observeOwner=Objects.requireNonNull(observeOwner);
         this.clock=Objects.requireNonNull(clock);
         if(ioTimeout==null||ioTimeout.isZero()||ioTimeout.isNegative()||ioTimeout.compareTo(Duration.ofSeconds(30))>0)throw invalid("entry.ioTimeout");
         ioTimeoutNanos=ioTimeout.toNanos();
@@ -64,14 +71,18 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     Context context(){require();return context;}
     OwnerLease permissionOwnerLease(ValidationTaskStore.Snapshot saved){
-        try(var scope=new ResponseScope()){return paid(scope,()->observePermissionOwner(saved));}
+        try(var scope=new ResponseScope()){return paid(scope,()->observePermissionOwner(saved, observeOwner));}
         catch(TapstateException unavailable){return OwnerLease.UNKNOWN;}
     }
     private OwnerLease observePermissionOwner(ValidationTaskStore.Snapshot saved){
+        return observePermissionOwner(saved, router::ownerLease);
+    }
+    private OwnerLease observePermissionOwner(ValidationTaskStore.Snapshot saved,
+            java.util.function.Function<ValidationOwner, OwnerLease> observation){
         require();var permission=saved.full().permission();
         if(saved.closed()||permission==null||permission.phase()==ValidationTaskStore.Phase.CLOSED
                 ||!permission.start().task().equals(saved.task())||!context.cluster().equals(saved.task().clusterId()))return OwnerLease.UNKNOWN;
-        return router.ownerLease(permission.start().run().owner());
+        return observation.apply(permission.start().run().owner());
     }
     Response start(ValidationOperation original){return response(original,Verb.START,null);}
     Response startScheduled(ValidationOperation original,java.time.Instant latest){return response(original,Verb.START,Objects.requireNonNull(latest));}

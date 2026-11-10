@@ -86,6 +86,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
         if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
     }
+    boolean lacksSnapshotRead() { return MongoValidationClaimObservation.lacksSnapshotRead(client); }
+
+    java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(
+            MongoValidationClaimObservation observation, MongoValidationPreparationFacts.Subject subject) {
+        businessActive();
+        var result = observation.cache(database, subject);
+        businessActive();
+        return result;
+    }
     boolean emptyForAuthenticationRecovery() {
         businessActive();
         return StoreIo.call(() -> database.listCollectionNames().into(new ArrayList<>()).isEmpty());

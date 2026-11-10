@@ -236,7 +236,9 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     /** How long a lease still has to run, worked out on the server, where {@code $$NOW} is. */
-    private Document leaseRemaining() {
+    private Document leaseRemaining() { return leaseRemaining(strict); }
+
+    static Document leaseRemaining(boolean strict) {
         Document remaining = new Document("$subtract", List.of("$leaseUntil", "$$NOW"));
         if (strict) remaining = new Document("$cond", List.of(
                 new Document("$eq", List.of(new Document("$type", "$leaseUntil"), "date")), remaining, 0L));
@@ -317,7 +319,10 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     WorkloadClaim decodeStored(Document document) { return read(document); }
 
     private WorkloadClaim read(Document document) {
-        if (!strict) return decode(document);
+        return strict ? decodeStrict(document) : decode(document);
+    }
+
+    private static WorkloadClaim decodeStrict(Document document) {
         try {
             for (String field : List.of("claimGeneration", "executionGeneration", "topologyRevision")) {
                 if (!(document.get(field) instanceof Long value) || value < 0 || (field.equals("claimGeneration") && value == 0)) throw unreadableClaim();
@@ -362,6 +367,11 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
                 Set.copyOf(document.getList("executionNodeIds", String.class, List.of())),
                 numberOrZero(document, "failureClaimGeneration"),
                 Boolean.TRUE.equals(document.getBoolean("failureAfterMemberLoss")));
+    }
+
+    static WorkloadClaimReading observedReading(Document document) {
+        if (!(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();
+        return new WorkloadClaimReading(decodeStrict(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
     }
 
     private WorkloadClaimReading reading(Document document) {
