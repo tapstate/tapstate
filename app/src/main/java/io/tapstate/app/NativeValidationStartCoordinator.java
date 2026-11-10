@@ -382,7 +382,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                 if(verb!=Verb.START)return;
                 if(!checked.eligible()){publish(entry,checked.refusal());return;}
                 synchronized(entries){if(closed||entry.reservationAttempted)return;entry.reservationAttempted=true;}
-                var attempt=router.reserveAttempt(request(entry.original));var reply=attempt.reply();
+                var attempt=router.reserveAttempt(request(entry.original), entry.latest == null);var reply=attempt.reply();
                 synchronized(entries){
                     if(attempt.dispatched())entry.receiver=attempt.receiver();
                     // These router outcomes positively exclude a retained original allocation.

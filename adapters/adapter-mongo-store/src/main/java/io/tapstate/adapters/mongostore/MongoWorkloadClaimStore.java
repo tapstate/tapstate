@@ -116,6 +116,28 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return updated == null ? WorkloadClaimAttempt.refused(existing.claim()) : WorkloadClaimAttempt.acquired(read(updated));
     }
 
+    Optional<WorkloadClaim> acquireNewValidationExecution(WorkloadClaim previous, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        var key = previous.key();
+        validate(key, owner, topologyRevision, ttl);
+        if (key.type() != io.tapstate.spi.store.WorkloadClaimType.VALIDATION || session == null || !strict)
+            throw new IllegalStateException("validation acquisition needs the original CACHE transaction");
+        if (previous.claimGeneration() == Long.MAX_VALUE || previous.executionGeneration() == Long.MAX_VALUE)
+            throw MongoCacheWorkloadClaimStore.claimFenced();
+        long claim = previous.claimGeneration() + 1;
+        long execution = previous.executionGeneration() + 1;
+        var filter = expected(previous).append("topologyRevision", previous.topologyRevision());
+        if (!owner.equals(previous.owner()))
+            filter.append("$expr", new Document("$lte", List.of("$leaseUntil", "$$NOW")));
+        var next = new Document("ownerNodeId", owner.nodeId()).append("ownerBootId", owner.bootId())
+                .append("claimGeneration", claim).append("executionGeneration", execution)
+                .append("topologyRevision", topologyRevision).append("leaseUntil", leaseUntil(ttl))
+                .append("contextExecutionGeneration", execution).append("executionClaimGeneration", claim)
+                .append("executionNodeIds", List.of(owner.nodeId()))
+                .append("failureClaimGeneration", 0L).append("failureAfterMemberLoss", false);
+        return Optional.ofNullable(findOneAndUpdate(filter, List.of(new Document("$set", next)), false)).map(this::read);
+    }
+
     @Override
     public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         Objects.requireNonNull(expected, "expected");

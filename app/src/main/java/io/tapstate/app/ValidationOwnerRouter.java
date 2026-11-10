@@ -85,6 +85,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
     @FunctionalInterface interface Local {
         /** CAPACITY/REDIRECT must prove no claim, ticket, Job or unknown allocation was retained. */
         Result reserve(Request request);
+        default Result reserve(Request request, boolean manualFull) { return reserve(request); }
         /** Passive lookup only. Missing original state never authorizes preparation or a new reservation. */
         default LocalReceipt receipt(Request request){return LocalReceipt.unknown();}
     }
@@ -208,7 +209,9 @@ final class ValidationOwnerRouter implements AutoCloseable {
                 ||!claim.owner().bootId().equals(original.bootId())||claim.executionGeneration()<original.executionGeneration()))return OwnerLease.UNKNOWN;
         return value.leased()?OwnerLease.LIVE:OwnerLease.NOT_LIVE;
     }
-    Attempt reserveAttempt(Request request) {
+    Attempt reserveAttempt(Request request) { return reserveAttempt(request, false); }
+
+    Attempt reserveAttempt(Request request, boolean manualFull) {
         Objects.requireNonNull(request); var before = roster(); long deadline = nanoTime.getAsLong() + timeoutNanos;
         var tried = new HashSet<Identity>();
         Attempt lastCapacity = null;
@@ -236,8 +239,8 @@ final class ValidationOwnerRouter implements AutoCloseable {
                 tried.add(selected);
                 var destination = before.members.get(selected.node);
                 var attempt = before.members.size() == 1 && destination.localMember()
-                        ? invokeLocal(request, selected, before.revision)
-                        : invoke(request, selected, before.revision, destination, deadline);
+                        ? invokeLocal(request, selected, before.revision, manualFull)
+                        : invoke(request, selected, before.revision, destination, deadline, manualFull);
                 var reply=attempt.reply();
                 var retained = attempt.dispatched() ? attempt : lastCapacity;
                 try { requireActive(); if (!before.same(roster())) return uncertain(request,selected,reply.reasonCode(),retained); }
@@ -267,21 +270,21 @@ final class ValidationOwnerRouter implements AutoCloseable {
         return new Attempt(unknown(request,receiver==null?target:receiver.identity(),reason),receiver,retained!=null&&retained.dispatched());
     }
 
-    private Attempt invokeLocal(Request request, Identity target, long revision) {
+    private Attempt invokeLocal(Request request, Identity target, long revision, boolean manualFull) {
         // The entry already owns a paid control worker. Local storage preparation can outlast
         // the member RPC deadline, so reserve locally under the same identity and roster checks.
         Receiver receiver = null;
         try {
             receiver = probe(target, revision);
             if (receiver == null) return new Attempt(rejected(request, target, null), null, false);
-            return new Attempt(receive(request, target, revision), receiver, true);
+            return new Attempt(receive(request, target, revision, manualFull), receiver, true);
         } catch (CancellationException | RejectedExecutionException | HazelcastInstanceNotActiveException
                 | TargetDisconnectedException | TargetNotMemberException | OperationTimeoutException unavailable) {
             return new Attempt(unknown(request, target, null), receiver, receiver != null);
         }
     }
 
-    private Attempt invoke(Request request, Identity target, long revision, Member destination, long deadline) {
+    private Attempt invoke(Request request, Identity target, long revision, Member destination, long deadline, boolean manualFull) {
         Receiver verified=null;boolean dispatched=false;
         try {
             long remaining = deadline - nanoTime.getAsLong(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
@@ -292,7 +295,7 @@ final class ValidationOwnerRouter implements AutoCloseable {
             verified=receiver;
             remaining = deadline - nanoTime.getAsLong(); if (remaining <= 0) return new Attempt(unknown(request,target,null),verified,dispatched);
             dispatched=true;
-            var future = executor.submitToMember(new Call(request, target, revision, receiver.incarnation()), destination);
+            var future = executor.submitToMember(new Call(request, target, revision, receiver.incarnation(), manualFull), destination);
             var reply = future.get(remaining, TimeUnit.NANOSECONDS);
             if (reply == null || !request.command().equals(reply.command()) || !target.equals(reply.receiver())) return new Attempt(unknown(request,target,null),verified,dispatched);
             return new Attempt(reply,verified,dispatched);
@@ -346,13 +349,13 @@ final class ValidationOwnerRouter implements AutoCloseable {
         return new Receipt(new Reply(value.outcome(),request.command(),expected,owner==null?0:owner.claimGeneration(),
                 owner==null?0:owner.executionGeneration(),owner==null?0:owner.topologyRevision(),value.reasonCode()),result.disposed());
     }
-    private Reply receive(Request request, Identity expected, long revision) {
+    private Reply receive(Request request, Identity expected, long revision, boolean manualFull) {
         boolean entered = false;
         try {
             var current = roster();
             if (current.revision != revision || !expected.matches(member.getCluster().getLocalMember())
                     || !expected.equals(current.identities.get(expected.node))) return rejected(request, expected, null);
-            entered = true; var result = Objects.requireNonNull(local.reserve(request));
+            entered = true; var result = Objects.requireNonNull(local.reserve(request, manualFull));
             requireActive(); if (!current.same(roster())) return unknown(request, expected, result.reasonCode());
             var owner = result.owner();
             if (owner != null && (!owner.clusterId().equals(current.cluster) || !owner.pipelineId().equals(request.pipeline())
@@ -422,15 +425,20 @@ final class ValidationOwnerRouter implements AutoCloseable {
         private static final long serialVersionUID = 1L;
         private final Request request; private final Identity expected; private final long revision;
         private final UUID receiver;
+        private final boolean manualFull;
         private transient HazelcastInstance member;
         Call(Request request, Identity expected, long revision, UUID receiver) {
+            this(request, expected, revision, receiver, false);
+        }
+        Call(Request request, Identity expected, long revision, UUID receiver, boolean manualFull) {
             this.request = request; this.expected = expected; this.revision = revision; this.receiver = Objects.requireNonNull(receiver);
+            this.manualFull = manualFull;
         }
         @Override public void setHazelcastInstance(HazelcastInstance member) { this.member = member; }
         @Override public Reply call() {
             Object receiver = member.getUserContext().get(CONTEXT);
             return receiver instanceof ValidationOwnerRouter router && this.receiver.equals(router.incarnation)
-                    ? router.receive(request, expected, revision) : rejected(request, expected, null);
+                    ? router.receive(request, expected, revision, manualFull) : rejected(request, expected, null);
         }
     }
     static final class Probe implements Callable<Receiver>, Serializable, HazelcastInstanceAware {

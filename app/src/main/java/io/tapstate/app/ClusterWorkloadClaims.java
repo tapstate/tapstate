@@ -67,6 +67,14 @@ final class ClusterWorkloadClaims {
         return call(()->Optional.of(store.acquire(key, owner, topologyRevision, ttl)));
     }
 
+    Optional<WorkloadClaim> acquireValidationExecution(
+            WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
+        var current = membership.committed();
+        if (!membership.businessEligible() || current == null || current.revision() != topologyRevision)
+            return Optional.empty();
+        return call(() -> store.acquireValidationExecution(key, owner, topologyRevision, ttl));
+    }
+
     Optional<WorkloadClaimAttempt> acquirePipeline(PipelineIntentScope scope, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
         return membership.businessEligible()

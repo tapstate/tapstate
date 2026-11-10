@@ -34,6 +34,12 @@ public interface WorkloadClaimStore {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 
+    /** Claims an existing validation tenure and advances its execution in the same transaction. */
+    default Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /** Renews only the exact owner and generation while its current lease is still live. */
     Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl);
 

@@ -46,16 +46,26 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
         this.validation = validation;
     }
 
-    @Override public Join join(Run run) {
+    @Override public Join join(Run run) { return join(run, ValidationRunState.STARTING); }
+
+    @Override public java.util.Optional<Join> joinRunning(Run run) {
         Objects.requireNonNull(run);
-        if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
-        requireAdmission(run, false);
+        if (validation == null || run.snapshot() == null || run.snapshot().method() != io.tapstate.core.validation.ValidationMethod.COUNT)
+            return java.util.Optional.empty();
+        return java.util.Optional.of(join(run, ValidationRunState.RUNNING));
+    }
+
+    private Join join(Run run, ValidationRunState initialState) {
+        Objects.requireNonNull(run);
+        requireJoinAdmission(run, initialState);
         var joined = transaction(run.identity().owner(), true, session -> {
             var control = control(session, run.identity().owner().pipelineId());
             var existing = row(session, run);
             if (existing != null) {
                 if (existing.getBoolean("retired") || state(existing).terminal() || control.getBoolean("closed")) return Join.GENERATION_CLOSED;
-                return current(control, run) && slot(control, run) ? Join.ALREADY_JOINED : Join.GENERATION_CLOSED;
+                return current(control, run) && slot(control, run)
+                        && (initialState == ValidationRunState.STARTING || state(existing) == initialState)
+                        ? Join.ALREADY_JOINED : Join.GENERATION_CLOSED;
             }
             var slots = slots(control); String key = slotKey(run.identity());
             if (slots.containsKey(key)) {
@@ -79,12 +89,20 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
             if (slots.size() == MAX_ACTIVE_RUNS || control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
             slots.put(key, runId(run)); control.put("retainedRuns", control.getLong("retainedRuns") + 1);
             writeControl(session, control);
-            rows.insertOne(session, record(run, ValidationRunState.STARTING, false));
+            rows.insertOne(session, record(run, initialState, false));
             return Join.JOINED;
         });
+        requireJoinAdmission(run, initialState);
+        return joined;
+    }
+
+    private void requireJoinAdmission(Run run, ValidationRunState initialState) {
+        if (initialState == ValidationRunState.RUNNING) {
+            validation.requireBornStart(run.admission());
+            return;
+        }
         requireAdmission(run, false);
         if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
-        return joined;
     }
 
     private Document record(Run run, ValidationRunState state, boolean retired) {

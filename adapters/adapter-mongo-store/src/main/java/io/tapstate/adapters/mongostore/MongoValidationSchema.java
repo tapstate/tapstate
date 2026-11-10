@@ -19,7 +19,22 @@ final class MongoValidationSchema {
     static final List<SystemCollections> CONFIG = List.of(SystemCollections.VALIDATION_TASKS,
             SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES);
     static final List<SystemCollections> CACHE = List.of(SystemCollections.VALIDATION_RUNS);
+    private static final ThreadLocal<IdentityHashMap<MongoDatabase, VerifiedStructure>> STARTUP = new ThreadLocal<>();
+
+    private record VerifiedStructure(boolean configuration, Document marker, Document identity) {}
+
     private MongoValidationSchema() {}
+
+    /** Reuses physical structure checks only inside one synchronous startup phase. */
+    static <T> T duringStartup(java.util.function.Supplier<T> work) {
+        if (STARTUP.get() != null) return work.get();
+        STARTUP.set(new IdentityHashMap<>());
+        try {
+            return work.get();
+        } finally {
+            STARTUP.remove();
+        }
+    }
 
     static Document marker(String operation, String phase, long initialized, CacheBusinessScope scope) {
         var result = new Document("formatVersion", 1).append("operationId", operation).append("phase", phase).append("initializedPipelines", initialized)
@@ -169,7 +184,13 @@ final class MongoValidationSchema {
     static void requireReady(MongoDatabase database, boolean configuration) {
         var table = configuration ? SystemCollections.SCHEMA_MIGRATIONS : SystemCollections.CACHE_SCHEMA_MIGRATIONS;
         var schema = table.on(database).find(new Document("_id", configuration ? "config" : "business")).first();
-        if (configuration && !configurationHasValidation(database, schema)) throw unreadable("version");
+        var startup = STARTUP.get();
+        var previous = startup == null ? null : startup.get(database);
+        if (previous != null && (configuration != previous.configuration() || !previous.marker().equals(schema))) {
+            startup.remove(database);
+            throw refused();
+        }
+        if (configuration && previous == null && !configurationHasValidation(database, schema)) throw unreadable("version");
         var marker = configuration ? requireConfiguration(schema, "READY") : requireVersionTwo(schema, "READY");
         if (configuration && Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
         var identity = (configuration ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.CACHE_IDENTITY)
@@ -179,7 +200,28 @@ final class MongoValidationSchema {
                 || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !configuration && (!Long.valueOf(original.bindingVersion()).equals(identity.get("bindingVersion"))
                 || !original.cacheIncarnation().equals(identity.get("cacheIncarnation")))) throw unreadable("identity");
-        if (!configuration) verify(database, CACHE);
+        if (startup == null) {
+            if (!configuration) verify(database, CACHE);
+            return;
+        }
+        var scopeIdentity = new Document("clusterId", identity.get("clusterId"))
+                .append("layoutId", identity.get("layoutId")).append("bindingVersion", identity.get("bindingVersion"))
+                .append("cacheIncarnation", identity.get("cacheIncarnation"));
+        if (previous != null && !previous.identity().equals(scopeIdentity)) {
+            startup.remove(database);
+            throw refused();
+        }
+        if (previous == null) {
+            if (!configuration) verify(database, CACHE);
+            startup.put(database, new VerifiedStructure(configuration, new Document(schema), scopeIdentity));
+        }
+    }
+
+    static boolean startupQueryIndexes(MongoDatabase database) {
+        var startup = STARTUP.get();
+        var proof = startup == null ? null : startup.get(database);
+        return proof != null && proof.configuration()
+                && queryIndexVersion(configurationMarker(proof.marker())) == CURRENT_QUERY_INDEX_VERSION;
     }
 
     static void requireAbsent(MongoDatabase database, List<SystemCollections> tables) {

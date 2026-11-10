@@ -94,6 +94,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             return store.acquire(key,owner,topologyRevision,ttl);
         });
     }
+    @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
+        requireKey(key);
+        if (key.type() != WorkloadClaimType.VALIDATION || validation == null || validation.closing()) throw claimFenced();
+        return transaction(true, (store, session) -> {
+            var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
+                    .find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            requireValidationClaim(session, row, key);
+            return store.acquireNewValidationExecution(store.decodeStored(row), owner, topologyRevision, ttl);
+        });
+    }
+
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);

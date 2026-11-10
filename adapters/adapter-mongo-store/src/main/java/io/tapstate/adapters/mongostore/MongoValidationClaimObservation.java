@@ -16,7 +16,7 @@ import java.util.Set;
 
 /** Bounded read snapshots for task status. The observations never grant storage or run authority. */
 final class MongoValidationClaimObservation {
-    record Configuration(MongoValidationPreparationFacts.Subject subject, long revision, Document binding,
+    record Configuration(MongoValidationPreparationFacts.State preparation, Document binding,
                          Document setup, Document recovery, Document marker, String pipelineHash,
                          io.tapstate.spi.store.PipelineStateMapping pipelineState) {
         @Override public String toString() { return "ValidationClaimConfiguration[redacted]"; }
@@ -39,9 +39,9 @@ final class MongoValidationClaimObservation {
         this.pipeline = pipeline;
     }
 
-    Configuration configuration() { return configuration(false); }
+    Configuration configuration(boolean routing) { return configuration(false, routing); }
 
-    private Configuration configuration(boolean recheck) {
+    private Configuration configuration(boolean recheck, boolean routing) {
         var row = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(config).aggregate(List.of(
                 match("cluster"),
                 lookup(SystemCollections.STORAGE_BINDING, "binding", "cluster", recheck ? BINDING_WITNESS : null),
@@ -65,16 +65,17 @@ final class MongoValidationClaimObservation {
         if (!(mapping.get("phase") instanceof String phase) || !Set.of("ACTIVE", "REBUILDING").contains(phase)
                 || !(mapping.get("validationPreparation") instanceof Document preparation)) throw fenced();
         var state = MongoValidationPreparationFacts.decode(preparation, scope.clusterId(), pipeline);
-        if (state.phase() != MongoValidationPreparationFacts.Phase.COMPLETE || state.closingOperationId() != null
-                || !scope.equals(state.subject().scope())) throw fenced();
-        return new Configuration(state.subject(), state.revision(), one(row, "binding", "cluster"),
+        if (state.closingOperationId() != null || state.phase() == MongoValidationPreparationFacts.Phase.CLOSED
+                || !routing && state.phase() != MongoValidationPreparationFacts.Phase.COMPLETE
+                || state.subject() != null && !scope.equals(state.subject().scope())) throw fenced();
+        return new Configuration(state, one(row, "binding", "cluster"),
                 one(row, "setup", "cluster"), one(row, "recovery", "cluster"), marker, hash,
                 MongoPipelineStateMappings.decode(pipeline, mapping));
     }
 
-    boolean stillCurrent(Configuration original) {
-        var current = configuration(true);
-        return original.subject().equals(current.subject()) && original.revision() == current.revision()
+    boolean stillCurrent(Configuration original, boolean routing) {
+        var current = configuration(true, routing);
+        return original.preparation().equals(current.preparation())
                 && original.pipelineState().equals(current.pipelineState()) && original.pipelineHash().equals(current.pipelineHash())
                 && original.marker().equals(current.marker())
                 && matches(original.binding(), current.binding(), BINDING_WITNESS)

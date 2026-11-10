@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.*;
 import io.tapstate.spi.store.*;
@@ -154,7 +155,9 @@ final class NativeValidationRuns implements AutoCloseable {
                             }
                             if(expired)return;
                             if(shared!=null&&!lifecycle.status().retired())shared.quota.reconcileLimit();
-                            observed=lifecycle.advance();
+                            observed=observed.state()==ValidationRunState.STARTING
+                                    ? MongoConfigurationDomain.duringValidationStartup(lifecycle::advance)
+                                    : lifecycle.advance();
                             if(observed.state()==ValidationRunState.RUNNING&&!sealed.get()&&delays!=null)applySavedDelay();
                         });
                     }

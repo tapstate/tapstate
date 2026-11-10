@@ -851,6 +851,55 @@ class MongoValidationSchemaIT {
         }
     }
 
+    @Test void validationStartupReusesStructureOnlyWhileItsSchemaProofIsCurrent() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                MongoConfigurationDomain.duringValidationStartup(() -> {
+                    f.configuration.validationTasks(() -> {});
+                    assertThat(commands).contains("listIndexes");
+                    commands.clear();
+                    f.configuration.validationTasks(() -> {});
+                    assertThat(commands).containsExactly("find", "find");
+
+                    SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                            new Document("$set", new Document("validation.operationId", UUID.randomUUID().toString())));
+                    commands.clear();
+                    assertThatThrownBy(() -> f.configuration.validationTasks(() -> {})).isInstanceOf(TapstateException.class);
+                    assertThat(commands).containsExactly("find");
+                    return null;
+                });
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
+            assertThatThrownBy(() -> MongoConfigurationDomain.duringValidationStartup(() -> f.configuration.validationTasks(() -> {})))
+                    .isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void validationRoutingReadsAnUnpreparedPipelineWithoutPreparingIt() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var node = WorkloadClaimFence.from(f.node("node"));
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb);
+            var key = new Document("_id", "flow0");
+            var before = mappings.find(key).first();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                assertThat(f.configuration.routeValidationClaim("flow0", f.scope, f.cache, node, () -> {})).isEmpty();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate");
+            assertThat(mappings.find(key).first()).isEqualTo(before);
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+        }
+    }
+
     @Test void validationOwnerObservationUsesThreeCommandsAcrossIndependentDatabases() {
         try (var f = new Fixture(1)) {
             f.upgrade();
@@ -867,6 +916,19 @@ class MongoValidationSchemaIT {
                 var observed = f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}).orElseThrow();
                 assertThat(observed.claim()).isEqualTo(running);
                 assertThat(observed.leased()).isTrue();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate", "aggregate");
+
+            commands.clear();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                assertThat(f.configuration.routeValidationClaim("flow0", f.scope, f.cache,
+                        WorkloadClaimFence.from(node), () -> {})).hasValueSatisfying(value -> {
+                    assertThat(value.claim()).isEqualTo(running);
+                    assertThat(value.leased()).isTrue();
+                });
             } finally {
                 MongoCommandObservation.CURRENT.remove();
             }

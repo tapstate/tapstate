@@ -243,10 +243,15 @@ class MongoValidationTaskStoreIT {
             var pending = java.util.concurrent.ConcurrentHashMap.<Integer>newKeySet();
             var listener = new com.mongodb.event.CommandListener() {
                 @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
-                    if (!event.getCommandName().equals("find") || !event.getDatabaseName().equals(f.configDb.getName())) return;
-                    var command = event.getCommand(); var projection = command.getDocument("projection", new org.bson.BsonDocument());
-                    if (command.getString("find").getValue().equals(SystemCollections.SOURCES.collectionName()) && projection.containsKey("contentHash")
-                            && once.compareAndSet(true, false)) pending.add(event.getRequestId());
+                    if (!event.getCommandName().equals("aggregate") || !event.getDatabaseName().equals(f.configDb.getName())) return;
+                    var command = event.getCommand();
+                    if (!command.getString("aggregate").getValue().equals(SystemCollections.CONFIGURATION_VERSION.collectionName())) return;
+                    boolean dependencyHeaders = command.getArray("pipeline").stream().map(org.bson.BsonValue::asDocument)
+                            .filter(stage -> stage.containsKey("$lookup")).map(stage -> stage.getDocument("$lookup"))
+                            .anyMatch(lookup -> lookup.getString("from").getValue().equals(SystemCollections.SOURCES.collectionName())
+                                    && lookup.getArray("pipeline").stream().map(org.bson.BsonValue::asDocument)
+                                            .anyMatch(step -> step.containsKey("$project") && step.getDocument("$project").containsKey("bytes")));
+                    if (dependencyHeaders && once.compareAndSet(true, false)) pending.add(event.getRequestId());
                 }
                 @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
                     if (!pending.remove(event.getRequestId())) return;
@@ -575,6 +580,37 @@ class MongoValidationTaskStoreIT {
             var two = workers.submit(() -> { gate.await(); return capacityCreate(other.validationTasks(() -> {}), b, "validation.clusterTaskBytes"); }); gate.countDown();
             assertThat(List.of(one.get(30, TimeUnit.SECONDS), two.get(30, TimeUnit.SECONDS))).containsExactlyInAnyOrder(true, false);
             assertThat(f.collection().countDocuments()).isEqualTo(perCluster); assertThat(f.configuration.configurationRevision()).isEqualTo(before + 1);
+        }
+    }
+
+    @Test void reservingAndOpeningPublishesOneReportBeforeJoiningCache() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow");
+            assertThat(f.tasks.create(create)).isEqualTo(Write.APPLIED);
+            var saved = f.tasks.read("flow", create.task().taskId()).orElseThrow();
+            var initial = f.reserve(saved, "first");
+            var admissions = initial.access().admissions();
+            assertThat(admissions.close(initial.start())).isEqualTo(ValidationReportAdmission.Closure.CLOSED);
+            var snapshot = new ValidationRunSpec(saved.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var first = initial.start().run();
+            var identity = new ValidationRunIdentity(first.owner(), first.taskId(), "next", snapshot.mode(),
+                    snapshot.fingerprint(), snapshot.task().mappingRevision(), snapshot.task().comparisonRulesVersion());
+            var next = new ValidationReportAdmission.Start(saved.task(), saved.revision(), 2, UUID.randomUUID().toString(), identity);
+            var open = new ValidationReportAdmission.Open(next, snapshot);
+            assertThat(admissions.reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.RESERVED);
+            var run = new ValidationControlStore.Run(identity, 1, next, snapshot);
+            assertThat(initial.access().control().read(first.owner(), run)).isEmpty();
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            assertThat(reports.countDocuments()).isEqualTo(1);
+            assertThat(reports.find(new Document("_id", MongoValidationAdmissionStore.reportId(identity))).first())
+                    .containsEntry("closed", false);
+            assertThat(admissions.reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.DUPLICATE);
+            assertThat(reports.countDocuments()).isEqualTo(1);
+            assertThat(f.tasks.read("flow", saved.task().taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(3);
+            var control = initial.access().control();
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.JOINED);
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.ALREADY_JOINED);
+            assertThat(control.read(first.owner(), run).orElseThrow().state()).isEqualTo(ValidationRunState.RUNNING);
         }
     }
 

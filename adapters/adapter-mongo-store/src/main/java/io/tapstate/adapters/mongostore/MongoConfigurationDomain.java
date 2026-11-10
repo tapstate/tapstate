@@ -1153,9 +1153,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     /** Configuration authoring remains CONFIG-only and never requires a running validation owner. */
     public io.tapstate.spi.store.ValidationTaskStore validationTasks(Runnable local) {
+        return validationTaskDefinitions(local);
+    }
+
+    public record BoundValidationInputs(io.tapstate.spi.store.ValidationTaskStore.Inputs inputs, String defaultSourceId) {}
+
+    public Optional<BoundValidationInputs> boundValidationInputs(io.tapstate.spi.store.ValidationReportAdmission.Task task,
+            long revision, Runnable local) {
+        return validationTaskDefinitions(local).boundInputs(task, revision, bindings);
+    }
+
+    private MongoValidationAdmissionStore.Definitions validationTaskDefinitions(Runnable local) {
         requireOpen(); Objects.requireNonNull(local).run();
         StoreIo.run(() -> MongoValidationSchema.requireReady(connection.database(), true));
-        return MongoValidationAdmissionStore.taskDefinitions(connection.client(), connection.database(), clusterId,
+        return MongoValidationAdmissionStore.nativeTaskDefinitions(connection.client(), connection.database(), clusterId,
                 () -> { requireOpen(); local.run(); }, artifacts);
     }
 
@@ -1169,6 +1180,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public java.util.UUID currentValidationGeneration(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected, Runnable local) {
         requireOpen(); Objects.requireNonNull(local).run();
         return validationPreparations().guardedBy(local).currentGeneration(pipeline, Objects.requireNonNull(expected));
+    }
+
+    /** Scoped physical readiness reuse. Durable fences still run at each mutation boundary. */
+    public static <T> T duringValidationStartup(java.util.function.Supplier<T> work) {
+        return MongoValidationSchema.duringStartup(Objects.requireNonNull(work));
     }
 
     /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
@@ -1186,18 +1202,36 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     /** Observes a lease for task status without issuing a preparation or obtaining mutation authority. */
     public java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(String pipeline,
             io.tapstate.spi.store.CacheBusinessScope scope, MongoCacheDomain cache, Runnable local) {
+        return observeValidationClaim(pipeline, scope, cache, local, false,
+                () -> loadValidationAccess(pipeline, scope, cache, local));
+    }
+
+    /** Selects a candidate without issuing a preparation on snapshot-capable stores. */
+    public java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> routeValidationClaim(String pipeline,
+            CacheBusinessScope scope, MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {
+        return observeValidationClaim(pipeline, scope, cache, local, true,
+                () -> prepareValidationAccess(pipeline, scope, cache, node, local));
+    }
+
+    private java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(String pipeline,
+            CacheBusinessScope scope, MongoCacheDomain cache, Runnable local, boolean routing,
+            java.util.function.Supplier<ValidationAccess> legacyAccess) {
         var observation = new MongoValidationClaimObservation(connection.database(), bindings, scope, pipeline);
         return StoreIo.call(() -> {
             requireOpen(); local.run();
             if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client()) || cache.lacksSnapshotRead()) {
-                var access = loadValidationAccess(pipeline, scope, cache, local);
-                return access.claims().read(io.tapstate.spi.store.ValidationClaims.key(scope.clusterId(), pipeline));
+                return legacyAccess.get().claims().read(io.tapstate.spi.store.ValidationClaims.key(scope.clusterId(), pipeline));
             }
-            var original = observation.configuration();
+            var original = observation.configuration(routing);
             cache.requireRecoveryTarget(observation.target(original));
-            var reading = cache.observeValidationClaim(observation, original.subject());
+            // A node cannot claim validation until preparation is COMPLETE.
+            var reading = original.preparation().phase() == MongoValidationPreparationFacts.Phase.COMPLETE
+                    ? cache.observeValidationClaim(observation, original.preparation().subject())
+                    : java.util.Optional.<io.tapstate.spi.store.WorkloadClaimReading>empty();
             local.run(); requireOpen();
-            return observation.stillCurrent(original) ? reading : java.util.Optional.empty();
+            if (observation.stillCurrent(original, routing)) return reading;
+            if (routing) throw MongoValidationPreparations.fenced();
+            return java.util.Optional.empty();
         });
     }
 

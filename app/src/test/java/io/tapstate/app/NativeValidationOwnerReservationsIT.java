@@ -113,7 +113,7 @@ class NativeValidationOwnerReservationsIT {
 
     @Test void preparedOwnerObservationDoesNotPrepareOrWriteEitherStorageDomain() {
         try(var f=new Fixture()){
-            f.owners.readOwner("flow");
+            f.configuration.prepareValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(f.node), () -> {});
             var before=storedRows(f);
             assertThat(f.owners.readPreparedOwner("flow")).isPresent();
             assertThat(storedRows(f)).isEqualTo(before);
@@ -227,6 +227,23 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
+    @Test void countExecutionAcquisitionCannotTakeALiveForeignLeaseOrReuseAGeneration() {
+        try (var f = new Fixture()) {
+            var access = f.configuration.prepareValidationAccess("flow", f.scope, f.cache,
+                    WorkloadClaimFence.from(f.node), () -> {});
+            var claims = access.claims();
+            var key = ValidationClaims.key("cluster", "flow");
+            var original = claims.acquireValidationExecution(key, f.node.owner(), 1, Duration.ofSeconds(30)).orElseThrow();
+            assertThat(claims.acquireValidationExecution(key, new WorkloadOwner("other", "other-boot"), 1,
+                    Duration.ofSeconds(30))).isEmpty();
+            var successor = claims.acquireValidationExecution(key, f.node.owner(), 1, Duration.ofSeconds(30)).orElseThrow();
+            assertThat(successor.claimGeneration()).isEqualTo(original.claimGeneration() + 1);
+            assertThat(successor.executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+            assertThat(claims.release(original)).isFalse();
+            assertThat(claims.read(key)).hasValueSatisfying(value -> assertThat(value.claim()).isEqualTo(successor));
+        }
+    }
+
     @Test void aProvenNewPipelineLifetimeUsesNewPreparationWithoutRestartingTheMemberContext() {
         try (var f = new Fixture()) {
             var oldRequest = f.request("FULL", 1); var old = f.owners.reserve(oldRequest);
@@ -241,6 +258,11 @@ class NativeValidationOwnerReservationsIT {
                 assertThat(notes.origin()).isEmpty(); notes.completeAfterVerifiedRelease();
             }
             retirements.complete(receipt); f.configuration.artifacts().create(definition);
+            var mappings = f.raw.getDatabase(f.configName).getCollection("operator_generations");
+            var flow = new Document("_id", "flow");
+            var unassigned = mappings.find(flow).first();
+            assertThat(f.owners.reserve(oldRequest).outcome()).isNotEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            assertThat(mappings.find(flow).first()).isEqualTo(unassigned);
             var task = new ValidationReportAdmission.Task("cluster", "flow", "replacement-task", UUID.randomUUID());
             assertThat(f.tasks.create(new ValidationTaskStore.Create(task, f.comparison, ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1000), UUID.randomUUID())))
                     .isEqualTo(ValidationTaskStore.Write.APPLIED);
@@ -311,7 +333,7 @@ class NativeValidationOwnerReservationsIT {
             for (String pipeline : List.of("flow", "second", "third")) {
                 if (!pipeline.equals("flow")) f.configuration.artifacts().create(new PipelineResource(pipeline, null, List.of(SourceRef.spec("input", false)), null, null,
                         new ServeBlock.Inline("serving", FromRef.literal("orders"), List.of(new SyncElement("out", "views", null, null, null)), null, null), null, null));
-                assertThat(f.owners.readOwner(pipeline).orElseThrow().leased()).isFalse();
+                assertThat(f.owners.readOwner(pipeline)).isEmpty();
             }
         }
     }

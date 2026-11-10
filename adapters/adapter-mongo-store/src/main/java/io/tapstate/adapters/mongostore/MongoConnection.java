@@ -72,6 +72,7 @@ public final class MongoConnection implements AutoCloseable {
     private final boolean strictStorage;
     private final boolean userAtlas;
     private MongoClient client;
+    private MongoDatabase database;
     private String databaseName;
     private SourceConfigKeyringHandle sourceConfigKeyring;
 
@@ -307,6 +308,7 @@ public final class MongoConnection implements AutoCloseable {
             opened.close();
             throw new TapstateException(StoreError.NOT_REPLICA_SET, Map.of("target", target), null);
         }
+        this.database = opened.getDatabase(databaseName);
         this.client = opened;
     }
 
@@ -378,7 +380,7 @@ public final class MongoConnection implements AutoCloseable {
             // bug. It crashes bare with a stack rather than being laundered into a coded diagnostic.
             throw new IllegalStateException("store connection not verified");
         }
-        return client.getDatabase(databaseName);
+        return database;
     }
 
     /**
@@ -630,6 +632,7 @@ public final class MongoConnection implements AutoCloseable {
         if (client != null) {
             client.close();
             client = null;
+            database = null;
         }
     }
 }

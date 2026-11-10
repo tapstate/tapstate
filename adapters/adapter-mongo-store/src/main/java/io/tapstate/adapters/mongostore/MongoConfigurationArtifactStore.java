@@ -244,24 +244,65 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
 
     /** Probe total stored bytes before materializing any selected resource body or decrypted secret. */
     Optional<Map<String, String>> validationInputsInTransaction(ClientSession session, Map<String, String> expected) {
-        var headers = versionsInTransaction(session, expected.keySet());
-        if (!headers.keySet().equals(expected.keySet()) || headers.entrySet().stream().anyMatch(entry -> !entry.getValue().hash().equals(expected.get(entry.getKey()))))
-            return Optional.empty();
-        requireValidationInputSize(session,expected.keySet());
+        if (expected.isEmpty() || expected.size() > 1024) throw unreadable("validation", "dependency-count");
         var requested = List.copyOf(expected.keySet());
-        var result = new LinkedHashMap<String, String>(); long characters = 0;
-        for (var collection : collections.values()) {
-            try (var rows = collection.find(session, new Document("_id", new Document("$in", requested))).batchSize(64).iterator()) {
-                while (rows.hasNext()) {
-                    var resource = decode(rows.next()); var canonical = WRITER.write(resource); characters += canonical.length();
-                    if (characters > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS) throw validationInputLimit();
-                    if (result.putIfAbsent(resource.id(), canonical) != null || !expected.get(resource.id()).equals(CanonicalHash.of(resource)))
-                        throw unreadable("validation", "input-version");
-                }
+        var headers = new LinkedHashMap<String, String>();
+        long storedBytes = 0;
+        var proof = validationInputRows(session, requested, true);
+        for (String kind : collections.keySet()) {
+            for (Document header : proof.getList(kind, Document.class)) {
+                if (!(header.get("_id") instanceof String id) || !expected.containsKey(id)
+                        || !kind.equals(header.get("kind")) || !(header.get("hash") instanceof String hash)
+                        || !hash.matches("[a-f0-9]{64}")) throw unreadable("validation", "dependency-version");
+                if (headers.putIfAbsent(id, hash) != null) throw unreadable(id, "cross-kind-identity");
+                if (!(header.get("bytes") instanceof Integer bytes) || bytes < 0) throw unreadable("validation", "input-size");
+                storedBytes += bytes;
+            }
+        }
+        if (!headers.equals(expected)) return Optional.empty();
+        if (storedBytes > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_STORED_BYTES) throw validationInputLimit();
+
+        var bodies = validationInputRows(session, requested, false);
+        var result = new LinkedHashMap<String, String>();
+        long characters = 0;
+        for (String kind : collections.keySet()) {
+            for (Document body : bodies.getList(kind, Document.class)) {
+                requireKind(body, kind);
+                var resource = decode(body);
+                var canonical = WRITER.write(resource);
+                characters += canonical.length();
+                if (characters > io.tapstate.spi.store.ValidationTaskStore.Inputs.MAX_CANONICAL_CHARACTERS) throw validationInputLimit();
+                if (result.putIfAbsent(resource.id(), canonical) != null || !CanonicalHash.of(resource).equals(expected.get(resource.id())))
+                    throw unreadable("validation", "input-version");
             }
         }
         if (!result.keySet().equals(expected.keySet())) throw unreadable("validation", "input-snapshot");
         return Optional.of(Map.copyOf(result));
+    }
+
+    private Document validationInputRows(ClientSession session, List<String> requested, boolean headersOnly) {
+        var stages = new ArrayList<Document>();
+        stages.add(new Document("$match", new Document("_id", ConfigurationVersion.ID)));
+        var selected = new Document("_id", 0);
+        for (var entry : collections.entrySet()) {
+            var pipeline = new ArrayList<Document>();
+            pipeline.add(new Document("$match", new Document("_id", new Document("$in", requested))));
+            if (headersOnly) {
+                pipeline.add(new Document("$project", new Document("kind", new Document("$cond",
+                        List.of(new Document("$eq", List.of("$kind", entry.getKey())), entry.getKey(), "")))
+                        .append("hash", new Document("$cond", List.of(
+                                new Document("$eq", List.of(new Document("$type", "$contentHash"), "string")),
+                                new Document("$substrCP", List.of("$contentHash", 0, 65)), "")))
+                        .append("bytes", new Document("$bsonSize", "$$ROOT"))));
+            }
+            stages.add(new Document("$lookup", new Document("from", entry.getValue().getNamespace().getCollectionName())
+                    .append("pipeline", pipeline).append("as", entry.getKey())));
+            selected.put(entry.getKey(), 1);
+        }
+        stages.add(new Document("$project", selected));
+        var rows = versions.aggregate(session, stages).first();
+        if (rows == null) throw unreadable("validation", "input-snapshot");
+        return rows;
     }
     /** Includes all bodies already retained by lazy discovery before decoding the next one. */
     private void requireValidationInputSize(ClientSession session,java.util.Collection<String> ids){
