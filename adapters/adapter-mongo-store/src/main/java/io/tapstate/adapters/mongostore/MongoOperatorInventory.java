@@ -43,25 +43,12 @@ final class MongoOperatorInventory {
         return decode(session, database, scope, root, true);
     }
 
-    /** The caller read and strictly validated this claim in the very same transaction attempt. */
-    static Document require(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document claim) {
-        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
-        Document root = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session,
-                new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first();
-        return decode(session, database, scope, root, true, true, java.util.Objects.requireNonNull(claim));
-    }
-
     private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root, boolean current) {
         return decode(session, database, scope, root, current, current);
     }
 
     private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root,
                                    boolean current, boolean requireCurrentPreparation) {
-        return decode(session, database, scope, root, current, requireCurrentPreparation, null);
-    }
-
-    private static Document decode(ClientSession session, MongoDatabase database, PipelineIntentScope scope, Document root,
-                                   boolean current, boolean requireCurrentPreparation, Document preparedClaim) {
         try {
             Set<String> expected = new HashSet<>(FIELDS);
             if (!current) expected.add("retirement");
@@ -75,9 +62,7 @@ final class MongoOperatorInventory {
             if (revision != (long) databases.size() + shapes.size() + placements.size()) throw unreadable(scope);
             if (requireCurrentPreparation) {
                 var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), io.tapstate.spi.store.WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
-                Document claim = preparedClaim == null
-                        ? SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first()
-                        : preparedClaim;
+                Document claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
                 if (claim == null || !(claim.get("pipelinePreparation") instanceof Document preparation)
                         || !preparationId.equals(preparation.get("preparationId"))) throw unreadable(scope);
             }

@@ -702,6 +702,45 @@ class ExecutionAuthorizationTest {
     }
 
     /** A run of `orders` submitted by node A, fenced by the generations the store handed it. */
+    @Test
+    void aStoreLeaseHeldUnderAReadingIsDroppedWhenTheReadingLosesTheClaimAndKeptWhileItHolds() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger dropped = new AtomicInteger();
+        io.tapstate.spi.store.LeasedStateStore store = dropped::incrementAndGet;
+        try (ExecutionAuthorization guard = guard(claims)) {
+            guard.require(fence);
+            guard.holdLease(fence, store);
+
+            // A refresh that finds the same live claim is no reason to prove the store's lease again.
+            nanos.addAndGet(WINDOW.toNanos());
+            guard.require(fence);
+            assertThat(dropped).hasValue(0);
+
+            // The claim runs out and another member takes it over; the next reading drops the lease.
+            claims.elapse(TTL.plusSeconds(1));
+            assertThat(ownership(NODE_B).permit("orders").granted()).isTrue();
+            nanos.addAndGet(WINDOW.toNanos());
+            assertThatThrownBy(() -> guard.require(fence)).isInstanceOf(TapstateException.class);
+            assertThat(dropped.get()).isPositive();
+        }
+        int beforeClose = dropped.get();
+        assertThat(beforeClose).isPositive();
+        java.lang.ref.Reference.reachabilityFence(store);
+    }
+
+    @Test
+    void closingTheGuardDropsEveryLeaseItHolds() {
+        ExecutionFence fence = submittedRun();
+        AtomicInteger dropped = new AtomicInteger();
+        io.tapstate.spi.store.LeasedStateStore store = dropped::incrementAndGet;
+        ExecutionAuthorization guard = guard(claims);
+        guard.require(fence);
+        guard.holdLease(fence, store);
+        guard.close();
+        assertThat(dropped).hasValue(1);
+        java.lang.ref.Reference.reachabilityFence(store);
+    }
+
     private ExecutionFence submittedRun() {
         PipelineActuationOwnership nodeA = ownership(NODE_A);
         assertThat(nodeA.permit("orders").granted()).isTrue();

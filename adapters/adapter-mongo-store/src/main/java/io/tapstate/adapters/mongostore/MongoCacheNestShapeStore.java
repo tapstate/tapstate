@@ -63,13 +63,10 @@ final class MongoCacheNestShapeStore implements NestShapeStore {
     }
 
     void requirePath(ClientSession session, OperatorPlacement placement) {
-        requirePath(session, placement, MongoOperatorInventory.require(session, access.database, access.scope));
-    }
-
-    void requirePath(ClientSession session, OperatorPlacement placement, Document inventory) {
         new MongoCacheMetadataStructure(target, access.rateRetention).verifyFacet(SystemCollections.CACHE_NEST_SHAPES);
         Document id = id(placement.stepId());
         Document row = SystemCollections.CACHE_NEST_SHAPES.on(target).find(session, new Document("_id", id)).first();
+        Document inventory = MongoOperatorInventory.require(session, access.database, access.scope);
         MongoOperatorInventory.requireShapeDatabase(inventory, target.getName(), placement.stepId());
         if (!MongoOperatorInventory.knowsShape(inventory, target.getName(), placement.stepId())
                 || row == null || !decode(row, id).contains(placement.pathId())) throw access.unreadable("nest-shape");

@@ -19,16 +19,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.Function;
-import java.util.function.BiFunction;
 
 /** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
 final class MongoCachePipelineAccess {
+    private static final String PIPELINE_SCOPE = "pipelineScope";
+    private static final String CLAIM_SCOPE_UNREADABLE = "pipeline-claim-scope";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     final MongoDatabase database;
     final PipelineIntentScope scope;
     private final MongoClient client;
-    private final MongoPipelineWrites writes;
     private final WorkloadClaimFence original;
     private final Runnable requireActive;
     private final boolean unpreparedModels;
@@ -51,21 +51,12 @@ final class MongoCachePipelineAccess {
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
-        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, new MongoPipelineWrites());
+        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null, java.util.Optional.empty(),null);
     }
-
-    MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
-            WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
-            io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, MongoPipelineWrites writes) {
-        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null,
-                java.util.Optional.empty(), null, writes);
-    }
-
     private MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, boolean unpreparedModels, WorkloadClaimFence originalNode,
-            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor,MongoConfigurationDomain.AuthoringModels authoringModels, MongoPipelineWrites writes) {
-        this.writes = Objects.requireNonNull(writes, "writes");
+            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor,MongoConfigurationDomain.AuthoringModels authoringModels) {
         this.unpreparedModels = unpreparedModels; this.originalNode = originalNode;
         this.authoringModels=authoringModels;
         this.authoringPredecessor = Objects.requireNonNull(authoringPredecessor);
@@ -79,12 +70,12 @@ final class MongoCachePipelineAccess {
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
-        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty(),null,new MongoPipelineWrites());
+        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty(),null);
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, MongoConfigurationDomain.AuthoringModels original,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
         return new MongoCachePipelineAccess(client, database, original.scope(), null,
-                active, retention, null, true, node, original.predecessor(),original,new MongoPipelineWrites());
+                active, retention, null, true, node, original.predecessor(),original);
     }
     void requireModelPin() { if (unpreparedModels) throw fenced(); }
 
@@ -92,40 +83,121 @@ final class MongoCachePipelineAccess {
 
     <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(true, action); }
 
-    private <T> T mutation(boolean mutation, java.util.function.Supplier<T> action) {
-        return mutation ? writes.call(scope.pipelineId(), requireActive, action) : action.get();
-    }
-
-
     private <T> T transaction(boolean observation, Function<ClientSession, T> action) {
         return transaction(observation, TRANSACTION, action);
     }
 
     private <T> T transaction(boolean observation, TransactionOptions options, Function<ClientSession, T> action) {
-        return transaction(observation, options, null, null, action);
-    }
-
-    private <T> T transaction(boolean observation, TransactionOptions options, SystemCollections operatorTable,
-            MongoDatabase operatorTarget, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
                         requireActive.run();
-                        T result;
-                        try (var metadata = MongoCollectionMetadata.operatorAttempt(database, operatorTarget, operatorTable)) {
-                            new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
-                                    .requireAdmissionState(session);
-                            if (observation) verifyStructures(); else verifyStateStructure();
-                            result = action.apply(session);
-                        }
+                        new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
+                                .requireAdmissionState(session);
+                        if (observation) verifyStructures(); else verifyStateStructure();
+                        T result = action.apply(session);
                         requireActive.run();
                         return result;
                     }, options);
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
+    }
+
+    /**
+     * A write under an already proved lease: one transaction holding the claim compare-and-set, the caller's
+     * own conditions and the action, with no admission, structure, state or inventory decoding. The
+     * compare-and-set is a real write to the claim document, so a takeover committing concurrently either
+     * conflicts with this transaction or leaves it matching nothing. The pipeline state's runtime write fence
+     * is not advanced: every ownership change it would catch also rewrites the claim document. Any failure,
+     * including a refused claim, propagates unchanged; the caller decides the lease is lost.
+     */
+    <T> T leasedWrite(LeasedClock committed, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    T written = session.withTransaction(() -> {
+                        requireActive.run();
+                        if (original == null || SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
+                                new Document("$inc", new Document("fencedPipelineWrites", 1L))).getMatchedCount() != 1) throw claimFenced();
+                        T result = action.apply(session);
+                        requireActive.run();
+                        return result;
+                    }, TRANSACTION);
+                    committed.observe(session);
+                    return written;
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+        });
+    }
+
+    /**
+     * A read under an already proved lease: no transaction and no preamble, read concern {@code majority}
+     * (set by the caller on the collection), in a causally consistent session that starts no earlier than
+     * {@code after}, the last write this store committed.
+     */
+    <T> T leasedRead(LeasedClock after, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            requireActive.run();
+            try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().causallyConsistent(true).build())) {
+                after.advance(session);
+                T result = action.apply(session);
+                requireActive.run();
+                return result;
+            }
+        });
+    }
+
+    /**
+     * The claim liveness half of a lease proof, inside the proof's transaction: the original claim is live
+     * and prepared under this scope. Answers how long its lease still runs on the store's own clock, in
+     * milliseconds, so the caller can count it down on its monotonic clock without reading a deadline.
+     */
+    long proveLease(ClientSession session) {
+        if (original == null) throw fenced();
+        MongoCacheWorkloadClaimStore.requireCollection(database);
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        Document row = table.find(session, liveClaim()).first();
+        if (row == null) throw claimFenced();
+        new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+        Document remaining = table.find(session, new Document("_id", row.get("_id")))
+                .projection(new Document("_id", 0).append("remaining", new Document("$subtract", List.of("$leaseUntil", "$$NOW")))).first();
+        if (remaining == null || !(remaining.get("remaining") instanceof Number millis)) throw claimFenced();
+        return Math.max(0L, millis.longValue());
+    }
+
+    private Document liveClaim() {
+        return WorkloadClaimDocuments.live(original)
+                .append(PIPELINE_SCOPE, MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+    }
+
+    /** The latest operation a store committed, so its next out-of-transaction read observes it. */
+    static final class LeasedClock {
+        private org.bson.BsonDocument clusterTime;
+        private org.bson.BsonTimestamp operationTime;
+
+        synchronized void observe(ClientSession session) {
+            org.bson.BsonDocument cluster = session.getClusterTime();
+            if (later(timestamp(cluster), timestamp(clusterTime))) clusterTime = cluster;
+            org.bson.BsonTimestamp operation = session.getOperationTime();
+            if (later(operation, operationTime)) operationTime = operation;
+        }
+
+        private static boolean later(org.bson.BsonTimestamp candidate, org.bson.BsonTimestamp known) {
+            return candidate != null && (known == null || candidate.compareTo(known) > 0);
+        }
+
+        synchronized void advance(ClientSession session) {
+            if (clusterTime != null) session.advanceClusterTime(clusterTime);
+            if (operationTime != null) session.advanceOperationTime(operationTime);
+        }
+
+        private static org.bson.BsonTimestamp timestamp(org.bson.BsonDocument cluster) {
+            return cluster == null ? null : cluster.getTimestamp("clusterTime");
+        }
     }
 
     <T> T metadataTransaction(SystemCollections table, boolean mutation, Function<ClientSession, T> action) {
@@ -182,30 +254,6 @@ final class MongoCachePipelineAccess {
                 new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()), requireActive).verifyRetired(session, retired);
     }
 
-    /** Reuses validation facts only inside this callback, including on every transaction retry. */
-    <T> T operatorTransaction(SystemCollections table, MongoDatabase target, boolean mutation,
-            BiFunction<ClientSession, Document, T> action) {
-        requireModelPin();
-        T result = mutation(mutation && table == SystemCollections.CACHE_NEST_STATE, () -> transaction(false, TRANSACTION,
-                table == SystemCollections.CACHE_NEST_STATE ? table : null, target, session -> {
-            PreparedState current = preparedState(session);
-            Document inventory = MongoOperatorInventory.require(session, database, scope, current.claim());
-            if (!database.getName().equals(target.getName())) {
-                String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
-                MongoOperatorInventory.requireDatabase(inventory, target.getName(), preparation, scope);
-            }
-            new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
-            if (mutation) {
-                // These writes remain real conflict fences in the same session as the payload.
-                proveClaim(session);
-                updateState(session, current.state(), new Document(), false);
-            }
-            return action.apply(session, inventory);
-        }));
-        requireActive.run();
-        return result;
-    }
-
     <T> T operatorPreparation(Function<ClientSession, T> action) {
         var local = TransactionOptions.builder().readConcern(ReadConcern.LOCAL).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
         return transaction(false, local, session -> {
@@ -245,22 +293,17 @@ final class MongoCachePipelineAccess {
     void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); }
 
     Document state(ClientSession session) {
-        return preparedState(session).state();
-    }
-
-    private PreparedState preparedState(ClientSession session) {
         Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session, new Document("_id", scope.pipelineId())).first();
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);
         if (!(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
                 || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
-        return new PreparedState(state, requirePreparedClaim(session));
+        requirePreparedClaim(session);
+        return state;
     }
 
-    private record PreparedState(Document state, Document claim) { }
-
-    private Document requirePreparedClaim(ClientSession session) {
+    private void requirePreparedClaim(ClientSession session) {
         MongoCacheWorkloadClaimStore.requireCollection(database);
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
@@ -268,14 +311,13 @@ final class MongoCachePipelineAccess {
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
         try {
-            if (!(row.get("pipelineScope") instanceof Document stored)) throw unreadable("pipeline-claim-scope");
+            if (!(row.get(PIPELINE_SCOPE) instanceof Document stored)) throw unreadable(CLAIM_SCOPE_UNREADABLE);
             var decoded = MongoPipelinePreparationFacts.scope(stored);
             if (!scope.pipelineId().equals(decoded.pipelineId()) || !new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation())
-                    .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable("pipeline-claim-scope");
+                    .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable(CLAIM_SCOPE_UNREADABLE);
             if (!scope.equals(decoded)) throw claimFenced();
-        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable("pipeline-claim-scope"); }
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(CLAIM_SCOPE_UNREADABLE); }
         if (MongoCachePipelinePreparations.phase(row, scope) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
-        return row;
     }
 
     void requireScope(Document row) {
@@ -294,9 +336,7 @@ final class MongoCachePipelineAccess {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var filter = WorkloadClaimDocuments.live(original)
-                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
-        Document row = table.find(session, filter).first();
+        Document row = table.find(session, liveClaim()).first();
         if (row == null) throw claimFenced();
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
     }
@@ -308,8 +348,7 @@ final class MongoCachePipelineAccess {
     private void proveClaim(ClientSession session,String counter) {
         if (original == null) throw fenced();
         MongoCacheWorkloadClaimStore.requireCollection(database);
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
-                        .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
+        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, liveClaim(),
                 new Document("$inc",new Document(counter,1L))).getMatchedCount() != 1) throw claimFenced();
     }
 
@@ -334,7 +373,7 @@ final class MongoCachePipelineAccess {
     void verifyStateStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE); }
 
     private void verifyStructure(SystemCollections table) {
-        var found = MongoCollectionMetadata.first(database, table.collectionName());
+        var found = database.listCollections().filter(new Document("name", table.collectionName())).first();
         if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
         var options = found.get("options", Document.class);
         if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("structure");
