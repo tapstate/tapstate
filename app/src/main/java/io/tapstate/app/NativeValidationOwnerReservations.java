@@ -126,8 +126,8 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
 
     @Override public Result reserve(Request request) { return reserve(request, false); }
 
-    @Override public Result reserve(Request request, boolean manualFull) {
-        requireActive();var attempt=new ReserveAttempt(request, manualFull);var failures=new ValidationFailureLatch();
+    @Override public Result reserve(Request request, boolean manualCountHint) {
+        requireActive();var attempt=new ReserveAttempt(request, manualCountHint);var failures=new ValidationFailureLatch();
         var local=pipeline(request.pipeline());attempt.local=local;
         if(!local.lock.tryLock()){unpin(local);return new Result(Outcome.BUSY,null,null);}
         Result result=null;Throwable bodyFailure=null,cleanupFailure=null;
@@ -144,12 +144,13 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     /** One caller owns preparation and cleanup; failures escape only after lock and pin release. */
     private final class ReserveAttempt {
         private final Request request;
-        private final boolean manualFull;
+        private final boolean manualCountHint;
         private Pipeline local;private Reservation operation;private Handoff handoff;
-        private ReserveAttempt(Request request, boolean manualFull){this.request=request;this.manualFull=manualFull;}
+        private ReserveAttempt(Request request, boolean manualCountHint){this.request=request;this.manualCountHint=manualCountHint;}
         private Result prepare(){
             try {
-                var replacementGeneration = discardStaleLifetime(local);
+                boolean manualCount = manualCountHint && request.mode().equals("FULL");
+                var replacementGeneration = discardStaleLifetime(local, manualCount);
                 reap(local);
                 for(var previous:local.operations.values())if(sameBlock(previous.request,request)&&previous.blocked.contains(request.command()))
                     return new Result(Outcome.REJECTED,null,ValidationError.EXECUTION_CANCELLED.code());
@@ -166,8 +167,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 }
                 operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
                 operation.preparing = true;
-                int frames=retainedFrames(request);Owner borrowed=null;long borrowedGeneration=0;
-                boolean manualCount = manualFull && frames == 1 && request.mode().equals("FULL");
+                // The coordinator read the exact task revision. The retained input read below still verifies the method.
+                int frames = manualCount ? 1 : retainedFrames(request);
+                Owner borrowed=null;long borrowedGeneration=0;
                 if(frames==2&&local.owner!=null&&!local.owner.retired.get()&&local.owner.lease.authorized()){
                     var current=local.owner;
                     if(current.quotaMetadata!=null&&current.quotaGeneration==current.countingGeneration){
@@ -361,9 +363,16 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         var current = local.owner;
         if (current != null && !current.retired.get() && current.lease.authorized()) {
             if (current.countingGeneration == 0) return initializeOwner(local, current, manualCount);
-            var snapshot = ownerControl(local, current, manualCount).snapshot(current.lease.owner());
-            if (!(snapshot.closed() && snapshot.active().isEmpty() && current.lease.owner().equals(snapshot.ledgerOwner())
-                    && snapshot.countingGeneration() == current.countingGeneration)) return new SelectedOwner(current, false);
+            var observed = closedCountLedger(current, manualCount);
+            if (observed.isPresent()) {
+                var ledger = observed.orElseThrow();
+                if (!current.lease.owner().equals(ledger.owner()) || ledger.countingGeneration() != current.countingGeneration)
+                    return new SelectedOwner(current, false);
+            } else {
+                var snapshot = ownerControl(local, current, manualCount).snapshot(current.lease.owner());
+                if (!(snapshot.closed() && snapshot.active().isEmpty() && current.lease.owner().equals(snapshot.ledgerOwner())
+                        && snapshot.countingGeneration() == current.countingGeneration)) return new SelectedOwner(current, false);
+            }
             current.retire();
             if (!manualCount) current.lease.close();
             local.owner = null;
@@ -420,6 +429,13 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
 
     private SelectedOwner initializeOwner(Pipeline local, Owner owner, boolean manualCount) {
         if (!closeObsolete(local, owner, manualCount)) throw invalid("owner.obsoletePermissions");
+        var observed = closedCountLedger(owner, manualCount);
+        if (observed.isPresent()) {
+            long generation = observed.orElseThrow().countingGeneration();
+            if (generation == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
+            owner.countingGeneration = generation + 1;
+            return new SelectedOwner(owner, true);
+        }
         var control = ownerControl(local, owner, manualCount);
         var snapshot = control.snapshot(owner.lease.owner());
         // Reuse only a clean check from this reservation after the COUNT epoch was registered.
@@ -437,6 +453,11 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if (!snapshot.active().isEmpty() || !snapshot.closed() || snapshot.countingGeneration() == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
         owner.countingGeneration = snapshot.countingGeneration() + 1;
         return new SelectedOwner(owner, reusable);
+    }
+
+    private static Optional<MongoConfigurationDomain.ValidationAccess.ClosedCountLedger> closedCountLedger(Owner owner, boolean manualCount) {
+        return manualCount && owner.countAccess != null
+                ? owner.countAccess.observeClosedCountLedger(owner.lease.owner()) : Optional.empty();
     }
 
     private ValidationControlStore ownerControl(Pipeline pipeline, Owner owner, boolean manualCount) {
@@ -461,12 +482,14 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if (pipeline.access == null) pipeline.access = configuration.prepareValidationAccess(pipeline.pipeline, scope, cache, node.get(), this::requireActive);
         return pipeline.access;
     }
-    private UUID discardStaleLifetime(Pipeline pipeline) {
+    private UUID discardStaleLifetime(Pipeline pipeline, boolean manualCount) {
         var old = pipeline.access;
         if (old == null) return null;
         // Only a proven different CONFIG lifecycle permits a fresh preparation. Transport failure,
         // stale owner proof or a retry of the same lifetime never causes rebinding or adoption.
-        var current = configuration.currentValidationGeneration(pipeline.pipeline, scope, this::requireActive);
+        var current = manualCount
+                ? configuration.observeCountValidationGeneration(pipeline.pipeline, scope, cache, this::requireActive)
+                : configuration.currentValidationGeneration(pipeline.pipeline, scope, this::requireActive);
         if (old.generation().equals(current)) return null;
         if (pipeline.owner != null) {
             var retired = pipeline.owner; retired.retire(); process.cleanup(retired.lease::close); pipeline.owner = null;

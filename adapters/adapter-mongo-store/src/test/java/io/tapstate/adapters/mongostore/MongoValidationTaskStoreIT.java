@@ -609,6 +609,22 @@ class MongoValidationTaskStoreIT {
         }
     }
 
+    @Test void committedCountClaimCannotCompleteAClosingPreparation() {
+        try (var f = new Fixture()) {
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var config = f.configuration.validationPreparations();
+            var issued = config.issue("flow", f.scope);
+            var proof = f.cache.validationPreparations(f.scope).prepare(issued, WorkloadClaimFence.from(node),
+                    new MongoValidationCachePreparations.InitialCountLease(1, TTL));
+            assertThat(proof.initialClaim(issued.subject())).isNotNull();
+            config.beginClose("flow", issued.subject().generation(), UUID.randomUUID());
+            assertThatThrownBy(() -> config.complete(issued, proof)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+        }
+    }
+
     @Test void oldManualCountOwnerCannotOpenOrPublishAfterConfigEpochChanges() {
         try (var f = new Fixture()) {
             var create = f.create("flow");
@@ -621,6 +637,8 @@ class MongoValidationTaskStoreIT {
             assertThat(access.takeInitialCountClaim()).isEmpty();
             var owner = ValidationClaims.owner("flow", first);
             var scoped = access.forManualCount(owner);
+            assertThat(scoped.observeClosedCountLedger(owner)).hasValueSatisfying(ledger ->
+                    assertThat(ledger.countingGeneration()).isZero());
             assertThat(scoped.countPermissionsCurrent(owner)).isTrue();
             var spec = new ValidationRunSpec(saved.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
             var id = new ValidationRunIdentity(owner, saved.task().taskId(), "old-count", spec.mode(), spec.fingerprint(),
@@ -628,6 +646,22 @@ class MongoValidationTaskStoreIT {
             var start = new ValidationReportAdmission.Start(saved.task(), saved.revision(), 1, UUID.randomUUID().toString(), id);
             var open = new ValidationReportAdmission.Open(start, spec);
             assertThat(scoped.admissions().reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.RESERVED);
+            var run = new ValidationControlStore.Run(id, 1, start, spec);
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            var report = new Document("_id", MongoValidationAdmissionStore.reportId(id));
+            reports.updateOne(report, new Document("$set", new Document("closed", true)));
+            assertThatThrownBy(() -> scoped.control().joinRunning(run)).isInstanceOf(TapstateException.class);
+            assertThat(scoped.control().read(owner, run)).isEmpty();
+            reports.updateOne(report, new Document("$set", new Document("closed", false)));
+            var control = scoped.countHandles().orElseThrow().control();
+            var schema = SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb);
+            schema.updateOne(new Document("_id", "config"), new Document("$set", new Document("validation.phase", "PREPARING")));
+            assertThatThrownBy(() -> control.joinRunning(run)).isInstanceOf(TapstateException.class);
+            schema.updateOne(new Document("_id", "config"), new Document("$set", new Document("validation.phase", "READY")));
+            assertThat(control.read(owner, run)).isEmpty();
+            assertThat(control.joinRunning(run)).contains(ValidationControlStore.Join.JOINED);
+            assertThat(scoped.control().joinRunning(run)).contains(ValidationControlStore.Join.ALREADY_JOINED);
+            assertThat(scoped.observeClosedCountLedger(owner)).isEmpty();
             var now = java.time.Instant.now();
             var read = new ValidationCheckEvent.ReadBoundary("read", "count-v1", now, now);
             var write = new ValidationResultStore.CountWrite(start.report(), spec,
@@ -638,6 +672,7 @@ class MongoValidationTaskStoreIT {
             assertThat(next.claim().claimGeneration()).isEqualTo(first.claimGeneration() + 1);
             assertThat(next.access().countPermissionsCurrent(ValidationClaims.owner("flow", next.claim()))).isFalse();
             assertThatThrownBy(() -> scoped.countPermissionsCurrent(owner)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.observeClosedCountLedger(owner)).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> scoped.admissions().reserveAndOpen(open)).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> scoped.results().publishCount(write)).isInstanceOf(TapstateException.class);
             var staleRun = new ValidationControlStore.Run(id, 1, start, spec);

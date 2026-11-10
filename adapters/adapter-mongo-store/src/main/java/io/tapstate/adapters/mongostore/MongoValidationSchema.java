@@ -72,18 +72,27 @@ final class MongoValidationSchema {
         return new Document("formatVersion", 1).append("operationId", operation).append("phase", phase).append("cursor", cursor).append("initializedTasks", initialized);
     }
     static boolean scheduledReady(MongoDatabase database, ClientSession session) {
-        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        return scheduledReady(SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first());
+    }
+    private static boolean scheduledReady(Document schema) {
         if (schema == null || !schema.containsKey("validation")) return false;
         var marker = configurationMarker(schema);
         if (!Integer.valueOf(2).equals(marker.get("formatVersion"))) return false;
         return "READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"));
     }
     static void requireTaskCoverage(MongoDatabase database, ClientSession session, Document task) {
-        boolean covered = scheduledReady(database, session);
+        requireTaskCoverage(scheduledReady(database, session), task);
+    }
+    static void requireTaskCoverage(Document schema, Document task) {
+        requireTaskCoverage(scheduledReady(schema), task);
+    }
+    static void requireTaskCoverage(boolean covered, Document task) {
         if (covered != Integer.valueOf(2).equals(task.get("formatVersion"))) throw unreadable("scheduled-task-coverage");
     }
     static void requireMutationReady(MongoDatabase database, ClientSession session) {
-        var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
+        requireMutationReady(SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first());
+    }
+    static void requireMutationReady(Document schema) {
         var marker = requireConfiguration(schema, "READY");
         if (Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
     }

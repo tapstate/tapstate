@@ -3,6 +3,7 @@ package io.tapstate.adapters.mongostore;
 import com.mongodb.ReadConcern;
 import com.mongodb.ReadPreference;
 import com.mongodb.client.MongoDatabase;
+import io.tapstate.core.validation.ValidationOwner;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.WorkloadClaimReading;
@@ -97,7 +98,25 @@ final class MongoValidationClaimObservation {
         return bindings.observationBinding(scope, observed.binding(), observed.setup(), observed.recovery());
     }
 
+    private record CacheObservation(WorkloadClaimReading reading, Document control) {}
+
     Optional<WorkloadClaimReading> cache(MongoDatabase cache, MongoValidationPreparationFacts.Subject expected) {
+        return cacheObservation(cache, expected).map(CacheObservation::reading);
+    }
+
+    Optional<MongoConfigurationDomain.ValidationAccess.ClosedCountLedger> closedCountLedger(MongoDatabase cache,
+            MongoValidationPreparationFacts.Subject expected, ValidationOwner current) {
+        var observed = cacheObservation(cache, expected).orElseThrow(MongoValidationClaimObservation::fenced);
+        if (!observed.reading().leased() || !current.equals(ValidationClaims.owner(pipeline, observed.reading().claim())))
+            throw fenced();
+        var control = observed.control();
+        if (!Boolean.TRUE.equals(control.get("closed")) || !control.get("slots", Document.class).isEmpty()) return Optional.empty();
+        var ledgerOwner = control.get("owner", Document.class);
+        return Optional.of(new MongoConfigurationDomain.ValidationAccess.ClosedCountLedger(
+                ledgerOwner == null ? null : MongoValidationControlStore.owner(ledgerOwner, pipeline), control.getLong("countingGeneration")));
+    }
+
+    private Optional<CacheObservation> cacheObservation(MongoDatabase cache, MongoValidationPreparationFacts.Subject expected) {
         var claimKey = ValidationClaims.key(scope.clusterId(), pipeline);
         var claimId = MongoWorkloadClaimStore.id(claimKey);
         var controlId = MongoValidationControlStore.controlId(scope.clusterId(), pipeline);
@@ -131,7 +150,7 @@ final class MongoValidationClaimObservation {
                     || claim.claimGeneration() == owner.claimGeneration()
                         && !claim.owner().equals(new WorkloadOwner(owner.nodeId(), owner.bootId()))) throw fenced();
         }
-        return Optional.of(reading);
+        return Optional.of(new CacheObservation(reading, control));
     }
 
     static boolean lacksSnapshotRead(com.mongodb.client.MongoClient client) {
@@ -151,13 +170,13 @@ final class MongoValidationClaimObservation {
         return lookup(table, field, id, null);
     }
 
-    private static Document lookup(SystemCollections table, String field, Object id, Document projection) {
+    static Document lookup(SystemCollections table, String field, Object id, Document projection) {
         var stages = new java.util.ArrayList<>(List.of(match(id), new Document("$limit", 2)));
         if (projection != null) stages.add(new Document("$project", projection));
         return new Document("$lookup", new Document("from", table.collectionName()).append("pipeline", stages).append("as", field));
     }
 
-    private static Document one(Document row, String name, Object id) {
+    static Document one(Document row, String name, Object id) {
         if (!(row.get(name) instanceof List<?> matches) || matches.size() != 1
                 || !(matches.getFirst() instanceof Document value) || !id.equals(value.get("_id"))) throw fenced();
         return value;

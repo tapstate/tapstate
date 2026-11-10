@@ -1182,6 +1182,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return validationPreparations().guardedBy(local).currentGeneration(pipeline, Objects.requireNonNull(expected));
     }
 
+    /** Read-only signal for discarding a cached COUNT preparation. It grants no replacement authority. */
+    public UUID observeCountValidationGeneration(String pipeline, CacheBusinessScope scope, MongoCacheDomain cache, Runnable local) {
+        return StoreIo.call(() -> {
+            requireOpen(); local.run();
+            if (MongoValidationClaimObservation.lacksSnapshotRead(connection.client()))
+                return currentValidationGeneration(pipeline, scope, local);
+            var observation = new MongoValidationClaimObservation(connection.database(), bindings, scope, pipeline);
+            var current = observation.configuration(true);
+            cache.requireRecoveryTarget(observation.target(current));
+            local.run(); requireOpen();
+            return current.preparation().generation();
+        });
+    }
+
     /** Scoped physical readiness reuse. Durable fences still run at each mutation boundary. */
     public static <T> T duringValidationStartup(java.util.function.Supplier<T> work) {
         return MongoValidationSchema.duringStartup(Objects.requireNonNull(work));
@@ -1292,7 +1306,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
             if (node.key().type() != io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION
                     || !node.key().clusterId().equals(scope().clusterId()) || !node.key().resourceId().equals(node.owner().nodeId()))
                 throw MongoValidationPreparations.fenced();
-            var store = claims();
+            var store = cache.validationCountClaims(original, local);
             var initial = takeInitialCountClaim()
                     .filter(claim -> claim.owner().equals(node.owner()) && claim.topologyRevision() == topologyRevision);
             if (initial.isPresent()) {
@@ -1300,11 +1314,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                         countAccess(io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim))));
             }
             var key = io.tapstate.spi.store.ValidationClaims.key(scope().clusterId(), pipelineId());
-            return store.acquireValidationExecution(key, node.owner(), topologyRevision, ttl).map(claim -> {
-                var selected = io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim);
-                original.registerCountOwner(selected);
-                return new CountTenure(claim, store, countAccess(selected));
-            });
+            return store.acquireValidationExecution(key, node.owner(), topologyRevision, ttl,
+                    claim -> original.registerCountOwner(io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim)))
+                    .map(claim -> new CountTenure(claim, store,
+                            countAccess(io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim))));
         }
 
         public ValidationAccess forManualCount(io.tapstate.core.validation.ValidationOwner selected) {
@@ -1330,6 +1343,17 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public void requireCurrent() { requireOpen(); original.requireComplete(); }
         public io.tapstate.spi.store.WorkloadClaimStore claims() { requireOpen(); return cache.validationClaims(original, local); }
         public io.tapstate.spi.store.ValidationControlStore control() { requireOpen(); return cache.validationControl(original, countOwner, local); }
+
+        public record ClosedCountLedger(io.tapstate.core.validation.ValidationOwner owner, long countingGeneration) {}
+
+        /** A read-only observation for choosing a tenure. All subsequent writes still recheck their fences. */
+        public Optional<ClosedCountLedger> observeClosedCountLedger(io.tapstate.core.validation.ValidationOwner current) {
+            requireOpen();
+            if (!current.equals(countOwner)) throw MongoValidationPreparations.fenced();
+            var observation = new MongoValidationClaimObservation(configuration.connection.database(),
+                    configuration.bindings, scope(), pipelineId());
+            return cache.observeClosedCountLedger(observation, original.subject(), current);
+        }
 
         public record CountHandles(io.tapstate.spi.store.ValidationReports reports,
                 io.tapstate.spi.store.ValidationReportAdmission admissions, io.tapstate.spi.store.ValidationControlStore control) {}

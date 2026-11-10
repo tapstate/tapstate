@@ -95,6 +95,15 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         businessActive();
         return result;
     }
+    java.util.Optional<MongoConfigurationDomain.ValidationAccess.ClosedCountLedger> observeClosedCountLedger(
+            MongoValidationClaimObservation observation, MongoValidationPreparationFacts.Subject subject,
+            io.tapstate.core.validation.ValidationOwner current) {
+        businessActive();
+        if (lacksSnapshotRead()) return java.util.Optional.empty();
+        var result = observation.closedCountLedger(database, subject, current);
+        businessActive();
+        return result;
+    }
     boolean emptyForAuthenticationRecovery() {
         businessActive();
         return StoreIo.call(() -> database.listCollectionNames().into(new ArrayList<>()).isEmpty());
@@ -318,9 +327,17 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {
         return validationClaims(original, () -> {});
     }
-    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
+    MongoCacheWorkloadClaimStore validationCountClaims(MongoValidationPreparations.Permission original, Runnable local) {
+        businessActive(); local.run();
+        // ValidationAccess already holds the exact verified binding. Claim operations recheck their durable fences.
+        return validationClaimHandle(new MongoValidationPreparations.Authority(original), local);
+    }
+    private MongoCacheWorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
         Objects.requireNonNull(local);
         requireValidationPreparation(original);
+        return validationClaimHandle(original, local);
+    }
+    private MongoCacheWorkloadClaimStore validationClaimHandle(MongoValidationPreparations.Authority original, Runnable local) {
         return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), () -> { businessActive(); local.run(); }, original);
     }
 

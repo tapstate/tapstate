@@ -80,7 +80,9 @@ final class MongoValidationCachePreparations {
             var predecessor = requirePredecessor(session, current, before.previous(), subject);
             var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
             var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-            var retained = claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            // For a first COUNT birth requirePredecessor already proved absence in this transaction.
+            var retained = count != null && current == null && before.previous() == null ? null
+                    : claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
             Subject origin;
             if (predecessor == null || predecessor.origin() == null) {
                 if (retained != null) throw unreadable(); origin = subject;
@@ -230,13 +232,17 @@ final class MongoValidationCachePreparations {
         return receiptInTransaction(session, database, scope, root);
     }
     static Receipt receiptInTransaction(ClientSession session, MongoDatabase database, CacheBusinessScope scope, Document root) {
+        return receiptInTransaction(session, database, scope, root, null);
+    }
+
+    static Receipt receiptInTransaction(ClientSession session, MongoDatabase database, CacheBusinessScope scope, Document root, Document knownClaim) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("validation receipts require their original CACHE transaction");
         var subject = binding(root); var origin = origin(root); var state = outcome(root);
         MongoValidationControlStore.validateIndependentSlots(session, database, root, scope, encode(subject));
         long generation = 0, execution = 0;
         var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var claim = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        var claim = knownClaim == null ? table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first() : knownClaim;
         if (origin == null) {
             if (claim != null || state != Outcome.CANCELLED || longValue(root, "countingGeneration") != 0) throw unreadable();
         }
@@ -244,6 +250,7 @@ final class MongoValidationCachePreparations {
             if (claim == null || !root.get("birth").equals(claim.get("validationPreparation"))
                     || !(claim.get("fencedValidationWrites") instanceof Long writes) || writes < 0 || writes == Long.MAX_VALUE) throw unreadable();
             var decoded = new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(claim);
+            if (!key.equals(decoded.key())) throw unreadable();
             generation = decoded.claimGeneration(); execution = decoded.executionGeneration();
             if (root.get("owner") instanceof Document stored) {
                 var retained = MongoValidationControlStore.owner(stored, subject.pipelineId());

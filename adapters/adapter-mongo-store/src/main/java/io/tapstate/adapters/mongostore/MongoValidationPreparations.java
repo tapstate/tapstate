@@ -107,11 +107,24 @@ final class MongoValidationPreparations {
         }
         private MongoValidationPreparations owner() { return permission == null ? closing.owner : permission.owner; }
         void enter(MongoClient client, MongoDatabase database, ClientSession session, boolean admission) {
+            enter(client, database, session, admission, false);
+        }
+        void enterCountStartRead(MongoClient client, MongoDatabase database, ClientSession session) {
+            if (!manualCount()) throw fenced();
+            enter(client, database, session, false, true);
+        }
+        private void enter(MongoClient client, MongoDatabase database, ClientSession session, boolean admission, boolean countStartRead) {
             var owner = owner(); owner.active.run();
             if (owner.client != client || !owner.database.getName().equals(database.getName())) throw fenced();
             var row = owner.mapping(session, pipelineId()); var state = owner.state(row, pipelineId());
             if (!Objects.equals(subject, state.subject())) throw fenced();
-            if (subject != null) owner.requireBinding(session, subject.scope());
+            if (subject != null) {
+                // Only the report observation reuses a previously admitted binding. Writes retain the full check.
+                if (countStartRead) {
+                    if (!owner.bindings.admittedCachePreparation(session).map(value -> value.businessScope().equals(subject.scope()))
+                            .orElse(false)) throw fenced();
+                } else owner.requireBinding(session, subject.scope());
+            }
             if (permission != null) {
                 if (countOwner == null) owner.requireDefinition(session, pipelineId());
                 else owner.requireDefinition(session, pipelineId(), row);
@@ -140,7 +153,10 @@ final class MongoValidationPreparations {
             if (countOwner != null && !countOwner.equals(expected)) throw fenced();
         }
         void requireCountStartOwner(ClientSession session, ValidationOwner expected) {
-            if (countOwner != null) requireCountOwner(owner().mapping(session, pipelineId()), expected);
+            if (countOwner != null) requireCountStartOwner(owner().mapping(session, pipelineId()), expected);
+        }
+        void requireCountStartOwner(Document row, ValidationOwner expected) {
+            requireCountOwner(row, expected);
         }
         void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed) {
             requireStart(start, closed, false);
@@ -174,6 +190,10 @@ final class MongoValidationPreparations {
             if (start == null || !pipelineId().equals(start.task().pipelineId()) || !owner().clusterId.equals(start.task().clusterId())) throw fenced();
             var owner = owner();
             var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
+            if (born && manualCount()) {
+                store.requireCountStartSnapshot(start);
+                return;
+            }
             store.transaction(session -> {
                 if (!closed) requireCountStartOwner(session, start.run().owner());
                 if (born) store.requireBornInTransaction(session, start);
@@ -363,15 +383,24 @@ final class MongoValidationPreparations {
     Permission complete(Permission permission, MongoValidationCachePreparations.Proof proof) {
         requireOwned(permission);
         var subject = permission.subject();
-        var receipt = proof.requirePrepared(subject);
         var claim = proof.initialClaim(subject);
+        // An initial COUNT claim is available only from the acknowledged CACHE birth transaction.
+        // CONFIG completion still competes with retirement on the original preparation row.
+        if (claim == null) proof.requirePrepared(subject);
         var initialOwner = claim == null ? null : ValidationClaims.owner(subject.pipelineId(), claim);
-        if (initialOwner != null && (receipt.claimGeneration() != initialOwner.claimGeneration()
-                || receipt.executionGeneration() != initialOwner.executionGeneration())) throw fenced();
         transaction(session -> {
-            requireDefinition(session, permission.subject().pipelineId()); requireBinding(session, permission.subject().scope());
-            var row = mapping(session, permission.subject().pipelineId()); var current = state(row, permission.subject().pipelineId());
-            requireSubject(current, permission.subject()); if (current.closingOperationId() != null) throw fenced();
+            final Document row;
+            if (initialOwner == null) {
+                requireDefinition(session, subject.pipelineId());
+                requireBinding(session, subject.scope());
+                row = mapping(session, subject.pipelineId());
+            } else {
+                row = mapping(session, subject.pipelineId());
+                requireDefinition(session, subject.pipelineId(), row);
+                requireBinding(session, subject.scope());
+            }
+            var current = state(row, subject.pipelineId());
+            requireSubject(current, subject); if (current.closingOperationId() != null) throw fenced();
             if (current.phase() == Phase.COMPLETE && initialOwner == null) return null;
             if (current.phase() != Phase.ISSUED && current.phase() != Phase.COMPLETE) throw fenced();
             var next = current.change(Phase.COMPLETE, current.subject(), null, current.previous());
@@ -379,9 +408,7 @@ final class MongoValidationPreparations {
             else writeCountOwner(session, row, next, initialOwner);
             return null;
         });
-        var confirmed = proof.requirePrepared(subject);
-        if (initialOwner != null && (confirmed.claimGeneration() != initialOwner.claimGeneration()
-                || confirmed.executionGeneration() != initialOwner.executionGeneration())) throw fenced();
+        if (initialOwner == null) proof.requirePrepared(subject);
         permission.requireComplete(); return new Permission(this, subject, false);
     }
 

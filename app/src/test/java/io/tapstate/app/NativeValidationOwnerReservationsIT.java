@@ -240,6 +240,19 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
+    @Test void manualCountHintCannotGrantANonCountTask() {
+        try (var f = new Fixture()) {
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task, 1, f.comparison,
+                    ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN, 1000), UUID.randomUUID())))
+                    .isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var request = new ValidationOwnerRouter.Request("flow", f.task.taskId(), f.task.generation(), 2, 1, "FULL",
+                    UUID.randomUUID(), UUID.randomUUID().toString());
+            assertThat(f.owners.reserve(request, true).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.REJECTED);
+            var mapping = f.raw.getDatabase(f.configName).getCollection("operator_generations").find(new Document("_id", "flow")).first();
+            assertThat(mapping.get("validationPreparation", Document.class)).containsEntry("phase", "UNASSIGNED");
+        }
+    }
+
     @Test void countExecutionAcquisitionCannotTakeALiveForeignLeaseOrReuseAGeneration() {
         try (var f = new Fixture()) {
             var access = f.configuration.prepareValidationAccess("flow", f.scope, f.cache,

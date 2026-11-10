@@ -96,14 +96,28 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
             long topologyRevision, Duration ttl) {
+        return acquireValidationExecution(key, owner, topologyRevision, ttl, null);
+    }
+
+    Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl, java.util.function.Consumer<WorkloadClaim> registerCountOwner) {
         requireKey(key);
         if (key.type() != WorkloadClaimType.VALIDATION || validation == null || validation.closing()) throw claimFenced();
-        return transaction(true, (store, session) -> {
+        java.util.function.Consumer<Optional<WorkloadClaim>> verifyCommitted = registerCountOwner == null ? null : granted -> {
+            if (granted.isEmpty()) requireValidationAuthority();
+            else {
+                requireActive.run();
+                MongoValidationSchema.requireReady(database, false);
+                registerCountOwner.accept(granted.orElseThrow());
+                requireActive.run();
+            }
+        };
+        return transaction(true, null, (store, session) -> {
             var row = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)
                     .find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-            requireValidationClaim(session, row, key);
+            MongoValidationControlStore.requirePreparedClaim(session, database, row, key, scope, validation.subject(), true, true);
             return store.acquireNewValidationExecution(store.decodeStored(row), owner, topologyRevision, ttl);
-        });
+        }, false, verifyCommitted);
     }
 
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -313,23 +327,37 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
             BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst) {
+        return transaction(admission, pipeline, operation, renewalFirst, null);
+    }
+
+    private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
+            BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst,
+            java.util.function.Consumer<T> verifyCommitted) {
         return StoreIo.call(() -> {
             try {
                 if(operations.budget()==null)operations.requireAdmission();
                 requireActive.run();
                 requireValidationAuthority();
                 var budget = operations.budget();
-                if (budget != null) return boundedTransaction(admission,pipeline,operation,renewalFirst,budget);
+                if (budget != null) {
+                    var result = boundedTransaction(admission,pipeline,operation,renewalFirst,budget);
+                    if (verifyCommitted != null) verifyCommitted.accept(result);
+                    return result;
+                }
                 for (int attempt = 0; ; attempt++) {
+                    T committed;
                     try (var session = client.startSession()) {
-                        var committed = session.withTransaction(() -> attempt(session,admission,pipeline,operation,renewalFirst,null), TRANSACTION);
-                        requireValidationAuthority();
-                        return committed;
+                        committed = session.withTransaction(() -> attempt(session,admission,pipeline,operation,renewalFirst,null), TRANSACTION);
                     } catch (MongoException conflict) {
                         // A duplicate-key error aborts its transaction; retry the original callback,
                         // never keep using that session or adopt another scope.
                         if (attempt >= 2 || ErrorCategory.fromErrorCode(conflict.getCode()) != ErrorCategory.DUPLICATE_KEY) throw conflict;
+                        continue;
                     }
+                    // CONFIG registration verifies the exact committed owner without replaying a CACHE write on failure.
+                    if (verifyCommitted == null) requireValidationAuthority();
+                    else verifyCommitted.accept(committed);
+                    return committed;
                 }
             } catch (RuntimeException failed) {
                 // A known closed/revoked owner is diagnosed before a driver's closed-client failure.
