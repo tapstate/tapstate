@@ -344,7 +344,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (fixedPosition == null) { fixedPosition = sourcePosition; fixedTables = actual; fixedAt = at; }
             else if (!fixedPosition.equals(sourcePosition) || !fixedTables.equals(actual)) throw fullUnproven(chain);
             requireCaptureCurrent();
-            var result = transaction(session -> {
+            var result = changingTheConsumer(() -> transaction(session -> {
                 proveFreshFull(session, full, original, node, capture, prepared);
                 var held = view(session, chain);
                 if (proposed != null && held.root().equals(proposedRoot)) return retained(session, held, snapshotEpoch, sourcePosition, actual);
@@ -389,7 +389,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 // A candidate is never a commit receipt: a retry must prove its exact durable root and cursor.
                 proposed = candidate; proposedRoot = new Document(replacement);
                 return candidate;
-            });
+            }));
             requireCaptureCurrent();
             return result;
         }
@@ -867,7 +867,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         var request=original.request();var physical=request.originalScope();var context=membership.context();
         if(!scope.equals(new CacheBusinessScope(physical.clusterId(),physical.bindingVersion(),physical.cacheIncarnation()))
                 || !physical.pipelineId().equals(context.key().pipelineId()) || physical.stateGeneration()!=context.stateGeneration())throw fenced();
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             MongoPipelineStateRebuilds.requireOriginalActive(original);
             MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
             var held=view(session,context.key().miningChainId()).members().get(context.key().consumerId());
@@ -880,7 +880,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw fenced();
             access.updateState(session,state,new Document(),false);
             return detachInTransaction(session,context,membership.revision(),request.originalClaim());
-        });
+        }));
     }
     @Override public Optional<SrsConsumerMembership> detachForRetirement(io.tapstate.spi.store.PipelineRetirementPreparation original,
             SrsConsumerMembership membership,WorkloadClaimFence currentNode,Optional<io.tapstate.spi.store.PipelineRetirementRequest.CacheOriginal> isolated) {
@@ -891,7 +891,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 || !physical.pipelineId().equals(context.key().pipelineId()) || physical.stateGeneration()!=context.stateGeneration()
                 || !fixed.claim().key().equals(declared.claim().key()) || fixed.claim().claimGeneration()<declared.claim().claimGeneration()
                 || fixed.claim().executionGeneration()<declared.claim().executionGeneration() || fixed.epoch()<declared.epoch())throw fenced();
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             MongoPipelineRetirements.requireOriginalActive(original);MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
             var held=view(session,context.key().miningChainId()).members().get(context.key().consumerId());
             if(replayed(held,context,membership.revision(),true,Set.of(),fixed.claim()))return Optional.of(held);
@@ -901,7 +901,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             expected.append("pipelineScope",MongoPipelinePreparationFacts.scope(physical)).append("pipelinePreparation.phase","PREPARED");
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,expected,new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw fenced();
             access.updateState(session,state,new Document(),false);return detachInTransaction(session,context,membership.revision(),fixed.claim());
-        });
+        }));
     }
 
     private Optional<SrsConsumerMembership> detachInTransaction(ClientSession session,SrsConsumerContext context,long expectedRevision,WorkloadClaimFence fence) {
