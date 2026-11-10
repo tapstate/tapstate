@@ -68,10 +68,8 @@ class ExecutionAuthorizationTest {
     private final AtomicLong nanos = new AtomicLong();
 
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.CsvSource({
-            "success,2,true", "twice,2,false", "budget,1,false", "fenced,1,false"})
-    void scopedProofRetriesOnlyOneTimeoutInsideTheOriginalWindow(
-            String outcome, int expectedReads, boolean authorized) {
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"driver-timeout", "outer-timeout", "fenced", "outage"})
+    void scopedProofWaitsForBackgroundRecoveryButKeepsConfirmedFences(String fault) {
         submittedRun();
         var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
         var reading = claims.read(key).orElseThrow();
@@ -82,16 +80,123 @@ class ExecutionAuthorizationTest {
                 .thenAnswer(call -> call.<java.util.function.Supplier<?>>getArgument(1).get());
         var reads = new AtomicInteger();
         when(store.readPipeline(scope)).thenAnswer(call -> {
+            assertThat(Thread.currentThread().getName()).isEqualTo("tapstate-scoped-proof-read");
             int attempt = reads.incrementAndGet();
-            if (attempt == 2 && outcome.equals("success")) return Optional.of(reading);
-            if (outcome.equals("budget")) nanos.addAndGet(WINDOW.toNanos());
-            if (outcome.equals("fenced")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            if (fault.equals("fenced")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            if (!fault.equals("outage") && attempt == 2) return Optional.of(reading);
+            if (fault.equals("outer-timeout")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,
+                    Map.of(), new java.util.concurrent.TimeoutException());
             throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoTimeoutException"), null);
         });
+        var window = Duration.ofMillis(fault.equals("outage") ? 150 : 800);
         try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
-                store, WINDOW, nanos::get, () -> true)) {
-            assertThat(guard.authorized(fence)).isEqualTo(authorized);
-            assertThat(reads).hasValue(expectedReads);
+                store, window, nanos::get, () -> true)) {
+            switch (fault) {
+                case "fenced" -> {
+                    assertThat(guard.authorized(fence)).isFalse();
+                    assertThat(reads).hasValue(1);
+                }
+                case "outage" -> {
+                    assertThatThrownBy(() -> guard.require(fence)).isInstanceOfSatisfying(TapstateException.class,
+                            e -> assertThat(e.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                    assertThat(reads.get()).isPositive().isLessThanOrEqualTo(16);
+                }
+                default -> {
+                    assertThat(guard.require(fence)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                    assertThat(guard.requireLocal(fence)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                    assertThat(reads).hasValue(2);
+                }
+            }
+        }
+    }
+
+    @Test void aSlowScopedProofIsSharedWithoutBlockingAnotherPipeline() throws Exception {
+        submittedRun();
+        var orders = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var inventory = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "inventory");
+        var acquired = claims.acquire(inventory, NODE_A, 7, TTL).claim();
+        claims.advanceExecution(acquired, 7, Set.of("node-a")).orElseThrow();
+        var orderReading = claims.read(orders).orElseThrow();
+        var inventoryReading = claims.read(inventory).orElseThrow();
+        var orderScope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var inventoryScope = new PipelineIntentScope("cluster-a", 1, "cache", "inventory", 1);
+        var orderFence = new ExecutionFence(orderScope, WorkloadClaimFence.from(orderReading.claim()));
+        var inventoryFence = new ExecutionFence(inventoryScope, WorkloadClaimFence.from(inventoryReading.claim()));
+        var store = mock(WorkloadClaimStore.class);
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var reads = new AtomicInteger();
+        when(store.readPipeline(orderScope)).thenAnswer(call -> {
+            reads.incrementAndGet();
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(orderReading);
+        });
+        when(store.readPipeline(inventoryScope)).thenReturn(Optional.of(inventoryReading));
+
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, WINDOW, nanos::get, () -> true);
+             var workers = Executors.newFixedThreadPool(3)) {
+            try {
+                var first = workers.submit(() -> guard.require(orderFence));
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                var second = workers.submit(() -> guard.require(orderFence));
+                var independent = workers.submit(() -> guard.require(inventoryFence));
+                assertThat(independent.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(inventoryReading.claim()));
+                assertThat(first.isDone()).isFalse();
+                assertThat(second.isDone()).isFalse();
+                release.countDown();
+                assertThat(first.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(orderReading.claim()));
+                assertThat(second.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(orderReading.claim()));
+                assertThat(reads).hasValue(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void aTimedOutCallerDoesNotOverlapTheStillRunningStoreRead() throws Exception {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var store = mock(DeadlineWorkloadClaimStore.class);
+        var reads = new AtomicInteger();
+        var calls = new AtomicInteger();
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var timedOut = new CountDownLatch(1);
+
+        try (var workers = Executors.newFixedThreadPool(2);
+             var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                     store, Duration.ofMillis(600), nanos::get, () -> true)) {
+            try {
+                when(store.readPipeline(scope)).thenAnswer(call -> {
+                    if (reads.incrementAndGet() == 1) {
+                        entered.countDown();
+                        assertThat(release.await(3, TimeUnit.SECONDS)).isTrue();
+                    }
+                    return Optional.of(reading);
+                });
+                when(store.withDeadline(org.mockito.ArgumentMatchers.anyLong(), org.mockito.ArgumentMatchers.any()))
+                        .thenAnswer(call -> {
+                            var operation = call.<java.util.function.Supplier<?>>getArgument(1);
+                            if (calls.incrementAndGet() != 1) return operation.get();
+                            workers.submit(operation::get);
+                            assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                            timedOut.countDown();
+                            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(),
+                                    new java.util.concurrent.TimeoutException());
+                        });
+
+                var waiter = workers.submit(() -> guard.require(fence));
+                assertThat(timedOut.await(2, TimeUnit.SECONDS)).isTrue();
+                Thread.sleep(450);
+                assertThat(reads).hasValue(1);
+                assertThat(calls).hasValue(1);
+                release.countDown();
+                assertThat(waiter.get(2, TimeUnit.SECONDS)).isEqualTo(WorkloadClaimFence.from(reading.claim()));
+                assertThat(reads).hasValue(2);
+            } finally { release.countDown(); }
         }
     }
 

@@ -101,7 +101,7 @@ final class MongoClaimOperations {
             throw MongoCacheWorkloadClaimStore.claimFenced();
         } catch (TimeoutException expired) {
             call.cancelPending();
-            throw MongoCacheWorkloadClaimStore.claimFenced();
+            throw deadlineExceeded(expired);
         } catch (ExecutionException failed) {
             if (failed.getCause() instanceof Error error) throw error;
             if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
@@ -114,9 +114,14 @@ final class MongoClaimOperations {
 
     private static long remaining(long deadline) {
         long remaining = deadline - System.nanoTime();
-        if (remaining <= 0 || Thread.currentThread().isInterrupted())
-            throw MongoCacheWorkloadClaimStore.claimFenced();
+        if (Thread.currentThread().isInterrupted()) throw MongoCacheWorkloadClaimStore.claimFenced();
+        if (remaining <= 0) throw deadlineExceeded(new TimeoutException());
         return remaining;
+    }
+
+    private static io.tapstate.core.common.TapstateException deadlineExceeded(TimeoutException cause) {
+        return new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED,
+                java.util.Map.of(), cause);
     }
 
     private final class Call<T> implements Runnable {
