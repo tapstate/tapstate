@@ -239,7 +239,14 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         return transaction(false, session -> table.on(target).countDocuments(session, new Document("_id.placement", address)));
     }
 
-    @Override public void dropLease() { lease.set(null); }
+    @Override public void dropLease() { lease.set(ended()); }
+
+    /**
+     * A fresh, already expired marker that every way of ending a lease installs, never {@code null}: a proof in
+     * flight publishes only over the exact lease it started from, so any end at any point of that proof wins,
+     * and no two ends can ever look like the same lease.
+     */
+    private static Lease ended() { return new Lease(System.nanoTime(), false, null, 0L); }
 
     /**
      * Opens a vertex instance's commit group. Every namespace must reach a store of this kind on the same
@@ -319,7 +326,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         try {
             return operation.apply(current);
         } catch (RuntimeException failure) {
-            if (lease.compareAndSet(current, null)) LEASE_LOSSES.incrementAndGet();
+            if (lease.compareAndSet(current, ended())) LEASE_LOSSES.incrementAndGet();
             throw failure;
         }
     }
@@ -337,12 +344,23 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             long startedAt = System.nanoTime();
             long maximum = maximumLeaseNanos();
             boolean claimed = access.originalClaim() != null;
-            Lease proved = validated(writes, (session, inventory) -> {
-                long held = claimed && writes ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
-                return new Lease(startedAt + held, writes, inventory.getString("preparationId"), inventory.getLong("revision"));
-            });
-            lease.set(proved);
+            Lease before = lease.get();
+            Lease proved;
+            try {
+                proved = validated(writes, (session, inventory) -> {
+                    long held = claimed && writes ? Math.min(maximum, TimeUnit.MILLISECONDS.toNanos(access.proveLease(session))) : maximum;
+                    return new Lease(startedAt + held, writes, inventory.getString("preparationId"), inventory.getLong("revision"));
+                });
+            } catch (RuntimeException failure) {
+                // A failed proof also ends a standing read lease, which an upgrade to a write would otherwise leave behind.
+                lease.set(ended());
+                throw failure;
+            }
             LEASE_OPENS.incrementAndGet();
+            // Published only over the exact lease this proof started from. A proof that ran out while validating,
+            // or whose starting lease a drop replaced meanwhile, serves only the operation it was proved for and
+            // is never visible to another one, which proves again.
+            if (System.nanoTime() - proved.deadlineNanos() < 0) lease.compareAndSet(before, proved);
             return proved;
         }
     }
@@ -366,7 +384,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         try {
             return validated(mutation, (session, inventory) -> action.apply(session));
         } catch (RuntimeException failure) {
-            lease.set(null);
+            lease.set(ended());
             throw failure;
         }
     }

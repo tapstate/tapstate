@@ -211,9 +211,12 @@ final class ExecutionAuthorization implements AutoCloseable {
     void holdLease(ExecutionFence fence, LeasedStateStore store) {
         Objects.requireNonNull(fence); Objects.requireNonNull(store);
         if (!fenced) return;
-        var held = leases.computeIfAbsent(ReadKey.of(fence), ignored -> new CopyOnWriteArrayList<>());
-        held.removeIf(reference -> reference.get() == null);
-        held.add(new WeakReference<>(store));
+        sweepLeases();
+        leases.compute(ReadKey.of(fence), (key, registered) -> {
+            var held = registered == null ? new CopyOnWriteArrayList<WeakReference<LeasedStateStore>>() : registered;
+            held.add(new WeakReference<>(store));
+            return held;
+        });
         if (closed.get()) dropLeases(ReadKey.of(fence));
     }
 
@@ -222,9 +225,25 @@ final class ExecutionAuthorization implements AutoCloseable {
         if (held == null) return;
         for (var reference : held) {
             var store = reference.get();
-            if (store == null) held.remove(reference); else store.dropLease();
+            if (store != null) store.dropLease();
         }
-        if (held.isEmpty()) leases.remove(key, held);
+        pruneLeases(key);
+    }
+
+    /**
+     * Sweeps every key, not only one being registered or dropped: a reading that ended keeps no entry to
+     * trigger its own cleanup. Runs on every registration and every background refresh.
+     */
+    private void sweepLeases() {
+        for (var key : leases.keySet()) pruneLeases(key);
+    }
+
+    /** Forgets collected stores under {@code key}, and the key once none is left, atomically with registration. */
+    private void pruneLeases(ReadKey key) {
+        leases.computeIfPresent(key, (ignored, registered) -> {
+            registered.removeIf(reference -> reference.get() == null);
+            return registered.isEmpty() ? null : registered;
+        });
     }
 
     /** A physical source uses the same bounded proof cache, independently of all Pipeline executions. */
@@ -380,6 +399,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 nextReadNanos.remove(key, deadline);
             }
         });
+        sweepLeases();
     }
 
     /**

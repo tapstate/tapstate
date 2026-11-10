@@ -23,6 +23,7 @@ import java.util.function.Function;
 /** A fixed Pipeline state identity and, for mutations, the original actuation claim. */
 final class MongoCachePipelineAccess {
     private static final String PIPELINE_SCOPE = "pipelineScope";
+    private static final String CLAIM_SCOPE_UNREADABLE = "pipeline-claim-scope";
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     final MongoDatabase database;
@@ -373,12 +374,12 @@ final class MongoCachePipelineAccess {
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);
         new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
         try {
-            if (!(row.get(PIPELINE_SCOPE) instanceof Document stored)) throw unreadable("pipeline-claim-scope");
+            if (!(row.get(PIPELINE_SCOPE) instanceof Document stored)) throw unreadable(CLAIM_SCOPE_UNREADABLE);
             var decoded = MongoPipelinePreparationFacts.scope(stored);
             if (!scope.pipelineId().equals(decoded.pipelineId()) || !new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation())
-                    .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable("pipeline-claim-scope");
+                    .equals(new CacheBusinessScope(decoded.clusterId(), decoded.bindingVersion(), decoded.cacheIncarnation()))) throw unreadable(CLAIM_SCOPE_UNREADABLE);
             if (!scope.equals(decoded)) throw claimFenced();
-        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable("pipeline-claim-scope"); }
+        } catch (IllegalArgumentException | NullPointerException | ClassCastException invalid) { throw unreadable(CLAIM_SCOPE_UNREADABLE); }
         if (MongoCachePipelinePreparations.phase(row, scope) != io.tapstate.spi.store.PipelineCachePreparations.Phase.PREPARED) throw claimFenced();
     }
 
