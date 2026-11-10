@@ -311,8 +311,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     private void requireValidationPreparation(MongoValidationPreparations.Authority original) {
-        Objects.requireNonNull(original, "original").require(false);
-        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(original.binding().cache()))) throw MongoCacheIdentity.fenced();
+        var binding = original.binding();
+        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
         loadBusinessScope(original.subject().scope());
         StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
     }

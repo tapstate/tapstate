@@ -1143,7 +1143,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     }
 
     MongoValidationAdmissionStore validationAdmissions(MongoValidationPreparations.Permission original) {
-        requireOpen(); return new MongoValidationAdmissionStore(connection.client(), connection.database(), clusterId,
+        requireOpen();
+        original.requireComplete();
+        return new MongoValidationAdmissionStore(connection.client(), connection.database(), clusterId,
                 this::requireOpen, new MongoValidationPreparations.Authority(original));
     }
 
@@ -1201,10 +1203,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         public io.tapstate.spi.store.CacheBusinessScope scope() { return original.subject().scope(); }
         public java.util.UUID generation() { return original.subject().generation(); }
         public java.util.UUID preparationId() { return original.subject().preparationId(); }
-        public void requireCurrent() { configuration.requireOpen(); local.run(); original.requireComplete(); }
-        public io.tapstate.spi.store.WorkloadClaimStore claims() { requireCurrent(); return cache.validationClaims(original, local); }
-        public io.tapstate.spi.store.ValidationControlStore control() { requireCurrent(); return cache.validationControl(original, local); }
-        public io.tapstate.spi.store.ValidationRunHistory history(){requireCurrent();return cache.validationHistory(original,local);}
+        private void requireOpen() { configuration.requireOpen(); local.run(); }
+        public void requireCurrent() { requireOpen(); original.requireComplete(); }
+        public io.tapstate.spi.store.WorkloadClaimStore claims() { requireOpen(); return cache.validationClaims(original, local); }
+        public io.tapstate.spi.store.ValidationControlStore control() { requireOpen(); return cache.validationControl(original, local); }
+        public io.tapstate.spi.store.ValidationRunHistory history() { requireOpen(); return cache.validationHistory(original, local); }
         public io.tapstate.spi.store.ValidationReportAdmission admissions() {
             requireCurrent(); return new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
                     () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
@@ -1219,7 +1222,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
         /** Only old-tenure CONFIG rights are revoked; current requests and saved task definitions remain intact. */
         public boolean closeObsoletePermissions(io.tapstate.core.validation.ValidationOwner current, int maximum) {
-            requireCurrent(); var control = control(); control.snapshot(Objects.requireNonNull(current));
+            var control = control(); control.snapshot(Objects.requireNonNull(current));
+            requireCurrent();
             var admissions = new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
                     () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
             boolean complete = admissions.transaction(session -> admissions.closeObsoletePermissionsInTransaction(session, current, maximum));

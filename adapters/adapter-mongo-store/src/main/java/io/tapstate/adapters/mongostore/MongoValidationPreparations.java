@@ -72,9 +72,10 @@ final class MongoValidationPreparations {
         private final Permission permission;
         private final Closing closing;
         private final Subject subject;
+        // Entry points validate the original before publishing the store.
         Authority(Permission permission) {
             this.permission = Objects.requireNonNull(permission); this.closing = null;
-            permission.requireComplete(); this.subject = permission.subject();
+            this.subject = permission.subject();
         }
         Authority(Closing closing) {
             this.permission = null; this.closing = Objects.requireNonNull(closing);
@@ -91,7 +92,11 @@ final class MongoValidationPreparations {
                 if (!Objects.equals(subject, state.subject()) || state.phase() == Phase.CLOSED || subject == null) throw fenced();
             }
         }
-        StorageBinding binding() { require(false); return permission == null ? closing.binding() : permission.binding(); }
+        StorageBinding binding() {
+            if (permission != null) return permission.owner.requireCompleteBinding(permission);
+            require(false);
+            return closing.binding();
+        }
         private MongoValidationPreparations owner() { return permission == null ? closing.owner : permission.owner; }
         void enter(MongoClient client, MongoDatabase database, ClientSession session, boolean admission) {
             var owner = owner(); owner.active.run();
@@ -381,11 +386,28 @@ final class MongoValidationPreparations {
     private State require(Permission permission, boolean complete) {
         requireOwned(permission);
         return transaction(session -> {
-            requireDefinition(session, permission.subject().pipelineId()); requireBinding(session, permission.subject().scope());
-            var current = state(mapping(session, permission.subject().pipelineId()), permission.subject().pipelineId()); requireSubject(current, permission.subject());
-            if (current.closingOperationId() != null || current.phase() != Phase.COMPLETE && (complete || current.phase() != Phase.ISSUED)) throw fenced();
-            return current;
+            var subject = permission.subject();
+            requireDefinition(session, subject.pipelineId());
+            requireBinding(session, subject.scope());
+            return requirePermission(session, subject, complete);
         });
+    }
+    private StorageBinding requireCompleteBinding(Permission permission) {
+        requireOwned(permission);
+        return transaction(session -> {
+            var subject = permission.subject();
+            requireDefinition(session, subject.pipelineId());
+            var loaded = bindings.readForTransaction(session).loaded().orElseThrow(MongoValidationPreparations::fenced);
+            if (!clusterId.equals(subject.scope().clusterId()) || !loaded.cachePreparation().businessScope().equals(subject.scope())) throw fenced();
+            requirePermission(session, subject, true);
+            return loaded.binding();
+        });
+    }
+    private State requirePermission(ClientSession session, Subject subject, boolean complete) {
+        var current = state(mapping(session, subject.pipelineId()), subject.pipelineId());
+        requireSubject(current, subject);
+        if (current.closingOperationId() != null || current.phase() != Phase.COMPLETE && (complete || current.phase() != Phase.ISSUED)) throw fenced();
+        return current;
     }
     private State requireClosing(Closing closing) {
         if (closing == null || closing.owner != this) throw fenced();
