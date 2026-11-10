@@ -13,7 +13,6 @@ import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.PipelineIntentStore;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineStoreViews;
-import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.Objects;
 import java.util.function.Function;
 import io.tapstate.spi.metrics.MetricsExport;
@@ -176,7 +175,7 @@ final class ConvergenceDriver {
                     permit = actuation.permit(snapshot.get().scope());
                     if (permit.granted()) {
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
-                        pass = new PipelineConvergencePass(snapshot.get(), WorkloadClaimFence.from(permit.claim()),
+                        pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
                                 scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
                     }
                 }

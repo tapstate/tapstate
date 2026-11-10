@@ -33,6 +33,7 @@ import java.util.function.BiFunction;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
+    private static final System.Logger LOG = System.getLogger(MongoCacheWorkloadClaimStore.class.getName());
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -70,6 +71,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         return StoreIo.call(() -> operations.call(deadline,active,operation));
     }
 
+    @Override public <T> T withRenewalDeadline(long deadline,Runnable active,java.util.function.Supplier<T> operation) {
+        return StoreIo.call(() -> operations.renew(deadline,active,operation));
+    }
+
     @Override public void awaitQuiescence(long deadline) { StoreIo.run(() -> operations.await(deadline)); }
 
     @Override public WorkloadClaimAttempt acquire(WorkloadClaimKey key, WorkloadOwner owner, long topologyRevision, Duration ttl) {
@@ -105,13 +110,25 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
+        var firstMongoError = new java.util.concurrent.atomic.AtomicBoolean();
         return transaction(false, null, (store, session) -> {
-            var renewed = store.renewBeforeReads(expected, ttl);
-            if (renewed.isPresent()) {
-                var retained = storedScope(session, expected.key());
-                if (retained != null) validateState(session, retained);
-            } else validateMutationScope(session, store, expected);
-            return renewed;
+            try {
+                var renewed = store.renewBeforeReads(expected, ttl);
+                if (renewed.isPresent()) {
+                    var retained = storedScope(session, expected.key());
+                    if (retained != null) validateState(session, retained);
+                } else validateMutationScope(session, store, expected);
+                return renewed;
+            } catch (MongoException failure) {
+                if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                        && firstMongoError.compareAndSet(false, true)) {
+                    LOG.log(System.Logger.Level.WARNING,
+                            "Pipeline renewal first Mongo error {0}, claim={1}, execution={2}, type={3}, code={4}, labels={5}",
+                            expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(),
+                            failure.getClass().getSimpleName(), failure.getCode(), failure.getErrorLabels());
+                }
+                throw failure;
+            }
         }, true);
     }
     @Override public boolean release(WorkloadClaim expected) {

@@ -86,6 +86,22 @@ final class PipelineConvergencePass {
         @Override public void delete(String pipelineId) { throw fenced(); }
     };
 
+    private long displacedExecution;
+
+    PipelineConvergencePass(PipelineIntentSnapshot intent, io.tapstate.spi.store.WorkloadClaim persisted,
+            PipelineStoreViews views, Runnable requireActive,
+            java.util.function.Consumer<PipelineConvergencePass> advancedObserver) {
+        this(intent, WorkloadClaimFence.from(persisted), views, requireActive, advancedObserver);
+        if (persisted.executionGeneration() > 0
+                && persisted.contextExecutionGeneration() == persisted.executionGeneration()
+                && persisted.executionClaimGeneration() > 0
+                && persisted.executionClaimGeneration() < persisted.claimGeneration()) {
+            displacedExecution = persisted.executionGeneration();
+        }
+    }
+
+    long displacedExecution() { return displacedExecution; }
+
     PipelineConvergencePass(PipelineIntentSnapshot intent, WorkloadClaimFence original,
             PipelineStoreViews views, Runnable requireActive) {
         this(intent,original,views,requireActive,ignored->{});

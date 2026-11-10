@@ -1198,7 +1198,13 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
                 }
-            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+            } catch (RuntimeException failure) {
+                try { requireActive.run(); }
+                catch (RuntimeException fence) {
+                    if (fence != failure) failure.addSuppressed(fence);
+                }
+                throw failure;
+            }
         });
     }
     private void verifyConsumerStructure() {

@@ -35,14 +35,20 @@ final class ClusterWorkloadClaims {
         return call(action, Long.MAX_VALUE);
     }
     private <T>T call(java.util.function.Supplier<T> action, long budgetNanos){
+        return call(action, budgetNanos, false);
+    }
+    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos, boolean renewal){
         if(admission==null)return action.get();
         if(!admission.enter())throw ThreeLayerStorePort.refused();
         try {
-            var result=store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded
-                    ? bounded.withDeadline(budgetNanos == Long.MAX_VALUE ? admission.deadlineNanos()
-                            : Math.min(admission.deadlineNanos(), System.nanoTime() + budgetNanos),()->{
-                        if(!admission.accepting())throw ThreeLayerStorePort.refused();
-                    },action) : action.get();
+            T result;
+            if (store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded) {
+                long deadline = budgetNanos == Long.MAX_VALUE ? admission.deadlineNanos()
+                        : Math.min(admission.deadlineNanos(), System.nanoTime() + budgetNanos);
+                Runnable active = () -> { if (!admission.accepting()) throw ThreeLayerStorePort.refused(); };
+                result = renewal ? bounded.withRenewalDeadline(deadline, active, action)
+                        : bounded.withDeadline(deadline, active, action);
+            } else result = action.get();
             if(!admission.current())throw ThreeLayerStorePort.refused();
             return result;
         }
@@ -104,12 +110,12 @@ final class ClusterWorkloadClaims {
     Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos) {
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
             throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
-        if (expected.executionGeneration() == 0) return renew(expected, ttl);
         ClusterMembership current = membership.committed();
         if (!membership.businessEligible() || current == null
                 || !current.clusterId().equals(expected.key().clusterId())
-                || current.revision() < expected.topologyRevision()) return Optional.empty();
-        return call(()->store.renew(expected, ttl), budgetNanos);
+                || current.revision() < expected.topologyRevision()
+                || expected.executionGeneration() == 0 && current.revision() != expected.topologyRevision()) return Optional.empty();
+        return call(()->store.renew(expected, ttl), budgetNanos, true);
     }
 
     /**

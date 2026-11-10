@@ -848,6 +848,22 @@ class MongoSrsConsumerStoreIT {
     }
 
     @Test
+    void aSecondaryFenceDoesNotMaskTheFirstProgressFailure() {
+        withBusiness(f -> {
+            var first = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "controlled"), null);
+            var secondary = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            var checks = new java.util.concurrent.atomic.AtomicInteger();
+            var guarded = f.consumers().guardedBy(() -> {
+                if (checks.getAndIncrement() == 0) throw first;
+                throw secondary;
+            });
+            assertThatThrownBy(() -> guarded.advanceWriter(A, 1, "run", "orders", "writer",
+                    point(1, 9, "late"), f.fenceA())).isSameAs(first);
+            assertThat(first.getSuppressed()).containsExactly(secondary);
+        });
+    }
+
+    @Test
     void generationAdvanceFencesAProgressTransactionThatAlreadyReadTheOriginalClaim() {
         withBusiness(f -> {
             SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),

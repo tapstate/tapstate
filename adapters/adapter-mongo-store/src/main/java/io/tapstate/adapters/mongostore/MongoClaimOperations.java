@@ -31,6 +31,12 @@ final class MongoClaimOperations {
                 thread.setDaemon(true);
                 return thread;
             });
+    private final ThreadPoolExecutor renewals = new ThreadPoolExecutor(1, 1, 100, TimeUnit.MILLISECONDS,
+            new LinkedBlockingQueue<>(), action -> {
+                var thread = new Thread(action, "mongo-pipeline-renewal-io");
+                thread.setDaemon(true);
+                return thread;
+            });
     private final Set<Call<?>> calls = ConcurrentHashMap.newKeySet();
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<MongoReadBudget> current = new ThreadLocal<>();
@@ -44,6 +50,7 @@ final class MongoClaimOperations {
         this.client = client;
         observeTopology();
         workers.allowCoreThreadTimeOut(true);
+        renewals.allowCoreThreadTimeOut(true);
     }
 
     MongoReadBudget budget() { return current.get(); }
@@ -70,6 +77,14 @@ final class MongoClaimOperations {
     }
 
     <T> T call(long deadline,Runnable guard,Supplier<T> action) {
+        return call(deadline, guard, action, workers);
+    }
+
+    <T> T renew(long deadline, Runnable guard, Supplier<T> action) {
+        return call(deadline, guard, action, renewals);
+    }
+
+    private <T> T call(long deadline,Runnable guard,Supplier<T> action,ThreadPoolExecutor lane) {
         requireAdmission();
         var inherited = current.get();
         if (inherited != null) {
@@ -80,15 +95,15 @@ final class MongoClaimOperations {
             try {check();var result=action.get();check();return result;}
             finally { current.set(inherited);active.set(previous); }
         }
-        return result(submit(deadline, guard,action,false), deadline);
+        return result(submit(deadline, guard,action,false,lane), deadline);
     }
 
-    private synchronized <T> Call<T> submit(long deadline,Runnable guard,Supplier<T> action,boolean cleanup) {
+    private synchronized <T> Call<T> submit(long deadline,Runnable guard,Supplier<T> action,boolean cleanup,ThreadPoolExecutor lane) {
         if (closed || stopping&&!cleanup) throw MongoCacheWorkloadClaimStore.claimFenced();
         remaining(deadline);
         var call = new Call<T>(deadline,guard, action);
         calls.add(call);
-        try { workers.execute(call); }
+        try { lane.execute(call); }
         catch (RuntimeException rejected) { calls.remove(call); notifyAll(); throw rejected; }
         return call;
     }
@@ -136,6 +151,7 @@ final class MongoClaimOperations {
         void cancelPending() {
             if (state.compareAndSet(0, 2)) {
                 workers.remove(this);
+                renewals.remove(this);
                 finished();
                 result.completeExceptionally(MongoCacheWorkloadClaimStore.claimFenced());
             }
@@ -278,7 +294,7 @@ final class MongoClaimOperations {
                 synchronized (transaction) {
                     if (!transactions.contains(transaction)) continue;
                     if (transaction.cleanup == null || transaction.cleanup.result.isDone())
-                        transaction.cleanup = submit(deadline,()->{}, () -> { abort(transaction, budget()); return null; },true);
+                        transaction.cleanup = submit(deadline,()->{}, () -> { abort(transaction, budget()); return null; },true,workers);
                     cleanup = transaction.cleanup;
                 }
                 result(cleanup, deadline);
@@ -291,5 +307,6 @@ final class MongoClaimOperations {
         if (!calls.isEmpty() || !transactions.isEmpty()) throw MongoCacheWorkloadClaimStore.claimFenced();
         closed = true;
         workers.shutdown();
+        renewals.shutdown();
     }
 }

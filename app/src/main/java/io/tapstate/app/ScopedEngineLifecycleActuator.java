@@ -190,7 +190,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                     Map.of("pipeline",id(),"seconds",STOP_BUDGET.toSeconds()),null);
             require();
         }
-        if (capture != null) { capture.stopCapture(id(),false); require(); }
+        if (run == null && pass.displacedExecution() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            // An absent Jet handle cannot supply the old capture fence. The successor may retire only
+            // local sessions in the original scope at or below its admitted fence.
+            scoped.retireScope(pass.scope(), command);
+            require();
+        } else if (capture != null) {
+            capture.stopCapture(id(), false);
+            require();
+        }
         if (manifest != null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
         if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
     }
@@ -215,6 +223,13 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         require(); run.resume(); require();
     }
     @Override public synchronized Optional<LeaseLoss> leaseLoss(String pipeline) {
+        long displaced = pass.displacedExecution();
+        if (displaced > 0 && displaced == command.executionGeneration()
+                && (run == null || original != null && pass.scope().equals(original.scope()) && !run.completed())) {
+            requireId(pipeline);
+            return Optional.of(new LeaseLoss(displaced,
+                    new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
+        }
         if (run == null || original == null || !pass.scope().equals(original.scope())) return Optional.empty();
         if (run.isCarryingAJob()) {
             if (original.claimGeneration() >= command.claimGeneration()) return Optional.empty();
