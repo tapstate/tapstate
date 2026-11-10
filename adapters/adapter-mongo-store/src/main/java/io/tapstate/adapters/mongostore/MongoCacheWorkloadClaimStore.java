@@ -118,8 +118,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(Objects.requireNonNull(expected, "expected").key());
         return transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
-            storedScope(session, expected.key());
-            return store.release(expected);
+            var retained = storedScope(session, expected.key());
+            boolean released = store.release(expected);
+            if (released && retained != null) fenceProgress(session, retained);
+            return released;
         });
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {
@@ -142,7 +144,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(Objects.requireNonNull(expected, "expected").key());
         return transaction(false, (store, session) -> {
             validateMutationScope(session, store, expected);
-            return store.advanceExecution(expected, topologyRevision, nodeIds);
+            var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
+            if (advanced.isPresent() && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION)
+                fenceProgress(session, storedScope(session, expected.key()));
+            return advanced;
         });
     }
     @Override public Optional<WorkloadClaim> recordExecutionFailure(WorkloadClaim expected, boolean afterMemberLoss) {
@@ -192,6 +197,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 validateState(session, retained);
             }
         }
+    }
+
+    private void fenceProgress(ClientSession session, PipelineIntentScope retained) {
+        var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
+        access.updateState(session, access.state(session), new Document(), false);
     }
 
     private void validateState(ClientSession session, PipelineIntentScope retained) {

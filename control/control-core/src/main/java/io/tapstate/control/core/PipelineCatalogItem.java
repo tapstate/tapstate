@@ -60,6 +60,7 @@ public record PipelineCatalogItem(
     public enum DisplayState {
         NEW,
         STARTING,
+        RECOVERING,
         RUNNING,
         PAUSING,
         PAUSED,
@@ -78,6 +79,7 @@ public record PipelineCatalogItem(
         NOT_STARTED,
         NEW,
         STARTING,
+        RECOVERING,
         RUNNING,
         PAUSING,
         PAUSED,

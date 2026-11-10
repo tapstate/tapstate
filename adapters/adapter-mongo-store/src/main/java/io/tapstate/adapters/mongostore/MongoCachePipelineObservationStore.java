@@ -86,9 +86,15 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
             // STOP first commits the checkpoint, then drains the job and may rebuild CONFIG/CACHE.
             // Its matching observation witnesses that the stop actually finished.
             case FAILED, COMPLETED -> Optional.of(new Observation(reading.pipeline(), actual,
-                    Map.of(), Map.of(), Map.of(), null, null, List.of()));
+                    Map.of(), Map.of(), Map.of(), leaseRecoveryFailure(reading, actual), null, List.of()));
             default -> Optional.empty();
         };
+    }
+
+    private static io.tapstate.core.lifecycle.ObservationFailure leaseRecoveryFailure(Reading reading, PipelineState actual) {
+        var recovery = actual == PipelineState.FAILED ? MongoStateStore.leaseRecovery(reading.state()) : null;
+        return recovery == null || recovery.attempts() < 3 ? null
+                : new io.tapstate.core.lifecycle.ObservationFailure("engine.execution-not-authorized", Map.of("pipeline", reading.pipeline()));
     }
 
     /** A previous RUNNING observation can witness progress, without serving its stale payload. */

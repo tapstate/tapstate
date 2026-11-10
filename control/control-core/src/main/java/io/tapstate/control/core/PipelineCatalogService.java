@@ -150,6 +150,8 @@ public final class PipelineCatalogService {
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
                 ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
+                : target == PipelineState.RUNNING && stateFacts != null && stateFacts.leaseRecovering()
+                        ? PipelineCatalogItem.DisplayState.RECOVERING
                 : target == PipelineState.RUNNING && stateFacts != null && stateFacts.runningObservationUnavailable()
                         ? PipelineCatalogItem.DisplayState.UNAVAILABLE
                         : displayState(target, effective, intentReadFailure == null);

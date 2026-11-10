@@ -294,8 +294,12 @@ final class MongoCachePipelineAccess {
 
     /** A recovery discovery read may use only its original live execution, without advancing state. */
     void verifyOriginalClaim(ClientSession session) {
+        verifyOriginalClaim(session, false);
+    }
+
+    void verifyOriginalClaim(ClientSession session, boolean structureChecked) {
         if (original == null) throw fenced();
-        MongoCacheWorkloadClaimStore.requireCollection(database);
+        if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         var filter = WorkloadClaimDocuments.live(original)
                 .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");

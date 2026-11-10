@@ -32,6 +32,8 @@ public final class PipelineConverger {
 
     /** The retry ceiling for one pass: a fenced writer rebases up to this many times before conceding. */
     public static final int MAX_CAS_ATTEMPTS = 8;
+    public static final int MAX_LEASE_RECOVERY_ATTEMPTS = 3;
+    private static final java.time.Duration LEASE_RETRY_DELAY = java.time.Duration.ofSeconds(10);
 
     private final DesiredStore desired;
     private final StateStore state;
@@ -80,7 +82,7 @@ public final class PipelineConverger {
 
     /** Drives the pipeline's actual state toward its current desired target, seeding it if new. */
     public ConvergeResult converge(String pipelineId) {
-        return converge(pipelineId, desired.read(pipelineId));
+        return converge(pipelineId, desired.read(pipelineId), 0);
     }
 
     /**
@@ -100,10 +102,10 @@ public final class PipelineConverger {
             BooleanSupplier currentIntent) {
         Objects.requireNonNull(intent, "intent");
         return new PipelineConverger(desired, scopedState, scopedActuator, clock, scopedRebuilds, true, finalObservation, currentIntent)
-                .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()));
+                .converge(intent.scope().pipelineId(), Optional.ofNullable(intent.desired()), intent.intentRevision());
     }
 
-    private ConvergeResult converge(String pipelineId, Optional<DesiredState> intent) {
+    private ConvergeResult converge(String pipelineId, Optional<DesiredState> intent, long intentRevision) {
         if (intent.isEmpty()) {
             return ConvergeResult.nothingToDo();
         }
@@ -134,7 +136,7 @@ public final class PipelineConverger {
         // Recording that run's failure would advance the epoch without carrying out the restart,
         // consuming its accepted start and any clearing the user requested.
         if (target == PipelineState.RUNNING && actual == PipelineState.RUNNING && !rebuildOwed) {
-            return convergeRunning(pipelineId, actualDoc.orElseThrow(), purgeState, rebuild, intent.get());
+            return convergeRunning(pipelineId, actualDoc.orElseThrow(), purgeState, rebuild, intent.get(), intentRevision);
         }
 
         if (target == PipelineState.PAUSED && actual == PipelineState.PAUSED) {
@@ -150,7 +152,11 @@ public final class PipelineConverger {
 
         if ((target == PipelineState.RUNNING || target == PipelineState.PAUSED)
                 && actual == PipelineState.FAILED && !rebuildOwed) {
-            return convergeFailed(pipelineId, target, actualDoc.orElseThrow());
+            var checkpoint = actualDoc.orElseThrow();
+            var recovery = checkpoint.leaseRecovery();
+            if (recovery != null && recovery.intentRevision() == intentRevision
+                    && recovery.attempts() >= MAX_LEASE_RECOVERY_ATTEMPTS) return ConvergeResult.converged(checkpoint);
+            return convergeFailed(pipelineId, target, checkpoint);
         }
 
         if (target == PipelineState.RUNNING && actual == PipelineState.COMPLETED && !rebuildOwed) {
@@ -171,7 +177,16 @@ public final class PipelineConverger {
     }
 
     private ConvergeResult convergeRunning(
-            String pipelineId, CheckpointDoc current, boolean purgeState, boolean rebuild, DesiredState intent) {
+            String pipelineId, CheckpointDoc current, boolean purgeState, boolean rebuild, DesiredState intent, long intentRevision) {
+        var saved = current.leaseRecovery();
+        var recovery = saved != null && saved.intentRevision() == intentRevision ? saved : null;
+        if (intentRevision > 0) {
+            var leaseLoss = actuator.leaseLoss(pipelineId);
+            if (leaseLoss.isPresent()) {
+                var lost = leaseLoss.orElseThrow();
+                return recoverLease(pipelineId, current, intentRevision, recovery, lost.executionGeneration(), lost.cause());
+            }
+        }
         // A pipeline believed running whose job has died converges to the observable FAILED state,
         // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
         // the driver can surface it. A converge-side transition, never a user verb.
@@ -205,6 +220,10 @@ public final class PipelineConverger {
         // resuming the job. Submitting is absent-safe, and the guard is "no job is carrying it"
         // rather than "this process did not start it", so the next tick actuates nothing.
         if (!actuator.isCarryingAJob(pipelineId)) {
+            if (recovery != null) {
+                return recoverLease(pipelineId, current, intentRevision, recovery, recovery.failedExecution(),
+                        new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null));
+            }
             try {
                 actuator.start(pipelineId);
             } catch (TapstateException refused) {
@@ -217,7 +236,28 @@ public final class PipelineConverger {
             }
             return ConvergeResult.converged(current);
         }
+        if (recovery != null && !actuator.recoveredJobRunning(pipelineId)) return ConvergeResult.recovering(current);
         return driveTo(pipelineId, PipelineState.RUNNING, true, current, purgeState, rebuild, false);
+    }
+
+    private ConvergeResult recoverLease(String pipelineId, CheckpointDoc current, long intentRevision,
+            CheckpointDoc.LeaseRecovery recovery, long failedExecution, Throwable failure) {
+        if (!stillOriginalIntent.getAsBoolean()) return ConvergeResult.superseded();
+        var now = clock.instant();
+        if (recovery != null && now.isBefore(recovery.retryAfter())) return ConvergeResult.recovering(current);
+        int attempts = recovery == null ? 0 : recovery.attempts();
+        if (attempts >= MAX_LEASE_RECOVERY_ATTEMPTS) return failedWith(pipelineId, failure);
+        var next = new CheckpointDoc.LeaseRecovery(intentRevision, failedExecution, attempts + 1, now.plus(LEASE_RETRY_DELAY));
+        var recorded = state.recordLeaseRecovery(pipelineId, current, next, now);
+        if (!(recorded instanceof CasOutcome.Applied applied) || !stillOriginalIntent.getAsBoolean())
+            return ConvergeResult.superseded();
+        try {
+            actuator.start(pipelineId);
+        } catch (TapstateException refused) {
+            if (refused.code() != IoError.STORE_UNAVAILABLE && refused.code() != IoError.WORKLOAD_CLAIM_FENCED
+                    && refused.code() != IoError.PIPELINE_INTENT_FENCED) return failedWith(pipelineId, refused);
+        }
+        return ConvergeResult.recovering(applied.next());
     }
 
     private ConvergeResult completeRun(

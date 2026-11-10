@@ -195,6 +195,7 @@ final class ConvergenceDriver {
                                 scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
                                         originalPass.state(), originalPass.observationSample(), null),
                                 () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
+                if (result.status() == ConvergeStatus.RECOVERING) continue;
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
                     // The job died on its own; the converge side moved the pipeline to the observable FAILED

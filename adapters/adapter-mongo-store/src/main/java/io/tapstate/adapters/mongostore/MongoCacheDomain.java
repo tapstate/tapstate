@@ -609,7 +609,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
     public record PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
-            boolean runningObservationUnavailable) {}
+            boolean runningObservationUnavailable, long leaseRecoveryIntentRevision) {
+        public PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                boolean runningObservationUnavailable) {
+            this(observation, runningObservationUnavailable, 0);
+        }
+    }
 
     public java.util.Map<String, PipelineObservationReading> pipelineObservationBatch(
             java.util.List<io.tapstate.spi.store.PipelineIntentScope> scopes, Runnable active, boolean includeDisplayState) {
@@ -647,8 +652,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 for (var reading : readings) {
                     var observation = MongoCachePipelineObservationStore.select(
                             reading, observations.get(reading.key()), terminal.get(reading.pipeline()));
+                    var recovery = includeDisplayState ? MongoStateStore.leaseRecovery(reading.state()) : null;
+                    boolean recovering = recovery != null && reading.actual() == io.tapstate.core.lifecycle.PipelineState.RUNNING
+                            && (observation.isEmpty() || reading.claim().getLong("executionGeneration") <= recovery.failedExecution());
+                    if (recovering) observation = java.util.Optional.empty();
+                    long recoveringIntent = recovering ? recovery.intentRevision() : 0;
                     result.put(reading.pipeline(), new PipelineObservationReading(
-                            observation, observation.isEmpty() && unavailable.contains(reading.pipeline())));
+                            observation, observation.isEmpty() && unavailable.contains(reading.pipeline()), recoveringIntent));
                 }
             }
             return java.util.Map.copyOf(result);

@@ -702,7 +702,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (runId == null || runId.isBlank() || table == null || table.isBlank() || writerId == null || writerId.isBlank())
             throw new IllegalArgumentException("an original writer report requires named run, table and writer");
         return transaction(runtimeStructure, session -> {
-            prove(session, context, fence, runtimeStructure);
+            proveProgress(session, context, fence, runtimeStructure);
             var own = runtimeStructure ? requireIncrementalOwn(session, context) : requireOwn(session, context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
             var held = own.cursor(); var run = held.writerRun();
@@ -774,7 +774,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context,"context"); requireRevision(membershipRevision);
         if (table == null || table.isBlank() || sequence < -1 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid original consumer read sequence");
         return transaction(runtimeStructure, session -> {
-            prove(session, context, fence, runtimeStructure);
+            proveProgress(session, context, fence, runtimeStructure);
             var own = runtimeStructure ? requireIncrementalOwn(session, context) : requireOwn(session, context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
             if (!own.member().tables().contains(table) || !own.cursor().ringDoneThrough().containsKey(table)) throw unavailable(context.key().miningChainId());
@@ -1160,6 +1160,16 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (!structureChecked) pipeline.verifyStateStructure();
         Document current = pipeline.state(session, structureChecked);
         pipeline.proveConsumerClaim(session, structureChecked);
+        pipeline.updateState(session, current, new Document(), false);
+    }
+
+    private void proveProgress(ClientSession session, SrsConsumerContext context, WorkloadClaimFence fence,
+            boolean structureChecked) {
+        var pipeline = pipelineAccess(context, fence);
+        if (!structureChecked) pipeline.verifyStateStructure();
+        Document current = pipeline.state(session, structureChecked);
+        pipeline.verifyOriginalClaim(session, structureChecked);
+        // Claim replacement and execution advancement also write this checkpoint fence.
         pipeline.updateState(session, current, new Document(), false);
     }
 

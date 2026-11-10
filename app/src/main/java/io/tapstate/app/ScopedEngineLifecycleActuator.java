@@ -214,6 +214,30 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         require(); run.resume(); require();
     }
+    @Override public synchronized Optional<LeaseLoss> leaseLoss(String pipeline) {
+        if (run == null || original == null || !pass.scope().equals(original.scope())) return Optional.empty();
+        if (run.isCarryingAJob()) {
+            if (original.claimGeneration() >= command.claimGeneration()) return Optional.empty();
+            requireId(pipeline);
+            // The successor can fence this old execution even before its Jet tasks notice the loss.
+            return Optional.of(new LeaseLoss(original.executionGeneration(),
+                    new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
+        }
+        var failure = run.failure();
+        for (Throwable cause = failure.orElse(null); cause != null; cause = cause.getCause()) {
+            if (cause instanceof TapstateException coded && coded.code() == EngineError.EXECUTION_NOT_AUTHORIZED) {
+                requireId(pipeline);
+                return Optional.of(new LeaseLoss(original.executionGeneration(), coded));
+            }
+        }
+        return Optional.empty();
+    }
+
+    @Override public synchronized boolean recoveredJobRunning(String pipeline) {
+        requireId(pipeline);
+        return run != null && isCurrentRun() && run.status() == com.hazelcast.jet.core.JobStatus.RUNNING;
+    }
+
     @Override public synchronized Optional<Throwable> failure(String pipeline) {
         requireId(pipeline);
         if (engine.isLost()) { var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost; }

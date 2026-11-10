@@ -746,7 +746,8 @@ final class PipelineActuationOwnership {
         List<Held> due = admittedCall(this::dueRenewals, List::of);
         for (Held state : due) {
             // Each independent renewal owns one allowance and yields the fair IO gate afterward.
-            admittedCall(() -> { renewIfDue(state);return null; }, () -> null);
+            long queued = nanoTime.getAsLong();
+            admittedCall(() -> { renewIfDue(state, queued);return null; }, () -> null);
         }
     }
 
@@ -756,13 +757,17 @@ final class PipelineActuationOwnership {
         // Earlier successful lease proofs take priority over subsequently renewed tails. This also
         // gives mid-pass arrivals their turn without interpreting the store's absolute deadlines.
         return held.values().stream().filter(state -> due(state, now))
-                .sorted(Comparator.comparingLong(state -> state.leaseProofOrder)).toList();
+                .sorted(Comparator.comparingLong((Held state) -> state.leaseDeadlineNanos)
+                        .thenComparingLong(state -> state.leaseProofOrder)).toList();
     }
 
-    private synchronized void renewIfDue(Held state) {
+    private synchronized void renewIfDue(Held state, long queued) {
         long now = nanoTime.getAsLong();
         if (!closing && admission.current() && due(state, now)
                 && held.get(state.renewalClaim().key().resourceId()) == state) {
+            LOG.log(System.Logger.Level.DEBUG, "Pipeline renewal admitted {0}, waitMs={1}, remainingMs={2}",
+                    state.renewalClaim().key().resourceId(), TimeUnit.NANOSECONDS.toMillis(now - queued),
+                    TimeUnit.NANOSECONDS.toMillis(state.leaseDeadlineNanos - now));
             renew(state, now);
         }
     }
@@ -1175,10 +1180,13 @@ final class PipelineActuationOwnership {
         try {
             renewed = membership.businessEligible()
                     ? state.scope == null ? claims.renew(original, ttl)
-                            : claims.renewScopedActuation(original, ttl, retrying ? remaining : Long.MAX_VALUE)
+                            : claims.renewScopedActuation(original, ttl, original.executionGeneration() == 0
+                                    ? Long.MAX_VALUE : Math.max(1, Math.min(remaining, renewIntervalNanos / 2)))
                     : claims.renewActuationControl(original, ttl);
         } catch (RuntimeException failure) {
             timedOut = claimIoTimedOut(failure);
+            LOG.log(System.Logger.Level.DEBUG, "Pipeline renewal failed {0}, claim={1}, execution={2}, retryable={3}, result={4}",
+                    original.key().resourceId(), original.claimGeneration(), original.executionGeneration(), timedOut, failure.toString());
         }
         state.contacted = true;
         state.nextContactNanos = now + renewIntervalNanos;
@@ -1195,6 +1203,9 @@ final class PipelineActuationOwnership {
 
         long after = nanoTime.getAsLong();
         remaining = state.leaseDeadlineNanos - after;
+        LOG.log(System.Logger.Level.DEBUG, "Pipeline renewal returned {0}, elapsedMs={1}, remainingMs={2}, matched={3}",
+                original.key().resourceId(), TimeUnit.NANOSECONDS.toMillis(after - now),
+                TimeUnit.NANOSECONDS.toMillis(remaining), renewed.isPresent());
         state.claim = null;
         state.retryClaim = null;
         if (!qualified || retrying && remaining <= 0) return Permit.denied();

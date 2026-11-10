@@ -848,6 +848,51 @@ class MongoSrsConsumerStoreIT {
     }
 
     @Test
+    void generationAdvanceFencesAProgressTransactionThatAlreadyReadTheOriginalClaim() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThat(f.consumers().beginWriterRun(A, member.revision(), "run",
+                    Map.of("orders", List.of("writer")), f.fenceA())).isTrue();
+            var before = cursor(f, A);
+            var beforeFence = new CountDownLatch(1);
+            var afterAdvance = new CountDownLatch(1);
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!"update".equals(event.getCommandName()) || beforeFence.getCount() == 0
+                            || !"pipeline_state".equals(event.getCommand().getString("update").getValue())) return;
+                    beforeFence.countDown();
+                    try {
+                        if (!afterAdvance.await(5, TimeUnit.SECONDS)) throw new AssertionError("execution did not advance");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(interrupted);
+                    }
+                }
+            };
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build();
+            try (var other = MongoClients.create(settings); var workers = Executors.newSingleThreadExecutor()) {
+                var store = new MongoSrsConsumerStore(other, other.getDatabase(f.database().getName()), SCOPE);
+                var progress = workers.submit(() -> assertThatThrownBy(() -> store.advanceWriter(A, member.revision(),
+                        "run", "orders", "writer", point(1, 9, "late"), f.fenceA())).satisfies(MongoSrsConsumerStoreIT::fenced));
+                try {
+                    assertThat(beforeFence.await(5, TimeUnit.SECONDS)).isTrue();
+                    var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {});
+                    var advanced = authority.advanceExecution(f.pipelineA(), 1, Set.of(f.pipelineA().owner().nodeId()));
+                    assertThat(advanced.orElseThrow().executionGeneration()).isEqualTo(f.fenceA().executionGeneration() + 1);
+                } finally {
+                    afterAdvance.countDown();
+                }
+                progress.get(5, TimeUnit.SECONDS);
+                assertThat(cursor(f, A)).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test
     void aNewExecutionReplacesOnlyWriterAccountingAndCannotAcceptLateOriginalReports() {
         withBusiness(f -> {
             var roster = Map.of("orders",List.of("writer"));
