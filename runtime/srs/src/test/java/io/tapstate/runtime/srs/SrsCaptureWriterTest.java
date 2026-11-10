@@ -95,6 +95,41 @@ class SrsCaptureWriterTest {
                     .satisfies(error -> code(error, IoError.CACHE_BUSINESS_FENCED));
         }
     }
+    @Test void batchedCheckpointFlushKeepsTheLatestTokenAndAllConfirmedTables() {
+        var f = new Fixture();
+        var writer = f.writer(true);
+        var callback = new AtomicReference<CaptureListener>();
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
+            callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null)),
+                    Optional.of(new SourcePosition("batch-1")));
+            callback.get().onBatch(List.of(Envelope.insert(2, "quiet", Map.of("id", 2), null)),
+                    Optional.of(new SourcePosition("batch-2")));
+            assertThat(f.log.largestSequence(f.ring("orders"))).isZero();
+            assertThat(f.log.largestSequence(f.ring("quiet"))).isZero();
+            assertThat(f.saved).singleElement().satisfies(point -> assertThat(point.position().token()).isEqualTo("seam"));
+
+            writer.flushCheckpoint();
+            writer.flushCheckpoint();
+            assertThat(f.saved).hasSize(2);
+            var checkpoint = f.saved.getLast();
+            assertThat(checkpoint.position()).isEqualTo(new ChainPosition(new SourceOrder(2, 2), "batch-2"));
+            assertThat(checkpoint.tables()).hasSize(2).allSatisfy((table, at) -> assertThat(at.sequence()).isZero());
+        }
+    }
+
+    @Test void batchedCheckpointCannotFlushAfterItsCaptureLosesAuthority() {
+        var f = new Fixture();
+        var writer = f.writer(true);
+        var callback = new AtomicReference<CaptureListener>();
+        try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
+            callback.get().onBatch(List.of(Envelope.insert(1, "orders", Map.of("id", 1), null)),
+                    Optional.of(new SourcePosition("pending")));
+            f.active.set(false);
+            assertThatThrownBy(writer::flushCheckpoint).satisfies(error -> code(error, IoError.CACHE_BUSINESS_FENCED));
+            assertThat(f.saved).singleElement().satisfies(point -> assertThat(point.position().token()).isEqualTo("seam"));
+        }
+    }
+
     @Test void checkpointConflictNeverAdoptsAnotherRevisionOrLetsTheCallbackContinue() {
         var f = new Fixture(); var writer = f.writer(); var callback = new AtomicReference<CaptureListener>();
         try (var source = writer.start(f.port(writer, callback, true), f.config(), CaptureStart.present(), new CaptureHealth())) {
@@ -225,6 +260,9 @@ class SrsCaptureWriterTest {
             },() -> { if (!f.active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null); });
             assertThat(f.published).hasSize(2); assertThat(told).containsExactly("seam");
             callback.get().onBatch(List.of(Envelope.insert(1,"orders",Map.of("id",1),null)),Optional.of(new SourcePosition("durable")));
+            assertThat(f.saved.getLast().position().token()).isEqualTo("seam");
+            assertThat(told).containsExactly("seam");
+            tail.finishCheckpointing();
             assertThat(f.saved.getLast().position().token()).isEqualTo("durable");
             tail.close(); tail.close(); assertThat(stopped).isTrue();
             assertThatThrownBy(() -> callback.get().onBatch(List.of(),Optional.of(new SourcePosition("late"))))
@@ -280,11 +318,12 @@ class SrsCaptureWriterTest {
         SrsChainState state(long revision, SrsCaptureCheckpoint checkpoint) { return new SrsChainState(chain, "capture", null, 2, actual.keySet(), actual.keySet(), revision, checkpoint, checkpoint == null ? null : Instant.EPOCH, 0, 0); }
         CaptureConfig config() { return new CaptureConfig("connector", Map.of(), List.copyOf(actual.keySet())); }
         String ring(String table) { return SrsRingbuffer.ringName(chain, table); }
-        SrsCaptureWriter writer() {
+        SrsCaptureWriter writer() { return writer(false); }
+        SrsCaptureWriter writer(boolean batchCheckpoints) {
             for (String name : actual.keySet()) SHARED_LOG.stores.put(ring(name), log);
             return new SrsCaptureWriter(SCOPE, opened, FENCE, new SrsStores(chains, models, SHARED_LOG, unusedConsumers), member, () -> {
                 if (!active.get()) throw new TapstateException(IoError.CACHE_BUSINESS_FENCED, Map.of(), null);
-            });
+            }, false, batchCheckpoints);
         }
         CapturePort port(SrsCaptureWriter writer, AtomicReference<CaptureListener> callback, boolean prepare) {
             return new CapturePort() {

@@ -73,6 +73,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
      */
     private final Map<String, NestStore<Map<String, Object>>> referenced;
     private final NestStore<RootAssembly> store;
+
     private boolean snapshotRootsHaveHistory;
     private final String outputStream;
     private final Deque<Object> outgoing = new ArrayDeque<>();
@@ -2162,13 +2163,17 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
     }
 
     private boolean flush() {
+        long rendered = 0;
         while (!outgoing.isEmpty()) {
-            if (!tryEmit(outgoing.peek())) {
-                return false;
+            Object next = outgoing.peek();
+            if (!tryEmit(next)) break;
+            if (vertex.pathId().isEmpty() && next instanceof Envelope document && document.op() == io.tapstate.core.event.Op.INSERT) {
+                rendered++;
             }
             outgoing.poll();
         }
-        return true;
+        if (rendered > 0) store.rendered(rendered);
+        return outgoing.isEmpty();
     }
 
     /** One document being worked on during a drain, before it is stored and emitted. */

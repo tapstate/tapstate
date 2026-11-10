@@ -85,8 +85,29 @@ public enum CardinalityBudget {
     NEST_PENDING_HIGH_WATER("tapstate.pipeline.nest.pending.high_water", MetricAttributes.NEST_NAMESPACE,
             1_000, Fold.HIGHEST),
     NEST_STORED("tapstate.pipeline.nest.stored", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    /** Documents sent by each nest's root level; one series per nest step, so far below the budget. */
+    NEST_ROOTS_RENDERED("tapstate.pipeline.nest.roots.rendered", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
     NEST_DEAD_LETTERED("tapstate.pipeline.nest.dead_lettered", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
+    /** One reading per namespace naming where it comes from; overflow folds its origin labels with the namespace. */
+    NEST_NAMESPACE_INFO("tapstate.pipeline.nest.namespace.info", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.HIGHEST, Set.of(MetricAttributes.NEST_NAMESPACE, MetricAttributes.NEST_STEP,
+                    MetricAttributes.NEST_PATH, MetricAttributes.NEST_MAP)),
+    /**
+     * Operator-state facts the shared state layer reports, today per nest namespace: commit groups, what
+     * each carried and cost, and entries let go of. Named under {@code state} rather than {@code nest} so an
+     * operator moved onto the same layer reports them under the same names.
+     */
+    STATE_COMMIT_GROUPS("tapstate.pipeline.state.commit.groups", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_COMMIT_KEYS("tapstate.pipeline.state.commit.keys", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_COMMIT_ROUND_TRIPS("tapstate.pipeline.state.commit.round_trips", MetricAttributes.NEST_NAMESPACE,
+            1_000, Fold.ADDED),
+    STATE_COMMIT_DURATION("tapstate.pipeline.state.commit.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_EVICTIONS("tapstate.pipeline.state.evictions", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,
@@ -128,8 +149,15 @@ public enum CardinalityBudget {
     private final String openDimension;
     private final int distinctValues;
     private final Fold fold;
+    private final Set<String> overflowDimensions;
 
     CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold) {
+        this(instrument, openDimension, distinctValues, fold, openDimension == null ? Set.of() : Set.of(openDimension));
+    }
+
+    CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold,
+            Set<String> overflowDimensions) {
+        this.overflowDimensions = Set.copyOf(overflowDimensions);
         this.instrument = instrument;
         this.openDimension = openDimension;
         this.distinctValues = distinctValues;
@@ -233,7 +261,7 @@ public enum CardinalityBudget {
                     continue;
                 }
                 Map<String, String> rest = new HashMap<>(point.attributes());
-                rest.remove(budget.openDimension);
+                budget.overflowDimensions.forEach(rest::remove);
                 rest.put(MetricAttributes.OVERFLOW, "true");
                 folded.computeIfAbsent(Map.copyOf(rest), key -> new ArrayList<>()).add(point);
             }

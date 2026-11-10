@@ -116,6 +116,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner==null){execution.ownership().requireEnded(fence);return;}
         if(!original.equals(owner.prepared) || !fence.equals(owner.fence) || !owner.sessions.isEmpty()
                 || !owner.ended.get() && needed(owner))throw refused();
+        if (!owner.ended.get() && owner.physical != null) owner.physical.finishCheckpointing();
         owner.ended.set(true);owner.release();execution.ownership().endTenure(fence);owners.remove(original.captureId(),owner);
     }
     synchronized void requireSharedRetired(CapturePreparation original,WorkloadClaimFence fence) {
@@ -509,6 +510,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         final AtomicBoolean live=new AtomicBoolean(true);final Owner owner;NativeSrsCaptureRunUnit.Tail tail;final Runnable guard=this::require;
         Physical(Owner owner){this.owner=owner;}
         void require(){owner.require();if(!live.get())throw refused();}
+        void finishCheckpointing() { if (tail != null) tail.finishCheckpointing(); }
         void close(){live.set(false);if(tail!=null)tail.close();runtime.stopOpenings(guard);}
     }
     private boolean needed(Owner owner) {
@@ -548,7 +550,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var configured=owner.configured;
         if(configured==null)configured=ConfiguredCaptureRun.prepare(owner.origin,owner.config,stores.notes(),connectors,owner::require,stores.recoveryPinned().test(owner.origin.scope()));
         else {stores.notes().guardedBy(owner::require).origin(configured.primary());connectors.resolve(configured.connectorId(),configured.artifactHash());owner.require();}
-        if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
+        if(owner.physical!=null){
+            owner.physical.finishCheckpointing();
+            owner.physical.close();owner.physical=null;
+            before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
         before=current.chains().requestTables(owner.prepared.chainId(),requested,owner.fence);
         long epoch=current.chains().openEpoch(owner.prepared.chainId(),before.epoch(),owner.fence).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
@@ -633,6 +639,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         for(var owner:unique) {
             owner.sessions.remove(session.original);
             if(owner.sessions.isEmpty() && (owner.ended.get() || !needed(owner))) {
+                if (!owner.ended.get() && owner.physical != null) owner.physical.finishCheckpointing();
                 owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);
             }
         }

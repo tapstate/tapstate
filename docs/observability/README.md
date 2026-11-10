@@ -72,6 +72,26 @@ latest observation and can still return retained samples for a stopped pipeline.
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 
+## Nest state metrics
+
+Read the `facts` array of `GET /api/pipelines/{id}/metrics`. Use `tapstate.nest.namespace` to
+join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its step, path and map.
+
+| Metric | Type | What it measures |
+|---|---|---|
+| `tapstate.pipeline.nest.roots.rendered` | Counter | Whole root documents handed to the downstream outbox |
+| `tapstate.pipeline.state.commit.groups` | Counter | Successful state-store write calls |
+| `tapstate.pipeline.state.commit.keys` | Histogram | Keys per successful write call |
+| `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
+| `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
+| `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+
+The root counter measures output from the operator. Target acknowledgement and table loading are
+shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
+within the same execution and counting lifetime. An acknowledged store call may contain multiple
+database transactions. Command counts cover the synchronous Mongo adapter; commands on other
+threads are outside the measurement.
+
 ## Current-run initial-load display
 
 The snapshot response can additionally carry `initialLoad`. Its `runKey` binds the reading to the

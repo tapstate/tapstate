@@ -1,5 +1,6 @@
 package io.tapstate.core.lifecycle;
 
+import java.time.Instant;
 import java.util.OptionalLong;
 
 /**
@@ -42,7 +43,35 @@ import java.util.OptionalLong;
  * @param stored how many keys the layer behind the memory holds, where there is one to ask
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-        long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess) {
+        long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess,
+        OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin) {
+
+    public NestStateReading {
+        rootsRendered = rootsRendered == null ? OptionalLong.empty() : rootsRendered;
+        if (rootsRendered.isPresent() != (rootsRenderedSince != null))
+            throw new IllegalArgumentException("rendered roots need a counting start");
+    }
+
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, keyAccess,
+                OptionalLong.empty(), null, null, null);
+    }
+
+    public NestStateReading withRootsRendered(long rendered, Instant since) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, OptionalLong.of(rendered), since, commits, origin);
+    }
+
+    public NestStateReading withCommits(StateCommitReading measured) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, rootsRendered, rootsRenderedSince, measured, origin);
+    }
+
+    public NestStateReading withContext(NestKeyAccess keys, NestOrigin placement) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keys, rootsRendered, rootsRenderedSince, commits, placement);
+    }
 
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater, OptionalLong stored) {

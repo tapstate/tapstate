@@ -56,12 +56,15 @@ class WhichBucketsADurationFallsIntoTest {
     }
 
     @Test
-    @DisplayName("exactly the two histogram instruments have bounds, and both are in seconds")
-    void onlyTheTwoHistogramInstrumentsHaveBounds() {
+    @DisplayName("every histogram uses its registered bounds and unit")
+    void onlyRegisteredHistogramInstrumentsHaveBounds() {
         assertThat(Arrays.stream(HistogramBounds.values()).map(HistogramBounds::instrument))
                 .containsExactlyInAnyOrder("tapstate.pipeline.record.delivery.duration",
-                        "tapstate.pipeline.process.duration");
-        assertThat(HistogramBounds.UNIT).isEqualTo("s");
+                        "tapstate.pipeline.process.duration", "tapstate.pipeline.state.commit.duration",
+                        "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips");
+        assertThat(HistogramBounds.STATE_COMMIT_DURATION.unit()).isEqualTo("s");
+        assertThat(HistogramBounds.STATE_COMMIT_KEYS.unit()).isEqualTo("{key}");
+        assertThat(HistogramBounds.STATE_COMMIT_ROUND_TRIPS.unit()).isEqualTo("{round_trip}");
         assertThat(HistogramBounds.forInstrument("tapstate.pipeline.lag")).isEmpty();
     }
 

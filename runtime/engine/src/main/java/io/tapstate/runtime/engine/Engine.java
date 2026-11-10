@@ -936,10 +936,20 @@ public final class Engine {
         var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
                 .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
         var keySamples = io.tapstate.runtime.engine.nest.NestStateSamples.keyAccess(collected, dataMembers);
+        var diagnostics = io.tapstate.runtime.engine.nest.NestStateSamples.diagnostics(collected);
+        var bindings = OperatorMapBindings.resolve(member, false);
         byNamespace.forEach((namespace, kinds) -> {
-            NestStateReading legacy = NestStateMetricNames.readingFrom(kinds, stored(namespace));
-            readings.put(namespace, new NestStateReading(legacy.entries(), legacy.accesses(), legacy.backfills(),
-                    legacy.backfillMillis(), legacy.pendingHighWater(), legacy.stored(), keySamples.get(namespace)));
+            var reading = NestStateMetricNames.readingFrom(kinds, stored(namespace));
+            var measured = diagnostics.get(namespace);
+            if (measured != null) {
+                if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
+                if (measured.commits() != null) reading = reading.withCommits(measured.commits());
+            }
+            var origin = bindings == null ? null : bindings.placementOf(namespace)
+                    .filter(placement -> placement.resource() == io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE)
+                    .map(placement -> new io.tapstate.core.lifecycle.NestOrigin(placement.stepId(), placement.pathId(), placement.namespace()))
+                    .orElse(null);
+            readings.put(namespace, reading.withContext(keySamples.get(namespace), origin));
         });
         return readings;
     }

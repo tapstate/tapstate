@@ -99,6 +99,13 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
                         "tapstate.pipeline.nest.dead_lettered",
+                        "tapstate.pipeline.nest.roots.rendered",
+                        "tapstate.pipeline.nest.namespace.info",
+                        "tapstate.pipeline.state.commit.groups",
+                        "tapstate.pipeline.state.commit.keys",
+                        "tapstate.pipeline.state.commit.round_trips",
+                        "tapstate.pipeline.state.commit.duration",
+                        "tapstate.pipeline.state.evictions",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
                         "tapstate.pipeline.records.driven",
@@ -451,6 +458,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.nest.namespace.info",
                         "tapstate.pipeline.reconcile.failures.streak");
     }
 }

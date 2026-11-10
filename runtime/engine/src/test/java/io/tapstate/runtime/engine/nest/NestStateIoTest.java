@@ -22,6 +22,22 @@ import org.junit.jupiter.api.Test;
 
 class NestStateIoTest {
     @Test
+    void oneSuccessfulStoreCallRecordsItsKeysAndCommandsAndARefusalRecordsNothing() {
+        var measured = new ArrayList<List<Long>>();
+        NestStateIo.Committed sink = (keys, trips, nanos) -> measured.add(List.of(keys, trips));
+        NestStateIo.commit(sink, 40, () -> {
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+        });
+        assertThatThrownBy(() -> NestStateIo.commit(sink, 1, () -> {
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+            throw new IllegalStateException("store refused");
+        })).isInstanceOf(IllegalStateException.class);
+        NestStateIo.commit(sink, 1, () -> {});
+        assertThat(measured).containsExactly(List.of(40L, 2L), List.of(1L, 0L));
+    }
+
+    @Test
     void aFreshWriteWaveSharesItsFirstDurableBatch() throws Exception {
         BlockingStore store = new BlockingStore();
         NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));

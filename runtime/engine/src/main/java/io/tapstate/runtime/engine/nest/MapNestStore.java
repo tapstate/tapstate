@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import com.hazelcast.map.EntryProcessor;
 import com.hazelcast.map.IMap;
+import com.hazelcast.map.LocalMapStats;
 import io.tapstate.runtime.engine.ProtectedMap;
 import java.io.Serializable;
 import java.util.Collection;
@@ -51,6 +52,8 @@ final class MapNestStore<S> implements NestStore<S> {
     private final NestStateStats stats;
     private final NestStateGauge gauge;
     private boolean keyPublisherBound;
+    private long publishedGroups;
+    private long publishedEvictions;
 
     MapNestStore(IMap<Object, S> map) {
         this(map, null, NestStateGauge.NONE);
@@ -111,12 +114,37 @@ final class MapNestStore<S> implements NestStore<S> {
         }
         String namespace = map.getName();
         NestStateStats.Counted counted = stats.counted(namespace);
-        gauge.reading(namespace, count(), counted.accesses(), counted.backfills(),
+        LocalMapStats local = map.getLocalMapStats();
+        gauge.reading(namespace, local.getOwnedEntryCount(), counted.accesses(), counted.backfills(),
                 counted.backfillNanos() / 1_000_000L, counted.pendingHighWater());
         if (!keyPublisherBound) {
             stats.publishKeys(namespace, gauge.keyPublisher(namespace));
             keyPublisherBound = true;
         } else stats.refreshKeys(namespace);
+        long evictions = local.getEvictionCount();
+        if (stats.commitGroups(namespace) != publishedGroups || evictions != publishedEvictions) {
+            var commits = stats.commits(namespace);
+            if (commits != null) {
+                gauge.commitReading(namespace, commits, evictions);
+                publishedGroups = commits.groups();
+                publishedEvictions = evictions;
+            }
+        }
+    }
+
+    /**
+     * Counts documents this level sent, per namespace rather than per store for the reason {@link #holding}
+     * gives, and leaves the reading at once: the count changes only here, and a document is the moment a
+     * reader watching a load wants it to move.
+     */
+    @Override
+    public void rendered(long documents) {
+        if (stats != null && documents > 0) {
+            String namespace = map.getName();
+            stats.rendered(namespace, documents);
+            var counted = stats.counted(namespace);
+            gauge.rootsReading(namespace, counted.rootsRendered(), counted.countingSinceMillis());
+        }
     }
 
     /**

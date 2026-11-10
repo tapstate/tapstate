@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.nest;
 import com.hazelcast.jet.core.metrics.JobMetrics;
 import com.hazelcast.jet.core.metrics.Measurement;
 import com.hazelcast.jet.core.metrics.MetricTags;
+import io.tapstate.core.lifecycle.HistogramBounds;
 import java.util.*;
 import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
@@ -54,6 +55,21 @@ class NestStateSamplesTest {
         assertThat(NestStateSamples.keyAccess(f.metrics(), Set.of("a", "b")).get("ns").available()).isFalse();
     }
 
+    @Test void commitHistogramsAndRenderedRootsAreSummedAcrossMembersWithoutDuplicatingProcessors() {
+        var f = new Samples();
+        f.commit("a", "0", 2, 4, 10);
+        f.commit("a", "1", 2, 4, 10);
+        f.commit("b", "0", 2, 3, 5);
+        // A partial scrape cannot be combined with older buckets.
+        f.point("a", "0", 3, NestStateMetricNames.COMMIT_GROUPS, 8);
+        var result = NestStateSamples.diagnostics(f.metrics()).get("ns");
+        assertThat(result.rootsRendered()).isEqualTo(15);
+        assertThat(result.commits().groups()).isEqualTo(7);
+        assertThat(result.commits().keys().count()).isEqualTo(7);
+        assertThat(result.commits().keys().sum()).isEqualTo(14.0);
+        assertThat(result.commits().keys().bucketCounts().stream().mapToLong(Long::longValue).sum()).isEqualTo(7);
+    }
+
     private static final class Samples {
         final Map<String, List<Measurement>> values = new HashMap<>();
         void add(String member, String processor, long at, long reads, long writes, long cold) {
@@ -65,6 +81,21 @@ class NestStateSamplesTest {
             String metric = NestStateMetricNames.nameOf(kind, "ns");
             values.computeIfAbsent(metric, ignored -> new ArrayList<>()).add(Measurement.of(metric, value, at,
                     Map.of(MetricTags.MEMBER, member, MetricTags.EXECUTION, "execution", MetricTags.VERTEX, "nest", MetricTags.PROCESSOR, processor)));
+        }
+        void commit(String member, String processor, long at, long groups, long roots) {
+            point(member, processor, at, NestStateMetricNames.ROOTS_RENDERED, roots);
+            point(member, processor, at, NestStateMetricNames.ROOTS_RENDERED_SINCE, 1);
+            point(member, processor, at, NestStateMetricNames.COMMIT_SINCE, 1);
+            point(member, processor, at, NestStateMetricNames.COMMIT_GROUPS, groups);
+            point(member, processor, at, NestStateMetricNames.COMMIT_KEYS_SUM, groups * 2);
+            point(member, processor, at, NestStateMetricNames.COMMIT_ROUND_TRIPS_SUM, groups * 2);
+            point(member, processor, at, NestStateMetricNames.COMMIT_NANOS_SUM, groups * 1000);
+            buckets(member, processor, at, NestStateMetricNames.COMMIT_KEYS_BUCKET, HistogramBounds.STATE_COMMIT_KEYS, groups);
+            buckets(member, processor, at, NestStateMetricNames.COMMIT_ROUND_TRIPS_BUCKET, HistogramBounds.STATE_COMMIT_ROUND_TRIPS, groups);
+            buckets(member, processor, at, NestStateMetricNames.COMMIT_NANOS_BUCKET, HistogramBounds.STATE_COMMIT_DURATION, groups);
+        }
+        void buckets(String member, String processor, long at, String kind, HistogramBounds bounds, long groups) {
+            for (int i = 0; i < bounds.buckets(); i++) point(member, processor, at, kind + i, i == 1 ? groups : 0);
         }
         JobMetrics metrics() { return JobMetrics.of(values); }
     }

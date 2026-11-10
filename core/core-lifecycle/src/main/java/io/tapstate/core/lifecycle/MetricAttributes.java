@@ -45,6 +45,9 @@ public final class MetricAttributes {
     public static final String CHAIN_ID = "tapstate.chain.id";
     /** The namespace a nest step keeps one level of its state under. */
     public static final String NEST_NAMESPACE = "tapstate.nest.namespace";
+    public static final String NEST_STEP = "tapstate.nest.step";
+    public static final String NEST_PATH = "tapstate.nest.path";
+    public static final String NEST_MAP = "tapstate.nest.map";
     /** The namespace a join step mirrors one dimension in. */
     public static final String JOIN_NAMESPACE = "tapstate.join.namespace";
     public static final String DIRECTION = "direction";

@@ -148,6 +148,17 @@ public interface NestStore<S> extends Serializable {
     }
 
     /**
+     * Reports that this vertex has just sent {@code documents} whole documents downstream. Only the vertex
+     * that renders documents - the root level - says so, and only once per document actually passed to the
+     * outbox, so a reader can see how far a load has got in the unit the target counts: roots, not rows.
+     *
+     * <p>A count of work done, never of what is held: it does not fall, and a restart begins it again. It
+     * does nothing by default, which is right for every level but the root.
+     */
+    default void rendered(long documents) {
+    }
+
+    /**
      * How many keys this vertex holds. It is asked of the state itself every time rather than counted up as
      * entries are written, because state outlives the run that wrote it: a tally started with the process
      * would report an almost empty vertex on the way back from a restart, and report it least accurately in

@@ -63,6 +63,29 @@ class MongoConnectionReplicaSetIT {
     }
 
     @Test
+    void aScopedCommandCountSeesTheRealCacheWriteAndCommit() {
+        var binding = new io.tapstate.spi.store.StorageBinding.Connection(
+                io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                REPLICA_SET.getReplicaSetUrl(), "meter_" + java.util.UUID.randomUUID().toString().replace("-", ""), null);
+        try (var connection = MongoConnection.forCache(binding, Duration.ofSeconds(5), "meter")) {
+            connection.verifyConnectivity();
+            var rows = connection.database().getCollection("writes");
+            rows.insertOne(new org.bson.Document("_id", "root").append("value", 1));
+            try (var session = connection.client().startSession();
+                    var count = io.tapstate.spi.store.StoreRoundTrips.count()) {
+                session.withTransaction(() -> {
+                    rows.updateOne(session, new org.bson.Document("_id", "root"),
+                            new org.bson.Document("$set", new org.bson.Document("value", 2)));
+                    return null;
+                });
+                assertThat(count.roundTrips()).isEqualTo(2L);
+            }
+            assertThat(rows.find().first().getInteger("value")).isEqualTo(2);
+            connection.database().drop();
+        }
+    }
+
+    @Test
     void aSavedCacheBindingUsesItsExplicitDatabaseWithoutRunningLegacyMigrations() {
         String suffix = java.util.UUID.randomUUID().toString().replace("-", "");
         String uriDatabase = "uri_" + suffix;
