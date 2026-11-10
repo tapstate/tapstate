@@ -17,16 +17,18 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
         if(request.method()==ValidationMethod.UNIQUE_KEY)confirmations.forEach((id,value)->projections.put(id,new NativeValidationMetadata.Projection(
                 value.fields().stream().map(ValidationTaskCompiler.Pair::source).toList(),value.fields().stream().map(ValidationTaskCompiler.Pair::target).toList())));
         var scope=metadata.inspect(request.selection(),request.choices().stream().map(choice->new ValidationSelectedDeclarations.Choice(
-                choice.mappingId(),choice.outputId(),choice.sourceId(),choice.table())).toList(),request.method(),projections,request.deadline());
+                choice.mappingId(),choice.outputId(),choice.sourceId(),choice.table())).toList(),request.method(),projections,request.deadline(),request.inspectMetadata());
         try{
+            if (request.inspectMetadata() && !confirmations.isEmpty())
+                ValidationTaskCompiler.compile(scope, confirmations, request.previous());
             ValidationTaskCompiler.Compiled compiled=request.method()==ValidationMethod.COUNT||!confirmations.isEmpty()
-                    ?ValidationTaskCompiler.compile(scope,confirmations,request.previous()):null;
+                    ?ValidationTaskCompiler.compileDeclaration(scope,confirmations,request.previous(),request.previousMethod()):null;
             var mappings=new ArrayList<ValidationEvaluation.Mapping>();long projected=0;
             var actual=new HashMap<String,NativeValidationMetadata.Mapping>();scope.mappings().forEach(value->actual.put(value.id(),value));
             for(var declared:scope.declarations().mappings()){
                 var observed=actual.get(declared.mapping().mappingId());
-                var source=side(declared.mapping().source(),observed.source(),true);
-                var target=side(declared.mapping().target(),observed.target(),false);
+                var source=side(declared.mapping().source(),observed == null ? null : observed.source(),true);
+                var target=side(declared.mapping().target(),observed == null ? null : observed.target(),false);
                 projected+=projectionBytes(source)+projectionBytes(target);
                 if(projected>8L*1024*1024)throw new io.tapstate.core.common.TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,Map.of("limit","validation.evaluationProjection"),null);
                 mappings.add(new ValidationEvaluation.Mapping(declared.mapping().mappingId(),source,target));
@@ -47,6 +49,8 @@ final class NativeValidationEvaluation implements ValidationEvaluationProbe {
         @Override public void close(){retained=null;comparison=null;scope.close();}
     }
     private static ValidationEvaluation.Side side(ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed,boolean source){
+        if (observed == null) return new ValidationEvaluation.Side(table.nodeId(), table.sourceId(), table.database(), table.schema(),
+                table.table(), table.modelVersion(), table.codecBinding(), null, List.of(), List.of(), !source);
         if(observed.model()==null)return new ValidationEvaluation.Side(table.nodeId(),table.sourceId(),table.database(),table.schema(),table.table(),null,null,
                 observed.countOperation().name(),List.of(),List.of(),!source);
         var model=observed.model().model();var rules=ValidationKeyMetadata.describe(model);

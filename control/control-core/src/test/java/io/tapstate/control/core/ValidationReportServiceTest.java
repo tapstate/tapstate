@@ -31,6 +31,24 @@ class ValidationReportServiceTest {
         }
         assertThat(pool.inUse()).isZero();assertThat(reports.writes).isZero();
     }
+    @Test void aCompletedFailedTableIsProjectedAsAnExecutionFailureWithoutAFalseCount(){
+        var reports=new Reports();var original=reports.row;
+        var failure=new ValidationTableFailure("orders",ValidationTableFailure.Side.TARGET,ValidationError.READ_FAILED.code(),"Table read failed");
+        reports.row=new ValidationReports.Snapshot(original.admission(),original.specification(),true,ValidationRunState.COMPLETED,
+                Instant.EPOCH,Instant.EPOCH,null,null,0,1,List.of(),List.of(failure));
+        var service=new ValidationReportService(reports,new ValidationMetadataBudget());
+        try(var response=service.report(ID)){
+            var report=response.value();
+            assertThat(report.result()).isEqualTo("COMPLETE_WITH_FAILURES");
+            assertThat(report.counts()).isEmpty();
+            assertThat(report.tableFailures()).singleElement().satisfies(item->{
+                assertThat(item.mapping()).isEqualTo("orders");
+                assertThat(item.side()).isEqualTo("TARGET");
+                assertThat(item.failure().code()).isEqualTo(ValidationError.READ_FAILED.code());
+                assertThat(item.failure().message()).isEqualTo("Table read failed");
+            });
+        }
+    }
     @Test void missingExpiredOrIncompleteNeverAppearsAsACompletedIssueFreeReport(){
         var pool=new ValidationMetadataBudget();var reports=new Reports();var service=new ValidationReportService(reports,pool);
         var original=reports.row;reports.row=new ValidationReports.Snapshot(original.admission(),original.specification(),true,null,null,null,null,null,0,0,List.of());

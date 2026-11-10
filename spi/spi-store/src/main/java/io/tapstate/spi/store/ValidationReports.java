@@ -30,12 +30,17 @@ public interface ValidationReports {
     }
     record Snapshot(ValidationReportAdmission.Start admission,ValidationRunSpec specification,boolean closed,
             ValidationRunState terminal,Instant terminalKnownAt,Instant endedAt,ValidationReportMetadata.Window window,ValidationReportMetadata.Failure failure,
-            long rootCount,long retainedBytes,List<ValidationCountCheck> counts){
+            long rootCount,long retainedBytes,List<ValidationCountCheck> counts,List<ValidationTableFailure> tableFailures){
+        public Snapshot(ValidationReportAdmission.Start admission,ValidationRunSpec specification,boolean closed,
+                ValidationRunState terminal,Instant terminalKnownAt,Instant endedAt,ValidationReportMetadata.Window window,
+                ValidationReportMetadata.Failure failure,long rootCount,long retainedBytes,List<ValidationCountCheck> counts){
+            this(admission,specification,closed,terminal,terminalKnownAt,endedAt,window,failure,rootCount,retainedBytes,counts,List.of());
+        }
         public Snapshot{
-            Objects.requireNonNull(admission);Objects.requireNonNull(specification);counts=List.copyOf(counts);
+            Objects.requireNonNull(admission);Objects.requireNonNull(specification);counts=List.copyOf(counts);tableFailures=List.copyOf(tableFailures);
             if(!admission.run().specHash().equals(specification.fingerprint())||rootCount<0||retainedBytes<0
                     ||terminal!=null&&(!terminal.terminal()||!closed||terminalKnownAt==null)||terminal==null&&terminalKnownAt!=null
-                    ||counts.size()>ValidationTaskSpec.MAX_MAPPINGS)
+                    ||counts.size()+tableFailures.size()>specification.task().mappings().size())
                 throw invalid("report.snapshot");
         }
         public ValidationResultStore.Report report(){return admission.report();}

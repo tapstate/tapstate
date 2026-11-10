@@ -42,4 +42,26 @@ class ValidationCountScanTest {
         assertThatThrownBy(holder[0]::run).isInstanceOf(TapstateException.class);assertThat(target).hasValue(0);assertThat(published).hasValue(0);
         assertThat(holder[0].complete()).isFalse();
     }
+    @Test void recoverableNativeFailureDoesNotPreventTheNextCount() {
+        var secondSource = new ValidationTaskSpec.Table("input", "input", "db", null, "later", null, null);
+        var secondTarget = new ValidationTaskSpec.Table("out", "target", "db", null, "later", null, null);
+        var task = new ValidationTaskSpec("flow", SPEC.task().dependencyHashes(), 1, "rules", List.of(
+                SPEC.task().mappings().getFirst(),
+                new ValidationTaskSpec.Mapping("later", ValidationTaskSpec.OutputKind.SYNC, "out", secondSource, secondTarget, null)));
+        var spec = new ValidationRunSpec(task, ValidationMode.FULL, ValidationMethod.COUNT);
+        var run = new ValidationRunIdentity(RUN.owner(), "task", "run", ValidationMode.FULL, spec.fingerprint(), 1, "rules");
+        var seen = new ArrayList<String>();
+        var scan = new ValidationCountScan(run, spec, List.of(
+                new ValidationCountScan.Mapping("mapping", guard -> scalar(SOURCE, 0), guard -> {
+                    throw new ValidationPairException(ValidationTableFailure.Side.TARGET,
+                            new TapstateException(ValidationError.READ_FAILED, Map.of("table", "right"), null));
+                }),
+                new ValidationCountScan.Mapping("later", guard -> scalar(secondSource, 4), guard -> scalar(secondTarget, 4))),
+                () -> {}, success -> seen.add(success.mappingId()),
+                (mapping, failed) -> seen.add(mapping + ":" + failed.side()));
+        scan.run();
+        assertThat(seen).containsExactly("mapping:TARGET", "later");
+        assertThat(scan.complete()).isTrue();
+    }
+
 }

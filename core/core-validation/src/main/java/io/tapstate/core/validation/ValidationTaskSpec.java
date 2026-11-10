@@ -36,15 +36,51 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
 
     /** Ordered user-confirmed fields; independent model and codec bindings belong to each physical side. */
     public record Keys(String confirmationId, List<ValidationKeyBinding.Component> source,
-                       List<ValidationKeyBinding.Component> target) {
+                       List<ValidationKeyBinding.Component> target, List<List<String>> sourcePaths,
+                       List<List<String>> targetPaths) {
+        public Keys(String confirmationId, List<ValidationKeyBinding.Component> source,
+                    List<ValidationKeyBinding.Component> target) {
+            this(confirmationId, source, target, null, null);
+        }
+        public static Keys deferred(String confirmationId, List<List<String>> sourcePaths, List<List<String>> targetPaths) {
+            return new Keys(confirmationId, List.of(), List.of(), sourcePaths, targetPaths);
+        }
         public Keys {
             confirmationId = id(confirmationId, "spec.confirmation");
-            source = keyFields(source); target = keyFields(target);
-            if (source.size() != target.size()) throw ValidationError.invalid("spec.keyArity");
-            for (int i = 0; i < source.size(); i++) {
-                if (source.get(i).domain() != target.get(i).domain() || source.get(i).numericPolicy() != target.get(i).numericPolicy())
-                    throw ValidationError.invalid("spec.keyDomains");
+            if (sourcePaths == null && targetPaths == null) {
+                source = keyFields(source);
+                target = keyFields(target);
+                if (source.size() != target.size()) throw ValidationError.invalid("spec.keyArity");
+                for (int i = 0; i < source.size(); i++) {
+                    if (source.get(i).domain() != target.get(i).domain() || source.get(i).numericPolicy() != target.get(i).numericPolicy())
+                        throw ValidationError.invalid("spec.keyDomains");
+                }
+            } else {
+                if (!List.of().equals(source) || !List.of().equals(target)) throw ValidationError.invalid("spec.keyFields");
+                source = List.of();
+                target = List.of();
+                sourcePaths = keyPaths(sourcePaths);
+                targetPaths = keyPaths(targetPaths);
+                if (sourcePaths.size() != targetPaths.size()) throw ValidationError.invalid("spec.keyArity");
             }
+        }
+        public boolean deferred() { return sourcePaths != null; }
+        public List<List<String>> sourcePaths() {
+            return deferred() ? sourcePaths : source.stream().map(ValidationKeyBinding.Component::path).toList();
+        }
+        public List<List<String>> targetPaths() {
+            return deferred() ? targetPaths : target.stream().map(ValidationKeyBinding.Component::path).toList();
+        }
+        private static List<List<String>> keyPaths(List<List<String>> fields) {
+            if (fields == null || fields.isEmpty() || fields.size() > ValidationKey.MAX_COMPONENTS)
+                throw ValidationError.invalid("spec.keyFields");
+            var paths = new HashSet<List<String>>();
+            for (var path : fields) {
+                if (path == null || path.size() != 1) throw ValidationError.invalid("spec.keyPath");
+                id(path.getFirst(), "spec.keyPath");
+                if (!paths.add(path)) throw ValidationError.invalid("spec.duplicateKeyField");
+            }
+            return fields.stream().map(List::copyOf).toList();
         }
         private static List<ValidationKeyBinding.Component> keyFields(List<ValidationKeyBinding.Component> fields) {
             if (fields == null || fields.isEmpty() || fields.size() > ValidationKey.MAX_COMPONENTS) throw ValidationError.invalid("spec.keyFields");
@@ -83,6 +119,10 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
             bytes += 256 + textBytes(mapping.mappingId()) + textBytes(mapping.outputId()) + tableBytes(mapping.source()) + tableBytes(mapping.target());
             if (mapping.keys() != null) {
                 bytes += textBytes(mapping.keys().confirmationId());
+                if (mapping.keys().deferred()) {
+                    for (var side : List.of(mapping.keys().sourcePaths(), mapping.keys().targetPaths()))
+                        for (var path : side) bytes += 32 + textBytes(path.getFirst());
+                }
                 for (var side : List.of(mapping.keys().source(), mapping.keys().target())) for (var field : side) {
                     bytes += 128;
                     for (var segment : field.path()) bytes += textBytes(segment);
@@ -101,6 +141,7 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
         if (!method.supports(mode)) throw ValidationError.invalid("spec.methodMode");
         if (method == ValidationMethod.COUNT) return;
         for (var mapping : mappings) {
+            if (mode == ValidationMode.FULL && mapping.keys() != null && mapping.keys().deferred()) continue;
             if (mapping.keys() == null || mapping.source().modelVersion() == null || mapping.target().modelVersion() == null
                     || mapping.source().codecBinding() == null || mapping.target().codecBinding() == null)
                 throw ValidationError.invalid("spec.keyModelCodecBinding");
@@ -112,7 +153,8 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
         try {
             var digest = MessageDigest.getInstance("SHA-256");
             try (var data = new DataOutputStream(new DigestOutputStream(OutputStream.nullOutputStream(), digest))) {
-                text(data, "validation-task-spec-v1"); text(data, pipelineId); data.writeLong(mappingRevision); text(data, comparisonRulesVersion);
+                boolean deferred = mappings.stream().anyMatch(mapping -> mapping.keys() != null && mapping.keys().deferred());
+                text(data, deferred ? "validation-task-spec-v2" : "validation-task-spec-v1"); text(data, pipelineId); data.writeLong(mappingRevision); text(data, comparisonRulesVersion);
                 data.writeInt(dependencyHashes.size());
                 for (var entry : new TreeMap<>(dependencyHashes).entrySet()) { text(data, entry.getKey()); text(data, entry.getValue()); }
                 data.writeInt(mappings.size());
@@ -120,7 +162,16 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
                     text(data, mapping.mappingId()); text(data, mapping.outputKind().name()); text(data, mapping.outputId());
                     table(data, mapping.source()); table(data, mapping.target()); data.writeBoolean(mapping.keys() != null);
                     if (mapping.keys() != null) {
-                        text(data, mapping.keys().confirmationId()); keys(data, mapping.keys().source()); keys(data, mapping.keys().target());
+                        var key = mapping.keys();
+                        text(data, key.confirmationId());
+                        if (deferred) data.writeBoolean(key.deferred());
+                        if (key.deferred()) {
+                            paths(data, key.sourcePaths());
+                            paths(data, key.targetPaths());
+                        } else {
+                            keys(data, key.source());
+                            keys(data, key.target());
+                        }
                     }
                 }
             }
@@ -131,6 +182,10 @@ public record ValidationTaskSpec(String pipelineId, Map<String, String> dependen
     private static void table(DataOutputStream data, Table table) throws IOException {
         text(data, table.nodeId()); text(data, table.sourceId()); text(data, table.database()); text(data, table.schema());
         text(data, table.table()); text(data, table.modelVersion()); text(data, table.codecBinding());
+    }
+    private static void paths(DataOutputStream data, List<List<String>> paths) throws IOException {
+        data.writeInt(paths.size());
+        for (var path : paths) text(data, path.getFirst());
     }
     private static void keys(DataOutputStream data, List<ValidationKeyBinding.Component> keys) throws IOException {
         data.writeInt(keys.size());

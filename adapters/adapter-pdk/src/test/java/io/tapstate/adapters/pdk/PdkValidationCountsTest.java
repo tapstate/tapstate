@@ -162,7 +162,7 @@ class PdkValidationCountsTest {
             assertThat(reader.drained()).isTrue();
             assertThat(reader.callExited().toCompletableFuture()).isCompleted();
             assertThat((AtomicInteger)settings.get("counts")).hasValue(1);
-            assertThat((AtomicInteger)settings.get("metadata")).hasValue(2);
+            assertThat((AtomicInteger)settings.get("metadata")).hasValue(0);
             assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
         }
         try (var reader=read(settings("zero"))) { assertThat(reader.count()).isZero(); }
@@ -172,7 +172,7 @@ class PdkValidationCountsTest {
             var settings = settings(mode);
             try (var reader=read(settings)) {
                 assertThatThrownBy(reader::count).isInstanceOfSatisfying(TapstateException.class,
-                        failed -> assertThat(failed.code()).isEqualTo(mode.equals("missing")?ValidationError.READ_PROTOCOL_VIOLATION:ValidationError.READ_FAILED));
+                        failed -> assertThat(failed.code()).isEqualTo(ValidationError.READ_FAILED));
                 assertThat(reader.drained()).isTrue();
                 assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
             }
@@ -180,7 +180,8 @@ class PdkValidationCountsTest {
         var settings=settings("missing");
         try(var reader=read(settings)) {
             assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
-            assertThat((AtomicInteger)settings.get("counts")).hasValue(0);
+            assertThat((AtomicInteger)settings.get("counts")).hasValue(1);
+            assertThat((AtomicInteger)settings.get("metadata")).hasValue(0);
         }
     }
     @Test void aLogicalConnectorNameDoesNotGrantOrSelectANativeCapability(){
@@ -191,28 +192,29 @@ class PdkValidationCountsTest {
             assertThat((AtomicInteger)values.get("counts")).hasValue(1);
         }
     }
-    @Test void sourceSelectionConsumesOnlyAVerifiedNativeNamespaceBeforeCounting(){
+    @Test void explicitInspectionUsesNativeNamespaceAdmissionWithoutCounting(){
         var values=settings("large");var admissions=new AtomicInteger();
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
                 new PdkValidationCounts.Request("records"),()->{},actual->{
                     assertThat(actual).isEqualTo("records");
                     assertThat((AtomicInteger)values.get("counts")).hasValue(admissions.getAndIncrement());
                 })){
-            assertThat(reader.count()).isEqualTo(9007199254740993L);assertThat(admissions).hasValue(2);
+            assertThat(reader.inspect()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+            assertThat(admissions).hasValue(1);
         }
         var refused=settings("large");var denied=new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","source-scope"),null);
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",refused),artifact,
                 new PdkValidationCounts.Request("records"),()->{},actual->{throw denied;})){
-            assertThatThrownBy(reader::count).isSameAs(denied);
+            assertThatThrownBy(reader::inspect).isSameAs(denied);
             assertThat((AtomicInteger)refused.get("counts")).hasValue(0);assertThat(reader.drained()).isTrue();
         }
     }
-    @Test void scopeAdmissionCanSeeOtherNativeTablesBeforeTheScalarRead(){
+    @Test void explicitInspectionCanSeeOtherNativeTables(){
         var values=settings("catalog");var seen=new java.util.ArrayList<String>();
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
                 new PdkValidationCounts.Request("records"),()->{},seen::add)){
-            assertThat(reader.count()).isEqualTo(9007199254740993L);
-            assertThat(seen).containsExactly("records","other_records","records","other_records");
+            assertThat(reader.inspect()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+            assertThat(seen).containsExactly("records","other_records");
         }
     }
     @Test void cancellationBeforeDispatchOpensNothing() {

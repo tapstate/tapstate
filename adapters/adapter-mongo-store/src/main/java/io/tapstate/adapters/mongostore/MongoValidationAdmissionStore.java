@@ -415,7 +415,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var task = tasks.find(session, new Document("_id", taskId(start.task()))).projection(new Document("_id", 1).append("formatVersion", 1)
                 .append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
-                .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
+                .append("definition.formatVersion", 1).append("definition.comparison.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
                 .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1)).first();
         if (task == null) return null;
@@ -460,7 +460,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private static Document taskHeader() {
         return new Document("_id", 1).append("formatVersion", 1).append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
-                .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
+                .append("definition.formatVersion", 1).append("definition.comparison.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
                 .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1);
     }
@@ -486,7 +486,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var method = start.run().mode() == ValidationMode.FULL
                 ? io.tapstate.core.validation.ValidationMethod.valueOf(definition.get("full", Document.class).getString("method"))
                 : io.tapstate.core.validation.ValidationMethod.FULL_COLUMN;
-        if (method != io.tapstate.core.validation.ValidationMethod.COUNT && !definition.getBoolean("keyInputsPresent")) return false;
+        boolean deferredFull = start.run().mode() == ValidationMode.FULL && Integer.valueOf(2).equals(comparison.get("formatVersion"));
+        if (method != io.tapstate.core.validation.ValidationMethod.COUNT && !definition.getBoolean("keyInputsPresent") && !deferredFull)
+            return false;
         return start.run().keyMappingRevision() == comparison.getLong("mappingRevision")
                 && start.run().comparisonRulesVersion().equals(comparison.get("comparisonRulesVersion"))
                 && start.run().specHash().equals(io.tapstate.core.validation.ValidationRunSpec.fingerprint(comparison.getString("fingerprint"), start.run().mode(), method));

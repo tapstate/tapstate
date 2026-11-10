@@ -249,7 +249,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             long count = oldCount + (previous == null ? 1 : 0), total = used - oldBytes + bytes;
             // Keep the existing total bound, including fixed report metadata and its bounded final summary.
             var fixed=new Document(report);fixed.remove("observationMetadata");fixed.remove("terminalMetadata");
-            if (count > MAX_STORED_ROOTS || total + encoded(fixed).length + 80L * 1024 > MAX_REPORT_BYTES || version == Long.MAX_VALUE)
+            if (count > MAX_STORED_ROOTS || total + encoded(fixed).length - tableFailureBytes(report) + 80L * 1024 > MAX_REPORT_BYTES || version == Long.MAX_VALUE)
                 throw MongoValidationObservationCodec.limit();
             var filter = original(write.report(), report).append("closed", false).append("publicationRevision", version);
             if (reports.updateOne(session, filter, new Document("$set", new Document("rootCount", count).append("resultBytes", total)
@@ -291,7 +291,11 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             if (!MongoValidationTaskCodec.run(write.snapshot()).equals(report.get("specSnapshot")))
                 throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "report.countSnapshot"), null);
             long previous = countSummaryBytes(report), used = number(report, "resultBytes"), version = number(report, "publicationRevision");
-            if (used != previous || number(report, "rootCount") != 0) throw unreadable("count-summary-accounting");
+            long failureBytes = tableFailureBytes(report);
+            if (used != previous + failureBytes || number(report, "rootCount") != 0)
+                throw unreadable("count-summary-accounting");
+            if (tableFailures(report, write.snapshot()).stream().anyMatch(failure -> failure.mappingId().equals(check.mappingId())))
+                throw invalid("report.conflictingTableOutcome");
             var summaries = new ArrayList<Document>();
             var seen = new java.util.HashSet<String>();
             boolean duplicate = false;
@@ -322,10 +326,97 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             if (bytes > 512 * 1024 || total > MAX_REPORT_BYTES) throw MongoValidationObservationCodec.limit();
             var changes = new Document("countSummaries", summaries).append("countSummaryBytes", bytes)
                     .append("resultBytes", total).append("publicationRevision", version + 1);
+            var replacement = new Document(report);
+            replacement.putAll(changes);
+            requireReportCapacity(replacement, bytes + failureBytes);
             if (reports.updateOne(session, original(write.report(), report).append("closed", false).append("publicationRevision", version),
                     new Document("$set", changes)).getMatchedCount() != 1) throw unreadable("count-write-fence");
             return Publication.APPLIED;
         });
+    }
+
+    @Override public Publication publishTableFailure(TableFailureWrite write) {
+        Objects.requireNonNull(write);
+        requireCluster(write.report());
+        admission.checkActive();
+        if (admission.closing()) return Publication.CLOSED_OR_EXPIRED;
+
+        var spec = write.snapshot();
+        var failure = write.failure();
+        var mappings = spec.task().mappings();
+        int ordinal = 0;
+        while (!mappings.get(ordinal).mappingId().equals(failure.mappingId())) ordinal++;
+        var payload = new Document("ordinal", ordinal).append("side", failure.side().name())
+                .append("code", failure.code()).append("message", failure.message());
+        return admission.transaction(session -> {
+            var report = report(session, write.report());
+            if (report == null || report.getBoolean("closed")) return Publication.CLOSED_OR_EXPIRED;
+            var start = MongoValidationAdmissionStore.decodeIdentity(report.get("admission", Document.class));
+            if (!admission.bornInTransaction(session, start)) return Publication.CLOSED_OR_EXPIRED;
+            if (!MongoValidationTaskCodec.run(spec).equals(report.get("specSnapshot")))
+                throw invalid("report.tableFailureSnapshot");
+            for (var existing : tableFailures(report, spec)) {
+                if (!existing.mappingId().equals(failure.mappingId())) continue;
+                if (!existing.equals(failure)) throw invalid("report.conflictingTableFailureReplay");
+                return Publication.DUPLICATE;
+            }
+            if (report.containsKey("countSummaries")) {
+                for (var summary : report.getList("countSummaries", Document.class)) {
+                    if (failure.mappingId().equals(summary.getString("mappingId"))) throw invalid("report.conflictingTableOutcome");
+                }
+            }
+
+            long previous = tableFailureBytes(report);
+            long countBytes = countSummaryBytes(report);
+            long used = number(report, "resultBytes");
+            long version = number(report, "publicationRevision");
+            if (used < previous + countBytes || version == Long.MAX_VALUE
+                    || spec.method() == ValidationMethod.COUNT && (used != previous + countBytes || number(report, "rootCount") != 0))
+                throw unreadable("table-failure-accounting");
+            var failures = new ArrayList<>(report.getList("tableFailures", Document.class, List.of()));
+            failures.add(payload);
+            long bytes = encoded(new Document("tableFailures", failures)).length;
+            var changes = new Document("tableFailures", failures).append("tableFailureBytes", bytes)
+                    .append("resultBytes", used - previous + bytes).append("publicationRevision", version + 1);
+            var replacement = new Document(report);
+            replacement.putAll(changes);
+            requireReportCapacity(replacement, bytes + countBytes);
+            if (reports.updateOne(session, original(write.report(), report).append("closed", false).append("publicationRevision", version),
+                    new Document("$set", changes)).getMatchedCount() != 1) throw unreadable("table-failure-write-fence");
+            return Publication.APPLIED;
+        });
+    }
+
+    private static long tableFailureBytes(Document report) {
+        if (!report.containsKey("tableFailures")) {
+            if (report.containsKey("tableFailureBytes")) throw unreadable("table-failure-accounting");
+            return 0;
+        }
+        long bytes = number(report, "tableFailureBytes");
+        if (bytes != encoded(new Document("tableFailures", report.get("tableFailures"))).length)
+            throw unreadable("table-failure-accounting");
+        return bytes;
+    }
+
+    private static List<ValidationTableFailure> tableFailures(Document report, ValidationRunSpec spec) {
+        if (!report.containsKey("tableFailures")) return List.of();
+        var mappings = spec.task().mappings();
+        if (!(report.get("tableFailures") instanceof List<?> stored) || stored.isEmpty() || stored.size() > mappings.size())
+            throw unreadable("table-failures");
+        var ordinals = new java.util.HashSet<Integer>();
+        var result = new ArrayList<ValidationTableFailure>(stored.size());
+        for (var entry : stored) {
+            if (!(entry instanceof Document row) || !row.keySet().equals(java.util.Set.of("ordinal", "side", "code", "message"))
+                    || !(row.get("ordinal") instanceof Integer ordinal) || ordinal < 0 || ordinal >= mappings.size() || !ordinals.add(ordinal))
+                throw unreadable("table-failure");
+            try {
+                result.add(new ValidationTableFailure(mappings.get(ordinal).mappingId(),
+                        ValidationTableFailure.Side.valueOf(row.getString("side")), row.getString("code"), row.getString("message")));
+            } catch (IllegalArgumentException | ClassCastException | NullPointerException | TapstateException bad) {
+                throw unreadable("table-failure");
+            }
+        }
+        return List.copyOf(result);
     }
 
     private static long countSummaryBytes(Document report) {
@@ -365,7 +456,10 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             var start=start(row);var spec=row.get("specSnapshot",Document.class);if(spec==null)throw unreadable("report-specification");
             var specification=MongoValidationTaskCodec.run(spec);var terminal=terminal(row);var facts=terminal==null?observation(row):terminal;var counts=new ArrayList<ValidationCountCheck>();
             if(!specification.fingerprint().equals(start.run().specHash()))throw unreadable("report-specification");
-            countSummaryBytes(row);var seen=new java.util.HashSet<String>();
+            long summaryBytes=countSummaryBytes(row)+tableFailureBytes(row);
+            var failures=tableFailures(row,specification);
+            var seen=new java.util.HashSet<String>();
+            failures.forEach(value->seen.add(value.mappingId()));
             if(row.containsKey("countSummaries")){
                 if(specification.method()!=ValidationMethod.COUNT||!(row.get("countSummaries") instanceof List<?> summaries)
                         ||summaries.size()>specification.task().mappings().size())throw unreadable("count-summaries");
@@ -377,12 +471,16 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                             readBoundary(summary.get("sourceRead",Document.class)),readBoundary(summary.get("targetRead",Document.class))));
                 }
             }
-            if(specification.method()==ValidationMethod.COUNT&&number(row,"rootCount")!=0)throw unreadable("count-roots");
-            if(terminal!=null&&"COMPLETED".equals(terminal.get("state"))&&specification.method()==ValidationMethod.COUNT&&counts.size()!=specification.task().mappings().size())throw unreadable("incomplete-count-report");
-            if(number(row,"rootCount")>MAX_STORED_ROOTS||number(row,"resultBytes")>MAX_REPORT_BYTES)throw unreadable("report-accounting");
+            long rootCount=number(row,"rootCount"), retained=number(row,"resultBytes");
+            if(specification.method()==ValidationMethod.COUNT){
+                if(rootCount!=0||retained!=summaryBytes)throw unreadable("count-summary-accounting");
+                if(terminal!=null&&"COMPLETED".equals(terminal.get("state"))&&seen.size()!=specification.task().mappings().size())
+                    throw unreadable("incomplete-count-report");
+            }
+            if(rootCount>MAX_STORED_ROOTS||retained<summaryBytes||retained>MAX_REPORT_BYTES)throw unreadable("report-accounting");
             return new Snapshot(start,specification,row.getBoolean("closed"),terminal==null?null:ValidationRunState.valueOf(terminal.getString("state")),
                     terminal==null?null:java.time.Instant.parse(terminal.getString("knownAt")),terminalEnd(terminal),window(facts),
-                    facts==null||!facts.containsKey("failure")?null:failure(facts.get("failure",Document.class)),number(row,"rootCount"),number(row,"resultBytes"),counts);
+                    facts==null||!facts.containsKey("failure")?null:failure(facts.get("failure",Document.class)),rootCount,retained,counts,failures);
         }catch(RuntimeException bad){throw unreadable("report-snapshot");}
     }
     private static java.time.Instant end(Document row,Map<Reference,io.tapstate.spi.store.ValidationControlStore.Status> pending){
@@ -461,8 +559,12 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
         throw unreadable("report-payload-type");
     }
     private static void requireReportCapacity(Document report){
-        long retained=encoded(report).length+number(report,"resultBytes")-countSummaryBytes(report);
-        if(retained>MAX_REPORT_BYTES)throw MongoValidationObservationCodec.limit();
+        requireReportCapacity(report,countSummaryBytes(report)+tableFailureBytes(report));
+    }
+    private static void requireReportCapacity(Document report,long embeddedResults){
+        long headerBytes=encoded(report).length;
+        long retained=headerBytes+number(report,"resultBytes")-embeddedResults;
+        if(headerBytes>MAX_REPORT_HEADER_BYTES||retained>MAX_REPORT_BYTES)throw MongoValidationObservationCodec.limit();
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field",field),null);}
     private static void validateCount(Document row, Report report) {

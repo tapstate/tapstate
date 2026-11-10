@@ -482,6 +482,13 @@ final class PdkValidationSession {
         } finally { discovery.seal(); }
         TapTable model = discovery.result();
         if (model.getNameFieldMap() == null || model.getNameFieldMap().size() > 4096) throw protocol();
+        if (scan instanceof Metadata) {
+            for (var field : scan.projection()) {
+                if (!model.getNameFieldMap().containsKey(field))
+                    throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
+                            Map.of("node", connectorId, "field", field, "rule", "key-field-missing"), null);
+            }
+        }
         if (!model.getNameFieldMap().keySet().containsAll(scan.ascendingKeys())
                 || !model.getNameFieldMap().keySet().containsAll(scan.matchFields())
                 || !model.getNameFieldMap().keySet().containsAll(scan.projection())) throw protocol();

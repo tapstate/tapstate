@@ -56,7 +56,7 @@ public final class PdkValidationCounts implements AutoCloseable {
         this.admitTable=Objects.requireNonNull(admitTable);
     }
 
-    /** One original count attempt. Failure, cancellation or a missing table never becomes a zero count. */
+    /** One original count attempt using the connector's native count contract. */
     public long count() { return attempt(false, false).count(); }
 
     /** An absent native count function leaves the scan on the PDK-ordered path. */
@@ -89,7 +89,7 @@ public final class PdkValidationCounts implements AutoCloseable {
                 check(); opened.connector().init(opened.context()); check();
                 // COUNT never discovers value models: schema discovery may sample business rows.
                 var table = new TapTable(request.table());
-                if (!optional) requireTable(opened);
+                if (metadataOnly) requireTable(opened);
                 var function = opened.functions().getCountByPartitionFilterFunction();
                 if (function == null) {
                     if (optional) return new Outcome(null, null);
@@ -101,7 +101,6 @@ public final class PdkValidationCounts implements AutoCloseable {
                 }
                 long count = PdkValidationCounter.direct(request.table(),
                         () -> function.countByPartitionFilter(opened.context(), table, TapAdvanceFilter.create()), this::check);
-                if (!optional) requireTable(opened);
                 check();
                 return new Outcome(Operation.PARTITION_FILTER, count);
             });

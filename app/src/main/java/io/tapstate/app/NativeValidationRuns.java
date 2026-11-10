@@ -20,6 +20,10 @@ final class NativeValidationRuns implements AutoCloseable {
     private volatile boolean closed;
     private final java.time.Clock clock;
     private final io.tapstate.core.logging.SecretRedactor redactor;
+    ValidationReportMetadata.Failure tableDiagnosis(TapstateException failure) {
+        return NativeValidationReportFailure.capture(failure, redactor);
+    }
+
     NativeValidationRuns(NativeValidationOwnerReservations owners,ValidationMemberResources.Member resources,
             ValidationMemberResources process,ValidationOwnerTimers timers) {
         this(owners,resources,process,timers,java.time.Clock.systemUTC(),new io.tapstate.core.logging.SecretRedactor());

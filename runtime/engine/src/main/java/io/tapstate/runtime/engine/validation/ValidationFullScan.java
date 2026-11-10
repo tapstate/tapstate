@@ -36,6 +36,8 @@ public final class ValidationFullScan {
     private final List<Mapping> mappings;
     private final Runnable requireCurrent;
     private final Consumer<ValidationRootCheck> publish;
+    private final java.util.function.BiConsumer<String, ValidationPairException> publishFailure;
+    private final Runnable finishMapping;
     private final AtomicBoolean attempted=new AtomicBoolean(),cancelled=new AtomicBoolean();
     // Publishes the current merge; its stateLock serializes close with consumption.
     @SuppressWarnings("java:S3077")
@@ -47,6 +49,13 @@ public final class ValidationFullScan {
 
     public ValidationFullScan(ValidationRunIdentity identity,ValidationRunSpec spec,List<Mapping> mappings,
             Runnable requireCurrent,Consumer<ValidationRootCheck> publish) {
+        this(identity, spec, mappings, requireCurrent, publish, (mapping, failed) -> { throw failed.diagnosis(); }, () -> {});
+    }
+    public ValidationFullScan(ValidationRunIdentity identity, ValidationRunSpec spec, List<Mapping> mappings,
+            Runnable requireCurrent, Consumer<ValidationRootCheck> publish,
+            java.util.function.BiConsumer<String, ValidationPairException> publishFailure, Runnable finishMapping) {
+        this.publishFailure = Objects.requireNonNull(publishFailure);
+        this.finishMapping = Objects.requireNonNull(finishMapping);
         this.identity=Objects.requireNonNull(identity);this.spec=Objects.requireNonNull(spec);
         this.mappings=List.copyOf(mappings);this.requireCurrent=Objects.requireNonNull(requireCurrent);this.publish=Objects.requireNonNull(publish);
         if(identity.mode()!=ValidationMode.FULL||spec.mode()!=ValidationMode.FULL||spec.method()==ValidationMethod.COUNT
@@ -67,37 +76,61 @@ public final class ValidationFullScan {
         for(int index=0;index<mappings.size();index++) {
             check();var mapping=mappings.get(index);var declared=spec.task().mappings().get(index);
             readingMapping=mapping.id();
-            var merge=Objects.requireNonNull(mapping.open().apply(this::check),"ordered readers");
+            ValidationPairException failed = null;
             try {
-                active=merge;check();
-                while(true) {
-                    check();var next=merge.next();if(next.isEmpty())break;
-                    ValidationRoot root;
-                    try(var pair=next.orElseThrow()) {
-                        var source=pair.source();var target=pair.target();
-                        source.ifPresent(group->physical(group.key().physical(),declared.source()));
-                        target.ifPresent(group->physical(group.key().physical(),declared.target()));
-                        var key=source.isPresent()?source.orElseThrow().key().comparison():target.orElseThrow().key().comparison();
-                        root=new ValidationRoot(declared.mappingId(),declared.outputId(),key,List.of());
-                        if(mapping.pairedChecker()!=null){
-                            check();var observation=new ValidationObservation(identity,root,1);
-                            publish(observation,mapping.pairedChecker().read(observation,pair,this::check));
-                            continue;
-                        }
-                    }
-                    check();var observation=new ValidationObservation(identity,root,1);
-                    publish(observation,mapping.checker().read(observation,this::check));
-                }
-                check();
-            }catch(RuntimeException|Error failed){record(failed);throw failed;}
-            finally{
-                try{merge.close();}catch(RuntimeException|Error cleanup){record(cleanup);}
-                finally{active=null;}
-                throwFailure();
+                scanMapping(mapping, declared);
+            } catch (ValidationPairException readFailure) {
+                failed = readFailure;
             }
+            try {
+                finishMapping.run();
+            } catch (ValidationPairException lateFailure) {
+                if (failed == null) failed = lateFailure;
+            }
+            check();
+            if (failed != null) publishFailure.accept(mapping.id(), failed);
             completedMappings=index+1;readingMapping=null;
         }
         check();complete=true;
+    }
+    private void scanMapping(Mapping mapping, ValidationTaskSpec.Mapping declared) {
+        var merge=Objects.requireNonNull(mapping.open().apply(this::check),"ordered readers");
+        try {
+            active=merge;check();
+            while(true) {
+                check();
+                Optional<ValidationOrderedMerge.Pair> next;
+                try { next = merge.next(); }
+                catch (TapstateException failure) {
+                    if (failure.code() == ValidationError.READ_PROTOCOL_VIOLATION)
+                        throw new ValidationPairException(ValidationTableFailure.Side.PAIR, failure);
+                    throw failure;
+                }
+                if (next.isEmpty()) break;
+                ValidationRoot root;
+                try(var pair=next.orElseThrow()) {
+                    var source=pair.source();var target=pair.target();
+                    source.ifPresent(group->physical(group.key().physical(),declared.source()));
+                    target.ifPresent(group->physical(group.key().physical(),declared.target()));
+                    var key=source.isPresent()?source.orElseThrow().key().comparison():target.orElseThrow().key().comparison();
+                    root=new ValidationRoot(declared.mappingId(),declared.outputId(),key,List.of());
+                    if(mapping.pairedChecker()!=null){
+                        check();var observation=new ValidationObservation(identity,root,1);
+                        publish(observation,mapping.pairedChecker().read(observation,pair,this::check));
+                        continue;
+                    }
+                }
+                check();var observation=new ValidationObservation(identity,root,1);
+                publish(observation,mapping.checker().read(observation,this::check));
+            }
+            check();
+        }catch(ValidationPairException failed){throw failed;}
+        catch(RuntimeException|Error failed){record(failed);throw failed;}
+        finally{
+            try{merge.close();}catch(RuntimeException|Error cleanup){record(cleanup);}
+            finally{active=null;}
+            throwFailure();
+        }
     }
     private void publish(ValidationObservation observation,ValidationRootCheck result){
         Objects.requireNonNull(result,"complete root result");

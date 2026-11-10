@@ -87,15 +87,20 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
                 var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(COUNT_WORK_BYTES,0,1,1));
                 PdkValidationCounts reader=null;
                 try{
-                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table()),()->{require();guard.run();},actual->{
-                        if(source)ValidationDirectMappings.requireObservedSourceTable(declared,actual);
-                    });
+                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table()),()->{require();guard.run();});
                     current=new Owned(reader,lease);
                     synchronized(owned){owned.add(current);}
                 }catch(RuntimeException|Error failed){
                     if(reader!=null)reader.close();lease.close();throw failed;
                 }
-                require();guard.run();var started=clock.instant();long count=reader.count();
+                require();guard.run();var started=clock.instant();long count;
+                try {
+                    count = reader.count();
+                } catch (RuntimeException failed) {
+                    if (!reader.drained()) throw failed;
+                    throw NativeValidationReportFailure.forTable(failed, source
+                            ? ValidationTableFailure.Side.SOURCE : ValidationTableFailure.Side.TARGET);
+                }
                 require();guard.run();
                 return new ValidationCountScan.Scalar(table,count,new ValidationCheckEvent.ReadBoundary(
                         UUID.randomUUID().toString(),"pdk-native-count-v1",started,clock.instant()));

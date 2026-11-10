@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.SourceResource;
+import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TableRename;
 import io.tapstate.core.validation.ValidationError;
 import io.tapstate.core.validation.ValidationTaskSpec;
@@ -82,10 +83,18 @@ final class ValidationDirectMappings {
             // The output scope includes routes omitted from the user's comparison selection.
             for (var route : selected.routes()) {
                 if (route.table() == null) {
-                    // The native reader audits this source's complete namespace. Another source
-                    // needs its own namespace admission before this output can be called one-to-one.
                     if (!route.source().equals(source.id()))
                         throw unsupported(mapping.outputId(), "from", "direct.table-scope-unknown");
+                    var rename = selected.sync().rename();
+                    if (rename != null && (rename.caseMode() != null || rename.map() != null && !rename.map().isEmpty())) {
+                        if (source.tables() == null || source.tables().stream().anyMatch(TableRef.Regex.class::isInstance))
+                            throw unsupported(mapping.outputId(), "from", "direct.table-scope-unknown");
+                        var declaration = new Declared(mapping, source, target, selected.sync(), selected.from());
+                        for (var selector : source.tables()) {
+                            String name = selector instanceof TableRef.Literal literal ? literal.name() : ((TableRef.Spec) selector).name();
+                            requireObservedSourceTable(declaration, name);
+                        }
+                    }
                     continue;
                 }
                 if (route.source().equals(source.id()) && route.table().equals(mapping.source().table())) continue;

@@ -4261,14 +4261,14 @@
     {
       "id": "mongo.config.validation_tasks",
       "resourceVersion": 2,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_tasks"
       ],
-      "responsibility": "Pipeline-bound validation configuration and bounded report-birth permissions. Task row format 2 additionally retains one FULL scheduled-admission high-watermark for the current configuration revision; manual FULL starts preserve it. No request history or per-occurrence rows.",
+      "responsibility": "Pipeline-bound validation configuration and bounded report-birth permissions. Task row format 2 additionally retains one FULL scheduled-admission high-watermark for the current configuration revision; manual FULL starts preserve it. No request history or per-occurrence rows. Comparison format 2 retains ordered source and target key paths for runtime binding; format 1 remains readable.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
       ],
@@ -4277,7 +4277,7 @@
       ],
       "recovery": "validation-scheduled-watermark-v2",
       "consistency": "validation-config-scheduled-watermark-v4",
-      "growth": "Two current permissions/counters per task and one FULL watermark <=1 KiB actual BSON, counted inside the existing <=16 KiB admission-metadata allowance. No new collection, index, TTL, event history, lease or per-run tombstone. Existing task/CONFIG total budgets remain unchanged; capacity rejects before mutation.",
+      "growth": "Two current permissions/counters per task and one FULL watermark <=1 KiB actual BSON, counted inside the existing <=16 KiB admission-metadata allowance. No new collection, index, TTL, event history, lease or per-run tombstone. Existing task/CONFIG total budgets remain unchanged; capacity rejects before mutation. Paths use the existing task comparison and configuration byte bounds.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java"
@@ -4286,14 +4286,14 @@
     {
       "id": "mongo.config.validation_reports",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_reports"
       ],
-      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one.",
+      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one. Report snapshots accept comparison formats 1 and 2. Per-pair failures are published to the original report and open epoch in the same CONFIG transaction.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationResultStore",
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
@@ -4304,7 +4304,7 @@
       ],
       "recovery": "validation-configuration",
       "consistency": "validation-config-r3",
-      "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights.",
+      "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights. At most one failure per mapping ordinal, up to 1024, with a bounded error code, side, and reason of at most 256 UTF-8 bytes. Failures count toward the existing header and report byte caps.",
       "evidence": [
         "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
@@ -4341,14 +4341,14 @@
     {
       "id": "mongo.cache.validation_runs",
       "resourceVersion": 2,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "validation_runs"
       ],
-      "responsibility": "Original validation runs and Pipeline owner/counting control, task-mode slots and problem-limit latch, with separate immutable run identities and six execution states. No business rows, pending keys or resumable checkpoints. Birth/control/run identities retain independent CONFIG generation/preparation. One current Pipeline root also arbitrates PREPARED/CANCELLED/RETIRED first-birth outcomes and the closing gate; no production pipelineScope authorizes it.",
+      "responsibility": "Original validation runs and Pipeline owner/counting control, task-mode slots and problem-limit latch, with separate immutable run identities and six execution states. No business rows, pending keys or resumable checkpoints. Birth/control/run identities retain independent CONFIG generation/preparation. One current Pipeline root also arbitrates PREPARED/CANCELLED/RETIRED first-birth outcomes and the closing gate; no production pipelineScope authorizes it. Immutable run snapshots accept comparison formats 1 and 2; original retirement and recovery retain the same fenced run identity.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationControlStore",
         "io.tapstate.adapters.mongostore.MongoValidationCachePreparations"
@@ -4359,7 +4359,7 @@
       ],
       "recovery": "validation-control-r3",
       "consistency": "validation-cache-r3",
-      "growth": "One current Pipeline control with <=8 KiB preparation metadata and bounded active-run references. Ended and pending-history controls count toward original retention and byte budgets. No lease/event history; exhausted storage refuses new validation without stopping synchronization.",
+      "growth": "One current Pipeline control with <=8 KiB preparation metadata and bounded active-run references. Ended and pending-history controls count toward original retention and byte budgets. No lease/event history; exhausted storage refuses new validation without stopping synchronization. Deferred key paths use the existing bounded immutable snapshot; pair failures are retained in CONFIG reports.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",

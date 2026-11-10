@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 final class ValidationRunLifecycle {
     enum Readiness { WAITING_FOR_INITIAL_LOAD, UNKNOWN, READY }
-    enum ReadPhase { PENDING,READING,READ_COMPLETE }
+    enum ReadPhase { PENDING,READING,READ_COMPLETE,READ_FAILED }
     /** Logical read/publication progress only; READ_COMPLETE does not claim physical drain or a successful run. */
     record Table(String mappingId,ReadPhase phase) implements java.io.Serializable {
         Table{ValidationError.fieldName(mappingId,"run.tableProgress");Objects.requireNonNull(phase);}

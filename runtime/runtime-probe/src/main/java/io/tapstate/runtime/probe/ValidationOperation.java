@@ -21,7 +21,7 @@ public record ValidationOperation(Context context,String pipeline,String task,UU
     /** A read observation only; the owner-fenced reservation still decides admission. */
     public enum OwnerLease { LIVE,NOT_LIVE,UNKNOWN }
     public record Table(String mapping,String phase) implements Serializable {
-        public Table {name(mapping);if(phase==null||!Set.of("PENDING","READING","READ_COMPLETE").contains(phase))throw invalid("table");}
+        public Table {name(mapping);if(phase==null||!Set.of("PENDING","READING","READ_COMPLETE","READ_FAILED").contains(phase))throw invalid("table");}
     }
     public record Status(ValidationOperation original,String run,Outcome outcome,String state,boolean admitted,boolean waiting,
             boolean controlUnknown,boolean retired,Drain drain,String reason,List<Table> tables) implements Serializable {

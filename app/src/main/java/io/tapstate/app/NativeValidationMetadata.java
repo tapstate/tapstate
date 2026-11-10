@@ -36,6 +36,10 @@ final class NativeValidationMetadata {
     }
     Scope inspect(ValidationTaskStore.Selection selection,List<ValidationSelectedDeclarations.Choice> choices,
             ValidationMethod method,Map<String,Projection> projections,Instant deadline){
+        return inspect(selection,choices,method,projections,deadline,true);
+    }
+    Scope inspect(ValidationTaskStore.Selection selection,List<ValidationSelectedDeclarations.Choice> choices,
+            ValidationMethod method,Map<String,Projection> projections,Instant deadline,boolean inspectMetadata){
         Objects.requireNonNull(selection);Objects.requireNonNull(method);Objects.requireNonNull(projections);
         if(deadline==null||!deadline.isAfter(clock.instant())||deadline.isAfter(clock.instant().plusSeconds(60)))throw invalid("deadline");
         if(!method.supports(ValidationMode.FULL)||method==ValidationMethod.COUNT&&!projections.isEmpty()||projections.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("method");
@@ -51,6 +55,7 @@ final class NativeValidationMetadata {
             for(var declared:scope.selected.mappings()){
                 scope.require();
                 if(method!=ValidationMethod.COUNT)NativeValidationPdkRows.requireStaticScope(scope.selected.output(declared.mapping().outputId()),declared);
+                if (!inspectMetadata) continue;
                 var projection=projections.get(declared.mapping().mappingId());
                 var source=scope.read(declared,true,projection==null?List.of():projection.source());
                 var target=scope.read(declared,false,projection==null?List.of():projection.target());
