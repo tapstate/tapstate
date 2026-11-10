@@ -203,11 +203,17 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 operation.claimUncertain = true;
                 if (replacementGeneration != null && !access(local).generation().equals(replacementGeneration))
                     throw unauthorized(local.pipeline);
-                var owner = ensureOwner(local, manualCount); operation.claimUncertain = false; if (owner == null) return operation.redirect();
-                operation.owner = owner; operation.access = local.access; owner.lease.require();
+                var selectedOwner = ensureOwner(local, manualCount);
+                operation.claimUncertain = false;
+                if (selectedOwner == null) return operation.redirect();
+                var owner = selectedOwner.owner();
+                operation.owner = owner; owner.lease.require();
+                if (manualCount && owner.countAccess == null) owner.countAccess = local.access.forManualCount(owner.lease.owner());
+                operation.access = manualCount ? owner.countAccess : local.access;
                 if(borrowed!=null&&(borrowed!=owner||borrowedGeneration!=owner.countingGeneration))return operation.reject();
                 if(operation.quotaMetadata!=null){owner.quotaMetadata=operation.quotaMetadata;owner.quotaGeneration=owner.countingGeneration;}
-                if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
+                if (!selectedOwner.obsoleteChecked() && !closeObsolete(local, owner, manualCount))
+                    throw invalid("owner.obsoletePermissions");
                 if (!manualCount || needsQuota(operation.spec)) {
                     NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
                             known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
@@ -349,29 +355,46 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }finally{local.lock.unlock();unpin(local);}
     }
 
-    private Owner ensureOwner(Pipeline local, boolean manualCount) {
+    private record SelectedOwner(Owner owner, boolean obsoleteChecked) {}
+
+    private SelectedOwner ensureOwner(Pipeline local, boolean manualCount) {
         var current = local.owner;
         if (current != null && !current.retired.get() && current.lease.authorized()) {
-            if (current.countingGeneration == 0) return initializeOwner(local, current);
-            var snapshot = access(local).control().snapshot(current.lease.owner());
+            if (current.countingGeneration == 0) return initializeOwner(local, current, manualCount);
+            var snapshot = ownerControl(local, current, manualCount).snapshot(current.lease.owner());
             if (!(snapshot.closed() && snapshot.active().isEmpty() && current.lease.owner().equals(snapshot.ledgerOwner())
-                    && snapshot.countingGeneration() == current.countingGeneration)) return current;
+                    && snapshot.countingGeneration() == current.countingGeneration)) return new SelectedOwner(current, false);
             current.retire();
             if (!manualCount) current.lease.close();
             local.owner = null;
         } else if (current != null) { current.retire(); local.owner = null; }
-        var access = access(local); var claims = new ClusterWorkloadClaims(access.claims(), membership);
-        var key = ValidationClaims.key(scope.clusterId(), local.pipeline); var actualNode = node.get();
+        var actualNode = node.get();
+        long startedPreparation = System.nanoTime();
+        var initialTopology = membership.committed();
+        if (manualCount && local.access == null) {
+            if (initialTopology == null) throw unauthorized(local.pipeline);
+            local.access = configuration.prepareCountValidationAccess(local.pipeline, scope, cache, actualNode,
+                    initialTopology.revision(), ttl, this::requireActive);
+        }
+        var access = access(local);
+        var key = ValidationClaims.key(scope.clusterId(), local.pipeline);
         final long askedAt;
         final WorkloadClaim granted;
+        final ClusterWorkloadClaims claims;
+        MongoConfigurationDomain.ValidationAccess countAccess = null;
         if (manualCount) {
-            askedAt = System.nanoTime();
             var topology = membership.committed();
             if (topology == null) throw unauthorized(local.pipeline);
-            var acquired = claims.acquireValidationExecution(key, actualNode.owner(), topology.revision(), ttl);
+            askedAt = startedPreparation;
+            var acquired = access.acquireCountTenure(actualNode, topology.revision(), ttl);
             if (acquired.isEmpty()) return null;
-            granted = acquired.orElseThrow();
+            var tenure = acquired.orElseThrow();
+            if (!topology.equals(membership.committed())) throw unauthorized(local.pipeline);
+            granted = tenure.claim();
+            claims = new ClusterWorkloadClaims(tenure.claims(), membership);
+            countAccess = tenure.access();
         } else {
+            claims = new ClusterWorkloadClaims(access.claims(), membership);
             var previous = claims.read(key);
             if (previous.filter(WorkloadClaimReading::leased).isPresent()) {
                 var held = previous.orElseThrow().claim();
@@ -388,29 +411,48 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
             if (advanced.isEmpty()) { claims.release(acquired.claim()); throw unauthorized(local.pipeline); }
             granted = advanced.orElseThrow();
         }
-        var owner = new Owner(local, granted, claims, askedAt); local.owner = owner;
+        var owner = new Owner(local, granted, claims, askedAt);
+        owner.countAccess = countAccess;
+        local.owner = owner;
         owner.lease.maintain(timers.renewals, timers.deadlines, renewal, Duration.ofMillis(250)); owner.lease.require();
-        return initializeOwner(local, owner);
+        return initializeOwner(local, owner, manualCount);
     }
 
-    private Owner initializeOwner(Pipeline local, Owner owner) {
-        var access = access(local);
-        if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
-        var control = access.control();
+    private SelectedOwner initializeOwner(Pipeline local, Owner owner, boolean manualCount) {
+        if (!closeObsolete(local, owner, manualCount)) throw invalid("owner.obsoletePermissions");
+        var control = ownerControl(local, owner, manualCount);
         var snapshot = control.snapshot(owner.lease.owner());
+        // Reuse only a clean check from this reservation after the COUNT epoch was registered.
+        boolean reusable = manualCount && owner.countAccess != null && snapshot.active().isEmpty();
         if (!snapshot.active().isEmpty()) {
+            // Recovery must validate the obsolete report under its original identity.
+            var recovery = manualCount && owner.countAccess != null ? access(local).control() : control;
             for (var old : snapshot.active()) {
                 if (old.run().identity().owner().claimGeneration() >= owner.lease.owner().claimGeneration()) throw invalid("owner.unexpectedActiveRun");
-                var outcome = control.terminateLostOwner(new ValidationControlStore.LostOwner(owner.lease.owner(), old.run(), old.run().report()));
+                var outcome = recovery.terminateLostOwner(new ValidationControlStore.LostOwner(owner.lease.owner(), old.run(), old.run().report()));
                 if (outcome == ValidationControlStore.Mutation.STALE) throw invalid("owner.obsoleteRun");
             }
             snapshot = control.snapshot(owner.lease.owner());
         }
         if (!snapshot.active().isEmpty() || !snapshot.closed() || snapshot.countingGeneration() == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
-        owner.countingGeneration = snapshot.countingGeneration() + 1; return owner;
+        owner.countingGeneration = snapshot.countingGeneration() + 1;
+        return new SelectedOwner(owner, reusable);
     }
 
-    private boolean closeObsolete(Pipeline pipeline, Owner owner) {
+    private ValidationControlStore ownerControl(Pipeline pipeline, Owner owner, boolean manualCount) {
+        if (manualCount && owner.countAccess != null)
+            return owner.countAccess.countHandles().orElseThrow().control();
+        return access(pipeline).control();
+    }
+
+    private boolean closeObsolete(Pipeline pipeline, Owner owner, boolean manualCount) {
+        if (manualCount && owner.countAccess != null) {
+            owner.lease.require();
+            if (owner.countAccess.countPermissionsCurrent(owner.lease.owner())) {
+                owner.lease.require();
+                return true;
+            }
+        }
         for (int pass = 0; pass < 104; pass++) { owner.lease.require(); if (access(pipeline).closeObsoletePermissions(owner.lease.owner(), 20)) return true; }
         return false;
     }
@@ -726,6 +768,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private final class Owner {
         final Pipeline pipeline; final AtomicBoolean retired = new AtomicBoolean(); final ValidationOwnerLease lease; final long created = handoffClock.getAsLong();
         volatile long countingGeneration,quotaGeneration;
+        MongoConfigurationDomain.ValidationAccess countAccess;
         // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
         @SuppressWarnings("java:S3077")
         volatile ValidationMemberResources.Metadata quotaMetadata;

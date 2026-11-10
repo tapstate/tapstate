@@ -183,6 +183,14 @@ class NativeValidationOwnerReservationsIT {
     }
 
     @Test void aReplacementContextEndsOldMetadataUnderANewTenureWithoutResumingItsRun() {
+        replacementClosesOriginalRun(false);
+    }
+
+    @Test void manualCountReplacementClosesAnOldOpenReportAndRunningSlot() {
+        replacementClosesOriginalRun(true);
+    }
+
+    private void replacementClosesOriginalRun(boolean manualCount) {
         try (var f = new Fixture(Duration.ofSeconds(2))) {
             var request = f.request("FULL", 1); var accepted = f.owners.reserve(request);
             assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
@@ -201,8 +209,13 @@ class NativeValidationOwnerReservationsIT {
                 var reserved=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
                 try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),replacement::readOwner,
                         new ValidationOwnerRouter.Local(){
-                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next){
-                                var result=replacement.reserve(next);reserved.set(result);return result;
+                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next) {
+                                return reserve(next, false);
+                            }
+                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next, boolean manualFull) {
+                                var result = replacement.reserve(next, manualCount && manualFull);
+                                reserved.set(result);
+                                return result;
                             }
                             @Override public ValidationOwnerRouter.LocalReceipt receipt(ValidationOwnerRouter.Request next){return replacement.receipt(next);}
                         },command->ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null),()->{},Duration.ofSeconds(5),System::nanoTime,replacement::readPreparedOwner);

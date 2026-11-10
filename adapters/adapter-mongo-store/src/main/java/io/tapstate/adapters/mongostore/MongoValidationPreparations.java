@@ -5,6 +5,8 @@ import com.mongodb.ReadPreference;
 import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
+import io.tapstate.core.validation.ValidationOwner;
+import io.tapstate.spi.store.ValidationClaims;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
@@ -47,6 +49,7 @@ final class MongoValidationPreparations {
         boolean consumeFirstAttempt() { return first && attempted.compareAndSet(false, true); }
         State requireCurrent() { return owner.require(this, false); }
         State requireComplete() { return owner.require(this, true); }
+        void registerCountOwner(ValidationOwner selected) { owner.registerCountOwner(this, selected); }
         StorageBinding binding() { return owner.binding(subject.scope()); }
         @Override public String toString() { return "ValidationPreparation[original]"; }
     }
@@ -72,19 +75,24 @@ final class MongoValidationPreparations {
         private final Permission permission;
         private final Closing closing;
         private final Subject subject;
+        private final ValidationOwner countOwner;
         // Entry points validate the original before publishing the store.
-        Authority(Permission permission) {
+        Authority(Permission permission) { this(permission, null); }
+        Authority(Permission permission, ValidationOwner countOwner) {
             this.permission = Objects.requireNonNull(permission); this.closing = null;
             this.subject = permission.subject();
+            this.countOwner = countOwner;
         }
         Authority(Closing closing) {
             this.permission = null; this.closing = Objects.requireNonNull(closing);
             var state = closing.requireCurrent();
             this.subject = state.subject();
+            this.countOwner = null;
         }
         Subject subject() { if (subject == null) throw fenced(); return subject; }
         String pipelineId() { return permission == null ? closing.pipeline : subject.pipelineId(); }
         boolean closing() { return closing != null; }
+        boolean manualCount() { return countOwner != null; }
         void require(boolean admission) {
             if (permission != null) permission.requireComplete();
             else {
@@ -105,12 +113,34 @@ final class MongoValidationPreparations {
             if (!Objects.equals(subject, state.subject())) throw fenced();
             if (subject != null) owner.requireBinding(session, subject.scope());
             if (permission != null) {
-                owner.requireDefinition(session, pipelineId());
+                if (countOwner == null) owner.requireDefinition(session, pipelineId());
+                else owner.requireDefinition(session, pipelineId(), row);
                 if (state.phase() != Phase.COMPLETE || state.closingOperationId() != null) throw fenced();
             } else {
                 if (admission) throw fenced(); requireClosing(state, closing);
             }
-            if (admission) owner.replace(session, row, state.change(state.phase(), state.subject(), state.closingOperationId(), state.previous()));
+            if (admission) {
+                requireCountOwner(row, countOwner);
+                owner.replace(session, row, state.change(state.phase(), state.subject(), state.closingOperationId(), state.previous()));
+            }
+        }
+        void fenceCountWrite(ClientSession session, ValidationOwner expected) {
+            if (countOwner == null) return;
+            var owner = owner();
+            var row = owner.mapping(session, pipelineId());
+            requireCountOwner(row, expected);
+            var state = owner.state(row, pipelineId());
+            owner.replace(session, row, state.change(state.phase(), state.subject(), state.closingOperationId(), state.previous()));
+        }
+        private void requireCountOwner(Document row, ValidationOwner expected) {
+            if (countOwner != null && (!countOwner.equals(expected)
+                    || !epoch(subject, expected).equals(row.get("validationCountOwner")))) throw fenced();
+        }
+        void requireCountIdentity(ValidationOwner expected) {
+            if (countOwner != null && !countOwner.equals(expected)) throw fenced();
+        }
+        void requireCountStartOwner(ClientSession session, ValidationOwner expected) {
+            if (countOwner != null) requireCountOwner(owner().mapping(session, pipelineId()), expected);
         }
         void requireStart(io.tapstate.spi.store.ValidationReportAdmission.Start start, boolean closed) {
             requireStart(start, closed, false);
@@ -145,6 +175,7 @@ final class MongoValidationPreparations {
             var owner = owner();
             var store = new MongoValidationAdmissionStore(owner.client, owner.database, owner.clusterId, owner.active, this);
             store.transaction(session -> {
+                if (!closed) requireCountStartOwner(session, start.run().owner());
                 if (born) store.requireBornInTransaction(session, start);
                 else store.requireOriginalInTransaction(session, start, closed);
                 return null;
@@ -330,16 +361,69 @@ final class MongoValidationPreparations {
     }
 
     Permission complete(Permission permission, MongoValidationCachePreparations.Proof proof) {
-        requireOwned(permission); proof.requirePrepared(permission.subject());
+        requireOwned(permission);
+        var subject = permission.subject();
+        var receipt = proof.requirePrepared(subject);
+        var claim = proof.initialClaim(subject);
+        var initialOwner = claim == null ? null : ValidationClaims.owner(subject.pipelineId(), claim);
+        if (initialOwner != null && (receipt.claimGeneration() != initialOwner.claimGeneration()
+                || receipt.executionGeneration() != initialOwner.executionGeneration())) throw fenced();
         transaction(session -> {
             requireDefinition(session, permission.subject().pipelineId()); requireBinding(session, permission.subject().scope());
             var row = mapping(session, permission.subject().pipelineId()); var current = state(row, permission.subject().pipelineId());
             requireSubject(current, permission.subject()); if (current.closingOperationId() != null) throw fenced();
-            if (current.phase() == Phase.COMPLETE) return null;
-            if (current.phase() != Phase.ISSUED) throw fenced();
-            replace(session, row, current.change(Phase.COMPLETE, current.subject(), null, current.previous())); return null;
+            if (current.phase() == Phase.COMPLETE && initialOwner == null) return null;
+            if (current.phase() != Phase.ISSUED && current.phase() != Phase.COMPLETE) throw fenced();
+            var next = current.change(Phase.COMPLETE, current.subject(), null, current.previous());
+            if (initialOwner == null) replace(session, row, next);
+            else writeCountOwner(session, row, next, initialOwner);
+            return null;
         });
-        proof.requirePrepared(permission.subject()); permission.requireComplete(); return new Permission(this, permission.subject(), false);
+        var confirmed = proof.requirePrepared(subject);
+        if (initialOwner != null && (confirmed.claimGeneration() != initialOwner.claimGeneration()
+                || confirmed.executionGeneration() != initialOwner.executionGeneration())) throw fenced();
+        permission.requireComplete(); return new Permission(this, subject, false);
+    }
+
+    void registerCountOwner(Permission original, ValidationOwner selected) {
+        requireOwned(original);
+        transaction(session -> {
+            var subject = original.subject();
+            var row = mapping(session, subject.pipelineId());
+            requireDefinition(session, subject.pipelineId(), row);
+            requireBinding(session, subject.scope());
+            var current = state(row, subject.pipelineId());
+            requireSubject(current, subject);
+            if (current.phase() != Phase.COMPLETE || current.closingOperationId() != null) throw fenced();
+            writeCountOwner(session, row, current.change(Phase.COMPLETE, subject, null, current.previous()), selected);
+            return null;
+        });
+    }
+
+    private static Document epoch(Subject subject, ValidationOwner owner) {
+        if (!subject.pipelineId().equals(owner.pipelineId()) || !subject.scope().clusterId().equals(owner.clusterId())) throw fenced();
+        var epoch = new Document("formatVersion", 1).append("generation", subject.generation().toString())
+                .append("preparationId", subject.preparationId().toString())
+                .append("nodeId", owner.nodeId()).append("bootId", owner.bootId())
+                .append("claimGeneration", owner.claimGeneration()).append("executionGeneration", owner.executionGeneration())
+                .append("topologyRevision", owner.topologyRevision());
+        if (new org.bson.RawBsonDocument(epoch, new org.bson.codecs.DocumentCodec()).getByteBuffer().remaining() > 1024) throw fenced();
+        return epoch;
+    }
+
+    private void writeCountOwner(ClientSession session, Document row, State next, ValidationOwner selected) {
+        var expected = epoch(next.subject(), selected);
+        var prior = row.get("validationCountOwner", Document.class);
+        if (expected.equals(prior)) return;
+        if (prior != null && expected.get("generation").equals(prior.get("generation"))
+                && expected.get("preparationId").equals(prior.get("preparationId"))
+                && (!(prior.get("claimGeneration") instanceof Long claim) || claim >= selected.claimGeneration()
+                || !(prior.get("executionGeneration") instanceof Long execution) || execution >= selected.executionGeneration()))
+            throw fenced();
+        var filter = new Document("_id", row.get("_id")).append("validationPreparation", row.get("validationPreparation"));
+        var changes = new Document("validationPreparation", encode(next)).append("validationCountOwner", expected);
+        if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session, filter,
+                new Document("$set", changes)).getMatchedCount() != 1) throw fenced();
     }
 
     Closing beginClose(String pipeline, UUID expectedGeneration, UUID operation) {
@@ -419,8 +503,17 @@ final class MongoValidationPreparations {
     private void requireOwned(Permission permission) { if (permission == null || permission.owner != this) throw fenced(); }
     private static void requireSubject(State state, Subject expected) { if (!expected.equals(state.subject())) throw fenced(); }
     private void requireDefinition(ClientSession session, String pipeline) {
+        requirePipelineArtifact(session, pipeline);
+        requireActiveMapping(mapping(session, pipeline));
+    }
+    private void requireDefinition(ClientSession session, String pipeline, Document row) {
+        requirePipelineArtifact(session, pipeline);
+        requireActiveMapping(row);
+    }
+    private void requirePipelineArtifact(ClientSession session, String pipeline) {
         if (!(artifacts.getInTransaction(session, pipeline).orElseThrow(MongoValidationPreparations::fenced) instanceof PipelineResource)) throw fenced();
-        var row = mapping(session, pipeline);
+    }
+    private static void requireActiveMapping(Document row) {
         if (!(row.get("phase") instanceof String phase) || !Set.of("ACTIVE", "REBUILDING").contains(phase)) throw fenced();
     }
     private void requireBinding(ClientSession session, CacheBusinessScope expected) {

@@ -568,6 +568,17 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         requireKnownPipelinePermissions(session, database, cluster, pipeline, null);
     }
     private static void requireKnownPipelinePermissions(ClientSession session, MongoDatabase database, String cluster, String pipeline, Long currentOwner) {
+        if (!pipelinePermissionsCurrent(session, database, cluster, pipeline, currentOwner))
+            throw unreadable("original-permission-closure");
+    }
+
+    boolean countPermissionsCurrent(ClientSession session, io.tapstate.core.validation.ValidationOwner current) {
+        if (validation == null || !validation.manualCount()) throw unreadable("obsolete-permission-closure");
+        validation.requireCountStartOwner(session, current);
+        return pipelinePermissionsCurrent(session, database, clusterId, current.pipelineId(), current.claimGeneration());
+    }
+
+    private static boolean pipelinePermissionsCurrent(ClientSession session, MongoDatabase database, String cluster, String pipeline, Long currentOwner) {
         var filter = new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline);
         int count = 0;
         var query = SystemCollections.VALIDATION_TASKS.on(database).find(session, filter).projection(taskHeader())
@@ -585,10 +596,11 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                     var held = permission(mode(row, selected));
                     if (held != null && !phase(held).equals("CLOSED") && (currentOwner == null
                             || decodeIdentity(held.get("identity", Document.class)).run().owner().claimGeneration() < currentOwner))
-                        throw unreadable("original-permission-closure");
+                        return false;
                 }
             }
         }
+        return true;
     }
 
     boolean closeObsoletePermissionsInTransaction(ClientSession session, io.tapstate.core.validation.ValidationOwner current, int maximum) {
@@ -732,16 +744,22 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         Objects.requireNonNull(start);
         if (!clusterId.equals(start.task().clusterId())) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "start.clusterId"), null);
         if (validation != null && !validation.pipelineId().equals(start.task().pipelineId())) throw unreadable("start-pipeline");
+        if (validation != null) validation.requireCountIdentity(start.run().owner());
         bounded(identity(start), 8 * 1024);
     }
     void checkActive() { requireActive.run(); }
+    void fenceCountWrite(ClientSession session, Start start) {
+        if (validation != null) validation.fenceCountWrite(session, start.run().owner());
+    }
     io.tapstate.spi.store.ValidationTaskStore.Snapshot retentionTask(ClientSession session,Task expected){
         if(!clusterId.equals(expected.clusterId()))throw unreadable("retention-cluster");requirePipeline(expected.pipelineId());
         var row=tasks.find(session,new Document("_id",taskId(expected))).first();if(row==null)return null;
         MongoValidationSchema.requireTaskCoverage(database,session,row);var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
-        // Birth and authoring use this same CONFIG write fence. No new lease or acknowledgement is introduced.
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
         return saved;
+    }
+    void fenceRetention(ClientSession session) {
+        // Actual report removal still serializes with authoring and report birth.
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
     }
     boolean closing() { return validation != null && validation.closing() || recovery != null; }
     void requirePipeline(String pipeline) {

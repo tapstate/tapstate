@@ -1190,14 +1190,29 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     /** Independent preparation only. The caller authenticates its command and supplies a pure local lifecycle guard. */
     public ValidationAccess prepareValidationAccess(String pipeline, io.tapstate.spi.store.CacheBusinessScope expected,
             MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node, Runnable local) {
+        return prepareValidationAccess(pipeline, expected, cache, node, null, local);
+    }
+
+    public ValidationAccess prepareCountValidationAccess(String pipeline, CacheBusinessScope expected,
+            MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node, long topologyRevision,
+            java.time.Duration ttl, Runnable local) {
+        return prepareValidationAccess(pipeline, expected, cache, node,
+                new MongoValidationCachePreparations.InitialCountLease(topologyRevision, ttl), local);
+    }
+
+    private ValidationAccess prepareValidationAccess(String pipeline, CacheBusinessScope expected,
+            MongoCacheDomain cache, io.tapstate.spi.store.WorkloadClaimFence node,
+            MongoValidationCachePreparations.InitialCountLease count, Runnable local) {
         Objects.requireNonNull(local).run(); requireOpen(); Objects.requireNonNull(expected); Objects.requireNonNull(cache);
         if (node == null || node.key().type() != io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION
                 || !expected.clusterId().equals(node.key().clusterId())) throw MongoValidationPreparations.fenced();
         cache.requireRecoveryTarget(bindings.load().orElseThrow(MongoCachePipelineAccess::fenced));
         var cachePreparation = cache.validationPreparations(expected, local);
         var configuration = validationPreparations().guardedBy(local); var original = configuration.issue(pipeline, expected);
-        var completed = configuration.complete(original, cachePreparation.prepare(original, node));
-        local.run(); requireOpen(); return new ValidationAccess(this, cache, completed, local);
+        var proof = cachePreparation.prepare(original, node, count);
+        var completed = configuration.complete(original, proof);
+        local.run(); requireOpen();
+        return new ValidationAccess(this, cache, completed, local, proof.initialClaim(completed.subject()), null);
     }
     /** Observes a lease for task status without issuing a preparation or obtaining mutation authority. */
     public java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(String pipeline,
@@ -1249,9 +1264,63 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private final MongoCacheDomain cache;
         private final MongoValidationPreparations.Permission original;
         private final Runnable local;
+        private final java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.WorkloadClaim> initialCountClaim;
+        private final io.tapstate.core.validation.ValidationOwner initialCountOwner;
+        private final io.tapstate.core.validation.ValidationOwner countOwner;
         private ValidationAccess(MongoConfigurationDomain configuration, MongoCacheDomain cache,
                 MongoValidationPreparations.Permission original, Runnable local) {
+            this(configuration, cache, original, local, null, null);
+        }
+        private ValidationAccess(MongoConfigurationDomain configuration, MongoCacheDomain cache,
+                MongoValidationPreparations.Permission original, Runnable local, io.tapstate.spi.store.WorkloadClaim initial,
+                io.tapstate.core.validation.ValidationOwner countOwner) {
             this.configuration = configuration; this.cache = cache; this.original = original; this.local = local;
+            this.initialCountClaim = new java.util.concurrent.atomic.AtomicReference<>(initial);
+            this.initialCountOwner = initial == null ? null : io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), initial);
+            this.countOwner = countOwner;
+        }
+        public Optional<io.tapstate.spi.store.WorkloadClaim> takeInitialCountClaim() {
+            requireOpen();
+            return Optional.ofNullable(initialCountClaim.getAndSet(null));
+        }
+        public record CountTenure(io.tapstate.spi.store.WorkloadClaim claim, io.tapstate.spi.store.WorkloadClaimStore claims,
+                ValidationAccess access) {}
+
+        public Optional<CountTenure> acquireCountTenure(io.tapstate.spi.store.WorkloadClaimFence node,
+                long topologyRevision, java.time.Duration ttl) {
+            requireOpen();
+            if (node.key().type() != io.tapstate.spi.store.WorkloadClaimType.NODE_SESSION
+                    || !node.key().clusterId().equals(scope().clusterId()) || !node.key().resourceId().equals(node.owner().nodeId()))
+                throw MongoValidationPreparations.fenced();
+            var store = claims();
+            var initial = takeInitialCountClaim()
+                    .filter(claim -> claim.owner().equals(node.owner()) && claim.topologyRevision() == topologyRevision);
+            if (initial.isPresent()) {
+                return initial.map(claim -> new CountTenure(claim, store,
+                        countAccess(io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim))));
+            }
+            var key = io.tapstate.spi.store.ValidationClaims.key(scope().clusterId(), pipelineId());
+            return store.acquireValidationExecution(key, node.owner(), topologyRevision, ttl).map(claim -> {
+                var selected = io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), claim);
+                original.registerCountOwner(selected);
+                return new CountTenure(claim, store, countAccess(selected));
+            });
+        }
+
+        public ValidationAccess forManualCount(io.tapstate.core.validation.ValidationOwner selected) {
+            requireOpen();
+            if (!selected.equals(initialCountOwner)) {
+                var key = io.tapstate.spi.store.ValidationClaims.key(scope().clusterId(), pipelineId());
+                var current = claims().read(key).filter(io.tapstate.spi.store.WorkloadClaimReading::leased)
+                        .orElseThrow(MongoValidationPreparations::fenced);
+                if (!selected.equals(io.tapstate.spi.store.ValidationClaims.owner(pipelineId(), current.claim())))
+                    throw MongoValidationPreparations.fenced();
+                original.registerCountOwner(selected);
+            }
+            return countAccess(selected);
+        }
+        private ValidationAccess countAccess(io.tapstate.core.validation.ValidationOwner selected) {
+            return new ValidationAccess(configuration, cache, original, local, null, selected);
         }
         public String pipelineId() { return original.subject().pipelineId(); }
         public io.tapstate.spi.store.CacheBusinessScope scope() { return original.subject().scope(); }
@@ -1260,20 +1329,46 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         private void requireOpen() { configuration.requireOpen(); local.run(); }
         public void requireCurrent() { requireOpen(); original.requireComplete(); }
         public io.tapstate.spi.store.WorkloadClaimStore claims() { requireOpen(); return cache.validationClaims(original, local); }
-        public io.tapstate.spi.store.ValidationControlStore control() { requireOpen(); return cache.validationControl(original, local); }
+        public io.tapstate.spi.store.ValidationControlStore control() { requireOpen(); return cache.validationControl(original, countOwner, local); }
+
+        public record CountHandles(io.tapstate.spi.store.ValidationReports reports,
+                io.tapstate.spi.store.ValidationReportAdmission admissions, io.tapstate.spi.store.ValidationControlStore control) {}
+
+        /** These handles retain the exact preparation and owner. Their operations still enforce durable fences. */
+        public Optional<CountHandles> countHandles() {
+            requireOpen();
+            if (countOwner == null) return Optional.empty();
+            var client = configuration.connection.client();
+            var database = configuration.connection.database();
+            var authority = new MongoValidationPreparations.Authority(original, countOwner);
+            return Optional.of(new CountHandles(
+                    new MongoValidationResultStore(client, database, configuration.clusterId, this::requireOpen,
+                            new MongoValidationPreparations.Authority(original)),
+                    new MongoValidationAdmissionStore(client, database, configuration.clusterId, this::requireOpen, authority),
+                    cache.validationControlHandle(authority, local)));
+        }
         public io.tapstate.spi.store.ValidationRunHistory history() { requireOpen(); return cache.validationHistory(original, local); }
         public io.tapstate.spi.store.ValidationReportAdmission admissions() {
             requireCurrent(); return new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
-                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original, countOwner));
         }
         public io.tapstate.spi.store.ValidationResultStore results() {
             requireCurrent(); return new MongoValidationResultStore(configuration.connection.client(), configuration.connection.database(), configuration.clusterId,
-                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original));
+                    () -> { configuration.requireOpen(); local.run(); }, new MongoValidationPreparations.Authority(original, countOwner));
         }
         public io.tapstate.spi.store.ValidationReports reports(){
             requireCurrent();return new MongoValidationResultStore(configuration.connection.client(),configuration.connection.database(),configuration.clusterId,
                     ()->{configuration.requireOpen();local.run();},new MongoValidationPreparations.Authority(original));
         }
+        /** Read-only fast path. Older open permissions still use the guarded cross-domain cleanup. */
+        public boolean countPermissionsCurrent(io.tapstate.core.validation.ValidationOwner current) {
+            requireOpen();
+            if (countOwner == null || !countOwner.equals(current)) throw MongoValidationPreparations.fenced();
+            var admissions = new MongoValidationAdmissionStore(configuration.connection.client(), configuration.connection.database(),
+                    configuration.clusterId, this::requireOpen, new MongoValidationPreparations.Authority(original, countOwner));
+            return admissions.transaction(session -> admissions.countPermissionsCurrent(session, current));
+        }
+
         /** Only old-tenure CONFIG rights are revoked; current requests and saved task definitions remain intact. */
         public boolean closeObsoletePermissions(io.tapstate.core.validation.ValidationOwner current, int maximum) {
             var control = control(); control.snapshot(Objects.requireNonNull(current));

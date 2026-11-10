@@ -57,8 +57,11 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
 
     private Join join(Run run, ValidationRunState initialState) {
         Objects.requireNonNull(run);
-        requireJoinAdmission(run, initialState);
-        var joined = transaction(run.identity().owner(), true, session -> {
+        // The original BORN check includes the CONFIG preparation and binding checks.
+        boolean manualCount = initialState == ValidationRunState.RUNNING && validation != null && validation.manualCount();
+        if (!manualCount) requireJoinAdmission(run, initialState);
+        Runnable configFence = manualCount ? () -> requireJoinAdmission(run, initialState) : null;
+        var joined = transaction(run.identity().owner(), true, configFence, session -> {
             var control = control(session, run.identity().owner().pipelineId());
             var existing = row(session, run);
             if (existing != null) {
@@ -92,7 +95,7 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
             rows.insertOne(session, record(run, initialState, false));
             return Join.JOINED;
         });
-        requireJoinAdmission(run, initialState);
+        if (!manualCount) requireJoinAdmission(run, initialState);
         return joined;
     }
 
@@ -395,10 +398,14 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
     }
 
     private <T> T transaction(ValidationOwner owner, boolean admission, Function<ClientSession, T> work) {
+        return transaction(owner, admission, null, work);
+    }
+
+    private <T> T transaction(ValidationOwner owner, boolean admission, Runnable configFence, Function<ClientSession, T> work) {
         if (!scope.clusterId().equals(owner.clusterId())) throw fenced();
         return StoreIo.call(() -> {
             requireActive.run(); requireCollection(database);
-            requireValidationAuthority(owner, admission);
+            requireValidationAuthority(owner, admission, configFence);
             try (var session = client.startSession()) {
                 var committed = session.withTransaction(() -> {
                     requireActive.run();
@@ -422,16 +429,17 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                     if (!ValidationClaims.owner(owner.pipelineId(), decoded).equals(owner)) throw fenced();
                     var result = work.apply(session); requireActive.run(); return result;
                 }, TRANSACTION);
-                requireValidationAuthority(owner, admission);
+                requireValidationAuthority(owner, admission, configFence);
                 return committed;
             }
         });
     }
 
-    private void requireValidationAuthority(ValidationOwner owner, boolean admission) {
+    private void requireValidationAuthority(ValidationOwner owner, boolean admission, Runnable configFence) {
         if (validation != null) {
             if (!validation.subject().pipelineId().equals(owner.pipelineId())) throw fenced();
-            validation.require(admission);
+            if (configFence == null) validation.require(admission);
+            else configFence.run();
             MongoValidationSchema.requireReady(database, false);
         }
     }

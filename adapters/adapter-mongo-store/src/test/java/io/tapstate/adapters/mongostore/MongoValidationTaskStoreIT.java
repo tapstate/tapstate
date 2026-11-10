@@ -583,6 +583,69 @@ class MongoValidationTaskStoreIT {
         }
     }
 
+    @Test void firstCountClaimIsUsableOnlyAfterConfigCompletion() {
+        try (var f = new Fixture()) {
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var config = f.configuration.validationPreparations();
+            var issued = config.issue("flow", f.scope);
+            var proof = f.cache.validationPreparations(f.scope).prepare(issued, WorkloadClaimFence.from(node),
+                    new MongoValidationCachePreparations.InitialCountLease(1, TTL));
+            var claim = proof.initialClaim(issued.subject());
+            assertThat(claim.claimGeneration()).isOne();
+            assertThat(claim.executionGeneration()).isOne();
+            assertThatThrownBy(() -> f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+
+            config.complete(issued, proof);
+            var access = f.configuration.loadValidationAccess("flow", f.scope, f.cache, () -> {});
+            assertThat(access.claims().read(claim.key())).hasValueSatisfying(value -> {
+                assertThat(value.leased()).isTrue();
+                assertThat(value.claim()).isEqualTo(claim);
+            });
+            var epoch = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb).find(new Document("_id", "flow")).first()
+                    .get("validationCountOwner", Document.class);
+            assertThat(epoch).containsEntry("claimGeneration", 1L).containsEntry("executionGeneration", 1L);
+        }
+    }
+
+    @Test void oldManualCountOwnerCannotOpenOrPublishAfterConfigEpochChanges() {
+        try (var f = new Fixture()) {
+            var create = f.create("flow");
+            assertThat(f.tasks.create(create)).isEqualTo(Write.APPLIED);
+            var saved = f.read(create.task());
+            var node = f.cache.workloadClaims(f.scope).acquire(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
+                    new WorkloadOwner("node", "boot"), 1, TTL).claim();
+            var access = f.configuration.prepareCountValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(node), 1, TTL, () -> {});
+            var first = access.takeInitialCountClaim().orElseThrow();
+            assertThat(access.takeInitialCountClaim()).isEmpty();
+            var owner = ValidationClaims.owner("flow", first);
+            var scoped = access.forManualCount(owner);
+            assertThat(scoped.countPermissionsCurrent(owner)).isTrue();
+            var spec = new ValidationRunSpec(saved.comparison(), ValidationMode.FULL, ValidationMethod.COUNT);
+            var id = new ValidationRunIdentity(owner, saved.task().taskId(), "old-count", spec.mode(), spec.fingerprint(),
+                    spec.task().mappingRevision(), spec.task().comparisonRulesVersion());
+            var start = new ValidationReportAdmission.Start(saved.task(), saved.revision(), 1, UUID.randomUUID().toString(), id);
+            var open = new ValidationReportAdmission.Open(start, spec);
+            assertThat(scoped.admissions().reserveAndOpen(open)).contains(ValidationReportAdmission.Reservation.RESERVED);
+            var now = java.time.Instant.now();
+            var read = new ValidationCheckEvent.ReadBoundary("read", "count-v1", now, now);
+            var write = new ValidationResultStore.CountWrite(start.report(), spec,
+                    new ValidationCountCheck(id, "mapping", "out", 1, 1, read, read));
+            assertThat(scoped.results().publishCount(write)).isEqualTo(ValidationResultStore.Publication.APPLIED);
+
+            var next = access.acquireCountTenure(WorkloadClaimFence.from(node), 1, TTL).orElseThrow();
+            assertThat(next.claim().claimGeneration()).isEqualTo(first.claimGeneration() + 1);
+            assertThat(next.access().countPermissionsCurrent(ValidationClaims.owner("flow", next.claim()))).isFalse();
+            assertThatThrownBy(() -> scoped.countPermissionsCurrent(owner)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.admissions().reserveAndOpen(open)).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> scoped.results().publishCount(write)).isInstanceOf(TapstateException.class);
+            var staleRun = new ValidationControlStore.Run(id, 1, start, spec);
+            assertThatThrownBy(() -> scoped.control().joinRunning(staleRun)).isInstanceOf(TapstateException.class);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).countDocuments()).isEqualTo(1);
+        }
+    }
+
     @Test void reservingAndOpeningPublishesOneReportBeforeJoiningCache() {
         try (var f = new Fixture()) {
             var create = f.create("flow");

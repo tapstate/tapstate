@@ -177,6 +177,9 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
         admission.requirePipeline(command.task().pipelineId());
         return admission.transaction(this::requireDifferences,session->{
             var current=admission.retentionTask(session,command.task());if(current==null)return new Cleanup(0,0,true);
+            boolean countRetention = command.mode() == ValidationMode.FULL
+                    && current.settings().full().method() == io.tapstate.core.validation.ValidationMethod.COUNT;
+            if (!countRetention) admission.fenceRetention(session);
             int keep=command.mode()==ValidationMode.FULL?current.settings().full().historyLimit():current.settings().incremental().historyLimit();
             if(keep!=command.keep())return new Cleanup(0,0,true);
             var filter=new Document("_id.clusterId",clusterId).append("_id.pipelineId",command.task().pipelineId()).append("_id.taskId",command.task().taskId())
@@ -203,6 +206,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                         ||!copy.run().admission().equals(start(row))))throw invalid("report.conflictingPendingTerminal");
                 if(!Boolean.TRUE.equals(row.getBoolean("closed"))||end(row,pending)==null){blocked=true;continue;}
                 if(retained++<keep)continue;
+                if (countRetention && removed == 0) admission.fenceRetention(session);
                 var exact=new Document("_id",row.get("_id")).append("openVersion",row.get("openVersion")).append("admission",row.get("admission"))
                         .append("closed",true);
                 if(terminal!=null)exact.put("terminalMetadata",terminal);else exact.put("terminalMetadata",new Document("$exists",false));
@@ -288,6 +292,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             if (report == null || report.getBoolean("closed")) return Publication.CLOSED_OR_EXPIRED;
             var start = MongoValidationAdmissionStore.decodeIdentity(report.get("admission", Document.class));
             if (!admission.bornInTransaction(session, start)) return Publication.CLOSED_OR_EXPIRED;
+            admission.fenceCountWrite(session, start);
             if (!MongoValidationTaskCodec.run(write.snapshot()).equals(report.get("specSnapshot")))
                 throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "report.countSnapshot"), null);
             long previous = countSummaryBytes(report), used = number(report, "resultBytes"), version = number(report, "publicationRevision");
@@ -353,6 +358,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
             if (report == null || report.getBoolean("closed")) return Publication.CLOSED_OR_EXPIRED;
             var start = MongoValidationAdmissionStore.decodeIdentity(report.get("admission", Document.class));
             if (!admission.bornInTransaction(session, start)) return Publication.CLOSED_OR_EXPIRED;
+            admission.fenceCountWrite(session, start);
             if (!MongoValidationTaskCodec.run(spec).equals(report.get("specSnapshot")))
                 throw invalid("report.tableFailureSnapshot");
             for (var existing : tableFailures(report, spec)) {
