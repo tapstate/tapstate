@@ -177,6 +177,7 @@ final class ConvergenceDriver {
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
                         pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
                                 scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
+                        actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
                     }
                 }
                 if (!permit.granted()) {

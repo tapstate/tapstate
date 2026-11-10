@@ -181,6 +181,13 @@ public final class PipelineConverger {
         var saved = current.leaseRecovery();
         var recovery = saved != null && saved.intentRevision() == intentRevision ? saved : null;
         if (intentRevision > 0) {
+            var terminalLeaseFailure = actuator.terminalLeaseFailure(pipelineId);
+            if (terminalLeaseFailure.isPresent()) {
+                if (!stillOriginalIntent.getAsBoolean()) return ConvergeResult.superseded();
+                ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, current, false);
+                return driven.checkpoint().map(checkpoint -> ConvergeResult.failed(checkpoint, terminalLeaseFailure.orElseThrow()))
+                        .orElse(driven);
+            }
             var leaseLoss = actuator.leaseLoss(pipelineId);
             if (leaseLoss.isPresent()) {
                 var lost = leaseLoss.orElseThrow();

@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -13,6 +15,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -154,6 +157,36 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void confirmedRefusalDoesNotRetryAndConflictsHaveABoundedBudget(boolean conflict) throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner();
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            if (conflict) {
+                io.renewalFailure = new TapstateException(
+                        IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoCommandException code=112"), null);
+            } else {
+                assertThat(io.raw.release(original)).isTrue();
+            }
+            io.makeDue();
+            for (int second = 0; second < 8; second++) {
+                owner.renewDue();
+                io.localOffset.addAndGet(Duration.ofSeconds(1).toNanos());
+            }
+            assertThat(io.attempts).hasSize(conflict ? 4 : 1);
+            assertThat(owner.permit(scope(id)).granted()).isFalse();
+            if (conflict) assertThat(io.raw.release(original)).isTrue();
+            io.makeDue();
+            var successor = owner.permit(scope(id));
+            assertThat(successor.granted()).isTrue();
+            var failure = owner.renewalFailure(scope(id), successor.claim()).orElseThrow();
+            assertThat(failure.code().code()).isEqualTo(conflict
+                    ? "engine.execution-renewal-failed" : "engine.execution-lease-lost");
+        }
+    }
+
     private static ArrayList<WorkloadClaim> seed(ControlledIo io, PipelineActuationOwnership owner, int count) {
         var originals = new ArrayList<WorkloadClaim>();
         for (var id : IDS.subList(0, count)) originals.add(seedOne(io, owner, id));
@@ -200,6 +233,7 @@ class PipelineActuationRenewalBudgetTest {
         private final CountDownLatch entered = new CountDownLatch(1);
         private volatile CountDownLatch release = new CountDownLatch(0);
         private volatile long delayMillis;
+        private volatile RuntimeException renewalFailure;
 
         private ControlledIo() {
             doAnswer(call -> bounded(worker, call.getArgument(0), call.getArgument(1), call.getArgument(2)))
@@ -225,6 +259,7 @@ class PipelineActuationRenewalBudgetTest {
                 entered.countDown();
                 if (!release.await(20, TimeUnit.SECONDS)) throw new AssertionError("IO was not released");
                 Thread.sleep(delayMillis);
+                if (renewalFailure != null) throw renewalFailure;
                 syncClock();return raw.renew(original, call.getArgument(1));
             });
         }

@@ -110,10 +110,12 @@ final class ScopedSrsSinkAckFactory implements SinkAckFactory {
                 else direct.advance(stream,progress.lastTokened(),claimed);
                 return;
             }
-            var source = source(stream); var run = source.run(); var handle = bound.get(run); handle.requireClaim(claimed);
-            if (progress.lastTokened() == null && progress.durableThrough().equals(reported.get(stream))) return;
-            if (!handle.store().advanceWriter(run.context(),run.membershipRevision(),runId,source.table(),writer,progress,run.originalClaim())) throw refused(run);
-            reported.put(stream,progress.durableThrough());
+            var source = source(stream); var run = source.run(); var handle = bound.get(run);
+            handle.withWriterStore(claimed, store -> {
+                if (progress.lastTokened() == null && progress.durableThrough().equals(reported.get(stream))) return;
+                if (!store.advanceWriter(run.context(),run.membershipRevision(),runId,source.table(),writer,progress,run.originalClaim())) throw refused(run);
+                reported.put(stream,progress.durableThrough());
+            });
         }
     }
 }

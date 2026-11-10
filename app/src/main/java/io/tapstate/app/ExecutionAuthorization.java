@@ -271,6 +271,18 @@ final class ExecutionAuthorization implements AutoCloseable {
         return entry.claim();
     }
 
+    /** Reuses the current proof for one synchronous operation, within its original deadline. */
+    Runnable pinLocalProof(ExecutionFence fence) {
+        Entry original = scopedEntry(ReadKey.of(fence));
+        Runnable require = () -> {
+            if (original == null || nanoTime.getAsLong() - original.deadlineNanos() >= 0)
+                throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
+            requireLocal(fence);
+        };
+        require.run();
+        return require;
+    }
+
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
     private Entry authorizedEntry(ExecutionFence fence) {
         Objects.requireNonNull(fence, "fence");

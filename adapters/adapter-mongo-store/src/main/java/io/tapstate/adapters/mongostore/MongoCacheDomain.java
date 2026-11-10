@@ -618,10 +618,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
     public record PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
-            boolean runningObservationUnavailable, long leaseRecoveryIntentRevision) {
+            boolean runningObservationUnavailable, io.tapstate.core.lifecycle.PipelineState checkpoint) {
         public PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
                 boolean runningObservationUnavailable) {
-            this(observation, runningObservationUnavailable, 0);
+            this(observation, runningObservationUnavailable, null);
         }
     }
 
@@ -665,9 +665,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                     boolean recovering = recovery != null && reading.actual() == io.tapstate.core.lifecycle.PipelineState.RUNNING
                             && (observation.isEmpty() || reading.claim().getLong("executionGeneration") <= recovery.failedExecution());
                     if (recovering) observation = java.util.Optional.empty();
-                    long recoveringIntent = recovering ? recovery.intentRevision() : 0;
                     result.put(reading.pipeline(), new PipelineObservationReading(
-                            observation, observation.isEmpty() && unavailable.contains(reading.pipeline()), recoveringIntent));
+                            observation, observation.isEmpty() && (recovering || unavailable.contains(reading.pipeline())), reading.actual()));
                 }
             }
             return java.util.Map.copyOf(result);

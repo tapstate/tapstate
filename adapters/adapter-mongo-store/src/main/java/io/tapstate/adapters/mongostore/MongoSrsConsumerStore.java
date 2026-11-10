@@ -1167,8 +1167,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             boolean structureChecked) {
         var pipeline = pipelineAccess(context, fence);
         if (!structureChecked) pipeline.verifyStateStructure();
-        Document current = pipeline.state(session, structureChecked);
-        pipeline.verifyOriginalClaim(session, structureChecked);
+        Document current = pipeline.stateForWriterProgress(session, structureChecked);
         // Claim replacement and execution advancement also write this checkpoint fence.
         pipeline.updateState(session, current, new Document(), false);
     }

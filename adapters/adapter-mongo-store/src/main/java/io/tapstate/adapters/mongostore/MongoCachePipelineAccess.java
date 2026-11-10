@@ -253,6 +253,24 @@ final class MongoCachePipelineAccess {
         return state;
     }
 
+    Document stateForWriterProgress(ClientSession session, boolean structureChecked) {
+        Document state = SystemCollections.CACHE_PIPELINE_STATE.on(database)
+                .find(session, new Document("_id", scope.pipelineId())).first();
+        validateState(state);
+        if (original == null) throw fenced();
+        if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var filter = WorkloadClaimDocuments.live(original)
+                .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
+        var row = table.find(session, filter).first();
+        if (row == null) {
+            requirePreparedClaim(session, structureChecked);
+            throw claimFenced();
+        }
+        requirePreparedClaim(session, row);
+        return state;
+    }
+
     void validateState(Document state) {
         if (state == null) throw unreadable("checkpoint");
         requireScope(state);

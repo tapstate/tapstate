@@ -48,6 +48,8 @@ public interface LifecycleActuator {
     /** A terminal Jet execution that was rejected by its original lease fence. */
     record LeaseLoss(long executionGeneration, Throwable cause) {}
 
+    default Optional<Throwable> terminalLeaseFailure(String pipelineId) { return Optional.empty(); }
+
     default Optional<LeaseLoss> leaseLoss(String pipelineId) { return Optional.empty(); }
 
     default boolean recoveredJobRunning(String pipelineId) { return isCarryingAJob(pipelineId); }

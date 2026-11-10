@@ -348,7 +348,8 @@ final class ThreeLayerStorePort implements StorePort {
                     var original = activeScope(entry.getKey(), header.mapping());
                     if (original.equals(header.preparation().scope())) scopes.add(original);
                 } else {
-                    result.put(entry.getKey(), new PipelineCatalogState(startFailure(entry.getKey(), header), header.desired(), header.intentFailure(), false));
+                    result.put(entry.getKey(), new PipelineCatalogState(startFailure(entry.getKey(), header), header.desired(), header.intentFailure(), false,
+                            io.tapstate.core.lifecycle.PipelineState.NEW));
                 }
             }
             if (!scopes.isEmpty()) {
@@ -361,7 +362,7 @@ final class ThreeLayerStorePort implements StorePort {
                             && current.preparation().equals(header.preparation())) {
                         result.put(entry.getKey(), new PipelineCatalogState(entry.getValue().observation(),
                                 header.desired(), header.intentFailure(), entry.getValue().runningObservationUnavailable(),
-                                header.intentRevision() > 0 && header.intentRevision() == entry.getValue().leaseRecoveryIntentRevision()));
+                                entry.getValue().checkpoint()));
                     }
                 }
             }

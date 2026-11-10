@@ -110,6 +110,29 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
+        if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION) return renewClaim(expected, ttl);
+        var previous = MongoCommandObservation.COLLECTIONS.get();
+        var stage = new java.util.concurrent.atomic.AtomicReference<String>();
+        MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+            if (previous != null) previous.accept(command, collection);
+            if (stage.getAndSet(command) == null) LOG.log(System.Logger.Level.DEBUG,
+                    "Pipeline renewal first Mongo command {0}, claim={1}, execution={2}, command={3}",
+                    expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), command);
+        });
+        try {
+            return renewClaim(expected, ttl);
+        } catch (TapstateException failure) {
+            LOG.log(System.Logger.Level.DEBUG,
+                    "Pipeline renewal last Mongo command {0}, claim={1}, execution={2}, command={3}, result={4}",
+                    expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), stage.get(), failure.code().code());
+            throw failure;
+        } finally {
+            if (previous == null) MongoCommandObservation.COLLECTIONS.remove();
+            else MongoCommandObservation.COLLECTIONS.set(previous);
+        }
+    }
+
+    private Optional<WorkloadClaim> renewClaim(WorkloadClaim expected, Duration ttl) {
         var firstMongoError = new java.util.concurrent.atomic.AtomicBoolean();
         return transaction(false, null, (store, session) -> {
             try {

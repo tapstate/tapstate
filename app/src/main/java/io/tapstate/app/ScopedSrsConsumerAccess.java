@@ -11,15 +11,37 @@ final class ScopedSrsConsumerAccess {
     private ScopedSrsConsumerAccess() {}
     static Bound bind(HazelcastInstance member,SrsConsumerRun run) {
         var authorization = ExecutionAuthorization.of(member); var fence = new ExecutionFence(run.scope(),run.originalClaim());
-        Runnable requireActive = () -> { if (!run.originalClaim().equals(authorization.require(fence))) throw refused(run); };
+        var writerProof = new ThreadLocal<Runnable>();
+        Runnable requireActive = () -> {
+            var proof = writerProof.get();
+            if (proof != null) proof.run();
+            else if (!run.originalClaim().equals(authorization.require(fence))) throw refused(run);
+        };
         requireActive.run();
         if (!(member.getUserContext().get(SrsStoreViews.USER_CONTEXT_KEY) instanceof SrsStoreViews views)) throw refused(run);
         var stores = views.srs(run.cacheScope(),requireActive);
         var reads = (SrsConsumerProgressReads)member.getUserContext().computeIfAbsent(
                 SrsConsumerProgressReads.USER_CONTEXT_KEY, ignored -> new SrsConsumerProgressReads());
-        return new Bound(run,stores.consumers().guardedBy(requireActive),stores.models(),requireActive,reads);
+        return new Bound(run,stores.consumers().guardedBy(requireActive),stores.models(),requireActive,reads,stores.consumers(),authorization,fence,writerProof);
     }
-    record Bound(SrsConsumerRun run,SrsConsumerStore store,SrsModelStore models,Runnable requireActive,SrsConsumerProgressReads reads) {
+    record Bound(SrsConsumerRun run,SrsConsumerStore store,SrsModelStore models,Runnable requireActive,SrsConsumerProgressReads reads,
+            SrsConsumerStore writerStore, ExecutionAuthorization authorization, ExecutionFence fence, ThreadLocal<Runnable> writerProof) {
+        void withWriterStore(WorkloadClaimFence claimed, java.util.function.Consumer<SrsConsumerStore> operation) {
+            if (claimed == null) {
+                requireClaim(null);
+                operation.accept(store);
+                return;
+            }
+            if (!run.originalClaim().equals(claimed)) throw refused(run);
+            writerProof.set(authorization.pinLocalProof(fence));
+            try {
+                operation.accept(writerStore);
+            } finally {
+                writerProof.remove();
+            }
+        }
+
+
         void requireClaim(WorkloadClaimFence claimed) { requireActive.run(); if (claimed != null && !run.originalClaim().equals(claimed)) throw refused(run); }
         SrsConsumerProgress progress() {
             requireActive.run(); var held = reads.read(run,() -> store.progress(run.context()).orElseThrow(() -> refused(run))); requireActive.run();

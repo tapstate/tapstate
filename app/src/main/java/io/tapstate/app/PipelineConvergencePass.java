@@ -87,6 +87,10 @@ final class PipelineConvergencePass {
     };
 
     private long displacedExecution;
+    private TapstateException renewalFailure;
+
+    void renewalFailed(TapstateException failure) { renewalFailure = Objects.requireNonNull(failure); }
+    Optional<TapstateException> renewalFailure() { return Optional.ofNullable(renewalFailure); }
 
     PipelineConvergencePass(PipelineIntentSnapshot intent, io.tapstate.spi.store.WorkloadClaim persisted,
             PipelineStoreViews views, Runnable requireActive,

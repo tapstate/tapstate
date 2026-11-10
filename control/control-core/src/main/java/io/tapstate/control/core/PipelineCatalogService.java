@@ -132,6 +132,9 @@ public final class PipelineCatalogService {
                 : hasArtifact ? observations.findStatus(id).orElse(null) : null;
         PipelineState observed = observation == null ? null : observation.observedState();
         PipelineState effective = observation == null ? null : observation.state();
+        PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
+        if (effective == null && stateFacts != null && stateFacts.runningObservationUnavailable()
+                && checkpoint == PipelineState.RUNNING) effective = checkpoint;
         PipelineState target;
         PipelineCatalogItem.IntentReadFailure intentReadFailure = null;
         try {
@@ -149,12 +152,8 @@ public final class PipelineCatalogService {
         }
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
-                ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
-                : target == PipelineState.RUNNING && stateFacts != null && stateFacts.leaseRecovering()
-                        ? PipelineCatalogItem.DisplayState.RECOVERING
-                : target == PipelineState.RUNNING && stateFacts != null && stateFacts.runningObservationUnavailable()
-                        ? PipelineCatalogItem.DisplayState.UNAVAILABLE
-                        : displayState(target, effective, intentReadFailure == null);
+                ? observed == null ? null : PipelineCatalogItem.DisplayState.valueOf(observed.name())
+                : displayState(target, effective, intentReadFailure == null);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
         String mode = draft == null ? null : draft.mode().name().toLowerCase(java.util.Locale.ROOT);
@@ -163,7 +162,8 @@ public final class PipelineCatalogService {
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
         PipelineCatalogItem.DisplayState runtimeState = observation != null && observed != effective
-                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name()) : state;
+                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name())
+                : checkpoint == null ? state : PipelineCatalogItem.DisplayState.valueOf(checkpoint.name());
         return new PipelineCatalogItem(
                 id,
                 name,
@@ -176,8 +176,7 @@ public final class PipelineCatalogService {
                 new PipelineCatalogItem.Status(
                         runtimeState,
                         recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
-                                : state == PipelineCatalogItem.DisplayState.UNAVAILABLE && !recoveryAtRest
-                                        ? PipelineCatalogItem.UiState.UNAVAILABLE : PipelineCatalogItem.UiState.of(state, hasArtifact),
+                                : PipelineCatalogItem.UiState.of(state, hasArtifact),
                         target,
                         observed,
                         observation == null ? null : observation.failure(),

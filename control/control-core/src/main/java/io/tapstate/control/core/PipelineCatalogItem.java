@@ -60,7 +60,6 @@ public record PipelineCatalogItem(
     public enum DisplayState {
         NEW,
         STARTING,
-        RECOVERING,
         RUNNING,
         PAUSING,
         PAUSED,
@@ -68,8 +67,7 @@ public record PipelineCatalogItem(
         STOPPING,
         STOPPED,
         COMPLETED,
-        FAILED,
-        UNAVAILABLE
+        FAILED
     }
 
     /** Authoring-aware UI projection carried separately from the existing catalog state vocabulary. */
@@ -79,7 +77,6 @@ public record PipelineCatalogItem(
         NOT_STARTED,
         NEW,
         STARTING,
-        RECOVERING,
         RUNNING,
         PAUSING,
         PAUSED,
@@ -87,15 +84,14 @@ public record PipelineCatalogItem(
         STOPPING,
         STOPPED,
         COMPLETED,
-        FAILED,
-        UNAVAILABLE;
+        FAILED;
 
         /** Projects internal lifecycle state into the authoring-facing status vocabulary. */
         public static UiState of(DisplayState state, boolean hasArtifact) {
             if (!hasArtifact) {
                 return DRAFT;
             }
-            if (state == null || state == DisplayState.UNAVAILABLE) {
+            if (state == null) {
                 return null;
             }
             if (state == DisplayState.NEW) {

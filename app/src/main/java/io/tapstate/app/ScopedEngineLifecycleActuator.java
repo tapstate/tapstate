@@ -222,6 +222,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         require(); run.resume(); require();
     }
+    @Override public synchronized Optional<Throwable> terminalLeaseFailure(String pipeline) {
+        requireId(pipeline);
+        return pass.renewalFailure().map(Throwable.class::cast);
+    }
+
     @Override public synchronized Optional<LeaseLoss> leaseLoss(String pipeline) {
         long displaced = pass.displacedExecution();
         if (displaced > 0 && displaced == command.executionGeneration()
