@@ -23,6 +23,7 @@ import java.util.Collection;
 import java.util.function.Consumer;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -53,17 +54,18 @@ final class ConvergenceDriver {
             Function<PipelineConvergencePass, LifecycleActuator> actuators,
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
             Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
-            Consumer<PipelineIntentStore.PendingStart> prepareStart) {
+            Consumer<PipelineIntentStore.PendingStart> prepareStart,
+            Consumer<String> resumeRebuild) {
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
-            this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none(), null);
+            this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none());
         }
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
                 PipelineAlertFeed alerts) {
-            this(intents, stores, active, actuators, rebuilds, retain, alerts, null);
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, null, null);
         }
         ScopedPorts {
             Objects.requireNonNull(intents, "intents"); Objects.requireNonNull(stores, "stores");
@@ -158,7 +160,12 @@ final class ConvergenceDriver {
                 } else {
                     var snapshot = scoped.intents().loadForActuation(pipelineId);
                     if (snapshot.isEmpty()) {
-                        if (scoped.prepareStart() != null) scoped.intents().pendingStart(pipelineId).ifPresent(this::prepareStart);
+                        var pendingStart = scoped.prepareStart() == null
+                                ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
+                        if (pendingStart.isPresent()) prepareStart(pendingStart.orElseThrow());
+                        else if (scoped.resumeRebuild() != null) {
+                            scoped.resumeRebuild().accept(pipelineId);
+                        }
                         continue;
                     }
                     if (snapshot.get().deleted()) continue;
