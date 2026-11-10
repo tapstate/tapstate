@@ -5,6 +5,7 @@ import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -101,6 +102,42 @@ class ScopedPipelineActuationOwnershipTest {
             membership.canCommit(Set.of("node-a","node-b"));
             assertThat(owner.permit(FIRST).granted()).isFalse();
         }finally {release.countDown();owner.stopForShutdown();}
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aRenewalTimeoutRetriesOnlyTheOriginalFenceWithinItsLease(boolean expired) {
+        var owner = ownership();
+        var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(permit.claim()));
+        var renewals = new AtomicInteger();
+        doAnswer(call -> {
+            var expected = call.<WorkloadClaim>getArgument(0);
+            assertThat(WorkloadClaimFence.from(expected)).isEqualTo(run.claimFence());
+            if (renewals.incrementAndGet() == 1) {
+                throw new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "MongoOperationTimeoutException"), null);
+            }
+            return raw.renew(expected, call.getArgument(1));
+        }).when(store).renew(any(), any());
+
+        raw.elapse(RENEW);
+        nanos.addAndGet(RENEW.toNanos());
+        owner.renewDue();
+        assertThat(owner.permit(FIRST).granted()).isFalse();
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
+
+        var delay = expired ? TTL.minus(RENEW) : Duration.ofSeconds(1);
+        raw.elapse(delay);
+        nanos.addAndGet(delay.toNanos());
+        owner.renewDue();
+        if (expired) {
+            assertThat(renewals).hasValue(1);
+            assertThat(owner.proveExecution(run.fence())).isFalse();
+        } else {
+            assertThat(renewals).hasValue(2);
+            assertThat(WorkloadClaimFence.from(owner.permit(FIRST).claim())).isEqualTo(run.claimFence());
+        }
+        assertThat(acquisitions).hasValue(1);
     }
 
     @Test void aJoinDuringRenewalPreservesTheOriginalScopedExecution() {

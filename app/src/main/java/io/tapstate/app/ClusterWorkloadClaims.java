@@ -32,11 +32,15 @@ final class ClusterWorkloadClaims {
     }
     ClusterWorkloadClaims draining(AdmissionDrain admission){return new ClusterWorkloadClaims(store,membership,admission);}
     private <T>T call(java.util.function.Supplier<T> action){
+        return call(action, Long.MAX_VALUE);
+    }
+    private <T>T call(java.util.function.Supplier<T> action, long budgetNanos){
         if(admission==null)return action.get();
         if(!admission.enter())throw ThreeLayerStorePort.refused();
         try {
             var result=store instanceof io.tapstate.spi.store.DeadlineWorkloadClaimStore bounded
-                    ? bounded.withDeadline(admission.deadlineNanos(),()->{
+                    ? bounded.withDeadline(budgetNanos == Long.MAX_VALUE ? admission.deadlineNanos()
+                            : Math.min(admission.deadlineNanos(), System.nanoTime() + budgetNanos),()->{
                         if(!admission.accepting())throw ThreeLayerStorePort.refused();
                     },action) : action.get();
             if(!admission.current())throw ThreeLayerStorePort.refused();
@@ -97,7 +101,7 @@ final class ClusterWorkloadClaims {
     }
 
     /** Keeps a scoped run's exact fence across joins; only a subsequent submission adopts the new topology. */
-    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl) {
+    Optional<WorkloadClaim> renewScopedActuation(WorkloadClaim expected, Duration ttl, long budgetNanos) {
         if (expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
             throw new IllegalArgumentException("a scoped actuation renewal requires a Pipeline claim");
         if (expected.executionGeneration() == 0) return renew(expected, ttl);
@@ -105,7 +109,7 @@ final class ClusterWorkloadClaims {
         if (!membership.businessEligible() || current == null
                 || !current.clusterId().equals(expected.key().clusterId())
                 || current.revision() < expected.topologyRevision()) return Optional.empty();
-        return call(()->store.renew(expected, ttl));
+        return call(()->store.renew(expected, ttl), budgetNanos);
     }
 
     /**
