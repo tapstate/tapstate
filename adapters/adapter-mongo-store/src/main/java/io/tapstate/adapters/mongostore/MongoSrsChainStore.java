@@ -45,6 +45,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private final Runnable requireStructure;
     private final MongoSrsModelStore models;
     private final MongoSrsLogStore log;
+    private final MongoSrsLease lease;
 
     public MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -53,16 +54,22 @@ public final class MongoSrsChainStore implements SrsChainStore {
         this(client, database, scope, requireActive, () -> {});
     }
     MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
+        this(client, database, scope, requireActive, requireStructure, MongoSrsLease.perTransaction());
+    }
+    /** The capture assembly's store: checkpoints prove once per {@code lease}, every other operation on every transaction. */
+    MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure,
+                       MongoSrsLease lease) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
-        this.models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+        this.lease = Objects.requireNonNull(lease, "lease");
+        this.models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure, lease);
         this.log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
-                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
+                SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease);
     }
     @Override public MongoSrsChainStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, lease);
     }
     @Override public SrsChainState prepare(String chain, String retention, WorkloadClaimFence fence) {
         requireName(chain);
@@ -98,18 +105,18 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     @Override public SrsChainState requestTables(String chain, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
-        return transaction(session -> {
+        return changingTheChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCapture(row, fence);
             SrsChainState held = state(session, row); var union = new TreeSet<>(held.requestedTables()); union.addAll(captured);
             if (union.equals(held.requestedTables())) return held;
             var replacement = new Document(row).append("requestedTables", new ArrayList<>(union));
             replace(session, row, replacement); return decode(replacement);
-        });
+        }));
     }
     @Override public OptionalLong openEpoch(String chain, long expectedEpoch, WorkloadClaimFence fence) {
         requireName(chain);
         if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
-        return transaction(session -> {
+        return changingTheChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCapture(row, fence);
             SrsChainState held = state(session, row);
             if (held.epoch() == expectedEpoch + 1 && WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)).equals(fence)) {
@@ -119,25 +126,27 @@ public final class MongoSrsChainStore implements SrsChainStore {
             var replacement = new Document(row).append("epoch", expectedEpoch + 1).append("captureFence", WorkloadClaimDocuments.stored(fence))
                     .append("servingTables", List.of());
             replace(session, row, replacement); return OptionalLong.of(expectedEpoch + 1);
-        });
+        }));
     }
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
-        return transaction(session -> {
+        return changingTheChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCurrent(row, epoch, fence);
             SrsChainState held = state(session, row);
             if (!captured.containsAll(held.requestedTables())) return false;
             if (!held.servingTables().isEmpty()) return held.servingTables().equals(captured);
             var replacement = new Document(row).append("servingTables", sorted(captured));
             replace(session, row, replacement); return true;
-        });
+        }));
     }
     @Override public Optional<SrsChainState> checkpoint(String chain, long expectedRevision, SrsCaptureCheckpoint checkpoint, WorkloadClaimFence fence) {
         requireName(chain); Objects.requireNonNull(checkpoint, "checkpoint");
         if (expectedRevision < 0 || expectedRevision == Long.MAX_VALUE) throw new IllegalArgumentException("invalid checkpoint revision");
-        return transaction(session -> {
-            prove(session, fence); Document row = requireRoot(session, chain);
-            requireCurrent(row, checkpoint.position().order().epoch(), fence); SrsChainState held = state(session, row);
+        return checkpointTransaction(fence, (session, proving) -> {
+            Document row = requireRoot(session, chain);
+            requireCurrent(row, checkpoint.position().order().epoch(), fence);
+            // Under a standing lease the held state is read as stored: its frontier was proved when the lease was.
+            SrsChainState held = proving ? state(session, row) : decode(row);
             if (held.checkpointRevision() == expectedRevision + 1 && checkpoint.equals(held.checkpoint())) return Optional.of(held);
             if (held.checkpointRevision() != expectedRevision) return Optional.empty();
             if (checkpoint.equals(held.checkpoint())) return Optional.of(held);
@@ -161,7 +170,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     if (next == null || next.sequence() < before.getValue().sequence()) throw unproven(chain);
                 }
             }
-            validateCheckpoint(session, row, checkpoint, fence, true);
+            if (proving) validateCheckpoint(session, row, checkpoint, fence, true);
             var replacement = new Document(row).append("checkpointRevision", expectedRevision + 1)
                     .append("checkpoint", checkpointDocument(checkpoint)).append("checkpointAt", Date.from(Instant.now()));
             if (held.resumeOverride() != null && checkpoint.position().order().epoch() > held.resumeOverride().fromEpoch()) replacement.put("resumeOverride", null);
@@ -329,6 +338,45 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
         });
+    }
+
+    /** A chain change by the owner ends both leases, however it ends: the next append and checkpoint prove against it. */
+    private <T> T changingTheChain(java.util.function.Supplier<T> change) {
+        try { return change.get(); } finally { lease.drop(); }
+    }
+
+    /**
+     * The checkpoint's own transaction: the claim is proved first, by a write to it, on every call. Structure,
+     * identity and the frontier's consistency with the log are proved on the first checkpoint after the
+     * checkpoint lease ran out, and skipped under a standing lease. A proving checkpoint publishes the lease
+     * once it has committed; whatever a checkpoint throws ends the lease, so the next one proves again.
+     */
+    private <T> T checkpointTransaction(WorkloadClaimFence fence, java.util.function.BiFunction<ClientSession, Boolean, T> action) {
+        MongoSrsLease.Lease before = lease.observe(MongoSrsLease.Facet.CHECKPOINT);
+        boolean proving = !lease.stands(before);
+        long startedNanos = System.nanoTime();
+        try {
+            return StoreIo.call(() -> {
+                try {
+                    requireActive.run();
+                    try (var session = client.startSession()) {
+                        long[] claimRemaining = {0L};
+                        T result = session.withTransaction(() -> {
+                            requireActive.run();
+                            if (proving) { requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session); }
+                            prove(session, fence);
+                            if (proving) claimRemaining[0] = MongoSrsLease.remainingMillis(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), session, fence);
+                            T value = action.apply(session, proving); requireActive.run(); return value;
+                        }, TRANSACTION);
+                        if (proving) lease.proved(MongoSrsLease.Facet.CHECKPOINT, before, startedNanos, claimRemaining[0]);
+                        return result;
+                    }
+                } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+            });
+        } catch (RuntimeException failure) {
+            lease.drop(MongoSrsLease.Facet.CHECKPOINT);
+            throw failure;
+        }
     }
     private static TapstateException unproven(String chain) { return new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null); }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-chain", "field", "chain-control"), null); }

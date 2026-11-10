@@ -379,12 +379,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
         structure.verifySrs(); active.run();
-        var models = new MongoSrsModelStore(client, database, expected, active, structure::verifySrs);
+        // One lease per assembly: a capture's fenced appends and checkpoints, and a consumer's read verifications
+        // and progress writes, prove once per lease; a model, chain, membership or snapshot change through any of
+        // these stores ends it.
+        var lease = MongoSrsLease.selected();
+        var models = new MongoSrsModelStore(client, database, expected, active, structure::verifySrs, lease);
         return new io.tapstate.spi.store.SrsStores(
-                new MongoSrsChainStore(client, database, expected, active, structure::verifySrs), models,
+                new MongoSrsChainStore(client, database, expected, active, structure::verifySrs, lease), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
-                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models),
-                new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
+                new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs, lease));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,
