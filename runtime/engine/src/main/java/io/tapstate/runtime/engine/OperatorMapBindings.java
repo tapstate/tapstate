@@ -5,10 +5,12 @@ import com.hazelcast.core.DistributedObject;
 import com.hazelcast.core.HazelcastInstance;
 import com.hazelcast.map.IMap;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.GroupCommitStateStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
+import io.tapstate.spi.store.StateGroup;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -198,7 +200,7 @@ public final class OperatorMapBindings implements AutoCloseable {
     }
 
     /** A name selects this local placeholder, but never supplies a cold location or authorization. */
-    private final class PendingStore implements NestReleaseStore {
+    private final class PendingStore implements NestReleaseStore, GroupCommitStateStore {
         final String name, database;
         final boolean nest;
         Bound bound;
@@ -233,6 +235,23 @@ public final class OperatorMapBindings implements AutoCloseable {
         @Override public void delete(String namespace, String key) { delegate(namespace).delete(namespace, key); }
         @Override public void dropNamespace(String namespace) { delegate(namespace).dropNamespace(namespace); }
         @Override public long count(String namespace) { return delegate(namespace).count(namespace); }
+        @Override public GroupNamespace underlying(String namespace) {
+            if (!(delegate(namespace) instanceof GroupCommitStateStore grouped)) throw fenced();
+            return grouped.underlying(namespace);
+        }
+        @Override public StateGroup openGroup(String vertexInstance, List<GroupNamespace> namespaces) { return openOn(vertexInstance, namespaces); }
+    }
+
+    /**
+     * Opens a group on the store that does the writing: each namespace is followed through every store that
+     * translates it, and the first one reached opens the group over all of them.
+     */
+    private static StateGroup openOn(String vertexInstance, List<GroupCommitStateStore.GroupNamespace> namespaces) {
+        if (namespaces.isEmpty()) throw new IllegalArgumentException("a group names at least one namespace");
+        var named = namespaces.get(0);
+        var resolved = named.store().underlying(named.namespace());
+        if (resolved.equals(named)) throw fenced();
+        return resolved.store().openGroup(vertexInstance, namespaces);
     }
 
     /** Captures one installed slot, so a late diagnostic callback cannot follow its replacement. */
@@ -261,8 +280,14 @@ public final class OperatorMapBindings implements AutoCloseable {
 
     private KeyedStateStore forMap(Bound original, KeyedStateStore cold) {
         String hotName = original.binding.mapName(); String coldName = original.binding.placement().mapName();
-        return new NestReleaseStore() {
+        return new HotStore() {
             private void check(String namespace) { if (!hotName.equals(namespace)) throw fenced(); original.requireActive(); }
+            @Override public GroupNamespace underlying(String namespace) {
+                check(namespace);
+                if (!(cold instanceof GroupCommitStateStore grouped)) throw fenced();
+                return grouped.underlying(coldName);
+            }
+            @Override public StateGroup openGroup(String vertexInstance, List<GroupNamespace> namespaces) { return openOn(vertexInstance, namespaces); }
             @Override public void saveWithRelease(String namespace, String key, byte[] state, byte[] routingKey) {
                 check(namespace);
                 if (cold instanceof NestReleaseStore releases) releases.saveWithRelease(coldName, key, state, routingKey);
@@ -284,6 +309,8 @@ public final class OperatorMapBindings implements AutoCloseable {
             @Override public long count(String namespace) { check(namespace); return cold.count(coldName); }
         };
     }
+    /** A hot map's store: it translates the hot name to the cold one, and can join a commit group through it. */
+    private interface HotStore extends NestReleaseStore, GroupCommitStateStore {}
     private Bound require(String name) { requireOpen(); Bound held = hotMaps.get(name); if (held == null) throw fenced(); held.requireActive(); return held; }
     private void requireNoMap(String name) {
         if (member == null) throw fenced();

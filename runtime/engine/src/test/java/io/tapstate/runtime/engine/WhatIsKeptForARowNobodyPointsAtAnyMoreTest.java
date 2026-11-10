@@ -12,7 +12,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -121,7 +121,7 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
         assertThat(rows(pipeline).keySet())
                 .describedAs("the customer the order was re-pointed to is filed, so the first customer "
                         + "really is one nothing points at any more")
-                .contains(List.of(POINTED_AT_NOW));
+                .contains(NestStateInspection.keyOf(List.of(POINTED_AT_NOW)));
 
         assertThat(rows(pipeline).keySet())
                 .describedAs("the record of the deletion is kept even though the one order naming that "
@@ -130,7 +130,7 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
                         + "here is owed: taken away, it cannot be told the row is gone, and an entry that "
                         + "is not there reads as one that has not arrived - so that document waits for "
                         + "ever instead of rendering without the field")
-                .contains(List.of(WALKED_AWAY_FROM));
+                .contains(NestStateInspection.keyOf(List.of(WALKED_AWAY_FROM)));
     }
 
     @Test
@@ -184,11 +184,10 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
 
     /** Every identity recorded as pointing at {@code customer}, across all of its buckets. */
     private Set<Object> recordedAgainst(String pipeline, int customer) {
-        IMap<Object, Set<Object>> index = member.getMap(
-                "nest." + pipeline + "." + STEP + ".customer.refs");
+        String index = "nest." + pipeline + "." + STEP + ".customer.refs";
         Set<Object> recorded = new LinkedHashSet<>();
         for (int bucket = 0; bucket < NestLookup.BUCKETS; bucket++) {
-            Set<Object> held = index.get(NestLookup.bucketKey(List.of(customer), bucket));
+            Set<Object> held = NestStateInspection.get(member, index, NestLookup.bucketKey(List.of(customer), bucket));
             if (held != null) {
                 recorded.addAll(held);
             }
@@ -198,8 +197,7 @@ class WhatIsKeptForARowNobodyPointsAtAnyMoreTest {
 
     /** The rows filed for the pointed-at level of {@code pipeline}. */
     private Map<Object, Object> rows(String pipeline) {
-        IMap<Object, Object> filed = member.getMap("nest." + pipeline + "." + STEP + ".customer");
-        return new LinkedHashMap<>(filed);
+        return NestStateInspection.entries(member, "nest." + pipeline + "." + STEP + ".customer");
     }
 
     /** The last document written per order - what a sink upserting them would be left holding. */

@@ -315,6 +315,11 @@ public final class MongoStorePort implements StorePort {
     }
 
     @Override
+    public java.util.Optional<Duration> transactionLifetimeLimit() {
+        return connection.transactionLifetimeLimit();
+    }
+
+    @Override
     public DerivedSchemaStore derivedSchemas() {
         return derivedSchemas;
     }

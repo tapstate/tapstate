@@ -83,7 +83,10 @@ final class MongoOperatorInventory {
                 if (!location.equals(location(decoded)) || !unique.add(location)) throw unreadable(scope);
                 if (!decoded.database().equals(database.getName()) && (decoded.resource() != OperatorPlacement.Resource.NEST_STATE
                         || !databaseNames.contains(decoded.database()))) throw unreadable(scope);
-                if (decoded.resource() == OperatorPlacement.Resource.NEST_STATE && !shapes.contains(shape(decoded.database(), decoded.stepId()))) throw unreadable(scope);
+                // The commit fence placement belongs to no step and so has no shape; it lives in the cache database only.
+                if (MongoCommitFence.reserved(decoded)) {
+                    if (!decoded.database().equals(database.getName()) || !decoded.equals(MongoCommitFence.placement(scope, database))) throw unreadable(scope);
+                } else if (decoded.resource() == OperatorPlacement.Resource.NEST_STATE && !shapes.contains(shape(decoded.database(), decoded.stepId()))) throw unreadable(scope);
             }
             return root;
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw unreadable(scope); }

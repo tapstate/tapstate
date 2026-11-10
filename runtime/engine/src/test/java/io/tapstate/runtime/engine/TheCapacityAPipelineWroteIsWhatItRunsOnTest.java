@@ -17,6 +17,7 @@ import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestTable;
 import io.tapstate.runtime.engine.nest.NestTopology;
+import io.tapstate.runtime.engine.nest.ResidencyBudget;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -53,6 +54,14 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
         aliases.put("customer", FromRef.literal("customers"));
         aliases.put("policy", FromRef.literal("policies"));
         return Step.inline(nodeId, FromClause.aliases(aliases), body, null);
+    }
+
+    /** The same nest step, writing {@code memory} as its byte budget. */
+    private static Step nestStepWithMemory(String nodeId, String memory) {
+        Step.Inline plain = (Step.Inline) nestStep(nodeId, null, null);
+        TransformBody.Nest written = (TransformBody.Nest) plain.body();
+        TransformBody.Nest body = new TransformBody.Nest(null, null, null, null, null, memory, written.root());
+        return Step.inline(nodeId, plain.from(), body, null);
     }
 
     private static PipelineResource pipelineOf(Step... steps) {
@@ -119,6 +128,29 @@ class TheCapacityAPipelineWroteIsWhatItRunsOnTest {
         // anything coarser than the vertex - the pipeline, say - the last one walked would win silently.
         assertThat(settings.elementsAllowedIn(documentNamespaceOf(first))).isEqualTo(2_000);
         assertThat(settings.elementsAllowedIn(documentNamespaceOf(second))).isEqualTo(9_000);
+    }
+
+    @Test
+    void eachNestStepSharesTheMemoryItWroteBetweenItsOwnNamespaces() {
+        Step written = nestStepWithMemory("doc_a", "64MiB");
+        Step silent = nestStep("doc_b", null, null);
+        long heap = 4L << 30;
+
+        NestSettings settings = settingsFor(pipelineOf(written, silent), NestSettings.defaults());
+
+        var writtenNamespaces = NestTopology.compile(PIPELINE, written.id(),
+                (TransformBody.Nest) ((Step.Inline) written).body(), TABLES::get).stateNamespaces();
+        var silentNamespaces = NestTopology.compile(PIPELINE, silent.id(),
+                (TransformBody.Nest) ((Step.Inline) silent).body(), TABLES::get).stateNamespaces();
+        assertThat(writtenNamespaces).hasSizeGreaterThan(1);
+        for (String namespace : writtenNamespaces) {
+            assertThat(settings.residentBytesIn(namespace, heap)).isEqualTo((64L << 20) / writtenNamespaces.size());
+        }
+        // A step that wrote nothing gets the default share of the heap, not the other step's number.
+        for (String namespace : silentNamespaces) {
+            assertThat(settings.residentBytesIn(namespace, heap))
+                    .isEqualTo(ResidencyBudget.defaultStepBytes(heap) / silentNamespaces.size());
+        }
     }
 
     @Test

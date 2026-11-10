@@ -33,6 +33,7 @@ import java.util.function.BiFunction;
 
 /** One fixed business scope; no claim transition uses another client or an unbound transaction. */
 final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.DeadlineWorkloadClaimStore {
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(MongoCacheWorkloadClaimStore.class);
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private final MongoClient client;
@@ -42,6 +43,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private final MongoWorkloadClaimStore raw;
     private final MongoValidationPreparations.Authority validation;
     private final MongoClaimOperations operations;
+    private final LeftOpenTransactions leftOpen;
+
+    /**
+     * Ends the store transactions a process left open, within an allowance or, when it is null, within the
+     * connection's own timeouts; answers how many it ended.
+     */
+    @FunctionalInterface
+    interface LeftOpenTransactions {
+        int end(String processId, Duration allowance);
+
+        LeftOpenTransactions NONE = (processId, allowance) -> 0;
+    }
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive) {
         this(client, database, scope, requireActive, null);
@@ -54,6 +67,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
             MongoValidationPreparations.Authority validation, MongoClaimOperations operations) {
+        this(client,database,scope,requireActive,validation,operations,LeftOpenTransactions.NONE);
+    }
+
+    MongoCacheWorkloadClaimStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            MongoValidationPreparations.Authority validation, MongoClaimOperations operations, LeftOpenTransactions leftOpen) {
+        this.leftOpen = Objects.requireNonNull(leftOpen, "leftOpen");
         this.client = Objects.requireNonNull(client, "client");
         this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope");
@@ -92,7 +111,45 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public WorkloadClaimAttempt acquirePipeline(PipelineIntentScope original, WorkloadOwner owner, long topologyRevision, Duration ttl) {
         requireScope(original);
         var key = pipelineKey(original);
+        endWhatAnExpiredOwnerLeftOpen(key, owner);
         return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
+    }
+
+    /**
+     * Before taking over an expired pipeline claim, ends the transactions its previous owner's process left
+     * open at the store.
+     *
+     * <p>An owner frozen inside a write (a long pause, a stopped process) whose lease expired is still a
+     * cluster member, so nothing ends its transactions on departure. Its open transaction holds the documents
+     * it wrote, and the takeover's own transaction conflicts with it and retries until the server gives up on
+     * the old one, which is the server's transaction lifetime (60 s by default), not the lease. Ending them
+     * first bounds the takeover by the lease. Nothing it wrote could have committed anyway: its lease is gone,
+     * so every write it still makes is refused by the claim fence.
+     *
+     * <p>Read outside any transaction, so an open transaction of the old owner cannot hold the read up.
+     * Nothing is ended while the lease is live, when the claim is this process's own, or when the store
+     * cannot say; a failure to end them only costs the takeover its bound, never its correctness.
+     */
+    private void endWhatAnExpiredOwnerLeftOpen(WorkloadClaimKey key, WorkloadOwner taker) {
+        if (leftOpen == LeftOpenTransactions.NONE) return;
+        Optional<WorkloadClaimReading> reading;
+        try {
+            reading = StoreIo.call(() -> raw.read(key));
+        } catch (RuntimeException unreadable) {
+            return;
+        }
+        if (reading.isEmpty() || reading.get().leased()) return;
+        String expiredBoot = reading.get().claim().owner().bootId();
+        if (expiredBoot.equals(taker.bootId())) return;
+        var budget = operations.budget();
+        try {
+            int ended = leftOpen.end(expiredBoot, budget == null ? null : Duration.ofMillis(budget.remainingMillis()));
+            if (ended > 0) LOG.warn("Ended {} store transaction(s) left open by the expired owner of {} before taking it over",
+                    ended, key.resourceId());
+        } catch (RuntimeException failed) {
+            LOG.warn("Could not end the store transactions the expired owner of {} left open; the takeover waits for"
+                    + " the store to end them itself", key.resourceId(), failed);
+        }
     }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
@@ -118,8 +175,13 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         requireKey(Objects.requireNonNull(expected, "expected").key());
         return transaction(false, (store, session) -> {
             if (knownRetiredPipeline(session, expected.key())) return false;
-            storedScope(session, expected.key());
-            return store.release(expected);
+            var retained = storedScope(session, expected.key());
+            boolean released = store.release(expected);
+            // A release ends the tenure with no proof to follow: an operator-state commit still in flight under
+            // it has to collide with this transaction rather than land after it.
+            if (released && retained != null && expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION)
+                MongoCommitFence.end(session, database, retained);
+            return released;
         });
     }
     private boolean knownRetiredPipeline(ClientSession session, WorkloadClaimKey key) {

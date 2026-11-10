@@ -1090,6 +1090,9 @@ nest.memory-budget-changed-while-running:
 nest.state-database-changed-while-running:
   message: "Nest state {namespace} is already routed to database {configured} on this process, and this pipeline asks for {requested}."
   solution: "Stop every writer and restart the server before changing this nest's state database. Migrate operator state and dead letters first, or purge the pipeline state and run a full replay."
+nest.state-value-too-large:
+  message: "A state value of {bytes} bytes in nest namespace {namespace} is larger than one commit group may hold ({limit} bytes)."
+  solution: "Lower how much one document or one parked subtree may hold, for example with max_elements_per_document, so no single document's state grows past the commit bound."
 nest.state-paths-changed:
   message: "Nest {stepId} stored its state under {recorded}, and now compiles to {compiled}."
   solution: "Stop the pipeline and start it again rather than resuming: renaming an embed path or inserting a level leaves the stored state where nothing reads it, and the new paths start empty beside documents that are not."

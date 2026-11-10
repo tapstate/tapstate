@@ -426,6 +426,7 @@ public final class NestDag {
         private final ChainAxes axes;
         private final Map<Integer, List<String>> chainsByOrdinal;
         private transient NestBinding.NestStores bound;
+        private transient int firstInstance;
 
         private NestLookupSupplier(NestLookup lookup, NestBinding.NestStores stores, long referrersAllowed,
                 ChainAxes axes, Map<Integer, List<String>> chainsByOrdinal) {
@@ -439,16 +440,20 @@ public final class NestDag {
         @Override
         public void init(Context context) {
             bound = stores.bind(context.hazelcastInstance(), JetNestStateGauge::new);
+            firstInstance = context.memberIndex() * context.localParallelism();
         }
 
         @Override
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
+                // One instance's stores, so a carrier that commits an instance's namespaces together sees
+                // both of this lookup's namespaces as one instance's.
+                NestBinding.NestStores instance = bound.forInstance(lookup.name() + "/" + (firstInstance + i), NestSettings.defaults());
                 // A level's bounds are worked out per instance, so each processor gets its own: sharing
                 // one would combine what different partitions have seen into a single promise.
-                processors.add(new LookupProcessor(lookup, bound.forLookup(lookup),
-                        bound.forReferences(lookup), referrersAllowed, axes == null ? null
+                processors.add(new LookupProcessor(lookup, instance.forLookup(lookup),
+                        instance.forReferences(lookup), referrersAllowed, axes == null ? null
                                 : new LevelBounds(chainsByOrdinal, axes, LevelBounds.HOLDS_NOTHING)));
             }
             return processors;
@@ -537,6 +542,7 @@ public final class NestDag {
         private transient ReplayFloor floor;
         private transient NestBinding.NestStores bound;
         private transient NestDeadLetter boundDeadLetter;
+        private transient int firstInstance;
 
         private NestVertexSupplier(NestVertex spec, List<EmbedSlot> slots, NestBinding.NestStores stores,
                 NestDeadLetter deadLetter, String outputStream, ChainAxes axes,
@@ -568,19 +574,23 @@ public final class NestDag {
             // Bound for the same reason and at the same moment: somewhere to keep what cannot be assembled
             // is reached through a handle that does not travel with the graph.
             boundDeadLetter = deadLetter.bind(context.hazelcastInstance());
+            firstInstance = context.memberIndex() * context.localParallelism();
         }
 
         @Override
         public Collection<? extends Processor> get(int count) {
             List<Processor> processors = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
+                // One instance's stores: its documents (or mappings) and its parking area are one instance's
+                // state, committed together where the carrier commits per instance.
+                NestBinding.NestStores instance = bound.forInstance(spec.name() + "/" + (firstInstance + i), settings);
                 processors.add(spec.isAssembler()
-                        ? new AssemblerProcessor(spec, slots, bound.forAssembler(spec), outputStream,
+                        ? new AssemblerProcessor(spec, slots, instance.forAssembler(spec), outputStream,
                                 axes, chainsByOrdinal, floor, settings, clock, sending,
-                                bound.forParking(spec), boundDeadLetter, referenced(),
+                                instance.forParking(spec), boundDeadLetter, referenced(),
                                 settleMissingReferencesOnComplete, lookupSnapshots)
-                        : new ResolverProcessor(spec, bound.forResolver(spec), boundDeadLetter, axes,
-                                chainsByOrdinal, floor, clock, settings, bound.forParking(spec)));
+                        : new ResolverProcessor(spec, instance.forResolver(spec), boundDeadLetter, axes,
+                                chainsByOrdinal, floor, clock, settings, instance.forParking(spec)));
             }
             return processors;
         }
@@ -593,7 +603,8 @@ public final class NestDag {
         private Map<String, NestStore<Map<String, Object>>> referenced() {
             Map<String, NestStore<Map<String, Object>>> byNamespace = new LinkedHashMap<>();
             for (NestLookup lookup : lookups) {
-                byNamespace.put(lookup.mapName(), bound.forLookup(lookup));
+                // Read, never written, from here: the lookup vertex is the one writer of these rows.
+                byNamespace.put(lookup.mapName(), bound.forReferencedRows(lookup));
             }
             return byNamespace;
         }

@@ -67,6 +67,8 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                     .append("pipelinePreparation",MongoCachePipelinePreparations.marker(retired.preparationId(),PipelineCachePreparations.Phase.RETIRED))
                     .append("pipelineRetirement",MongoPipelineRetirementFacts.cache(retired));
             if(claims.updateOne(session,expected,new Document("$set",values)).getMatchedCount()!=1)throw fenced();
+            // Retirement ends the tenure with no proof to follow; an operator-state commit in flight collides here.
+            MongoCommitFence.end(session,database,scope);
             if(SystemCollections.CACHE_PIPELINE_STATE.on(database).updateOne(session,new Document("_id",scope.pipelineId()).append("scope",state.get("scope"))
                             .append("epoch",state.get("epoch")).append("runtimeWriteFence",state.get("runtimeWriteFence")),
                     new Document("$set",new Document("stateJson",StateJson.of(PipelineState.STOPPED)).append("epoch",epoch).append("runtimeWriteFence",write))).getMatchedCount()!=1)throw fenced();

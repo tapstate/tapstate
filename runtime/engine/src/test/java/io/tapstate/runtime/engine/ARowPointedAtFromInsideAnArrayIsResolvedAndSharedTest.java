@@ -12,7 +12,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -192,19 +192,10 @@ class ARowPointedAtFromInsideAnArrayIsResolvedAndSharedTest {
      */
     private Map<String, Integer> entriesHoldingTheEditedSku() {
         Map<String, Integer> found = new LinkedHashMap<>();
-        List<String> names = new ArrayList<>();
-        member.getDistributedObjects().forEach(object -> {
-            if (object instanceof IMap && object.getName().startsWith("nest." + PIPELINE + ".")) {
-                names.add(object.getName());
-            }
-        });
-        Collections.sort(names);
-        for (String name : names) {
-            IMap<Object, Object> map = member.getMap(name);
+        for (String name : NestStateInspection.namespaces(member, "nest." + PIPELINE + ".")) {
             int holding = 0;
-            for (Object key : map.keySet()) {
-                Object state = map.get(key);
-                if (state != null && serialized(state).contains(AFTER)) {
+            for (Object state : NestStateInspection.entries(member, name).values()) {
+                if (serialized(state).contains(AFTER)) {
                     holding++;
                 }
             }

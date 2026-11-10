@@ -12,7 +12,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -159,12 +159,11 @@ class ARowRemembersWhatPointsAtItInBoundedEntriesTest {
 
         member.getJet().newJob(ordersPointingAtOneCustomer(pipeline, orders)).join();
 
-        IMap<Object, Set<Object>> index = member.getMap(
+        Map<Object, Set<Object>> index = NestStateInspection.entries(member,
                 "nest." + pipeline + "." + STEP + ".customer.refs");
         int identities = 0;
         int largest = 0;
-        for (Object key : index.keySet()) {
-            Collection<Object> bucket = index.get(key);
+        for (Collection<Object> bucket : index.values()) {
             identities += bucket.size();
             largest = Math.max(largest, bucket.size());
         }

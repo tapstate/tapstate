@@ -366,6 +366,7 @@ nest.state-database-changed-while-running
 nest.state-far-exceeds-memory-budget
 nest.state-paths-changed
 nest.state-served-from-cold-layer
+nest.state-value-too-large
 nest.tombstone-limit-exceeded
 pipeline-draft.already-exists
 pipeline-draft.artifact-conflict

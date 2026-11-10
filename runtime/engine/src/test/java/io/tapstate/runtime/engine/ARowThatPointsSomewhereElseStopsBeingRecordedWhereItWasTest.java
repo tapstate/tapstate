@@ -13,7 +13,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -167,11 +167,10 @@ class ARowThatPointsSomewhereElseStopsBeingRecordedWhereItWasTest {
 
     /** Every identity recorded as pointing at {@code customer}, across all of its buckets. */
     private Set<Object> recordedAgainst(int customer) {
-        IMap<Object, Set<Object>> index = member.getMap(
-                "nest." + PIPELINE + "." + STEP + ".customer.refs");
+        String index = "nest." + PIPELINE + "." + STEP + ".customer.refs";
         Set<Object> recorded = new LinkedHashSet<>();
         for (int bucket = 0; bucket < NestLookup.BUCKETS; bucket++) {
-            Set<Object> held = index.get(NestLookup.bucketKey(List.of(customer), bucket));
+            Set<Object> held = NestStateInspection.get(member, index, NestLookup.bucketKey(List.of(customer), bucket));
             if (held != null) {
                 recorded.addAll(held);
             }

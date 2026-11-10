@@ -350,7 +350,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
         StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
-        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
+        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations,
+                (processId, allowance) -> allowance == null ? connection.endTransactionsLeftOpenBy(processId)
+                        : connection.endTransactionsLeftOpenBy(processId, allowance));
     }
 
     public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected) {
@@ -605,6 +607,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public int endTransactionsLeftOpenBy(String processId) {
         businessActive();
         return connection.endTransactionsLeftOpenBy(processId);
+    }
+
+    /** The cache server's own transaction lifetime, where it reports one. */
+    public java.util.Optional<Duration> transactionLifetimeLimit() {
+        businessActive();
+        return connection.transactionLifetimeLimit();
     }
 
     public Duration rateRetention() { businessActive(); return rateRetention; }

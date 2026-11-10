@@ -175,6 +175,24 @@ public record NestBinding(
             return this;
         }
 
+        /**
+         * The stores of one vertex instance, named by its vertex and instance index. A carrier that commits
+         * an instance's namespaces together needs to know which stores belong to one instance; every store
+         * asked for from the answer belongs to it. Carriers with nothing per instance answer themselves.
+         */
+        default NestStores forInstance(String vertexInstance, NestSettings settings) {
+            return this;
+        }
+
+        /**
+         * The rows a level points at, as the assembler reads them to render: another vertex's namespace,
+         * read and never written. Defaults to the lookup's own store, which for a cluster-wide map is the
+         * same thing; a carrier whose state is per instance answers with a read through to the store.
+         */
+        default NestStore<Map<String, Object>> forReferencedRows(NestLookup lookup) {
+            return forLookup(lookup);
+        }
+
         /** The store for one resolver's mappings and the children waiting in it. */
         NestStore<ResolverState> forResolver(NestVertex vertex);
 
@@ -263,6 +281,9 @@ public record NestBinding(
         private final OperatorRunManifest original;
         private final String stepId;
         private final OperatorStepMaps names;
+        /** One vertex instance's state session, when the direct carrier is selected and this is per instance. */
+        private final transient NestStateSession session;
+        private final transient NestSettings settings;
 
         private MapNestStores(HazelcastInstance member) {
             this(member, () -> NestStateGauge.NONE);
@@ -270,7 +291,12 @@ public record NestBinding(
 
         private MapNestStores(HazelcastInstance member, Supplier<NestStateGauge> gauges) { this(member,gauges,null,null); }
         private MapNestStores(HazelcastInstance member,Supplier<NestStateGauge> gauges,OperatorRunManifest original,String stepId) {
+            this(member, gauges, original, stepId, null, null);
+        }
+        private MapNestStores(HazelcastInstance member,Supplier<NestStateGauge> gauges,OperatorRunManifest original,String stepId,
+                NestStateSession session, NestSettings settings) {
             this.member = member; this.gauges = gauges; this.original = original; this.stepId = stepId;
+            this.session = session; this.settings = settings;
             this.names = original == null || stepId == null ? null : original.forStep(original.pipelineId(),stepId);
         }
         @Override public boolean hasTypedPlacements() { return original != null; }
@@ -302,13 +328,41 @@ public record NestBinding(
         }
 
         @Override
+        public NestStores forInstance(String vertexInstance, NestSettings settings) {
+            if (!NestStateSession.selected()) return this;
+            if (member == null) throw new IllegalStateException("nest stores were asked for " + vertexInstance + " before being bound to a member");
+            return new MapNestStores(member, gauges, original, stepId, NestStateSession.on(member, vertexInstance),
+                    Objects.requireNonNull(settings, "settings"));
+        }
+
+        @Override
+        public NestStore<Map<String, Object>> forReferencedRows(NestLookup lookup) {
+            if (!NestStateSession.selected()) return forLookup(lookup);
+            if (member == null) throw new IllegalStateException("nest stores were asked for " + lookup.name() + " before being bound to a member");
+            return NestStateSession.readThrough(member, name(lookup.pathId(), NestMap.LOOKUP, lookup.alias(), lookup.mapName()));
+        }
+
+        @Override
         public NestStore<ResolverState> forResolver(NestVertex vertex) {
-            return metered(mapOf(vertex));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()), vertex.mapName());
         }
 
         @Override
         public NestStore<RootAssembly> forAssembler(NestVertex vertex) {
-            return metered(mapOf(vertex));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()), vertex.mapName());
+        }
+
+        /**
+         * The instance's view of a namespace on its state session when it has one, and the namespace's map
+         * otherwise. A session's resident budget is the share of the step's memory the settings give the
+         * namespace, filed under the name the compiler gave it.
+         */
+        private <S> NestStore<S> stateOf(String askedFor, String name, String settingsName) {
+            if (session == null) return metered(mapNamed(askedFor, name));
+            NestStateGauge gauge = gauges.get();
+            long residentBytes = settings.residentBytesIn(settingsName, Runtime.getRuntime().maxMemory());
+            return gauge == NestStateGauge.NONE ? session.view(name, residentBytes)
+                    : session.view(name, residentBytes, NestStateStats.of(member), gauge);
         }
 
         /**
@@ -326,21 +380,18 @@ public record NestBinding(
 
         @Override
         public NestStore<ParkedSubtree> forParking(NestVertex vertex) {
-            return metered(mapNamed(vertex.name(), name(vertex.pathId(),NestMap.PARKING,null,vertex.parkingMapName())));
+            return stateOf(vertex.name(), name(vertex.pathId(),NestMap.PARKING,null,vertex.parkingMapName()), vertex.parkingMapName());
         }
 
         @Override
         public NestStore<Map<String, Object>> forLookup(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.LOOKUP,lookup.alias(),lookup.mapName())));
+            return stateOf(lookup.name(), name(lookup.pathId(),NestMap.LOOKUP,lookup.alias(),lookup.mapName()), lookup.mapName());
         }
 
         @Override
         public NestStore<Set<Object>> forReferences(NestLookup lookup) {
-            return metered(mapNamed(lookup.name(), name(lookup.pathId(),NestMap.REFERENCES,lookup.alias(),lookup.referencesMapName())));
-        }
-
-        private <S> IMap<Object, S> mapOf(NestVertex vertex) {
-            return mapNamed(vertex.name(), name(vertex.pathId(),NestMap.STATE,null,vertex.mapName()));
+            return stateOf(lookup.name(), name(lookup.pathId(),NestMap.REFERENCES,lookup.alias(),lookup.referencesMapName()),
+                    lookup.referencesMapName());
         }
 
         private String name(java.util.List<String> path,NestMap kind,String alias,String legacy) {

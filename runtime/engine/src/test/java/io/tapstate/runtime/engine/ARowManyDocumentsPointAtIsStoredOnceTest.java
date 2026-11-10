@@ -12,7 +12,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -160,10 +160,9 @@ class ARowManyDocumentsPointAtIsStoredOnceTest {
     private Map<String, Integer> entriesHoldingTheMarker() {
         Map<String, Integer> found = new LinkedHashMap<>();
         for (String name : stateMapNames()) {
-            IMap<Object, Object> map = member.getMap(name);
             int holding = 0;
-            for (Object key : map.keySet()) {
-                if (holdsMarker(map.get(key))) {
+            for (Object state : NestStateInspection.entries(member, name).values()) {
+                if (holdsMarker(state)) {
                     holding++;
                 }
             }
@@ -176,15 +175,7 @@ class ARowManyDocumentsPointAtIsStoredOnceTest {
 
     /** Every map this pipeline's tree took, whatever it called them. */
     private Collection<String> stateMapNames() {
-        List<String> names = new ArrayList<>();
-        member.getDistributedObjects().forEach(object -> {
-            String name = object.getName();
-            if (object instanceof IMap && name.startsWith("nest." + PIPELINE + ".")) {
-                names.add(name);
-            }
-        });
-        Collections.sort(names);
-        return names;
+        return NestStateInspection.namespaces(member, "nest." + PIPELINE + ".");
     }
 
     private static boolean holdsMarker(Object state) {

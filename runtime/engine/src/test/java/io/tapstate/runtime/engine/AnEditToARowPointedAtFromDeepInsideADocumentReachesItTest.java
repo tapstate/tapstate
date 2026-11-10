@@ -14,7 +14,7 @@ import com.hazelcast.jet.core.DAG;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
-import com.hazelcast.map.IMap;
+import io.tapstate.runtime.engine.nest.NestStateInspection;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.model.SourceRef;
@@ -232,9 +232,7 @@ class AnEditToARowPointedAtFromDeepInsideADocumentReachesItTest {
 
     /** How many product rows the tree is holding - one per product, however many lines name them. */
     private int rowsFiledForProducts() {
-        IMap<Object, Object> filed = member.getMap(
-                "nest." + PIPELINE + "." + STEP + ".lines.product");
-        return filed.size();
+        return NestStateInspection.entries(member, "nest." + PIPELINE + "." + STEP + ".lines.product").size();
     }
 
     // ---- the pipeline under test ------------------------------------------------------

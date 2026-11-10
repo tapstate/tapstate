@@ -220,6 +220,7 @@ class HazelcastConfiguration {
                 StorePort store = storePorts.getIfAvailable();
                 if (store != null) {
                     endWhatDepartedMembersLeaveOpen(member, store);
+                    TakeoverBound.warnIfStoreOutlastsLease(store, clusterProperties.getWorkloadClaimTtl());
                 }
             }
             // A member its own out-of-memory handling shuts down leaves this process up and serving HTTP over an

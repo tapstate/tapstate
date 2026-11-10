@@ -6,7 +6,9 @@ import com.mongodb.client.model.BulkWriteOptions;
 import com.mongodb.client.model.ReplaceOneModel;
 import com.mongodb.client.model.WriteModel;
 import java.util.ArrayList;
+import io.tapstate.spi.store.GroupCommitStateStore;
 import io.tapstate.spi.store.LeasedStateStore;
+import io.tapstate.spi.store.StateGroup;
 import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
 import org.bson.Document;
@@ -39,22 +41,22 @@ import java.util.function.Function;
  * <p>Reads within a lease are not fenced: a member that has lost its claim may still read until its next
  * proof, and can never write.
  */
-final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStateStore {
+final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStateStore, GroupCommitStateStore {
     private static final String STATE_FIELD = "state";
     private static final String FORMAT_VERSION_FIELD = "formatVersion";
     private static final int BATCH_KEYS = 256;
     private static final int BATCH_BYTES = 4 * 1024 * 1024;
-    private final MongoCachePipelineAccess access;
-    private final com.mongodb.client.MongoDatabase target;
-    private final OperatorPlacement placement;
-    private final SystemCollections table;
+    final MongoCachePipelineAccess access;
+    final com.mongodb.client.MongoDatabase target;
+    final OperatorPlacement placement;
+    final SystemCollections table;
     private final Document address;
     private final String mapName;
     private final long addressBytes;
     private final Validation validation;
     private final AtomicReference<Lease> lease = new AtomicReference<>();
     private final Object proving = new Object();
-    private final MongoCachePipelineAccess.LeasedClock committed = new MongoCachePipelineAccess.LeasedClock();
+    final MongoCachePipelineAccess.LeasedClock committed = new MongoCachePipelineAccess.LeasedClock();
 
     /**
      * Selects how often this store validates. {@code transaction} restores per-transaction validation for one
@@ -84,14 +86,20 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
 
     MongoCacheOperatorStateStore(MongoCachePipelineAccess access, OperatorPlacement placement) {
         this.access = Objects.requireNonNull(access, "access"); this.placement = Objects.requireNonNull(placement, "placement");
-        if (!access.scope.equals(placement.scope())) throw MongoCachePipelineAccess.fenced();
+        if (!access.scope.equals(placement.scope()) || MongoCommitFence.reserved(placement)) throw MongoCachePipelineAccess.fenced();
         target = access.operatorDatabase(placement.database(), placement.resource());
         table = table(placement.resource()); mapName = placement.mapName();
-        address = new Document("scope", MongoPipelinePreparationFacts.scope(placement.scope()))
-                .append("database", placement.database()).append("resource", placement.resource().name())
-                .append("stepId", OperatorStateText.encode(placement.stepId())).append("pathId", OperatorStateText.encode(placement.pathId())).append("namespace", OperatorStateText.encode(placement.namespace()));
+        address = address(placement);
         addressBytes = 1024L + 3L * address.toJson().length();
         validation = Validation.selected();
+    }
+
+    /** The stored address every row of {@code placement} carries in its identity. */
+    static Document address(OperatorPlacement placement) {
+        return new Document("scope", MongoPipelinePreparationFacts.scope(placement.scope()))
+                .append("database", placement.database()).append("resource", placement.resource().name())
+                .append("stepId", OperatorStateText.encode(placement.stepId())).append("pathId", OperatorStateText.encode(placement.pathId()))
+                .append("namespace", OperatorStateText.encode(placement.namespace()));
     }
 
     static SystemCollections table(OperatorPlacement.Resource resource) {
@@ -241,6 +249,46 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
     private static Lease ended() { return new Lease(System.nanoTime(), false, null, 0L); }
 
     /**
+     * Opens a vertex instance's commit group. Every namespace must reach a store of this kind on the same
+     * pipeline execution and the same database; the group then proves its lease before returning.
+     */
+    @Override public StateGroup openGroup(String vertexInstance, List<GroupNamespace> namespaces) {
+        Objects.requireNonNull(vertexInstance, "vertexInstance");
+        if (vertexInstance.isEmpty() || namespaces.isEmpty()) throw new IllegalArgumentException("a group names its instance and at least one namespace");
+        Map<String, MongoCacheOperatorStateStore> stores = new LinkedHashMap<>();
+        for (GroupNamespace named : namespaces) {
+            GroupNamespace resolved = named;
+            for (int depth = 0; ; depth++) {
+                GroupNamespace next = resolved.store().underlying(resolved.namespace());
+                if (next.equals(resolved)) break;
+                if (depth == 8) throw MongoCachePipelineAccess.fenced();
+                resolved = next;
+            }
+            if (!(resolved.store() instanceof MongoCacheOperatorStateStore store)) throw MongoCachePipelineAccess.fenced();
+            store.requireNamespace(resolved.namespace());
+            if (stores.put(named.namespace(), store) != null) throw new IllegalArgumentException("a namespace is named once in a group");
+        }
+        var group = new MongoStateGroup(vertexInstance, stores);
+        group.prove();
+        return group;
+    }
+
+    /** Takes a lease a group has proved for this store's placement, so its reads need no proof of their own. */
+    void adoptLease(long deadlineNanos, String preparationId, long inventoryRevision) {
+        lease.set(new Lease(deadlineNanos, true, preparationId, inventoryRevision));
+    }
+
+    /** A group commit failed on this store's placement: the lease it stood on is gone. */
+    void loseLease() {
+        if (lease.getAndSet(null) != null) LEASE_LOSSES.incrementAndGet();
+    }
+
+    /** The configured longest lease, on the monotonic clock. */
+    static long maximumLeaseNanos() {
+        return TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
+    }
+
+    /**
      * Proves a lease now, as an explicit open: for a store holding a claim this registers its placement and
      * proves the claim for writes, so none of that bookkeeping is left to the first write. Per-transaction
      * mode validates every call instead, and opening is then a no-op.
@@ -294,7 +342,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             Lease standing = lease.get();
             if (standing != null && System.nanoTime() - standing.deadlineNanos() < 0 && (standing.writes() || !writes)) return standing;
             long startedAt = System.nanoTime();
-            long maximum = TimeUnit.MILLISECONDS.toNanos(Math.max(1L, Long.getLong(LEASE_PROPERTY, DEFAULT_LEASE_MILLIS)));
+            long maximum = maximumLeaseNanos();
             boolean claimed = access.originalClaim() != null;
             Lease before = lease.get();
             Lease proved;
@@ -343,26 +391,33 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
 
     /** One fully validated transaction; the action also sees the inventory root as this transaction left it. */
     private <T> T validated(boolean mutation, java.util.function.BiFunction<ClientSession, Document, T> action) {
-        return access.metadataTransaction(table, target, mutation, session -> {
-            Document inventory = MongoOperatorInventory.require(session, access.database, placement.scope());
-            if (!MongoOperatorInventory.knowsPlacement(inventory, placement)) {
-                if (table.on(target).find(session, new Document("_id.placement", address)).projection(new Document("_id", 1)).first() != null)
-                    throw access.unreadable("operator-inventory");
-                if (mutation) {
-                    MongoOperatorInventory.rememberPlacement(session, access.database, inventory, placement);
-                    inventory = MongoOperatorInventory.require(session, access.database, placement.scope());
-                }
-            }
-            if (placement.resource() == OperatorPlacement.Resource.NEST_STATE) {
-                new MongoCacheNestShapeStore(access, placement.database()).requirePath(session, placement);
-            }
-            return action.apply(session, inventory);
-        });
+        return access.metadataTransaction(table, target, mutation, session ->
+                action.apply(session, admitPlacement(session, MongoOperatorInventory.require(session, access.database, placement.scope()), mutation)));
     }
 
-    private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
-    private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
-    private Document row(Document id, byte[] value) { return new Document("_id", id).append(FORMAT_VERSION_FIELD, table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append(STATE_FIELD, new Binary(value)); }
+    /**
+     * The placement half of a full validation, inside its transaction: the inventory lists this placement, or,
+     * for a mutation, it is registered now; a nest placement's path is the one its shape declares. Answers the
+     * inventory root as the transaction now holds it.
+     */
+    Document admitPlacement(ClientSession session, Document inventory, boolean mutation) {
+        if (!MongoOperatorInventory.knowsPlacement(inventory, placement)) {
+            if (table.on(target).find(session, new Document("_id.placement", address)).projection(new Document("_id", 1)).first() != null)
+                throw access.unreadable("operator-inventory");
+            if (mutation) {
+                MongoOperatorInventory.rememberPlacement(session, access.database, inventory, placement);
+                inventory = MongoOperatorInventory.require(session, access.database, placement.scope());
+            }
+        }
+        if (placement.resource() == OperatorPlacement.Resource.NEST_STATE) {
+            new MongoCacheNestShapeStore(access, placement.database()).requirePath(session, placement);
+        }
+        return inventory;
+    }
+
+    void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
+    Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
+    Document row(Document id, byte[] value) { return new Document("_id", id).append(FORMAT_VERSION_FIELD, table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append(STATE_FIELD, new Binary(value)); }
     private byte[] decode(Document row, Document id) {
         if (!id.equals(row.get("_id")) || !Integer.valueOf(table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).equals(row.get(FORMAT_VERSION_FIELD))
                 || !(row.get(STATE_FIELD) instanceof Binary binary) || binary.getType() != 0) throw access.unreadable("operator-state");

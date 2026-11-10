@@ -79,6 +79,19 @@ final class MongoCacheBusinessIdentity {
         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateMany(session,
                 new Document("_id.clusterId", scope.clusterId()),
                 List.of(new Document("$set", new Document("leaseUntil", "$$NOW"))));
+        // Stopping the domain ends every pipeline tenure in it with no proof to follow, so every pipeline's
+        // operator-state commit fence is rewritten here too; a commit in flight collides with this transaction.
+        // A pipeline whose stored scope cannot be read has no commit that could still match its claim.
+        try (var pipelines = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,
+                new Document("_id.clusterId", scope.clusterId()).append("_id.resourceType", "PIPELINE_ACTUATION")
+                        .append("pipelineScope", new Document("$type", "object"))).projection(new Document("pipelineScope", 1)).iterator()) {
+            while (pipelines.hasNext()) {
+                io.tapstate.spi.store.PipelineIntentScope pipeline;
+                try { pipeline = MongoPipelinePreparationFacts.scope(pipelines.next().get("pipelineScope", Document.class)); }
+                catch (RuntimeException unreadable) { continue; }
+                MongoCommitFence.end(session, database, pipeline);
+            }
+        }
     }
 
     private Document identityFilter() {

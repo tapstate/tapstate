@@ -135,6 +135,47 @@ final class MongoCachePipelineAccess {
     }
 
     /**
+     * A group commit under an already proved group lease: one transaction holding the caller's fence and the
+     * payload, with no admission, structure, state or inventory decoding and no write to the claim document.
+     * The action writes its own vertex instance's fence row and reads the claim; that row is what a tenure
+     * change collides with. Every clock in {@code committed} observes the commit, so the next out-of-transaction
+     * read of each store sees it. Any failure propagates unchanged.
+     */
+    <T> T groupWrite(List<LeasedClock> committed, Function<ClientSession, T> action) {
+        return StoreIo.call(() -> {
+            try {
+                requireActive.run();
+                try (var session = client.startSession()) {
+                    T written = session.withTransaction(() -> {
+                        requireActive.run();
+                        if (original == null) throw claimFenced();
+                        T result = action.apply(session);
+                        requireActive.run();
+                        return result;
+                    }, TRANSACTION);
+                    for (LeasedClock clock : committed) clock.observe(session);
+                    return written;
+                }
+            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+        });
+    }
+
+    /** Whether the claim inside this snapshot is still the live, prepared one this access was opened under. */
+    boolean claimLive(ClientSession session) {
+        return original != null && SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, liveClaim())
+                .projection(new Document("_id", 1)).first() != null;
+    }
+
+    /** Whether {@code other} stands on the same cache, pipeline scope and original claim as this access. */
+    boolean sameTenure(MongoCachePipelineAccess other) {
+        return database.getName().equals(other.database.getName()) && scope.equals(other.scope)
+                && Objects.equals(original, other.original) && client == other.client;
+    }
+
+    /** Runs this access's liveness guard. */
+    void requireActive() { requireActive.run(); }
+
+    /**
      * A read under an already proved lease: no transaction and no preamble, read concern {@code majority}
      * (set by the caller on the collection), in a causally consistent session that starts no earlier than
      * {@code after}, the last write this store committed.

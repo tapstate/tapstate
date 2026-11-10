@@ -268,8 +268,9 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
 
     @Override
     public boolean complete() {
-        // End of input can follow a backpressured final drain without another idle callback.
-        return tryProcess();
+        // End of input can follow a backpressured final drain without another idle callback. Nothing may
+        // stay in an open group once input has ended: no later turn would ever close it.
+        return tryProcess() && settled();
     }
 
     private boolean tryProcessRecording() {
@@ -494,7 +495,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!flush()) {
             return false;
         }
-        return bounds.advance(ordinal, watermark, this::tryEmit);
+        return (bounds.advance(ordinal, watermark, this::behindGroup) && flush());
     }
 
     /**
@@ -766,7 +767,7 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         if (!(collected || gaveUp) || bounds == null) {
             return true;
         }
-        return bounds.release(this::tryEmit);
+        return (bounds.release(this::behindGroup) && flush());
     }
 
     /**
@@ -983,8 +984,68 @@ public final class ResolverProcessor extends AbstractProcessor implements Staged
         outgoing.add(item);
     }
 
-    /** Empties what is waiting to go out, reporting whether it all got out. */
+    /**
+     * Makes this instance's changed state durable now: the open commit group, every namespace of it. Called
+     * before anything that says a change has left, which is every bound this vertex offers; a no-op where
+     * the store writes through.
+     */
+    private boolean commitState() {
+        store.commit();
+        if (parking != null) parking.commit();
+        return true;
+    }
+
+    /**
+     * Whether the changes waiting to go out may leave now: nothing they depend on is uncommitted, or the open
+     * group has reached a bound and is committed here. Otherwise they wait for the group, and the vertex
+     * keeps taking input into it, so a group is not cut at every drain.
+     */
+    private boolean groupClosed() {
+        if (!(store.hasUncommitted() || (parking != null && parking.hasUncommitted()))) return true;
+        if (!(store.commitDue() && (parking == null || parking.commitDue()))) return false;
+        return commitState();
+    }
+
+    /**
+     * Queues a bound behind whatever is waiting to go out, so it leaves after them and only once the open
+     * commit group they belong to has committed. Forcing the group to commit at every bound would cut it
+     * to the handful of changes that arrived since the last one, and a change stream carries a bound with
+     * nearly every change. A bound still queued on the same axis is replaced rather than followed: the new
+     * one promises at least as much, and nothing queued after the old one would have left without it.
+     * Never refuses, so the bounds it is handed are never kept back to be offered again.
+     */
+    private boolean behindGroup(Watermark bound) {
+        for (java.util.Iterator<Object> queued = outgoing.descendingIterator(); queued.hasNext(); ) {
+            if (!(queued.next() instanceof Watermark earlier)) break;
+            if (earlier.key() == bound.key()) {
+                queued.remove();
+                break;
+            }
+        }
+        outgoing.add(bound);
+        return true;
+    }
+
+    /**
+     * Commits the open group and then empties what is waiting to go out, answering whether it all got out:
+     * what a bound has to wait for, since a bound offered ahead of the changes queued behind it would say
+     * they had left.
+     */
+    private boolean settled() {
+        return commitState() && flush();
+    }
+
+    /**
+     * Empties what is waiting to go out, reporting whether it all got out. Changes whose state is still in an
+     * open commit group stay queued, in order, until the group commits: drain, mutate, commit, emit.
+     */
     private boolean flush() {
+        // Asked even with nothing queued: a group whose changes produce no output yet - documents waiting on
+        // a reference, a snapshot still arriving - is otherwise closed by nothing but the input ending, and
+        // grows with the input until then.
+        if (!groupClosed() && !outgoing.isEmpty()) {
+            return true;
+        }
         while (!outgoing.isEmpty()) {
             if (!tryEmit(outgoing.peek())) {
                 return false;
