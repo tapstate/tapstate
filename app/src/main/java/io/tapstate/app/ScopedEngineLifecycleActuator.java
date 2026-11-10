@@ -64,6 +64,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private OperatorRunManifest manifest;
     private ExecutionFence original;
     private PipelineCaptureCoordinator capture;
+    private boolean checkingStart;
 
     ScopedEngineLifecycleActuator(PipelineConvergencePass pass,Engine engine,DagSource dags,
             PipelineCaptureCoordinator captures,PipelineActuationOwnership ownership,String defaultDatabase,
@@ -90,7 +91,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private void require() {
         if (invalidated) throw fenced();
         pass.requirePipeline(id());
-        if (!command.equals(pass.claim()) || !ownership.proveClaim(pass.scope(),command)) throw fenced();
+        if (!command.equals(pass.claim())) throw fenced();
+        boolean proved = checkingStart ? ownership.proveStartClaim(pass.scope(), command)
+                : ownership.proveClaim(pass.scope(), command);
+        if (!proved) throw fenced();
         pass.requirePipeline(id());
         if (!command.equals(pass.claim())) throw fenced();
     }
@@ -112,6 +116,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized void start(String pipeline) {
+        checkingStart = true;
+        try {
+            startOwned(pipeline);
+        } finally {
+            checkingStart = false;
+        }
+    }
+
+    private void startOwned(String pipeline) {
         requireId(pipeline); engine.refuseIfLost(id());
         DagSource.StartPreparation prepared;
         Set<String> shared;
@@ -144,6 +157,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
             var previous = recorder.last(id()); require();
             recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
+            checkingStart = false;
             submissions.attempting(manifest); submissionAttempted = true;
             run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
             submissions.returned(manifest); require();

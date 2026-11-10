@@ -140,6 +140,32 @@ class ScopedPipelineActuationOwnershipTest {
         assertThat(acquisitions).hasValue(1);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"same", "expired", "unavailable"})
+    void startClaimProofRetriesOneTimeoutAndChecksTheReturnedLease(String result) {
+        var owner = ownership();
+        var expected = WorkloadClaimFence.from(owner.permit(FIRST).claim());
+        var attempts = new AtomicInteger();
+        doAnswer(call -> {
+            if (attempts.incrementAndGet() == 1 || result.equals("unavailable")) {
+                throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                        Map.of("detail", "MongoOperationTimeoutException"), null);
+            }
+            if (result.equals("expired")) raw.elapse(TTL);
+            return raw.read(KEY);
+        }).when(store).readPipeline(FIRST);
+
+        if (result.equals("unavailable")) {
+            assertThatThrownBy(() -> owner.proveStartClaim(FIRST, expected))
+                    .isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+        } else {
+            assertThat(owner.proveStartClaim(FIRST, expected)).isEqualTo(result.equals("same"));
+        }
+        assertThat(attempts).hasValue(2);
+        assertThat(acquisitions).hasValue(1);
+    }
+
     @Test void aJoinDuringRenewalPreservesTheOriginalScopedExecution() {
         var owner=ownership();var permit=owner.permit(FIRST);
         var execution=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));

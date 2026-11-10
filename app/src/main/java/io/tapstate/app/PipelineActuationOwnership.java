@@ -801,6 +801,11 @@ final class PipelineActuationOwnership {
         return proveClaim(scope, expected, true);
     }
 
+    /** Retries only the start's proof read, under the same admission deadline. */
+    boolean proveStartClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        return admittedCall(() -> proveClaimOwned(scope, expected, true, true), () -> false);
+    }
+
     /** Captures a conservative original lease outside CONFIG; the returned guard performs no IO. */
     Optional<Runnable> evaluationProof(PipelineIntentScope scope, WorkloadClaimFence expected) {
         return admittedCall(()->evaluationProofOwned(scope,expected),Optional::empty);
@@ -829,19 +834,27 @@ final class PipelineActuationOwnership {
     }
 
     private boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
-        return admittedCall(()->proveClaimOwned(scope,expected,compareTopology),()->false);
+        return admittedCall(()->proveClaimOwned(scope,expected,compareTopology,false),()->false);
     }
-    private boolean proveClaimOwned(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
+    private boolean proveClaimOwned(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology,
+            boolean retryTimeout) {
         if (!fenced || closing || (scope != null && !accepts(scope)) || !expected.owner().equals(owner)
                 || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
                 || !clusterId.equals(expected.key().clusterId())
                 || (scope != null && !scope.pipelineId().equals(expected.key().resourceId()))) return false;
         long askedAt = nanoTime.getAsLong();
         Optional<WorkloadClaimReading> reading;
-        try {
-            reading = scope == null ? claims.read(expected.key()) : claims.readPipeline(scope);
-        } catch (RuntimeException unreachable) {
-            return false;
+        for (int attempt = 0; ; attempt++) {
+            try {
+                reading = scope == null ? claims.read(expected.key()) : claims.readPipeline(scope);
+                break;
+            } catch (RuntimeException unavailable) {
+                if (!retryTimeout || !claimIoTimedOut(unavailable)) return false;
+                if (attempt != 0 || !admission.current()) {
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "startup claim read timed out"), unavailable);
+                }
+            }
         }
         if (reading.isEmpty()) return false;
         synchronized (this) {
@@ -1165,7 +1178,7 @@ final class PipelineActuationOwnership {
                             : claims.renewScopedActuation(original, ttl, retrying ? remaining : Long.MAX_VALUE)
                     : claims.renewActuationControl(original, ttl);
         } catch (RuntimeException failure) {
-            timedOut = renewalTimedOut(failure);
+            timedOut = claimIoTimedOut(failure);
         }
         state.contacted = true;
         state.nextContactNanos = now + renewIntervalNanos;
@@ -1198,7 +1211,7 @@ final class PipelineActuationOwnership {
         return new Permit(true, state.claim);
     }
 
-    private static boolean renewalTimedOut(RuntimeException failure) {
+    private static boolean claimIoTimedOut(RuntimeException failure) {
         if (!(failure instanceof TapstateException coded)) return false;
         if (coded.code() == IoError.WORKLOAD_CLAIM_FENCED) return coded.getCause() instanceof TimeoutException;
         if (coded.code() != IoError.STORE_UNAVAILABLE || !(coded.args().get("detail") instanceof String detail)) return false;

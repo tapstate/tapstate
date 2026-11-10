@@ -104,7 +104,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         this.runtime=Objects.requireNonNull(runtime); this.buffer=Objects.requireNonNull(buffer);
         this.connectors=Objects.requireNonNull(connectors); this.ports=Objects.requireNonNull(ports);
         this.reportClock=Objects.requireNonNull(reportClock);
-        maintenance.scheduleWithFixedDelay(this::maintain,1,1,TimeUnit.SECONDS);
+        maintenance.scheduleWithFixedDelay(this::maintenanceTick,1,1,TimeUnit.SECONDS);
     }
     @Override public void runOnlyWhileDriving(Predicate<String> driving) { this.driving.set(Objects.requireNonNull(driving)); }
 
@@ -1064,7 +1064,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             if(existing.drainingReports())throw new RingNotOpenYet(new CaptureId(id));
             if(existing.ended.get())throw refused();
             if(!existing.prepared.equals(prepared.preparation()))throw refused(); source.owner=existing; existing.require();
-            if(!existing.lease.retain(() -> existing.sessions.add(session.original)))throw refused(); return existing;
+            if (!existing.lease.retain(() -> {
+                existing.sessions.add(session.original);
+                existing.demandRevision++;
+                existing.demand.set(true);
+            })) throw refused();
+            return existing;
         }
         var permit=execution.ownership().acquire(new CaptureId(id));
         if(!permit.acquired()) {
@@ -1075,13 +1080,17 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var owner=new Owner(prepared.preparation(),permit.claim()); owners.put(id,owner); owner.sessions.add(session.original); source.owner=owner;
         owner.identity=source.identity;
         owner.lease=new CaptureClaimLease(execution.ownership(),permit.claim(),execution.renewal(),() -> lost(owner));
-        owner.lease.whileNeeded(() -> needed(owner));
+        owner.lease.whileNeeded(owner.demand::get);
         owner.require(); return owner;
     }
     private final class Owner {
         final CapturePreparation prepared; final WorkloadClaimFence fence; final WorkloadClaim initial;
         final Set<ExecutionFence> sessions=ConcurrentHashMap.newKeySet(); final AtomicBoolean ended=new AtomicBoolean();
         SourceBindingSnapshot identity;CaptureClaimLease lease;ExecutionFence origin;CaptureConfig config;ConfiguredCaptureRun configured;Physical physical;boolean positionEditsRestricted;
+        final AtomicBoolean demand = new AtomicBoolean(true);
+        // Guarded by the coordinator monitor; an attachment invalidates an outstanding demand read.
+        long demandRevision;
+        long nextDemandCheck = System.nanoTime() + execution.renewal().toNanos();
         volatile Long reportDrainStarted;
         volatile boolean handingOff;
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
@@ -1332,6 +1341,36 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 Map.of("captureId",source.prepared.captureId(),"seconds",ttl.toSeconds()),null);
         return new RingNotOpenYet(new CaptureId(source.prepared.captureId()));
     }
+    private record DemandCheck(Owner owner, long revision) {}
+
+    private void maintenanceTick() {
+        maintain();
+        List<DemandCheck> due = new ArrayList<>();
+        synchronized (this) {
+            if (closed.get()) return;
+            long now = System.nanoTime();
+            for (Owner owner : owners.values()) {
+                if (!owner.ended.get() && now - owner.nextDemandCheck >= 0) {
+                    owner.nextDemandCheck = now + execution.renewal().toNanos();
+                    due.add(new DemandCheck(owner, owner.demandRevision));
+                }
+            }
+        }
+        for (DemandCheck check : due) {
+            Owner owner = check.owner();
+            boolean required = true;
+            try {
+                required = needed(owner);
+            } catch (RuntimeException unavailable) {
+                LOG.debug("Could not check demand for capture {}", owner.prepared.captureId(), unavailable);
+            }
+            synchronized (this) {
+                if (owners.get(owner.prepared.captureId()) == owner && !owner.ended.get()
+                        && owner.demandRevision == check.revision()) owner.demand.set(required);
+            }
+        }
+    }
+
     private synchronized void maintain() {
         if(closed.get())return;
         for (var owner : List.copyOf(owners.values())) {
