@@ -38,6 +38,7 @@ CLI's: the path for scripts, CI, and machines without a browser or an AI assista
 | [Join](join/) | SQL subset, dimension-key uniqueness, output keys, and usage requirements. |
 | [Nest](nest/) | Assemble one document out of many tables and keep it current. |
 | [Unwind](unwind/) | Expand array elements into individually keyed rows and keep them current. |
+| [Reserved row field](reserved-field/) | The one field Tapstate adds to rows, what a target receives under it, how to strip it, and how a source column of the same name is renamed. |
 | [Observability](observability/) | Read current state, bounded output-rate and lag history, and one shared evidence-backed explanation. |
 | [Start checks](start-checks/) | What a start looks at before it writes anything, how its questions are answered from each client, and how a new check is added. |
 | [Connectors](connectors/) | How the bundled connector catalog is generated, what has to be rebuilt when something moves upstream, and how this repository declares what a connector can do. |

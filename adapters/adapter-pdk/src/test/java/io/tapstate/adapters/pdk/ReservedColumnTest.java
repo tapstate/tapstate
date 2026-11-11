@@ -107,4 +107,21 @@ class ReservedColumnTest {
                 .isInstanceOfSatisfying(TapstateException.class, error ->
                         assertThat(error.code()).isEqualTo(ReservedFieldError.RENAME_CONFLICT));
     }
+
+    @Test
+    @DisplayName("a read sent to the source names the column as the source does, only where it was renamed")
+    void aReadIsSentInTheSourcesOwnNames() {
+        Map<String, Object> live = Map.of("id", 1, RESERVED, 1);
+        Map<String, Object> ordinary = Map.of("id", 1, RENAMED, 1);
+        Map<String, Object> tuple = new LinkedHashMap<>();
+        tuple.put(RENAMED, "k");
+        tuple.put("id", 4);
+
+        assertThat(ReservedColumn.atSource(live, RENAMED)).isEqualTo(RESERVED);
+        assertThat(ReservedColumn.atSource(live, "id")).isEqualTo("id");
+        assertThat(ReservedColumn.atSource(live, tuple)).containsExactly(Map.entry(RESERVED, "k"), Map.entry("id", 4));
+        // A table whose own column has the new name was never renamed, so nothing is translated.
+        assertThat(ReservedColumn.atSource(ordinary, RENAMED)).isEqualTo(RENAMED);
+        assertThat(ReservedColumn.atSource(ordinary, tuple)).isSameAs(tuple);
+    }
 }

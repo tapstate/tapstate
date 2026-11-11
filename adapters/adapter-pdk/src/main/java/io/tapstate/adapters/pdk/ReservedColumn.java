@@ -55,6 +55,26 @@ final class ReservedColumn {
     }
 
     /**
+     * {@code column}, a name known above the connector, as a live connector table knows it. Used
+     * where a read is sent to the source with nothing stored to consult: the table is the source's
+     * own answer, so a column it holds under the reserved name is the one that was renamed.
+     */
+    static String atSource(Map<String, ?> liveFields, String column) {
+        return renamed().equals(column) && liveFields != null && liveFields.containsKey(ReservedField.NAME)
+                ? ReservedField.NAME : column;
+    }
+
+    /** {@code row}, keyed by names known above the connector, keyed as the source knows them. */
+    static Map<String, Object> atSource(Map<String, ?> liveFields, Map<String, Object> row) {
+        if (!row.containsKey(renamed()) || atSource(liveFields, renamed()).equals(renamed())) {
+            return row;
+        }
+        Map<String, Object> sent = new LinkedHashMap<>();
+        row.forEach((name, value) -> sent.put(atSource(liveFields, name), value));
+        return sent;
+    }
+
+    /**
      * {@code table} with a reserved column renamed in its fields, its key and its indexes; the same
      * object when it has none. Refused when the table already has a column under the new name, since
      * two columns cannot enter under one.
