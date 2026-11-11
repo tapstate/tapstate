@@ -9,7 +9,10 @@ import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.RollupExpressions;
+import io.tapstate.core.dsl.AggregateSizingRules;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.RollupPick;
 import io.tapstate.core.model.Step;
@@ -94,7 +97,75 @@ public final class PipelineExplainService {
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return diagnose(pipelineId, observation)
                 .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()))
-                .withRollups(rollupsOf(pipelineId));
+                .withRollups(rollupsOf(pipelineId))
+                .withAggregates(aggregatesOf(pipelineId, observation));
+    }
+
+    /** What an aggregate step's count of its own state travels under on the flat face, before the step. */
+    private static final String AGGREGATE_STATE_ENTRIES = "aggregateStateEntries.";
+
+    /**
+     * What each aggregate step the pipeline's stored definition declares keeps in state: the entries per
+     * input row, which the definition alone decides, the total that comes to when the last load said how
+     * many rows the inputs hold, and beside it what the running step last counted.
+     */
+    private List<PipelineExplanation.Aggregate> aggregatesOf(String pipelineId, Observation observation) {
+        List<PipelineExplanation.Aggregate> steps = new ArrayList<>();
+        artifacts.getResource(pipelineId).map(StoredResource::resource).ifPresent(resource -> {
+            if (!(resource instanceof PipelineResource pipeline) || pipeline.transforms() == null) {
+                return;
+            }
+            Map<String, Step.Inline> inline = new LinkedHashMap<>();
+            for (Step step : pipeline.transforms()) {
+                if (step instanceof Step.Inline written) {
+                    inline.put(written.id(), written);
+                }
+            }
+            inline.values().forEach(step -> {
+                if (!(step.body() instanceof TransformBody.Aggregate aggregate)) {
+                    return;
+                }
+                List<String> kept = AggregateSizingRules.keptInputFields(aggregate);
+                int perRow = AggregateSizingRules.entriesPerRow(aggregate);
+                Long rows = inputRows(step, inline, observation, new LinkedHashSet<>());
+                steps.add(new PipelineExplanation.Aggregate(step.id(), perRow, kept, rows,
+                        rows == null ? null : Math.multiplyExact(rows, (long) perRow),
+                        observation.metrics().get(AGGREGATE_STATE_ENTRIES + step.id())));
+            });
+        });
+        return steps;
+    }
+
+    /**
+     * The rows the tables under {@code step} hold by the last load's estimate, added up; null when any of
+     * them has none, since a total with a table missing would read as the whole.
+     */
+    private static Long inputRows(Step.Inline step, Map<String, Step.Inline> inline, Observation observation,
+            Set<String> walked) {
+        if (!(step.from() instanceof FromClause.Flow flow) || !walked.add(step.id())) {
+            return null;
+        }
+        long rows = 0;
+        for (FromRef ref : flow.refs()) {
+            if (!(ref instanceof FromRef.Literal named)) {
+                return null;
+            }
+            Step.Inline above = inline.get(named.ref());
+            Long counted;
+            if (above != null) {
+                counted = inputRows(above, inline, observation, walked);
+            } else {
+                String table = named.ref().substring(named.ref().lastIndexOf('.') + 1);
+                TableSnapshot loaded = observation.snapshot().containsKey(named.ref())
+                        ? observation.snapshot().get(named.ref()) : observation.snapshot().get(table);
+                counted = loaded == null ? null : loaded.rowsTotal();
+            }
+            if (counted == null) {
+                return null;
+            }
+            rows += counted;
+        }
+        return rows;
     }
 
     /**

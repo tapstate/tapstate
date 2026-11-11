@@ -34,7 +34,8 @@ public record PipelineExplanation(
         Pending pending,
         ExecutionPlan plan,
         List<String> awaitingRebalance,
-        List<Rollup> rollups) {
+        List<Rollup> rollups,
+        List<Aggregate> aggregates) {
 
     public PipelineExplanation {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -47,12 +48,22 @@ public record PipelineExplanation(
         // Absent reads as none: the wire omits an empty list, and an explanation read back from it names nobody.
         awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
         rollups = rollups == null ? List.of() : List.copyOf(rollups);
+        aggregates = aggregates == null ? List.of() : List.copyOf(aggregates);
         if ((observedAt == null) != (observedAgeMillis == null)) {
             throw new IllegalArgumentException("observation time and age are both present or both absent");
         }
         if (kind == Kind.NO_MATCH && cannotSay.isEmpty()) {
             throw new IllegalArgumentException("a no-match explanation names what it cannot say");
         }
+    }
+
+    /** An explanation that lists no aggregate steps. */
+    public PipelineExplanation(String pipelineId, PipelineState state, Kind kind, String message,
+            Instant observedAt, Long observedAgeMillis, Freshness freshness, List<Evidence> evidence,
+            List<String> cannotSay, Next next, Pending pending, ExecutionPlan plan, List<String> awaitingRebalance,
+            List<Rollup> rollups) {
+        this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay, next,
+                pending, plan, awaitingRebalance, rollups, List.of());
     }
 
     /** An explanation that lists no rollup fields. */
@@ -82,13 +93,41 @@ public record PipelineExplanation(
      */
     public PipelineExplanation withPlan(ExecutionPlan plan, List<String> awaitingRebalance) {
         return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups, aggregates);
     }
 
     /** The same explanation, listing the rollup fields the pipeline declares. */
     public PipelineExplanation withRollups(List<Rollup> declared) {
         return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance, declared);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, declared, aggregates);
+    }
+
+    /** The same explanation, listing what each aggregate step of the pipeline keeps. */
+    public PipelineExplanation withAggregates(List<Aggregate> steps) {
+        return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups, steps);
+    }
+
+    /**
+     * What one aggregate step keeps in state. The step stores every input row it has seen and, on the
+     * group side, the row again and one more entry for each field that needs its inputs kept, so the cost
+     * per input row is known from the definition alone.
+     *
+     * @param step             the step
+     * @param entriesPerRow    state entries kept per input row: two, and one per field that keeps its inputs
+     * @param keptInputFields  the fields that keep their inputs, by name
+     * @param inputRows        how many rows the step's inputs hold by their last load's estimate, or null
+     *                         when any of them is not known
+     * @param estimatedEntries {@code entriesPerRow} times {@code inputRows}, or null when that is not known;
+     *                         an upper estimate, since a row failing {@code where:} keeps one entry only
+     * @param storedEntries    what the running step last counted, or null when it has not finished a count
+     */
+    public record Aggregate(String step, int entriesPerRow, List<String> keptInputFields, Long inputRows,
+            Long estimatedEntries, Long storedEntries) {
+        public Aggregate {
+            Objects.requireNonNull(step, "step");
+            keptInputFields = List.copyOf(keptInputFields);
+        }
     }
 
     /**

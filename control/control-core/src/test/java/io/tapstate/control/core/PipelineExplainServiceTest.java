@@ -289,6 +289,48 @@ class PipelineExplainServiceTest {
     }
 
     @Test
+    void anExplanationSaysWhatEachAggregateStepKeepsAndWhatTheRunningStepCounted() {
+        Resource pipeline = new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: orders
+                source: source
+                transforms:
+                  - id: paid
+                    from: [ orders ]
+                    type: filter
+                    expr: "after.status == 'paid'"
+                  - id: by_region
+                    from: [ paid ]
+                    type: aggregate
+                    groupBy: { region: $region }
+                    fields:
+                      orders: { count: true }
+                      most: { max: $amount }
+                serve:
+                  from: by_region
+                  sync:
+                    - { id: sink, source: target, write_mode: upsert, on_full_load: clear }
+                """);
+        ArtifactQueryService artifacts = artifactsOf(new LinkedHashMap<>(Map.of(ID, pipeline)));
+
+        // The load said how many rows the input holds, and the running step has finished a count.
+        Observation sized = new Observation(ID, PipelineState.RUNNING,
+                Map.of("recordCount", 5L, "aggregateStateEntries.by_region", 2_400L),
+                Map.of("orders", new TableSnapshot(1_000L, 1_000L, 100)), Map.of(), null, NOW.minusSeconds(2));
+        assertThat(new PipelineExplainService(artifacts, observations(sized), Clock.fixed(NOW, ZoneOffset.UTC),
+                (key, args) -> key).explain(ID).aggregates()).containsExactly(
+                        new PipelineExplanation.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, 2_400L));
+
+        // Neither is known: both are absent, and the cost per row still stands.
+        Observation unsized = observation(PipelineState.RUNNING, Map.of("recordCount", 5L), 5L, NOW.minusSeconds(2));
+        assertThat(new PipelineExplainService(artifacts, observations(unsized), Clock.fixed(NOW, ZoneOffset.UTC),
+                (key, args) -> key).explain(ID).aggregates()).containsExactly(
+                        new PipelineExplanation.Aggregate("by_region", 3, List.of("most"), null, null, null));
+        assertThat(service(unsized).explain(ID).aggregates()).isEmpty();
+    }
+
+    @Test
     void anExplanationListsEachRollupFieldWithItsLevelFunctionFilterAndTheReferencesItReads() {
         Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 5L), 5L,
                 NOW.minusSeconds(2));

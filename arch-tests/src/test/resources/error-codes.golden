@@ -47,6 +47,8 @@ aggregate.name-conflict
 aggregate.overflow
 aggregate.rebuild-needs-clear
 aggregate.result-not-convertible
+aggregate.state-estimate
+aggregate.state-estimate-unsized
 aggregate.step-busy
 aggregate.step-not-running
 aggregate.total-mismatch

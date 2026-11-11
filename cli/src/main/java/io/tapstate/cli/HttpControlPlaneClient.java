@@ -1515,9 +1515,39 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (rollups == null) {
             return null;
         }
+        List<ExplainOutcome.Aggregate> aggregates = explanationAggregates(map.get("aggregates"));
+        if (aggregates == null) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups, aggregates);
+    }
+
+    /** The aggregate steps an explanation lists; absent is none, and anything malformed is no answer. */
+    private static List<ExplainOutcome.Aggregate> explanationAggregates(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Aggregate> aggregates = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> a) || !(a.get("step") instanceof String step)
+                    || !(a.get("entriesPerRow") instanceof Number perRow)) {
+                return null;
+            }
+            List<String> kept = a.get("keptInputFields") == null ? List.of() : strings(a.get("keptInputFields"));
+            if (kept == null) {
+                return null;
+            }
+            aggregates.add(new ExplainOutcome.Aggregate(step, perRow.intValue(), kept,
+                    a.get("inputRows") instanceof Number rows ? rows.longValue() : null,
+                    a.get("estimatedEntries") instanceof Number estimated ? estimated.longValue() : null,
+                    a.get("storedEntries") instanceof Number stored ? stored.longValue() : null));
+        }
+        return aggregates;
     }
 
     /** The rollup fields an explanation lists; absent is none, and anything malformed is no answer. */
