@@ -40,12 +40,15 @@ actuation.view-store-unreachable
 aggregate.definition-changed
 aggregate.evaluation-failed
 aggregate.expression-invalid
+aggregate.group-invalid
 aggregate.input-not-supported
 aggregate.key-required
 aggregate.name-conflict
 aggregate.overflow
 aggregate.rebuild-needs-clear
 aggregate.result-not-convertible
+aggregate.step-not-running
+aggregate.total-mismatch
 aggregate.type-unknown
 aggregate.upstream-filter-unsafe
 aggregate.value-type-mismatch

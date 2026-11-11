@@ -304,15 +304,19 @@ class AnAggregateStepSendsEachGroupItChangedTest {
             assertThat(found.groups()).isEqualTo(2);
             assertThat(found.next()).isNull();
             assertThat(found.findings()).singleElement().satisfies(finding -> {
-                assertThat(finding.group()).containsExactly("EU");
+                assertThat(finding.group()).containsExactly(Map.entry("region", "EU"));
                 assertThat(finding.verdict()).isEqualTo("mismatch");
                 assertThat(finding.fields()).containsExactly("(rows)", "orders", "revenue");
             });
             assertThat(WRITTEN).as("a check sends nothing").isEmpty();
 
-            AggregateRequests.Report repaired = ask(AggregateRequests.Request.one(AggregateRequests.Action.REPAIR, List.of("EU")));
+            AggregateRequests.Report repaired = ask(AggregateRequests.Request.one(AggregateRequests.Action.REPAIR, Map.of("region", "EU")));
             assertThat(repaired.findings()).singleElement()
                     .satisfies(finding -> assertThat(finding.fields()).containsExactly("(rows)", "orders", "revenue"));
+
+            AggregateRequests.Report refused = ask(AggregateRequests.Request.one(AggregateRequests.Action.CHECK, Map.of("country", "EU")));
+            assertThat(refused.refusal()).isEqualTo("aggregate.group-invalid");
+            assertThat(refused.refusalArgs()).containsEntry("step", "by_region");
 
             AggregateRequests.Report after = ask(AggregateRequests.Request.page(AggregateRequests.Action.CHECK, null, 10));
             assertThat(after.findings()).isEmpty();

@@ -51,7 +51,16 @@ public enum AggregateError implements TapstateErrorCode {
     DEFINITION_CHANGED("aggregate.definition-changed", Set.of("step", "changed")),
 
     /** A target fed by the step would keep its existing rows through a full load. */
-    REBUILD_NEEDS_CLEAR("aggregate.rebuild-needs-clear", Set.of("step", "target", "policy"));
+    REBUILD_NEEDS_CLEAR("aggregate.rebuild-needs-clear", Set.of("step", "target", "policy")),
+
+    /** A check found a value derived for a group that differs from what the group's stored rows give. */
+    TOTAL_MISMATCH("aggregate.total-mismatch", Set.of("step", "group", "field")),
+
+    /** A check or a repair was asked of a step that no member is running. */
+    STEP_NOT_RUNNING("aggregate.step-not-running", Set.of("pipeline", "step")),
+
+    /** A group named for a check or a repair does not read as a group of the step. */
+    GROUP_INVALID("aggregate.group-invalid", Set.of("step", "reason"));
 
     /** The step's code for a reason the shared function library reports under its own name. */
     public static AggregateError of(RollupError reason) {

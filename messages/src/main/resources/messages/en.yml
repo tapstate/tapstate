@@ -1505,3 +1505,12 @@ aggregate.definition-changed:
 aggregate.rebuild-needs-clear:
   message: "Target `{target}` reads the aggregate step `{step}` and is set to `on_full_load: {policy}`, which keeps the rows it already holds."
   solution: "A full load rebuilds every group, and a group that no longer exists would stay in the target. Set `on_full_load: clear` on the target, or `fail` to refuse a full load while it holds rows."
+aggregate.total-mismatch:
+  message: "Aggregate step `{step}`, group {group}: the stored `{field}` is not what the group's stored rows give."
+  solution: "Run the repair for this group: it writes the group's totals again from its stored rows and sends the group on. This compares the step's totals with the rows the step holds; it says nothing about whether those rows match the source."
+aggregate.step-not-running:
+  message: "No member is running an aggregate step `{step}` of pipeline `{pipeline}`."
+  solution: "A check or a repair is answered by the running step itself. Check the step id with `tapstate explain`, and start the pipeline if it is stopped."
+aggregate.group-invalid:
+  message: "That does not name a group of aggregate step `{step}`: {reason}."
+  solution: "Name the group by every name under the step's `groupBy:`, as `name=value` pairs; a name with no value means null. Copy a group as a check printed it."
