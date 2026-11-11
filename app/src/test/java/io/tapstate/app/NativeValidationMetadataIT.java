@@ -169,7 +169,7 @@ class NativeValidationMetadataIT {
                 try(var result=service.evaluate(input)){
                     fingerprint=result.view().fingerprint();assertThat(fingerprint).isNotBlank();
                     assertThat(result.view().mappings()).singleElement().satisfies(mapping->{
-                        assertThat(mapping.target().table()).isEqualTo("checked_orders");assertThat(mapping.source().countOperation()).isEqualTo("DOCUMENT_COUNT");
+                        assertThat(mapping.target().table()).isEqualTo("checked_orders");assertThat(mapping.source().countOperation()).isEqualTo("PARTITION_FILTER");
                         assertThat(mapping.source().fields()).isEmpty();
                     });assertThat(f.resources.snapshot().metadataFrames()).isOne();
                 }

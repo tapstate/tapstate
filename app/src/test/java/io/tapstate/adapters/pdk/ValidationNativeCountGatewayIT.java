@@ -124,7 +124,12 @@ class ValidationNativeCountGatewayIT {
                 assertThat(count(source,sourceRef,"empty_records")).isZero();
                 assertThat(count(target,targetRef,"empty_records")).isZero();
                 assertThatThrownBy(()->count(source,sourceRef,"missing_records")).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(()->count(target,targetRef,"missing_records")).isInstanceOf(TapstateException.class);
+                // Mongo's native count can return zero for an absent namespace. Validation
+                // admission rejects the missing table through the metadata-only PDK inspection.
+                try (var missing = new PdkValidationCounts(target, targetRef,
+                        new PdkValidationCounts.Request("missing_records"), () -> {})) {
+                    assertThatThrownBy(missing::inspect).isInstanceOf(TapstateException.class);
+                }
                 var commands=database.getCollection("system.profile").find().into(new ArrayList<>()).stream()
                         .map(row->row.get("command",Document.class)).filter(Objects::nonNull).toList();
                 assertThat(commands).filteredOn(command -> command.containsKey("count") || command.containsKey("aggregate"))

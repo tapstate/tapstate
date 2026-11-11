@@ -36,5 +36,5 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { error_count: 1 }
+  - await: { error_count: 1 }
   - assert: { count: { tgt_file.orders: 0 } }

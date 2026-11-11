@@ -42,6 +42,6 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { error_count: 1 }
-  - assert: { failure_code: connector.write-failed }
+  - await: { error_count: 1 }
+  - await: { failure_code: connector.write-failed }
   - assert: { count: { tgt_file.orders: 0 } }

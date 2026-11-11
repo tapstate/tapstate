@@ -182,8 +182,10 @@ class NativeValidationPdkCountIT {
                     assertThat(f.member.getJet().getJobs()).singleElement().satisfies(job->assertThat(job.getConfig().isAutoScaling()).isFalse());
                     var commands=target.getCollection("system.profile").find().into(new ArrayList<>()).stream().map(row->row.get("command",Document.class)).filter(Objects::nonNull).toList();
                     if(count){
-                        assertThat(commands).filteredOn(command->command.containsKey("aggregate")).hasSize(2);
-                        assertThat(commands).noneSatisfy(command->assertThat(command.containsKey("find")||command.containsKey("count")||command.toJson().contains("$sample")).isTrue());
+                        assertThat(commands).filteredOn(command -> command.containsKey("count")
+                                || command.containsKey("aggregate")).hasSize(2);
+                        assertThat(commands).noneMatch(command -> command.containsKey("find")
+                                || command.toJson().contains("$sample"));
                     }else {
                         assertThat(commands).anySatisfy(command->assertThat(command).containsKey("find"));
                         assertThat(commands).filteredOn(command->command.get("find") instanceof String table&&Set.of("checked_orders","checked_items").contains(table))

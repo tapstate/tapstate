@@ -244,7 +244,11 @@ class NativeValidationCommandsIT {
                     router.command(Command.of(Action.ACTIVATE,request,owner));
                     await(()->runs.read(identity).controlUnknown());
                     router.command(Command.of(Action.STOP,request,owner));
-                    await(()->f.tasks.read("flow","task").orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&runs.original(request,owner).isEmpty());
+                    await(() -> {
+                        var permission = f.tasks.read("flow", "task").orElseThrow().full().permission();
+                        return permission != null && permission.phase() == ValidationTaskStore.Phase.CLOSED
+                                && runs.original(request, owner).isEmpty();
+                    });
                     for(var action:List.of(Action.STATUS,Action.STOP,Action.STATUS)){
                         var known=router.command(Command.of(action,request,owner));assertThat(known.outcome()).isEqualTo(Outcome.ACCEPTED);
                         assertThat(known.state()).isEqualTo("STOPPED");assertThat(known.retired()).isTrue();assertThat(known.drained()).isTrue();assertThat(known.unknown()).isFalse();
@@ -472,7 +476,11 @@ class NativeValidationCommandsIT {
         try(var failure=refuseReportBirth(f)){
             var identity=f.owners.original(request,owner).run();router.command(Command.of(Action.ACTIVATE,request,owner));
             await(()->runs.read(identity).controlUnknown());router.command(Command.of(Action.STOP,request,owner));
-            await(()->f.tasks.read("flow",request.task()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED&&runs.original(request,owner).isEmpty());
+            await(() -> {
+                var permission = f.tasks.read("flow", request.task()).orElseThrow().full().permission();
+                return permission != null && permission.phase() == ValidationTaskStore.Phase.CLOSED
+                        && runs.original(request, owner).isEmpty();
+            });
         }
     }
     private static ValidationOwner owner(Reply reply){return new ValidationOwner("cluster","flow",reply.receiver().node(),reply.receiver().boot(),reply.claimGeneration(),reply.executionGeneration(),reply.topologyRevision());}
