@@ -528,6 +528,7 @@ public final class DslParser {
             case "unwind" -> Set.of("path", "include_array_index",
                     "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
             case "union" -> Set.of();
+            case "aggregate" -> Set.of("key", "where", "groupBy", "fields");
             case "nest" -> Set.of(
                     PRIMARY_KEY_FIELD, "order", "entries_in_memory", "max_elements_per_document",
                     "state", "root");
@@ -547,6 +548,7 @@ public final class DslParser {
             case "map" -> Set.of("fields");
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path");
+            case "aggregate" -> Set.of("fields");
             case "nest" -> Set.of("root");
             case "join" -> Set.of("engine", "sql");
             default -> Set.of();
@@ -571,6 +573,7 @@ public final class DslParser {
                     elementType(s),
                     sourceIdField(s));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> aggregate(s);
             case "nest" -> new TransformBody.Nest(
                     s.string(PRIMARY_KEY_FIELD),
                     enumByYaml(NestOrder.values(), NestOrder::yaml, s, "order"),
@@ -586,7 +589,7 @@ public final class DslParser {
                 yield new TransformBody.Join(engine, sql);
             }
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
-                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, nest, join)"));
+                    Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, aggregate, nest, join)"));
         };
     }
 
@@ -685,7 +688,40 @@ public final class DslParser {
      * against the level's columns and references is judged where the tree and its models are known.
      */
     private Map<String, RollupField> rollupFields(YamlMap embed) {
-        YamlMap fields = embed.mapping("rollup");
+        return rollupFields(embed, "rollup");
+    }
+
+    /**
+     * An aggregate step's payload. Shape only, as for a rollup: every expression compiles over a row,
+     * and whether it type-checks against the input's columns is judged where the input model is known.
+     */
+    private TransformBody.Aggregate aggregate(YamlMap s) {
+        List<String> key = s.has("key") ? scalarList(s.seq("key"), "key") : null;
+        if (key != null && key.isEmpty()) {
+            throw s.errorAt("key", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, "at least one column identifying an input row"));
+        }
+        String where = s.string("where");
+        if (where != null) {
+            checkRollupExpression(s, "where", where, true);
+        }
+        Map<String, String> groupBy = new LinkedHashMap<>();
+        YamlMap groups = s.mapping("groupBy");
+        if (groups != null) {
+            for (String name : groups.keys()) {
+                groupBy.put(name, rollupExpression(groups, name));
+            }
+        }
+        Map<String, RollupField> fields = rollupFields(s, "fields");
+        if (fields.isEmpty()) {
+            throw s.errorAt("fields", DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, "{}", EXPECTED_TOKEN, "at least one output field"));
+        }
+        return new TransformBody.Aggregate(key, where, groupBy, fields);
+    }
+
+    private Map<String, RollupField> rollupFields(YamlMap owner, String fieldsKey) {
+        YamlMap fields = owner.mapping(fieldsKey);
         if (fields == null) {
             return null;
         }
@@ -758,6 +794,10 @@ public final class DslParser {
     }
 
     private static void checkRollupExpression(YamlMap owner, String key, String written) {
+        checkRollupExpression(owner, key, written, "filter".equals(key));
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written, boolean predicate) {
         if (written.startsWith("$")) {
             String column = written.substring(1);
             if (!RollupExpressions.isColumnName(column)) {
@@ -771,7 +811,7 @@ public final class DslParser {
                     "expected", "$<column> naming one field of the element, or =<expression>"));
         }
         String expr = written.substring(1);
-        String detail = "filter".equals(key)
+        String detail = predicate
                 ? RollupExpressions.untypedPredicateError(expr)
                 : RollupExpressions.untypedValueError(expr);
         failExpression(owner, key, expr, detail);

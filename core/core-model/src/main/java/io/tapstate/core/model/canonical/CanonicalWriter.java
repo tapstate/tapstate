@@ -331,6 +331,18 @@ public final class CanonicalWriter {
             }
             case TransformBody.Union ignored -> {
             }
+            // The order the step is read in: which rows, then how they are grouped, then what is
+            // computed. Group names and fields keep the order written, which is the output's.
+            case TransformBody.Aggregate a -> {
+                b.scalarSeq("key", a.key());
+                b.scalar("where", a.where());
+                if (!a.groupBy().isEmpty()) {
+                    B g = new B();
+                    a.groupBy().forEach((name, expression) -> g.putRequired(name, scalar(expression)));
+                    b.put("groupBy", g.build());
+                }
+                b.put("fields", rollupFields(a.fields()));
+            }
             case TransformBody.Nest n -> {
                 b.scalar("primary_key", n.primaryKey());
                 if (n.order() != null) {

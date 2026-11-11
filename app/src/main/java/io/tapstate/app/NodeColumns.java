@@ -183,7 +183,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
 
     /**
      * What a transform step produces, given what reaches it and, where it has one, what it compiled to.
-     * Seven kinds, and the switch is exhaustive over all of them: an eighth cannot be added to the
+     * Eight kinds, and the switch is exhaustive over all of them: a ninth cannot be added to the
      * grammar without this stopping the build.
      *
      * <p><b>A script is the one kind that cannot be answered for, and the answer is final rather than
@@ -212,6 +212,10 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             // not to touch a column, so folding them together would make a later change to one of
             // them silently a change to the other.
             case TransformBody.Union ignored -> merged(inputs.values());
+            // The group names and the fields, typed by the functions. Until the typed output of the
+            // function library is wired here, the step says it has no answer rather than guess one.
+            case TransformBody.Aggregate ignored ->
+                    unknown("aggregate: the output columns of a grouped step are not worked out yet");
             case TransformBody.Nest nest -> rootOf(nest, inputs);
             case TransformBody.Join ignored -> published(compiledJoin);
         };
