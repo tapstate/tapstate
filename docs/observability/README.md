@@ -32,20 +32,19 @@ pipeline. The history and explanation responses, including coded errors, carry
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 | How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
-The status response keeps `state` tied to runtime observation. Before the first observation, a known
-pipeline returns `state: "NEW"` and omits `observedState`, `observedAt`, and `observedAgeMillis`;
-`desiredState` carries the requested lifecycle target and `displayState` carries the authoring-facing
-lifecycle projection. An applied artifact that has never been started reports `displayState: "NOT_STARTED"`;
-when a start or resume is in progress, it can report `STARTING` or `RESUMING`. When an observation exists,
-`state`, `observedState`, and `observedAt` come from the same observation, and `observedAgeMillis` is
-calculated from that observation time. A saved draft reports `displayState: "DRAFT"` and `hasArtifact: false`.
+The status response uses `state` for runtime lifecycle state, `desiredState` for the requested target,
+and `displayState` for the authoring-facing lifecycle projection. An applied artifact that has never been
+started reports `displayState: "NOT_STARTED"`. An accepted start can report `desiredState: "RUNNING"`
+and `displayState: "STARTING"` while the runtime checkpoint and observation are still absent. In that
+window the response omits `state`, `observedState`, `observedAt`, and `observedAgeMillis`. A saved draft
+reports `state: "NEW"`, `displayState: "DRAFT"`, and `hasArtifact: false`. The observation fields describe
+the last runtime observation, and `observedAgeMillis` is calculated from its timestamp.
 
-A failure to read the desired lifecycle document is returned separately as `intentReadFailure`, with a coded
-`code`, named `params`, and rendered `message`. Any runtime observation already read remains available in
-`state`, `observedState`, and `observedAt`. If neither desired intent nor an observation can be read, the
-response omits `displayState`; clients should keep this read failure separate from the lifecycle label and
-should not infer a fallback state. A status read for a leftover runtime observation without a current draft or
-artifact reports `hasArtifact: false` and omits `displayState`.
+When runtime state is available but desired intent cannot be read, the response preserves the runtime
+state and includes an `intentReadFailure` object with `code`, `params`, and `message`. If an applied
+Pipeline has no usable runtime state or known transition, the endpoint returns HTTP 500 with
+`io.document-unreadable` and `params.field: "checkpoint"`. A status read for a leftover runtime
+observation without a current draft or artifact reports `hasArtifact: false` and omits `displayState`.
 
 The status watch sends observed state changes only. It stays open without frames while a known pipeline or
 saved draft has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads

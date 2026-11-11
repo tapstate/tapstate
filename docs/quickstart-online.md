@@ -779,8 +779,9 @@ pagination, REST and MCP forms, and the difference between an empty retained win
 - The read faces lag the write verbs: they report observed state, which converges to
   what you asked for rather than changing with the command. Immediately after `start`,
   CLI `status` and `metrics` may report `monitor.no-observation` until the first runtime
-  observation. REST `GET /api/pipelines/{id}/status` returns `state: "NEW"` and omits
-  `observedState` during that window; `desiredState` carries the requested target. After
+  observation. During startup, REST `GET /api/pipelines/{id}/status` can show
+  `desiredState: "RUNNING"` and `displayState: "STARTING"` while omitting `state` and
+  `observedState` until runtime state is available. After
   `stop`, the observed state can still be `RUNNING` until another observation arrives,
   even though the intent is `STOPPED`. `status --watch` streams observed state changes
   only; a known unobserved pipeline or saved draft keeps the watch open without frames,
