@@ -2,7 +2,13 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.Embed;
+import io.tapstate.core.dsl.RollupCompiler;
+import io.tapstate.core.dsl.aggregate.RollupError;
+import io.tapstate.core.dsl.aggregate.RollupScope;
+import io.tapstate.core.dsl.aggregate.RollupSpec;
+import io.tapstate.core.dsl.aggregate.ValueType;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
 import io.tapstate.core.model.NestRoot;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.WriteMode;
@@ -110,6 +116,8 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             node.referenced(referenced(node, tables));
         }
         checkFlatFieldConflicts(root.from(), List.of(), top, tables);
+        checkRollupFieldConflicts(root.from(), List.of(), top, tables);
+        compileRollups(all, tables);
         List<String> rootIdentity = identityOf(ROOT_NAMESPACE, rootKey, claimants(top));
         for (Node node : all) {
             if (!node.children().isEmpty()) {
@@ -560,8 +568,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         }
         for (int i = 0; i < children.size(); i++) {
             for (int j = i + 1; j < children.size(); j++) {
-                if (children.get(i).embed().as() == EmbedAs.FLAT
-                        || children.get(j).embed().as() == EmbedAs.FLAT) {
+                if (children.get(i).embed().path() == null || children.get(j).embed().path() == null) {
                     continue;
                 }
                 List<String> a = segments(children.get(i).embed().path());
@@ -592,7 +599,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             }
         }
         for (Node child : children) {
-            if (child.embed().as() != EmbedAs.FLAT) {
+            if (child.embed().path() != null) {
                 occupied.putIfAbsent(child.embed().path(), render(child.pathId()));
             }
         }
@@ -624,7 +631,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         for (Node child : node.children()) {
             Map<String, String> contributed = child.embed().as() == EmbedAs.FLAT
                     ? knownFlatOutput(child, tables)
-                    : Map.of(child.embed().path(), render(child.pathId()));
+                    : renderedOutput(child);
             Map<String, String> collisions = conflicts(contributed.keySet(), output);
             if (!collisions.isEmpty()) {
                 throw flatFieldConflict(child.embed().as() == EmbedAs.FLAT ? child : node, collisions);
@@ -632,6 +639,109 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
             contributed.forEach(output::put);
         }
         return output;
+    }
+
+    /** The fields a non-flat embed writes on its parent: its path, if it renders one, and its rollup fields. */
+    private static Map<String, String> renderedOutput(Node child) {
+        Map<String, String> output = new LinkedHashMap<>();
+        if (child.embed().path() != null) {
+            output.put(child.embed().path(), render(child.pathId()));
+        }
+        for (String field : child.embed().rollupFields().keySet()) {
+            output.put(field, render(child.pathId()) + " rollup field");
+        }
+        return output;
+    }
+
+    // ---- rollup fields ----------------------------------------------------------------------------
+
+    /**
+     * Refuses a rollup field whose name is already taken where it lands: by a column of the parent row, an
+     * embed's path, a flat field, or another rollup field, from this embed or a sibling. The ADR-0115 pass
+     * for flat fields, widened to the one namespace every field of a level shares. A model that was not
+     * discovered contributes nothing here, and the render checks the actual row the same way.
+     */
+    private static void checkRollupFieldConflicts(String parentAlias, List<String> parentPathId,
+            List<Node> children, Function<String, NestTable> tables) {
+        String level = parentPathId.isEmpty() ? ROOT_NAMESPACE : render(parentPathId);
+        Map<String, String> occupied = new LinkedHashMap<>();
+        NestTable parent = tables.apply(parentAlias);
+        if (parent != null) {
+            for (String field : new TreeSet<>(parent.fields())) {
+                occupied.putIfAbsent(field, level + " row");
+            }
+        }
+        for (Node child : children) {
+            if (child.embed().path() != null) {
+                occupied.putIfAbsent(child.embed().path(), render(child.pathId()));
+            } else if (child.embed().as() == EmbedAs.FLAT) {
+                knownFlatOutput(child, tables).keySet()
+                        .forEach(field -> occupied.putIfAbsent(field, render(child.pathId())));
+            }
+        }
+        for (Node child : children) {
+            for (String field : child.embed().rollupFields().keySet()) {
+                for (Map.Entry<String, String> taken : occupied.entrySet()) {
+                    if (pathsOverlap(field, taken.getKey())) {
+                        throw new TapstateException(RollupError.FIELD_CONFLICT,
+                                Map.of("field", field, "level", level, "other", taken.getValue()), null);
+                    }
+                }
+                occupied.put(field, render(child.pathId()) + " rollup field");
+            }
+        }
+        for (Node child : children) {
+            checkRollupFieldConflicts(child.embed().from(), child.pathId(), child.children(), tables);
+        }
+    }
+
+    /**
+     * Checks and types every rollup field of the tree, deepest first, so a level's scope already carries the
+     * fields its own children's rollups write on its elements. A rollup can read those - a total over line
+     * totals - but nothing shallower, since it is computed before anything above it is.
+     */
+    private static void compileRollups(List<Node> deepestFirst, Function<String, NestTable> tables) {
+        for (Node node : deepestFirst) {
+            Map<String, RollupField> fields = node.embed().rollupFields();
+            if (fields.isEmpty()) {
+                continue;
+            }
+            if (node.referenced()) {
+                throw new TapstateException(RollupError.ON_REFERENCE_EMBED,
+                        Map.of("embedPath", render(node.pathId())), null);
+            }
+            RollupScope scope = scopeOf(node, tables);
+            List<RollupSpec> specs = new ArrayList<>();
+            fields.forEach((name, field) -> specs.add(RollupCompiler.compile(name, field, scope)));
+            node.rollups(specs);
+        }
+    }
+
+    /** One element of {@code node} as its rollup fields read it: columns, merged flat fields, references. */
+    private static RollupScope scopeOf(Node node, Function<String, NestTable> tables) {
+        NestTable table = tables.apply(node.embed().from());
+        Map<String, ValueType> columns = new LinkedHashMap<>(table == null ? Map.of() : table.types());
+        boolean known = table != null && !table.types().isEmpty();
+        Map<String, RollupScope> objects = new LinkedHashMap<>();
+        Map<String, RollupScope> arrays = new LinkedHashMap<>();
+        Map<String, Boolean> gathered = new LinkedHashMap<>();
+        for (Node child : node.children()) {
+            Embed embed = child.embed();
+            NestTable childTable = tables.apply(embed.from());
+            Map<String, ValueType> childTypes = childTable == null ? Map.of() : childTable.types();
+            if (embed.as() == EmbedAs.FLAT) {
+                childTypes.forEach(columns::putIfAbsent);
+            } else if (child.referenced() && embed.path() != null) {
+                RollupScope referenced = RollupScope.ofColumns(childTypes, !childTypes.isEmpty());
+                (embed.as() == EmbedAs.OBJECT ? objects : arrays).put(embed.path(), referenced);
+            } else if (embed.path() != null) {
+                gathered.put(embed.path(), embed.as() == EmbedAs.ARRAY);
+            }
+            for (RollupSpec spec : child.rollups()) {
+                columns.put(spec.field(), spec.resultType());
+            }
+        }
+        return new RollupScope(columns, known, objects, arrays, gathered);
     }
 
     /** Every candidate field that overlaps an occupied field, mapped to the existing owner. */
@@ -795,9 +905,9 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
                     ? new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
                             referenceFields(embed),
                             mapName(pipelineId, nodeId, node.pathId()),
-                            slotsOf(pipelineId, nodeId, node.children()))
+                            slotsOf(pipelineId, nodeId, node.children()), node.rollups())
                     : new EmbedSlot(embed.treeSegment(), embed.path(), render(node.pathId()), embed.as(),
-                            null, null, slotsOf(pipelineId, nodeId, node.children())));
+                            null, null, slotsOf(pipelineId, nodeId, node.children()), node.rollups()));
         }
         return slots;
     }
@@ -872,6 +982,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
         private List<String> identity = List.of();
         private List<String> arrayKey;
         private boolean referenced;
+        private List<RollupSpec> rollups = List.of();
 
         private Node(Embed embed, List<String> pathId, List<String> parentPathId, String parentAlias,
                 List<String> parentKey, List<Node> children) {
@@ -889,6 +1000,15 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
 
         private List<String> parentKey() {
             return parentKey;
+        }
+
+        /** The rollup fields this embed writes on its parent, checked and typed; empty until compiled. */
+        private List<RollupSpec> rollups() {
+            return rollups;
+        }
+
+        private void rollups(List<RollupSpec> compiled) {
+            this.rollups = List.copyOf(compiled);
         }
 
         /** Whether the level above points at this embed's rows, rather than its rows naming that level. */
