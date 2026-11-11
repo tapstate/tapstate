@@ -15,8 +15,10 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.bson.Document;
@@ -125,14 +127,24 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         var key = pipelineKey(original);
         return transaction(true, original, (store, session) -> store.acquireExisting(key, owner, topologyRevision, ttl));
     }
+
+    @Override public WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope original, WorkloadClaimFence node,
+            long topologyRevision) {
+        requireScope(original);
+        if (topologyRevision != 1 || !node.owner().nodeId().equals(scope.clusterId())) throw claimFenced();
+        return transaction(true, original, (store, session) -> {
+            MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+            return store.acquireNodeBackedPipeline(pipelineKey(original), node, topologyRevision);
+        });
+    }
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
         var key = pipelineKey(original);
-        return transaction(false, original, (store, session) -> {
+        return operations.pipelineRenewal(key, () -> transaction(false, original, (store, session) -> {
             var retained = storedScope(session, key);
             if (retained != null && !retained.equals(original)) throw claimFenced();
             return store.read(key);
-        });
+        }));
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -146,7 +158,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                     expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(), command);
         });
         try {
-            return renewClaim(expected, ttl);
+            return operations.pipelineRenewal(expected.key(), () -> renewClaim(expected, ttl));
         } catch (TapstateException failure) {
             LOG.log(System.Logger.Level.DEBUG,
                     "Pipeline renewal last Mongo command {0}, claim={1}, execution={2}, command={3}, result={4}",
@@ -164,10 +176,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             try {
                 var renewed = store.renewBeforeReads(expected, ttl);
                 if (renewed.isPresent()) {
-                    var retained = storedScope(session, expected.key());
+                    var retained = expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
+                            ? decodeScope(renewed.orElseThrow().row(), expected.key()) : storedScope(session, expected.key());
                     if (retained != null) validateState(session, retained);
                 } else validateMutationScope(session, store, expected);
-                return renewed;
+                return renewed.map(MongoWorkloadClaimStore.Renewal::claim);
             } catch (MongoException failure) {
                 if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION
                         && firstMongoError.compareAndSet(false, true)) {
@@ -176,6 +189,9 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                             expected.key().resourceId(), expected.claimGeneration(), expected.executionGeneration(),
                             failure.getClass().getSimpleName(), failure.getCode(), failure.getErrorLabels());
                 }
+                if (operations.pipelineRenewal() && failure.getCode() == 112
+                        && failure.hasErrorLabel("TransientTransactionError")
+                        && !failure.hasErrorLabel("UnknownTransactionCommitResult")) throw new RenewalWriteConflict();
                 throw failure;
             }
         }, true);
@@ -448,6 +464,17 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                         if(safe!=failed)failed.addSuppressed(safe);
                     }
                 }
+                if (failed instanceof RenewalWriteConflict) {
+                    throw new WorkloadClaimRenewalException(owned.released()
+                            ? WorkloadClaimRenewalException.Reason.WRITE_CONFLICT
+                            : WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "Mongo Pipeline renewal WriteConflict code=112");
+                }
+                if (operations.pipelineRenewal() && failed instanceof MongoException mongo
+                        && mongo.hasErrorLabel("UnknownTransactionCommitResult")) {
+                    throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "Mongo Pipeline renewal UnknownTransactionCommitResult");
+                }
                 if(!committedAck && owned.released() && retryCommit) {budget.remainingMillis();continue;}
                 if(!committedAck && owned.released() && failed instanceof MongoException mongo
                         && !mongo.hasErrorLabel("UnknownTransactionCommitResult")
@@ -467,6 +494,11 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private static final class UnresolvedTransaction extends RuntimeException {
         private final Throwable original;
         private UnresolvedTransaction(Throwable original){super(null,null,false,false);this.original=original;}
+    }
+
+    /** Ends the callback after abort instead of asking the driver to immediately replay it. */
+    private static final class RenewalWriteConflict extends RuntimeException {
+        private RenewalWriteConflict() { super(null, null, false, false); }
     }
 
     private void requireScope(PipelineIntentScope original) {

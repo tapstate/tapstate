@@ -4,6 +4,7 @@ import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimAttempt;
+import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
@@ -81,6 +82,12 @@ final class ClusterWorkloadClaims {
                 ? call(()->Optional.of(store.acquirePipeline(scope, owner, topologyRevision, ttl))) : Optional.empty();
     }
 
+    Optional<WorkloadClaimAttempt> acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
+            long topologyRevision) {
+        return membership.businessEligible()
+                ? call(() -> Optional.of(store.acquireNodeBackedPipeline(scope, node, topologyRevision))) : Optional.empty();
+    }
+
     Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
         return membership.businessEligible() ? call(()->store.readPipeline(scope)) : Optional.empty();
     }
@@ -133,6 +140,16 @@ final class ClusterWorkloadClaims {
      */
     Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl) {
         return membership.singleControlEligible(expected) ? call(()->store.renew(expected, ttl)) : Optional.empty();
+    }
+
+    Optional<WorkloadClaim> renewActuationControl(WorkloadClaim expected, Duration ttl, long budgetNanos) {
+        return membership.singleControlEligible(expected)
+                ? call(() -> store.renew(expected, ttl), budgetNanos, true) : Optional.empty();
+    }
+
+    Optional<WorkloadClaimReading> confirmPipelineRenewal(PipelineIntentScope scope, WorkloadClaim expected, long budgetNanos) {
+        if (!membership.businessEligible() && !membership.singleControlEligible(expected)) return Optional.empty();
+        return call(() -> store.readPipeline(scope), budgetNanos, true);
     }
 
     /** Read-only reporting proof for the exact retained SINGLE execution, never a business grant. */

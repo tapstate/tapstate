@@ -132,7 +132,7 @@ public final class MongoStateStore implements StateStore {
                 return session.withTransaction(() -> {
                     // Reuse the existing fence-proof counter. A write makes a takeover conflict with
                     // this transaction; a read of the claim alone would only prove an old snapshot.
-                    boolean owned = workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence),
+                    boolean owned = workloadClaims.updateOne(session, WorkloadClaimDocuments.livePipeline(session, workloadClaims, fence),
                             new Document("$inc", new Document("fencedSinkEffects", 1L))).getMatchedCount() == 1;
                     if (owned) {
                         Document applied = collection.findOneAndUpdate(session,

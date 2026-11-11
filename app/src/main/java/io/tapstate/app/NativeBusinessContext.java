@@ -444,14 +444,22 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new ValidationPipelineInitials(member, owner.original.preparation().businessScope(), owner.memberStorage::requireNode, authorization);
         }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
-                NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
+                NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims,
+                CloudRuntimeSettings cloud) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
+            if (cluster.explicitSingle()) {
+                return PipelineActuationOwnership.nodeBacked(owner.original.preparation().businessScope(),
+                        WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
+                        cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
+            }
             return PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
-                    cluster.getWorkloadClaimTtl(), cluster.getWorkloadClaimRenewInterval(), System::nanoTime);
+                    cluster.pipelineClaimTtl(cloud.cloud()), cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
         }
-        @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster) {
-            return new ActuationClaimRenewer(ownership, cluster.getWorkloadClaimRenewInterval());
+        @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
+                CloudRuntimeSettings cloud) {
+            return cluster.explicitSingle() ? ActuationClaimRenewer.inactive()
+                    : new ActuationClaimRenewer(ownership, cluster.pipelineClaimRenewInterval(cloud.cloud()));
         }
         @Bean CaptureOwnership captureOwnership(HazelcastInstance member, ClusterProperties cluster,
                 ClusterMembershipGate membership, ClusterWorkloadClaims claims) {

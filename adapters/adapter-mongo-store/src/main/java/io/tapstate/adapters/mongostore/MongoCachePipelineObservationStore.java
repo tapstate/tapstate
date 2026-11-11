@@ -58,7 +58,12 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         access.validateState(state);
         var claim = row == null ? null : row.get("claim", Document.class);
         access.requirePreparedClaim(session, claim);
-        return new Reading(access, state, claim, Boolean.TRUE.equals(row.get("live")));
+        boolean live = Boolean.TRUE.equals(row.get("live"));
+        if (MongoWorkloadClaimStore.nodeBacked(claim)) {
+            var store = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(access.database)).inStrictSession(session);
+            live = store.nodeLease(claim).isPresent();
+        }
+        return new Reading(access, state, claim, live);
     }
 
     @Override public Optional<Observation> read(String pipelineId) {

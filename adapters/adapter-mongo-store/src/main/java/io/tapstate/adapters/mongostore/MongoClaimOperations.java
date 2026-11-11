@@ -8,6 +8,8 @@ import com.mongodb.TransactionOptions;
 import com.mongodb.WriteConcern;
 import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import java.util.ArrayList;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -41,6 +43,8 @@ final class MongoClaimOperations {
     private final Set<Transaction> transactions = ConcurrentHashMap.newKeySet();
     private final ThreadLocal<MongoReadBudget> current = new ThreadLocal<>();
     private final ThreadLocal<Runnable> active = new ThreadLocal<>();
+    private final ThreadLocal<WorkloadClaimKey> renewalKey = new ThreadLocal<>();
+    private final ThreadLocal<Boolean> renewalLane = new ThreadLocal<>();
     private boolean closed;
     private boolean stopping;
     private volatile boolean replicaSet;
@@ -54,6 +58,28 @@ final class MongoClaimOperations {
     }
 
     MongoReadBudget budget() { return current.get(); }
+
+    <T> T pipelineRenewal(WorkloadClaimKey key, Supplier<T> action) {
+        var budget = budget();
+        if (budget == null || renewalLane.get() == null) return action.get();
+        for (var transaction : transactions) {
+            if (!key.equals(transaction.renewalKey)) continue;
+            try {
+                abort(transaction, budget);
+            } catch (RuntimeException unconfirmed) {
+                throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                        "previous Pipeline renewal transaction remains unresolved");
+            }
+        }
+        renewalKey.set(key);
+        try {
+            return action.get();
+        } finally {
+            renewalKey.remove();
+        }
+    }
+
+    boolean pipelineRenewal() { return renewalKey.get() != null; }
     private void observeTopology() {
         var topology = client.getClusterDescription();
         if (topology.getType() == com.mongodb.connection.ClusterType.REPLICA_SET) {
@@ -81,7 +107,11 @@ final class MongoClaimOperations {
     }
 
     <T> T renew(long deadline, Runnable guard, Supplier<T> action) {
-        return call(deadline, guard, action, renewals);
+        return call(deadline, guard, () -> {
+            renewalLane.set(true);
+            try { return action.get(); }
+            finally { renewalLane.remove(); }
+        }, renewals);
     }
 
     private <T> T call(long deadline,Runnable guard,Supplier<T> action,ThreadPoolExecutor lane) {
@@ -177,6 +207,7 @@ final class MongoClaimOperations {
 
     final class Transaction {
         private final ClientSession session;
+        private final WorkloadClaimKey renewalKey = MongoClaimOperations.this.renewalKey.get();
         private long number;
         private BsonDocument recoveryToken;
         private Call<Void> cleanup;

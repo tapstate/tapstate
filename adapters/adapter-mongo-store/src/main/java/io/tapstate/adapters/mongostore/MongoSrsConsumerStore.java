@@ -475,7 +475,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 if (!changed) return null;
                 // End the original tenures in this same transaction: a delayed writer cannot recreate its old run roster.
                 for (var reader : originals.entrySet()) {
-                    var filter = WorkloadClaimDocuments.live(reader.getValue()).append("pipelineScope", MongoPipelinePreparationFacts.scope(reader.getKey()))
+                    var filter = WorkloadClaimDocuments.livePipeline(session, database, reader.getValue()).append("pipelineScope", MongoPipelinePreparationFacts.scope(reader.getKey()))
                             .append("pipelinePreparation.phase", "PREPARED");
                     if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, filter,
                             List.of(new Document("$set", new Document("leaseUntil", "$$NOW")))).getMatchedCount() != 1) throw fenced();
@@ -683,7 +683,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         // Freeze caller-owned collections before a transaction callback can be retried.
         var requested = new SrsConsumerWriterRun(membershipRevision,fence,runId,expected,Map.of());
         return transaction(session -> {
-            prove(session,context,fence); var own = requireOwn(session,context);
+            proveProgress(session,context,fence,false); var own = requireOwn(session,context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
             if (!own.member().tables().equals(requested.expected().keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var before = held.writerRun();

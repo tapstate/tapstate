@@ -263,6 +263,12 @@ final class MongoCachePipelineAccess {
         var filter = WorkloadClaimDocuments.live(original)
                 .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
         var row = table.find(session, filter).first();
+        if (row == null && MongoWorkloadClaimStore.canUseNodeLease(original)) {
+            var nodeFilter = WorkloadClaimDocuments.livePipeline(session, table, original);
+            if (nodeFilter.containsKey(MongoWorkloadClaimStore.NODE_LEASE_GENERATION))
+                row = table.find(session, nodeFilter.append("pipelineScope", MongoPipelinePreparationFacts.scope(scope))
+                        .append("pipelinePreparation.phase", "PREPARED")).first();
+        }
         if (row == null) {
             requirePreparedClaim(session, structureChecked);
             throw claimFenced();
@@ -319,7 +325,7 @@ final class MongoCachePipelineAccess {
         if (original == null) throw fenced();
         if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var filter = WorkloadClaimDocuments.live(original)
+        var filter = WorkloadClaimDocuments.livePipeline(session, table, original)
                 .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
         Document row = table.find(session, filter).first();
         if (row == null) throw claimFenced();
@@ -337,9 +343,14 @@ final class MongoCachePipelineAccess {
     private void proveClaim(ClientSession session,String counter,boolean structureChecked) {
         if (original == null) throw fenced();
         if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
-        if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, WorkloadClaimDocuments.live(original)
-                        .append("pipelineScope", MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED"),
-                new Document("$inc",new Document(counter,1L))).getMatchedCount() != 1) throw claimFenced();
+        var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var update = new Document("$inc", new Document(counter, 1L));
+        var physical = MongoPipelinePreparationFacts.scope(scope);
+        var live = WorkloadClaimDocuments.live(original).append("pipelineScope", physical).append("pipelinePreparation.phase", "PREPARED");
+        if (table.updateOne(session, live, update).getMatchedCount() == 1) return;
+        var node = new MongoWorkloadClaimStore(table).inStrictSession(session).nodeBackedFilter(original);
+        if (node.isEmpty() || table.updateOne(session, node.orElseThrow().append("pipelineScope", physical)
+                .append("pipelinePreparation.phase", "PREPARED"), update).getMatchedCount() != 1) throw claimFenced();
     }
 
     /** This real write also serializes an observation with replacement of the current state scope. */

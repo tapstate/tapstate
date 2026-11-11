@@ -9,6 +9,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.WorkloadClaim;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimRenewalException;
 import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import java.time.Duration;
@@ -71,6 +72,31 @@ class PipelineActuationRenewalBudgetTest {
                 owner.stopForShutdown();io.release.countDown();
                 renewal.get(2, TimeUnit.SECONDS);owner.awaitStopped(deadline(2000));
             }
+        }
+    }
+
+    @Test void unconfirmedRenewalReadsBackTheCommittedLeaseBeforeWritingAgain() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner();
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            doAnswer(call -> {
+                io.attempts.add(id);
+                io.raw.clockAt(original.leaseUntil().minus(TTL).plus(RENEW));
+                assertThat(io.raw.renew(call.getArgument(0), call.getArgument(1))).isPresent();
+                throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                        "commit reply lost");
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(id))).thenAnswer(call -> io.raw.read(original.key()));
+            io.makeDue();
+            owner.renewDue();
+            io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+            owner.renewDue();
+
+            var current = owner.permit(scope(id)).claim();
+            assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(current.leaseUntil()).isAfter(original.leaseUntil());
+            assertThat(io.attempts).containsExactly(id);
         }
     }
 
@@ -175,7 +201,12 @@ class PipelineActuationRenewalBudgetTest {
                 owner.renewDue();
                 io.localOffset.addAndGet(Duration.ofSeconds(1).toNanos());
             }
-            assertThat(io.attempts).hasSize(conflict ? 4 : 1);
+            assertThat(io.attempts).hasSize(conflict ? 8 : 1);
+            if (conflict) {
+                io.localOffset.addAndGet(TTL.toNanos());
+                owner.renewDue();
+                assertThat(io.attempts).hasSize(8);
+            }
             assertThat(owner.permit(scope(id)).granted()).isFalse();
             if (conflict) assertThat(io.raw.release(original)).isTrue();
             io.makeDue();

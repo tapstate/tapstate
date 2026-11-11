@@ -848,6 +848,89 @@ class MongoSrsConsumerStoreIT {
     }
 
     @Test
+    void writerRegistrationCanRemainInFlightWhileTheOriginalPipelineRenews() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var beforeWriterWrite = new CountDownLatch(1);
+            var releaseWriter = new CountDownLatch(1);
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!"update".equals(event.getCommandName()) || beforeWriterWrite.getCount() == 0
+                            || !"srs_consumer_offsets".equals(event.getCommand().getString("update").getValue())) return;
+                    beforeWriterWrite.countDown();
+                    try {
+                        if (!releaseWriter.await(10, TimeUnit.SECONDS)) throw new AssertionError("writer was not released");
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new AssertionError(interrupted);
+                    }
+                }
+            };
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(listener).build();
+            try (var other = MongoClients.create(settings); var workers = Executors.newSingleThreadExecutor()) {
+                var store = new MongoSrsConsumerStore(other, other.getDatabase(f.database().getName()), SCOPE);
+                var registration = workers.submit(() -> store.beginWriterRun(A, member.revision(), "run",
+                        Map.of("orders", List.of("writer")), f.fenceA()));
+                try {
+                    assertThat(beforeWriterWrite.await(5, TimeUnit.SECONDS)).isTrue();
+                    var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {});
+                    var renewed = authority.withRenewalDeadline(System.nanoTime() + Duration.ofSeconds(2).toNanos(),
+                            () -> {}, () -> authority.renew(f.pipelineA(), Duration.ofSeconds(60))).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(f.fenceA());
+                } finally {
+                    releaseWriter.countDown();
+                }
+                assertThat(registration.get(5, TimeUnit.SECONDS)).isTrue();
+            }
+        });
+    }
+
+    @Test
+    void nodeBackedWriterUsesTheNodeLeaseAndRejectsBothOldExecutionsAndOldBoots() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var raw = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var authority = new MongoCacheWorkloadClaimStore(f.client(), f.database(), SCOPE, () -> {});
+            var nodeKey = new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.NODE_SESSION, SCOPE.clusterId());
+            var ttl = Duration.ofSeconds(60);
+            var node = raw.acquire(nodeKey, new WorkloadOwner(SCOPE.clusterId(), "first-boot"), 1, ttl).claim();
+            assertThat(raw.release(f.pipelineA())).isTrue();
+            var claim = authority.acquireNodeBackedPipeline(positionScope(A), WorkloadClaimFence.from(node), 1).claim();
+            var running = authority.advanceExecution(claim, 1, Set.of(SCOPE.clusterId())).orElseThrow();
+            var original = WorkloadClaimFence.from(running);
+            var member = f.consumers().attach(A, 0, Set.of("orders"), original).orElseThrow();
+            var roster = Map.of("orders", List.of("writer"));
+            assertThat(f.consumers().beginWriterRun(A, member.revision(), "first", roster, original)).isTrue();
+            assertThat(f.consumers().advanceWriter(A, member.revision(), "first", "orders", "writer",
+                    point(1, 1, "t1"), original)).isTrue();
+
+            var next = authority.advanceExecution(running, 1, Set.of(SCOPE.clusterId())).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A, member.revision(), "first", "orders", "writer",
+                    point(1, 2, "late"), original)).satisfies(MongoSrsConsumerStoreIT::fenced);
+            var renewedNode = raw.renew(node, Duration.ofSeconds(90)).orElseThrow();
+            assertThat(authority.readPipeline(positionScope(A)).orElseThrow().claim().leaseUntil())
+                    .isEqualTo(renewedNode.leaseUntil());
+            assertThat(raw.acquire(nodeKey, new WorkloadOwner(SCOPE.clusterId(), "second-boot"), 1, ttl).acquired()).isFalse();
+
+            assertThat(raw.release(renewedNode)).isTrue();
+            assertThat(authority.readPipeline(positionScope(A)).orElseThrow().leased()).isFalse();
+            assertThatThrownBy(() -> f.consumers().beginWriterRun(A, member.revision(), "second", roster,
+                    WorkloadClaimFence.from(next))).satisfies(MongoSrsConsumerStoreIT::fenced);
+            var replacement = raw.acquire(nodeKey, new WorkloadOwner(SCOPE.clusterId(), "second-boot"), 1, ttl).claim();
+            var resumed = authority.acquireNodeBackedPipeline(positionScope(A), WorkloadClaimFence.from(replacement), 1).claim();
+            assertThat(resumed.owner()).isEqualTo(replacement.owner());
+            assertThat(resumed.claimGeneration()).isGreaterThan(running.claimGeneration());
+            assertThatThrownBy(() -> f.consumers().advanceWriter(A, member.revision(), "first", "orders", "writer",
+                    point(1, 3, "old-boot"), original)).satisfies(MongoSrsConsumerStoreIT::fenced);
+        });
+    }
+
+    @Test
     void aSecondaryFenceDoesNotMaskTheFirstProgressFailure() {
         withBusiness(f -> {
             var first = new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "controlled"), null);
