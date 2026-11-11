@@ -2002,6 +2002,68 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return steps;
     }
 
+    @Override
+    public AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId, String step,
+            boolean repair, Map<String, String> group, String after) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        if (group != null) {
+            body.put("group", group);
+        }
+        if (after != null) {
+            body.put("after", after);
+        }
+        try {
+            HttpRequest request = authed(baseUrl, "/api/pipelines/" + pipelineId + "/aggregates/" + encode(step)
+                            + (repair ? ":repair" : ":check"), credential)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(JsonOut.compact(body), StandardCharsets.UTF_8))
+                    .build();
+            HttpResponse<String> response =
+                    send(request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+            if (response.statusCode() == 200) {
+                AggregateCheckOutcome.Found found = aggregateReport(response.body());
+                return found == null ? new AggregateCheckOutcome.Unreachable() : found;
+            }
+            Rejection r = rejection(response.body(), repair ? "The server refused the repair." : "The server refused the check.");
+            return new AggregateCheckOutcome.Rejected(r.code(), r.message());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return new AggregateCheckOutcome.Unreachable();
+        } catch (IOException | RuntimeException e) {
+            return new AggregateCheckOutcome.Unreachable();
+        }
+    }
+
+    /**
+     * The step's answer decoded from a 200 body, or {@code null} when the body is not the object this
+     * contract promises. A group's key value that is JSON null stays a null: it is the null of that
+     * column, not a missing answer.
+     */
+    static AggregateCheckOutcome.Found aggregateReport(String body) {
+        if (!(JsonReader.parse(body) instanceof Map<?, ?> report) || !(report.get("groups") instanceof Number groups)
+                || !(report.get("findings") instanceof List<?> listed)) {
+            return null;
+        }
+        List<AggregateCheckOutcome.Finding> findings = new ArrayList<>();
+        for (Object entry : listed) {
+            if (!(entry instanceof Map<?, ?> finding) || !(finding.get("group") instanceof Map<?, ?> named)
+                    || !(finding.get("verdict") instanceof String verdict)) {
+                return null;
+            }
+            Map<String, String> group = new LinkedHashMap<>();
+            named.forEach((name, value) -> group.put(String.valueOf(name), value == null ? null : String.valueOf(value)));
+            List<String> fields = new ArrayList<>();
+            if (finding.get("fields") instanceof List<?> names) {
+                names.forEach(name -> fields.add(String.valueOf(name)));
+            }
+            findings.add(new AggregateCheckOutcome.Finding(group, verdict, fields, string(finding.get("code")),
+                    string(finding.get("field"))));
+        }
+        return new AggregateCheckOutcome.Found(groups.intValue(), findings, string(report.get("next")),
+                report.get("conflicts") instanceof Number conflicts ? conflicts.longValue() : 0,
+                report.get("withheld") instanceof Number withheld ? withheld.longValue() : 0);
+    }
+
     /** A JSON cell as a string, or null where it is absent - which is what an absent side means here. */
     private static String string(Object value) {
         return value instanceof String s ? s : null;

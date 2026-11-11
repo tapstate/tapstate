@@ -343,6 +343,19 @@ interface ControlPlaneClient extends AutoCloseable {
     }
 
     /**
+     * Asks a running aggregate step to compare its groups with the rows it holds, or with
+     * {@code repair} to write them again from those rows, via
+     * {@code POST {baseUrl}/api/pipelines/{pipelineId}/aggregates/{step}:check} or {@code ...:repair},
+     * authenticated by the bearer {@code credential}. {@code group} names one group by the text of each
+     * of its key values, or is null to take a page of the step's groups starting after {@code after}, the
+     * place an earlier answer gave. Never throws.
+     */
+    default AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId, String step,
+            boolean repair, Map<String, String> group, String after) {
+        return new AggregateCheckOutcome.Unreachable();
+    }
+
+    /**
      * Watches a pipeline's status over a websocket ({@code /api/pipelines/{pipelineId}/status/watch}),
      * delivering each state — the current one, then each change — to {@code sink} until the stream ends or
      * {@code stop} signals (a {@code true} return between frames). One attach and no more: a dropped

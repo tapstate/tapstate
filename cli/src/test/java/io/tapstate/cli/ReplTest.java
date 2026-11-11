@@ -199,6 +199,9 @@ class ReplTest {
         /** The canned derived-schema answer, and every call as {@code read|accept credential@base/id}. */
         DerivedSchemaOutcome derivedSchemaOutcome = new DerivedSchemaOutcome.Unreachable();
         final List<String> derivedSchemaCalls = new ArrayList<>();
+        /** One answer per page asked for, in order; the last one stays. */
+        final java.util.ArrayDeque<AggregateCheckOutcome> aggregateOutcomes = new java.util.ArrayDeque<>();
+        final List<String> aggregateCalls = new ArrayList<>();
         LifecycleOutcome lifecycleOutcome = new LifecycleOutcome.Unreachable();
         /**
          * Per-verb outcomes, falling back to {@link #lifecycleOutcome}. A composed verb drives
@@ -564,6 +567,17 @@ class ReplTest {
             // The last one sticks rather than draining: a wait polls an unknown number of times, and a
             // queue that empties would answer the next poll with something nobody scripted.
             return statusOutcomes.size() == 1 ? statusOutcomes.peek() : statusOutcomes.poll();
+        }
+
+        @Override
+        public AggregateCheckOutcome aggregateCheck(URI baseUrl, String credential, String pipelineId,
+                String step, boolean repair, Map<String, String> group, String after) {
+            aggregateCalls.add((repair ? "repair " : "check ") + pipelineId + "/" + step + " group=" + group
+                    + " after=" + after);
+            if (!healthy.contains(baseUrl) || aggregateOutcomes.isEmpty()) {
+                return new AggregateCheckOutcome.Unreachable();
+            }
+            return aggregateOutcomes.size() == 1 ? aggregateOutcomes.peek() : aggregateOutcomes.poll();
         }
 
         @Override
@@ -5386,6 +5400,86 @@ class ReplTest {
         assertThat(h.repl().dispatch("derived-schema pl1 --accpet")).isTrue();
 
         assertThat(client.derivedSchemaCalls).isEmpty();
+    }
+
+    private static AggregateCheckOutcome.Finding differing(String region, String... fields) {
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", region);
+        return new AggregateCheckOutcome.Finding(group, "mismatch", List.of(fields), null, null);
+    }
+
+    @Test
+    void aggregateWalksEveryPageAndSaysWhatTheCheckDidNotLookAt() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(32, List.of(differing("EU", "revenue")), "c1", 0, 0));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(5, List.of(), null, 2, 1));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly(
+                "check pl1/by_region group=null after=null", "check pl1/by_region group=null after=c1");
+        String printed = h.sink().toString().substring(mark);
+        assertThat(printed).contains("37 groups compared").contains("1 differs").contains("region=EU")
+                .contains("revenue").contains("2 input events not applied");
+        // A clean line read as "the view matches the source" would be believed for something the check
+        // never read.
+        assertThat(printed).contains("does not read the source or the target");
+    }
+
+    @Test
+    void aggregateWithRepairRoutesToTheRepairAndNotToTheCheck() {
+        // A --repair that reached the check would print the same groups and change nothing.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(differing("EU", "revenue")), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=EU --repair")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly("repair pl1/by_region group={region=EU} after=null");
+        assertThat(h.sink().toString().substring(mark)).contains("written again").contains("rewritten: revenue");
+    }
+
+    @Test
+    void aGroupNameWithNoValueAsksForTheNullOfThatColumn() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region,year=2026")).isTrue();
+
+        assertThat(client.aggregateCalls).containsExactly(
+                "check pl1/by_region group={region=null, year=2026} after=null");
+    }
+
+    @Test
+    void aGroupTooLargeToDecideIsNotPrintedAsMatching() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", "EU");
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1,
+                List.of(new AggregateCheckOutcome.Finding(group, "inconclusive", List.of(), null, null)), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=EU")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("too large to decide")
+                .doesNotContain("matches its rows");
+    }
+
+    @Test
+    void aggregateRefusesAnArgumentItDoesNotKnow() {
+        // A misspelt --repair must not become a check reported as done.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1, List.of(), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --repiar")).isTrue();
+
+        assertThat(client.aggregateCalls).isEmpty();
     }
 
     @Test

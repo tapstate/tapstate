@@ -182,7 +182,7 @@ final class Repl {
     private static final List<String> ONLINE_VERBS = List.of(
             "apply", "get", "delete", "ls", "start", "stop", "pause", "resume", "restart", "status", "metrics",
             "snapshot", "logs", "position", "test", "test-result", "discover-schema", "schema", "register",
-            "connectors", "cluster", "token", "derived-schema", "explain", "storage", "configuration");
+            "connectors", "cluster", "token", "derived-schema", "aggregate", "explain", "storage", "configuration");
 
     private final CommandLine commandLine;
 
@@ -886,6 +886,10 @@ final class Repl {
         // flag and leave the verb doing a plain read while reporting success.
         if (words.get(0).equals("derived-schema")) {
             return derivedSchemaOnline(words);
+        }
+        // `aggregate` takes a second operand and its own flags, for the same reason.
+        if (words.get(0).equals("aggregate")) {
+            return aggregateOnline(words);
         }
         // `status` carries `--rate`: wait for the second reading a rate is made of, which it does by
         // default only at a terminal. It parses its own words for the reason `derived-schema` does -- the
@@ -4429,6 +4433,134 @@ final class Repl {
      * check worth having is the one moment a person looks at the difference and decides; a flag on the
      * start is typed once and then lives in a script, which is the same as not checking.
      */
+    private static final String AGGREGATE_USAGE =
+            "aggregate <pipeline-id> <step> [--group <name=value,...>] [--repair]";
+
+    /**
+     * Checks a running aggregate step's groups against the rows the step holds for them, and with
+     * {@code --repair} writes them again from those rows.
+     *
+     * <p><b>What a clean answer means is printed with every answer.</b> The check compares each group's
+     * totals with the step's own stored rows. It reads neither the source nor the target, so it cannot
+     * say the view matches the source, and a line that let it be read that way would be believed for
+     * something nobody looked at.
+     *
+     * <p>Without {@code --group} it walks every group, a page at a time; the step answers each page
+     * between two of its own updates, so the walk does not stop the pipeline. With {@code --group} it
+     * looks at that one group, named by every name under the step's {@code groupBy:}; a name with no
+     * value is the null of that column.
+     */
+    private int aggregateOnline(List<String> words) {
+        PrintWriter err = commandLine.getErr();
+        if (words.size() < 3 || words.get(1).isBlank() || words.get(2).isBlank() || words.get(2).startsWith("--")) {
+            err.println("aggregate: usage: " + AGGREGATE_USAGE);
+            err.flush();
+            return Cli.EXIT_USAGE;
+        }
+        String id = words.get(1);
+        String step = words.get(2);
+        boolean repair = false;
+        Map<String, String> group = null;
+        for (int i = 3; i < words.size(); i++) {
+            String word = words.get(i);
+            if (word.equals("--repair") && !repair) {
+                repair = true;
+            } else if (word.equals("--group") && group == null && i + 1 < words.size()) {
+                group = groupNamed(words.get(++i));
+            } else if (word.startsWith("--group=") && group == null) {
+                group = groupNamed(word.substring("--group=".length()));
+            } else {
+                err.println("aggregate: usage: " + AGGREGATE_USAGE);
+                err.flush();
+                return Cli.EXIT_USAGE;
+            }
+        }
+        int groups = 0;
+        long conflicts = 0;
+        long withheld = 0;
+        List<AggregateCheckOutcome.Finding> findings = new ArrayList<>();
+        String after = null;
+        while (true) {
+            boolean repairing = repair;
+            Map<String, String> named = group;
+            String from = after;
+            AggregateCheckOutcome outcome = withFailover(() -> controlPlane.aggregateCheck(
+                    session.landingNode(), session.credential(), id, step, repairing, named, from),
+                    o -> o instanceof AggregateCheckOutcome.Unreachable);
+            switch (outcome) {
+                case AggregateCheckOutcome.Found found -> {
+                    groups += found.groups();
+                    findings.addAll(found.findings());
+                    conflicts = found.conflicts();
+                    withheld = found.withheld();
+                    after = found.next();
+                }
+                case AggregateCheckOutcome.Rejected rejected -> {
+                    return renderRejection(rejected.code(), rejected.message());
+                }
+                case AggregateCheckOutcome.Unreachable ignored -> {
+                    return reportRequestFailed();
+                }
+            }
+            if (after == null || group != null) {
+                break;
+            }
+        }
+        renderAggregateCheck(commandLine.getOut(), step, repair, groups, findings, conflicts, withheld);
+        return Cli.EXIT_OK;
+    }
+
+    /** {@code name=value,...} as a group: a name with no {@code =} is the null of that column. */
+    private static Map<String, String> groupNamed(String text) {
+        Map<String, String> group = new LinkedHashMap<>();
+        if (text.isEmpty()) {
+            return group;
+        }
+        for (String pair : text.split(",", -1)) {
+            int at = pair.indexOf('=');
+            group.put(at < 0 ? pair : pair.substring(0, at), at < 0 ? null : pair.substring(at + 1));
+        }
+        return group;
+    }
+
+    private static String groupShown(Map<String, String> group) {
+        if (group.isEmpty()) {
+            return "(the one group)";
+        }
+        StringBuilder shown = new StringBuilder();
+        group.forEach((name, value) -> shown.append(shown.isEmpty() ? "" : ",").append(name)
+                .append(value == null ? "" : "=" + value));
+        return shown.toString();
+    }
+
+    private static void renderAggregateCheck(PrintWriter out, String step, boolean repair, int groups,
+            List<AggregateCheckOutcome.Finding> findings, long conflicts, long withheld) {
+        long differing = findings.stream().filter(finding -> finding.verdict().equals("mismatch")).count();
+        long undecided = findings.stream().filter(finding -> finding.verdict().equals("inconclusive")).count();
+        out.println(step + ": " + groups + (groups == 1 ? " group " : " groups ") + (repair ? "written again from " : "compared with ")
+                + (groups == 1 ? "its" : "their") + " rows, " + differing + (repair ? " had differed" : (differing == 1 ? " differs" : " differ"))
+                + (undecided == 0 ? "" : ", " + undecided + " too large to decide"));
+        for (AggregateCheckOutcome.Finding finding : findings) {
+            StringBuilder line = new StringBuilder("  ").append(groupShown(finding.group())).append("  ");
+            switch (finding.verdict()) {
+                case "mismatch" -> line.append(repair ? "rewritten: " : "differs: ").append(String.join(", ", finding.fields()));
+                case "inconclusive" -> line.append("too large to decide; nothing was ").append(repair ? "changed" : "claimed");
+                default -> line.append("matches its rows");
+            }
+            if (finding.code() != null) {
+                line.append("  [cannot be given exactly: ").append(finding.code())
+                        .append(finding.field() == null ? "" : " on " + finding.field()).append(']');
+            }
+            out.println(line);
+        }
+        if (conflicts > 0 || withheld > 0) {
+            out.println("since the step started: " + conflicts + " input events not applied, " + withheld
+                    + " times a group was sent at its last good values");
+        }
+        out.println("This compares the step's totals with the rows the step holds. It does not read the source or the target.");
+        out.flush();
+    }
+
     private int derivedSchemaOnline(List<String> words) {
         String id = readTargetId(words);
         if (id == null) {

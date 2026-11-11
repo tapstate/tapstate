@@ -124,6 +124,33 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anAggregateReportKeepsANullGroupValueApartFromAnEmptyOne() {
+        AggregateCheckOutcome.Found found = HttpControlPlaneClient.aggregateReport("""
+                {"pipeline":"pl1","step":"by_region","repaired":false,"groups":2,"next":"c1","conflicts":3,"withheld":1,
+                 "findings":[{"group":{"region":null,"kind":""},"verdict":"mismatch","fields":["revenue","(rows)"],
+                              "code":"aggregate.sum-out-of-range","field":"revenue"}]}""");
+
+        assertThat(found.groups()).isEqualTo(2);
+        assertThat(found.next()).isEqualTo("c1");
+        assertThat(found.conflicts()).isEqualTo(3);
+        assertThat(found.withheld()).isEqualTo(1);
+        AggregateCheckOutcome.Finding finding = found.findings().get(0);
+        assertThat(finding.group()).containsEntry("region", null).containsEntry("kind", "");
+        assertThat(finding.verdict()).isEqualTo("mismatch");
+        assertThat(finding.fields()).containsExactly("revenue", "(rows)");
+        assertThat(finding.code()).isEqualTo("aggregate.sum-out-of-range");
+        assertThat(finding.field()).isEqualTo("revenue");
+    }
+
+    @Test
+    void anAggregateAnswerThatIsNotAReportIsNotReadAsAnEmptyOne() {
+        // An empty report says every group matched; a body nobody could read must not say that.
+        assertThat(HttpControlPlaneClient.aggregateReport("{\"findings\":[]}")).isNull();
+        assertThat(HttpControlPlaneClient.aggregateReport(
+                "{\"groups\":1,\"findings\":[{\"group\":{},\"fields\":[]}]}")).isNull();
+    }
+
+    @Test
     void healthyWhenHealthzReturns200() throws Exception {
         HttpServer server = serverReplying(200, "ok");
         try {
