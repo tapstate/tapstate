@@ -33,7 +33,10 @@ public enum AggregateError implements TapstateErrorCode {
     EXPRESSION_INVALID("aggregate.expression-invalid", Set.of("step", "field", "part", "reason")),
 
     /** A sum or average reads a value whose numeric type nothing resolved. */
-    TYPE_UNKNOWN("aggregate.type-unknown", Set.of("step", "field", "expression"));
+    TYPE_UNKNOWN("aggregate.type-unknown", Set.of("step", "field", "expression")),
+
+    /** Running: an expression that passed its checks failed on a row. */
+    EVALUATION_FAILED("aggregate.evaluation-failed", Set.of("step", "part", "expression", "reason"));
 
     private final String code;
     private final Set<String> placeholders;
