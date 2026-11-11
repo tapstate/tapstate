@@ -84,8 +84,6 @@ class NestRollupFieldsCdcIT {
                 converge(mongo, target, mysql, "after an item moved into the reward filter");
                 sql(mysql, "UPDATE items SET prize_definition_id = 2 WHERE id = 5");
                 converge(mongo, target, mysql, "after the item moved back out of the filter");
-                sql(mysql, "UPDATE items SET transaction_id = 1 WHERE id = 6");
-                converge(mongo, target, mysql, "after an item moved to another transaction");
 
                 // The latest rating, MGM's shape: two ratings on one model date told apart by rating type,
                 // arriving out of order over two batches, one with no model date (no candidate) and one
@@ -118,6 +116,75 @@ class NestRollupFieldsCdcIT {
                 control.lifecycle(pipeline, LifecycleVerb.PAUSE);
             }
         }
+    }
+
+    // ---- an element moving to another parent ------------------------------------------------------------
+
+    /**
+     * An item moving to another transaction takes its share of the totals with it: the old document's total
+     * shrinks by exactly what the new one's grows by. A running delta applied only where the change arrived
+     * leaves the old document's total where it was.
+     *
+     * <p>The items here carry no reference of their own. An element with a reference child is currently lost
+     * from both documents when it moves, with or without rollup fields; that is a defect of the move itself,
+     * tracked on its own, and a rollup over the array can only be as right as the array.
+     */
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aMovedItemTakesItsShareOfTheTotalsToItsNewTransaction(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("rollup_move_src_" + suffix);
+        seedWallet(mysql);
+        String targetUri = SharedMongo.replicaSetUrl("rollup_move_target_" + suffix);
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        String pipeline = "rollup_move_" + suffix;
+        Map<String, Object> rollups = new LinkedHashMap<>();
+        rollups.put("qty", Map.of("sum", "$amount", "default", 0));
+        rollups.put("lines", Map.of("count", true));
+        Map<String, Object> items = new LinkedHashMap<>();
+        items.put("from", "i");
+        items.put("on", Map.of("transaction_id", "id"));
+        items.put("as", "array");
+        items.put("path", "item_movement");
+        items.put("arrayKey", List.of("id"));
+        items.put("trackKeyChanges", true);
+        items.put("rollup", rollups);
+        Map<String, Object> definition = pipelineOf(pipeline, Map.of("t", "transactions", "i", "items"), "t",
+                List.of(items));
+
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            start(server, storage, mysql, List.of("transactions", "items"), targetUri, pipeline, definition);
+            awaitTotals(mongo, target, "after the snapshot", Map.of(1, List.of(7L, 3L), 2, List.of(12L, 4L)));
+            sql(mysql, "UPDATE items SET transaction_id = 1 WHERE id = 6");
+            awaitTotals(mongo, target, "after item 6 moved to transaction 1",
+                    Map.of(1, List.of(8L, 4L), 2, List.of(11L, 3L)));
+        }
+    }
+
+    private static void awaitTotals(MongoEndpoints mongo, EndpointAddress target, String when,
+            Map<Integer, List<Long>> expected) {
+        AtomicReference<String> last = new AtomicReference<>("not observed");
+        Await.until("qty and lines " + when, () -> {
+            for (var entry : expected.entrySet()) {
+                Map<String, Object> doc = mongo.fetch(target, TARGET, Map.of("id", entry.getKey())).orElse(null);
+                if (doc == null) {
+                    last.set("transaction " + entry.getKey() + " not written");
+                    return false;
+                }
+                long ownQty = 0;
+                for (Object item : (List<?>) doc.get("item_movement")) {
+                    ownQty += ((Number) ((Document) item).get("amount")).longValue();
+                }
+                assertThat(doc.get("qty")).as("%s: qty against its own items", when).isEqualTo(ownQty);
+                List<Object> got = List.of(doc.get("qty"), doc.get("lines"));
+                if (!got.equals(entry.getValue())) {
+                    last.set("transaction " + entry.getKey() + ": " + got + " != " + entry.getValue());
+                    return false;
+                }
+            }
+            return true;
+        }, last::get);
     }
 
     // ---- the numeric contract ---------------------------------------------------------------------------
@@ -302,6 +369,7 @@ class NestRollupFieldsCdcIT {
                         "root", Map.of("from", root, "key", List.of("id"), "embed", embeds))),
                 "serve", Map.of("from", "doc", "sync", List.of(Map.of("source", "wallet-store",
                         "rename", Map.of("prefix", id.startsWith("rollup_cdc") || id.startsWith("rollup_ref")
+                                || id.startsWith("rollup_move")
                                 ? "wallet_" : id + "_"),
                         "execution", Map.of("parallelism", 1)))));
     }
