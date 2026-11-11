@@ -8,6 +8,7 @@ import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.Observation;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
@@ -1375,7 +1376,10 @@ class MongoCachePipelineRebuildsIT {
             var writer = f.domain.operatorState(placement,original.request().originalClaim(),ACTIVE);
             writer.save(placement.mapName(),"original",new byte[]{1,2});
             var before = f.claim(); var oldState = f.state();
-            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).insertOne(new Document("_id","flow").append("scope",MongoPipelinePreparationFacts.scope(f.scope)).append("diagnostic","old"));
+            var running = new Observation("flow", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT, List.of());
+            var observations = f.domain.pipelineObservations(f.scope, original.request().originalClaim(), ACTIVE);
+            observations.save(running, 9);
+            assertThat(observations.read("flow")).contains(running);
             f.initial("independent"); var b = f.claims().find(new Document("_id.resourceId","independent")).first();
             var receipt = f.rebuilds().prepare(original,f.node,TTL,AT);
             assertThat(receipt.claim().claimGeneration()).isEqualTo(original.request().originalClaim().claimGeneration()+1);
@@ -1387,7 +1391,8 @@ class MongoCachePipelineRebuildsIT {
             assertThat(f.state()).containsEntry("scope",MongoPipelinePreparationFacts.scope(original.request().targetScope()))
                     .containsEntry("epoch",10L).containsEntry("runtimeWriteFence",oldState.getLong("runtimeWriteFence")+1).containsEntry("stateJson","STOPPED");
             assertThat(f.claims().find(new Document("_id.resourceId","independent")).first()).isEqualTo(b);
-            assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).find(new Document("_id","flow")).first()).isNull();
+            observations.save(running, 9);
+            assertThat(f.domain.pipelineObservations(original.request().targetScope()).read("flow")).isEmpty();
             assertThat(f.configuration.intents().loadForActuation("flow")).isEmpty();
             try (var session=f.cacheClient.startSession()) {
                 session.withTransaction(() -> { assertThat(MongoOperatorInventory.requireRetired(session,f.cache,original).getList("placements",Document.class)).hasSize(1); return null; });
@@ -1452,14 +1457,20 @@ class MongoCachePipelineRebuildsIT {
         });
     }
 
-    @Test void originalClaimChangesAndForeignObservationPreventTheEntireTransition() {
+    @Test void changedClaimFencesTheTransitionAndAnotherObservationCannotBlockIt() {
         withFixture(f -> {
             var pending=f.pending(0); var row=f.claim();
             f.claims().updateOne(new Document("_id",row.get("_id")),new Document("$inc",new Document("claimGeneration",1L)));var before=f.snapshot();
             assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.WORKLOAD_CLAIM_FENCED);assertThat(f.snapshot()).isEqualTo(before);
             f.claims().replaceOne(new Document("_id",row.get("_id")),row);
-            SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).insertOne(new Document("_id","flow").append("scope",MongoPipelinePreparationFacts.scope(pending.request().targetScope())));
-            before=f.snapshot();assertCode(() -> f.rebuilds().prepare(pending,f.node,TTL,AT),IoError.PIPELINE_STATE_REBUILD_REQUIRED);assertThat(f.snapshot()).isEqualTo(before);
+            var target = pending.request().targetScope();
+            var running = new Observation("flow", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null, AT, List.of());
+            f.domain.pipelineObservations(target, pending.request().originalClaim(), ACTIVE).save(running, 1);
+            assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.cache).countDocuments()).isOne();
+            var receipt = f.rebuilds().prepare(pending,f.node,TTL,AT);
+            assertThat(receipt.claim().claimGeneration()).isEqualTo(pending.request().originalClaim().claimGeneration()+1);
+            assertThat(f.state()).containsEntry("scope",MongoPipelinePreparationFacts.scope(target)).containsEntry("stateJson","STOPPED");
+            assertThat(f.domain.pipelineObservations(target).read("flow")).isEmpty();
         });
     }
 

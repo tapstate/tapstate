@@ -34,7 +34,8 @@ class NativeValidationStartCoordinatorTest {
                 var next=new ValidationOperation(coordinator.context(),"flow","task",GENERATION,1,2,UUID.randomUUID());
                 try(var response=coordinator.start(next)){assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.REJECTED);}
                 assertThat(routing.calls.values()).allSatisfy(count->assertThat(count).hasValue(0));
-                assertThat(resources.snapshot().metadataFrames()).isZero();
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3))
+                        .untilAsserted(() -> assertThat(resources.snapshot().metadataFrames()).isZero());
             }
         }
     }

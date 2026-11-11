@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import com.hazelcast.core.OperationTimeoutException;
 import io.tapstate.core.validation.*;
 import io.tapstate.runtime.engine.validation.*;
 import io.tapstate.spi.store.*;
@@ -32,7 +33,7 @@ class NativeValidationCommandsIT {
     }
     @Test void aLostReservationReplyCanBeReadPassivelyBeforeOnlyAnExplicitOriginalRetryActivates()throws Exception{
         var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
-        var returned=new java.util.concurrent.CountDownLatch(1);var reservations=new AtomicInteger();var plans=new AtomicInteger();var receiptsVisible=new AtomicBoolean();
+        var reservations=new AtomicInteger();var plans=new AtomicInteger();var receiptsVisible=new AtomicBoolean();
         var captured=new AtomicReference<Request>();
         try(var f=new NativeValidationOwnerReservationsIT.Fixture();var runs=new NativeValidationRuns(f.owners,f.resources,f.process,f.timers);
                 var processors=new ValidationProcessorRegistry(f.member,()->{})){
@@ -44,7 +45,7 @@ class NativeValidationCommandsIT {
                     assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);entered.countDown();
                     try{if(!release.await(12,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("original reply barrier timeout");}
                     catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
-                    returned.countDown();return accepted;
+                    throw new OperationTimeoutException("lost original reservation reply");
                 }
                 public LocalReceipt receipt(Request request){return receiptsVisible.get()?f.owners.receipt(request):LocalReceipt.unknown();}
             };
@@ -62,8 +63,10 @@ class NativeValidationCommandsIT {
                     if(!entered.await(5,java.util.concurrent.TimeUnit.SECONDS)){
                         try(var response=coordinator.read(op)){throw new AssertionError("receiver not entered: original="+response.value()+"; reservations="+reservations+"; request="+captured+"; resources="+f.resources.snapshot());}
                     }
+                    // The single-member route invokes reserve inline on its paid control worker.
+                    release.countDown();
                     await(()->{try(var response=coordinator.read(op)){return response.value().outcome()==io.tapstate.runtime.probe.ValidationOperation.Outcome.UNKNOWN;}});
-                    release.countDown();assertThat(returned.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();receiptsVisible.set(true);
+                    receiptsVisible.set(true);
                     assertThat(f.owners.receipt(captured.get()).result().outcome()).isEqualTo(Outcome.ACCEPTED);
                     try(var response=coordinator.read(op)){
                         assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);
@@ -89,7 +92,8 @@ class NativeValidationCommandsIT {
                 public Result reserve(Request request){reservations.incrementAndGet();captured.set(request);var accepted=f.owners.reserve(request);
                     assertThat(accepted.outcome()).isEqualTo(Outcome.ACCEPTED);entered.countDown();
                     try{if(!release.await(12,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("unused reply barrier timeout");}
-                    catch(InterruptedException interrupted){throw new AssertionError(interrupted);}return accepted;}
+                    catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                    throw new OperationTimeoutException("lost unused reservation reply");}
                 public LocalReceipt receipt(Request request){return visible.get()?f.owners.receipt(request):LocalReceipt.unknown();}
             };
             var commands=new NativeValidationCommands(f.owners,runs,f.member,processors,f.process,original->{throw new AssertionError("receipt reads cannot construct a plan");});
@@ -99,8 +103,9 @@ class NativeValidationCommandsIT {
                 try{
                     try(var response=coordinator.start(op)){assertThat(response.value().original()).isEqualTo(op);}
                     await(()->entered.getCount()==0);
+                    release.countDown();
                     await(()->{try(var response=coordinator.read(op)){return response.value().outcome()==io.tapstate.runtime.probe.ValidationOperation.Outcome.UNKNOWN;}});
-                    release.countDown();visible.set(true);
+                    visible.set(true);
                     try(var response=coordinator.read(op)){assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.ACCEPTED);assertThat(response.value().admitted()).isFalse();}
                     now.addAndGet(Duration.ofSeconds(31).toNanos());f.owners.expire();
                     await(()->{try(var response=coordinator.read(op)){var value=response.value();return "STOPPED".equals(value.state())&&value.drain()==io.tapstate.runtime.probe.ValidationOperation.Drain.DRAINED;}});
