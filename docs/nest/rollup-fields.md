@@ -216,10 +216,25 @@ same level `as: array`: its elements are stored as whole rows.
 The send itself is the whole document, as for every nest ([throughput limits](throughput-limits.md)): a
 level with many elements is rewritten and re-folded on every change to any of them.
 
-> **Sizing guidance pending measurement.** How many elements per document a rollup level carries
-> comfortably is being measured at 10 to 100,000 elements per root. Until those numbers are published
-> here, treat a rollup level as you would the same level `as: array`: tens to low thousands of elements
-> per document.
+### How wide a rollup level can be
+
+Measured on a 2-CPU / 8 GB engine with one shared MongoDB, one level of five-column rows:
+
+| Elements per document | Render per send, 1 field / 5 fields | Changes per second one document sustains |
+|---:|---|---|
+| 10 | 0.04 / 0.15 ms | as many as a plain array (the engine's own ceiling) |
+| 100 | 0.09 / 0.33 ms | as many as a plain array |
+| 1,000 | 0.4 / 1.6 ms | as many as a plain array |
+| 10,000 | 4.5 / 17 ms | fewer than 25, where the same level as a plain array sustains 50 |
+
+**Keep a rollup level to about 1,000 elements per document.** Up to there rollup fields cost nothing a
+nest's own throughput would notice; at 10,000 the document falls behind at a few dozen changes a second.
+Beyond 1,000 elements, compute the value in the target or wait for the cross-row step.
+
+Independent of rollups, a nest level also meets these limits as it widens: a snapshot that reads more than
+10,000 children before their parent row stops with `nest.pending-limit-exceeded`; a document holds 20,000
+elements by default (`max_elements_per_document`); and a root's stored state, about 300 bytes per element at
+this row width, must fit one MongoDB document, which it outgrows just under 50,000 elements.
 
 ## When to use something else
 
@@ -238,7 +253,7 @@ the target or in a `js` step.
 |---|---|
 | No arithmetic on decimals inside expressions | `=after.qty * after.unit_price` over decimals is refused at apply |
 | `sum` and `avg` need a discovered type | a rollup over a `map` step's output or an undiscovered source can count, but not sum |
-| Recompute on every send | a document with very many elements per rollup level pays a full walk per send |
+| Recompute on every send | a document with very many elements per rollup level pays a full walk per send; keep it to about 1,000 |
 | Changing a level from `as: array` to `as: rollup` changes its state identity | the level's stored rows are not carried over; plan such a change as a rebuild |
 | No time-driven re-render | a filter that compares with the current time is right only as of the last change to the document |
 | Data validation does not check rollup fields | validating a nest that declares rollup fields is refused rather than compared |
