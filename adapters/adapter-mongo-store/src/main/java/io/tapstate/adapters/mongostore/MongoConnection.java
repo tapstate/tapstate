@@ -424,6 +424,11 @@ public final class MongoConnection implements AutoCloseable {
                 .addCommandListener(MongoCommandObservation.LISTENER)
                 .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(MongoHttpDiagnosticsScope.POOL_LISTENER))
                 .applyConnectionString(connectionString)
+                .addCommandListener(new com.mongodb.event.CommandListener() {
+                    @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                        io.tapstate.spi.store.StoreRoundTrips.observed();
+                    }
+                })
                 .applyToClusterSettings(b ->
                         b.serverSelectionTimeout(settings.serverSelectionTimeout().toMillis(), TimeUnit.MILLISECONDS));
         // TLS follows the URI (applyConnectionString already applied it). A CA file is meaningful only

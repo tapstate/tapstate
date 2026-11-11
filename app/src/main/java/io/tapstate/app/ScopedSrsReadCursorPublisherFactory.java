@@ -42,7 +42,6 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
                 bound.requireClaim(null);
             };
         }
-        var models = bound.models().guardedBy(bound.requireActive());
         if(bound.store().supportsReadEventVerification())return (item,sequence)->{
             bound.requireClaim(null);
             var model=bound.store().verifyReadEvent(run,table,ring,sequence,item.epoch(),item.schemaVer(),item.captureFence())
@@ -51,6 +50,7 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
             if(!expected.equals(model.key()) || !ring.equals(model.ringName()))throw unavailable(ring,item);
             bound.requireClaim(null);
         };
+        var models = bound.models().guardedBy(bound.requireActive());
         return (item,sequence) -> {
             bound.requireClaim(null); var progress = bound.progress();
             if (!progress.cursor().perTableSeq().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);

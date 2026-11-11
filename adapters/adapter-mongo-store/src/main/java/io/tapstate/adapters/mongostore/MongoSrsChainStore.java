@@ -43,6 +43,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
     private final Runnable requireStructure;
+    private final MongoSrsLease appendLease;
     private final MongoSrsModelStore models;
     private final MongoSrsLogStore log;
 
@@ -53,16 +54,22 @@ public final class MongoSrsChainStore implements SrsChainStore {
         this(client, database, scope, requireActive, () -> {});
     }
     MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
+        this(client, database, scope, requireActive, requireStructure, MongoSrsLease.perTransaction());
+    }
+
+    MongoSrsChainStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            Runnable requireStructure, MongoSrsLease appendLease) {
+        this.appendLease = Objects.requireNonNull(appendLease, "appendLease");
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
-        this.models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+        this.models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure, appendLease);
         this.log = new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                 SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models);
     }
     @Override public MongoSrsChainStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+        return new MongoSrsChainStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, appendLease);
     }
     @Override public SrsChainState prepare(String chain, String retention, WorkloadClaimFence fence) {
         requireName(chain);
@@ -98,18 +105,18 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     @Override public SrsChainState requestTables(String chain, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
-        return transaction(session -> {
+        return changingChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCapture(row, fence);
             SrsChainState held = state(session, row); var union = new TreeSet<>(held.requestedTables()); union.addAll(captured);
             if (union.equals(held.requestedTables())) return held;
             var replacement = new Document(row).append("requestedTables", new ArrayList<>(union));
             replace(session, row, replacement); return decode(replacement);
-        });
+        }));
     }
     @Override public OptionalLong openEpoch(String chain, long expectedEpoch, WorkloadClaimFence fence) {
         requireName(chain);
         if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
-        return transaction(session -> {
+        return changingChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCapture(row, fence);
             SrsChainState held = state(session, row);
             if (held.epoch() == expectedEpoch + 1 && WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)).equals(fence)) {
@@ -119,13 +126,13 @@ public final class MongoSrsChainStore implements SrsChainStore {
             var replacement = new Document(row).append("epoch", expectedEpoch + 1).append("captureFence", WorkloadClaimDocuments.stored(fence))
                     .append("servingTables", List.of());
             replace(session, row, replacement); return OptionalLong.of(expectedEpoch + 1);
-        });
+        }));
     }
     @Override public Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain);
         if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
         Set<String> captured = tables(tables);
-        return transaction(session -> {
+        return changingChain(() -> transaction(session -> {
             prove(session, fence);
             Document row = requireRoot(session, chain);
             requireCapture(row, fence);
@@ -146,7 +153,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     .append("requestedTables", sorted(requested)).append("servingTables", sorted(requested));
             replace(session, row, replacement);
             return Optional.of(decode(replacement));
-        });
+        }));
     }
 
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
@@ -155,7 +162,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     @Override public Optional<SrsChainState> publishServingTablesAndGet(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
-        return transaction(session -> {
+        return changingChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCurrent(row, epoch, fence);
             SrsChainState held = state(session, row);
             if (!captured.containsAll(held.requestedTables())) return Optional.empty();
@@ -163,8 +170,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
             var replacement = new Document(row).append("servingTables", sorted(captured));
             replace(session, row, replacement);
             return Optional.of(decode(replacement));
-        });
+        }));
     }
+    private <T> T changingChain(java.util.function.Supplier<T> change) {
+        appendLease.drop();
+        try { return change.get(); }
+        finally { appendLease.drop(); }
+    }
+
     @Override public Optional<SrsChainState> checkpoint(String chain, long expectedRevision, SrsCaptureCheckpoint checkpoint, WorkloadClaimFence fence) {
         requireName(chain); Objects.requireNonNull(checkpoint, "checkpoint");
         if (expectedRevision < 0 || expectedRevision == Long.MAX_VALUE) throw new IllegalArgumentException("invalid checkpoint revision");

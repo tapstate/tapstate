@@ -29,6 +29,9 @@ class NestColdLayerMeasurementAvailabilityTest {
 
         watch.saw("p", Map.of("ns", legacy(400, 240).withKeyCounts(1_200, 600)));
         assertThat(alert.crossed).hasSize(1);
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p", Map.of("ns", legacy(500, 240).withKeyCounts(1_500, 600)));
+        assertThat(alert.cleared).hasSize(1);
         NestStateWindow recovered = alert.cleared.getFirst();
         assertThat(recovered.accesses()).isEqualTo(100);
         assertThat(recovered.keyAccesses()).hasValue(300);
@@ -47,10 +50,13 @@ class NestColdLayerMeasurementAvailabilityTest {
 
         watch.saw("p", Map.of("ns", legacy(200, 140).withKeyCounts(800, 480)));
         assertThat(alert.crossed).hasSize(1);
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p", Map.of("ns", legacy(300, 146).withKeyCounts(950, 510)));
+        assertThat(alert.cleared).hasSize(1);
         NestStateWindow recovered = alert.cleared.getFirst();
         assertThat(recovered.accesses()).isEqualTo(100);
-        assertThat(recovered.keyAccesses()).hasValue(400);
-        assertThat(recovered.coldKeys()).hasValue(80);
+        assertThat(recovered.keyAccesses()).hasValue(150);
+        assertThat(recovered.coldKeys()).hasValue(30);
         assertThat(recovered.servedFromCold()).hasValue(0.2);
         report("publication-resumed", recovered);
     }
@@ -64,10 +70,13 @@ class NestColdLayerMeasurementAvailabilityTest {
         assertThat(alert.cleared).isEmpty();
 
         watch.saw("p", Map.of("ns", legacy(100, 20).withKeyCounts(400, 40)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p", Map.of("ns", legacy(200, 30).withKeyCounts(600, 60)));
+        assertThat(alert.cleared).hasSize(1);
         NestStateWindow recovered = alert.cleared.getFirst();
         assertThat(recovered.accesses()).isEqualTo(100);
-        assertThat(recovered.keyAccesses()).hasValue(400);
-        assertThat(recovered.coldKeys()).hasValue(40);
+        assertThat(recovered.keyAccesses()).hasValue(200);
+        assertThat(recovered.coldKeys()).hasValue(20);
         assertThat(recovered.servedFromCold()).hasValue(0.1);
         report("counter-reset", recovered);
     }

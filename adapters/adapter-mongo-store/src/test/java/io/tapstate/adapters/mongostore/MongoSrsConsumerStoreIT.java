@@ -7,9 +7,11 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerContext;
+import io.tapstate.spi.store.SrsConsumerRun;
 import io.tapstate.spi.store.SrsSnapshotPin;
 import io.tapstate.spi.store.SrsModel;
 import io.tapstate.spi.store.SrsModelKey;
+import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SourceTable;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SrsConsumerKey;
@@ -20,6 +22,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import io.tapstate.spi.store.WriterProgress;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.testsupport.RequiresDocker;
 import org.bson.Document;
@@ -80,6 +83,90 @@ class MongoSrsConsumerStoreIT {
             var oversized=new io.tapstate.spi.store.SrsConsumerMembership(a.context(),a.revision(),false,large,a.commandFence());
             SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),new MongoSrsConsumerRecords(SCOPE).membership(oversized));
             assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+        });
+    }
+
+    @Test void readLeaseFinishesOldEventsAndRevalidatesTheFirstEventOfTheNextCaptureEpoch() {
+        withBusiness(f -> {
+            String table = "orders";
+            String ring = ring(table);
+            var log = preparedTrimLog(f);
+            f.chains().requestTables(CHAIN, Set.of(table), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of(table), f.captureFence())).isTrue();
+
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database().getName(), "find", "srs_models")) {
+                var reader = new MongoSrsConsumerStore(witness.client, witness.database, SCOPE, () -> {}, null,
+                        MongoSrsLease.selected());
+                var member = reader.attach(A, 0, Set.of(table), f.fenceA()).orElseThrow();
+                var run = SrsConsumerRun.of(positionScope(A), member);
+                assertThat(reader.startReadingAfter(A, member.revision(), 0, table, -1, f.fenceA())).isTrue();
+                var old = log.load(ring, 0).orElseThrow();
+                var first = verify(reader, run, table, ring, 0, old);
+                int firstProof = witness.confirmedCommands();
+                assertThat(firstProof).isPositive();
+
+                assertThat(f.chains().openEpoch(CHAIN, 1, f.captureFence())).hasValue(2);
+                assertThat(f.chains().publishServingTables(CHAIN, 2, Set.of(table), f.captureFence())).isTrue();
+                var nextKey = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 2, 0);
+                models(f).publishInitial(nextKey, ring, first.table(), f.captureFence());
+                var next = new SrsLogRecord("t5", Op.INSERT, 2, null, Map.of("id", 5), 0, f.captureFence(), 2);
+                var latest = new SrsLogRecord("t6", Op.INSERT, 3, null, Map.of("id", 6), 0, f.captureFence(), 2);
+                log.storeAll(ring, 5, List.of(next, latest));
+
+                for (long sequence = 1; sequence < 5; sequence++) {
+                    assertThat(verify(reader, run, table, ring, sequence, log.load(ring, sequence).orElseThrow())).isEqualTo(first);
+                }
+                assertThat(witness.confirmedCommands()).isEqualTo(firstProof);
+                assertThat(verify(reader, run, table, ring, 5, log.load(ring, 5).orElseThrow()).key()).isEqualTo(nextKey);
+                int nextProof = witness.confirmedCommands();
+                assertThat(nextProof).isGreaterThan(firstProof);
+                assertThat(verify(reader, run, table, ring, 6, log.load(ring, 6).orElseThrow()).key()).isEqualTo(nextKey);
+                assertThat(verify(reader, run, table, ring, 3, log.load(ring, 3).orElseThrow())).isEqualTo(first);
+                assertThat(witness.confirmedCommands()).isEqualTo(nextProof);
+
+                assertThat(reader.detach(A, member.revision(), f.fenceA())).isPresent();
+                assertThat(reader.verifyReadEvent(run, table, ring, 6, 2, 0, f.captureFence())).isEmpty();
+            }
+        });
+    }
+
+    private static SrsModel verify(MongoSrsConsumerStore reader, SrsConsumerRun run, String table,
+            String ring, long sequence, SrsLogRecord event) {
+        return reader.verifyReadEvent(run, table, ring, sequence, event.epoch(), event.schemaVer(),
+                event.captureFence()).orElseThrow();
+    }
+
+    @Test void cursorLeaseSkipsRepeatedProofButFencesEachWriteAndKeepsTheRecoveryFloor() {
+        withBusiness(f -> {
+            String table = "orders";
+            preparedTrimLog(f);
+            f.chains().requestTables(CHAIN, Set.of(table), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of(table), f.captureFence())).isTrue();
+            var model = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 1, 0);
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 1), "t0"),
+                    Map.of(table, new io.tapstate.spi.store.SrsTableCheckpoint(model, 0)));
+            assertThat(f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence())).isPresent();
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database().getName(), "find", "srs_models")) {
+                var reader = new MongoSrsConsumerStore(witness.client, witness.database, SCOPE, () -> {}, null, MongoSrsLease.selected());
+                var member = reader.attach(A, 0, Set.of(table), f.fenceA()).orElseThrow();
+                assertThat(reader.startReadingAfter(A, member.revision(), 0, table, -1, f.fenceA())).isTrue();
+                assertThat(reader.advanceReadSequence(A, member.revision(), table, 0, f.fenceA())).isTrue();
+                int proofQueries = witness.confirmedCommands();
+                assertThat(proofQueries).isPositive();
+                assertThat(reader.advanceReadSequence(A, member.revision(), table, 1, f.fenceA())).isTrue();
+                assertThat(witness.confirmedCommands()).isEqualTo(proofQueries);
+                var held = f.consumers().progress(A).orElseThrow();
+                assertThat(held.cursor().perTableSeq()).containsEntry(table, 1L);
+                assertThat(held.ringDoneThrough()).containsEntry(table, -1L);
+                assertThat(held.cursor().sinkAcked()).isNull();
+
+                var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database());
+                claims.updateOne(new Document("_id", MongoWorkloadClaimStore.id(f.pipelineA().key())),
+                        new Document("$inc", new Document("claimGeneration", 1L)));
+                assertThatThrownBy(() -> reader.advanceReadSequence(A, member.revision(), table, 2, f.fenceA()))
+                        .satisfies(MongoSrsConsumerStoreIT::fenced);
+                assertThat(f.consumers().progress(A)).contains(held);
+            }
         });
     }
 
@@ -1361,7 +1448,8 @@ class MongoSrsConsumerStoreIT {
     }
     private static String ring(String table) { return "srs." + CHAIN + "." + table; }
 
-    @Test void incrementalBatchKeepsSchemaBoundariesAndOriginalProgressFences() {
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void incrementalBatchKeepsSchemaBoundariesAndOriginalProgressFences(boolean leased) {
         withBusiness(f -> {
             var refs = publishSnapshotModels(f, Set.of("orders"));
             var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
@@ -1375,14 +1463,30 @@ class MongoSrsConsumerStoreIT {
             var next = new SrsModel(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 1), ring,
                     new SourceTable("orders", List.of(new SourceField("id", "long")), List.of(), List.of()), 100);
             models(f).publish(next, f.captureFence());
-            var store = runtimeConsumer(f.client(), f.database());
+            var structure = new MongoCacheMetadataStructure(f.database(), Duration.ofHours(1));
+            var store = leased
+                    ? new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, structure::verifySrs,
+                            MongoSrsLease.selected(), true)
+                    : runtimeConsumer(f.client(), f.database());
             var beforeDdl = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(99, 1, 0, f.captureFence());
             var afterDdl = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(100, 1, 1, f.captureFence());
             var wrongSchema = new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(100, 1, 0, f.captureFence());
             var changed = f.captureFence();
             var wrongCapture = new WorkloadClaimFence(changed.key(), changed.owner(), changed.claimGeneration() + 1,
                     changed.executionGeneration(), changed.topologyRevision());
-            assertThat(store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, afterDdl))).isTrue();
+            var observedCommands = new java.util.ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(observedCommands::add);
+            try {
+                assertThat(store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, afterDdl))).isTrue();
+                assertThat(observedCommands).contains("find");
+                if (leased) {
+                    observedCommands.clear();
+                    assertThat(store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, afterDdl))).isTrue();
+                    assertThat(observedCommands).isEmpty();
+                }
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
             assertThatThrownBy(() -> store.verifyReadEvents(run, "orders", ring, List.of(beforeDdl, wrongSchema)))
                     .satisfies(error -> code(error, IoError.SRS_EVENT_MODEL_UNAVAILABLE));
             assertThatThrownBy(() -> store.verifyReadEvents(run, "orders", ring, List.of(afterDdl,
@@ -1749,7 +1853,9 @@ class MongoSrsConsumerStoreIT {
     }
 
     private static void withBusiness(Scenario scenario) {
-        try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
+        try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                .addCommandListener(MongoCommandObservation.LISTENER).build())) {
             var database = client.getDatabase("srs_consumer_" + UUID.randomUUID().toString().replace("-", ""));
             try {
                 try (var session = client.startSession()) {

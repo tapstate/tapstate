@@ -9,18 +9,22 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.LeasedStateStore;
 import io.tapstate.spi.store.WorkloadClaimKey;
 import io.tapstate.spi.store.WorkloadClaimReading;
 import io.tapstate.spi.store.WorkloadClaimStore;
 import io.tapstate.spi.store.WorkloadClaimType;
 
+import java.lang.ref.WeakReference;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeoutException;
@@ -88,6 +92,8 @@ final class ExecutionAuthorization implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Map<ReadKey, Entry> entries = new ConcurrentHashMap<>();
     private final Map<ReadKey, Long> nextReadNanos = new ConcurrentHashMap<>();
+    /** State stores whose lease was proved under one pipeline's reading; held weakly, never kept alive from here. */
+    private final Map<ReadKey, List<WeakReference<LeasedStateStore>>> leases = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
     private final ThreadPoolExecutor proofReaders;
     private final Map<ReadKey, ScopedProof> scopedProofs = new ConcurrentHashMap<>();
@@ -220,6 +226,50 @@ final class ExecutionAuthorization implements AutoCloseable {
                     EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
         }
         return authorized.claim();
+    }
+
+    /**
+     * Ties {@code store}'s lease to this member's reading of {@code fence}'s claim: the lease is dropped the
+     * moment a refresh cannot reach the store, finds the claim gone, moved to other generations or with no
+     * lease left, or a newer scope replaces the reading, and when this guard closes. The store proves a new
+     * lease at its next operation, which fails closed while the claim is not this member's.
+     */
+    void holdLease(ExecutionFence fence, LeasedStateStore store) {
+        Objects.requireNonNull(fence); Objects.requireNonNull(store);
+        if (!fenced) return;
+        sweepLeases();
+        leases.compute(ReadKey.of(fence), (key, registered) -> {
+            var held = registered == null ? new CopyOnWriteArrayList<WeakReference<LeasedStateStore>>() : registered;
+            held.add(new WeakReference<>(store));
+            return held;
+        });
+        if (closed.get()) dropLeases(ReadKey.of(fence));
+    }
+
+    private void dropLeases(ReadKey key) {
+        var held = leases.get(key);
+        if (held == null) return;
+        for (var reference : held) {
+            var store = reference.get();
+            if (store != null) store.dropLease();
+        }
+        pruneLeases(key);
+    }
+
+    /**
+     * Sweeps every key, not only one being registered or dropped: a reading that ended keeps no entry to
+     * trigger its own cleanup. Runs on every registration and every background refresh.
+     */
+    private void sweepLeases() {
+        for (var key : leases.keySet()) pruneLeases(key);
+    }
+
+    /** Forgets collected stores under {@code key}, and the key once none is left, atomically with registration. */
+    private void pruneLeases(ReadKey key) {
+        leases.computeIfPresent(key, (ignored, registered) -> {
+            registered.removeIf(reference -> reference.get() == null);
+            return registered.isEmpty() ? null : registered;
+        });
     }
 
     /** A physical source uses the same bounded proof cache, independently of all Pipeline executions. */
@@ -503,12 +553,14 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     private void refreshScopedProofs() {
+        sweepLeases();
         long now = System.nanoTime();
         scopedProofs.forEach((key, proof) -> {
             synchronized (proof) {
                 if (!proof.reading && !proof.storeReading.get() && now - proof.lastUsed >= 4 * windowNanos) {
                     if (scopedProofs.remove(key, proof)) {
                         proof.superseded = true;
+                        dropLeases(key);
                         proof.result = new ProofResult(null, true);
                         proof.notifyAll();
                     }
@@ -548,6 +600,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                         held <= 0);
             }
         } catch (RuntimeException unavailable) {
+            dropLeases(key);
             proof.readFailure = unavailable instanceof TapstateException coded ? coded.getMessage() : unavailable.getClass().getSimpleName();
             if (definitiveRefusal(unavailable)) {
                 result = new ProofResult(null, true);
@@ -573,6 +626,9 @@ final class ExecutionAuthorization implements AutoCloseable {
                 proof.reading = false;
                 if (!closed.get() && !proof.superseded && scopedProofs.get(key) == proof) {
                     if (result != null) {
+                        var previous = proof.result.entry();
+                        if (result.denied() || previous != null && (result.entry() == null
+                                || !previous.claim().equals(result.entry().claim()))) dropLeases(key);
                         if (key.scope() != null && !proof.scopeProved && newerScopeProved(key)) {
                             proof.superseded = true;
                             proof.result = new ProofResult(null, true);
@@ -610,6 +666,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                     || key.scope().stateGeneration() >= newer.scope().stateGeneration()) return;
             synchronized (proof) {
                 proof.superseded = true;
+                dropLeases(key);
                 proof.result = new ProofResult(null, true);
                 proof.notifyAll();
             }
@@ -647,6 +704,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 nextReadNanos.remove(key, deadline);
             }
         });
+        sweepLeases();
     }
 
     /**
@@ -661,6 +719,16 @@ final class ExecutionAuthorization implements AutoCloseable {
      * with no reading in hand to say so and no reading allowed until the floor runs out.
      */
     private synchronized Entry read(ReadKey key, boolean evenIfStillLive) {
+        Entry before = entries.get(key);
+        try {
+            return readStoreEntry(key, evenIfStillLive);
+        } finally {
+            Entry after = entries.get(key);
+            if (before != null && (after == null || !after.claim().equals(before.claim()))) dropLeases(key);
+        }
+    }
+
+    private Entry readStoreEntry(ReadKey key, boolean evenIfStillLive) {
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(key);
         if (entry != null && !evenIfStillLive && now - entry.deadlineNanos() < 0) {
@@ -707,6 +775,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     @Override
     public void close() {
         closed.set(true); entries.clear(); nextReadNanos.clear();
+        leases.keySet().forEach(this::dropLeases);
         scopedProofs.values().forEach(proof -> {
             synchronized (proof) { proof.notifyAll(); }
         });

@@ -448,13 +448,13 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Runnable verifyStructure = planning ? () -> {} : () -> {
             if (!runtime || !expected.equals(admittedCaptureStartup.get())) structure.verifySrs();
         };
-        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure);
+        var lease = MongoSrsLease.selected();
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
         return new io.tapstate.spi.store.SrsStores(
-                new MongoSrsChainStore(client, database, expected, active, verifyStructure), models,
+                new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
-                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models),
-                runtime ? MongoSrsConsumerStore.admittedRuntime(client, database, expected, active, verifyStructure)
-                        : new MongoSrsConsumerStore(client, database, expected, active, verifyStructure));
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(), runtime));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,

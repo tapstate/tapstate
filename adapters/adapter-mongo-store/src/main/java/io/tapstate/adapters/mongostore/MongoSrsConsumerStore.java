@@ -49,7 +49,9 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Membership, its cursor and minimal chain dependency facts change in one cache transaction. */
 public final class MongoSrsConsumerStore implements SrsConsumerStore {
@@ -66,6 +68,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     private final boolean runtimeStructure;
     private final MongoSrsChainStore chains;
     private final MongoSrsConsumerRecords records;
+    private final MongoSrsLease readLease;
+    private final AtomicReference<ProvenReads> provenReads;
+    private final MongoSrsLease cursorLease;
+    private final AtomicReference<ProvenCursor> provenCursor;
 
     public MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -74,17 +80,33 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         this(client, database, scope, requireActive, null);
     }
     MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
-        this(client, database, scope, requireActive, requireStructure, false);
+        this(client, database, scope, requireActive, requireStructure, MongoSrsLease.perTransaction(), false);
     }
 
-    /** The caller has verified the SRS and workload-claim collections for this admitted CACHE view. */
+    MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            Runnable requireStructure, MongoSrsLease readLease) {
+        this(client, database, scope, requireActive, requireStructure, readLease, false);
+    }
+
     static MongoSrsConsumerStore admittedRuntime(MongoClient client, MongoDatabase database, CacheBusinessScope scope,
             Runnable requireActive, Runnable requireStructure) {
-        return new MongoSrsConsumerStore(client, database, scope, requireActive, requireStructure, true);
+        return new MongoSrsConsumerStore(client, database, scope, requireActive, requireStructure,
+                MongoSrsLease.perTransaction(), true);
+    }
+
+    MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
+            Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure) {
+        this(client, database, scope, requireActive, requireStructure, readLease, runtimeStructure, new AtomicReference<>(),
+                readLease.enabled() ? MongoSrsLease.selected() : MongoSrsLease.perTransaction(), new AtomicReference<>());
     }
 
     private MongoSrsConsumerStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive,
-            Runnable requireStructure, boolean runtimeStructure) {
+            Runnable requireStructure, MongoSrsLease readLease, boolean runtimeStructure, AtomicReference<ProvenReads> provenReads,
+            MongoSrsLease cursorLease, AtomicReference<ProvenCursor> provenCursor) {
+        this.readLease = readLease;
+        this.provenReads = provenReads;
+        this.cursorLease = cursorLease;
+        this.provenCursor = provenCursor;
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = requireStructure == null ? this::verifyConsumerStructure : requireStructure;
@@ -93,7 +115,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
     @Override public MongoSrsConsumerStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, runtimeStructure);
+        return new MongoSrsConsumerStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, readLease, runtimeStructure, provenReads, cursorLease, provenCursor);
     }
 
     @Override public SharedSrsRecoverySnapshot inspectSharedRecovery(CapturePreparation previous) {
@@ -342,7 +364,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             if (fixedPosition == null) { fixedPosition = sourcePosition; fixedTables = actual; fixedAt = at; }
             else if (!fixedPosition.equals(sourcePosition) || !fixedTables.equals(actual)) throw fullUnproven(chain);
             requireCaptureCurrent();
-            var result = transaction(session -> {
+            var result = changingTheConsumer(() -> transaction(session -> {
                 proveFreshFull(session, full, original, node, capture, prepared);
                 var held = view(session, chain);
                 if (proposed != null && held.root().equals(proposedRoot)) return retained(session, held, snapshotEpoch, sourcePosition, actual);
@@ -387,7 +409,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 // A candidate is never a commit receipt: a retry must prove its exact durable root and cursor.
                 proposed = candidate; proposedRoot = new Document(replacement);
                 return candidate;
-            });
+            }));
             requireCaptureCurrent();
             return result;
         }
@@ -648,34 +670,134 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         if (!scope.equals(run.cacheScope())) return false;
         var batch = List.copyOf(events);
         if (batch.isEmpty()) return true;
-        return transaction(runtimeStructure, session -> {
-            var held = own(session, run.context());
-            if (held == null || held.member().detached() || held.member().revision() != run.membershipRevision()
-                    || !held.cursor().value().perTableSeq().containsKey(table)) return false;
-            var pin = singleSnapshotModel(session, held);
-            var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
-            models.verifyReadBatch(session, held.root(), run.miningChainId(), table, ring, batch, pin);
+        requireActive.run();
+        var before = readLease.observe();
+        var known = provenReads.get();
+        boolean reuse = readLease.stands(before) && known != null && known.lease() == before && known.run().equals(run);
+        if (reuse && batch.stream().allMatch(event -> {
+                    var model = known.models().get(readModel(table, ring, event));
+                    return model != null && model.range().covers(event.sequence());
+                })) return true;
+
+        long started = System.nanoTime();
+        try {
+            var checked = transaction(runtimeStructure, session -> {
+                var held = own(session, run.context());
+                if (held == null || held.member().detached()
+                        || !bound(held.member(), run.membershipRevision(), run.originalClaim())
+                        || !held.cursor().value().perTableSeq().containsKey(table)) return null;
+                var pin = singleSnapshotModel(session, held);
+                var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+                var references = models.verifyReadBatch(session, held.root(), run.miningChainId(), table, ring, batch, pin);
+                if (!readLease.enabled()) return new BatchReadProof(Map.of(), 0);
+                var ranges = new HashMap<ReadModel, MongoSrsModelStore.ModelReference>();
+                for (var event : batch) {
+                    var model = readModel(table, ring, event);
+                    ranges.put(model, references.get(model.key(run)));
+                }
+                long remaining = MongoSrsLease.remainingMillis(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),
+                        session, run.originalClaim());
+                return new BatchReadProof(Map.copyOf(ranges), remaining);
+            });
+            if (checked == null) {
+                readLease.drop();
+                return false;
+            }
+            if (reuse && readLease.stands(before)) {
+                // Add the proved models without extending the deadline of any previously proved range.
+                var ranges = new HashMap<>(known.models());
+                ranges.putAll(checked.models());
+                provenReads.compareAndSet(known, new ProvenReads(before, run, Map.copyOf(ranges)));
+            } else {
+                var published = readLease.proved(before, started, checked.remainingMillis());
+                if (published != null) provenReads.set(new ProvenReads(published, run, checked.models()));
+            }
             return true;
-        });
+        } catch (RuntimeException failure) {
+            readLease.drop();
+            throw failure;
+        }
     }
+
+    private static ReadModel readModel(String table, String ring, ReadEvent event) {
+        return new ReadModel(table, ring, event.epoch(), event.version(), event.capture());
+    }
+
+    private record BatchReadProof(Map<ReadModel, MongoSrsModelStore.ModelReference> models, long remainingMillis) {}
 
     @Override public Optional<SrsModel> verifyReadEvent(SrsConsumerRun run, String table, String ring, long sequence,
             long epoch, long version, WorkloadClaimFence capture) {
-        Objects.requireNonNull(run,"run");
-        if(!scope.equals(run.cacheScope()))return Optional.empty();
-        return transaction(session -> {
-            var original=own(session,run.context());
-            if(original==null || original.member().detached())return Optional.empty();
-            var held=original.cursor();validateSnapshot(session,run.context(),held.snapshot());
-            if(original.member().revision()!=run.membershipRevision() || !held.value().perTableSeq().containsKey(table))return Optional.empty();
-            if(sequence<0 || sequence==Long.MAX_VALUE || epoch<1 || epoch==Long.MAX_VALUE || version==Long.MAX_VALUE || capture==null)
-                throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.SRS_EVENT_MODEL_UNAVAILABLE,
-                        Map.of("ring",ring,"epoch",String.valueOf(epoch),"version",String.valueOf(version)),null);
-            var expected=new SrsModelKey(run.miningChainId(),table,run.scope().cacheIncarnation(),epoch,version);
-            var models=new MongoSrsModelStore(client,database,scope,requireActive,requireStructure);
-            return Optional.of(models.requireEventInSession(session,expected,ring,sequence,capture));
-        });
+        Objects.requireNonNull(run, "run");
+        if (!scope.equals(run.cacheScope())) return Optional.empty();
+        requireActive.run();
+
+        var before = readLease.observe();
+        var known = provenReads.get();
+        boolean reuse = readLease.stands(before) && known != null && known.lease() == before && known.run().equals(run);
+        var event = new ReadModel(table, ring, epoch, version, capture);
+        boolean coordinates = sequence >= 0 && sequence < Long.MAX_VALUE && epoch > 0 && epoch < Long.MAX_VALUE
+                && version >= 0 && version < Long.MAX_VALUE && capture != null;
+        if (reuse && coordinates) {
+            var proof = known.models().get(event);
+            if (proof != null && proof.range().covers(sequence)) return Optional.of(proof.model());
+        }
+
+        long started = System.nanoTime();
+        try {
+            var checked = transaction(session -> {
+                var original = own(session, run.context());
+                if (original == null || original.member().detached() || !bound(original.member(), run.membershipRevision(), run.originalClaim()))
+                    return Optional.<ReadProof>empty();
+                var held = original.cursor();
+                validateSnapshot(session, run.context(), held.snapshot());
+                if (!held.value().perTableSeq().containsKey(table)) return Optional.<ReadProof>empty();
+
+                if (!coordinates)
+                    throw new TapstateException(IoError.SRS_EVENT_MODEL_UNAVAILABLE,
+                            Map.of("ring", ring, "epoch", String.valueOf(epoch), "version", String.valueOf(version)), null);
+
+                var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
+                var reference = models.requireEventReference(session, event.key(run), ring, capture);
+                reference.range().requireAt(sequence, ring, epoch, version);
+
+                long remaining = readLease.enabled() ? MongoSrsLease.remainingMillis(
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), session, run.originalClaim()) : 0;
+                var ranges = new HashMap<ReadModel, MongoSrsModelStore.ModelReference>();
+                if (reuse) {
+                    for (var prior : known.models().keySet()) {
+                        if (prior.equals(event) || !held.value().perTableSeq().containsKey(prior.table())) continue;
+                        try {
+                            ranges.put(prior, models.requireEventReference(session, prior.key(run), prior.ring(), prior.capture()));
+                        } catch (TapstateException unavailable) {
+                            if (unavailable.code() != IoError.SRS_EVENT_MODEL_UNAVAILABLE) throw unavailable;
+                        }
+                    }
+                }
+                ranges.put(event, reference);
+                return Optional.of(new ReadProof(reference.model(), Map.copyOf(ranges), remaining));
+            });
+            if (checked.isEmpty()) {
+                readLease.drop();
+                return Optional.empty();
+            }
+            var proof = checked.orElseThrow();
+            var published = readLease.proved(before, started, proof.remainingMillis());
+            if (published != null) provenReads.set(new ProvenReads(published, run, proof.models()));
+            return Optional.of(proof.model());
+        } catch (RuntimeException failure) {
+            readLease.drop();
+            throw failure;
+        }
     }
+
+    private record ReadModel(String table, String ring, long epoch, long version, WorkloadClaimFence capture) {
+        SrsModelKey key(SrsConsumerRun run) {
+            return new SrsModelKey(run.miningChainId(), table, run.scope().cacheIncarnation(), epoch, version);
+        }
+    }
+    private record ReadProof(SrsModel model, Map<ReadModel, MongoSrsModelStore.ModelReference> models, long remainingMillis) {}
+    private record ProvenReads(MongoSrsLease.Lease lease, SrsConsumerRun run,
+                               Map<ReadModel, MongoSrsModelStore.ModelReference> models) {}
 
     @Override public boolean beginWriterRun(SrsConsumerContext context,long membershipRevision,String runId,
             Map<String,List<String>> expected,WorkloadClaimFence fence) {
@@ -773,20 +895,72 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public boolean advanceReadSequence(SrsConsumerContext context,long membershipRevision,String table,long sequence,WorkloadClaimFence fence) {
         Objects.requireNonNull(context,"context"); requireRevision(membershipRevision);
         if (table == null || table.isBlank() || sequence < -1 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid original consumer read sequence");
-        return transaction(runtimeStructure, session -> {
-            proveProgress(session, context, fence, runtimeStructure);
-            var own = runtimeStructure ? requireIncrementalOwn(session, context) : requireOwn(session, context);
-            if (!bound(own.member(),membershipRevision,fence)) return false;
-            if (!own.member().tables().contains(table) || !own.cursor().ringDoneThrough().containsKey(table)) throw unavailable(context.key().miningChainId());
-            var held = own.cursor(); var old = held.value();
-            if (sequence <= old.perTableSeq().get(table)) return true;
-            var read = new HashMap<>(old.perTableSeq()); read.put(table,sequence);
-            var next = new ConsumerOffset(old.pipelineId(),read,old.sinkAcked(),old.snapshotCompletedTables(),old.cdcStartPosition(),
-                    old.snapshotEpoch(),old.sinkAckedByTable(),old.progressKind());
-            replaceProgress(session,own,next,held.writerRun());
-            return true;
-        });
+        if (!cursorLease.enabled()) {
+            return transaction(runtimeStructure, session -> {
+                proveProgress(session, context, fence, runtimeStructure);
+                var own = runtimeStructure ? requireIncrementalOwn(session, context) : requireOwn(session, context);
+                return writeReadCursor(session, own.member(), own.cursor(), membershipRevision, table, sequence, fence);
+            });
+        }
+        var before = cursorLease.observe();
+        var known = provenCursor.get();
+        var pipeline = pipelineAccess(context, fence);
+        long started = System.nanoTime();
+        try {
+            var result = inTransaction(session -> {
+                if (known != null && known.lease() == before && cursorLease.stands(before)
+                        && known.member().context().equals(context) && known.member().revision() == membershipRevision
+                        && known.member().commandFence().equals(fence)) {
+                    var current = pipeline.stateForWriterProgress(session, runtimeStructure);
+                    pipeline.updateState(session, current, new Document(), false);
+                    var row = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
+                            .find(session, new Document("_id", records.id(context.key()))).first();
+                    if (row != null && Long.valueOf(membershipRevision).equals(row.get("membershipRevision"))) {
+                        var cursor = records.cursor(known.member(), row);
+                        return new CursorResult(writeReadCursor(session, known.member(), cursor, membershipRevision, table, sequence, fence), null, 0L);
+                    }
+                    cursorLease.drop();
+                    var own = requireOwn(session, context);
+                    return new CursorResult(writeReadCursor(session, own.member(), own.cursor(), membershipRevision, table, sequence, fence), null, 0L);
+                }
+                validateStore(session, runtimeStructure);
+                proveProgress(session, context, fence, runtimeStructure);
+                var own = runtimeStructure ? requireIncrementalOwn(session, context) : requireOwn(session, context);
+                if (!writeReadCursor(session, own.member(), own.cursor(), membershipRevision, table, sequence, fence))
+                    return new CursorResult(false, null, 0L);
+                long remaining = MongoSrsLease.remainingMillis(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), session, fence);
+                return new CursorResult(true, own.member(), remaining);
+            });
+            if (!result.advanced()) {
+                cursorLease.drop();
+            } else if (result.proved() != null) {
+                var published = cursorLease.proved(before, started, result.remainingMillis());
+                if (published != null) provenCursor.set(new ProvenCursor(published, result.proved()));
+            }
+            return result.advanced();
+        } catch (RuntimeException failure) {
+            cursorLease.drop();
+            throw failure;
+        }
     }
+
+    private boolean writeReadCursor(ClientSession session, SrsConsumerMembership member, MongoSrsConsumerRecords.Cursor held,
+            long membershipRevision, String table, long sequence, WorkloadClaimFence fence) {
+        if (!bound(member, membershipRevision, fence)) return false;
+        if (!member.tables().contains(table) || !held.ringDoneThrough().containsKey(table))
+            throw unavailable(member.context().key().miningChainId());
+        var old = held.value();
+        if (sequence <= old.perTableSeq().get(table)) return true;
+        var read = new HashMap<>(old.perTableSeq());
+        read.put(table, sequence);
+        var next = new ConsumerOffset(old.pipelineId(), read, old.sinkAcked(), old.snapshotCompletedTables(), old.cdcStartPosition(),
+                old.snapshotEpoch(), old.sinkAckedByTable(), old.progressKind());
+        replaceProgress(session, member, held, next, held.writerRun(), held.ringDoneThrough());
+        return true;
+    }
+
+    private record ProvenCursor(MongoSrsLease.Lease lease, SrsConsumerMembership member) {}
+    private record CursorResult(boolean advanced, SrsConsumerMembership proved, long remainingMillis) {}
 
     private static boolean bound(SrsConsumerMembership member,long revision,WorkloadClaimFence fence) {
         if (member.revision() != revision) return false;
@@ -797,7 +971,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         replaceProgress(session,own,value,run,own.cursor().ringDoneThrough());
     }
     private void replaceProgress(ClientSession session,Own own,ConsumerOffset value,SrsConsumerWriterRun run,Map<String,Long> done) {
-        var held = own.cursor(); var member = own.member(); String chain = member.context().key().miningChainId();
+        replaceProgress(session, own.member(), own.cursor(), value, run, done);
+    }
+
+    private void replaceProgress(ClientSession session, SrsConsumerMembership member, MongoSrsConsumerRecords.Cursor held,
+            ConsumerOffset value, SrsConsumerWriterRun run, Map<String, Long> done) {
+        String chain = member.context().key().miningChainId();
         if (held.revision() >= Long.MAX_VALUE - 1) throw unavailable(chain);
         var next = records.cursor(member,value,held.revision()+1,held.snapshot(),run,MongoSrsConsumerRecords.confirmedFloors(value,done,run));
         if (SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).replaceOne(session,
@@ -810,7 +989,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context, "context"); Objects.requireNonNull(snapshot, "snapshot");
         requireRevision(membershipRevision); requireRevision(expectedProgressRevision); String chain = context.key().miningChainId();
         var pipeline = pipelineAccess(context, fence);
-        return pinTransaction(pipeline, session -> {
+        return changingTheConsumer(() -> pinTransaction(pipeline, session -> {
             // Retain the claim-before-chain write order. Take the chain fence before
             // a checkpoint can invalidate a snapshot held through the model and cursor reads.
             var business = new MongoCacheBusinessIdentity(database, scope);
@@ -852,7 +1031,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             // An exhausted chain fence can still answer a replay above, but cannot publish a new pin.
             if (root == null) chains.replace(session, view.root(), new Document(view.root()));
             return true;
-        });
+        }));
     }
     private boolean pinTransaction(MongoCachePipelineAccess pipeline, Function<ClientSession, Boolean> action) {
         return StoreIo.call(() -> {
@@ -916,7 +1095,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
         if (selected.isEmpty() || selected.stream().anyMatch(String::isBlank)) throw new IllegalArgumentException("an attached consumer requires tables");
         String chain = context.key().miningChainId();
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             prove(session,context,fence); var view = view(session, chain); var held = view.members().get(context.key().consumerId());
             if (replayed(held, context, expectedRevision, false, selected, fence)) return Optional.of(held);
             long revision = held == null ? 0 : held.revision();
@@ -933,11 +1112,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     new Document("_id", records.id(context.key())).append("membershipRevision", held.revision()), cursorRow).getMatchedCount() != 1) throw unavailable(chain);
             changeRoot(session, view, held == null || held.detached() ? 1 : 0);
             return Optional.of(next);
-        });
+        }));
     }
     @Override public Optional<SrsConsumerMembership> detach(SrsConsumerContext context, long expectedRevision, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision);
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             prove(session, context, fence);
             var held = view(session, context.key().miningChainId());
             var member = held.members().get(context.key().consumerId());
@@ -956,7 +1135,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 }
             }
             return detachInTransaction(session, context, expectedRevision, fence);
-        });
+        }));
     }
     @Override public Optional<SrsConsumerMembership> detachForRebuild(io.tapstate.spi.store.PipelineRebuildPreparation original,
             SrsConsumerMembership membership,WorkloadClaimFence currentNode) {
@@ -964,7 +1143,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         var request=original.request();var physical=request.originalScope();var context=membership.context();
         if(!scope.equals(new CacheBusinessScope(physical.clusterId(),physical.bindingVersion(),physical.cacheIncarnation()))
                 || !physical.pipelineId().equals(context.key().pipelineId()) || physical.stateGeneration()!=context.stateGeneration())throw fenced();
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             MongoPipelineStateRebuilds.requireOriginalActive(original);
             MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
             var held=view(session,context.key().miningChainId()).members().get(context.key().consumerId());
@@ -977,7 +1156,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw fenced();
             access.updateState(session,state,new Document(),false);
             return detachInTransaction(session,context,membership.revision(),request.originalClaim());
-        });
+        }));
     }
     @Override public Optional<SrsConsumerMembership> detachForRetirement(io.tapstate.spi.store.PipelineRetirementPreparation original,
             SrsConsumerMembership membership,WorkloadClaimFence currentNode,Optional<io.tapstate.spi.store.PipelineRetirementRequest.CacheOriginal> isolated) {
@@ -988,7 +1167,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 || !physical.pipelineId().equals(context.key().pipelineId()) || physical.stateGeneration()!=context.stateGeneration()
                 || !fixed.claim().key().equals(declared.claim().key()) || fixed.claim().claimGeneration()<declared.claim().claimGeneration()
                 || fixed.claim().executionGeneration()<declared.claim().executionGeneration() || fixed.epoch()<declared.epoch())throw fenced();
-        return transaction(session -> {
+        return changingTheConsumer(() -> transaction(session -> {
             MongoPipelineRetirements.requireOriginalActive(original);MongoCachePipelinePreparations.proveNode(session,database,scope,currentNode);
             var held=view(session,context.key().miningChainId()).members().get(context.key().consumerId());
             if(replayed(held,context,membership.revision(),true,Set.of(),fixed.claim()))return Optional.of(held);
@@ -998,7 +1177,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             expected.append("pipelineScope",MongoPipelinePreparationFacts.scope(physical)).append("pipelinePreparation.phase","PREPARED");
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,expected,new Document("$inc",new Document("fencedConsumerWrites",1L))).getMatchedCount()!=1)throw fenced();
             access.updateState(session,state,new Document(),false);return detachInTransaction(session,context,membership.revision(),fixed.claim());
-        });
+        }));
     }
 
     private Optional<SrsConsumerMembership> detachInTransaction(ClientSession session,SrsConsumerContext context,long expectedRevision,WorkloadClaimFence fence) {
@@ -1181,19 +1360,40 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 context.key().pipelineId(), context.stateGeneration());
         return new MongoCachePipelineAccess(client, database, physical, fence, requireActive);
     }
+    private <T> T changingTheConsumer(Supplier<T> change) {
+        readLease.drop();
+        cursorLease.drop();
+        try { return change.get(); }
+        finally {
+            readLease.drop();
+            cursorLease.drop();
+        }
+    }
+
     private <T> T transaction(Function<ClientSession, T> action) {
         return transaction(false, action);
     }
+
     private <T> T transaction(boolean structureChecked, Function<ClientSession, T> action) {
+        return inTransaction(session -> {
+            validateStore(session, structureChecked);
+            return action.apply(session);
+        });
+    }
+
+    private void validateStore(ClientSession session, boolean structureChecked) {
+        if (!structureChecked) requireStructure.run();
+        requireActive.run();
+        new MongoCacheBusinessIdentity(database, scope).requireReady(session);
+    }
+
+    private <T> T inTransaction(Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
                         requireActive.run();
-                        if (!structureChecked) requireStructure.run();
-                        requireActive.run();
-                        new MongoCacheBusinessIdentity(database, scope).requireReady(session);
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
                 }

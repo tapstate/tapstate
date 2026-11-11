@@ -42,6 +42,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
     private final Runnable requireActive;
     private final Runnable requireStructure;
     private final MongoSrsModelContexts contexts;
+    private final MongoSrsLease lease;
 
     public MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope) {
         this(client, database, scope, () -> {});
@@ -50,20 +51,34 @@ public final class MongoSrsModelStore implements SrsModelStore {
         this(client, database, scope, requireActive, () -> {});
     }
     MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure) {
+        this(client, database, scope, requireActive, requireStructure, MongoSrsLease.perTransaction());
+    }
+    /** The capture assembly's store: a model change here invalidates the append proof. */
+    MongoSrsModelStore(MongoClient client, MongoDatabase database, CacheBusinessScope scope, Runnable requireActive, Runnable requireStructure,
+                       MongoSrsLease lease) {
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
+        this.lease = Objects.requireNonNull(lease, "lease");
         this.contexts = new MongoSrsModelContexts(database, scope);
     }
     @Override public MongoSrsModelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional, "requireActive");
-        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure);
+        return new MongoSrsModelStore(client, database, scope, () -> { requireActive.run(); additional.run(); }, requireStructure, lease);
     }
     @Override public long reclaim(String chainId,WorkloadClaimFence fence) {
         if(chainId==null || chainId.isBlank())throw new IllegalArgumentException("blank mining chain");
         Objects.requireNonNull(fence,"originalCapture");
         if(fence.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId()))throw claimFenced();
-        return transaction(session -> {
+        // An empty retention pass leaves the append proof valid.
+        boolean changed = true;
+        try {
+            long deleted = transaction(session -> reclaimInSession(session, chainId, fence));
+            changed = deleted > 0;
+            return deleted;
+        } finally { if (changed) lease.drop(); }
+    }
+    private long reclaimInSession(ClientSession session, String chainId, WorkloadClaimFence fence) {
             requireBusiness(session);
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
@@ -97,8 +112,8 @@ public final class MongoSrsModelStore implements SrsModelStore {
                     if(!ids.isEmpty())deleted+=SystemCollections.SRS_MODELS.on(database).deleteMany(session,new Document("_id",new Document("$in",ids))).getDeletedCount();
                 }
             }
+            if (deleted > 0) lease.drop();
             return deleted;
-        });
     }
     private void requireBudget(ClientSession session,SrsModel proposed,Document captured) {
         long bytes=captured.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
@@ -163,9 +178,14 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     @Override public SrsModel publish(SrsModel model, WorkloadClaimFence fence) {
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
-        return transaction(session -> publishInSession(session, model, fence));
+        return changingTheModels(() -> transaction(session -> publishInSession(session, model, fence)));
+    }
+    /** A model change by the owner invalidates the proof so the next append validates again. */
+    private <T> T changingTheModels(java.util.function.Supplier<T> change) {
+        try { return change.get(); } finally { lease.drop(); }
     }
     SrsModel publishInSession(ClientSession session, SrsModel model, WorkloadClaimFence fence) {
+        lease.drop();
         if (!session.hasActiveTransaction()) throw new IllegalStateException("model publication requires its original CACHE transaction");
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
         requireScope(model.key());
@@ -220,28 +240,31 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (ring == null || ring.isBlank() || sequence < 0 || sequence == Long.MAX_VALUE) throw new IllegalArgumentException("invalid event model coordinates");
         return transaction(session -> {
             requireBusiness(session);
-            return requireEventInSession(session,expected,ring,sequence,originalCapture);
+            var reference = requireEventReference(session, expected, ring, originalCapture);
+            reference.range().requireAt(sequence, ring, expected.captureEpoch(), expected.modelVersion());
+            return reference.model();
         });
     }
 
-    SrsModel requireEventInSession(ClientSession session,SrsModelKey expected,String ring,long sequence,WorkloadClaimFence originalCapture) {
-        // Both callers have verified the business identity in this same read transaction.
-        requireScope(expected);requireActive.run();
+    /** The original model and its range, read within the consumer's verification transaction. */
+    ModelReference requireEventReference(ClientSession session, SrsModelKey expected, String ring, WorkloadClaimFence originalCapture) {
+        requireScope(expected);
+        requireActive.run();
         try {
-            if(originalCapture==null)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
-            if(originalCapture.key().type()!=WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId()))throw claimFenced();
-            var chain=requireChain(session,expected);
-            var reference=eventReference(session,ring,expected.captureEpoch(),expected.modelVersion(),originalCapture,false,chain);
-            if(!expected.equals(reference.model().key()))throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
-            reference.range().requireAt(sequence,ring,expected.captureEpoch(),expected.modelVersion());
-            requireActive.run();return reference.model();
-        }catch(TapstateException missing){
-            if(missing.code()==IoError.SRS_MODEL_UNAVAILABLE)throw eventUnavailable(ring,expected.captureEpoch(),expected.modelVersion());
+            if (originalCapture == null) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
+            if (originalCapture.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(originalCapture.key().clusterId())) throw claimFenced();
+            var chain = requireChain(session, expected);
+            var reference = eventReference(session, ring, expected.captureEpoch(), expected.modelVersion(), originalCapture, false, chain);
+            if (!expected.equals(reference.model().key())) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
+            requireActive.run();
+            return reference;
+        } catch (TapstateException missing) {
+            if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, expected.captureEpoch(), expected.modelVersion());
             throw missing;
         }
     }
 
-    void verifyReadBatch(ClientSession session, Document root, String chain, String table, String ring,
+    Map<SrsModelKey, ModelReference> verifyReadBatch(ClientSession session, Document root, String chain, String table, String ring,
             List<ReadEvent> events, SrsModelKey pin) {
         var requested = new HashSet<SrsModelKey>();
         for (var event : events) {
@@ -302,6 +325,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 throw missing;
             }
         }
+        return references;
     }
 
     private SrsModelKey readKey(String chain, String table, ReadEvent event) {
@@ -745,11 +769,15 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     record EventModelRange(long firstSequence, Long nextSequence) {
+        boolean covers(long sequence) {
+            return sequence >= firstSequence && (nextSequence == null || sequence < nextSequence);
+        }
+
         void requireAt(long sequence, String ring, SrsLogRecord event) {
             requireAt(sequence, ring, event.epoch(), event.schemaVer());
         }
         void requireAt(long sequence, String ring, long epoch, long version) {
-            if (sequence < firstSequence || (nextSequence != null && sequence >= nextSequence)) {
+            if (!covers(sequence)) {
                 throw eventUnavailable(ring, epoch, version);
             }
         }

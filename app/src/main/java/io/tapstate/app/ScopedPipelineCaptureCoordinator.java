@@ -272,6 +272,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner==null){execution.ownership().requireEnded(fence);return;}
         if(!original.equals(owner.prepared) || !fence.equals(owner.fence) || !owner.sessions.isEmpty()
                 || !owner.ended.get() && !owner.drainingReports() && needed(owner))throw refused();
+        owner.finishCheckpointingForRetirement();
         owner.ended.set(true);owner.release();execution.ownership().endTenure(fence);owners.remove(original.captureId(),owner);
     }
     synchronized void requireSharedRetired(CapturePreparation original,WorkloadClaimFence fence) {
@@ -1094,6 +1095,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         volatile Long reportDrainStarted;
         volatile boolean handingOff;
         Owner(CapturePreparation prepared,WorkloadClaim initial) { this.prepared=prepared;this.initial=initial;this.fence=WorkloadClaimFence.from(initial); }
+        void finishCheckpointingForRetirement() {
+            if (ended.get() || drainingReports() || physical == null || !physical.live.get()) return;
+            try {
+                physical.finishCheckpointing();
+            } catch (TapstateException missing) {
+                if (missing.code() != IoError.SRS_MODEL_UNAVAILABLE) throw missing;
+                // Control identity has already been proved. An unprovable pending cut must not keep the owner alive.
+                LOG.warn("Retiring capture {} at its last durable checkpoint [{}]", prepared.captureId(), missing.code().code());
+            }
+        }
         void release() {
             if(physical!=null) {physical.close();physical=null;}
             if(lease!=null)lease.closeAfterPhysicalExit();else execution.ownership().release(initial);
@@ -1226,6 +1237,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         volatile boolean ioExitConfirmed;
         Physical(Owner owner){this.owner=owner;}
         void require(){owner.require();if(!live.get())throw refused();}
+        void finishCheckpointing() { if (tail != null) tail.finishCheckpointing(); }
         void requireLocal(){active();if(!live.get() || owner.ended.get())throw refused();execution.authorization().requireCaptureLocal(stores.scope(),owner.fence);}
         void requireReport(){owner.require();if(!reportLive())throw refused();}
         void requireReportLocal(){active();if(owner.ended.get()||!reportLive())throw refused();execution.authorization().requireCaptureLocal(stores.scope(),owner.fence);}
@@ -1291,7 +1303,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             connectors.resolve(configured.connectorId(), configured.artifactHash());
             owner.require();
         }
-        if(owner.physical!=null){owner.physical.close();owner.physical=null;before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);}
+        if(owner.physical!=null){
+            owner.physical.finishCheckpointing();
+            owner.physical.close();owner.physical=null;
+            before=current.chains().load(owner.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
         if(before.epoch()>0 && before.checkpoint()==null)throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",owner.prepared.chainId()),null);
         SrsChainState opened;
         if (admitted) {
@@ -1480,6 +1496,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         for(var owner:unique) {
             owner.sessions.remove(session.original);
             if(owner.sessions.isEmpty() && (owner.ended.get() || !needed(owner))) {
+                owner.finishCheckpointingForRetirement();
                 owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);
             }
         }
@@ -1519,7 +1536,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private static CacheBusinessScope business(PipelineIntentScope scope) { return new CacheBusinessScope(scope.clusterId(),scope.bindingVersion(),scope.cacheIncarnation()); }
     private static TapstateException refused() { return new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null); }
     @Override public synchronized void close() {
-        closed.set(true);maintenance.shutdownNow(); Throwable first=null;
+        Throwable first = null;
+        if (!closed.get()) {
+            maintenance.shutdownNow();
+            for (var owner : owners.values()) {
+                first = cleanup(first, owner::finishCheckpointingForRetirement);
+            }
+        }
+        closed.set(true);
         owners.values().forEach(owner -> owner.ended.set(true));
         for(var session:List.copyOf(sessions.values())) {
             try {stop(session);sessions.remove(session.original,session);}

@@ -85,9 +85,30 @@ within an operation; later visits count again. The flat view spells these instru
 deltas. Older observations without both instruments have no measured cold share. Existing callback
 timings and counters keep their units; callbacks are not physical database command counts.
 
-The cold-layer alert still requires at least 100 logical accesses and a cold share of at least 50%.
-Small samples accumulate, missing key measurements do not establish recovery, and notifications describe
-pressure and recovery transitions.
+The cold-layer alert requires a cold share of at least 50% over at least 100 accesses. It applies that
+floor in keys when split read/write instrumentation is available and in logical accesses for older
+reporters with aggregate key counters. Small samples accumulate and missing measurements do not establish
+recovery. An active alert clears after two measured windows below 40%.
+
+## Nest state metrics
+
+Read the `facts` array of `GET /api/pipelines/{id}/metrics`. Use `tapstate.nest.namespace` to
+join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its step, path and map.
+
+| Metric | Type | What it measures |
+|---|---|---|
+| `tapstate.pipeline.nest.roots.rendered` | Counter | Whole root documents handed to the downstream outbox |
+| `tapstate.pipeline.state.commit.groups` | Counter | Successful state-store write calls |
+| `tapstate.pipeline.state.commit.keys` | Histogram | Keys per successful write call |
+| `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
+| `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
+| `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+
+The root counter measures output from the operator. Target acknowledgement and table loading are
+shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
+within the same execution and counting lifetime. An acknowledged store call may contain multiple
+database transactions. Command counts cover the synchronous Mongo adapter; commands on other
+threads are outside the measurement.
 
 ## Current-run initial-load display
 

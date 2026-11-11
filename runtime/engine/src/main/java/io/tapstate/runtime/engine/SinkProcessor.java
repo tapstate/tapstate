@@ -549,7 +549,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             reapSettled();
         } while (writeWhatIsDue());
         reportWaiting();
-        return inFlight.isEmpty() && queued.isEmpty();
+        boolean done = inFlight.isEmpty() && queued.isEmpty();
+        if (ack != null && done) ack.flush(true);
+        return done;
     }
 
     /**
@@ -690,7 +692,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return;
         }
         closed = true;
-        writer.close();
+        try {
+            if (ack != null) ack.flushOnClose();
+        } finally {
+            writer.close();
+        }
     }
 
     /** Removes every settled write, surfacing the cause of a failed one so it fails the job. */
@@ -728,6 +734,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         });
         if (frontier != null) {
             releaseHeld();
+        if (ack != null) ack.flush(false);
             reportTrailing();
         }
     }
