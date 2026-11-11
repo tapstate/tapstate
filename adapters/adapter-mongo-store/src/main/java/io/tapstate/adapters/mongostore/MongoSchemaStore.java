@@ -314,12 +314,18 @@ public final class MongoSchemaStore implements SchemaStore {
         for (SourceField field : table.fields()) {
             // The document holds both type namespaces, so each key names the one it carries. The declared
             // type is null when discovery could not resolve it; stored as a null value, read back as null.
-            fields.add(new Document("name", field.name())
+            Document stored = new Document("name", field.name())
                     .append("type", field.dataType())
                     .append("tapstateType", field.type().name())
                     .append("unknownBecause", field.unknownBecause())
                     .append("numericType", numericDocument(field.numericType()))
-                    .append("stringType", stringDocument(field.stringType())));
+                    .append("stringType", stringDocument(field.stringType()));
+            // Written only for a column known here by another name than its source gives it, so every
+            // record of a table without one stays byte for byte what it was.
+            if (field.sourceName() != null) {
+                stored.append("sourceName", field.sourceName());
+            }
+            fields.add(stored);
         }
         List<Document> indexes = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {
@@ -455,7 +461,10 @@ public final class MongoSchemaStore implements SchemaStore {
                 throw unreadable(id);
             }
             try {
-                fields.add(field(fieldName, field));
+                SourceField read = field(fieldName, field);
+                String atSource = field.getString("sourceName");
+                fields.add(atSource == null ? read : new SourceField(read.name(), read.dataType(), read.type(),
+                        read.unknownBecause(), read.numericType(), read.stringType(), atSource));
             } catch (IllegalArgumentException | ClassCastException error) {
                 throw unreadable(id);
             }

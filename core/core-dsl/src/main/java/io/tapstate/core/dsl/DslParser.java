@@ -35,6 +35,7 @@ import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.common.ReservedField;
 import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TableRef;
@@ -552,7 +553,7 @@ public final class DslParser {
         return switch (type) {
             case "js" -> new TransformBody.Js(s.requireString("script"));
             case "map" -> new TransformBody.MapProjection(
-                    fieldRules(s.require("fields", s.mapping("fields"))));
+                    fieldRules(s.require("fields", s.mapping("fields")), stepName(type, s)));
             case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
@@ -585,10 +586,27 @@ public final class DslParser {
         };
     }
 
-    private Map<String, FieldRule> fieldRules(YamlMap fields) {
+    /** What a step is called in a diagnostic: its id where it wrote one, its type otherwise. */
+    private static String stepName(String type, YamlMap step) {
+        String id = step.string("id");
+        return id == null ? type : id;
+    }
+
+    private Map<String, FieldRule> fieldRules(YamlMap fields, String step) {
         Map<String, FieldRule> rules = new LinkedHashMap<>();
         for (String name : fields.keys()) {
+            if (ReservedField.is(name)) {
+                // Dropping it is declaring it too: no customer column carries this name past capture,
+                // so a rule about it can only be about the product's own data, which no step may touch.
+                throw fields.errorAt(name, DslError.RESERVED_FIELD_DECLARED,
+                        Map.of("step", step, "field", name));
+            }
             FieldRule rule = fieldRule(YamlMap.nodeValue(fields.node(name)));
+            if (rule instanceof FieldRule.Rename rename && ReservedField.is(rename.sourceField())) {
+                throw fields.errorAt(name, DslError.ILLEGAL_EXPRESSION, Map.of(
+                        "expr", "$" + rename.sourceField(),
+                        "detail", "the field " + rename.sourceField() + " is reserved and cannot be read"));
+            }
             if (rule instanceof FieldRule.Computed computed) {
                 checkValue(fields, name, computed.celExpr());
             }
@@ -822,7 +840,7 @@ public final class DslParser {
             checkValue(owner, FORMAT_FIELD, expr);
             return PushFormat.cel(expr);
         }
-        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD))));
+        return PushFormat.fields(fieldRules(YamlMap.requireMapping(n, owner.childPath(FORMAT_FIELD)), "format"));
     }
 
     private Settings settings(YamlMap m) {

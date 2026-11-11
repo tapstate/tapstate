@@ -1,8 +1,8 @@
-package io.tapstate.core.event;
+package io.tapstate.core.common;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.tapstate.core.event.ReservedField.Owner;
+import io.tapstate.core.common.ReservedField.Owner;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;

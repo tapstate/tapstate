@@ -472,6 +472,9 @@ dsl.unknown-field:
 dsl.forbidden-field:
   message: "Field '{field}' is not allowed at {path}."
   solution: "It is valid elsewhere but not in this position; run `tapstate explain` to confirm."
+dsl.reserved-field-declared:
+  message: "Step {step} declares an output field named {field}, a name Tapstate reserves for its own data on a row."
+  solution: "Give the field another name. Whatever writes a row to a target removes the reserved field, so a column declared under that name would never arrive."
 dsl.missing-reference:
   message: "Reference '{ref}' at {path} points to nothing in this workspace."
   solution: "Define the referenced resource, or fix the name to match an existing one."
@@ -1129,6 +1132,12 @@ nest.capacity-estimate-incomplete:
 schema.column-name-reads-as-a-path:
   message: "Pipeline {pipeline} writes column {column} of table {table} to {target}, which reads a dot in a key as a step into a nested document rather than as part of a name."
   solution: "The rows cross correctly and the key is really written, but a read for {column} on {target} answers nothing unless the dot is escaped, and no index can be declared over it at all, because an index key is written in that same path syntax. If it is a column you will query or index, rename it in {source}, or give it a name without a dot in a map step before it is written."
+schema.reserved-field-renamed:
+  message: "Table {table} in source {source} has a column named {column}, a name Tapstate reserves for its own data on a row; it is read as {renamed} from here on."
+  solution: "Nothing is lost: every value crosses, and a key column keeps its values under the new name. Use {renamed} wherever a pipeline refers to this column, and expect {renamed} as the field name in your targets."
+schema.reserved-field-rename-conflict:
+  message: "Table {table} in source {source} has a column with the name Tapstate reserves for its own data on a row, and also a column named {renamed}, the name the first would be read under."
+  solution: "Rename one of the two columns in the source, or leave the table out of this source's tables. Two columns cannot be read under one name."
 # Connector-supplied connection-test diagnostics.
 #
 # The connector API's typed test exceptions carry translation keys rather than sentences, and the

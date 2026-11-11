@@ -2,7 +2,7 @@ package io.tapstate.archtests;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.tapstate.core.event.ReservedField;
+import io.tapstate.core.common.ReservedField;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
@@ -33,7 +33,7 @@ class ReservedFieldIsSpelledInOnePlaceTest {
     private static final Path REPOSITORY = Path.of("..");
 
     /** The registry, the one file allowed to spell the name. */
-    private static final String REGISTRY = "core/core-event/src/main/java/io/tapstate/core/event/ReservedField.java";
+    private static final String REGISTRY = "core/core-common/src/main/java/io/tapstate/core/common/ReservedField.java";
 
     /** The name as a whole string literal, or as the first step of a dotted path inside one. */
     private static final Pattern THE_NAME_AS_A_LITERAL =

@@ -18,6 +18,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
+import io.tapstate.control.core.ReservedColumnAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
@@ -426,6 +427,7 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
+                        new ReservedColumnAdvisories(),
                         new ExecutionAdvisories()),
                 derivation, livePipelines, attribution, stateDatabasePolicy);
     }

@@ -89,7 +89,7 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
                 config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
         try {
             List<TapTable> tables = drive(connector);
-            return toSourceModel(tables, countRows?counts(connector,tables):Map.of());
+            return entered(config.id(), toSourceModel(tables, countRows?counts(connector,tables):Map.of()));
         } finally {
             connector.stopQuietly();
             connector.close();
@@ -178,6 +178,25 @@ public final class PdkSchemaDiscoverer implements SchemaDiscoverer {
 
     /** Normalizes the actual open session's metadata without launching a separate discovery or count. */
     static SourceModel structuralModel(List<TapTable> tables) { return toSourceModel(tables, Map.of()); }
+
+    /**
+     * The same metadata as a source's tables are known once they have entered: a column carrying the
+     * reserved field name is under its new name, in the fields, the key and the indexes. This is the
+     * model a capture compares with the one discovery stored, so both sides of that comparison are
+     * read the same way. {@link #structuralModel} stays in the connector's own names, for a read that
+     * talks to a connector on either side of a pipeline.
+     */
+    static SourceModel enteredModel(String source, List<TapTable> tables) {
+        return entered(source, toSourceModel(tables, Map.of()));
+    }
+
+    private static SourceModel entered(String source, SourceModel model) {
+        List<SourceTable> tables = new ArrayList<>(model.tables().size());
+        for (SourceTable table : model.tables()) {
+            tables.add(ReservedColumn.entered(source, table));
+        }
+        return new SourceModel(tables);
+    }
 
     private static SourceModel toSourceModel(List<TapTable> tables, Map<TapTable, Long> counts) {
         List<SourceTable> mapped = new ArrayList<>(tables.size());

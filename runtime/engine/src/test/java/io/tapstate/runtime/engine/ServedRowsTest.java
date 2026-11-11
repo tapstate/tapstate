@@ -3,8 +3,8 @@ package io.tapstate.runtime.engine;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.ReservedField;
-import io.tapstate.core.event.ReservedField.Owner;
+import io.tapstate.core.common.ReservedField;
+import io.tapstate.core.common.ReservedField.Owner;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;

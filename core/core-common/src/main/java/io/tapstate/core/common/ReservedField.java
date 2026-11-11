@@ -1,4 +1,4 @@
-package io.tapstate.core.event;
+package io.tapstate.core.common;
 
 import java.util.ArrayList;
 import java.util.Collections;

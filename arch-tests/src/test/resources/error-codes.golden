@@ -251,6 +251,7 @@ dsl.missing-field
 dsl.missing-reference
 dsl.mode-mismatch
 dsl.mode-required-for-read
+dsl.reserved-field-declared
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
@@ -387,6 +388,8 @@ position.nothing-to-write
 position.write-back-while-live
 role.unsupported
 schema.column-name-reads-as-a-path
+schema.reserved-field-rename-conflict
+schema.reserved-field-renamed
 source.already-exists
 source.id-mismatch
 source.in-use

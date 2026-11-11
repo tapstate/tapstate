@@ -782,12 +782,16 @@ public final class ApplyService {
                         List<DiscoveredTable> tables = new ArrayList<>();
                         for (SourceTable table : SourceTableScope.select(source, discovered.model().tables())) {
                             Map<String, TapstateType> columns = new LinkedHashMap<>();
+                            Map<String, String> renamed = new LinkedHashMap<>();
                             for (SourceField field : table.fields()) {
                                 columns.put(field.name(), field.type());
+                                if (field.sourceName() != null) {
+                                    renamed.put(field.name(), field.sourceName());
+                                }
                             }
                             tables.add(new DiscoveredTable(
                                     table.name(), columns, table.primaryKey(),
-                                    table.approximateRowCount()));
+                                    table.approximateRowCount(), renamed));
                         }
                         bySource.put(source.id(), tables);
                     });

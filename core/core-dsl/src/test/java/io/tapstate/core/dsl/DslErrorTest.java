@@ -56,6 +56,8 @@ class DslErrorTest {
                 // document, so both are witnessed by an ordinary corpus case
                 "dsl.unwind-needs-an-element-key",
                 "dsl.unwind-needs-an-upsert-target",
+                // a step output field taking the name kept for product-added row data
+                "dsl.reserved-field-declared",
                 // Source columns are available during assembly, not offline corpus validation.
                 "dsl.unwind-column-already-exists",
                 // the write-target gate: which connectors may be written to is a property of the

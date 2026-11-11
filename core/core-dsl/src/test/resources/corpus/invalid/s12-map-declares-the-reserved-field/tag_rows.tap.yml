@@ -1,0 +1,7 @@
+# Invalid: the output field takes the one top-level name the product reserves for its own data on
+# a row. Whatever serves a row removes that field, so a column declared under it would never arrive.
+version: tapstate/v1
+kind: transform
+id: tag_rows
+type: map
+fields: { __tap: "=after.region" }

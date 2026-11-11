@@ -64,6 +64,7 @@ class CorpusSmokeTest {
             // an unwind naming nothing that varies per element, so every row it makes carries the
             // key of the row it came from
             "unwind-needs-an-element-key",
+            "reserved-field-declared",
             // an unwind whose rows reach a sync that appends, where a delete is another row
             "unwind-needs-an-upsert-target");
 

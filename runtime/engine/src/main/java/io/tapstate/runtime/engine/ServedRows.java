@@ -1,7 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import io.tapstate.core.event.Envelope;
-import io.tapstate.core.event.ReservedField;
+import io.tapstate.core.common.ReservedField;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
 import java.util.ArrayList;
