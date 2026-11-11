@@ -280,6 +280,11 @@ public final class RowExpressions {
      */
     private static final Map<CelType, TapstateType> FROM_CEL_TYPE = fromCelType();
 
+    /** The tapstate type a CEL result type came from, or {@code UNKNOWN} when no column type maps to it. */
+    static TapstateType tapstateTypeOf(CelType type) {
+        return FROM_CEL_TYPE.getOrDefault(type, TapstateType.UNKNOWN);
+    }
+
     private static Map<CelType, TapstateType> fromCelType() {
         Map<CelType, TapstateType> byCelType = new LinkedHashMap<>();
         for (TapstateType type : TapstateType.values()) {
@@ -289,7 +294,7 @@ public final class RowExpressions {
     }
 
     /** A tapstate type as CEL sees it, or a named opaque type where CEL has no exact counterpart. */
-    private static CelType celTypeOf(TapstateType type) {
+    static CelType celTypeOf(TapstateType type) {
         return switch (type) {
             case STRING -> SimpleType.STRING;
             case INT64 -> SimpleType.INT;
@@ -351,7 +356,7 @@ public final class RowExpressions {
      * <p>Only the row root is refused. Indexing envelope metadata reaches no source column, and
      * indexing a value read out of the row leaves the column itself named.
      */
-    private static String indexedRow(CelAbstractSyntaxTree ast) {
+    static String indexedRow(CelAbstractSyntaxTree ast) {
         return CelNavigableAst.fromAst(ast).getRoot().allNodes()
                 .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.CALL)
                 .map(node -> node.expr().call())

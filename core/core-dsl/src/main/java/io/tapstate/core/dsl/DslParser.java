@@ -5,6 +5,10 @@ import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
@@ -124,7 +128,10 @@ public final class DslParser {
     static final Set<String> NEST_STATE_KEYS = Set.of("database");
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed");
+            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed", "rollup");
+    /** The keys that qualify a rollup field's one function rather than naming it. */
+    private static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
+    private static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of(
             "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load", EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");
@@ -646,18 +653,128 @@ public final class DslParser {
             if (as == EmbedAs.FLAT && e.has("arrayKey")) {
                 throw e.errorAt("arrayKey", DslError.FORBIDDEN_FIELD, Map.of("field", "arrayKey"));
             }
+            if (as == EmbedAs.ROLLUP && e.has("path")) {
+                throw e.errorAt("path", DslError.FORBIDDEN_FIELD, Map.of("field", "path"));
+            }
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && e.has("rollup")) {
+                throw e.errorAt("rollup", DslError.ROLLUP_ON_SINGLE_ROW_EMBED, Map.of("as", as.yaml()));
+            }
+            Map<String, RollupField> rollup = rollupFields(e);
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw e.errorAt("as", DslError.ROLLUP_LEVEL_WITHOUT_FIELDS, Map.of());
+            }
             out.add(new Embed(
                     e.requireString("from"),
                     e.require("on", stringMap(e, "on")),
                     as,
-                    as == EmbedAs.FLAT ? null : e.requireString("path"),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : e.requireString("path"),
                     scalarList(e.seq("key"), "key"),
                     scalarList(e.seq("arrayKey"), "arrayKey"),
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),
-                    embeds(e.seq("embed"), e.childPath("embed"))));
+                    embeds(e.seq("embed"), e.childPath("embed")),
+                    rollup));
         }
         return out;
+    }
+
+    /**
+     * An embed's {@code rollup:} map, in the order written. Shape is all that is judged here: each field
+     * names exactly one known function, its argument is a {@code $column}, an {@code =expression} or (for a
+     * count) {@code true}, and every expression compiles over a row. Whether the expressions type-check
+     * against the level's columns and references is judged where the tree and its models are known.
+     */
+    private Map<String, RollupField> rollupFields(YamlMap embed) {
+        YamlMap fields = embed.mapping("rollup");
+        if (fields == null) {
+            return null;
+        }
+        Map<String, RollupField> out = new LinkedHashMap<>();
+        for (String name : fields.keys()) {
+            YamlMap f = YamlMap.requireMapping(fields.node(name), fields.childPath(name));
+            List<String> functions = new ArrayList<>();
+            for (String key : f.keys()) {
+                if (!ROLLUP_OPTION_KEYS.contains(key)) {
+                    functions.add(key);
+                }
+            }
+            if (functions.size() != 1 || RollupFunction.byYaml(functions.getFirst()).isEmpty()) {
+                throw fields.errorAt(name, DslError.ROLLUP_FUNCTION_UNKNOWN, Map.of(
+                        "field", name,
+                        "function", functions.isEmpty() ? "(none)" : String.join(", ", functions),
+                        "known", String.join(", ", RollupFunction.spellings())));
+            }
+            RollupFunction function = RollupFunction.byYaml(functions.getFirst()).orElseThrow();
+            String key = function.yaml();
+            Object argument = switch (function) {
+                case FIRST, LAST -> rollupPick(f.mapping(key));
+                case COUNT -> {
+                    Object value = YamlMap.nodeValue(f.node(key));
+                    if (Boolean.TRUE.equals(value)) {
+                        yield Boolean.TRUE;
+                    }
+                    yield rollupExpression(f, key);
+                }
+                default -> rollupExpression(f, key);
+            };
+            String filter = f.string("filter");
+            if (filter != null) {
+                checkRollupExpression(f, "filter", filter);
+            }
+            out.put(name, RollupField.of(function, argument, filter,
+                    enumByYaml(RollupResultType.values(), RollupResultType::yaml, f, "type"),
+                    f.has("default") ? YamlMap.nodeValue(f.node("default")) : null));
+        }
+        return out;
+    }
+
+    private RollupPick rollupPick(YamlMap pick) {
+        pick.requireOnly(ROLLUP_PICK_KEYS);
+        pick.requirePresent(ROLLUP_PICK_KEYS);
+        String value = rollupExpression(pick, "value");
+        List<String> by = new ArrayList<>();
+        Node byNode = pick.node("by");
+        if (byNode instanceof SequenceNode) {
+            List<String> written = scalarList(pick.seq("by"), "by");
+            for (int i = 0; i < written.size(); i++) {
+                checkRollupExpression(pick, "by", written.get(i));
+                by.add(written.get(i));
+            }
+        } else {
+            by.add(rollupExpression(pick, "by"));
+        }
+        if (by.isEmpty()) {
+            throw pick.errorAt("by", DslError.ILLEGAL_VALUE,
+                    Map.of("value", "[]", "expected", "at least one ordering expression"));
+        }
+        return new RollupPick(value, by);
+    }
+
+    /** A rollup argument as written, after checking it is a {@code $column} or an {@code =expression}. */
+    private static String rollupExpression(YamlMap owner, String key) {
+        String written = owner.requireString(key);
+        checkRollupExpression(owner, key, written);
+        return written;
+    }
+
+    private static void checkRollupExpression(YamlMap owner, String key, String written) {
+        if (written.startsWith("$")) {
+            String column = written.substring(1);
+            if (!RollupExpressions.isColumnName(column)) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                        "expected", "$<column> naming one field of the element, or =<expression>"));
+            }
+            return;
+        }
+        if (!written.startsWith("=")) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of("value", written,
+                    "expected", "$<column> naming one field of the element, or =<expression>"));
+        }
+        String expr = written.substring(1);
+        String detail = "filter".equals(key)
+                ? RollupExpressions.untypedPredicateError(expr)
+                : RollupExpressions.untypedValueError(expr);
+        failExpression(owner, key, expr, detail);
     }
 
     // ---- view / serve -------------------------------------------------------------
