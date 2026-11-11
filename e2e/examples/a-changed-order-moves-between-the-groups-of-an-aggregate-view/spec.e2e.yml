@@ -1,0 +1,97 @@
+# A change to one order changes the groups it touches, and only those, exactly as a GROUP BY run again
+# over the source would.
+#
+# Orders are grouped by region with a count, a sum and a maximum; cancelled orders are left out with
+# `where:`. After the load, one change at a time is made at the source, and after each the rows of
+# every group are compared with the GROUP BY of the source as it then stands.
+#
+# What the assertions have to discriminate:
+#
+# - An order moves from EU to US. A step that only ever adds leaves it counted in EU; the EU row is
+#   asserted after the move, not only the US one.
+# - The order holding EU's maximum is deleted. A maximum kept as one running value cannot go back
+#   down: `max_order` must become the next largest amount still in the group.
+# - An order is cancelled and then paid again. It leaves its group and returns to it, and the group
+#   ends where it started. A step that judged `where:` only at load keeps it throughout; one that
+#   dropped it for good never brings it back.
+# - The last order of APAC is deleted. The group's row must be gone from the target and the row count
+#   must fall, not stay with a count of zero.
+# - Every step asserts the groups the change did not touch as well.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+
+name: a-changed-order-moves-between-the-groups-of-an-aggregate-view
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, region: EU, amount: 100, status: paid }
+      - { id: 2, region: EU, amount: 250, status: paid }
+      - { id: 3, region: EU, amount: 900, status: paid }
+      - { id: 4, region: US, amount: 40, status: paid }
+      - { id: 5, region: US, amount: 60, status: paid }
+      - { id: 6, region: APAC, amount: 7, status: paid }
+      - { id: 7, region: APAC, amount: 5, status: cancelled }
+steps:
+  - start
+  - await: { count: { tgt_mongo.sales_by_region: 3 } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 3, revenue: 1250, max_order: 900 } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 2, revenue: 100, max_order: 60 } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # A new order joins its group.
+  - cdc: { src_mysql.orders: { insert: { values: [ { id: 8, region: US, amount: 300, status: paid } ] } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 3, revenue: 400, max_order: 300 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 3, revenue: 1250, max_order: 900 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # An amount changes: the sum follows, the count does not.
+  - cdc: { src_mysql.orders: { update: { where: { id: 1 }, set: { amount: 120 } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 3, revenue: 1270, max_order: 900 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 3, revenue: 400, max_order: 300 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # An order moves to another region: it leaves one group and joins the other.
+  - cdc: { src_mysql.orders: { update: { where: { id: 2 }, set: { region: US } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 2, revenue: 1020, max_order: 900 } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 4, revenue: 650, max_order: 300 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # The order holding the largest amount of its group is deleted: the maximum goes back down.
+  - cdc: { src_mysql.orders: { delete: { where: { id: 3 } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 1, revenue: 120, max_order: 120 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 4, revenue: 650, max_order: 300 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # Cancelled, an order leaves its group; paid again, it returns to it.
+  - cdc: { src_mysql.orders: { update: { where: { id: 8 }, set: { status: cancelled } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 3, revenue: 350, max_order: 250 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 1, revenue: 120, max_order: 120 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  - cdc: { src_mysql.orders: { update: { where: { id: 8 }, set: { status: paid } } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 4, revenue: 650, max_order: 300 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 1, revenue: 120, max_order: 120 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: APAC }, expect: { order_count: 1, revenue: 7, max_order: 7 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 3 } }
+  # The last order of a group is deleted: the group is gone from the target, not left at zero.
+  - cdc: { src_mysql.orders: { delete: { where: { id: 6 } } } }
+  - await: { count: { tgt_mongo.sales_by_region: 2 } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 1, revenue: 120, max_order: 120 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 4, revenue: 650, max_order: 300 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 2 } }
+  # A cancelled order that is deleted was in no group, and changes nothing.
+  - cdc: { src_mysql.orders: { delete: { where: { id: 7 } } } }
+  - cdc: { src_mysql.orders: { insert: { values: [ { id: 9, region: EU, amount: 1, status: paid } ] } } }
+  - await: { doc: { tgt_mongo.sales_by_region: { where: { region: EU }, expect: { order_count: 2, revenue: 121, max_order: 120 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region: { where: { region: US }, expect: { order_count: 4, revenue: 650, max_order: 300 } } } }
+  - assert: { count: { tgt_mongo.sales_by_region: 2 } }

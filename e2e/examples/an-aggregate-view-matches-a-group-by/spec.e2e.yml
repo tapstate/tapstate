@@ -1,0 +1,98 @@
+# One row per region and day, and every field of every row is what a GROUP BY over the source gives.
+#
+# The pipeline groups 40 orders by region and day, leaves cancelled orders out with `where:`, and keeps
+# four fields per group. The expected values below are the answer of
+#
+#   SELECT region, order_day, COUNT(*), SUM(amount), SUM(amount >= 1000), MAX(amount)
+#   FROM orders WHERE status <> 'cancelled' GROUP BY region, order_day
+#
+# over the seed, written out row by row.
+#
+# What the assertions have to discriminate:
+#
+# - Six orders are cancelled. A step that ignored `where:` counts them, and every group holding one is
+#   then wrong in its count, its sum, or both.
+# - Every order of APAC on 2026-03-04 is cancelled, so that group must not exist at all: the target
+#   holds 11 rows, not 12. A step that created a group for rows failing `where:` writes the twelfth.
+# - `big_orders` carries its own filter. Applied to every field it would shrink `order_count` and
+#   `revenue`; ignored, `big_orders` would equal `order_count`. The seed has groups where it is zero,
+#   groups where it is some of the orders, and none where the two readings agree by accident on
+#   every row.
+# - The day is an expression over the row. One that grouped on the wrong column, or not at all,
+#   changes how many rows the target holds.
+#
+# Amounts are integers. Sums over decimals are exact too, but a decimal cannot be compared with a
+# literal in a filter yet, and `big_orders` needs that comparison.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips
+# this example, naming a directory whose jars do not resolve fails it.
+
+name: an-aggregate-view-matches-a-group-by
+setup:
+  databases:
+    src: { kind: mysql }
+    tgt: { kind: mongo }
+  connectors: [mysql, mongodb]
+  apply: [src_mysql.tap.yml, tgt_mongo.tap.yml, pipeline.tap.yml]
+  discover: [src_mysql]
+pipeline: pipeline.tap.yml
+
+seed:
+  src_mysql.orders:
+    values:
+      - { id: 1, region: US, order_day: "2026-03-01", amount: 237, status: paid }
+      - { id: 2, region: APAC, order_day: "2026-03-01", amount: 374, status: paid }
+      - { id: 3, region: EU, order_day: "2026-03-02", amount: 511, status: paid }
+      - { id: 4, region: US, order_day: "2026-03-02", amount: 648, status: cancelled }
+      - { id: 5, region: APAC, order_day: "2026-03-02", amount: 785, status: paid }
+      - { id: 6, region: EU, order_day: "2026-03-03", amount: 922, status: paid }
+      - { id: 7, region: US, order_day: "2026-03-03", amount: 1059, status: paid }
+      - { id: 8, region: APAC, order_day: "2026-03-03", amount: 1196, status: paid }
+      - { id: 9, region: EU, order_day: "2026-03-04", amount: 1333, status: paid }
+      - { id: 10, region: US, order_day: "2026-03-04", amount: 1470, status: paid }
+      - { id: 11, region: APAC, order_day: "2026-03-04", amount: 1607, status: cancelled }
+      - { id: 12, region: EU, order_day: "2026-03-01", amount: 1744, status: paid }
+      - { id: 13, region: US, order_day: "2026-03-01", amount: 1881, status: cancelled }
+      - { id: 14, region: APAC, order_day: "2026-03-01", amount: 118, status: paid }
+      - { id: 15, region: EU, order_day: "2026-03-02", amount: 255, status: paid }
+      - { id: 16, region: US, order_day: "2026-03-02", amount: 392, status: paid }
+      - { id: 17, region: APAC, order_day: "2026-03-02", amount: 529, status: paid }
+      - { id: 18, region: EU, order_day: "2026-03-03", amount: 666, status: paid }
+      - { id: 19, region: US, order_day: "2026-03-03", amount: 803, status: paid }
+      - { id: 20, region: APAC, order_day: "2026-03-03", amount: 940, status: paid }
+      - { id: 21, region: EU, order_day: "2026-03-04", amount: 1077, status: paid }
+      - { id: 22, region: US, order_day: "2026-03-04", amount: 1214, status: cancelled }
+      - { id: 23, region: APAC, order_day: "2026-03-04", amount: 1351, status: cancelled }
+      - { id: 24, region: EU, order_day: "2026-03-01", amount: 1488, status: paid }
+      - { id: 25, region: US, order_day: "2026-03-01", amount: 1625, status: paid }
+      - { id: 26, region: APAC, order_day: "2026-03-01", amount: 1762, status: paid }
+      - { id: 27, region: EU, order_day: "2026-03-02", amount: 1899, status: paid }
+      - { id: 28, region: US, order_day: "2026-03-02", amount: 136, status: paid }
+      - { id: 29, region: APAC, order_day: "2026-03-02", amount: 273, status: paid }
+      - { id: 30, region: EU, order_day: "2026-03-03", amount: 410, status: paid }
+      - { id: 31, region: US, order_day: "2026-03-03", amount: 547, status: paid }
+      - { id: 32, region: APAC, order_day: "2026-03-03", amount: 684, status: paid }
+      - { id: 33, region: EU, order_day: "2026-03-04", amount: 821, status: paid }
+      - { id: 34, region: US, order_day: "2026-03-04", amount: 958, status: paid }
+      - { id: 35, region: APAC, order_day: "2026-03-04", amount: 1095, status: cancelled }
+      - { id: 36, region: EU, order_day: "2026-03-01", amount: 1232, status: paid }
+      - { id: 37, region: US, order_day: "2026-03-01", amount: 1369, status: paid }
+      - { id: 38, region: APAC, order_day: "2026-03-01", amount: 1506, status: paid }
+      - { id: 39, region: EU, order_day: "2026-03-02", amount: 1643, status: paid }
+      - { id: 40, region: US, order_day: "2026-03-02", amount: 1780, status: paid }
+steps:
+  - start
+  - await: { count: { tgt_mongo.sales_by_region_day: 11 } }
+  - await: { doc: { tgt_mongo.sales_by_region_day: { where: { region: US, day: "2026-03-01" }, expect: { order_count: 3, revenue: 3231, big_orders: 2, max_order: 1625 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: APAC, day: "2026-03-01" }, expect: { order_count: 4, revenue: 3760, big_orders: 2, max_order: 1762 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: EU, day: "2026-03-02" }, expect: { order_count: 4, revenue: 4308, big_orders: 2, max_order: 1899 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: APAC, day: "2026-03-02" }, expect: { order_count: 3, revenue: 1587, big_orders: 0, max_order: 785 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: EU, day: "2026-03-03" }, expect: { order_count: 3, revenue: 1998, big_orders: 0, max_order: 922 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: US, day: "2026-03-03" }, expect: { order_count: 3, revenue: 2409, big_orders: 1, max_order: 1059 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: APAC, day: "2026-03-03" }, expect: { order_count: 3, revenue: 2820, big_orders: 1, max_order: 1196 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: EU, day: "2026-03-04" }, expect: { order_count: 3, revenue: 3231, big_orders: 2, max_order: 1333 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: US, day: "2026-03-04" }, expect: { order_count: 2, revenue: 2428, big_orders: 1, max_order: 1470 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: EU, day: "2026-03-01" }, expect: { order_count: 3, revenue: 4464, big_orders: 3, max_order: 1744 } } } }
+  - assert: { doc: { tgt_mongo.sales_by_region_day: { where: { region: US, day: "2026-03-02" }, expect: { order_count: 3, revenue: 2308, big_orders: 1, max_order: 1780 } } } }
+  # Eleven rows and no twelfth: the one region and day whose orders are all cancelled has none.
+  - assert: { count: { tgt_mongo.sales_by_region_day: 11 } }

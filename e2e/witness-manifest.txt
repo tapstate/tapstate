@@ -12,6 +12,8 @@ a-cdc-failure-is-observable on IN_PROCESS
 a-cdc-failure-is-observable on REAL_PROCESS
 a-cdc-only-pipeline-carries-its-changes on IN_PROCESS
 a-cdc-only-pipeline-carries-its-changes on REAL_PROCESS
+a-changed-order-moves-between-the-groups-of-an-aggregate-view on IN_PROCESS
+a-changed-order-moves-between-the-groups-of-an-aggregate-view on REAL_PROCESS
 a-child-collection-arrives-from-another-engine on IN_PROCESS
 a-child-collection-arrives-from-another-engine on REAL_PROCESS
 a-child-collection-from-another-engine-lands-in-the-managed-store on IN_PROCESS
@@ -68,6 +70,8 @@ a-view-whose-source-matches-tables-by-pattern-is-refused-without-discovery on IN
 a-view-whose-source-matches-tables-by-pattern-is-refused-without-discovery on REAL_PROCESS
 a-view-whose-store-cannot-be-reached-fails-with-a-named-code on IN_PROCESS
 a-view-whose-store-cannot-be-reached-fails-with-a-named-code on REAL_PROCESS
+an-aggregate-view-matches-a-group-by on IN_PROCESS
+an-aggregate-view-matches-a-group-by on REAL_PROCESS
 an-oracle-table-reaches-the-managed-store on IN_PROCESS
 an-oracle-table-reaches-the-managed-store on REAL_PROCESS
 an-order-row-is-widened-by-its-customer-and-its-payment on IN_PROCESS
