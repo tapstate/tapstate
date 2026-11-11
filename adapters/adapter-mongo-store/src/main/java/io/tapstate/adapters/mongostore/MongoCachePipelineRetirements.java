@@ -109,7 +109,7 @@ final class MongoCachePipelineRetirements implements PipelineCacheRetirements {
                 || SystemCollections.CACHE_PIPELINE_STATE.on(database).find(session,new Document("_id",scope.pipelineId())).first()!=null
                 || SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session,new Document("_id.pipelineId",scope.pipelineId())).first()!=null
                 || SystemCollections.SRS_CONSUMERS.on(database).find(session,new Document("pipelineId",scope.pipelineId())).first()!=null)throw rebuild(scope);
-        var tables=List.of(SystemCollections.CACHE_NEST_STATE,SystemCollections.CACHE_JOIN_FACTS,SystemCollections.CACHE_JOIN_DIMENSIONS,SystemCollections.CACHE_JOIN_INDEXES,SystemCollections.CACHE_JOIN_WRITERS);
+        var tables=List.of(SystemCollections.CACHE_NEST_STATE,SystemCollections.CACHE_JOIN_FACTS,SystemCollections.CACHE_JOIN_DIMENSIONS,SystemCollections.CACHE_JOIN_INDEXES,SystemCollections.CACHE_JOIN_WRITERS,SystemCollections.CACHE_AGGREGATE_STATE);
         for(var table:tables)if(table.on(database).find(session,new Document("_id.placement.scope.pipelineId",scope.pipelineId())).first()!=null)throw rebuild(scope);
         for(var entry:List.of(Map.entry(SystemCollections.DIRECT_CHANNEL_OFFSETS,"_id.scope.pipelineId"),Map.entry(SystemCollections.DIRECT_BATCHES,"_id.channel.scope.pipelineId"),
                 Map.entry(SystemCollections.CACHE_NEST_SHAPES,"_id.scope.pipelineId"),Map.entry(SystemCollections.CACHE_SINK_PREPARATIONS,"_id.scope.pipelineId"),

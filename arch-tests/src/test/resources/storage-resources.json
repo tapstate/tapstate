@@ -3441,6 +3441,33 @@
       ]
     },
     {
+      "id": "mongo.cache.aggregate_state",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "aggregate_state"
+      ],
+      "responsibility": "State of aggregate steps. Membership rows: one per input row, holding the group the row is in and the order of the last event applied, or that the row is gone. Group rows: one per input row in its group, holding what the row gives each field and its order; one totals row per group; one ordered entry per input row for each min, max, first or last field; one count per distinct value for each count_distinct field. Keys are text that sorts by content, and customer values appear inside them.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheOperatorStateStore"
+      ],
+      "recovery": "runtime-state",
+      "consistency": "cache",
+      "growth": "About two rows per live input row plus one per input row for each field that keeps its inputs, plus one totals row per group. Rows of deleted input rows are kept until the source position that removed them is settled. No row grows with the size of a group.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoAggregateStateStoreIT.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/aggregate/GroupStage.java",
+        "runtime/engine/src/main/java/io/tapstate/runtime/engine/aggregate/MembershipStage.java",
+        "runtime/engine/src/test/java/io/tapstate/runtime/engine/aggregate/AggregateStagesReplayTest.java"
+      ]
+    },
+    {
       "id": "mongo.cache.nest_shapes",
       "resourceVersion": 1,
       "proposalVersion": 1,

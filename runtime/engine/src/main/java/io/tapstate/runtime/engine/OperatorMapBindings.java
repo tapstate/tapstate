@@ -174,7 +174,7 @@ public final class OperatorMapBindings implements AutoCloseable {
         Bound original = require(namespace);
         boolean join = switch (original.binding.placement().resource()) {
             case JOIN_FACTS, JOIN_DIMENSIONS, JOIN_INDEXES, JOIN_WRITERS -> true;
-            case NEST_STATE -> false;
+            case NEST_STATE, AGGREGATE_STATE -> false;
         };
         if (!join) throw fenced();
         return original.store;

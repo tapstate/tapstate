@@ -23,7 +23,8 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final List<SystemCollections> COLD = List.of(SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_JOIN_FACTS,
-            SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS);
+            SystemCollections.CACHE_JOIN_DIMENSIONS, SystemCollections.CACHE_JOIN_INDEXES, SystemCollections.CACHE_JOIN_WRITERS,
+            SystemCollections.CACHE_AGGREGATE_STATE);
     private final MongoClient client;
     private final MongoDatabase database;
     private final CacheBusinessScope business;

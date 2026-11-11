@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import io.tapstate.spi.store.LeasedStateStore;
 import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
+import io.tapstate.spi.store.OrderedStateStore;
 import org.bson.Document;
 import org.bson.types.Binary;
 
@@ -39,7 +40,7 @@ import java.util.function.Function;
  * <p>Reads within a lease are not fenced: a member that has lost its claim may still read until its next
  * proof, and can never write.
  */
-final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStateStore {
+final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStateStore, OrderedStateStore {
     private static final String STATE_FIELD = "state";
     private static final String FORMAT_VERSION_FIELD = "formatVersion";
     private static final int BATCH_KEYS = 256;
@@ -101,6 +102,7 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
             case JOIN_DIMENSIONS -> SystemCollections.CACHE_JOIN_DIMENSIONS;
             case JOIN_INDEXES -> SystemCollections.CACHE_JOIN_INDEXES;
             case JOIN_WRITERS -> SystemCollections.CACHE_JOIN_WRITERS;
+            case AGGREGATE_STATE -> SystemCollections.CACHE_AGGREGATE_STATE;
         };
     }
 
@@ -360,7 +362,109 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
         });
     }
 
-    private void requireNamespace(String namespace) { if (!mapName.equals(namespace)) throw MongoCachePipelineAccess.fenced(); }
+    /** The keyed operations serve every resource but the ordered one, whose keys are stored in another form. */
+    private void requireNamespace(String namespace) {
+        if (!mapName.equals(namespace) || table == SystemCollections.CACHE_AGGREGATE_STATE) throw MongoCachePipelineAccess.fenced();
+    }
+
+    // ---- ordered entries: whole commits and the first key of a range, for the aggregate resource only ----
+
+    /** What one commit may carry: the batch bound of every other write, with room left for ids and framing. */
+    private static final OrderedStateStore.Limit ORDERED_COMMIT = new OrderedStateStore.Limit(BATCH_KEYS, BATCH_BYTES / 2);
+
+    @Override public OrderedStateStore.Limit commitLimit() { return ORDERED_COMMIT; }
+
+    @Override public List<byte[]> loadAll(List<byte[]> keys) {
+        requireOrdered();
+        List<Document> ids = new ArrayList<>(keys.size());
+        for (byte[] key : keys) ids.add(orderedId(key));
+        if (ids.isEmpty()) return List.of();
+        return read(session -> {
+            Map<Document, byte[]> found = new java.util.HashMap<>();
+            for (int from = 0; from < ids.size(); from += BATCH_KEYS) {
+                List<Document> batch = ids.subList(from, Math.min(ids.size(), from + BATCH_KEYS));
+                for (Document row : rows().find(session, new Document("_id", new Document("$in", batch)))) {
+                    if (!(row.get("_id") instanceof Document id)) throw access.unreadable("operator-identity");
+                    found.put(id, orderedState(row));
+                }
+            }
+            List<byte[]> states = new ArrayList<>(ids.size());
+            for (Document id : ids) states.add(found.get(id));
+            return java.util.Collections.unmodifiableList(states);
+        });
+    }
+
+    @Override public void commit(List<OrderedStateStore.Entry> saves, List<byte[]> deletes) {
+        requireOrdered();
+        List<WriteModel<Document>> batch = new ArrayList<>(saves.size() + deletes.size());
+        java.util.Set<String> named = new java.util.HashSet<>();
+        long bytes = 0;
+        for (OrderedStateStore.Entry save : saves) {
+            Document id = orderedId(save.key());
+            if (!named.add(id.getString("key"))) throw new IllegalArgumentException("a key appears twice in one commit");
+            bytes += save.key().length + save.state().length;
+            batch.add(new ReplaceOneModel<>(new Document("_id", id), new Document("_id", id).append(FORMAT_VERSION_FIELD, 1)
+                    .append(STATE_FIELD, new Binary(save.state().clone())), new ReplaceOptions().upsert(true)));
+        }
+        for (byte[] delete : deletes) {
+            Document id = orderedId(delete);
+            if (!named.add(id.getString("key"))) throw new IllegalArgumentException("a key appears twice in one commit");
+            bytes += delete.length;
+            batch.add(new com.mongodb.client.model.DeleteOneModel<>(new Document("_id", id)));
+        }
+        if (batch.size() > ORDERED_COMMIT.operations() || bytes > ORDERED_COMMIT.bytes())
+            throw new IllegalArgumentException("a commit of " + batch.size() + " operations and " + bytes + " bytes is beyond " + ORDERED_COMMIT);
+        if (batch.isEmpty()) return;
+        // One transaction: the compare-and-set on the live claim, the inventory check, and every save and delete.
+        write(session -> { table.on(target).bulkWrite(session, batch, new BulkWriteOptions().ordered(true)); return null; });
+    }
+
+    @Override public Optional<OrderedStateStore.Entry> first(byte[] from, byte[] to, OrderedStateStore.End end) {
+        requireOrdered();
+        Document range = new Document("$gte", orderedId(from)).append("$lt", orderedId(to));
+        return read(session -> {
+            Document row = rows().find(session, new Document("_id", range))
+                    .sort(new Document("_id", end == OrderedStateStore.End.LOWEST ? 1 : -1)).limit(1).first();
+            return row == null ? Optional.empty() : Optional.of(orderedEntry(row));
+        });
+    }
+
+    @Override public List<OrderedStateStore.Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+        requireOrdered();
+        if (limit < 1 || limit > MAX_PAGE_KEYS) throw new IllegalArgumentException("a page holds 1 to " + MAX_PAGE_KEYS + " entries");
+        Document range = (after == null ? new Document("$gte", orderedId(from)) : new Document("$gt", orderedId(after))).append("$lt", orderedId(to));
+        return read(session -> {
+            List<OrderedStateStore.Entry> page = new ArrayList<>();
+            for (Document row : rows().find(session, new Document("_id", range)).sort(new Document("_id", 1)).limit(limit)) page.add(orderedEntry(row));
+            return List.copyOf(page);
+        });
+    }
+
+    private void requireOrdered() { if (table != SystemCollections.CACHE_AGGREGATE_STATE) throw MongoCachePipelineAccess.fenced(); }
+
+    /**
+     * An id whose key is the lowercase hexadecimal of the caller's bytes. Ids of one placement then compare
+     * as their keys do, byte by byte, so a range of keys is a range of the id index and needs no other.
+     */
+    private Document orderedId(byte[] key) {
+        return new Document("placement", address).append("key", java.util.HexFormat.of().formatHex(Objects.requireNonNull(key, "key")));
+    }
+
+    private byte[] orderedState(Document row) {
+        if (!Integer.valueOf(1).equals(row.get(FORMAT_VERSION_FIELD)) || !(row.get(STATE_FIELD) instanceof Binary binary)
+                || binary.getType() != 0) throw access.unreadable("operator-state");
+        return binary.getData().clone();
+    }
+
+    private OrderedStateStore.Entry orderedEntry(Document row) {
+        if (!(row.get("_id") instanceof Document id) || !id.keySet().equals(java.util.Set.of("placement", "key"))
+                || !address.equals(id.get("placement")) || !(id.get("key") instanceof String hex)) throw access.unreadable("operator-identity");
+        byte[] key;
+        try { key = java.util.HexFormat.of().parseHex(hex); }
+        catch (IllegalArgumentException invalid) { throw access.unreadable("operator-identity"); }
+        if (!java.util.HexFormat.of().formatHex(key).equals(hex)) throw access.unreadable("operator-identity");
+        return new OrderedStateStore.Entry(key, orderedState(row));
+    }
     private Document id(String key) { return new Document("placement", address).append("key", OperatorStateText.encode(Objects.requireNonNull(key, "key"))); }
     private Document row(Document id, byte[] value) { return new Document("_id", id).append(FORMAT_VERSION_FIELD, table == SystemCollections.CACHE_NEST_STATE ? 2 : 1).append(STATE_FIELD, new Binary(value)); }
     private byte[] decode(Document row, Document id) {

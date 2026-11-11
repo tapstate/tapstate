@@ -12,7 +12,12 @@ import java.util.Objects;
 /** One immutable hot and cold operator-state address, independent of execution attempts. */
 public record OperatorPlacement(PipelineIntentScope scope, String database, Resource resource,
         String stepId, String pathId, String namespace) implements Serializable {
-    public enum Resource { NEST_STATE, JOIN_FACTS, JOIN_DIMENSIONS, JOIN_INDEXES, JOIN_WRITERS }
+    public enum Resource {
+        NEST_STATE, JOIN_FACTS, JOIN_DIMENSIONS, JOIN_INDEXES, JOIN_WRITERS, AGGREGATE_STATE;
+
+        /** Whether an operator reaches this state through a member map. Aggregate state is read and committed directly. */
+        public boolean keptInAMap() { return this != AGGREGATE_STATE; }
+    }
 
     public OperatorPlacement {
         Objects.requireNonNull(scope, "scope"); Objects.requireNonNull(resource, "resource");
@@ -31,7 +36,7 @@ public record OperatorPlacement(PipelineIntentScope scope, String database, Reso
                 text(out, scope.cacheIncarnation()); text(out, scope.pipelineId()); out.writeLong(scope.stateGeneration());
                 text(out, database); text(out, resource.name()); text(out, stepId); text(out, pathId); text(out, namespace);
             }
-            return (resource == Resource.NEST_STATE ? "nest." : "join.")
+            return (resource == Resource.NEST_STATE ? "nest." : resource == Resource.AGGREGATE_STATE ? "aggregate." : "join.")
                     + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes.toByteArray()));
         } catch (IOException | NoSuchAlgorithmException impossible) { throw new IllegalStateException(impossible); }
     }
