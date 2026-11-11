@@ -24,8 +24,15 @@ class StorageSetupServiceTest {
     }
     static final class States implements StorageSetupStateStore {
         Status state = new Status(SCOPE, Phase.CONFIG_PREPARED, 0);
+        Binding store;
         @Override public StorageSetupStateStore guardedBy(Runnable active) { active.run(); return this; }
         @Override public Status load() { return state; }
+        @Override public View loadView() {
+            return new View(state, Optional.ofNullable(store.binding), store.cachePreparation());
+        }
+        @Override public View requireCurrentView(StorageSetupScope expected, Purpose purpose) {
+            requireCurrent(expected, purpose); return loadView();
+        }
         @Override public Status rotate(StorageSetupScope expected, Purpose purpose) { throw new UnsupportedOperationException(); }
         @Override public void requireCurrent(StorageSetupScope expected, Purpose purpose) {
             if (!state.scope().equals(expected) || state.phase() == Phase.COMPLETE) throw new TapstateException(ControlError.BOOTSTRAP_FORBIDDEN, Map.of(), null);
@@ -38,7 +45,7 @@ class StorageSetupServiceTest {
         StorageBinding binding;
         int inserts;
         Runnable beforeCommit = () -> {};
-        Binding(States states) { this.states = states; this.root = this; this.active = () -> {}; }
+        Binding(States states) { this.states = states; this.root = this; this.active = () -> {}; states.store = this; }
         Binding(Binding root, Runnable active) { this.states = root.states; this.root = root; this.active = active; }
         @Override public StorageBindingStore guardedBy(Runnable guard) { return new Binding(root, guard); }
         @Override public Optional<StorageBinding> load() { active.run(); return Optional.ofNullable(root.binding); }

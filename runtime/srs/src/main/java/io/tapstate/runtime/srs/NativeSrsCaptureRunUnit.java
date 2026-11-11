@@ -56,6 +56,12 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
     public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive, boolean priorCacheHistory) {
+        return startTail(scope, opened, originalCapture, config, start, ports, requireActive, priorCacheHistory, false);
+    }
+
+    public synchronized Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+            CaptureConfig config, CaptureStart start, Function<SrsCaptureWriter, CapturePort> ports,
+            Runnable requireActive, boolean priorCacheHistory, boolean skipEmptyStartupAck) {
         Runnable fixed = guard(requireActive); fixed.run();
         var stores = views.srs(scope,fixed);
         var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed,priorCacheHistory,true);
@@ -67,7 +73,9 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                     observation -> writer.start(port,config,start,health,observation));
             owned.subscription = source; fixed.run();
             owned.opening = null;
-            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed),opened.miningChainId(),opened.epoch(),source,health,fixed);
+            boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
+            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
+                    opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
             fixed.run();
             owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
             return owned;

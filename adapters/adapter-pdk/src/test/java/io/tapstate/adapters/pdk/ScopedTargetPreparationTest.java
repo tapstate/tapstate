@@ -46,6 +46,27 @@ class ScopedTargetPreparationTest {
         assertThatThrownBy(() -> binding.requireReady(TARGET)).isInstanceOf(TapstateException.class);assertThat(calls).isEmpty();
         var attempt=store.begin(store.held.input());store.complete(attempt,new SinkPreparationStore.Result(true));calls.clear();binding.requireReady(TARGET);assertThat(calls).isEmpty();
     }
+    @Test void preparedWritesReuseOnlyTheExactReadyModel() throws Throwable {
+        var calls = new ArrayList<String>();
+        var store = new Receipts(calls);
+        store.complete(store.begin(store.held.input()), new SinkPreparationStore.Result(true));
+        calls.clear();
+        var preparation = new PdkTargetPreparation("demo", null, functions(calls), OnFullLoad.CLEAR, true,
+                NODE, null, true, PipelineNode.Purpose.SYNC, () -> {}, binding(store));
+
+        preparation.prepare(TARGET, TargetTapTable.build(TARGET));
+        int readsAtOpen = store.reads;
+        preparation.prepareForWrite(TARGET, TargetTapTable.build(TARGET));
+        preparation.prepareForWrite(TARGET, TargetTapTable.build(TARGET));
+        assertThat(store.reads).isEqualTo(readsAtOpen);
+        assertThat(calls).isEmpty();
+
+        var changed = new TargetTable(TARGET.name(), List.of(new TargetField("different", "bigint", true)));
+        assertThatThrownBy(() -> preparation.prepareForWrite(changed, TargetTapTable.build(changed)))
+                .isInstanceOf(TapstateException.class);
+        assertThat(store.reads).isEqualTo(readsAtOpen + 1);
+    }
+
     @Test void createdPrimaryKeyResultIsReusedWhenIndexRetryOpensAgain()throws Throwable {
         var calls=new ArrayList<String>();var store=new Receipts(calls);var functions=functions(calls);
         functions.supportCreateTableV2((context,event) -> {calls.add("create-new");return new CreateTableOptions().tableExists(false);});
@@ -107,10 +128,10 @@ class ScopedTargetPreparationTest {
     private static ConnectorFunctions functions(List<String> calls){var functions=new ConnectorFunctions();functions.supportCreateTableV2((context,event) -> {calls.add("create");return new CreateTableOptions().tableExists(true);});functions.supportClearTable((context,event) -> calls.add("clear"));functions.supportCreateIndex((context,table,event) -> calls.add("index"));return functions;}
     private static TapstateException refused(){return new TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED,Map.of("pipeline",SCOPE.pipelineId()),null);}
     private static final class Receipts implements SinkPreparationStore {
-        private final List<String> calls;private Snapshot held;
+        private final List<String> calls;private Snapshot held;private int reads;
         Receipts(List<String> calls){this.calls=calls;held=new Snapshot(PdkSinkPreparations.input(SCOPE,NODE,PipelineNode.Purpose.SYNC,OnFullLoad.CLEAR,true,TARGET),UUID.randomUUID().toString(),0,Phase.PREPARING,null,null);}
         public void prepareTargets(List<Input> inputs){throw new AssertionError("plugin code cannot grant its own preparation roster");}
-        public Snapshot load(Input input){if(!input.equals(held.input()))throw refused();return held;}
+        public Snapshot load(Input input){reads++;if(!input.equals(held.input()))throw refused();return held;}
         public Attempt begin(Input input){load(input);if(held.revision()!=0)throw refused();held=new Snapshot(input,held.operationId(),1,Phase.PREPARING,CLAIM,null);calls.add("issued");return new Original(held);}
         public Snapshot complete(Attempt attempt,Result result){assertThat(attempt.original()).isEqualTo(held);held=new Snapshot(held.input(),held.operationId(),2,Phase.READY,CLAIM,result);calls.add("ready");return held;}
         private record Original(Snapshot original)implements Attempt{}

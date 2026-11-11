@@ -128,15 +128,48 @@ public final class MongoSrsChainStore implements SrsChainStore {
             replace(session, row, replacement); return OptionalLong.of(expectedEpoch + 1);
         }));
     }
+    @Override public Optional<SrsChainState> openServingEpoch(String chain, long expectedEpoch, Set<String> tables, WorkloadClaimFence fence) {
+        requireName(chain);
+        if (expectedEpoch < 0 || expectedEpoch >= Long.MAX_VALUE - 1) throw new IllegalArgumentException("invalid expected capture epoch");
+        Set<String> captured = tables(tables);
+        return changingChain(() -> transaction(session -> {
+            prove(session, fence);
+            Document row = requireRoot(session, chain);
+            requireCapture(row, fence);
+            var held = state(session, row);
+            var requested = new TreeSet<>(held.requestedTables());
+            requested.addAll(captured);
+            long epoch = expectedEpoch + 1;
+            if (held.epoch() == epoch) {
+                if (!WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)).equals(fence)
+                        || !held.requestedTables().equals(requested)) return Optional.empty();
+                if (held.servingTables().equals(requested)) return Optional.of(held);
+                if (!held.servingTables().isEmpty()) return Optional.empty();
+            } else {
+                if (held.epoch() != expectedEpoch) return Optional.empty();
+                if (held.epoch() > 0 && held.checkpoint() == null) throw unproven(chain);
+            }
+            var replacement = new Document(row).append("epoch", epoch).append("captureFence", WorkloadClaimDocuments.stored(fence))
+                    .append("requestedTables", sorted(requested)).append("servingTables", sorted(requested));
+            replace(session, row, replacement);
+            return Optional.of(decode(replacement));
+        }));
+    }
+
     @Override public boolean publishServingTables(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
+        return publishServingTablesAndGet(chain, epoch, tables, fence).isPresent();
+    }
+
+    @Override public Optional<SrsChainState> publishServingTablesAndGet(String chain, long epoch, Set<String> tables, WorkloadClaimFence fence) {
         requireName(chain); Set<String> captured = tables(tables);
         return changingChain(() -> transaction(session -> {
             prove(session, fence); Document row = requireRoot(session, chain); requireCurrent(row, epoch, fence);
             SrsChainState held = state(session, row);
-            if (!captured.containsAll(held.requestedTables())) return false;
-            if (!held.servingTables().isEmpty()) return held.servingTables().equals(captured);
+            if (!captured.containsAll(held.requestedTables())) return Optional.empty();
+            if (!held.servingTables().isEmpty()) return held.servingTables().equals(captured) ? Optional.of(held) : Optional.empty();
             var replacement = new Document(row).append("servingTables", sorted(captured));
-            replace(session, row, replacement); return true;
+            replace(session, row, replacement);
+            return Optional.of(decode(replacement));
         }));
     }
     private <T> T changingChain(java.util.function.Supplier<T> change) {
@@ -184,6 +217,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing) {
+        validateCheckpoint(session, root, checkpoint, fence, writing, false);
+    }
+
+    private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
+                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked) {
         String chain = root.getString("_id");
         for (var at : checkpoint.tables().values()) {
             var key = at.model();
@@ -191,7 +229,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
         }
         var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-        var current = models.currentReferences(session, root, keys);
+        var current = models.currentReferences(session, root, keys, businessChecked);
         var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
                         .collect(java.util.stream.Collectors.toSet()));
@@ -212,8 +250,12 @@ public final class MongoSrsChainStore implements SrsChainStore {
         }
     }
     SrsChainState state(ClientSession session, Document row) {
+        return state(session, row, false);
+    }
+
+    SrsChainState state(ClientSession session, Document row, boolean businessChecked) {
         SrsChainState state = decode(row);
-        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false);
+        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked);
         if (state.pendingFreshFull() != null)
             models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
         return state;
@@ -245,6 +287,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
         requireCapture(row, fence);
         if (!Long.valueOf(epoch).equals(row.get("epoch")) || !fence.equals(WorkloadClaimDocuments.readCapture(row.get("captureFence", Document.class)))) throw fenced();
     }
+    /** A pin takes the chain write fence early and validates this exact preimage before commit. */
+    Document reserveSnapshotPin(ClientSession session, String chain) {
+        var available = new Document("$type", "long").append("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
+        return SystemCollections.SRS_CHAINS.on(database).findOneAndUpdate(session,
+                new Document("_id", chain).append("cacheIncarnation", scope.cacheIncarnation()).append("modelWriteFence", available),
+                new Document("$inc", new Document("modelWriteFence", 1L)));
+    }
+
     void replace(ClientSession session, Document expected, Document replacement) {
         long revision = expected.getLong("modelWriteFence");
         if (revision >= Long.MAX_VALUE - 1) throw unproven(expected.getString("_id"));

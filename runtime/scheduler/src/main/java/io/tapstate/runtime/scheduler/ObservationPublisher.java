@@ -805,7 +805,9 @@ public final class ObservationPublisher {
         return current.map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             if (actual == PipelineState.COMPLETED) {
-                Optional<Observation> previous = observations.read(pipelineId);
+                Optional<Observation> previous = observations.read(pipelineId)
+                        .filter(last -> last.state() == PipelineState.COMPLETED && last.observedAt() != null);
+                if (previous.isEmpty()) previous = observations.beforeCompletion(pipelineId, checkpoint.epoch());
                 if (previous.isPresent()) {
                     Observation last = previous.get();
                     List<MetricFact> retained = last.facts().stream()
@@ -815,7 +817,7 @@ public final class ObservationPublisher {
                     Observation terminal = new Observation(pipelineId, actual,
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
-                    observations.save(terminal);
+                    save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null);
                     return terminal;
                 }
             }
@@ -866,7 +868,7 @@ public final class ObservationPublisher {
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
-            observations.save(published);
+            save(observations, published, requirePreparedState ? checkpoint.epoch() : null);
             if (measuredSuccessfully) {
                 coldLayer.saw(pipelineId, readings);
                 frontierStall.saw(pipelineId, pinned, gaps);
@@ -906,7 +908,7 @@ public final class ObservationPublisher {
         } catch (RuntimeException unavailable) {
             // This path must still report when the state store itself is what the pass could not read.
         }
-        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current);
+        publishReconcileFailure(pipelineId, consecutiveFailures, observations, current, null);
     }
 
     /** A failed pass still uses its original ports, including when no projection has been made yet. */
@@ -916,14 +918,20 @@ public final class ObservationPublisher {
         Objects.requireNonNull(scopedState, "scopedState");
         Objects.requireNonNull(scopedObservations, "scopedObservations");
         var current = scopedState.read(scope.pipelineId()).orElseThrow(() -> missingCheckpoint(scope.pipelineId()));
-        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()));
+        publishReconcileFailure(scope.pipelineId(), consecutiveFailures, scopedObservations, StateJson.parse(current.stateJson()), current.epoch());
     }
 
     private void publishReconcileFailure(String pipelineId, long consecutiveFailures, ObservationStore observations,
-            PipelineState unpublishedState) {
+            PipelineState unpublishedState, Long checkpointEpoch) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Observation previous = observations.read(pipelineId).orElse(null);
-        PipelineState lastState = unpublishedState == PipelineState.COMPLETED ? PipelineState.COMPLETED
+        if (checkpointEpoch != null && unpublishedState == PipelineState.STOPPED
+                && (previous == null || previous.state() != PipelineState.STOPPED)) {
+            // The checkpoint is written before the actuator drains or rebuilds. A failed pass
+            // cannot be the witness that stopping finished.
+            return;
+        }
+        PipelineState lastState = checkpointEpoch != null || unpublishedState == PipelineState.COMPLETED ? unpublishedState
                 : previous != null ? previous.state() : unpublishedState;
         Map<String, String> lastPositions = previous != null ? previous.positions() : Map.of();
         ObservationFailure lastFailure = previous != null ? previous.failure() : null;
@@ -939,10 +947,16 @@ public final class ObservationPublisher {
                     .forEach(measured::add);
         }
         measured.add(readAt(pipelineId, RECONCILE_STREAK_METRIC, "{pass}", at, consecutiveFailures));
-        observations.save(new Observation(pipelineId, lastState,
+        var observation = new Observation(pipelineId, lastState,
                 FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
                 keepLoad ? previous.snapshot() : null, lastPositions, lastFailure, at, measured,
-                keepLoad ? previous.initialLoad() : null));
+                keepLoad ? previous.initialLoad() : null);
+        save(observations, observation, checkpointEpoch);
+    }
+
+    private static void save(ObservationStore store, Observation observation, Long checkpointEpoch) {
+        if (checkpointEpoch == null) store.save(observation);
+        else store.save(observation, checkpointEpoch);
     }
 
     private static TapstateException missingCheckpoint(String pipelineId) {

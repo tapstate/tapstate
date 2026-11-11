@@ -33,6 +33,12 @@ public final class ScopedPipelineStateStore implements StateStore {
         requirePipeline(pipelineId);
         return views.pipelineStates(scope,original,requireActive).compareAndSwap(pipelineId,epoch,next,at);
     }
+    @Override public CasOutcome recordLeaseRecovery(String pipelineId, CheckpointDoc expected,
+            CheckpointDoc.LeaseRecovery recovery, Instant at) {
+        requirePipeline(pipelineId);
+        WorkloadClaimFence original = Objects.requireNonNull(originalClaim.get(), "originalClaim");
+        return views.pipelineStates(scope, original, requireActive).recordLeaseRecovery(pipelineId, expected, recovery, at);
+    }
     @Override public void create(String pipelineId,String next,Instant at) { throw fenced(); }
     @Override public void delete(String pipelineId) { throw fenced(); }
     private void requirePipeline(String pipelineId) { if (!scope.pipelineId().equals(pipelineId)) throw fenced(); requireActive.run(); }

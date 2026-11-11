@@ -17,7 +17,12 @@ public final class ValidationConfigurationService {
     public record Pair(String source,String target) {}
     public record Confirmation(String id,List<Pair> fields) {}
     public record Input(String pipelineId,String taskId,String taskGeneration,String expectedRevision,String method,
-            List<Choice> mappings,Map<String,Confirmation> confirmations) {}
+            List<Choice> mappings,Map<String,Confirmation> confirmations,Boolean inspectMetadata) {
+        public Input(String pipelineId,String taskId,String taskGeneration,String expectedRevision,String method,
+                List<Choice> mappings,Map<String,Confirmation> confirmations) {
+            this(pipelineId,taskId,taskGeneration,expectedRevision,method,mappings,confirmations,null);
+        }
+    }
     public record Field(String name,String type,String keyDomain,String unavailableReason) {}
     public record Candidate(String origin,List<String> fields,List<String> issues) {}
     public record Side(String nodeId,String sourceId,String database,String schema,String table,String modelVersion,String codecBinding,
@@ -73,7 +78,7 @@ public final class ValidationConfigurationService {
     }
     public Evaluation evaluate(Input input){
         var checked=check(input);var previous=previous(checked);
-        var lease=evaluations.evaluate(request(checked,previous));
+        var lease=evaluations.evaluate(request(checked,previous,!Boolean.FALSE.equals(input.inspectMetadata())));
         try{return new Evaluation(lease);}catch(RuntimeException|Error failed){lease.close();throw failed;}
     }
     public Saved save(String principal,Save command){
@@ -85,7 +90,7 @@ public final class ValidationConfigurationService {
             if(configured!=null)schedules.preview(configured,clock.instant(),Math.max(1,checked.revision),ValidationSchedule.SearchBudget.DEFAULT);
             var settings=new ValidationTaskStore.Settings(new ValidationTaskStore.Full(checked.method,1,configured,command.scheduleEnabled(),command.historyLimit()),
                     previous==null?new ValidationTaskStore.Incremental(0,10):previous.settings().incremental());
-            try(var evaluated=evaluations.evaluate(request(checked,previous))){
+            try(var evaluated=evaluations.evaluate(request(checked,previous,false))){
                 if(evaluated.comparison().isEmpty())return new Saved("PRECHECK_REQUIRED",null,null);
                 var view=evaluated.view();if(!command.fingerprint().equals(view.fingerprint()))return new Saved("CONFLICT",view.fingerprint(),null);
                 evaluated.requireCurrent();
@@ -115,8 +120,8 @@ public final class ValidationConfigurationService {
                 Long.toString(value.full().nextStartSequence()),value.closed(),value.settings().full().method().name(),value.comparison().fingerprint(),value.settings().full().historyLimit(),
                 schedule(value.settings().full().schedule()),value.settings().full().scheduleEnabled(),value.comparison().mappings().stream().map(mapping->new SavedMapping(
                     mapping.mappingId(),mapping.outputId(),mapping.source().sourceId(),mapping.source().table(),mapping.target().sourceId(),mapping.target().table(),
-                    mapping.keys()==null?null:new Key(mapping.keys().confirmationId(),java.util.stream.IntStream.range(0,mapping.keys().source().size())
-                            .mapToObj(index->new SavedPair(mapping.keys().source().get(index).path(),mapping.keys().target().get(index).path())).toList()))).toList(),ValidationExecutionService.Context.from(context),permission(value),observation(observations.read(value.task(),value.revision()).orElse(null))));
+                    mapping.keys()==null?null:new Key(mapping.keys().confirmationId(),java.util.stream.IntStream.range(0,mapping.keys().sourcePaths().size())
+                            .mapToObj(index->new SavedPair(mapping.keys().sourcePaths().get(index),mapping.keys().targetPaths().get(index))).toList()))).toList(),ValidationExecutionService.Context.from(context),permission(value),observation(observations.read(value.task(),value.revision()).orElse(null))));
     }
     private Permission permission(ValidationTaskStore.Snapshot snapshot){
         var value=snapshot.full().permission();if(value==null)return null;var original=value.start();
@@ -168,9 +173,9 @@ public final class ValidationConfigurationService {
                 &&!(command!=null&&command.equals(current.commandId())&&current.revision()==checked.revision+1))throw new StaleDefinition();
         return current;
     }
-    private ValidationEvaluation.Request request(Checked checked,ValidationTaskStore.Snapshot previous){
+    private ValidationEvaluation.Request request(Checked checked,ValidationTaskStore.Snapshot previous,boolean inspectMetadata){
         return new ValidationEvaluation.Request(new ValidationTaskStore.Selection(checked.task.pipelineId(),checked.choices.stream().map(ValidationEvaluation.Choice::outputId).distinct().toList()),
-                checked.choices,checked.method,checked.confirmations,previous==null?null:previous.comparison(),clock.instant().plusSeconds(45));
+                checked.choices,checked.method,checked.confirmations,previous==null?null:previous.comparison(),clock.instant().plusSeconds(45),inspectMetadata,previous==null?null:previous.settings().full().method());
     }
     private static Side side(ValidationEvaluation.Side side){return new Side(side.nodeId(),side.sourceId(),side.database(),side.schema(),side.table(),side.modelVersion(),side.codecBinding(),side.countOperation(),
             side.fields().stream().map(field->new Field(field.name(),field.type(),field.keyDomain(),field.unavailableReason())).toList(),

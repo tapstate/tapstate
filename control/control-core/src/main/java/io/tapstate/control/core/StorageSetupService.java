@@ -127,13 +127,13 @@ public final class StorageSetupService {
 
     /** The caller guard is established by the server's existing Cloud identity or OP management capability. */
     public synchronized TestResult test(StorageSetupScope expected, Runnable active, Candidate candidate, Layer layer) {
-        requireSetup(expected, active);
+        operationActive.run(); active.run();
         if (layer != Layer.CACHE) throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of(), null);
         Candidate local = localCandidate(candidate);
         var cache = probe.normalize(local.cache());
-        var setup = states.guardedBy(active).load();
-        var bound = setup.phase() == StorageSetupStateStore.Phase.STORAGE_BOUND
-                ? bindings.guardedBy(active).load() : Optional.<StorageBinding>empty();
+        var view = states.guardedBy(active).requireCurrentView(expected, StorageSetupStateStore.Purpose.SETUP);
+        var bound = view.status().phase() == StorageSetupStateStore.Phase.STORAGE_BOUND
+                ? view.binding() : Optional.<StorageBinding>empty();
         boolean existingCache = bound.isPresent() && sameOperation(bound.get().setup(), expected) && bound.get().cache().equals(cache);
         if (existingCache) {
             try { probe.test(cache); } catch (TapstateException refused) { throw testFailed(layer, refused); }

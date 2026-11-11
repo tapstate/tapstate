@@ -20,10 +20,10 @@ import static org.assertj.core.api.Assertions.*;
 class NativeValidationPdkRowsIT {
     @Container static final MongoDBContainer MONGO = NativeValidationOwnerReservationsIT.MONGO;
 
-    @Test void anOlderSavedTextKeyCannotBypassNativeOrderingAdmission() {
+    @Test void anUnknownSavedTextEncodingCannotBypassAdmission() {
         try(var f=new NativeValidationOwnerReservationsIT.Fixture()){
             var previous=f.comparison;var mapping=previous.mappings().getFirst();
-            var field=new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("text"));
+            var field=new ValidationKeyBinding.Component(List.of("id"),ValidationKey.Kind.TEXT,java.util.Set.of("unknown-text"));
             var legacy=new ValidationTaskSpec(previous.pipelineId(),previous.dependencyHashes(),previous.mappingRevision()+1,previous.comparisonRulesVersion(),
                     List.of(new ValidationTaskSpec.Mapping(mapping.mappingId(),mapping.outputKind(),mapping.outputId(),mapping.source(),mapping.target(),
                             new ValidationTaskSpec.Keys("old-text-confirmation",List.of(field),List.of(field)))));
@@ -33,7 +33,7 @@ class NativeValidationPdkRowsIT {
             var original=f.owners.take(f.owners.original(request,accepted.owner()));
             assertThatThrownBy(()->new NativeValidationPdkRows(original,original.declarations,ValidationDirectMappings.declare(original.declarations),Map.of(),Clock.systemUTC()))
                     .isInstanceOfSatisfying(TapstateException.class,refused->{assertThat(refused.code()).isEqualTo(ValidationError.RULE_UNSUPPORTED);
-                        assertThat(refused.args()).containsEntry("rule","native-text-ordering-unproven");});
+                        assertThat(refused.args()).containsEntry("rule","key-text-domain-unavailable");});
         }
     }
 

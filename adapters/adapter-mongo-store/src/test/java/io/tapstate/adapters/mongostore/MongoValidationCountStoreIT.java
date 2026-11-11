@@ -34,6 +34,41 @@ class MongoValidationCountStoreIT {
             assertThat(SystemCollections.VALIDATION_DIFFERENCES.on(f.database).countDocuments()).isZero();
         }
     }
+    @Test void failedTableAndSuccessfulCountSurviveTheSameCompletedReport() {
+        try(var f=new Fixture()) {
+            var report=f.start.report();
+            var failure=new ValidationTableFailure("one",ValidationTableFailure.Side.TARGET,ValidationError.READ_FAILED.code(),"Table read failed");
+            var write=new ValidationResultStore.TableFailureWrite(report,f.spec,failure);
+            assertThat(f.first.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.APPLIED);
+            assertThat(f.second.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.DUPLICATE);
+            var conflicting=new ValidationResultStore.TableFailureWrite(report,f.spec,
+                    new ValidationTableFailure("one",ValidationTableFailure.Side.SOURCE,ValidationError.READ_FAILED.code(),"Table read failed"));
+            assertThatThrownBy(()->f.second.publishTableFailure(conflicting)).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableFailureReplay");
+            assertThatThrownBy(()->f.second.publishCount(f.write("one",1,1))).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableOutcome");
+            assertThat(f.second.publishCount(f.write("two",2,2))).isEqualTo(ValidationResultStore.Publication.APPLIED);
+            var successful=new ValidationResultStore.TableFailureWrite(report,f.spec,
+                    new ValidationTableFailure("two",ValidationTableFailure.Side.TARGET,ValidationError.READ_FAILED.code(),"Table read failed"));
+            assertThatThrownBy(()->f.first.publishTableFailure(successful)).isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("conflictingTableOutcome");
+            assertThat(f.first.seal(report)).isEqualTo(ValidationResultStore.Seal.SEALED);
+            var terminal=new Document("formatVersion",1).append("state","COMPLETED").append("countingGeneration",1L)
+                    .append("knownAt",Instant.EPOCH.toString());
+            SystemCollections.VALIDATION_REPORTS.on(f.database).updateOne(
+                    new Document("_id",MongoValidationAdmissionStore.reportId(f.start.run())),
+                    new Document("$set",new Document("terminalMetadata",terminal)));
+
+            var reference=new ValidationReports.Reference("flow","task",ValidationMode.FULL,"run",f.task.generation(),1);
+            var stored=f.second.find(reference).orElseThrow();
+            assertThat(stored.tableFailures()).containsExactly(failure);
+            assertThat(stored.counts()).extracting(ValidationCountCheck::mappingId).containsExactly("two");
+            assertThat(stored.terminal()).isEqualTo(ValidationRunState.COMPLETED);
+            assertThat(f.report().getList("tableFailures",Document.class)).singleElement()
+                    .satisfies(row->assertThat(row).containsEntry("ordinal",0).doesNotContainKey("mappingId"));
+            assertThat(f.first.publishTableFailure(write)).isEqualTo(ValidationResultStore.Publication.CLOSED_OR_EXPIRED);
+        }
+    }
     @Test void publishCompetesWithSealAndCannotResurrectAnExpiredReport()throws Exception {
         try(var f=new Fixture();var workers=Executors.newFixedThreadPool(2)) {
             var gate=new CountDownLatch(1);

@@ -69,7 +69,7 @@ class StorageAuthenticationDuringStartupIT {
                     long before = identity.find(new org.bson.Document("_id", "cluster")).first().getLong("authWriteFence");
                     assertThat(dispatcher.dispatch("storage.status", caller, java.util.Map.of())).containsEntry("businessPhase", "READY");
                     long after = identity.find(new org.bson.Document("_id", "cluster")).first().getLong("authWriteFence");
-                    assertThat(after - before).as("initial and final session checks for each original authorization before and after the complete read-only projection").isEqualTo(4);
+                    assertThat(after - before).as("one committed admission for each explicit authorization before and after the read-only projection").isEqualTo(2);
                 }
                 var directGuards = new AtomicInteger();
                 root.snapshot(caller, directGuards::incrementAndGet);

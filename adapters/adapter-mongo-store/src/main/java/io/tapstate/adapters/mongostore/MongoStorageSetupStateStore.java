@@ -34,10 +34,18 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
         return new MongoStorageSetupStateStore(client, database, bindings, () -> { active.run(); guard.run(); });
     }
     @Override public Status load() { return transaction(this::load); }
+    @Override public View loadView() { return transaction(this::view); }
 
     @Override public void requireCurrent(StorageSetupScope expected, Purpose purpose) {
+        requireCurrentView(expected, purpose);
+    }
+    @Override public View requireCurrentView(StorageSetupScope expected, Purpose purpose) {
         Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(purpose, "purpose");
-        transaction(session -> { require(session, load(session), expected, purpose); return null; });
+        return transaction(session -> {
+            var result = view(session);
+            require(session, result.status(), expected, purpose);
+            return result;
+        });
     }
     @Override public Status rotate(StorageSetupScope expected, Purpose purpose) {
         Objects.requireNonNull(expected, "expected"); Objects.requireNonNull(purpose, "purpose");
@@ -57,6 +65,9 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
     }
 
     private Status load(ClientSession session) {
+        return view(session).status();
+    }
+    private View view(ClientSession session) {
         var facts = bindings.readForTransaction(session);
         var binding = facts.loaded().map(MongoStorageBindingStore.Loaded::binding);
         Document row = facts.setup();
@@ -65,7 +76,8 @@ final class MongoStorageSetupStateStore implements StorageSetupStateStore {
                     row.getString("operationId"), row.getLong("generation"));
             Phase phase = Phase.valueOf(row.getString("phase"));
             long version = binding.map(StorageBinding::bindingVersion).orElse(0L);
-            return new Status(scope, phase, version);
+            return new View(new Status(scope, phase, version), binding,
+                    facts.loaded().map(MongoStorageBindingStore.Loaded::cachePreparation));
         } catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) {
             throw new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "storage-setup", "field", "phase"), null);
         }

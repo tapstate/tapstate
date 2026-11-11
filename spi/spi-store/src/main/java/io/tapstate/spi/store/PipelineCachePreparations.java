@@ -18,6 +18,11 @@ public interface PipelineCachePreparations {
     /** Rechecks CONFIG outside the CACHE transaction, then verifies or publishes the original initial receipt. */
     PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant touchTime);
 
+    default PipelinePreparationReceipt seedDeferred(Reservation original, PipelineStatePreparations configuration,
+            PipelineIntentStore.PendingStart pending, Instant touchTime) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
     /** The scope, nonce and exact original claim remain fixed throughout a seed attempt. */
     record Reservation(PipelineIntentScope scope, String preparationId, Phase phase, WorkloadClaimFence claim) {
         public Reservation {

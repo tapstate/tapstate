@@ -17,7 +17,20 @@ import java.util.Objects;
  *       part in the CAS comparison, so clock drift can never corrupt the fencing decision.</li>
  * </ul>
  */
-public record CheckpointDoc(String pipelineId, String stateJson, long epoch, Instant touchTime) {
+public record CheckpointDoc(String pipelineId, String stateJson, long epoch, Instant touchTime, LeaseRecovery leaseRecovery) {
+
+    public CheckpointDoc(String pipelineId, String stateJson, long epoch, Instant touchTime) {
+        this(pipelineId, stateJson, epoch, touchTime, null);
+    }
+
+    /** The attempts and last failure for one accepted RUNNING intent. */
+    public record LeaseRecovery(long intentRevision, long failedExecution, int attempts, Instant retryAfter) {
+        public LeaseRecovery {
+            if (intentRevision < 1 || failedExecution < 1 || attempts < 1)
+                throw new IllegalArgumentException("invalid lease recovery");
+            Objects.requireNonNull(retryAfter, "retryAfter");
+        }
+    }
 
     public CheckpointDoc {
         Objects.requireNonNull(pipelineId, "pipelineId");

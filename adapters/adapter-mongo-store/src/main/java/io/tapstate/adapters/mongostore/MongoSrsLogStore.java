@@ -270,6 +270,35 @@ public final class MongoSrsLogStore implements SrsLogStore {
         return new SrsLogBounds(largestRetainedSequence(ring), -1L);
     }
 
+    @Override public Optional<Map<String, SrsLogBounds>> publishedBounds(String chain, java.util.Set<String> rings) {
+        if (models == null || rings.size() < 2 || rings.size() > 32) return Optional.empty();
+        var selected = java.util.Set.copyOf(rings);
+        return transaction(null, session -> publishedBounds(session, chain, selected, null));
+    }
+
+    Optional<Map<String, SrsLogBounds>> publishedBounds(ClientSession session, String chain,
+            java.util.Set<String> rings, Document heldRoot) {
+        if (rings.size() < 2 || rings.size() > 32) return Optional.empty();
+        boolean proved = heldRoot == null ? models.provePublishedRings(session, chain, rings)
+                : models.provePublishedRings(session, heldRoot, chain, rings);
+        if (!proved) return Optional.empty();
+        var ids = rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId, ring -> ring));
+        var keys = List.copyOf(ids.keySet());
+        var bounds = new java.util.HashMap<String, SrsLogBounds>();
+        for (var found : boundsCollection.aggregate(session, List.of(
+                new Document("$match", new Document("_id", new Document("$in", keys))),
+                new Document("$limit", ids.size() + 1),
+                new Document("$project", new Document("row", "$$ROOT")
+                        .append("matches", MongoSrsModelStore.exactMatches(keys, "$_id")))))) {
+            var row = found.get("row", Document.class);
+            String id = row.getString("_id");
+            String ring = ids.get(id);
+            if (ring == null || !List.of(id).equals(found.get("matches"))
+                    || bounds.putIfAbsent(ring, decodeSplitBounds(row)) != null) return Optional.empty();
+        }
+        return bounds.size() == rings.size() ? Optional.of(Map.copyOf(bounds)) : Optional.empty();
+    }
+
     private long largestRetainedSequence(String ring) {
         Document last = StoreIo.call(() -> collection.find(ringRange(ring, Long.MAX_VALUE))
                 .sort(new Document("_id", -1))

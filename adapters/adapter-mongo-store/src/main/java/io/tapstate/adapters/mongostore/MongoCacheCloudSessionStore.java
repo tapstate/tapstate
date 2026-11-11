@@ -73,12 +73,41 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
 
     @Override public Optional<CloudSessionRecord> authenticate(CloudSessionIdentity identity, String jwtId, String hash, Instant now, Instant idleExpiresAt) {
         requireMutation(hash, now); Objects.requireNonNull(idleExpiresAt, "idleExpiresAt"); key(identity, jwtId);
+        if (budget != null) return authenticateRequest(identity, jwtId, hash, now, idleExpiresAt);
         return transaction(session -> {
             facts.fence(session);
             if (!local(identity) || denied(session, identity, jwtId)) return Optional.empty();
             Document filter = context(identity, jwtId).append("secretHash", hash).append("revoked", false)
                     .append("idleExpiresAt", new Document("$gt", now.toEpochMilli()));
             Document update = new Document("$max", new Document("lastUsedAt", now.toEpochMilli()).append("idleExpiresAt", idleExpiresAt.toEpochMilli()));
+            return Optional.ofNullable(sessions.findOneAndUpdate(session, filter, update, AFTER)).map(row -> decode(identity, jwtId, row));
+        });
+    }
+
+    /** The committed request transaction is the admission boundary; later revocation affects later admissions. */
+    private Optional<CloudSessionRecord> authenticateRequest(CloudSessionIdentity identity, String jwtId,
+            String hash, Instant now, Instant expires) {
+        return transaction(session -> {
+            Document admitted = facts.admitRequest(session);
+            if (!local(identity)) return Optional.empty();
+            String id = key(identity, jwtId);
+            var joined = sessions.aggregate(session, List.of(new Document("$match", new Document("_id", id)),
+                    new Document("$project", new Document("_id", 0).append("record", "$$ROOT")),
+                    new Document("$lookup", new Document("from", revocations.getNamespace().getCollectionName())
+                            .append("pipeline", List.of(new Document("$match", new Document("_id", id)), new Document("$limit", 1)))
+                            .append("as", "requestRevocation")),
+                    new Document("$lookup", new Document("from", SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())
+                            .append("pipeline", List.of(new Document("$match", new Document("_id", "auth")), new Document("$limit", 1)))
+                            .append("as", "requestSchema")))).first();
+            if (joined == null) return Optional.empty();
+            var schema = joined.getList("requestSchema", Document.class);
+            facts.requireRequestSchema(schema.isEmpty() ? null : schema.getFirst(), admitted);
+            var denial = joined.getList("requestRevocation", Document.class);
+            if (!denial.isEmpty() && denied(denial.getFirst(), identity, jwtId)) return Optional.empty();
+            decode(identity, jwtId, joined.get("record", Document.class));
+            Document filter = context(identity, jwtId).append("secretHash", hash).append("revoked", false)
+                    .append("idleExpiresAt", new Document("$gt", now.toEpochMilli()));
+            Document update = new Document("$max", new Document("lastUsedAt", now.toEpochMilli()).append("idleExpiresAt", expires.toEpochMilli()));
             return Optional.ofNullable(sessions.findOneAndUpdate(session, filter, update, AFTER)).map(row -> decode(identity, jwtId, row));
         });
     }
@@ -110,6 +139,9 @@ final class MongoCacheCloudSessionStore implements CloudSessionStore {
 
     private boolean denied(ClientSession session, CloudSessionIdentity identity, String jwtId) {
         Document row = revocations.find(session, new Document("_id", key(identity, jwtId))).first();
+        return denied(row, identity, jwtId);
+    }
+    private boolean denied(Document row, CloudSessionIdentity identity, String jwtId) {
         if (row == null) return false;
         if (!row.keySet().equals(DENIAL) || !Integer.valueOf(1).equals(row.get("formatVersion"))
                 || !identity.issuer().equals(row.get("issuer")) || !identity.organizationId().equals(row.get("organizationId"))

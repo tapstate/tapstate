@@ -26,10 +26,11 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     private record Known(ValidationReportAdmission.Start start,boolean closed,Status passive) {}
     private record Fence(UUID generation,long nextSequence,boolean closed) implements Serializable {}
-    private record Lookup(Known known,boolean eligible,Status refusal,Fence fence) {}
+    private record Lookup(Known known, boolean eligible, Status refusal, Fence fence, boolean count) {}
     private final HazelcastInstance member;
     private final MongoConfigurationDomain configuration;
     private final ValidationOwnerRouter router;
+    private final java.util.function.Function<ValidationOwner, OwnerLease> observeOwner;
     private final ValidationMemberResources.Member resources;
     private final Runnable active;private final long ioTimeoutNanos;private final java.time.Clock clock;
     private final Context context;
@@ -48,6 +49,12 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
             ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout,java.time.Clock clock){
+        this(member,configuration,router,resources,process,active,ioTimeout,clock,router::ownerLease);
+    }
+    NativeValidationStartCoordinator(HazelcastInstance member,MongoConfigurationDomain configuration,ValidationOwnerRouter router,
+            ValidationMemberResources.Member resources,ValidationMemberResources process,Runnable active,Duration ioTimeout,
+            java.time.Clock clock,java.util.function.Function<ValidationOwner, OwnerLease> observeOwner){
+        this.observeOwner=Objects.requireNonNull(observeOwner);
         this.clock=Objects.requireNonNull(clock);
         if(ioTimeout==null||ioTimeout.isZero()||ioTimeout.isNegative()||ioTimeout.compareTo(Duration.ofSeconds(30))>0)throw invalid("entry.ioTimeout");
         ioTimeoutNanos=ioTimeout.toNanos();
@@ -64,14 +71,18 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
     }
     Context context(){require();return context;}
     OwnerLease permissionOwnerLease(ValidationTaskStore.Snapshot saved){
-        try(var scope=new ResponseScope()){return paid(scope,()->observePermissionOwner(saved));}
+        try(var scope=new ResponseScope()){return paid(scope,()->observePermissionOwner(saved, observeOwner));}
         catch(TapstateException unavailable){return OwnerLease.UNKNOWN;}
     }
     private OwnerLease observePermissionOwner(ValidationTaskStore.Snapshot saved){
+        return observePermissionOwner(saved, router::ownerLease);
+    }
+    private OwnerLease observePermissionOwner(ValidationTaskStore.Snapshot saved,
+            java.util.function.Function<ValidationOwner, OwnerLease> observation){
         require();var permission=saved.full().permission();
         if(saved.closed()||permission==null||permission.phase()==ValidationTaskStore.Phase.CLOSED
                 ||!permission.start().task().equals(saved.task())||!context.cluster().equals(saved.task().clusterId()))return OwnerLease.UNKNOWN;
-        return router.ownerLease(permission.start().run().owner());
+        return observation.apply(permission.start().run().owner());
     }
     Response start(ValidationOperation original){return response(original,Verb.START,null);}
     Response startScheduled(ValidationOperation original,java.time.Instant latest){return response(original,Verb.START,Objects.requireNonNull(latest));}
@@ -371,7 +382,7 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                 if(verb!=Verb.START)return;
                 if(!checked.eligible()){publish(entry,checked.refusal());return;}
                 synchronized(entries){if(closed||entry.reservationAttempted)return;entry.reservationAttempted=true;}
-                var attempt=router.reserveAttempt(request(entry.original));var reply=attempt.reply();
+                var attempt=router.reserveAttempt(request(entry.original), entry.latest == null && checked.count());var reply=attempt.reply();
                 synchronized(entries){
                     if(attempt.dispatched())entry.receiver=attempt.receiver();
                     // These router outcomes positively exclude a retained original allocation.
@@ -430,18 +441,19 @@ final class NativeValidationStartCoordinator implements AutoCloseable {
                 var start=permission.start();var terminal=configuration.validationReports(this::require).find(reference(start)).orElse(null);
                 if(permission.phase()==ValidationTaskStore.Phase.BORN&&terminal==null)throw invalid("entry.bornReportMissing");
                 var passive=passive(operation,start,permission.phase()==ValidationTaskStore.Phase.CLOSED,terminal);
-                return new Lookup(new Known(start,permission.phase()==ValidationTaskStore.Phase.CLOSED,passive),false,null,fence(saved));
+                return new Lookup(new Known(start,permission.phase()==ValidationTaskStore.Phase.CLOSED,passive),false,null,fence(saved),false);
             }
         }
         // Historical original reports can survive a later definition or task lifetime; they still grant no replacement start.
         var retained=configuration.validationReports(this::require).find(new ValidationReports.Reference(operation.pipeline(),operation.task(),ValidationMode.FULL,
                 runId(operation),operation.taskGeneration(),operation.sequence())).orElse(null);
-        if(retained!=null&&matches(operation,retained.admission()))return new Lookup(new Known(retained.admission(),retained.closed(),passive(operation,retained.admission(),retained.closed(),retained)),false,null,fence(saved));
+        if(retained!=null&&matches(operation,retained.admission()))return new Lookup(new Known(retained.admission(),retained.closed(),passive(operation,retained.admission(),retained.closed(),retained)),false,null,fence(saved),false);
         boolean valid=saved!=null&&!saved.closed()&&saved.task().generation().equals(operation.taskGeneration())&&saved.revision()==operation.revision()
                 &&saved.full().nextStartSequence()==operation.sequence()
                 &&(saved.full().permission()==null||saved.full().permission().phase()==ValidationTaskStore.Phase.CLOSED
                 ||observePermissionOwner(saved)==OwnerLease.NOT_LIVE);
-        return new Lookup(null,valid,status(operation,Outcome.REJECTED,null),fence(saved));
+        boolean count = valid && saved.settings().full().method() == io.tapstate.core.validation.ValidationMethod.COUNT;
+        return new Lookup(null, valid, status(operation, Outcome.REJECTED, null), fence(saved), count);
     }
     private static Fence fence(ValidationTaskStore.Snapshot saved){return saved==null?null:new Fence(saved.task().generation(),saved.full().nextStartSequence(),saved.closed());}
     private <T>T paid(ResponseScope scope,java.util.concurrent.Callable<T> command){return paid(scope.control(),command);}

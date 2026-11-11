@@ -43,7 +43,7 @@ public final class StorageControlAccess {
         original.requireActive().run();
         if (original.storageScope().isEmpty() && (mode != StorageBinding.Mode.CLOUD || original.organizationId().isEmpty()))
             throw new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
-        return ordinary(mode, setups.get(), original.storageScope().orElse(null), principal,
+        return ordinary(mode, original.setupScope().orElseGet(setups), original.storageScope().orElse(null), principal,
                 original.organizationId().orElse(null), original.requireActive());
     }
     public static StorageControlAccess management(SetupCapabilityService.Permission verified) {

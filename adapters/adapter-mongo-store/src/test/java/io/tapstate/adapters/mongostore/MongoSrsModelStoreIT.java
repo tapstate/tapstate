@@ -1219,6 +1219,28 @@ class MongoSrsModelStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void publishedBoundsMatchExactReadsAndFallBackForCollatingAliases(boolean caseInsensitive) {
+        withBusiness(caseInsensitive, f -> {
+            var first = model(0, table("original", null));
+            f.models().publish(first, f.fence());
+            var orders = table("id", null);
+            var customerTable = new SourceTable("customers", orders.fields(), orders.primaryKey(), orders.indexes());
+            String customerRing = "srs.chain-a.customers";
+            var customerKey = new SrsModelKey(CHAIN, "customers", SCOPE.cacheIncarnation(), 7, 0);
+            f.models().publish(new SrsModel(customerKey, customerRing, customerTable, 0), f.fence());
+            var log = new MongoSrsLogStore(f.client(), SystemCollections.SRS_EVENTS.on(f.database()),
+                    SystemCollections.SRS_LOG_BOUNDS.on(f.database()), SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()), f.models());
+            log.store(RING, 0, event(0, 7, f.fence()));
+            var rings = java.util.Set.of(RING, customerRing);
+            assertThat(log.publishedBounds(CHAIN, rings)).hasValue(Map.of(RING, log.bounds(RING), customerRing, log.bounds(customerRing)));
+            assertThat(log.publishedBounds(CHAIN, java.util.Set.of(RING, customerRing.toUpperCase(java.util.Locale.ROOT)))).isEmpty();
+            SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteOne(new Document("_id", MongoSrsLogStore.boundsId(customerRing)));
+            assertThat(log.publishedBounds(CHAIN, rings)).isEmpty();
+        });
+    }
+
     @Test
     void aNewSnapshotSelectsTheCurrentPublishedContextWithoutDependingOnUnreferencedOldPayloads() {
         withBusiness(f -> {
@@ -1390,6 +1412,10 @@ class MongoSrsModelStoreIT {
         assertThat(error.getMessage()).doesNotContain("raw-secret-sentinel");
     }); }
     private static void withBusiness(Scenario scenario) {
+        withBusiness(false, scenario);
+    }
+
+    private static void withBusiness(boolean caseInsensitive, Scenario scenario) {
         try (var client = MongoClients.create(MONGO.getReplicaSetUrl())) {
             var database = client.getDatabase("srs_model_" + UUID.randomUUID().toString().replace("-", ""));
             try {
@@ -1397,7 +1423,12 @@ class MongoSrsModelStoreIT {
                     for (var table : List.of(SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.SRS_CHAINS,
                             SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.CACHE_WORKLOAD_CLAIMS,
                             SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
-                        table.prepareCollectionOn(database, session);
+                        if (caseInsensitive && (table == SystemCollections.SRS_MODEL_CONTEXTS || table == SystemCollections.SRS_LOG_BOUNDS)) {
+                            var collation = com.mongodb.client.model.Collation.builder().locale("en")
+                                    .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build();
+                            database.createCollection(session, table.collectionName(),
+                                    new com.mongodb.client.model.CreateCollectionOptions().collation(collation));
+                        } else table.prepareCollectionOn(database, session);
                         for (var index : table.indexes()) IndexEnsure.createInTransaction(session, table.on(database), index);
                     }
                 }

@@ -4,6 +4,8 @@ import com.hazelcast.core.Hazelcast;
 import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
+import io.tapstate.spi.store.DeadlineWorkloadClaimStore;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.CacheBusinessScope;
@@ -20,13 +22,18 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,18 +47,9 @@ import org.slf4j.LoggerFactory;
  * on the monotonic clock from a point taken <em>before</em> the read went out — so the deadline cannot
  * outlive the answer it was cut from, and moving the node's wall clock cannot widen it.
  *
- * <p>What it compares is the pair of generations the run was submitted with against the pair the store
- * holds now. A refresh that cannot reach the store, a record that has gone, either generation having
- * moved, or the lease behind them having lapsed all read the same way: refused. Refusing is the safe
- * direction for a run that should stop — it stops calls going out.
- *
- * <p><b>A refusal is not a pause, so being behind is not a safe place to be.</b> It leaves here as an
- * exception, through the sink writer, into the processor, and it ends the job — there is no next refresh
- * for the run it refused, and nothing rebuilds a run whose members are all still present. So a reading
- * this member knows to be older than the run it is being asked about is refreshed on the spot rather
- * than waited out, and the floor that keeps an unreachable store from being asked per batch is not
- * allowed to become a stretch of time in which a live store is not asked at all. Measured 2026-09-20:
- * that stretch ended 14 of 20 unprompted failovers with the pipeline left failed for a person.
+ * <p>Scoped executions and captures keep a separate background refresh for each claim. The data path
+ * uses the last matching proof until its original deadline. It waits for background publication if a
+ * proof is missing, and stops on confirmed loss or when that wait expires.
  *
  * <p>What this bounds, and what it does not: the deadline is the shorter of this member's refresh window
  * and what the store says is left of the owner's lease, so this member stops no later than the moment the
@@ -73,7 +71,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ExecutionAuthorization.class);
 
     /** The exact claim this member last read for one pipeline, and when that reading expires locally. */
-    private record Entry(WorkloadClaimFence claim, long deadlineNanos) {
+    private record Entry(WorkloadClaimFence claim, long deadlineNanos, long leaseDeadlineNanos) {
     }
 
     private record ReadKey(String pipelineId, PipelineIntentScope scope, WorkloadClaimType type) {
@@ -97,6 +95,22 @@ final class ExecutionAuthorization implements AutoCloseable {
     /** State stores whose lease was proved under one pipeline's reading; held weakly, never kept alive from here. */
     private final Map<ReadKey, List<WeakReference<LeasedStateStore>>> leases = new ConcurrentHashMap<>();
     private final ScheduledExecutorService refresher;
+    private final ThreadPoolExecutor proofReaders;
+    private final Map<ReadKey, ScopedProof> scopedProofs = new ConcurrentHashMap<>();
+
+    private record ProofResult(Entry entry, boolean denied) {}
+
+    private static final class ScopedProof {
+        volatile ProofResult result = new ProofResult(null, false);
+        volatile String readFailure;
+        volatile long lastUsed = System.nanoTime();
+        volatile boolean scopeProved;
+        final AtomicBoolean storeReading = new AtomicBoolean();
+        long nextRead;
+        long revision;
+        boolean reading;
+        boolean superseded;
+    }
 
     private ExecutionAuthorization(boolean denied) {
         this.nodeActive = () -> !denied;
@@ -109,6 +123,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         this.nanoTime = System::nanoTime;
         this.fenced = denied;
         this.refresher = null;
+        this.proofReaders = null;
     }
 
     /** An explicit fixture guard for a port with no coordinated store. */
@@ -157,7 +172,18 @@ final class ExecutionAuthorization implements AutoCloseable {
             return thread;
         });
         long period = Math.max(1, TimeUnit.NANOSECONDS.toMillis(refreshIntervalNanos));
-        refresher.scheduleWithFixedDelay(this::refreshAll, period, period, TimeUnit.MILLISECONDS);
+        proofReaders = businessScope == null ? null : new ThreadPoolExecutor(4, 4, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(256), runnable -> {
+                    var thread = new Thread(runnable, "tapstate-scoped-proof-read");
+                    thread.setDaemon(true);
+                    return thread;
+                });
+        if (proofReaders == null) {
+            refresher.scheduleWithFixedDelay(this::refreshAll, period, period, TimeUnit.MILLISECONDS);
+        } else {
+            long tick = Math.max(1, Math.min(1000, period / 2));
+            refresher.scheduleWithFixedDelay(this::refreshScopedProofs, tick, tick, TimeUnit.MILLISECONDS);
+        }
     }
 
     /**
@@ -253,21 +279,23 @@ final class ExecutionAuthorization implements AutoCloseable {
                 || original.key().type() != WorkloadClaimType.CAPTURE || !clusterId.equals(original.key().clusterId())
                 || closed.get() || !nodeActive.getAsBoolean()) throw captureRefused();
         var key = new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE);
-        Entry entry = entries.get(key); long now = nanoTime.getAsLong();
-        if (entry != null && (entry.claim().claimGeneration() < original.claimGeneration()
-                || entry.claim().claimGeneration() == original.claimGeneration()
-                        && (entry.claim().executionGeneration() < original.executionGeneration()
-                                || entry.claim().executionGeneration() == original.executionGeneration()
-                                        && entry.claim().topologyRevision() != original.topologyRevision()))) read(key,true);
-        else if (entry == null || now - entry.deadlineNanos() >= 0) read(key,false);
-        Entry published = entries.get(key);
-        if (closed.get() || !nodeActive.getAsBoolean() || published == null
-                || nanoTime.getAsLong() - published.deadlineNanos() >= 0 || !original.equals(published.claim())) throw captureRefused();
-        return published.claim();
+        Entry entry = awaitScopedProof(key, value -> original.equals(value.claim()),
+                value -> captureProofPrecedes(value.claim(), original));
+        if (entry == null) throw captureRefused();
+        return entry.claim();
     }
+
+    private static boolean captureProofPrecedes(WorkloadClaimFence actual, WorkloadClaimFence expected) {
+        return actual.claimGeneration() < expected.claimGeneration()
+                || actual.claimGeneration() == expected.claimGeneration()
+                        && (actual.executionGeneration() < expected.executionGeneration()
+                        || actual.executionGeneration() == expected.executionGeneration()
+                                && actual.topologyRevision() < expected.topologyRevision());
+    }
+
     /** Rechecks one already-published physical capture claim, without refreshing the store. */
     WorkloadClaimFence requireCaptureLocal(CacheBusinessScope originalScope,WorkloadClaimFence original) {
-        var entry=entries.get(new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE));
+        var entry=scopedEntry(new ReadKey(original.key().resourceId(),null,WorkloadClaimType.CAPTURE));
         if(!fenced || !Objects.equals(businessScope,originalScope) || closed.get() || !nodeActive.getAsBoolean()
                 || entry==null || nanoTime.getAsLong()-entry.deadlineNanos()>=0 || !original.equals(entry.claim()))throw captureRefused();
         return entry.claim();
@@ -287,11 +315,82 @@ final class ExecutionAuthorization implements AutoCloseable {
     /** Rechecks only an already-published proof and its original deadline, without store IO. */
     WorkloadClaimFence requireLocal(ExecutionFence fence) {
         Objects.requireNonNull(fence,"fence");
-        Entry entry=entries.get(ReadKey.of(fence));
+        Entry entry=businessScope == null ? entries.get(ReadKey.of(fence)) : scopedEntry(ReadKey.of(fence));
         if(!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || entry==null
                 || nanoTime.getAsLong()-entry.deadlineNanos()>=0 || !matches(entry.claim(),fence))
             throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline",fence.pipelineId()),null);
         return entry.claim();
+    }
+
+    /** Checks the current local proof for the original fence, without store IO. */
+    Runnable localProofGuard(ExecutionFence fence) {
+        Runnable require = () -> requireWriterProof(fence);
+        require.run();
+        return require;
+    }
+
+    private void requireWriterProof(ExecutionFence fence) {
+        if (businessScope == null) {
+            requireLocal(fence);
+            return;
+        }
+        var key = ReadKey.of(fence);
+        var proof = scopedProofs.get(key);
+        if (proof == null) throw writerRefused(fence);
+        proof.lastUsed = System.nanoTime();
+        var entry = requireWriterLease(fence, proof);
+        if (nanoTime.getAsLong() - entry.deadlineNanos() >= 0)
+            throw new WriterProofUnavailable(proof, entry.leaseDeadlineNanos());
+    }
+
+    private Entry requireWriterLease(ExecutionFence fence, ScopedProof proof) {
+        var result = proof.result;
+        var entry = result.entry();
+        if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || result.denied()
+                || entry == null || !matches(entry.claim(), fence)
+                || nanoTime.getAsLong() - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
+        return entry;
+    }
+
+    /** A pre-commit guard may suspend an acknowledgement, but the transaction must exit before waiting. */
+    static final class WriterProofUnavailable extends RuntimeException {
+        private final ScopedProof proof;
+        private final long leaseDeadline;
+
+        private WriterProofUnavailable(ScopedProof proof, long leaseDeadline) {
+            this.proof = proof;
+            this.leaseDeadline = leaseDeadline;
+        }
+    }
+
+    void awaitWriterProof(ExecutionFence fence, WriterProofUnavailable unavailable) {
+        var key = ReadKey.of(fence);
+        var proof = unavailable.proof;
+        LOG.info("Waiting for SRS acknowledgement proof for {} claim={} execution={} remainingMs={} lastRead={}",
+                fence.pipelineId(), fence.claimGeneration(), fence.executionGeneration(),
+                TimeUnit.NANOSECONDS.toMillis(unavailable.leaseDeadline - nanoTime.getAsLong()), proof.readFailure);
+        synchronized (proof) {
+            while (true) {
+                long left = unavailable.leaseDeadline - nanoTime.getAsLong();
+                if (left <= 0 || scopedProofs.get(key) != proof) throw writerRefused(fence);
+                var entry = requireWriterLease(fence, proof);
+                if (nanoTime.getAsLong() - entry.deadlineNanos() < 0) break;
+                proof.lastUsed = System.nanoTime();
+                requestScopedProof(key, proof);
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw writerRefused(fence);
+                }
+            }
+        }
+        LOG.info("Recovered SRS acknowledgement proof for {} claim={} execution={}",
+                fence.pipelineId(), fence.claimGeneration(), fence.executionGeneration());
+    }
+
+    private static TapstateException writerRefused(ExecutionFence fence) {
+        return new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
     }
 
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
@@ -299,6 +398,9 @@ final class ExecutionAuthorization implements AutoCloseable {
         Objects.requireNonNull(fence, "fence");
         if (!accepts(fence) || closed.get() || !nodeActive.getAsBoolean()) return null;
         ReadKey key = ReadKey.of(fence);
+        if (businessScope != null) {
+            return awaitScopedProof(key, value -> matches(value.claim(), fence), value -> precedes(value, fence));
+        }
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(key);
         if (entry != null && precedes(entry, fence)) {
@@ -368,6 +470,209 @@ final class ExecutionAuthorization implements AutoCloseable {
                 : claims.readPipeline(key.scope());
     }
 
+    private Optional<WorkloadClaimReading> readExecutionProof(ReadKey key, ScopedProof proof, long startedAt) {
+        long deadline = System.nanoTime() + windowNanos;
+        if (claims instanceof DeadlineWorkloadClaimStore bounded) {
+            return bounded.withDeadline(deadline, () -> readScopedStore(key, proof, startedAt, deadline));
+        }
+        return readScopedStore(key, proof, startedAt, deadline);
+    }
+
+    private Optional<WorkloadClaimReading> readScopedStore(ReadKey key, ScopedProof proof, long startedAt, long deadline) {
+        // A bounded caller can time out before the underlying Mongo operation has exited.
+        if (!proof.storeReading.compareAndSet(false, true)) throw proofUnavailable(key);
+        try {
+            try {
+                return readStore(key);
+            } catch (TapstateException failed) {
+                if (!proofReadTimedOut(failed) || nanoTime.getAsLong() - startedAt >= windowNanos
+                        || System.nanoTime() - deadline >= 0) throw failed;
+                return readStore(key);
+            }
+        } finally {
+            proof.storeReading.set(false);
+        }
+    }
+
+    private static boolean proofReadTimedOut(TapstateException failure) {
+        if (failure.code() != io.tapstate.spi.store.IoError.STORE_UNAVAILABLE
+                || !(failure.args().get("detail") instanceof String detail)) return false;
+        // The Mongo adapter exposes only a sanitized driver type and optional numeric code.
+        return switch (detail.split(" ", 2)[0]) {
+            case "MongoTimeoutException", "MongoOperationTimeoutException", "MongoExecutionTimeoutException" -> true;
+            default -> false;
+        };
+    }
+
+    private Entry scopedEntry(ReadKey key) {
+        var proof = scopedProofs.get(key);
+        if (proof == null) return null;
+        proof.lastUsed = System.nanoTime();
+        return proof.result.entry();
+    }
+
+    private Entry awaitScopedProof(ReadKey key, Predicate<Entry> matches, Predicate<Entry> precedes) {
+        var proof = scopedProofs.computeIfAbsent(key, ignored -> new ScopedProof());
+        proof.lastUsed = System.nanoTime();
+        var result = proof.result;
+        if (liveMatch(result, matches) && proof.result == result) return result.entry();
+        long startedAt = System.nanoTime();
+        synchronized (proof) {
+            long initialRevision = proof.revision;
+            while (!closed.get() && nodeActive.getAsBoolean() && !proof.superseded) {
+                result = proof.result;
+                var entry = result.entry();
+                if (liveMatch(result, matches)) return entry;
+                if (entry != null && !precedes.test(entry)
+                        && (result.denied() || !matches.test(entry))) return null;
+                if (entry == null && result.denied() && proof.revision != initialRevision) return null;
+
+                long left = 3 * windowNanos - (System.nanoTime() - startedAt);
+                if (left <= 0) throw proofUnavailable(key);
+                requestScopedProof(key, proof);
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw proofUnavailable(key);
+                }
+            }
+        }
+        return null;
+    }
+
+    private boolean liveMatch(ProofResult result, Predicate<Entry> matches) {
+        var entry = result.entry();
+        return !closed.get() && nodeActive.getAsBoolean() && !result.denied() && entry != null
+                && nanoTime.getAsLong() - entry.deadlineNanos() < 0 && matches.test(entry);
+    }
+
+    private static TapstateException proofUnavailable(ReadKey key) {
+        return new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "authorization-proof-unavailable " + key.type().name()), null);
+    }
+
+    private void refreshScopedProofs() {
+        sweepLeases();
+        long now = System.nanoTime();
+        scopedProofs.forEach((key, proof) -> {
+            synchronized (proof) {
+                if (!proof.reading && !proof.storeReading.get() && now - proof.lastUsed >= 4 * windowNanos) {
+                    if (scopedProofs.remove(key, proof)) {
+                        proof.superseded = true;
+                        dropLeases(key);
+                        proof.result = new ProofResult(null, true);
+                        proof.notifyAll();
+                    }
+                } else {
+                    requestScopedProof(key, proof);
+                }
+            }
+        });
+    }
+
+    /** Caller holds only the proof's monitor, never while doing store I/O. */
+    private void requestScopedProof(ReadKey key, ScopedProof proof) {
+        if (closed.get() || proof.superseded || proof.reading || proof.storeReading.get()
+                || proof.nextRead != 0 && System.nanoTime() - proof.nextRead < 0) return;
+        proof.reading = true;
+        try {
+            proofReaders.execute(() -> readScopedProof(key, proof));
+        } catch (RejectedExecutionException busy) {
+            proof.reading = false;
+            proof.nextRead = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100);
+        }
+    }
+
+    private void readScopedProof(ReadKey key, ScopedProof proof) {
+        long startedAt = nanoTime.getAsLong();
+        ProofResult result = null;
+        try {
+            var reading = readExecutionProof(key, proof, startedAt);
+            proof.readFailure = null;
+            if (reading.isEmpty()) {
+                result = new ProofResult(null, true);
+            } else {
+                var observed = reading.orElseThrow();
+                long lease = observed.leaseRemaining().toNanos();
+                long held = Math.min(windowNanos, lease);
+                result = new ProofResult(new Entry(WorkloadClaimFence.from(observed.claim()), startedAt + held, startedAt + lease),
+                        held <= 0);
+            }
+        } catch (RuntimeException unavailable) {
+            dropLeases(key);
+            proof.readFailure = unavailable instanceof TapstateException coded ? coded.getMessage() : unavailable.getClass().getSimpleName();
+            if (definitiveRefusal(unavailable)) {
+                result = new ProofResult(null, true);
+            } else {
+                LOG.debug("Could not refresh {} authorization for {}", key.type(), key.pipelineId(), unavailable);
+            }
+        } finally {
+            publishScopedProof(key, proof, result);
+        }
+    }
+
+    private static boolean definitiveRefusal(RuntimeException failure) {
+        if (!(failure instanceof TapstateException coded) || failure.getCause() instanceof TimeoutException)
+            return false;
+        return coded.code() == IoError.WORKLOAD_CLAIM_FENCED || coded.code() == IoError.CACHE_BUSINESS_FENCED
+                || coded.code() == IoError.PIPELINE_INTENT_FENCED;
+    }
+
+    private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result) {
+        // Publish and retire older scopes in one order. No store calls take either monitor.
+        synchronized (scopedProofs) {
+            synchronized (proof) {
+                proof.reading = false;
+                if (!closed.get() && !proof.superseded && scopedProofs.get(key) == proof) {
+                    if (result != null) {
+                        var previous = proof.result.entry();
+                        if (result.denied() || previous != null && (result.entry() == null
+                                || !previous.claim().equals(result.entry().claim()))) dropLeases(key);
+                        if (key.scope() != null && !proof.scopeProved && newerScopeProved(key)) {
+                            proof.superseded = true;
+                            proof.result = new ProofResult(null, true);
+                        } else {
+                            proof.result = result;
+                            if (result.entry() != null && key.scope() != null && !proof.scopeProved) {
+                                proof.scopeProved = true;
+                                retireOlderScopes(key);
+                            }
+                        }
+                        proof.revision++;
+                    }
+                    // A failed refresh retains any still-valid proof without moving its deadline.
+                    long delay = result == null ? Math.min(refreshIntervalNanos, TimeUnit.SECONDS.toNanos(1))
+                            : refreshIntervalNanos;
+                    proof.nextRead = System.nanoTime() + delay;
+                }
+                proof.notifyAll();
+            }
+        }
+    }
+
+    private boolean newerScopeProved(ReadKey original) {
+        return scopedProofs.entrySet().stream().anyMatch(candidate -> {
+            var key = candidate.getKey();
+            return key.scope() != null && key.pipelineId().equals(original.pipelineId())
+                    && key.scope().stateGeneration() > original.scope().stateGeneration()
+                    && candidate.getValue().scopeProved;
+        });
+    }
+
+    private void retireOlderScopes(ReadKey newer) {
+        scopedProofs.forEach((key, proof) -> {
+            if (key.scope() == null || !key.pipelineId().equals(newer.pipelineId())
+                    || key.scope().stateGeneration() >= newer.scope().stateGeneration()) return;
+            synchronized (proof) {
+                proof.superseded = true;
+                dropLeases(key);
+                proof.result = new ProofResult(null, true);
+                proof.notifyAll();
+            }
+        });
+    }
+
     /**
      * Whether {@code entry} was read before the run {@code fence} names was submitted, ordered the way
      * the store advances the pair: taking a claim over takes the next claim generation and carries the
@@ -423,28 +728,6 @@ final class ExecutionAuthorization implements AutoCloseable {
         }
     }
 
-    /**
-     * A proved replacement ends every older positive answer for this Pipeline immediately, and the leases
-     * held under them. Reads are serialized, and the scoped store refuses a scope that is no longer current.
-     * Returns false, replacing nothing, when a newer scope than {@code key}'s is already known.
-     */
-    private boolean replaceOlderScopes(ReadKey key) {
-        boolean newerKnown = entries.keySet().stream().anyMatch(other -> other.type() == key.type() && other.scope() != null && other.pipelineId().equals(key.pipelineId())
-                && other.scope().stateGeneration() > key.scope().stateGeneration());
-        if (newerKnown) return false;
-        for (ReadKey other : Set.copyOf(entries.keySet())) {
-            if (sibling(key, other)) {
-                entries.remove(other); dropLeases(other); leases.remove(other);
-            }
-        }
-        nextReadNanos.keySet().removeIf(other -> sibling(key, other));
-        return true;
-    }
-
-    private static boolean sibling(ReadKey key, ReadKey other) {
-        return other.type() == key.type() && other.pipelineId().equals(key.pipelineId()) && !other.equals(key);
-    }
-
     private Entry readStoreEntry(ReadKey key, boolean evenIfStillLive) {
         long now = nanoTime.getAsLong();
         Entry entry = entries.get(key);
@@ -468,7 +751,6 @@ final class ExecutionAuthorization implements AutoCloseable {
             return null;
         }
         nextReadNanos.remove(key);
-        if (key.scope() != null && !entries.containsKey(key) && !replaceOlderScopes(key)) return null;
         if (current.isEmpty()) {
             entries.remove(key);
             return null;
@@ -485,7 +767,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             entries.remove(key);
             return null;
         }
-        Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held);
+        Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held, startedAt + leaseRemaining.toNanos());
         entries.put(key, refreshed);
         return refreshed;
     }
@@ -494,6 +776,11 @@ final class ExecutionAuthorization implements AutoCloseable {
     public void close() {
         closed.set(true); entries.clear(); nextReadNanos.clear();
         leases.keySet().forEach(this::dropLeases);
+        scopedProofs.values().forEach(proof -> {
+            synchronized (proof) { proof.notifyAll(); }
+        });
+        scopedProofs.clear();
+        if (proofReaders != null) proofReaders.shutdownNow();
         if (refresher != null) {
             refresher.shutdownNow();
         }

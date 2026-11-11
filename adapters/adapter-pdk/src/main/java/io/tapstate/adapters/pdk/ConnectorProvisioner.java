@@ -28,6 +28,14 @@ public interface ConnectorProvisioner {
         return ref;
     }
 
+    /** Resolves only the connector needed by the current Capture startup. */
+    default ConnectorRef resolveCaptureStartup(String connectorId) { return resolve(connectorId); }
+
+    /** Rechecks a captured registration at physical open; other implementations retain full resolution. */
+    default ConnectorRef revalidateCaptureStartup(String connectorId, ConnectorRef captured) {
+        return resolve(connectorId, captured.contentHash());
+    }
+
     /** A stable, non-secret version identity for cache keys; implementations may avoid loading the connector. */
     default String cacheIdentity(String connectorId) {
         ConnectorRef connector = resolve(connectorId);

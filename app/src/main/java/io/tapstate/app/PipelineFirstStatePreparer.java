@@ -53,9 +53,32 @@ final class PipelineFirstStatePreparer {
     /** Runtime preparation requires the current captured source contract even when CONFIG already says COMPLETE. */
     PipelinePreparation prepare(PipelineIntentScope original,PipelinePreparationInputs inputs) {
         Objects.requireNonNull(inputs,"inputs"); requireActive.run();
-        configuration.validateSources(original,inputs); requireActive.run();
         var result = prepareAttempt(original,inputs,null,() -> {}); requireActive.run();
         cache.verifySources(original,inputs); requireActive.run(); return result;
+    }
+
+    void prepareDeferred(io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
+        var scope = pending.intent().scope();
+        if (!business.equals(new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))) throw fenced();
+        var node = requireCurrentNode();
+        var issued = configuration.issueDeferred(pending, node);
+        PipelineCachePreparations.Reservation reservation;
+        if (issued instanceof FirstPipelineCreationResult.Issued winner) {
+            try {
+                reservation = cache.reserveFirst(winner.creation(), ttl);
+            } catch (TapstateException failure) {
+                if (failure.code() != IoError.PIPELINE_STATE_REBUILD_REQUIRED) throw failure;
+                reservation = cache.resume(winner.creation().preparation(), node, ttl);
+            }
+        } else {
+            var retained = ((FirstPipelineCreationResult.AlreadyIssued) issued).preparation();
+            requireOriginal(scope, retained);
+            if (retained.phase() == PipelinePreparation.Phase.COMPLETE) return;
+            reservation = cache.resume(retained, node, ttl);
+        }
+        requireActive.run();
+        var receipt = cache.seedDeferred(reservation, configuration, pending, clock.instant());
+        configuration.completeDeferred(pending, receipt);
     }
 
     PipelinePreparation prepareRecovered(io.tapstate.spi.store.CacheRecoveryStore.FullPreparation confirmation,
@@ -76,6 +99,10 @@ final class PipelineFirstStatePreparer {
         PipelinePreparation facts = configuration.read(original.pipelineId()).orElseThrow(PipelineFirstStatePreparer::fenced);
         requireOriginal(original, facts);
         requireActive.run();
+        if (inputs != null && confirmation == null && facts.phase() != PipelinePreparation.Phase.UNASSIGNED) {
+            configuration.validateSources(original, inputs);
+            requireActive.run();
+        }
         if (facts.phase() == PipelinePreparation.Phase.COMPLETE) return facts;
         WorkloadClaimFence node = currentNode.get().orElseThrow(PipelineFirstStatePreparer::claimFenced);
         requireNode(node);
@@ -92,6 +119,12 @@ final class PipelineFirstStatePreparer {
             } else {
                 facts = ((FirstPipelineCreationResult.AlreadyIssued) issued).preparation();
                 requireOriginal(original, facts);
+                // A winning issuance validates inputs in its CONFIG write transaction. A losing
+                // attempt receives retained facts and still needs its own input proof.
+                if (inputs != null && confirmation == null) {
+                    configuration.validateSources(original, inputs);
+                    requireActive.run();
+                }
                 if (facts.phase() == PipelinePreparation.Phase.COMPLETE) return facts;
                 return continueExisting(original, facts, node);
             }

@@ -56,7 +56,10 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
     private final StorePort storePort;
     private final StoreBackedDagSource joins;
     private final AuditGate auditGate;
-    @FunctionalInterface interface Commands { Command bind(String pipeline); }
+    @FunctionalInterface interface Commands {
+        Command bind(String pipeline);
+        default Command bindPublication(String pipeline) { return bind(pipeline); }
+    }
     record Command(StorePort ports, Runnable release) implements AutoCloseable {
         Command { Objects.requireNonNull(ports); Objects.requireNonNull(release); }
         @Override public void close() { release.run(); }
@@ -160,6 +163,19 @@ final class StoreBackedDerivedSchemas implements DerivedSchemas, SchemaDerivatio
         refuseUnlessAtRest(pipelineId);
         joins.copySourceSchemas(pipelineId);
         joins.refreshStepSchemas(pipelineId);
+    }
+
+    @Override
+    public void derivePublishedDraft(String pipelineId, PublishedInputs inputs, long stateGeneration) {
+        if (commands == null || stateGeneration == 0) {
+            derive(pipelineId);
+            return;
+        }
+        try (var command = commands.bindPublication(pipelineId)) {
+            if (!(command.ports() instanceof ThreeLayerStorePort nativePort)) throw ThreeLayerStorePort.refused();
+            nativePort.requirePublishedGeneration(pipelineId, stateGeneration);
+            joins.recordPublishedModels(pipelineId, inputs, nativePort.derivedSchemas());
+        }
     }
 
     /**

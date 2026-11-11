@@ -18,6 +18,22 @@ public interface StorePort {
     /** Read-only admission: this Pipeline must use its explicit full recovery instead of an ordinary start. */
     default boolean pipelineRecoveryRequired(String pipelineId) { return false; }
 
+    record PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+            java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+            java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
+            io.tapstate.core.lifecycle.PipelineState checkpoint) {
+        public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+                java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable) {
+            this(observation, desired, intentFailure, runningObservationUnavailable, null);
+        }
+    }
+
+    /** Batched ordinary display states. Absent ids use the original per-Pipeline read path. */
+    default java.util.Map<String, PipelineCatalogState> pipelineCatalogStates(java.util.List<String> ids) {
+        return java.util.Map.of();
+    }
+
     /** The canonical, authoritative store of applied resources. */
     ArtifactStore artifacts();
 

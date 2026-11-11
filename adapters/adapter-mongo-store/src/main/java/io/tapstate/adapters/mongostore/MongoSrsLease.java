@@ -83,6 +83,12 @@ final class MongoSrsLease {
     static long remainingMillis(MongoCollection<Document> claims, ClientSession session, WorkloadClaimFence fence) {
         Document remaining = claims.find(session, WorkloadClaimDocuments.live(fence))
                 .projection(new Document("_id", 0).append("remaining", new Document("$subtract", List.of("$leaseUntil", "$$NOW")))).first();
+        if (remaining == null && MongoWorkloadClaimStore.canUseNodeLease(fence)) {
+            return new MongoWorkloadClaimStore(claims).inStrictSession(session).read(fence.key())
+                    .filter(reading -> reading.leased() && fence.equals(WorkloadClaimFence.from(reading.claim())))
+                    .map(reading -> reading.leaseRemaining().toMillis()).orElseThrow(
+                            () -> new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null));
+        }
         if (remaining == null || !(remaining.get("remaining") instanceof Number millis)) {
             throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
         }

@@ -91,6 +91,17 @@ class ValidationDirectMappingsTest {
         assertThatThrownBy(()->ValidationDirectMappings.compile(excluded,ValidationDirectMappingsTest::metadata))
                 .isInstanceOf(TapstateException.class).hasMessageContaining("sourceTableScope");
     }
+    @Test void dynamicRenamesMustProveOneToOneScopeWithoutProbing() {
+        var saved = saved("serve: { from: input, sync: [{ id: out, source: target, rename: { case: lower } }] }",
+                List.of("orders"), List.of("orders"), true);
+        var reads = new AtomicInteger();
+        assertThatThrownBy(() -> ValidationDirectMappings.compile(saved, table -> {
+            reads.incrementAndGet();
+            return metadata(table);
+        })).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.args()).containsEntry("rule", "direct.table-scope-unknown"));
+        assertThat(reads).hasValue(0);
+    }
     @Test void aReturnedModelFromAnotherTableCannotSupplyTheSavedMapping() {
         var saved=saved("serve: { from: input.orders, sync: [{ id: out, source: target }] }",
                 List.of("orders"),List.of("orders"),false);

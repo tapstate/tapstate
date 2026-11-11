@@ -370,6 +370,31 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aBlockedDemandReadDoesNotDelayCaptureRenewal() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var renewedDuringRead = new CountDownLatch(1);
+            var held = ownedShared(f);
+            when(f.authorization.authorized(ORIGINAL)).thenAnswer(call -> {
+                entered.countDown();
+                if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("demand read was not released");
+                return true;
+            });
+            doAnswer(call -> {
+                if (entered.getCount() == 0 && release.getCount() != 0) renewedDuringRead.countDown();
+                return Optional.of(call.getArgument(0));
+            }).when(f.ownership).renew(held.claim());
+            try {
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                assertThat(renewedDuringRead.await(2, TimeUnit.SECONDS)).isTrue();
+                verify(f.ownership, never()).release(held.claim());
+            } finally {
+                release.countDown();
+            }
+        }
+    }
+
     @Test void anAuthorizedLocalExecutionRetainsItsPhysicalReader() throws Exception {
         try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
             var held = ownedShared(f);
@@ -379,7 +404,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                 return Optional.of(call.getArgument(0));
             }).when(f.ownership).renew(held.claim());
             assertThat(renewed.await(3, TimeUnit.SECONDS)).isTrue();
-            verify(f.authorization, atLeast(2)).authorized(ORIGINAL);
+            verify(f.authorization, timeout(3000).atLeast(2)).authorized(ORIGINAL);
             verify(held.tail(), never()).close();
             verify(f.ownership, never()).release(held.claim());
         }
@@ -418,8 +443,8 @@ class ScopedPipelineCaptureCoordinatorTest {
             doAnswer(call -> { readerClosed.countDown(); return null; }).when(held.tail()).close();
             when(f.authorization.authorized(ORIGINAL)).thenReturn(false);
             assertThat(renewed.await(3, TimeUnit.SECONDS)).isTrue();
-            verify(f.authorization, atLeast(2)).authorized(peer);
-            verify(f.pipelines, atLeast(2)).pipelineStates(peerScope);
+            verify(f.authorization, timeout(3000).atLeast(2)).authorized(peer);
+            verify(f.pipelines, timeout(3000).atLeast(2)).pipelineStates(peerScope);
             verify(held.tail(), never()).close();
             verify(f.ownership, never()).release(held.claim());
             peerAuthorized.set(false);

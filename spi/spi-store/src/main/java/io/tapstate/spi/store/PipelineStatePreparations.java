@@ -21,6 +21,18 @@ public interface PipelineStatePreparations {
         throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_STATE_REBUILD_REQUIRED, java.util.Map.of("pipeline", scope.pipelineId()), null);
     }
 
+    default FirstPipelineCreationResult issueDeferred(PipelineIntentStore.PendingStart pending, WorkloadClaimFence node) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    default void requireIssuedDeferred(PipelineIntentStore.PendingStart pending, String preparationId) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
+    default PipelinePreparation completeDeferred(PipelineIntentStore.PendingStart pending, PipelinePreparationReceipt receipt) {
+        throw new UnsupportedOperationException("deferred first start is not supported");
+    }
+
     /** Read-only same-domain validation of captured Pipeline and Source definitions. */
     void validateSources(PipelineIntentScope scope, PipelinePreparationInputs inputs);
 

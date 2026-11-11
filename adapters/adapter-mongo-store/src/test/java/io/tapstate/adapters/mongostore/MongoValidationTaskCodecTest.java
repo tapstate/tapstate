@@ -66,6 +66,24 @@ class MongoValidationTaskCodecTest {
         assertThat(MongoValidationTaskCodec.definition(decoded.comparison(), decoded.settings())).isEqualTo(encoded);
     }
 
+    @Test void deferredFullKeysRoundTripAsPathsWhileBoundKeysRetainVersionOne() {
+        var bound=spec(true);
+        var original=spec(false);
+        var mapping=original.mappings().getFirst();
+        var deferred=new ValidationTaskSpec(original.pipelineId(),original.dependencyHashes(),original.mappingRevision(),
+                original.comparisonRulesVersion(),List.of(new ValidationTaskSpec.Mapping(mapping.mappingId(),mapping.outputKind(),
+                        mapping.outputId(),mapping.source(),mapping.target(),
+                        ValidationTaskSpec.Keys.deferred(UUID.randomUUID().toString(),List.of(List.of("key.a")),List.of(List.of("other"))))));
+        var settings=ValidationTaskStore.Settings.defaults(ValidationMethod.UNIQUE_KEY,1_000);
+        var encoded=MongoValidationTaskCodec.definition(deferred,settings);
+        assertThat(encoded.get("comparison",Document.class).getInteger("formatVersion")).isEqualTo(2);
+        assertThat(encoded.getBoolean("keyInputsPresent")).isFalse();
+        assertThat(MongoValidationTaskCodec.definition(copy(encoded)).comparison()).isEqualTo(deferred);
+        var legacy=MongoValidationTaskCodec.comparison(bound);
+        assertThat(legacy.getInteger("formatVersion")).isOne();
+        assertThat(MongoValidationTaskCodec.comparison(copy(legacy)).fingerprint()).isEqualTo(bound.fingerprint());
+    }
+
     @Test void literalResourceNamesRemainValuesRatherThanBsonFieldPaths() {
         var spec = new ValidationTaskSpec("flow.name", Map.of("flow.name", "a".repeat(64), "source.with.dots", "b".repeat(64), "target$literal", "c".repeat(64)),
                 1, "rules-v1", List.of(new ValidationTaskSpec.Mapping("map", ValidationTaskSpec.OutputKind.SYNC, "output",

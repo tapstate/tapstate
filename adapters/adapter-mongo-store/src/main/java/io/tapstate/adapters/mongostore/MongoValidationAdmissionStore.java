@@ -24,6 +24,7 @@ import org.bson.codecs.EncoderContext;
 import org.bson.io.BasicOutputBuffer;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
 
@@ -63,11 +64,16 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     static ValidationTaskStore taskDefinitions(MongoClient client, MongoDatabase database, String cluster, Runnable active,
             MongoConfigurationArtifactStore artifacts) {
+        return nativeTaskDefinitions(client, database, cluster, active, artifacts);
+    }
+
+    static Definitions nativeTaskDefinitions(MongoClient client, MongoDatabase database, String cluster, Runnable active,
+            MongoConfigurationArtifactStore artifacts) {
         if (!artifacts.belongsTo(client, database.getName())) throw new IllegalArgumentException("validation definitions need the original CONFIG client");
         return new Definitions(new MongoValidationAdmissionStore(client, database, cluster, active), artifacts);
     }
 
-    private static final class Definitions implements ValidationTaskStore {
+    static final class Definitions implements ValidationTaskStore {
         private final MongoValidationAdmissionStore owner;
         private final MongoConfigurationArtifactStore artifacts;
         private Definitions(MongoValidationAdmissionStore owner, MongoConfigurationArtifactStore artifacts) { this.owner = owner; this.artifacts = artifacts; }
@@ -123,15 +129,26 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }
 
         @Override public java.util.Optional<Inputs> inputs(Task task, long revision) {
+            return readInputs(task, revision, (session, inputs) -> inputs);
+        }
+
+        Optional<MongoConfigurationDomain.BoundValidationInputs> boundInputs(Task task, long revision,
+                MongoStorageBindingStore bindings) {
+            return readInputs(task, revision, (session, inputs) -> new MongoConfigurationDomain.BoundValidationInputs(
+                    inputs, bindings.loadForTransaction(session).orElseThrow(MongoValidationPreparations::fenced).defaultSourceId()));
+        }
+
+        private <T> Optional<T> readInputs(Task task, long revision, java.util.function.BiFunction<ClientSession, Inputs, T> project) {
             Objects.requireNonNull(task); scope(task);
             if (revision < 1 || revision == Long.MAX_VALUE) throw unreadable("task-revision");
             return call(session -> {
-                var row = document(session, task.pipelineId(), task.taskId()); if (row == null) return java.util.Optional.empty();
+                var row = document(session, task.pipelineId(), task.taskId()); if (row == null) return Optional.empty();
                 var saved = MongoValidationTaskCodec.snapshot(row, owner.clusterId);
-                if (!saved.task().equals(task) || saved.revision() != revision || saved.closed()) return java.util.Optional.empty();
+                if (!saved.task().equals(task) || saved.revision() != revision || saved.closed()) return Optional.empty();
                 MongoValidationPreparations.requireTaskAuthoringParent(session, owner.database, owner.clusterId, task.pipelineId());
                 long current = ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(owner.database));
-                return artifacts.validationInputsInTransaction(session, saved.comparison().dependencyHashes()).map(resources -> new Inputs(saved, current, resources));
+                return artifacts.validationInputsInTransaction(session, saved.comparison().dependencyHashes())
+                        .map(resources -> project.apply(session, new Inputs(saved, current, resources)));
             });
         }
 
@@ -305,11 +322,22 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
 
     @Override public Reservation reserve(Start start) { return reserve(start, null, null); }
     @Override public Reservation reserveScheduled(Start start, java.time.Instant due, ValidationSchedule.Calculator calculator) { return reserve(start, Objects.requireNonNull(due), Objects.requireNonNull(calculator)); }
+    @Override public java.util.Optional<Reservation> reserveAndOpen(Open command) {
+        Objects.requireNonNull(command);
+        return java.util.Optional.of(reserve(command.start(), null, null, command.snapshot()));
+    }
+
     private Reservation reserve(Start start, java.time.Instant due, ValidationSchedule.Calculator calculator) {
+        return reserve(start, due, calculator, null);
+    }
+
+    private Reservation reserve(Start start, java.time.Instant due, ValidationSchedule.Calculator calculator,
+            io.tapstate.core.validation.ValidationRunSpec snapshot) {
         requireStart(start);
         return transaction(true, () -> {}, session -> {
             var task = task(session, start); if (task == null) return Reservation.STALE;
-            MongoValidationSchema.requireTaskCoverage(database, session, task);
+            // task() has already checked coverage in this same CONFIG snapshot.
+            if (validation == null || !validation.manualCount()) MongoValidationSchema.requireTaskCoverage(database, session, task);
             if (Boolean.TRUE.equals(task.get("closed"))) return Reservation.CLOSED;
             var mode = mode(task, start.run().mode()); var held = permission(mode);
             if (due != null) {
@@ -329,7 +357,10 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             }
             if (held != null && held.getLong("sequence") == start.sequence()) {
                 if (!identity(start).equals(held.get("identity"))) return Reservation.STALE;
-                return phase(held).equals("CLOSED") ? Reservation.CLOSED : Reservation.DUPLICATE;
+                if (phase(held).equals("CLOSED")) return Reservation.CLOSED;
+                if (snapshot != null && openInTransaction(session, start, snapshot, task, mode, held) == Birth.CLOSED)
+                    return Reservation.CLOSED;
+                return Reservation.DUPLICATE;
             }
             if (mode.getLong("nextStartSequence") != start.sequence()
                     || task.getLong("revision") != start.configurationRevision()) return Reservation.STALE;
@@ -343,10 +374,13 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
                 ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             }
             var next = new Document("nextStartSequence", start.sequence() + 1)
-                    .append("permission", new Document("sequence", start.sequence()).append("phase", "OPEN").append("identity", identity(start)));
+                    .append("permission", new Document("sequence", start.sequence())
+                            .append("phase", snapshot == null ? "OPEN" : "BORN").append("identity", identity(start)));
             if (mode.containsKey("scheduledAdmission")) next.put("scheduledAdmission", mode.get("scheduledAdmission"));
             if (due != null) next.put("scheduledAdmission", MongoValidationTaskCodec.watermark(new ValidationTaskStore.ScheduledAdmission(start.configurationRevision(), due, java.util.UUID.fromString(start.commandId()), start.sequence())));
-            updateMode(session, task, start, next); return Reservation.RESERVED;
+            updateMode(session, task, start, next);
+            if (snapshot != null) insertReport(session, start, snapshot);
+            return Reservation.RESERVED;
         });
     }
 
@@ -359,25 +393,34 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
             if (Boolean.TRUE.equals(task.get("closed"))) return Birth.CLOSED;
             var mode = mode(task, start.run().mode()); var held = matching(mode, start);
             if (held == null) return Birth.STALE;
-            if (phase(held).equals("CLOSED")) return Birth.CLOSED;
-            var existing = reports.find(session, new Document("_id", reportId(start.run()))).first();
-            if (phase(held).equals("BORN")) {
-                requireReport(existing, start);
-                if (task.containsKey("definition")) requireSnapshot(existing, start);
-                return existing.getBoolean("closed") ? Birth.CLOSED : Birth.DUPLICATE;
-            }
-            if (existing != null) throw unreadable("unexpected-report-before-birth");
-            if (task.containsKey("definition") && snapshot == null) throw new TapstateException(ValidationError.INVALID_CONTRACT,
-                    Map.of("field", "report.specSnapshot"), null);
-            var report = new Document("_id", reportId(start.run())).append("formatVersion", 1)
-                    .append("admission", identity(start)).append("openVersion", start.sequence()).append("closed", false)
-                    .append("publicationRevision", 0L).append("rootCount", 0L).append("resultBytes", 0L);
-            if (snapshot != null) report.append("specSnapshot", MongoValidationTaskCodec.run(snapshot));
-            bounded(report, 512 * 1024);
-            changePhase(session, task, start, mode, "BORN");
-            reports.insertOne(session, report);
-            return Birth.CREATED;
+            return openInTransaction(session, start, snapshot, task, mode, held);
         });
+    }
+
+    private Birth openInTransaction(ClientSession session, Start start, io.tapstate.core.validation.ValidationRunSpec snapshot,
+            Document task, Document mode, Document held) {
+        if (phase(held).equals("CLOSED")) return Birth.CLOSED;
+        var existing = reports.find(session, new Document("_id", reportId(start.run()))).first();
+        if (phase(held).equals("BORN")) {
+            requireReport(existing, start);
+            if (task.containsKey("definition")) requireSnapshot(existing, start);
+            return existing.getBoolean("closed") ? Birth.CLOSED : Birth.DUPLICATE;
+        }
+        if (existing != null) throw unreadable("unexpected-report-before-birth");
+        if (task.containsKey("definition") && snapshot == null) throw new TapstateException(ValidationError.INVALID_CONTRACT,
+                Map.of("field", "report.specSnapshot"), null);
+        changePhase(session, task, start, mode, "BORN");
+        insertReport(session, start, snapshot);
+        return Birth.CREATED;
+    }
+
+    private void insertReport(ClientSession session, Start start, io.tapstate.core.validation.ValidationRunSpec snapshot) {
+        var report = new Document("_id", reportId(start.run())).append("formatVersion", 1)
+                .append("admission", identity(start)).append("openVersion", start.sequence()).append("closed", false)
+                .append("publicationRevision", 0L).append("rootCount", 0L).append("resultBytes", 0L);
+        if (snapshot != null) report.append("specSnapshot", MongoValidationTaskCodec.run(snapshot));
+        bounded(report, 512 * 1024);
+        reports.insertOne(session, report);
     }
 
     @Override public Closure close(Start start) {
@@ -415,7 +458,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var task = tasks.find(session, new Document("_id", taskId(start.task()))).projection(new Document("_id", 1).append("formatVersion", 1)
                 .append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
-                .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
+                .append("definition.formatVersion", 1).append("definition.comparison.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
                 .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1)).first();
         if (task == null) return null;
@@ -460,7 +503,7 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
     private static Document taskHeader() {
         return new Document("_id", 1).append("formatVersion", 1).append("taskGeneration", 1).append("revision", 1).append("modes", 1).append("closed", 1)
                 .append("lastMutationId", 1).append("schedulingRevision", 1).append("schedulingCommandId", 1)
-                .append("definition.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
+                .append("definition.formatVersion", 1).append("definition.comparison.formatVersion", 1).append("definition.comparison.fingerprint", 1).append("definition.comparison.mappingRevision", 1)
                 .append("definition.comparison.comparisonRulesVersion", 1).append("definition.comparison.pipelineId", 1)
                 .append("definition.keyInputsPresent", 1).append("definition.full.method", 1).append("definition.incremental.firstCheckDelayMillis", 1);
     }
@@ -486,7 +529,9 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         var method = start.run().mode() == ValidationMode.FULL
                 ? io.tapstate.core.validation.ValidationMethod.valueOf(definition.get("full", Document.class).getString("method"))
                 : io.tapstate.core.validation.ValidationMethod.FULL_COLUMN;
-        if (method != io.tapstate.core.validation.ValidationMethod.COUNT && !definition.getBoolean("keyInputsPresent")) return false;
+        boolean deferredFull = start.run().mode() == ValidationMode.FULL && Integer.valueOf(2).equals(comparison.get("formatVersion"));
+        if (method != io.tapstate.core.validation.ValidationMethod.COUNT && !definition.getBoolean("keyInputsPresent") && !deferredFull)
+            return false;
         return start.run().keyMappingRevision() == comparison.getLong("mappingRevision")
                 && start.run().comparisonRulesVersion().equals(comparison.get("comparisonRulesVersion"))
                 && start.run().specHash().equals(io.tapstate.core.validation.ValidationRunSpec.fingerprint(comparison.getString("fingerprint"), start.run().mode(), method));
@@ -524,25 +569,45 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         requireKnownPipelinePermissions(session, database, cluster, pipeline, null);
     }
     private static void requireKnownPipelinePermissions(ClientSession session, MongoDatabase database, String cluster, String pipeline, Long currentOwner) {
+        if (!pipelinePermissionsCurrent(session, database, cluster, pipeline, currentOwner, false))
+            throw unreadable("original-permission-closure");
+    }
+
+    boolean countPermissionsCurrent(ClientSession session, io.tapstate.core.validation.ValidationOwner current) {
+        if (validation == null || !validation.manualCount()) throw unreadable("obsolete-permission-closure");
+        validation.requireCountStartOwner(session, current);
+        return pipelinePermissionsCurrent(session, database, clusterId, current.pipelineId(), current.claimGeneration(), true);
+    }
+
+    private static boolean pipelinePermissionsCurrent(ClientSession session, MongoDatabase database, String cluster, String pipeline,
+            Long currentOwner, boolean reuseCoverage) {
         var filter = new Document("_id.clusterId", cluster).append("_id.pipelineId", pipeline);
         int count = 0;
-        try (var cursor = SystemCollections.VALIDATION_TASKS.on(database).find(session, filter).projection(taskHeader())
-                .batchSize(20).limit(MAX_TASKS_PER_PIPELINE + 1).iterator()) {
+        Boolean covered = null;
+        var query = SystemCollections.VALIDATION_TASKS.on(database).find(session, filter).projection(taskHeader())
+                .batchSize(20).limit(MAX_TASKS_PER_PIPELINE + 1);
+        if (MongoValidationSchema.startupQueryIndexes(database)) query.hintString("validation_tasks_pipeline_task");
+        try (var cursor = query.iterator()) {
             while (cursor.hasNext()) {
                 if (++count > MAX_TASKS_PER_PIPELINE) throw new TapstateException(ValidationError.VALUE_LIMIT_EXCEEDED,
                         Map.of("limit", "validation.taskControlHeaders"), null);
                 var row = cursor.next(); Task task;
                 try { task = new Task(cluster, pipeline, row.get("_id", Document.class).getString("taskId"), java.util.UUID.fromString(row.getString("taskGeneration"))); }
                 catch (NullPointerException | ClassCastException | IllegalArgumentException invalid) { throw unreadable("task"); }
-                validateTask(row, task, true); MongoValidationSchema.requireTaskCoverage(database, session, row);
+                validateTask(row, task, true);
+                if (reuseCoverage) {
+                    if (covered == null) covered = MongoValidationSchema.scheduledReady(database, session);
+                    MongoValidationSchema.requireTaskCoverage(covered, row);
+                } else MongoValidationSchema.requireTaskCoverage(database, session, row);
                 for (var selected : ValidationMode.values()) {
                     var held = permission(mode(row, selected));
                     if (held != null && !phase(held).equals("CLOSED") && (currentOwner == null
                             || decodeIdentity(held.get("identity", Document.class)).run().owner().claimGeneration() < currentOwner))
-                        throw unreadable("original-permission-closure");
+                        return false;
                 }
             }
         }
+        return true;
     }
 
     boolean closeObsoletePermissionsInTransaction(ClientSession session, io.tapstate.core.validation.ValidationOwner current, int maximum) {
@@ -573,7 +638,11 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         return complete;
     }
     Document requireOriginalInTransaction(ClientSession session, Start start, boolean closed) {
-        var task = task(session, start); if (task == null) throw unreadable("original-task");
+        return requireOriginalTask(task(session, start), start, closed);
+    }
+
+    private static Document requireOriginalTask(Document task, Start start, boolean closed) {
+        if (task == null) throw unreadable("original-task");
         var selected = mode(task, start.run().mode()); var held = permission(selected);
         if (closed) {
             if (held == null || held.getLong("sequence") < start.sequence()
@@ -584,9 +653,40 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         return task;
     }
     void requireBornInTransaction(ClientSession session, Start start) {
-        var task=requireOriginalInTransaction(session,start,false);var held=matching(mode(task,start.run().mode()),start);
-        if (held == null || !phase(held).equals("BORN")) throw unreadable("original-report-birth");
+        var task = requireOriginalInTransaction(session, start, false);
         var report = reports.find(session, new Document("_id", reportId(start.run()))).first();
+        requireBornReport(task, report, start);
+    }
+
+    /** Reads the original task, epoch, schema coverage and immutable report in the same CONFIG snapshot. */
+    void requireCountBornInTransaction(ClientSession session, Start start) {
+        requireStart(start);
+        if (validation == null || !validation.manualCount()) throw unreadable("count-report-authority");
+        var reportId = reportId(start.run());
+        var reportFields = new Document("formatVersion", 1).append("admission", 1).append("openVersion", 1)
+                .append("closed", 1).append("publicationRevision", 1).append("rootCount", 1).append("resultBytes", 1)
+                .append("specSnapshot", 1);
+        var row = tasks.aggregate(session, java.util.List.of(
+                new Document("$match", new Document("_id", taskId(start.task()))),
+                new Document("$project", taskHeader()),
+                new Document("$project", new Document("task", "$$ROOT")),
+                MongoValidationClaimObservation.lookup(SystemCollections.SCHEMA_MIGRATIONS, "schema", "config", null),
+                MongoValidationClaimObservation.lookup(SystemCollections.OPERATOR_GENERATIONS, "owner",
+                        start.task().pipelineId(), new Document("validationCountOwner", 1)),
+                MongoValidationClaimObservation.lookup(SystemCollections.VALIDATION_REPORTS, "report", reportId, reportFields)))
+                .hintString("_id_").first();
+        if (row == null) throw unreadable("original-task");
+        validation.requireCountStartOwner(MongoValidationClaimObservation.one(row, "owner", start.task().pipelineId()), start.run().owner());
+        var task = requireOriginalTask(validateTask(row.get("task", Document.class), start.task()), start, false);
+        var schema = MongoValidationClaimObservation.one(row, "schema", "config");
+        MongoValidationSchema.requireMutationReady(schema);
+        MongoValidationSchema.requireTaskCoverage(schema, task);
+        requireBornReport(task, MongoValidationClaimObservation.one(row, "report", reportId), start);
+    }
+
+    private static void requireBornReport(Document task, Document report, Start start) {
+        var held = matching(mode(task, start.run().mode()), start);
+        if (held == null || !phase(held).equals("BORN")) throw unreadable("original-report-birth");
         requireReport(report, start);
         if (task.containsKey("definition")) requireSnapshot(report, start);
         if (report.getBoolean("closed")) throw unreadable("original-report-closed");
@@ -686,16 +786,22 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         Objects.requireNonNull(start);
         if (!clusterId.equals(start.task().clusterId())) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "start.clusterId"), null);
         if (validation != null && !validation.pipelineId().equals(start.task().pipelineId())) throw unreadable("start-pipeline");
+        if (validation != null) validation.requireCountIdentity(start.run().owner());
         bounded(identity(start), 8 * 1024);
     }
     void checkActive() { requireActive.run(); }
+    void fenceCountWrite(ClientSession session, Start start) {
+        if (validation != null) validation.fenceCountWrite(session, start.run().owner());
+    }
     io.tapstate.spi.store.ValidationTaskStore.Snapshot retentionTask(ClientSession session,Task expected){
         if(!clusterId.equals(expected.clusterId()))throw unreadable("retention-cluster");requirePipeline(expected.pipelineId());
         var row=tasks.find(session,new Document("_id",taskId(expected))).first();if(row==null)return null;
         MongoValidationSchema.requireTaskCoverage(database,session,row);var saved=MongoValidationTaskCodec.snapshot(row,clusterId);if(!saved.task().equals(expected))return null;
-        // Birth and authoring use this same CONFIG write fence. No new lease or acknowledgement is introduced.
-        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
         return saved;
+    }
+    void fenceRetention(ClientSession session) {
+        // Actual report removal still serializes with authoring and report birth.
+        ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
     }
     boolean closing() { return validation != null && validation.closing() || recovery != null; }
     void requirePipeline(String pipeline) {
@@ -706,13 +812,28 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         return transaction(false, verifyAdditionalStructures, work);
     }
     private <T> T transaction(boolean admission, Runnable verifyAdditionalStructures, Function<ClientSession, T> work) {
+        return transaction(admission, verifyAdditionalStructures, work, false);
+    }
+
+    void requireCountStartSnapshot(Start start) {
+        transaction(false, () -> {}, session -> {
+            requireCountBornInTransaction(session, start);
+            return null;
+        }, true);
+    }
+
+    private <T> T transaction(boolean admission, Runnable verifyAdditionalStructures, Function<ClientSession, T> work,
+            boolean countStartRead) {
         return StoreIo.call(() -> {
             requireActive.run(); verifyStructures(); verifyAdditionalStructures.run();
             try (var session = client.startSession()) {
                 return session.withTransaction(() -> {
                     requireActive.run();
-                    if (validation != null || recovery != null) MongoValidationSchema.requireMutationReady(database, session);
-                    if (validation != null) validation.enter(client, database, session, admission);
+                    if (countStartRead) validation.enterCountStartRead(client, database, session);
+                    else {
+                        if (validation != null || recovery != null) MongoValidationSchema.requireMutationReady(database, session);
+                        if (validation != null) validation.enter(client, database, session, admission);
+                    }
                     if (recovery != null) {
                         if (admission) throw unreadable("recovery-admission");
                         recovery.require(client, database, session);
@@ -723,6 +844,15 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         });
     }
     private void verifyStructures() {
+        if (validation != null && validation.manualCount()) {
+            var names = java.util.List.of(SystemCollections.VALIDATION_TASKS.collectionName(),
+                    SystemCollections.VALIDATION_REPORTS.collectionName());
+            var collections = database.listCollections()
+                    .filter(new Document("name", new Document("$in", names)).append("type", "collection"))
+                    .into(new java.util.ArrayList<>());
+            if (collections.size() != names.size()) throw unreadable("validation-collection");
+            return;
+        }
         for (var table : java.util.List.of(SystemCollections.VALIDATION_TASKS, SystemCollections.VALIDATION_REPORTS)) {
             var row = database.listCollections().filter(new Document("name", table.collectionName())).first();
             if (row == null || !"collection".equals(row.get("type"))) throw unreadable("validation-collection");

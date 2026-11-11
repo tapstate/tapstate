@@ -12,6 +12,14 @@ public interface TargetProbe {
     /** What the table {@code table} on the source {@code connection} holds. */
     TargetRows rows(String connection, String table);
 
+    default java.util.function.Function<io.tapstate.core.model.SourceResource, Runnable> resolvedSourceTracking() {
+        return ignored -> () -> {};
+    }
+
+    default TargetRows rows(io.tapstate.core.model.SourceResource source, String table) {
+        return rows(source.id(), table);
+    }
+
     /**
      * What a target holds.
      *

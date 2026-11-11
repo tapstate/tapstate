@@ -80,23 +80,27 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
                 require();var declared=declarations.get(index);var table=source?declared.mapping().source():declared.mapping().target();
                 // Every decode owns its nested settings; plugin defaults cannot alter a later mapping.
                 SourceResource resource=StoredArtifacts.requireSource(saved.artifacts(),table.sourceId());
-                var connection=new ConnectionConfig(resource.id(),resource.connector(),resource.config());
-                var database=database(table,connection);var artifact=artifacts.get(resource.id());
+                var artifact=artifacts.get(resource.id());
                 if(artifact==null)throw invalid("artifactScope");
+                var connection = new ConnectionConfig(resource.id(), resource.connector(), resource.config());
                 // Charge the independent context and its work before any native initialization.
                 var lease=original.resources().budget().reserve(new ValidationLocalBudget.Amount(COUNT_WORK_BYTES,0,1,1));
                 PdkValidationCounts reader=null;
                 try{
-                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table(),database,
-                            PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{require();guard.run();},actual->{
-                        if(source)ValidationDirectMappings.requireObservedSourceTable(declared,actual);
-                    });
+                    reader=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table.table()),()->{require();guard.run();});
                     current=new Owned(reader,lease);
                     synchronized(owned){owned.add(current);}
                 }catch(RuntimeException|Error failed){
                     if(reader!=null)reader.close();lease.close();throw failed;
                 }
-                require();guard.run();var started=clock.instant();long count=reader.count();
+                require();guard.run();var started=clock.instant();long count;
+                try {
+                    count = reader.count();
+                } catch (RuntimeException failed) {
+                    if (!reader.drained()) throw failed;
+                    throw NativeValidationReportFailure.forTable(failed, source
+                            ? ValidationTableFailure.Side.SOURCE : ValidationTableFailure.Side.TARGET);
+                }
                 require();guard.run();
                 return new ValidationCountScan.Scalar(table,count,new ValidationCheckEvent.ReadBoundary(
                         UUID.randomUUID().toString(),"pdk-native-count-v1",started,clock.instant()));
@@ -136,14 +140,6 @@ final class NativeValidationPdkPlans implements NativeValidationFullJob.Factory 
         }
         private TapstateException cancelled(){return new TapstateException(ValidationError.EXECUTION_CANCELLED,
                 Map.of("node",nodeId),null);}
-    }
-    private static String database(ValidationTaskSpec.Table table,ConnectionConfig connection){
-        var configured=connection.settings().get("database");
-        if(configured!=null&&!(configured instanceof String))throw invalid("database");
-        if(configured instanceof String text&&text.isBlank())throw invalid("database");
-        if(table.database()!=null&&!table.database().equals(configured))throw invalid("databaseScope");
-        if(table.schema()!=null&&!table.schema().equals(connection.settings().get("schema")))throw invalid("schemaScope");
-        return (String)configured;
     }
     private static TapstateException invalid(String field){return new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","pdkPlan."+field),null);}
 }

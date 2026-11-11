@@ -28,6 +28,14 @@ class NativeValidationApiIT {
     @Container static final MongoDBContainer MONGO=NativeValidationOwnerReservationsIT.MONGO;
     @TempDir Path work;
     @Test @Timeout(120) void fullMethodsAndObservedDifferencesUseTheActiveChildAndRealRegisteredPdk()throws Exception{
+        verify(false);
+    }
+
+    @Test @Timeout(90) void uriOnlyCountUsesTheRegisteredPdkWithoutAnArtifactCapabilityOverride() throws Exception {
+        verify(true);
+    }
+
+    private void verify(boolean countOnly) throws Exception {
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"validation_http","admin","validation-password");
         try(var schema=io.tapstate.adapters.mongostore.MongoConfigurationDomain.prepareValidationSchema(
                 new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5)),storage.clusterId(),UUID.randomUUID());
@@ -42,16 +50,19 @@ class NativeValidationApiIT {
                     "--tapstate.connectors.seed-dir="+work.resolve("no-seeds"),"--tapstate.connectors.plugins-dir="+work.resolve("plugins"),
                     "--tapstate.control.auth.jwt-secret=validation-http-fixture-signing-key")){
                 NativeAppStorage.awaitBusiness(app);var child=NativeAppStorage.business(app);
-                var artifact=Path.of(Objects.requireNonNull(System.getProperty("tapstate.pdk.it.mongodb-jar")));
+                String defaultArtifact = System.getProperty("tapstate.pdk.it.mongodb-jar");
+                var artifact=Path.of(Objects.requireNonNull(countOnly
+                        ? System.getProperty("tapstate.pdk.it.validation-count-jar", defaultArtifact)
+                        : defaultArtifact));
                 var registered=child.getBean(ConnectorArtifactRegistrar.class).register(artifact,RegistrationSource.REGISTER);
                 var connector=registered.registration().connectorId();
                 var stableRow=new Document("id",1L).append("payload","same");
                 observer.getDatabase(sourceDb).getCollection("orders").insertOne(stableRow);
                 observer.getDatabase(targetDb).getCollection("checked_orders").insertOne(new Document(stableRow));
                 var artifacts=child.getBean(ArtifactStore.class);
-                artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"database",sourceDb,"isUri",true),
+                artifacts.create(new SourceResource("validation_input",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(sourceDb),"isUri",true),
                         SourceMode.SNAPSHOT,List.of(TableRef.literal("orders")),null,null));
-                artifacts.create(new SourceResource("validation_target",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(targetDb),"database",targetDb,"isUri",true),null,null,null,null));
+                artifacts.create(new SourceResource("validation_target",null,connector,Map.of("uri",MONGO.getReplicaSetUrl(targetDb),"isUri",true),null,null,null,null));
                 artifacts.create(new PipelineResource("validation_flow",null,List.of(SourceRef.spec("validation_input",false)),null,null,
                         new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("validation_input.orders")),List.of(new SyncElement("out","validation_target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
                 var http=RestClient.create("http://127.0.0.1:"+((WebServerApplicationContext)app).getWebServer().getPort());
@@ -133,6 +144,7 @@ class NativeValidationApiIT {
                 var report=completedReport(http,token,reportPath);
                 assertThat(report).containsEntry("method","COUNT").containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("physicalDrain","UNKNOWN").containsEntry("premiseVerifiedBySystem",false);
                 var counts=(List<?>)report.get("counts");var count=(Map<?,?>)counts.getFirst();assertThat(count.get("source")).isEqualTo("1");assertThat(count.get("target")).isEqualTo("1");assertThat(count.get("difference")).isEqualTo("0");
+                if (countOnly) return;
                 var occupied=ValidationMetadataSlots.acquire(child.getBean(ValidationMemberResources.Member.class),4,Duration.ofSeconds(2));
                 try{
                     assertThat(http.post().uri("/api/validation:progress").header("Authorization","Bearer "+token).contentType(MediaType.APPLICATION_JSON).body(operation)
