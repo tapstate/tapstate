@@ -397,6 +397,16 @@ public final class ControlOperations {
     public static final Operation PIPELINE_ACCEPT_DERIVED_SCHEMA = new Operation(
             "pipeline.accept-derived-schema", Scope.WRITE, true, null, CLI_ONLY);
 
+    // A running aggregate step compared with its own rows, and written again from them. The check reads
+    // only; the repair rewrites stored totals and sends rows to the target, so it is write-scoped and
+    // audited. Both stay off the model-facing surface: what a check proves is narrow -- the totals match
+    // the rows the step holds, not the source -- and a repair is a decision about a finding, taken by the
+    // person looking at it.
+    public static final Operation PIPELINE_AGGREGATE_CHECK = new Operation(
+            "pipeline.aggregate-check", Scope.READ, false, null, CLI_ONLY);
+    public static final Operation PIPELINE_AGGREGATE_REPAIR = new Operation(
+            "pipeline.aggregate-repair", Scope.WRITE, true, null, CLI_ONLY);
+
     // The HTTP face projects the CLI-staged inventory; the current user read stays off MCP.
     public static final Operation AUTH_CURRENT_USER = new Operation(
             "auth.current-user", Scope.READ, false, null,
@@ -501,6 +511,8 @@ public final class ControlOperations {
             PIPELINE_SET_POSITION,
             PIPELINE_DERIVED_SCHEMA,
             PIPELINE_ACCEPT_DERIVED_SCHEMA,
+            PIPELINE_AGGREGATE_CHECK,
+            PIPELINE_AGGREGATE_REPAIR,
             AUTH_CURRENT_USER,
             USER_CREATE,
             USER_PASSWD,

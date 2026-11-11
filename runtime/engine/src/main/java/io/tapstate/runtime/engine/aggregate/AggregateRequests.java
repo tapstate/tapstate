@@ -121,16 +121,17 @@ public final class AggregateRequests {
     }
 
     /** A request waiting for its step, and where its answer goes. */
-    record Waiting(Request request, CompletableFuture<Report> answer) {
+    public record Waiting(Request request, CompletableFuture<Report> answer) {
     }
 
     /** What a running step polls between drains. */
-    static final class Inbox {
+    public static final class Inbox {
         private final ConcurrentLinkedQueue<Waiting> waiting = new ConcurrentLinkedQueue<>();
         private final AtomicInteger held = new AtomicInteger();
         private volatile boolean closed;
 
-        Waiting poll() {
+        /** The next request to answer, or null when none waits. */
+        public Waiting poll() {
             Waiting next = waiting.poll();
             if (next != null) {
                 held.decrementAndGet();
@@ -163,7 +164,7 @@ public final class AggregateRequests {
     }
 
     /** Registers the step running on {@code member}; a later registration under the same name replaces it. */
-    static Inbox register(HazelcastInstance member, String pipeline, String step) {
+    public static Inbox register(HazelcastInstance member, String pipeline, String step) {
         Inbox inbox = new Inbox();
         Inbox before = inboxes(member).put(name(pipeline, step), inbox);
         if (before != null) {
@@ -173,7 +174,7 @@ public final class AggregateRequests {
     }
 
     /** Removes {@code inbox} if it is still the one registered, and refuses what it had not answered. */
-    static void unregister(HazelcastInstance member, String pipeline, String step, Inbox inbox) {
+    public static void unregister(HazelcastInstance member, String pipeline, String step, Inbox inbox) {
         inboxes(member).remove(name(pipeline, step), inbox);
         inbox.close();
     }
