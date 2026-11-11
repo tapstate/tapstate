@@ -62,7 +62,7 @@ public final class RollupFold {
             accumulators[i] = Aggregates.of(specs.get(i).function()).init(specs.get(i).argumentType());
         }
         for (RollupElement element : ordered) {
-            Map<String, Object> row = bound(element.rendered());
+            Map<String, Object> row = bound(element.values());
             for (int i = 0; i < n; i++) {
                 RollupSpec spec = specs.get(i);
                 if (incomplete[i]) {
