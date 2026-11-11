@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.RollupFold;
 import io.tapstate.core.dsl.aggregate.RollupElement;
@@ -1330,7 +1331,11 @@ public final class RootAssembly implements Serializable {
                     missing.add(child.path());
                 }
             }
-            live.add(new RollupElement(entry.getKey(), rendered, missing));
+            // A value a connector converted travels in a carrier, which orders and adds as nothing at all: a
+            // rollup reads the value inside, while the array keeps the carrier the target is owed.
+            @SuppressWarnings("unchecked")
+            Map<String, Object> plain = (Map<String, Object>) ConvertedValue.unwrap(rendered);
+            live.add(new RollupElement(entry.getKey(), rendered, plain, missing));
         }
         return live;
     }
