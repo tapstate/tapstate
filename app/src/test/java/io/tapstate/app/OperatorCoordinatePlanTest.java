@@ -43,6 +43,19 @@ class OperatorCoordinatePlanTest {
         assertThat(plan.placements()).noneMatch(position -> position.stepId().equals("empty"));
     }
 
+    @Test void anAggregateStepHasAPositionForEachOfItsStoresAndNoMapBehindEither() {
+        var step = Step.inline("totals",FromClause.list(FromRef.literal("orders")),
+                new TransformBody.Aggregate(List.of("id"),null,Map.of("region","$region"),Map.of()),null);
+        var pipeline = new PipelineResource("p",null,List.of(SourceRef.bare("orders")),List.of(step),null,null,null,null);
+        var plan = OperatorCoordinatePlan.compile(SCOPE,pipeline,"cache",TABLES::get,Map.of(),NestSettings.defaults());
+        assertThat(plan.placements()).containsExactlyInAnyOrder(
+                OperatorMapCoordinates.aggregate(SCOPE,"cache","totals",OperatorMapCoordinates.AggregateStore.MEMBERS),
+                OperatorMapCoordinates.aggregate(SCOPE,"cache","totals",OperatorMapCoordinates.AggregateStore.GROUPS));
+        assertThat(plan.placements()).allMatch(position -> position.resource() == Resource.AGGREGATE_STATE);
+        assertThat(plan.capacities()).isEmpty();
+        assertThat(plan.configurations("quorum")).isEmpty();
+    }
+
     @Test void eachStepRetainsItsOwnMemoryAndLogicalDocumentBudgetAndReturnsFreshStableConfigurations() {
         var plan = plan(); var configs = plan.configurations("quorum");
         assertThat(configs).hasSameSizeAs(plan.placements());

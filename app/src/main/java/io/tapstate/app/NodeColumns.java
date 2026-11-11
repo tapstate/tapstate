@@ -237,10 +237,8 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * not hold is refused with the step's code when the pipeline is applied. A group value may be null,
      * as in SQL, and so may every field but a count: a group whose rows all carry null has no sum.
      */
-    private static NodeColumns grouped(String step, TransformBody.Aggregate aggregate, NodeColumns upstream) {
-        if (!upstream.known()) {
-            return upstream;
-        }
+    /** A node's columns as the types an aggregate step's expressions are checked against. */
+    static Map<String, ValueType> valueTypes(NodeColumns upstream) {
         Map<String, ValueType> input = new LinkedHashMap<>();
         upstream.columns().forEach((name, declared) -> {
             TapstateType type = JoinSchemaDrift.typeOf(declared);
@@ -248,7 +246,14 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             input.put(name, type == TapstateType.DECIMAL
                     ? ValueType.decimal(numeric == null ? null : numeric.scale()) : ValueType.of(type));
         });
-        AggregateStepSpec spec = AggregateStepRules.shape(step, aggregate, input, true);
+        return input;
+    }
+
+    private static NodeColumns grouped(String step, TransformBody.Aggregate aggregate, NodeColumns upstream) {
+        if (!upstream.known()) {
+            return upstream;
+        }
+        AggregateStepSpec spec = AggregateStepRules.shape(step, aggregate, valueTypes(upstream), true);
         Map<String, String> columns = new LinkedHashMap<>();
         Map<String, NumericType> numbers = new LinkedHashMap<>();
         spec.outputColumns().forEach((name, type) -> {

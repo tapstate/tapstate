@@ -66,7 +66,12 @@ public record ParallelismRequest(
          * A step whose input carries no key it can be routed by. The same reason as a keyless sink: two
          * processors would take one row's changes in an order nobody decides.
          */
-        KEY_NOT_DERIVABLE("key-not-derivable", true);
+        KEY_NOT_DERIVABLE("key-not-derivable", true),
+        /**
+         * A step that keeps state one writer commits. Two processors would each commit part of a change
+         * that has to land whole, so a wider target is held to one and reported, not refused.
+         */
+        STATE_HAS_ONE_WRITER("state-has-one-writer", false);
 
         private final String id;
         private final boolean refusesExplicit;

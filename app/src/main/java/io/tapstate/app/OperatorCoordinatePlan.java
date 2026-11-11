@@ -44,10 +44,12 @@ final class OperatorCoordinatePlan {
     private final List<StateMap> maps;
     private final List<OperatorPlacement> placements;
 
-    private OperatorCoordinatePlan(PipelineIntentScope scope,Map<String,NestStep> nests,List<StateMap> maps) {
+    private OperatorCoordinatePlan(PipelineIntentScope scope,Map<String,NestStep> nests,List<StateMap> maps,List<OperatorPlacement> stores) {
         this.scope = scope; this.nests = Map.copyOf(nests);
         this.maps = maps.stream().sorted(java.util.Comparator.comparing(map -> map.placement().mapName())).toList();
-        this.placements = this.maps.stream().map(StateMap::placement).toList();
+        // State an operator commits directly has a position like any other and no map, so no capacity.
+        this.placements = java.util.stream.Stream.concat(this.maps.stream().map(StateMap::placement),stores.stream())
+                .sorted(java.util.Comparator.comparing(OperatorPlacement::mapName)).toList();
         var names = new HashSet<String>();
         for (var placement : placements) if (!names.add(placement.mapName()))
             throw new IllegalArgumentException("duplicate compiled operator position");
@@ -91,7 +93,15 @@ final class OperatorCoordinatePlan {
                 maps.add(joinMap(scope,defaultDatabase,step,Resource.JOIN_INDEXES,alias));
             }
         });
-        return new OperatorCoordinatePlan(scope,nests,maps);
+        var stores = new ArrayList<OperatorPlacement>();
+        if (pipeline.transforms() != null) for (Step step : pipeline.transforms()) {
+            if (!(step instanceof Step.Inline inline) || !(inline.body() instanceof TransformBody.Aggregate)) continue;
+            if (nests.containsKey(step.id()) || joinDimensions.containsKey(step.id()))
+                throw new IllegalArgumentException("duplicate compiled operator step");
+            for (var kind : OperatorMapCoordinates.AggregateStore.values())
+                stores.add(OperatorMapCoordinates.aggregate(scope,defaultDatabase,step.id(),kind));
+        }
+        return new OperatorCoordinatePlan(scope,nests,maps,stores);
     }
 
     private static StateMap nestMap(PipelineIntentScope scope,String database,String step,List<String> path,

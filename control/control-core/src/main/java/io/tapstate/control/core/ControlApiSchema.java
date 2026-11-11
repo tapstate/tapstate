@@ -456,7 +456,8 @@ public final class ControlApiSchema {
                 "Processors per member; absent for a node run as one processor for the cluster"));
         node.put("effective", positiveInteger("Processors the node runs in total"));
         node.put("reasons", array(string("Why the width is what it is: requested-one, source-reads-not-split, "
-                + "single-target-keyless, key-not-derivable, rounded-up, rounded-down, or budget:<name>")));
+                + "single-target-keyless, key-not-derivable, state-has-one-writer, rounded-up, rounded-down, "
+                + "or budget:<name>")));
         node.put("batch", object(List.of("maxRecords", "maxWaitMillis"), batch, false));
         Map<String, Object> resources = new LinkedHashMap<>();
         resources.put("writers", positiveInteger("Processors writing the sink's rows, across the run"));
