@@ -109,6 +109,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         long nextRead;
         long revision;
         boolean reading;
+        boolean lastReadSucceeded;
         boolean superseded;
     }
 
@@ -376,7 +377,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 var entry = requireWriterLease(fence, proof);
                 if (nanoTime.getAsLong() - entry.deadlineNanos() < 0) break;
                 proof.lastUsed = System.nanoTime();
-                requestScopedProof(key, proof);
+                requestScopedProof(key, proof, false);
                 try {
                     TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
                 } catch (InterruptedException interrupted) {
@@ -525,11 +526,14 @@ final class ExecutionAuthorization implements AutoCloseable {
                 if (liveMatch(result, matches)) return entry;
                 if (entry != null && !precedes.test(entry)
                         && (result.denied() || !matches.test(entry))) return null;
-                if (entry == null && result.denied() && proof.revision != initialRevision) return null;
+                // A completed read that cannot prove the requested fence is already an answer.
+                if (proof.revision != initialRevision) return null;
+                if (entry == null && result.denied() && proof.readFailure != null
+                        && System.nanoTime() - proof.nextRead < 0) return null;
 
                 long left = 3 * windowNanos - (System.nanoTime() - startedAt);
                 if (left <= 0) throw proofUnavailable(key);
-                requestScopedProof(key, proof);
+                requestScopedProof(key, proof, true);
                 try {
                     TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
                 } catch (InterruptedException interrupted) {
@@ -565,17 +569,19 @@ final class ExecutionAuthorization implements AutoCloseable {
                         proof.notifyAll();
                     }
                 } else {
-                    requestScopedProof(key, proof);
+                    requestScopedProof(key, proof, false);
                 }
             }
         });
     }
 
     /** Caller holds only the proof's monitor, never while doing store I/O. */
-    private void requestScopedProof(ReadKey key, ScopedProof proof) {
+    private void requestScopedProof(ReadKey key, ScopedProof proof, boolean foreground) {
+        boolean refreshNow = foreground && proof.lastReadSucceeded;
         if (closed.get() || proof.superseded || proof.reading || proof.storeReading.get()
-                || proof.nextRead != 0 && System.nanoTime() - proof.nextRead < 0) return;
+                || !refreshNow && proof.nextRead != 0 && System.nanoTime() - proof.nextRead < 0) return;
         proof.reading = true;
+        proof.lastReadSucceeded = false;
         try {
             proofReaders.execute(() -> readScopedProof(key, proof));
         } catch (RejectedExecutionException busy) {
@@ -648,6 +654,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                     long delay = result == null ? Math.min(refreshIntervalNanos, TimeUnit.SECONDS.toNanos(1))
                             : refreshIntervalNanos;
                     proof.nextRead = System.nanoTime() + delay;
+                    proof.lastReadSucceeded = scopeRead;
                 }
                 proof.notifyAll();
             }
