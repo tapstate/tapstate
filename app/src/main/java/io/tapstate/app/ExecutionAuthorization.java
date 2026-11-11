@@ -587,6 +587,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     private void readScopedProof(ReadKey key, ScopedProof proof) {
         long startedAt = nanoTime.getAsLong();
         ProofResult result = null;
+        boolean scopeRead = false;
         try {
             var reading = readExecutionProof(key, proof, startedAt);
             proof.readFailure = null;
@@ -599,6 +600,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 result = new ProofResult(new Entry(WorkloadClaimFence.from(observed.claim()), startedAt + held, startedAt + lease),
                         held <= 0);
             }
+            scopeRead = true;
         } catch (RuntimeException unavailable) {
             dropLeases(key);
             proof.readFailure = unavailable instanceof TapstateException coded ? coded.getMessage() : unavailable.getClass().getSimpleName();
@@ -608,7 +610,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 LOG.debug("Could not refresh {} authorization for {}", key.type(), key.pipelineId(), unavailable);
             }
         } finally {
-            publishScopedProof(key, proof, result);
+            publishScopedProof(key, proof, result, scopeRead);
         }
     }
 
@@ -619,7 +621,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 || coded.code() == IoError.PIPELINE_INTENT_FENCED;
     }
 
-    private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result) {
+    private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result, boolean scopeRead) {
         // Publish and retire older scopes in one order. No store calls take either monitor.
         synchronized (scopedProofs) {
             synchronized (proof) {
@@ -634,7 +636,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                             proof.result = new ProofResult(null, true);
                         } else {
                             proof.result = result;
-                            if (result.entry() != null && key.scope() != null && !proof.scopeProved) {
+                            // A successful scoped read confirms the generation even before it has a claim.
+                            if (scopeRead && key.scope() != null && !proof.scopeProved) {
                                 proof.scopeProved = true;
                                 retireOlderScopes(key);
                             }

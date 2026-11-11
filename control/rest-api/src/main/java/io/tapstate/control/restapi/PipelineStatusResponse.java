@@ -83,7 +83,7 @@ record PipelineStatusResponse(
                 default -> null;
             };
         }
-        if (state == null && item.hasArtifact() && status.displayState() != PipelineCatalogItem.UiState.RECOVERY_REQUIRED) {
+        if (state == null && item.hasArtifact() && !knownTransition(status.displayState())) {
             throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
                     Map.of("id", item.id(), "field", "checkpoint"), null);
         }
@@ -93,6 +93,13 @@ record PipelineStatusResponse(
                         : Math.max(0, Duration.between(observedAt, clock.instant()).toMillis()),
                 status.desiredState(), status.observedState(), item.hasArtifact(), null, null,
                 intentReadFailure(status.intentReadFailure(), catalog));
+    }
+
+    private static boolean knownTransition(PipelineCatalogItem.UiState state) {
+        return state != null && switch (state) {
+            case STARTING, STOPPING, PAUSING, RESUMING, RECOVERY_REQUIRED -> true;
+            default -> false;
+        };
     }
 
     private static Failure intentReadFailure(

@@ -182,8 +182,8 @@ public final class PdkSinkPort implements SinkPort {
 
     /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
     private PdkConnector started(SinkConfig config, ConnectorRef ref, ConfiguredDrive drive) {
-        PdkConnector connector = PdkConnector.openSink(
-                config.connectorId(), ref, config.settings(), config.node(), stateStore, drive.scopes(), purpose, drive.identity());
+        PdkConnector connector = PdkConnector.open(
+                config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
         var initializing=sharedInitialization.get();
         try {
             connector.underLoader(() -> {
@@ -272,8 +272,8 @@ public final class PdkSinkPort implements SinkPort {
 
     private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
             boolean preparedAhead, ConfiguredDrive drive) {
-        PdkConnector connector = PdkConnector.openSink(config.connectorId(), ref, config.settings(), config.node(),
-                stateStore, drive.scopes(), purpose, drive.identity());
+        PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
+                stateStore, null, drive.scopes(), purpose);
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
