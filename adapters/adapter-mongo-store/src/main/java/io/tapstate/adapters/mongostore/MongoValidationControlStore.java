@@ -8,6 +8,10 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.FindOneAndUpdateOptions;
+import com.mongodb.client.model.ReturnDocument;
+import com.mongodb.client.model.UpdateOneModel;
+import com.mongodb.client.model.UpdateOptions;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.validation.*;
 import io.tapstate.spi.store.*;
@@ -46,16 +50,29 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
         this.validation = validation;
     }
 
-    @Override public Join join(Run run) {
+    @Override public Join join(Run run) { return join(run, ValidationRunState.STARTING); }
+
+    @Override public java.util.Optional<Join> joinRunning(Run run) {
         Objects.requireNonNull(run);
-        if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
-        requireAdmission(run, false);
-        var joined = transaction(run.identity().owner(), true, session -> {
-            var control = control(session, run.identity().owner().pipelineId());
+        if (validation == null || run.snapshot() == null || run.snapshot().method() != io.tapstate.core.validation.ValidationMethod.COUNT)
+            return java.util.Optional.empty();
+        return java.util.Optional.of(join(run, ValidationRunState.RUNNING));
+    }
+
+    private Join join(Run run, ValidationRunState initialState) {
+        Objects.requireNonNull(run);
+        // The original BORN check includes the CONFIG preparation and binding checks.
+        boolean manualCount = initialState == ValidationRunState.RUNNING && validation != null && validation.manualCount();
+        if (!manualCount) requireJoinAdmission(run, initialState);
+        Runnable configFence = manualCount ? () -> requireJoinAdmission(run, initialState) : null;
+        var joined = transaction(run.identity().owner(), true, configFence, (session, preparedControl) -> {
+            var control = manualCount ? preparedControl : control(session, run.identity().owner().pipelineId());
             var existing = row(session, run);
             if (existing != null) {
                 if (existing.getBoolean("retired") || state(existing).terminal() || control.getBoolean("closed")) return Join.GENERATION_CLOSED;
-                return current(control, run) && slot(control, run) ? Join.ALREADY_JOINED : Join.GENERATION_CLOSED;
+                return current(control, run) && slot(control, run)
+                        && (initialState == ValidationRunState.STARTING || state(existing) == initialState)
+                        ? Join.ALREADY_JOINED : Join.GENERATION_CLOSED;
             }
             var slots = slots(control); String key = slotKey(run.identity());
             if (slots.containsKey(key)) {
@@ -78,13 +95,25 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
             if (!current(control, run) || control.getBoolean("closed")) return Join.GENERATION_CLOSED;
             if (slots.size() == MAX_ACTIVE_RUNS || control.getLong("retainedRuns") == MAX_RETAINED_RUNS) throw limit();
             slots.put(key, runId(run)); control.put("retainedRuns", control.getLong("retainedRuns") + 1);
-            writeControl(session, control);
-            rows.insertOne(session, record(run, ValidationRunState.STARTING, false));
+            var record = record(run, initialState, false);
+            if (manualCount) writeCountJoin(session, control, record);
+            else {
+                writeControl(session, control);
+                rows.insertOne(session, record);
+            }
             return Join.JOINED;
         });
+        if (!manualCount) requireJoinAdmission(run, initialState);
+        return joined;
+    }
+
+    private void requireJoinAdmission(Run run, ValidationRunState initialState) {
+        if (initialState == ValidationRunState.RUNNING) {
+            validation.requireBornStart(run.admission());
+            return;
+        }
         requireAdmission(run, false);
         if (validation != null) validation.requireRunSnapshot(run.admission(), run.snapshot());
-        return joined;
     }
 
     private Document record(Run run, ValidationRunState state, boolean retired) {
@@ -377,10 +406,17 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
     }
 
     private <T> T transaction(ValidationOwner owner, boolean admission, Function<ClientSession, T> work) {
+        return transaction(owner, admission, null, (session, preparedControl) -> work.apply(session));
+    }
+
+    private <T> T transaction(ValidationOwner owner, boolean admission, Runnable configFence,
+            java.util.function.BiFunction<ClientSession, Document, T> work) {
         if (!scope.clusterId().equals(owner.clusterId())) throw fenced();
         return StoreIo.call(() -> {
-            requireActive.run(); requireCollection(database);
-            requireValidationAuthority(owner, admission);
+            requireActive.run();
+            // Manual COUNT checks the collection again inside the actual write transaction.
+            if (configFence == null) requireCollection(database);
+            requireValidationAuthority(owner, admission, configFence);
             try (var session = client.startSession()) {
                 var committed = session.withTransaction(() -> {
                     requireActive.run();
@@ -393,27 +429,37 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                     filter.append("contextExecutionGeneration", owner.executionGeneration()).append("executionClaimGeneration", owner.claimGeneration())
                             .append("executionNodeIds", List.of(owner.nodeId()))
                             .append("fencedValidationWrites", new Document("$gte", 0L).append("$lt", Long.MAX_VALUE));
-                    if (SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session, filter,
-                            new Document("$inc", new Document("fencedValidationWrites", 1L))).getMatchedCount() != 1) throw fenced();
+                    var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+                    var increment = new Document("$inc", new Document("fencedValidationWrites", 1L));
+                    Document claim;
+                    if (configFence != null) {
+                        claim = claims.findOneAndUpdate(session, filter, increment, new FindOneAndUpdateOptions().returnDocument(ReturnDocument.AFTER));
+                        if (claim == null) throw fenced();
+                    } else {
+                        if (claims.updateOne(session, filter, increment).getMatchedCount() != 1) throw fenced();
+                        claim = null;
+                    }
                     var business = new MongoCacheBusinessIdentity(database, scope);
                     if (admission) business.admitMetadataWrite(session); else business.requireAdmissionState(session);
                     var key = ValidationClaims.key(scope.clusterId(), owner.pipelineId());
-                    var claim = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-                    requirePreparedClaim(session, database, claim, key, scope, validation == null ? null : validation.subject(), admission);
+                    if (configFence == null) claim = claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+                    var preparedControl = preparedClaimControl(session, database, claim, key, scope,
+                            validation == null ? null : validation.subject(), admission, configFence != null);
                     var decoded = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(claim);
                     if (!ValidationClaims.owner(owner.pipelineId(), decoded).equals(owner)) throw fenced();
-                    var result = work.apply(session); requireActive.run(); return result;
+                    var result = work.apply(session, preparedControl); requireActive.run(); return result;
                 }, TRANSACTION);
-                requireValidationAuthority(owner, admission);
+                requireValidationAuthority(owner, admission, configFence);
                 return committed;
             }
         });
     }
 
-    private void requireValidationAuthority(ValidationOwner owner, boolean admission) {
+    private void requireValidationAuthority(ValidationOwner owner, boolean admission, Runnable configFence) {
         if (validation != null) {
             if (!validation.subject().pipelineId().equals(owner.pipelineId())) throw fenced();
-            validation.require(admission);
+            if (configFence == null) validation.require(admission);
+            else configFence.run();
             MongoValidationSchema.requireReady(database, false);
         }
     }
@@ -462,6 +508,16 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
 
     static void requirePreparedClaim(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key, CacheBusinessScope scope,
             MongoValidationPreparationFacts.Subject expected, boolean admission) {
+        requirePreparedClaim(session, database, claim, key, scope, expected, admission, false);
+    }
+
+    static void requirePreparedClaim(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key,
+            CacheBusinessScope scope, MongoValidationPreparationFacts.Subject expected, boolean admission, boolean reuseClaim) {
+        preparedClaimControl(session, database, claim, key, scope, expected, admission, reuseClaim);
+    }
+
+    private static Document preparedClaimControl(ClientSession session, MongoDatabase database, Document claim, WorkloadClaimKey key,
+            CacheBusinessScope scope, MongoValidationPreparationFacts.Subject expected, boolean admission, boolean reuseClaim) {
         requireCollection(database);
         if (claim != null && claim.get("validationPreparation") instanceof Document independent && Integer.valueOf(2).equals(independent.get("formatVersion"))) {
             if (expected == null || !expected.scope().equals(scope) || !key.equals(ValidationClaims.key(scope.clusterId(), expected.pipelineId()))
@@ -470,9 +526,10 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
             if (control == null) throw unreadable("control");
             MongoValidationCachePreparations.validateRoot(control, scope, expected.pipelineId());
             if (!expected.equals(MongoValidationCachePreparations.binding(control)) || !independent.equals(control.get("birth"))) throw fenced();
-            if (MongoValidationCachePreparations.receiptInTransaction(session, database, scope, control).outcome() != MongoValidationPreparationFacts.Outcome.PREPARED
+            if (MongoValidationCachePreparations.receiptInTransaction(session, database, scope, control,
+                    reuseClaim ? claim : null).outcome() != MongoValidationPreparationFacts.Outcome.PREPARED
                     || admission && control.getBoolean("admissionClosed")) throw fenced();
-            return;
+            return control;
         }
         if (expected != null) throw fenced();
         if (claim == null || key.type() != WorkloadClaimType.VALIDATION || !(claim.get("validationPreparation") instanceof Document birth)
@@ -506,6 +563,7 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                 || !(state.get("epoch") instanceof Long epoch) || epoch < 0 || epoch == Long.MAX_VALUE
                 || !(state.get("runtimeWriteFence") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("original-pipeline-state");
+        return control;
     }
 
     private Document control(ClientSession session, String pipeline) {
@@ -610,10 +668,26 @@ final class MongoValidationControlStore implements ValidationControlStore,Valida
                 .append("retired", previous.get("retired")), new Document("$set", values)).getMatchedCount() != 1) throw unreadable("run-cas");
     }
     private void writeControl(ClientSession session, Document control) {
+        if (rows.replaceOne(session, controlWriteFence(control), nextControl(control)).getMatchedCount() != 1)
+            throw unreadable("control-cas");
+    }
+    private void writeCountJoin(ClientSession session, Document control, Document run) {
+        var next = nextControl(control);
+        next.remove("_id");
+        var result = rows.bulkWrite(session, List.of(
+                new UpdateOneModel<Document>(controlWriteFence(control), new Document("$set", next)),
+                new UpdateOneModel<Document>(new Document("_id", run.get("_id")), new Document("$setOnInsert", run),
+                        new UpdateOptions().upsert(true))));
+        if (result.getMatchedCount() != 1 || result.getModifiedCount() != 1 || result.getUpserts().size() != 1
+                || result.getUpserts().getFirst().getIndex() != 1) throw unreadable("count-join-cas");
+    }
+    private Document controlWriteFence(Document control) {
+        return new Document("_id", control.get("_id")).append("scope", scope(scope)).append("revision", control.getLong("revision"));
+    }
+    private static Document nextControl(Document control) {
         long revision = control.getLong("revision"); if (revision == Long.MAX_VALUE - 1) throw limit();
         var next = new Document(control); next.put("revision", revision + 1); bounded(next, MAX_CONTROL_BYTES);
-        if (rows.replaceOne(session, new Document("_id", control.get("_id")).append("scope", scope(scope)).append("revision", revision), next).getMatchedCount() != 1)
-            throw unreadable("control-cas");
+        return next;
     }
     private static boolean current(Document control, Run run) {
         return Long.valueOf(run.countingGeneration()).equals(control.get("countingGeneration")) && WorkloadClaimDocuments.stored(run.fence()).equals(control.get("owner"));

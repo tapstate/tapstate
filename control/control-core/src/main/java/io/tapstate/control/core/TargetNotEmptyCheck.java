@@ -55,10 +55,13 @@ public final class TargetNotEmptyCheck implements StartCheck {
         for (StartPlan.Entry entry : fullLoads) {
             byTarget.computeIfAbsent(entry.coordinate(), coordinate -> new ArrayList<>()).add(entry);
         }
-        Map<String, StartCheckContext.Probed> probed =
-                context.probe(byTarget.values().stream().map(List::getFirst).toList());
+        var targetsToProbe = byTarget.values().stream()
+                .filter(writers -> policy(writers) != OnFullLoad.CLEAR).map(List::getFirst).toList();
+        Map<String, StartCheckContext.Probed> probed = context.probe(targetsToProbe);
         List<StartFinding> findings = new ArrayList<>();
-        byTarget.forEach((coordinate, writers) -> findings.add(finding(writers, probed.get(coordinate), fullLoads)));
+        byTarget.forEach((coordinate, writers) -> {
+            if (probed.containsKey(coordinate)) findings.add(finding(writers, probed.get(coordinate), fullLoads));
+        });
         return findings;
     }
 

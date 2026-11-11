@@ -20,9 +20,9 @@ import static org.assertj.core.api.Assertions.*;
 @RequiresDocker
 class ValidationNativeCountGatewayIT {
     private static final String DB="validation_counts", PASSWORD="count-fixture-only";
-    @Test @Timeout(120) void mysqlAndMongoUseExactNativeCountsWithoutValueDiscovery()throws Exception { verify(true); }
-    @Test @Timeout(120) void postgresAndMongoUseExactNativeCountsWithoutValueDiscovery()throws Exception { verify(false); }
-    @Test @Timeout(60) void nativeIdentifierKeysRequireTheirOwnConfirmedDomain()throws Exception{
+    @Test @Timeout(120) void mysqlAndMongoUsePdkCountsWithoutValueDiscovery()throws Exception { verify(true); }
+    @Test @Timeout(120) void postgresAndMongoUsePdkCountsWithoutValueDiscovery()throws Exception { verify(false); }
+    @Test @Timeout(60) void nativeIdentifierKeysRetainLegacyAndPortableTextBindings()throws Exception{
         var artifact=artifact("mongodb");var identifier=new org.bson.types.ObjectId("0123456789abcdef01234567");
         var limits=new io.tapstate.core.validation.ValidationValues.Limits(64*1024,8192,32);
         try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))){
@@ -50,8 +50,11 @@ class ValidationNativeCountGatewayIT {
                     assertThat(reader.next()).isEmpty();
                 }
                 try(var reader=PdkValidationReads.scan(connection,artifact,configurationHash,"identifiers",binding,textKeys,false,()->{},query,decode,2,limits)){
-                    assertThatThrownBy(reader::next).isInstanceOfSatisfying(TapstateException.class,
-                            failure->assertThat(failure.code()).isEqualTo(io.tapstate.core.validation.ValidationError.RULE_UNSUPPORTED));
+                    try(var row=reader.next().orElseThrow()){
+                        assertThat((io.tapstate.core.validation.ValidationValues.Typed)row.values().fields().get("_id"))
+                                .satisfies(value->{assertThat(value.logicalType()).isEqualTo("text");assertThat(value.value()).isEqualTo(identifier.toHexString());});
+                    }
+                    assertThat(reader.next()).isEmpty();
                 }
             }
         }
@@ -112,28 +115,26 @@ class ValidationNativeCountGatewayIT {
             settings.put("timezone","+00:00");settings.put("oldVersionTimezone",false);
             if(mysql)settings.put("addtionalString","useSSL=false&allowPublicKeyRetrieval=true");else settings.put("schema","public");
             var source=new ConnectionConfig("source",kind,settings);
-            var target=new ConnectionConfig("target","independent-document-alias",Map.of("uri",mongo.getReplicaSetUrl(DB),"database",DB,"isUri",true));
+            var target=new ConnectionConfig("target","independent-document-alias",Map.of("uri",mongo.getReplicaSetUrl(DB),"isUri",true));
             try(var observer=MongoClients.create(mongo.getReplicaSetUrl(DB))) {
                 var database=observer.getDatabase(DB);database.getCollection("records").insertMany(List.of(new Document("_id",1),new Document("_id",2)));
                 database.createCollection("empty_records");database.runCommand(new Document("profile",2));
-                assertThat(count(source,sourceRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(3);
-                assertThat(count(target,targetRef,"records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isEqualTo(2);
-                assertThat(count(source,sourceRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
-                assertThat(count(target,targetRef,"empty_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isZero();
-                assertThatThrownBy(()->count(source,sourceRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(()->count(target,targetRef,"missing_records",PdkValidationCounts.Operation.NATIVE_PROTOCOL)).isInstanceOf(TapstateException.class);
+                assertThat(count(source,sourceRef,"records")).isEqualTo(3);
+                assertThat(count(target,targetRef,"records")).isEqualTo(2);
+                assertThat(count(source,sourceRef,"empty_records")).isZero();
+                assertThat(count(target,targetRef,"empty_records")).isZero();
+                assertThatThrownBy(()->count(source,sourceRef,"missing_records")).isInstanceOf(TapstateException.class);
+                assertThatThrownBy(()->count(target,targetRef,"missing_records")).isInstanceOf(TapstateException.class);
                 var commands=database.getCollection("system.profile").find().into(new ArrayList<>()).stream()
                         .map(row->row.get("command",Document.class)).filter(Objects::nonNull).toList();
-                assertThat(commands).filteredOn(command->"records".equals(command.get("aggregate"))||"empty_records".equals(command.get("aggregate")))
-                        .hasSize(2).allSatisfy(command->assertThat(command.getList("pipeline",Document.class)).anySatisfy(stage->assertThat(stage).containsKey("$group")));
-                assertThat(commands).noneSatisfy(command->{
-                    assertThat(command.containsKey("find")||command.containsKey("count")||command.toJson().contains("$sample")).isTrue();
-                });
+                assertThat(commands).filteredOn(command -> command.containsKey("count") || command.containsKey("aggregate"))
+                        .hasSize(2);
+                assertThat(commands).noneMatch(command -> command.containsKey("find") || command.toJson().contains("$sample"));
             }
         }
     }
-    private static long count(ConnectionConfig connection,ConnectorRef artifact,String table,PdkValidationCounts.Operation operation) {
-        try(var count=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table,DB,operation),()->{})) {
+    private static long count(ConnectionConfig connection,ConnectorRef artifact,String table) {
+        try(var count=new PdkValidationCounts(connection,artifact,new PdkValidationCounts.Request(table),()->{})) {
             long value=count.count();assertThat(count.drained()).isTrue();assertThat(count.callExited().toCompletableFuture()).isCompleted();return value;
         }
     }

@@ -26,11 +26,23 @@ public interface WorkloadClaimStore {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 
+    /** Admits a Pipeline in an explicit single-member deployment under its original node session. */
+    default WorkloadClaimAttempt acquireNodeBackedPipeline(PipelineIntentScope scope, WorkloadClaimFence node,
+            long topologyRevision) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
     /**
      * Reads only the claim admitted under this original Pipeline scope. A generic metadata read does
      * not establish that a run still belongs to its physical state; unsupported stores refuse.
      */
     default Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope scope) {
+        throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+    }
+
+    /** Claims an existing validation tenure and advances its execution in the same transaction. */
+    default Optional<WorkloadClaim> acquireValidationExecution(WorkloadClaimKey key, WorkloadOwner owner,
+            long topologyRevision, Duration ttl) {
         throw new io.tapstate.core.common.TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
     }
 

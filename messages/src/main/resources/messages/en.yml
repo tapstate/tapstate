@@ -709,6 +709,9 @@ connector.ambiguous-registration:
 connector.registration-conflict:
   message: "Connector '{connector}' is already registered under artifact {existing}; a different artifact {incoming} was refused."
   solution: "Keep a single registered artifact per connector id; unregister the existing artifact before registering a different one."
+connector.cloud-upload-disabled:
+  message: "Manual connector uploads are unavailable in Cloud clusters."
+  solution: "Use a connector bundled with the Cloud runtime image."
 connector.load-failed:
   message: "Connector '{connector}' could not be loaded."
   solution: "Check the connector jar and its dependencies are present and readable."
@@ -880,6 +883,10 @@ mcp.invalid-server-response:
 mcp.server-rejected:
   message: "The Tapstate Server rejected the request with HTTP status {status} without a structured error code."
   solution: "Inspect the Server logs and verify that the MCP sidecar and Server use compatible control contracts."
+engine.execution-lease-lost:
+  message: "Pipeline {pipeline} stopped because its execution lease expired or was replaced."
+engine.execution-renewal-failed:
+  message: "Pipeline {pipeline} stopped because it could not confirm renewal of its execution lease."
 engine.execution-not-authorized:
   message: "This member may no longer act for pipeline `{pipeline}`: its run is not the current one."
   solution: "Let the member that holds the pipeline's claim run it; check cluster connectivity to the coordination store if no member is running it."
@@ -1125,7 +1132,7 @@ nest.parent-absent:
   solution: "A dangling reference in the source is normal and nothing was lost - the event was never going to appear in any document. A long wait means the reference has dangled all along; a short one means the parent row was deleted while its children were still arriving."
 nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident})."
-  solution: "Raise this pipeline's in-memory entry budget so more of its working set stays resident, or accept the round trips if the throughput they allow is enough."
+  solution: "Inspect cold-key traffic, backend latency and batching. Increase the in-memory entry budget only when the measured working set and available memory justify it."
 nest.rollup-on-reference-embed:
   message: "The embed at {embedPath} is one its parent points at, so it holds at most one row and cannot carry rollup fields."
   solution: "Read the referenced row's columns directly, for example in a rollup field one level up: `=after.<path>.<column>`."

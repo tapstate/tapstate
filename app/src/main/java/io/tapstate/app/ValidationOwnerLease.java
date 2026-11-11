@@ -83,6 +83,13 @@ final class ValidationOwnerLease implements AutoCloseable {
         return fence;
     }
 
+    /** Read-only observation of the original proof. Expiry and retirement are handled by the owner lifecycle. */
+    boolean observesLive() {
+        if (!active || expired()) return false;
+        try { return nodeAuthorized.getAsBoolean() && active && !expired(); }
+        catch (TapstateException unavailable) { return false; }
+    }
+
     /** Cheap guard before every external call and after blocking reads, with no store call. */
     boolean authorized() {
         if (!active) return false;

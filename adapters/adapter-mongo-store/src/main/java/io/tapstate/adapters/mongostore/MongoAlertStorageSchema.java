@@ -61,11 +61,16 @@ final class MongoAlertStorageSchema {
 
     /** Load-only: absent means unprepared only when the entire feature set is absent as well. */
     int load(MongoReadBudget budget) {
+        Document marker = loadVerifiedMarker(budget);
+        return marker == null ? 0 : marker.getInteger("installedVersion");
+    }
+
+    Document loadVerifiedMarker(MongoReadBudget budget) {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
             requireActive.run();
             Document marker = verifiedMarker(budget);
-            requireActive.run(); budget.remainingMillis(); return marker == null ? 0 : marker.getInteger("installedVersion");
+            requireActive.run(); budget.remainingMillis(); return marker;
         });
     }
 

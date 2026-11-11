@@ -21,6 +21,25 @@ public interface SrsConsumerStore {
     /** Bounded exact original relation only; no scan of other consumers, cursors or model bodies. */
     default boolean attached(SrsConsumerRun original,String table){throw new io.tapstate.core.common.TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",original.miningChainId()),null);}
     SrsConsumerTopology attached(String miningChainId);
+    record AttachedChain(SrsConsumerTopology topology, SrsChainState chain) {}
+
+    default AttachedChain attachedWithChain(String chain) {
+        throw new UnsupportedOperationException("combined Capture topology is not supported");
+    }
+
+    record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
+
+    /** Reads original progress and the boundaries for its missing rings from one snapshot. */
+    default Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {
+        throw new UnsupportedOperationException("Capture startup sampling is not supported");
+    }
+
+    /** The exact progress committed by an admitted startup's conditional write. */
+    default Optional<SrsConsumerProgress> startReadingAfterAndGet(SrsConsumerContext context, long membershipRevision,
+            long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence) {
+        throw new UnsupportedOperationException("Capture arrival receipt is not supported");
+    }
+
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
@@ -31,6 +50,15 @@ public interface SrsConsumerStore {
     default Optional<SrsModel> verifyReadEvent(SrsConsumerRun run, String table, String ring, long sequence,
             long epoch, long version, WorkloadClaimFence capture) {
         throw new UnsupportedOperationException("read event verification is not supported");
+    }
+
+    record ReadEvent(long sequence, long epoch, long version, WorkloadClaimFence capture) {}
+
+    default boolean supportsReadBatchVerification() { return false; }
+
+    /** Verifies every event against one view of the original consumer and its models. */
+    default boolean verifyReadEvents(SrsConsumerRun run, String table, String ring, java.util.List<ReadEvent> events) {
+        throw new UnsupportedOperationException("read batch verification is not supported");
     }
 
     /** Freezes the original current view and one store-issued completed CONFIG full. */

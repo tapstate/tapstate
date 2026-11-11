@@ -20,6 +20,11 @@ final class InstalledConnectorTests {
     }
 
     InstalledConnectorTests(ConnectorPluginProperties properties, Clock clock, Set<String> selectedFileNames) {
+        this(properties, clock, selectedFileNames, false);
+    }
+
+    InstalledConnectorTests(ConnectorPluginProperties properties, Clock clock, Set<String> selectedFileNames,
+                            boolean loadSeedInPlace) {
         var registrations = new LinkedHashMap<String,ConnectorRegistration>();
         var artifacts = new LinkedHashMap<String,byte[]>();
         ConnectorRegistry registry = new ConnectorRegistry() {
@@ -29,13 +34,18 @@ final class InstalledConnectorTests {
             }
             @Override public RegistrationOutcome register(String id, String api, RegistrationSource source,
                                                             String hash, long length, InputStream bytes) throws IOException {
+                if (loadSeedInPlace) {
+                    ArtifactStreams.copyVerified(bytes, OutputStream.nullOutputStream(), hash, length);
+                    return registerOwned(id, api, source, hash, null);
+                }
                 return registerOwned(id, api, source, hash, ArtifactStreams.readVerified(bytes, hash, length));
             }
             private RegistrationOutcome registerOwned(String id, String api, RegistrationSource source, String hash, byte[] bytes) {
                 var existing = registrations.get(hash);
                 if (existing != null) return new RegistrationOutcome(existing, false);
                 var created = new ConnectorRegistration(id, hash, api, source);
-                registrations.put(hash, created); artifacts.put(hash, bytes);
+                registrations.put(hash, created);
+                if (!loadSeedInPlace) artifacts.put(hash, bytes);
                 return new RegistrationOutcome(created, true);
             }
             @Override public List<ConnectorRegistration> list() { return List.copyOf(registrations.values()); }
@@ -46,7 +56,9 @@ final class InstalledConnectorTests {
                 ArtifactStreams.copyVerified(new ByteArrayInputStream(bytes), target, hash, bytes.length);
                 return true;
             }
-            @Override public boolean hasArtifact(String hash) { return artifacts.containsKey(hash); }
+            @Override public boolean hasArtifact(String hash) {
+                return loadSeedInPlace ? registrations.containsKey(hash) : artifacts.containsKey(hash);
+            }
         };
         var rows = new LinkedHashMap<String,ConnectorCatalogEntry>();
         ConnectorCatalogStore catalog = new ConnectorCatalogStore() {
@@ -60,7 +72,8 @@ final class InstalledConnectorTests {
             @Override public Optional<byte[]> get(String hash) { return Optional.ofNullable(sources.get(hash)).map(byte[]::clone); }
         };
         var introspector = new ConnectorIntrospector();
-        var provisioner = new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir());
+        var provisioner = new RegistryConnectorProvisioner(registry, introspector, properties.getPluginsDir(),
+                loadSeedInPlace ? properties.getSeedDir() : null, loadSeedInPlace);
         var registrar = new ConnectorArtifactRegistrar(registry, introspector, new PdkCapabilityDeriver(provisioner),
                 catalog, specs, properties.getAlsoAcceptIds());
         var sweep = new SeedConnectorSweep(registrar);

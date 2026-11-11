@@ -37,6 +37,29 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class RegistryConnectorProvisionerTest {
 
+    @Test
+    void captureStartupReusesInspectionOnlyForARegisteredAndVerifiedArtifact(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        var registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes);
+        Path cache = dir.resolve("plugins");
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), cache);
+        var captured = provisioner.resolveCaptureStartup("orders");
+        assertThat(provisioner.revalidateCaptureStartup("orders", captured)).isSameAs(captured);
+        assertThat(registry.artifactCalls).isEqualTo(1);
+
+        var unregistered = new RegistryConnectorProvisioner(new InMemoryConnectorRegistry(), new ConnectorIntrospector(), cache);
+        assertThatThrownBy(() -> unregistered.revalidateCaptureStartup("orders", captured))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+
+        Path jar = captured.classpath().getFirst();
+        Files.delete(jar);
+        assertThat(provisioner.revalidateCaptureStartup("orders", captured).contentHash()).isEqualTo(captured.contentHash());
+        assertThat(registry.artifactCalls).isEqualTo(2);
+        Files.writeString(jar, "damaged cache");
+        assertSafeLoadFailure(() -> provisioner.revalidateCaptureStartup("orders", captured));
+    }
+
     @Test void managedTestResolutionPreservesLinkageDefectsThroughTheRealRegistry(@TempDir Path dir) throws IOException {
         var registry = new InMemoryConnectorRegistry();
         registry.register("orders", "1.3.5", RegistrationSource.SEED, Files.readAllBytes(Synthetic.connectorMissingItsSuperclass(dir.resolve("jar"))));

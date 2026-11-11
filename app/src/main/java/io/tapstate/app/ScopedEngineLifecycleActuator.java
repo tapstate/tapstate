@@ -64,6 +64,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private OperatorRunManifest manifest;
     private ExecutionFence original;
     private PipelineCaptureCoordinator capture;
+    private boolean checkingStart;
 
     ScopedEngineLifecycleActuator(PipelineConvergencePass pass,Engine engine,DagSource dags,
             PipelineCaptureCoordinator captures,PipelineActuationOwnership ownership,String defaultDatabase,
@@ -90,7 +91,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     private void require() {
         if (invalidated) throw fenced();
         pass.requirePipeline(id());
-        if (!command.equals(pass.claim()) || !ownership.proveClaim(pass.scope(),command)) throw fenced();
+        if (!command.equals(pass.claim())) throw fenced();
+        boolean proved = checkingStart ? ownership.proveStartClaim(pass.scope(), command)
+                : ownership.proveClaim(pass.scope(), command);
+        if (!proved) throw fenced();
         pass.requirePipeline(id());
         if (!command.equals(pass.claim())) throw fenced();
     }
@@ -112,6 +116,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized void start(String pipeline) {
+        checkingStart = true;
+        try {
+            startOwned(pipeline);
+        } finally {
+            checkingStart = false;
+        }
+    }
+
+    private void startOwned(String pipeline) {
         requireId(pipeline); engine.refuseIfLost(id());
         DagSource.StartPreparation prepared;
         Set<String> shared;
@@ -144,6 +157,7 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
             var previous = recorder.last(id()); require();
             recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
+            checkingStart = false;
             submissions.attempting(manifest); submissionAttempted = true;
             run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
             submissions.returned(manifest); require();
@@ -176,7 +190,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                     Map.of("pipeline",id(),"seconds",STOP_BUDGET.toSeconds()),null);
             require();
         }
-        if (capture != null) { capture.stopCapture(id(),false); require(); }
+        if (run == null && pass.displacedExecution() > 0 && captures instanceof ScopedPipelineCaptureCoordinator scoped) {
+            // An absent Jet handle cannot supply the old capture fence. The successor may retire only
+            // local sessions in the original scope at or below its admitted fence.
+            scoped.retireScope(pass.scope(), command);
+            require();
+        } else if (capture != null) {
+            capture.stopCapture(id(), false);
+            require();
+        }
         if (manifest != null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
         if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
     }
@@ -200,6 +222,42 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         }
         require(); run.resume(); require();
     }
+    @Override public synchronized Optional<Throwable> terminalLeaseFailure(String pipeline) {
+        requireId(pipeline);
+        return pass.renewalFailure().map(Throwable.class::cast);
+    }
+
+    @Override public synchronized Optional<LeaseLoss> leaseLoss(String pipeline) {
+        long displaced = pass.displacedExecution();
+        if (displaced > 0 && displaced == command.executionGeneration()
+                && (run == null || original != null && pass.scope().equals(original.scope()) && !run.completed())) {
+            requireId(pipeline);
+            return Optional.of(new LeaseLoss(displaced,
+                    new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
+        }
+        if (run == null || original == null || !pass.scope().equals(original.scope())) return Optional.empty();
+        if (run.isCarryingAJob()) {
+            if (original.claimGeneration() >= command.claimGeneration()) return Optional.empty();
+            requireId(pipeline);
+            // The successor can fence this old execution even before its Jet tasks notice the loss.
+            return Optional.of(new LeaseLoss(original.executionGeneration(),
+                    new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", pipeline), null)));
+        }
+        var failure = run.failure();
+        for (Throwable cause = failure.orElse(null); cause != null; cause = cause.getCause()) {
+            if (cause instanceof TapstateException coded && coded.code() == EngineError.EXECUTION_NOT_AUTHORIZED) {
+                requireId(pipeline);
+                return Optional.of(new LeaseLoss(original.executionGeneration(), coded));
+            }
+        }
+        return Optional.empty();
+    }
+
+    @Override public synchronized boolean recoveredJobRunning(String pipeline) {
+        requireId(pipeline);
+        return run != null && isCurrentRun() && run.status() == com.hazelcast.jet.core.JobStatus.RUNNING;
+    }
+
     @Override public synchronized Optional<Throwable> failure(String pipeline) {
         requireId(pipeline);
         if (engine.isLost()) { var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost; }

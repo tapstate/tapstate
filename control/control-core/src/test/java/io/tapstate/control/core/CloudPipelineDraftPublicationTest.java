@@ -35,6 +35,38 @@ class CloudPipelineDraftPublicationTest {
     private static final String EDITOR = "verified-cloud-user-b";
     private static final CanonicalWriter WRITER = new CanonicalWriter();
 
+    @Test
+    void publicationPassesThePlannedSourceSchemaToDerivation() {
+        var reads = new LinkedHashMap<String, Integer>();
+        var model = new io.tapstate.spi.store.DiscoveredSourceModel("mongo_input", "mongodb", NOW.toEpochMilli(),
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders", List.of(
+                        new io.tapstate.spi.store.SourceField("_id", "int", io.tapstate.core.common.TapstateType.INT64)),
+                        List.of("_id"), List.of()))));
+        io.tapstate.spi.store.SchemaStore schemas = new io.tapstate.spi.store.SchemaStore() {
+            @Override public void save(io.tapstate.spi.store.DiscoveredSourceModel ignored) {
+                throw new AssertionError("read only");
+            }
+            @Override public Optional<io.tapstate.spi.store.DiscoveredSourceModel> get(String id) {
+                reads.merge(id, 1, Integer::sum);
+                return id.equals("mongo_input") ? Optional.of(model) : Optional.empty();
+            }
+        };
+        var captured = new java.util.concurrent.atomic.AtomicReference<SchemaDerivation.PublishedInputs>();
+        SchemaDerivation derivation = new SchemaDerivation() {
+            @Override public void derive(String id) { throw new AssertionError("expected publication inputs"); }
+            @Override public void derivePublishedDraft(String id, PublishedInputs inputs, long generation) {
+                captured.set(inputs);
+            }
+        };
+        var fixture = new Fixture(true, PipelineDraft.Mode.DAG, schemas, derivation);
+
+        assertThat(fixture.service.publish("orders", 1, null, OWNER).published()).isTrue();
+        assertThat(reads).containsExactlyInAnyOrderEntriesOf(Map.of("mongo_input", 1, "mongo_target", 1));
+        assertThat(captured.get().models()).containsEntry("mongo_input", Optional.of(model));
+        assertThat(captured.get().definitions()).containsOnlyKeys("orders", "mongo_input", "mongo_target");
+        assertThat(captured.get().definitions().get("orders")).isEqualTo(fixture.drafts.lastPublication.artifact());
+    }
+
     @ParameterizedTest
     @EnumSource(PipelineDraft.Mode.class)
     void cloudPublicationAttributesTheArtifactToTheVerifiedPublisher(PipelineDraft.Mode mode) {
@@ -175,6 +207,11 @@ class CloudPipelineDraftPublicationTest {
         private final PipelineDraftService service;
 
         private Fixture(boolean cloud, PipelineDraft.Mode mode) {
+            this(cloud, mode, new EmptySchemaStore(), SchemaDerivation.none());
+        }
+
+        private Fixture(boolean cloud, PipelineDraft.Mode mode, io.tapstate.spi.store.SchemaStore schemas,
+                SchemaDerivation derivation) {
             DslParser parser = new DslParser();
             artifacts.save(parser.parse("""
                     version: tapstate/v1
@@ -195,7 +232,7 @@ class CloudPipelineDraftPublicationTest {
             Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
             AuditGate gate = new AuditGate(record -> {}, clock);
             apply = new ApplyService(TapstateCatalog::load, artifacts, gate,
-                    new EmptySchemaStore(), PlanAdvisories.none(), SchemaDerivation.none(), null,
+                    schemas, PlanAdvisories.none(), derivation, null,
                     cloud ? ResourceAttributionPolicy.managedCloud() : ResourceAttributionPolicy.onPrem(),
                     cloud ? StateDatabasePolicy.CLOUD : StateDatabasePolicy.ON_PREM);
             service = new PipelineDraftService(drafts, new PipelineDraftCompiler(), WRITER, clock, gate, apply);

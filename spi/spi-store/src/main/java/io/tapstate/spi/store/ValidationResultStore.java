@@ -7,6 +7,7 @@ import io.tapstate.core.validation.ValidationRunIdentity;
 import io.tapstate.core.validation.ValidationRunSpec;
 import io.tapstate.core.validation.ValidationCountCheck;
 import io.tapstate.core.validation.ValidationMethod;
+import io.tapstate.core.validation.ValidationTableFailure;
 import java.util.Map;
 import java.util.Objects;
 
@@ -41,6 +42,17 @@ public interface ValidationResultStore {
                             && mapping.outputId().equals(check.outputId()))) throw invalid("report.countScope");
         }
     }
+    record TableFailureWrite(Report report, ValidationRunSpec snapshot, ValidationTableFailure failure) {
+        public TableFailureWrite {
+            Objects.requireNonNull(report);
+            Objects.requireNonNull(snapshot);
+            Objects.requireNonNull(failure);
+            if (!report.run().specHash().equals(snapshot.fingerprint())
+                    || snapshot.task().mappings().stream().noneMatch(mapping -> mapping.mappingId().equals(failure.mappingId()))) {
+                throw invalid("report.tableFailureScope");
+            }
+        }
+    }
     enum Publication { APPLIED, DUPLICATE, STALE_OBSERVATION, CLOSED_OR_EXPIRED }
     enum Seal { SEALED, ALREADY_SEALED, CLOSED_OR_EXPIRED }
 
@@ -54,6 +66,9 @@ public interface ValidationResultStore {
 
     /** Same CONFIG open-report fence as root publication; implementations must never create a report. */
     default Publication publishCount(CountWrite write) { throw invalid("report.countPublicationUnsupported"); }
+
+    /** Retains the failed table outcome under the original open CONFIG report fence. */
+    default Publication publishTableFailure(TableFailureWrite write) { throw invalid("report.tableFailurePublicationUnsupported"); }
 
     /**
      * Irreversibly close this original report epoch in the same transaction domain as publish.

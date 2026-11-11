@@ -29,6 +29,81 @@ class MongoValidationSchemaIT {
     @Container static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     static final Duration TTL = Duration.ofSeconds(30);
 
+    @Test void legacyQueryIndexesResumeThroughExistingPreparationAndPublishOnce() {
+        try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                    new Document("$unset", new Document("validation.queryIndexVersion", "")));
+            for (var table : MongoValidationSchema.CONFIG) for (var index : table.indexes())
+                if (MongoValidationSchema.queryIndex(index) && table != SystemCollections.VALIDATION_TASKS)
+                    table.on(f.configDb).dropIndex(index.indexName());
+            var retained = new Document("_id", "retained-history").append("fixture", true);
+            SystemCollections.VALIDATION_REPORTS.on(f.configDb).insertOne(retained);
+            try (var ordinary = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(ordinary.schemaVersion()).isEqualTo(2);
+            }
+            var revision = f.configuration.configurationRevision();
+            f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            assertThat(f.configSchema().get("validation", Document.class).getInteger("queryIndexVersion")).isEqualTo(1);
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision + 1);
+            assertThat(SystemCollections.VALIDATION_REPORTS.on(f.configDb).find(new Document("_id", "retained-history")).first()).isEqualTo(retained);
+            MongoValidationSchema.verifyQueryIndexes(f.configDb);
+            f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision + 1);
+        }
+    }
+
+    @Test void existingPipelineInstallationAddsOnlyQueryIndexesThroughItsRetainedOperation() {
+        try (var f = new Fixture(1)) {
+            var operation = f.upgrade();
+            var pipeline = f.configuration.artifacts().get("flow0").orElseThrow();
+            var preparation = f.configuration.validationPreparations().read("flow0");
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                    new Document("$unset", new Document("validation.queryIndexVersion", "")));
+            for (var table : MongoValidationSchema.CONFIG) for (var index : table.indexes())
+                if (MongoValidationSchema.queryIndex(index)) table.on(f.configDb).dropIndex(index.indexName());
+            var revision = f.configuration.configurationRevision();
+            try (var ignored = f.resume(operation)) { }
+            MongoValidationSchema.verifyQueryIndexes(f.configDb);
+            assertThat(f.configuration.artifacts().get("flow0").orElseThrow()).isEqualTo(pipeline);
+            assertThat(f.configuration.validationPreparations().read("flow0")).isEqualTo(preparation);
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision + 1);
+            try (var ignored = f.resume(operation)) { }
+            assertThat(f.configuration.configurationRevision()).isEqualTo(revision + 1);
+        }
+    }
+
+    @Test void publishedQueryIndexesAreRequiredAndOrdinaryOpenNeverRepairsThem() {
+        try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            assertThat(reports.listIndexes().into(new ArrayList<>())).anySatisfy(index -> {
+                assertThat(index.getString("name")).isEqualTo("validation_reports_history");
+                assertThat(index.get("key", Document.class)).containsEntry("terminalMetadata.endedAt.seconds", -1)
+                        .containsEntry("terminalMetadata.endedAt.nanos", -1);
+            });
+            reports.dropIndex("validation_reports_history");
+            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster")).isInstanceOf(TapstateException.class);
+            assertThat(reports.listIndexes()).noneMatch(index -> "validation_reports_history".equals(index.get("name")));
+        }
+    }
+
+    @Test void malformedLegacyQueryIndexCannotBePublishedAsPrepared() {
+        try (var f = new Fixture(0)) {
+            var original = f.configuration.bindings().cachePreparation().orElseThrow();
+            f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                    new Document("$unset", new Document("validation.queryIndexVersion", "")));
+            var reports = SystemCollections.VALIDATION_REPORTS.on(f.configDb);
+            reports.dropIndex("validation_reports_history");
+            reports.createIndex(new Document("_id.clusterId", 1), new com.mongodb.client.model.IndexOptions().name("validation_reports_history"));
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {})).isInstanceOf(TapstateException.class);
+            assertThat(f.configSchema().get("validation", Document.class)).doesNotContainKey("queryIndexVersion");
+        }
+    }
+
     @ParameterizedTest
     @org.junit.jupiter.params.provider.EnumSource(StorageBinding.Mode.class)
     void originalEmptyInstallationPublishesBothSchemaHalvesBeforeBusinessAndReplaysWithoutRepair(StorageBinding.Mode mode) {
@@ -773,6 +848,119 @@ class MongoValidationSchemaIT {
             assertThat(f.productionFacts()).isEqualTo(before);
             assertThat(SystemCollections.CACHE_PIPELINE_STATE.on(f.cacheDb).countDocuments()).isZero();
             assertThat(SystemCollections.CACHE_SOURCE_SCHEMAS.on(f.cacheDb).countDocuments()).isZero();
+        }
+    }
+
+    @Test void validationStartupReusesStructureOnlyWhileItsSchemaProofIsCurrent() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                MongoConfigurationDomain.duringValidationStartup(() -> {
+                    f.configuration.validationTasks(() -> {});
+                    assertThat(commands).contains("listIndexes");
+                    commands.clear();
+                    f.configuration.validationTasks(() -> {});
+                    assertThat(commands).containsExactly("find", "find");
+
+                    SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                            new Document("$set", new Document("validation.operationId", UUID.randomUUID().toString())));
+                    commands.clear();
+                    assertThatThrownBy(() -> f.configuration.validationTasks(() -> {})).isInstanceOf(TapstateException.class);
+                    assertThat(commands).containsExactly("find");
+                    return null;
+                });
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
+            assertThatThrownBy(() -> MongoConfigurationDomain.duringValidationStartup(() -> f.configuration.validationTasks(() -> {})))
+                    .isInstanceOf(TapstateException.class);
+        }
+    }
+
+    @Test void validationRoutingReadsAnUnpreparedPipelineWithoutPreparingIt() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var node = WorkloadClaimFence.from(f.node("node"));
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb);
+            var key = new Document("_id", "flow0");
+            var before = mappings.find(key).first();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                assertThat(f.configuration.routeValidationClaim("flow0", f.scope, f.cache, node, () -> {})).isEmpty();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate");
+            assertThat(mappings.find(key).first()).isEqualTo(before);
+            assertThat(SystemCollections.VALIDATION_RUNS.on(f.cacheDb).countDocuments()).isZero();
+        }
+    }
+
+    @Test void validationOwnerObservationUsesThreeCommandsAcrossIndependentDatabases() {
+        try (var f = new Fixture(1)) {
+            f.upgrade();
+            var node = f.node("node");
+            var access = f.configuration.prepareValidationAccess("flow0", f.scope, f.cache, WorkloadClaimFence.from(node), () -> {});
+            var key = ValidationClaims.key("cluster", "flow0");
+            var claims = access.claims();
+            var held = claims.acquire(key, node.owner(), 1, TTL).claim();
+            var running = claims.advanceExecution(held, 1, Set.of(node.owner().nodeId())).orElseThrow();
+
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                var observed = f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}).orElseThrow();
+                assertThat(observed.claim()).isEqualTo(running);
+                assertThat(observed.leased()).isTrue();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate", "aggregate");
+
+            commands.clear();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                assertThat(f.configuration.routeValidationClaim("flow0", f.scope, f.cache,
+                        WorkloadClaimFence.from(node), () -> {})).hasValueSatisfying(value -> {
+                    assertThat(value.claim()).isEqualTo(running);
+                    assertThat(value.leased()).isTrue();
+                });
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+            assertThat(commands).containsExactly("aggregate", "aggregate", "aggregate");
+
+            var mappings = SystemCollections.OPERATOR_GENERATIONS.on(f.configDb);
+            var mappingId = new Document("_id", "flow0");
+            var calls = new java.util.concurrent.atomic.AtomicInteger();
+            assertThat(f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {
+                if (calls.incrementAndGet() == 2)
+                    mappings.updateOne(mappingId,
+                            new Document("$set", new Document("validationPreparation.generation", UUID.randomUUID().toString())));
+            })).isEmpty();
+            assertThatThrownBy(() -> f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
+            mappings.updateOne(mappingId,
+                    new Document("$set", new Document("validationPreparation.generation", access.generation().toString())));
+
+            var recovery = SystemCollections.STORAGE_RECOVERY.on(f.configDb);
+            var recoveryId = new Document("_id", "cluster");
+            calls.set(0);
+            assertThat(f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {
+                if (calls.incrementAndGet() == 2)
+                    recovery.updateOne(recoveryId,
+                            new Document("$set", new Document("cacheIncarnation", UUID.randomUUID().toString())));
+            })).isEmpty();
+            recovery.updateOne(recoveryId, new Document("$set", new Document("cacheIncarnation", f.scope.cacheIncarnation())));
+
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cacheDb).updateOne(new Document("_id", MongoWorkloadClaimStore.id(key)),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+            var expired = f.configuration.observeValidationClaim("flow0", f.scope, f.cache, () -> {}).orElseThrow();
+            assertThat(expired.leased()).isFalse();
         }
     }
 

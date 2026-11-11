@@ -30,11 +30,28 @@ final class MongoValidationCachePreparations {
         this.targetFingerprint = Objects.requireNonNull(targetFingerprint); this.active = Objects.requireNonNull(active);
     }
 
+    record InitialCountLease(long topologyRevision, java.time.Duration ttl) {
+        InitialCountLease {
+            if (topologyRevision < 0 || ttl.isNegative() || ttl.isZero() || ttl.toMillis() == 0)
+                throw new IllegalArgumentException("invalid initial COUNT lease");
+        }
+    }
+
     /** Native proof retains its actual CACHE reader; a matching DTO cannot impersonate a committed result. */
     static final class Proof {
         private final MongoValidationCachePreparations owner;
         private final Subject subject;
-        private Proof(MongoValidationCachePreparations owner, Subject subject) { this.owner = owner; this.subject = subject; }
+        private final io.tapstate.spi.store.WorkloadClaim initialClaim;
+        private Proof(MongoValidationCachePreparations owner, Subject subject) { this(owner, subject, null); }
+        private Proof(MongoValidationCachePreparations owner, Subject subject, io.tapstate.spi.store.WorkloadClaim initialClaim) {
+            this.owner = owner;
+            this.subject = subject;
+            this.initialClaim = initialClaim;
+        }
+        io.tapstate.spi.store.WorkloadClaim initialClaim(Subject expected) {
+            if (!subject.equals(expected)) throw fenced();
+            return initialClaim;
+        }
         Receipt requirePrepared(Subject expected) {
             var receipt = requireResult(expected);
             if (receipt.outcome() != Outcome.PREPARED) throw fenced(); return receipt;
@@ -48,9 +65,13 @@ final class MongoValidationCachePreparations {
     }
 
     Proof prepare(MongoValidationPreparations.Permission permission, WorkloadClaimFence node) {
+        return prepare(permission, node, null);
+    }
+
+    Proof prepare(MongoValidationPreparations.Permission permission, WorkloadClaimFence node, InitialCountLease count) {
         Objects.requireNonNull(permission); var before = permission.requireCurrent(); var subject = permission.subject();
         requireTarget(permission.binding(), subject); boolean first = permission.consumeFirstAttempt();
-        mutate(node, session -> {
+        var initialClaim = mutate(node, (session, serverNow) -> {
             var current = control(session, subject.pipelineId());
             if (current != null && subject.equals(binding(current))) {
                 var receipt = receipt(session, current); if (receipt.outcome() != Outcome.PREPARED) throw fenced(); return null;
@@ -59,7 +80,9 @@ final class MongoValidationCachePreparations {
             var predecessor = requirePredecessor(session, current, before.previous(), subject);
             var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
             var claims = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-            var retained = claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+            // For a first COUNT birth requirePredecessor already proved absence in this transaction.
+            var retained = count != null && current == null && before.previous() == null ? null
+                    : claims.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
             Subject origin;
             if (predecessor == null || predecessor.origin() == null) {
                 if (retained != null) throw unreadable(); origin = subject;
@@ -67,20 +90,33 @@ final class MongoValidationCachePreparations {
                 if (retained == null) throw unreadable(); origin = predecessor.origin();
             }
             var birth = birth(subject, origin); var replacement = root(subject, origin, Outcome.PREPARED, current);
+            io.tapstate.spi.store.WorkloadClaim initial = null;
             if (retained == null) {
-                claims.insertOne(session, new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
+                var row = new Document("_id", MongoWorkloadClaimStore.id(key)).append("clusterId", key.clusterId())
                         .append("resourceType", key.type().name()).append("resourceId", key.resourceId())
                         .append("ownerNodeId", node.owner().nodeId()).append("ownerBootId", node.owner().bootId())
                         .append("claimGeneration", 1L).append("executionGeneration", 0L).append("topologyRevision", 0L)
-                        .append("leaseUntil", new Date(0)).append("validationPreparation", birth).append("fencedValidationWrites", 0L));
+                        .append("leaseUntil", new Date(0)).append("validationPreparation", birth).append("fencedValidationWrites", 0L);
+                if (count != null && current == null && before.previous() == null) {
+                    row.put("leaseUntil", new Date(Math.addExact(serverNow.getTime(), count.ttl().toMillis())));
+                    row.put("topologyRevision", count.topologyRevision());
+                    row.put("executionGeneration", 1L);
+                    row.put("contextExecutionGeneration", 1L);
+                    row.put("executionClaimGeneration", 1L);
+                    row.put("executionNodeIds", java.util.List.of(node.owner().nodeId()));
+                    row.put("failureClaimGeneration", 0L);
+                    row.put("failureAfterMemberLoss", false);
+                    initial = new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);
+                }
+                claims.insertOne(session, row);
             } else {
                 if (claims.updateOne(session, new Document("_id", retained.get("_id")).append("validationPreparation", retained.get("validationPreparation"))
                         .append("claimGeneration", retained.get("claimGeneration")).append("executionGeneration", retained.get("executionGeneration")),
                         new Document("$set", new Document("validationPreparation", birth))).getMatchedCount() != 1) throw fenced();
             }
-            replaceControl(session, current, replacement); return null;
+            replaceControl(session, current, replacement); return initial;
         });
-        permission.requireCurrent(); return new Proof(this, subject);
+        permission.requireCurrent(); return new Proof(this, subject, initialClaim);
     }
 
     /** Returns PREPARED while original active runs still require known report closure and retirement. */
@@ -196,13 +232,17 @@ final class MongoValidationCachePreparations {
         return receiptInTransaction(session, database, scope, root);
     }
     static Receipt receiptInTransaction(ClientSession session, MongoDatabase database, CacheBusinessScope scope, Document root) {
+        return receiptInTransaction(session, database, scope, root, null);
+    }
+
+    static Receipt receiptInTransaction(ClientSession session, MongoDatabase database, CacheBusinessScope scope, Document root, Document knownClaim) {
         if (!session.hasActiveTransaction()) throw new IllegalStateException("validation receipts require their original CACHE transaction");
         var subject = binding(root); var origin = origin(root); var state = outcome(root);
         MongoValidationControlStore.validateIndependentSlots(session, database, root, scope, encode(subject));
         long generation = 0, execution = 0;
         var key = ValidationClaims.key(scope.clusterId(), subject.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
-        var claim = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
+        var claim = knownClaim == null ? table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first() : knownClaim;
         if (origin == null) {
             if (claim != null || state != Outcome.CANCELLED || longValue(root, "countingGeneration") != 0) throw unreadable();
         }
@@ -210,6 +250,7 @@ final class MongoValidationCachePreparations {
             if (claim == null || !root.get("birth").equals(claim.get("validationPreparation"))
                     || !(claim.get("fencedValidationWrites") instanceof Long writes) || writes < 0 || writes == Long.MAX_VALUE) throw unreadable();
             var decoded = new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(claim);
+            if (!key.equals(decoded.key())) throw unreadable();
             generation = decoded.claimGeneration(); execution = decoded.executionGeneration();
             if (root.get("owner") instanceof Document stored) {
                 var retained = MongoValidationControlStore.owner(stored, subject.pipelineId());
@@ -271,13 +312,17 @@ final class MongoValidationCachePreparations {
                 .append("birth", previous.get("birth")), next).getMatchedCount() != 1) throw fenced();
     }
     private <T> T mutate(WorkloadClaimFence node, Function<ClientSession, T> work) {
+        return mutate(node, (session, time) -> work.apply(session));
+    }
+    private <T> T mutate(WorkloadClaimFence node, java.util.function.BiFunction<ClientSession, Date, T> work) {
         return StoreIo.call(() -> {
             active.run(); MongoValidationSchema.requireReady(database, false);
             try (var session = client.startSession()) {
                 var committed = session.withTransaction(() -> {
-                    active.run(); MongoCachePipelinePreparations.proveNode(session, database, scope, node);
+                    active.run();
+                    var serverNow = MongoCachePipelinePreparations.proveNode(session, database, scope, node);
                     new MongoCacheBusinessIdentity(database, scope).admitMetadataWrite(session);
-                    var result = work.apply(session); active.run(); return result;
+                    var result = work.apply(session, serverNow); active.run(); return result;
                 }, TRANSACTION);
                 MongoValidationSchema.requireReady(database, false); active.run(); return committed;
             }

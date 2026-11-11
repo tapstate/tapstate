@@ -178,7 +178,7 @@ def check(workflows, contexts, inputs):
     assert 'ref: ${{ inputs.source-sha || github.ref }}' in cloud_dev \
         and 'ref: ${{ inputs.web-sha || github.ref_name }}' in cloud_dev, \
         'release calls must build their frozen source commits'
-    assert cloud_dev.count('RELEASE_VERSION: ${{ inputs.version }}') == 2 \
+    assert cloud_dev.count('RELEASE_VERSION: ${{ inputs.version }}') == 1 \
         and 'echo "version=$RELEASE_VERSION" >> "$GITHUB_OUTPUT"' in cloud_dev, \
         'release calls must retain the selected release version'
     assert 'environment: cloud-ghcr-dev' in cloud_dev \
@@ -189,13 +189,18 @@ def check(workflows, contexts, inputs):
         and "github.ref_type == 'branch'" in cloud_dev, 'Cloud dev image dispatch must exclude tag refs'
     assert '.github/scripts/next-version.sh "$BUMP" origin/main' in cloud_dev, \
         'Cloud dev version calculation must use the tagged main history'
-    assert '--dev-source-sha "$SOURCE_SHA"' in cloud_dev, \
-        'feature builds must publish under a source-specific dev tag'
-    assert cloud_dev.count("if: inputs.version != '' || github.ref == 'refs/heads/main'") == 2 \
-        and 'DEV_BRANCH: main' in cloud_dev, \
-        'only main builds and pinned release candidates may register in the dev catalog'
-    assert 'if [[ -z "$RELEASE_VERSION" && "$GITHUB_REF" != refs/heads/main ]]; then' in cloud_dev, \
-        'pinned releases retain the canonical dev tag even when dispatched from an allowed branch'
+    assert '--dev-source-sha' not in cloud_dev, \
+        'all branches must publish the canonical dev tag without a source suffix'
+    assert 'bash deploy/cloud/ghcr-publish.sh publish-dev' in cloud_dev, \
+        'all branches must use dev publication mode'
+    for step_name in ('validate the dev version registration configuration',
+                      'register the checked image in the dev Cloud version catalog'):
+        step = next(step for step in re.split(r'(?m)(?=^      - )', cloud_dev)
+                    if f'- name: {step_name}' in step)
+        assert not re.search(r'^        (?:if|continue-on-error):', step, re.M), \
+            'all branch builds must validate and register their checked dev image'
+    assert "DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}" in cloud_dev, \
+        'standalone builds must register their actual branch; pinned releases retain main provenance'
     sonar = ci.get('sonarqube', '')
     sonar_name = '    name: sonarqube'
     assert sonar_name in sonar.splitlines(), 'sonarqube must keep its exact name on analysis events'
@@ -334,11 +339,15 @@ for original, replacement in [
     ('RELEASE_VERSION: ${{ inputs.version }}', 'RELEASE_VERSION: ""'),
     ('environment: cloud-ghcr-dev', 'environment: cloud-ghcr-release'),
     ('secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_DEV', 'secrets.CLOUD_CLUSTER_VERSION_RELEASE_TOKEN_PROD'),
-    ("inputs.version != '' || github.ref == 'refs/heads/main'", "github.ref == 'refs/heads/main'"),
-    ('-z "$RELEASE_VERSION" && "$GITHUB_REF"', '"$GITHUB_REF"'),
+    ('- name: validate the dev version registration configuration',
+     "- name: validate the dev version registration configuration\n        if: github.ref == 'refs/heads/main'"),
+    ('- name: register the checked image in the dev Cloud version catalog',
+     "- name: register the checked image in the dev Cloud version catalog\n        if: github.ref == 'refs/heads/main'"),
     ('.github/scripts/next-version.sh "$BUMP" origin/main', '.github/scripts/next-version.sh "$BUMP" HEAD'),
-    ('--dev-source-sha "$SOURCE_SHA"', ''),
-    ('DEV_BRANCH: main', 'DEV_BRANCH: ${{ github.ref_name }}'),
+    ('bash deploy/cloud/ghcr-publish.sh publish-dev', 'bash deploy/cloud/ghcr-publish.sh publish'),
+    ('--version "$VERSION" --expected-digest "$DIGEST"',
+     '--version "$VERSION" --expected-digest "$DIGEST" --dev-source-sha "${{ steps.source.outputs.sha }}"'),
+    ("DEV_BRANCH: ${{ inputs.version != '' && 'main' || github.ref_name }}", 'DEV_BRANCH: main'),
 ]:
     assert original in workflows['cloud-cluster-dev.yml'], f'Cloud dev mutation target absent: {original}'
     mutated_workflows = {**workflows,

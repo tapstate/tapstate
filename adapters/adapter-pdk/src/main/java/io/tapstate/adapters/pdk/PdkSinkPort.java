@@ -144,10 +144,10 @@ public final class PdkSinkPort implements SinkPort {
             if(plannedIdentities!=null && !plannedIdentities.keySet().equals(targets.keySet()))
                 throw new IllegalArgumentException("frozen identities must cover every input stream");
             var physical=plannedIdentities==null?targets.values():plannedIdentities.values().stream().map(TargetIdentityPlan::target).toList();
-            for(var target:physical)preparations.requireReady(target);
+            preparations.requireReady(physical);
         }
         ConnectorRef ref = provisioner.resolve(config.connectorId());
-        ConfiguredDrive drive = configuredDrive(config, ref);
+        ConfiguredDrive drive = configuredDrive(config, ref, true);
         SharedSinkConnectors.NoteIdentity identity = drive.identity();
         if(preparations==null)PdkTargetPreparation.requirePrepared(config.node(), stateStore, targets.values(), purpose);
         if (sharing == null || config.node() == null || !ref.shareSafe()) {
@@ -182,8 +182,8 @@ public final class PdkSinkPort implements SinkPort {
 
     /** A connector opened and started for the writers that will share it, stopped again if it fails to start. */
     private PdkConnector started(SinkConfig config, ConnectorRef ref, ConfiguredDrive drive) {
-        PdkConnector connector = PdkConnector.open(
-                config.connectorId(), ref, config.settings(), config.node(), stateStore, null, drive.scopes(), purpose);
+        PdkConnector connector = PdkConnector.openSink(
+                config.connectorId(), ref, config.settings(), config.node(), stateStore, drive.scopes(), purpose, drive.identity());
         var initializing=sharedInitialization.get();
         try {
             connector.underLoader(() -> {
@@ -272,8 +272,8 @@ public final class PdkSinkPort implements SinkPort {
 
     private SinkWriter open(SinkConfig config, ConnectorRef ref, Map<String, TargetTable> targets,
             boolean preparedAhead, ConfiguredDrive drive) {
-        PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings(), config.node(),
-                stateStore, null, drive.scopes(), purpose);
+        PdkConnector connector = PdkConnector.openSink(config.connectorId(), ref, config.settings(), config.node(),
+                stateStore, drive.scopes(), purpose, drive.identity());
         WriteRecordFunction write;
         try {
             write = requireWriteFunction(connector.functions().getWriteRecordFunction());
@@ -311,6 +311,10 @@ public final class PdkSinkPort implements SinkPort {
     private record ConfiguredDrive(SharedSinkConnectors.NoteIdentity identity, ConnectorNoteScopes scopes) { }
 
     private ConfiguredDrive configuredDrive(SinkConfig config, ConnectorRef ref) {
+        return configuredDrive(config, ref, false);
+    }
+
+    private ConfiguredDrive configuredDrive(SinkConfig config, ConnectorRef ref, boolean writerOpening) {
         if (noteScopes == null) return new ConfiguredDrive(null, null);
         requireActive();
         if (config.node() == null || execution.key().type() != WorkloadClaimType.PIPELINE_ACTUATION
@@ -326,12 +330,16 @@ public final class PdkSinkPort implements SinkPort {
                 || primary.owner().bindingVersion() != global.owner().bindingVersion()) {
             throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
         }
-        var origin = noteScopes.store().origin(primary);
+        var prior = writerOpening && preparations != null ? preparations.openedNotes() : null;
+        var origin = prior != null && prior.execution().equals(execution)
+                && prior.primary().equals(primary) && prior.global().equals(global)
+                ? prior.origin() : noteScopes.store().origin(primary);
         if (!origin.equals(ConnectorNoteOrigin.capture(config.connectorId(), ref.contentHash(), config.settings()))) {
             throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH, Map.of(), null);
         }
         requireActive();
         var identity = new SharedSinkConnectors.NoteIdentity(execution, primary, global, origin);
+        if (writerOpening && preparations != null) preparations.rememberOpenedNotes(identity);
         ConnectorNoteScopes fixed = ConnectorNoteScopes.of(noteScopes.store(), namespace -> {
             if (namespace.equals(primary.owner().namespace())) return primary;
             if (namespace.equals(global.owner().namespace())) return global;

@@ -18,6 +18,59 @@ class NestColdLayerWatchTest {
 
     private final RecordingAlert alert = new RecordingAlert();
 
+    @Test void keyCountsDrivePressureWithoutChangingLegacyCounters() {
+        var watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", keyed(100, 0, 100, "first")));
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.windows.getFirst().accesses()).isEqualTo(1);
+        assertThat(alert.windows.getFirst().pressureAccesses()).isEqualTo(100);
+    }
+
+    @Test void missingAndInconsistentSamplesCannotClearPressure() {
+        var watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", keyed(100, 0, 100, "first")));
+        watch.saw("p1", Map.of("ns", keyed(-1, -1, -1, "missing")));
+        watch.saw("p1", Map.of("ns", keyed(200, 0, 200, "first")));
+        watch.saw("p1", Map.of("ns", keyed(300, 0, 500, "first")));
+        assertThat(alert.cleared).isEmpty();
+    }
+
+    @Test void membershipChangeStartsANewBaselineWithoutCallingItRecovery() {
+        var watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", keyed(100, 0, 100, "first")));
+        watch.saw("p1", Map.of("ns", keyed(1000, 0, 0, "second")));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", keyed(1100, 0, 0, "second")));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", keyed(1200, 0, 0, "second")));
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    private static NestStateReading keyed(long reads, long writes, long cold, String generation) {
+        return new NestStateReading(100, 1, 1, 1, 0, OptionalLong.empty(),
+                new io.tapstate.core.lifecycle.NestKeyAccess(reads, writes, cold, generation));
+    }
+
+    @Test void sufficientWindowsAroundTheThresholdDoNotFlap() {
+        var watch = new NestColdLayerWatch(PRESSURE, alert);
+        long accesses = 0, backfills = 0;
+        for (int i = 0; i < 6; i++) {
+            accesses += 100; backfills += i % 2 == 0 ? 51 : 49;
+            watch.saw("p1", Map.of("ns", reading(accesses, backfills)));
+        }
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.cleared).isEmpty();
+    }
+
+    @Test void oneApparentlyHealthyWindowCannotClearSustainedPressure() {
+        var watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(200, 180)));
+        watch.saw("p1", Map.of("ns", reading(400, 180)));
+        watch.saw("p1", Map.of("ns", reading(600, 360)));
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        assertThat(alert.cleared).isEmpty();
+    }
+
     @Test
     void missingKeyInstrumentationNeitherRaisesNorClearsPressure() {
         NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
@@ -28,6 +81,8 @@ class NestColdLayerWatchTest {
         watch.saw("p1", Map.of("ns", new NestStateReading(100, 400, 200, 200)));
         assertThat(alert.cleared).isEmpty();
         watch.saw("p1", Map.of("ns", reading(500, 200)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(600, 200)));
         assertThat(alert.cleared).containsExactly("p1/ns");
     }
 
@@ -39,6 +94,8 @@ class NestColdLayerWatchTest {
         watch.saw("p1", Map.of("ns", reading(281, 210).withKeyCounts(40, 36)));
         assertThat(alert.cleared).isEmpty();
         watch.saw("p1", Map.of("ns", reading(381, 210).withKeyCounts(140, 36)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(481, 210).withKeyCounts(240, 36)));
         assertThat(alert.cleared).containsExactly("p1/ns");
     }
 
@@ -65,7 +122,8 @@ class NestColdLayerWatchTest {
             assertThat(alert.cleared).isEmpty();
         }
         watch.saw("p1", Map.of("ns", reading(300, 200)));
-
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(400, 200)));
         assertThat(alert.cleared).containsExactly("p1/ns");
     }
 
@@ -91,6 +149,8 @@ class NestColdLayerWatchTest {
 
         assertThat(alert.cleared).isEmpty();
         watch.saw("p1", Map.of("ns", reading(350, 210)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(450, 210)));
         assertThat(alert.cleared).containsExactly("p1/ns");
     }
 
@@ -129,6 +189,9 @@ class NestColdLayerWatchTest {
         watch.saw("p1", Map.of("ns", reading(1_000, 900)));
         watch.saw("p1", Map.of("ns", reading(2_000, 900)));
 
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(3_000, 900)));
+
         assertThat(alert.crossed).containsExactly("p1/ns");
         assertThat(alert.cleared).containsExactly("p1/ns");
     }
@@ -140,7 +203,8 @@ class NestColdLayerWatchTest {
 
         watch.saw("p1", Map.of("ns", reading(1_000, 900)));
         watch.saw("p1", Map.of("ns", reading(2_000, 900)));
-        watch.saw("p1", Map.of("ns", reading(3_000, 1_900)));
+        watch.saw("p1", Map.of("ns", reading(3_000, 900)));
+        watch.saw("p1", Map.of("ns", reading(4_000, 1_900)));
 
         assertThat(alert.crossed).containsExactly("p1/ns", "p1/ns");
         assertThat(alert.cleared).containsExactly("p1/ns");
