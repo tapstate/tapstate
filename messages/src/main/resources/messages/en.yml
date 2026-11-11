@@ -1490,3 +1490,12 @@ aggregate.type-unknown:
 aggregate.evaluation-failed:
   message: "Aggregate step `{step}` could not evaluate its {part} `{expression}` on a row: {reason}"
   solution: "The expression passed its checks and then failed on the values of one row, for example a division by zero or a conversion of text that is not a number. Guard the expression against such values, or exclude the rows with `where:`."
+aggregate.overflow:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} does not fit in {type}."
+  solution: "The value is not rounded or wrapped, and the group keeps its last good values until its rows bring the total back in range. Check the group's rows for an outlier."
+aggregate.value-type-mismatch:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} met a {actual} value where its column was declared {declared}."
+  solution: "The value is not coerced and the row is not left out: the group keeps its last good values until the row is fixed or removed. Rediscover the source if the column's declared type has changed."
+aggregate.result-not-convertible:
+  message: "Aggregate step `{step}`, field `{field}` of group {group} is the {from} value that `type: {to}` cannot hold exactly."
+  solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal). The group keeps its last good values meanwhile."

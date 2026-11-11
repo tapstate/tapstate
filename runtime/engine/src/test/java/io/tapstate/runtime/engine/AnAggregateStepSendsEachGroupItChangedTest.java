@@ -166,6 +166,36 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 .containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("40.50"));
     }
 
+    @Test
+    @DisplayName("a group that cannot be given exactly is sent at its last good values with a marker, and recovers")
+    @SuppressWarnings("unchecked")
+    void aGroupThatCannotBeGivenKeepsItsLastGoodValuesAndSaysSo() {
+        run(List.of(insert(1, 1, "EU", "open", "100.00"), insert(2, 2, "US", "open", "5.00")));
+        WRITTEN.clear();
+
+        // A row whose amount is text where the column is a decimal: it is not coerced and not left out.
+        Map<String, Object> wrong = row(3, "EU", "open", "1.00");
+        wrong.put("amount", "a lot");
+        run(List.of(Envelope.insert(3, "orders", wrong, null).withOrder(new SourceOrder(1, 3)),
+                insert(4, 4, "US", "open", "2.00")));
+
+        Map<Object, Envelope> held = lastPerGroup();
+        assertThat(held.get("EU").after()).as("the values the group last had, not ones that count the row or skip it")
+                .containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("100.00"));
+        Map<String, Object> marker = (Map<String, Object>) ((Map<String, Object>) ((Map<String, Object>)
+                held.get("EU").after().get("__tap")).get("aggregate")).get("by_region");
+        assertThat(marker).containsEntry("status", "failed").containsEntry("code", "aggregate.value-type-mismatch")
+                .containsKeys("failed_since", "last_good_at");
+        assertThat(held.get("US").after()).as("every other group carries on, and a current row carries no marker")
+                .containsEntry("orders", 2L).doesNotContainKey("__tap");
+        WRITTEN.clear();
+
+        run(List.of(delete(3, 5, wrong)));
+
+        assertThat(lastPerGroup().get("EU").after()).as("once the row is gone the group is current again")
+                .containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("100.00")).doesNotContainKey("__tap");
+    }
+
     private void run(List<Envelope> events) {
         PipelineResource pipeline = (PipelineResource) new DslParser().parse(YAML);
         Step.Inline step = (Step.Inline) pipeline.transforms().getFirst();

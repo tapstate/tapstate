@@ -36,7 +36,26 @@ public enum AggregateError implements TapstateErrorCode {
     TYPE_UNKNOWN("aggregate.type-unknown", Set.of("step", "field", "expression")),
 
     /** Running: an expression that passed its checks failed on a row. */
-    EVALUATION_FAILED("aggregate.evaluation-failed", Set.of("step", "part", "expression", "reason"));
+    EVALUATION_FAILED("aggregate.evaluation-failed", Set.of("step", "part", "expression", "reason")),
+
+    /** Running: a group's sum is larger than its type holds; the group is held at its last good values. */
+    OVERFLOW("aggregate.overflow", Set.of("step", "field", "group", "type")),
+
+    /** Running: a row carries a value of another type than its column declares; the group is held. */
+    VALUE_TYPE_MISMATCH("aggregate.value-type-mismatch", Set.of("step", "field", "group", "declared", "actual")),
+
+    /** Running: a field's {@code type:} cannot hold its group's value exactly; the group is held. */
+    RESULT_NOT_CONVERTIBLE("aggregate.result-not-convertible", Set.of("step", "field", "group", "from", "to"));
+
+    /** The step's code for a reason the shared function library reports under its own name. */
+    public static AggregateError of(RollupError reason) {
+        return switch (reason) {
+            case OVERFLOW -> OVERFLOW;
+            case VALUE_TYPE_MISMATCH -> VALUE_TYPE_MISMATCH;
+            case RESULT_NOT_CONVERTIBLE -> RESULT_NOT_CONVERTIBLE;
+            default -> throw new IllegalArgumentException("not a reason a group is held for: " + reason);
+        };
+    }
 
     private final String code;
     private final Set<String> placeholders;

@@ -5,6 +5,7 @@ import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.dsl.AggregateRow;
+import io.tapstate.core.dsl.aggregate.AggregateError;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.dsl.aggregate.Contribution;
 import io.tapstate.core.dsl.aggregate.OrderedBytes;
@@ -45,8 +46,15 @@ import java.util.Objects;
  * <p>An input row is told apart by the step's key and ordered by the position it carries on the chain
  * it came through. A row without an order cannot be placed against what is stored and is refused as a
  * defect of whatever wired the step, never guessed at.
+ *
+ * <p>A group that cannot be given exactly is never sent as if it could: it goes out with the values it
+ * last had and a marker saying so, and every other group carries on.
  */
 public final class AggregateProcessor extends AbstractProcessor implements Staged {
+
+    /** The reserved field a held group's marker travels under, and the name it is filed under inside it. */
+    static final String MARKER_FIELD = "__tap";
+    static final String MARKER_OWNER = "aggregate";
 
     private final String step;
     private final AggregateStepSpec spec;
@@ -144,9 +152,9 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             if (!outcome.send()) {
                 continue;
             }
-            if (outcome.failure() != null) {
-                // A group that cannot be given exactly is not given at all; what it last was stays downstream.
+            if (outcome.failure() != null && outcome.members() > 0) {
                 withheldGroups++;
+                pending.add(held(outcome, ts).withPositions(positions));
                 continue;
             }
             pending.add(row(outcome, ts).withPositions(positions));
@@ -216,6 +224,30 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         return Envelope.insert(ts, step, row, null);
     }
 
+    /**
+     * A group that cannot be given exactly, as the row it is sent as: its names, the values it last had
+     * when every field could be given, or nulls when it never had any, and a marker saying the row is
+     * not current. A healthy row never carries the marker, and the next healthy row replaces this one
+     * whole, so a reader's rule is one line: a row without it is current.
+     */
+    private Envelope held(GroupOutcome outcome, long ts) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        for (int i = 0; i < groupNames.size(); i++) {
+            row.put(groupNames.get(i), outcome.group().get(i));
+        }
+        for (var field : spec.fields()) {
+            row.put(field.field(), outcome.lastGood() == null ? null : outcome.lastGood().get(field.field()));
+        }
+        Map<String, Object> marker = new LinkedHashMap<>();
+        marker.put("status", "failed");
+        marker.put("code", AggregateError.of(outcome.failure()).code());
+        marker.put("failed_since", java.time.Instant.ofEpochMilli(outcome.failedSince()).toString());
+        marker.put("last_good_at", outcome.lastGood() == null ? null
+                : java.time.Instant.ofEpochMilli(outcome.lastGoodAt()).toString());
+        row.put(MARKER_FIELD, Map.of(MARKER_OWNER, Map.of(step, java.util.Collections.unmodifiableMap(marker))));
+        return Envelope.insert(ts, step, row, null);
+    }
+
     @Override
     public boolean tryProcess() {
         return drain();
@@ -236,7 +268,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         return bounds != null || super.tryProcessWatermark(watermark);
     }
 
-    /** Groups not sent because a field of theirs could not be given exactly. */
+    /** Times a group was sent held at its last good values because a field of it could not be given exactly. */
     public long withheldGroups() {
         return withheldGroups;
     }
