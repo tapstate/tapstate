@@ -103,7 +103,7 @@ class AggregateOutputTargetTest {
                       revenue: { sum: $amount }
                 serve:
                   from: by_region
-                  sync: [ { id: dw, source: target, write_mode: upsert } ]
+                  sync: [ { id: dw, source: target, write_mode: upsert, on_full_load: clear } ]
                 """.formatted(key, groupBy);
     }
 

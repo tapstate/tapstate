@@ -22,4 +22,4 @@ transforms:
       latest_status: { last: { value: $status, by: $updated_at } }
 serve:
   from: sales_by_region_day
-  sync: [ { id: dw, source: tgt_sales, write_mode: upsert } ]
+  sync: [ { id: dw, source: tgt_sales, write_mode: upsert, on_full_load: clear } ]

@@ -12,4 +12,4 @@ transforms:
       revenue: { sum: $amount }
 serve:
   from: totals
-  sync: [ { id: dw, source: tgt_sales, write_mode: upsert } ]
+  sync: [ { id: dw, source: tgt_sales, write_mode: upsert, on_full_load: clear } ]

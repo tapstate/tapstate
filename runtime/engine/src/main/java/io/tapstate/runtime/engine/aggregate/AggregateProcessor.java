@@ -4,7 +4,9 @@ import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.Watermark;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.AggregateRow;
+import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateError;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.dsl.aggregate.Contribution;
@@ -21,6 +23,7 @@ import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.runtime.engine.aggregate.GroupChange.FieldInput;
 import io.tapstate.runtime.engine.aggregate.GroupStage.GroupOutcome;
 import io.tapstate.runtime.engine.aggregate.MembershipStage.RowEvent;
+import io.tapstate.spi.store.OrderedStateStore;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -56,8 +59,12 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     static final String MARKER_FIELD = "__tap";
     static final String MARKER_OWNER = "aggregate";
 
+    /** Sorts before every entry of a group, whose keys start at 0x01. */
+    private static final byte[] DEFINITION_KEY = {0x00};
+
     private final String step;
     private final AggregateStepSpec spec;
+    private final AggregateDefinition definition;
     private final AggregateStores stores;
     private final LevelBounds bounds;
     private final List<String> groupNames;
@@ -74,9 +81,14 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     private long conflicts;
     private long dropped;
 
-    public AggregateProcessor(String step, AggregateStepSpec spec, AggregateStores stores, LevelBounds bounds) {
+    /**
+     * @param definition what the step is defined as now; state built by another definition refuses the run
+     */
+    public AggregateProcessor(String step, AggregateStepSpec spec, AggregateDefinition definition,
+            AggregateStores stores, LevelBounds bounds) {
         this.step = Objects.requireNonNull(step, "step");
         this.spec = Objects.requireNonNull(spec, "spec");
+        this.definition = Objects.requireNonNull(definition, "definition");
         this.stores = Objects.requireNonNull(stores, "stores");
         this.bounds = bounds;
         this.groupNames = spec.outputKey();
@@ -95,8 +107,27 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     @Override
     protected void init(Processor.Context context) {
         this.timer = StageTimer.of(stage(), context);
+        OrderedStateStore byGroup = stores.open(context.hazelcastInstance(), step, AggregateStore.GROUPS);
+        admit(byGroup);
         this.membership = new MembershipStage(stores.open(context.hazelcastInstance(), step, AggregateStore.MEMBERS));
-        this.groups = new GroupStage(spec, stores.open(context.hazelcastInstance(), step, AggregateStore.GROUPS));
+        this.groups = new GroupStage(spec, byGroup);
+    }
+
+    /**
+     * Refuses state built by another definition, and marks empty state as built by this one. The mark is
+     * written before the first row is, under the same claim, so state never exists without it.
+     */
+    private void admit(OrderedStateStore byGroup) {
+        byte[] stored = byGroup.loadAll(List.of(DEFINITION_KEY)).getFirst();
+        if (stored == null) {
+            byGroup.commit(List.of(new OrderedStateStore.Entry(DEFINITION_KEY, definition.stored())), List.of());
+            return;
+        }
+        List<String> changed = definition.changedSince(AggregateDefinition.read(stored));
+        if (!changed.isEmpty()) {
+            throw new TapstateException(AggregateError.DEFINITION_CHANGED,
+                    Map.of("step", step, "changed", String.join(", ", changed)), null);
+        }
     }
 
     @Override

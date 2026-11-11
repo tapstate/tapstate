@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.config.Config;
 import com.hazelcast.config.JoinConfig;
@@ -73,7 +74,7 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                   largest: { max: $amount }
             serve:
               from: by_region
-              sync: [ { id: dw, source: tgt, write_mode: upsert } ]
+              sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: clear } ]
             """;
 
     private static final Map<String, Stored> STORES = new ConcurrentHashMap<>();
@@ -196,8 +197,29 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 .containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("100.00")).doesNotContainKey("__tap");
     }
 
+    @Test
+    @DisplayName("state built under one grouping does not start under another, and says which part changed")
+    void stateBuiltByAnotherDefinitionRefusesTheRun() {
+        run(List.of(insert(1, 1, "EU", "open", "100.00")));
+        WRITTEN.clear();
+
+        assertThatThrownBy(() -> run(List.of(insert(2, 2, "US", "open", "5.00")),
+                YAML.replace("region: $region", "region: $status")))
+                .hasStackTraceContaining("aggregate.definition-changed")
+                .hasStackTraceContaining("groupBy");
+
+        assertThat(WRITTEN).isEmpty();
+        // The definition that built the state still runs on it.
+        run(List.of(insert(2, 2, "US", "open", "5.00")));
+        assertThat(lastPerGroup()).containsKey("US");
+    }
+
     private void run(List<Envelope> events) {
-        PipelineResource pipeline = (PipelineResource) new DslParser().parse(YAML);
+        run(events, YAML);
+    }
+
+    private void run(List<Envelope> events, String yaml) {
+        PipelineResource pipeline = (PipelineResource) new DslParser().parse(yaml);
         Step.Inline step = (Step.Inline) pipeline.transforms().getFirst();
         Map<String, ValueType> columns = new LinkedHashMap<>();
         columns.put("id", ValueType.INT64);
