@@ -2,6 +2,7 @@ package io.tapstate.core.model;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
@@ -175,6 +176,45 @@ public sealed interface TransformBody {
         @Override
         public String type() {
             return "nest";
+        }
+    }
+
+    /**
+     * {@code type: aggregate} - one output row per group of input rows, kept current as rows are
+     * inserted, changed and deleted.
+     *
+     * <p>The output is keyed by the {@code groupBy} names in declared order, followed by the fields.
+     * With no {@code groupBy} every member row falls into one group and the output is a single row.
+     * A field is declared in the same form as a rollup field of a nest, and its expressions see one
+     * input row.
+     */
+    @YamlType("aggregate")
+    @Doc("Groups the rows of one input and keeps one output row per group, with fields computed over "
+            + "the group's rows.")
+    record Aggregate(
+            @Doc("The columns that identify one input row. Absent uses the input's primary key; "
+                    + "required when the input has none.")
+            List<String> key,
+            @Doc(value = "A predicate over the input row: a row that fails it belongs to no group, and a "
+                    + "row that stops passing it leaves its group.", key = "where")
+            String where,
+            @Doc(value = "Output key fields by name, each a $column or an =expression over the input row; "
+                    + "declared order is the order of the output key. Absent or empty gives one group "
+                    + "holding every row.", key = "groupBy")
+            Map<String, String> groupBy,
+            @Doc(value = "Output fields by name, each one function over the group's rows.", required = true)
+            Map<String, RollupField> fields) implements TransformBody {
+        public Aggregate {
+            Objects.requireNonNull(fields, "fields");
+            key = key == null ? null : List.copyOf(key);
+            groupBy = groupBy == null
+                    ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(groupBy));
+            fields = Collections.unmodifiableMap(new LinkedHashMap<>(fields));
+        }
+
+        @Override
+        public String type() {
+            return "aggregate";
         }
     }
 

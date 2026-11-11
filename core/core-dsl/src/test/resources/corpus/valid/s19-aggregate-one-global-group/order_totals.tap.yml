@@ -1,0 +1,15 @@
+# No groupBy: every order falls into one group, and the output is a single row of totals.
+version: tapstate/v1
+kind: pipeline
+id: order_totals
+source: src_orders
+transforms:
+  - id: totals
+    from: [ orders ]
+    type: aggregate
+    fields:
+      orders: { count: true }
+      revenue: { sum: $amount }
+serve:
+  from: totals
+  sync: [ { id: dw, source: tgt_sales, write_mode: upsert } ]

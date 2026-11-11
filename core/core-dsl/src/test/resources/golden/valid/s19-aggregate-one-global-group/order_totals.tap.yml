@@ -1,0 +1,19 @@
+version: tapstate/v1
+kind: pipeline
+id: order_totals
+source: src_orders
+transforms:
+  - id: totals
+    type: aggregate
+    from: [orders]
+    fields:
+      orders:
+        count: true
+      revenue:
+        sum: $amount
+serve:
+  id: serve
+  from: totals
+  sync:
+    - id: dw
+      source: tgt_sales

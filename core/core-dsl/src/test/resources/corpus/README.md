@@ -44,6 +44,8 @@ cdc read, and `srs.enabled: false`.
 | `s14-srs-override-on-source-ref` | §4 / X13 | per-source-reference Shared Record Store switch | object and bare-string `source:` elements in one list; scalar sugar does not apply to a single object |
 | `s15-unwind-order-lines` | §5 | one row per element of a list | `type: unwind` with all five payload keys, keyed by `element_key` with the ordinal carried alongside |
 | `s17-modeling-nest-rollup` | §5 | nest with rollup fields | `rollup:` on an `as: array` embed (`count: true`, a filtered `sum` with `default:`), and an `as: rollup` level carrying a `last` with a list `by` |
+| `s18-aggregate-sales-by-region` | §5 | one row per group of input rows | `type: aggregate` with `key`, `where`, two `groupBy` names and five fields, one of them a `last` pick |
+| `s19-aggregate-one-global-group` | §5 | one row of totals over every input row | `type: aggregate` with `fields` alone |
 
 ## invalid/ — minimal self-contained violation batches
 

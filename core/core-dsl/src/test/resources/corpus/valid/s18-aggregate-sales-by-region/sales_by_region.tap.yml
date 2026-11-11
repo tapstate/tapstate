@@ -1,0 +1,25 @@
+# Orders are grouped by region and day, and one row per group is kept current: a cancelled
+# order leaves its group, and an order that moves region leaves one group and joins another.
+# Every field is one function over the group's rows, written the way a rollup field is.
+version: tapstate/v1
+kind: pipeline
+id: sales_by_region
+source: src_orders
+transforms:
+  - id: sales_by_region_day
+    from: [ orders ]
+    type: aggregate
+    key: [ id ]
+    where: "=after.status != 'cancelled'"
+    groupBy:
+      region: $region
+      day: "=after.created_day"
+    fields:
+      order_count: { count: true }
+      revenue: { sum: $amount, default: 0 }
+      big_orders: { count: true, filter: "=after.amount >= 1000" }
+      max_order: { max: $amount }
+      latest_status: { last: { value: $status, by: $updated_at } }
+serve:
+  from: sales_by_region_day
+  sync: [ { id: dw, source: tgt_sales, write_mode: upsert } ]
