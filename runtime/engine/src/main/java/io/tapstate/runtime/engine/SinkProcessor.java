@@ -983,7 +983,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         // Every writer a sink runs is opened here, so this is the one place a row is cleared of product
         // bookkeeping before it reaches a target. A factory that opts its target out of delivered markers
         // says so; every other target receives them.
-        boolean deliver = !(factory instanceof StripsInternalFields strips && strips.stripsInternalFields());
+        boolean deliver = !(factory instanceof StripsInternalFields);
         return ServedRows.over(writer, deliver);
     }
 

@@ -9,6 +9,7 @@ import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FromClause;
+import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.ReadMode;
@@ -497,7 +498,7 @@ public final class PipelineDagBuilder {
             // A chain reaching the sink over several paths arrives in whatever order they drain in, which is
             // the reading an assembly needs, for the same reason.
             boolean severalPaths = chains != null && chains.anyOverSeveralPaths(sink.upstream());
-            ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.writers(), sinkAck, axes,
+            ProcessorMetaSupplier supplier = preparingTargets(sinkVertex(sink.name(), sink.opened(), sinkAck, axes,
                     assembled || severalPaths, chains == null ? null : chains.perOrdinal(sink.upstream()),
                     sink.batch()), sink);
             if (startsTheRun) {
@@ -581,7 +582,15 @@ public final class PipelineDagBuilder {
 
     /** One sink a graph draws: its vertex, the producers it reads, the writers it opens and the batch it forms. */
     private record SinkNode(String name, List<String> upstream, SupplierEx<? extends SinkWriter> writers,
-            BatchSpec batch) {
+            BatchSpec batch, boolean stripsInternalFields) {
+
+        /**
+         * The writers as the sink vertex opens them. {@link #writers} stays the factory the bindings gave,
+         * because what else it can do, such as preparing its targets, is asked of that object itself.
+         */
+        SupplierEx<? extends SinkWriter> opened() {
+            return StripsInternalFields.when(stripsInternalFields, writers);
+        }
     }
 
     private static void attachTrace(DAG dag, String nodeId, Vertex source, DagTraceBinding trace,
@@ -652,7 +661,7 @@ public final class PipelineDagBuilder {
                 ? null
                 : () -> new LevelBounds(Map.of(SinkRouter.SPREAD, carried, SinkRouter.BY_KEY, carried), axes,
                         LevelBounds.HOLDS_NOTHING);
-        ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.writers(),
+        ProcessorMetaSupplier writers = preparingTargets(SinkProcessor.nativeMetaSupplier(name, sink.opened(),
                 sinkAck, () -> SettledFloor.forRoutedWriter(axes, SettledFloor.DEFAULT_MAX_ENTRIES_PER_CHAIN), edges,
                 shape.plannedMembers(), sink.batch().effectiveMaxRecords(), sink.batch().effectiveMaxWaitMillis()),
                 sink);
@@ -698,7 +707,7 @@ public final class PipelineDagBuilder {
             // the state store, and the vertex is a terminal sink like any other.
             List<String> upstream = resolve(view.from(), bindings);
             sinks.add(new SinkNode(viewVertex(view), upstream, bindings.viewSinks().apply(view),
-                    batchOf(view.execution())));
+                    batchOf(view.execution()), false));
             readsAs.put(view.id(), upstream);
         }
         if (pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync() != null) {
@@ -708,7 +717,7 @@ public final class PipelineDagBuilder {
                 SyncElement element = sync.get(i);
                 String name = serveVertex(element, i);
                 sinks.add(new SinkNode(name, upstream, bindings.sinkWriters().apply(element),
-                        batchOf(element.execution())));
+                        batchOf(element.execution()), element.internalFields() == InternalFields.STRIP));
             }
         }
         return sinks;

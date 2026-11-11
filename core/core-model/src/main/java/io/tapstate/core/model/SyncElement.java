@@ -32,15 +32,23 @@ public record SyncElement(
                 def = "append")
         OnFullLoad onFullLoad,
         @Doc("How this node runs: its target total parallelism across the cluster and its batch.")
-        ExecutionSpec execution) {
+        ExecutionSpec execution,
+        @Doc(value = "Whether this target receives the product-added row field that marks, for example, a stale aggregate row.",
+                def = "deliver")
+        InternalFields internalFields) {
+
+    public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl,
+            OnFullLoad onFullLoad, ExecutionSpec execution) {
+        this(id, source, writeMode, rename, ddl, onFullLoad, execution, null);
+    }
 
     public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl) {
-        this(id, source, writeMode, rename, ddl, null, null);
+        this(id, source, writeMode, rename, ddl, null, null, null);
     }
 
     public SyncElement(String id, String source, WriteMode writeMode, RenameSpec rename, DdlPolicy ddl,
             OnFullLoad onFullLoad) {
-        this(id, source, writeMode, rename, ddl, onFullLoad, null);
+        this(id, source, writeMode, rename, ddl, onFullLoad, null, null);
     }
 
     public SyncElement {

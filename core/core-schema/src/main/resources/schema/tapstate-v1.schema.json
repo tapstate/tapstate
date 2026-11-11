@@ -215,6 +215,20 @@
       "description": "An upstream reference: either a literal token (step id, table name, or source_id.table) or a /…/ regex matching multiple upstreams.",
       "type": "string"
     },
+    "InternalFields": {
+      "type": "string",
+      "description": "Whether the target receives the product-added row field that marks, for example, a stale aggregate row.",
+      "oneOf": [
+        {
+          "const": "deliver",
+          "description": "Write the product-added markers meant for consumers; internal bookkeeping is never written."
+        },
+        {
+          "const": "strip",
+          "description": "Write no product-added field at all, for a target that accepts only the fields it declared."
+        }
+      ]
+    },
     "JoinEngine": {
       "type": "string",
       "description": "The engine that runs the join.",
@@ -1058,6 +1072,11 @@
         "execution": {
           "description": "How this node runs: its target total parallelism across the cluster and its batch.",
           "$ref": "#/$defs/ExecutionSpec"
+        },
+        "internal_fields": {
+          "description": "Whether this target receives the product-added row field that marks, for example, a stale aggregate row.",
+          "$ref": "#/$defs/InternalFields",
+          "default": "deliver"
         }
       },
       "required": [

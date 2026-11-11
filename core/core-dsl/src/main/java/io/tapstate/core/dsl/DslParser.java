@@ -35,6 +35,7 @@ import io.tapstate.core.model.SrsSchemaEvolution;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TableRef;
 import io.tapstate.core.model.TransformBody;
@@ -136,7 +137,8 @@ public final class DslParser {
     private static final Set<String> SERVE_INLINE_KEYS = Set.of("id", "from", "sync", "query", "push");
     static final Set<String> SOURCE_REF_KEYS = Set.of("id", "srs");
     static final Set<String> SYNC_KEYS = Set.of(
-            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
+            "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", "internal_fields", OPTIONS_FIELD,
+            EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
     static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
@@ -755,7 +757,8 @@ public final class DslParser {
                     rename(s.mapping("rename")),
                     enumByYaml(DdlPolicy.values(), DdlPolicy::yaml, s, "ddl"),
                     enumByYaml(OnFullLoad.values(), OnFullLoad::yaml, s, "on_full_load"),
-                    execution(s.mapping(EXECUTION_FIELD))));
+                    execution(s.mapping(EXECUTION_FIELD)),
+                    enumByYaml(InternalFields.values(), InternalFields::yaml, s, "internal_fields")));
         }
         return out;
     }

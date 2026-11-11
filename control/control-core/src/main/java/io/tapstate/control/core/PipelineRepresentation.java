@@ -29,6 +29,7 @@ import io.tapstate.core.model.SourceRef;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.Storage;
 import io.tapstate.core.model.SyncElement;
+import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.ViewBlock;
@@ -533,6 +534,7 @@ public final class PipelineRepresentation {
             value.put("ddl", element.ddl() == null ? null : element.ddl().name());
             value.put("onFullLoad", element.onFullLoad() == null ? null : element.onFullLoad().name());
             value.put("execution", executionValue(element.execution()));
+            value.put("internalFields", element.internalFields() == null ? null : element.internalFields().name());
             return Collections.unmodifiableMap(value);
         }).toList();
     }
@@ -707,7 +709,9 @@ public final class PipelineRepresentation {
                     enumValue(value.get("ddl"), DdlPolicy.values(), DdlPolicy::yaml, path + ".ddl"),
                     enumValue(value(value, "on_full_load", "onFullLoad"), OnFullLoad.values(), OnFullLoad::yaml,
                             path + ".onFullLoad"),
-                    execution(value.get("execution"), path + "[" + index + "].execution")));
+                    execution(value.get("execution"), path + "[" + index + "].execution"),
+                    enumValue(value(value, "internal_fields", "internalFields"), InternalFields.values(),
+                            InternalFields::yaml, path + ".internalFields")));
         }
         return List.copyOf(result);
     }
