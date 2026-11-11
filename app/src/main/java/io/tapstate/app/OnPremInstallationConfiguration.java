@@ -34,17 +34,14 @@ class OnPremInstallationConfiguration {
             org.springframework.context.ConfigurableApplicationContext context, Environment environment) {
         var installation = new OnPremInstallation(root, files, mongo, targets.getObject(), clock);
         installation.requireCredential(environment.getProperty("tapstate.installation.require-credential", Boolean.class, false));
-        if ("true".equals(environment.getProperty("tapstate.installation.automatic-restart"))) {
-            installation.onRestartRequired(new InstallationAutomaticRestart(context::close, Runtime.getRuntime()::halt));
-            installation.onStartupCompleted(() -> {
+        if ("true".equals(environment.getProperty("tapstate.installation.automatic-restart"))) installation.onStartupCompleted(() -> {
                 if (!installation.automaticAuthorization() && root.runtime().requireConfiguration().firstAdmin().load().orElseThrow(StorageRuntime::unavailable).phase()
                         == io.tapstate.spi.store.FirstAdminStore.Phase.PENDING) {
-                    InstallationCommand.authorize(files, mongo, clock);
+                    InstallationCommand.authorizeFirstAdministrator(files, mongo, clock);
                     org.slf4j.LoggerFactory.getLogger(OnPremInstallationConfiguration.class)
                             .info("First-administrator authorization is ready in {}; continue at {}", files.directory().resolve("capability.json"), files.stage().managementUrl());
                 }
-            });
-        }
+        });
         return installation;
     }
     @Bean WebServerFactoryCustomizer<TomcatServletWebServerFactory> installationConnector(OnPremInstallation installation, Environment environment) {

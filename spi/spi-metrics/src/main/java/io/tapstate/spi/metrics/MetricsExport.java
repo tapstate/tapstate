@@ -26,6 +26,9 @@ public interface MetricsExport extends AutoCloseable {
      */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts);
 
+    /** Bounded process facts, independent of Pipeline identities and never an alarm input. */
+    default void offerRuntime(Instant observedAt, List<MetricFact> facts) { }
+
     /** Drops what is held for every pipeline outside {@code pipelineIds}, which is the set that still exists. */
     void forgetPipelinesOutside(Collection<String> pipelineIds);
 

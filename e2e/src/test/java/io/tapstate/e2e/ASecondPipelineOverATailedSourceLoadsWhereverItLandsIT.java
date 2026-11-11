@@ -23,9 +23,9 @@ import org.junit.jupiter.api.Test;
  * The harness's own connector cannot show that, because its tail replays the whole table on every run; a
  * real one's tail carries only what changed after it began.
  *
- * <p>Which member drives a pipeline is decided by whichever claims it first, so pipelines are added over
- * the same source until one lands on the member not holding the capture, and that one is held to the rows
- * seeded before any pipeline started and to a change made after it did.
+ * <p>Native first preparation seeds the initial claim on the member receiving START. The second
+ * pipeline is started through the other member and its actual ownership is checked before requiring
+ * the rows seeded before any pipeline started and a change made afterwards.
  */
 class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
 
@@ -64,15 +64,19 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                         () -> "rows at the first target = " + mongo.count(firstTarget, TABLE));
                 String holder = Await.answered("the cluster to name the member reading the source",
                         () -> control.captureOwnersOf(first).values().stream().findFirst());
+                assertThat(control.pipelineControllerOf(first)).as("the first pipeline established the capture locally")
+                        .contains(holder);
+                ControlPlane remote = cluster.memberOtherThan(holder);
+                remote.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
+                String remoteMember = holder.equals(TwoMemberCluster.NODE_A)
+                        ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
 
                 for (int n = 2; n <= MOST_PIPELINES; n++) {
                     String pipeline = "shared_pipe_" + n;
-                    EndpointAddress target = startPipelineInto(control, n, sourceUri);
+                    EndpointAddress target = startPipelineInto(remote, n, sourceUri);
                     String driver = Await.answered("the cluster to name the member driving " + pipeline,
-                            () -> control.pipelineControllerOf(pipeline));
-                    if (driver.equals(holder)) {
-                        continue;
-                    }
+                            () -> remote.pipelineControllerOf(pipeline));
+                    assertThat(driver).as("the native claim was prepared on the other member").isEqualTo(remoteMember);
                     Await.until(pipeline + ", driven by " + driver + " while " + holder + " holds the capture, "
                                     + "to receive the rows seeded before any pipeline started",
                             () -> mongo.count(target, TABLE) >= SEEDED_ROWS,

@@ -168,9 +168,10 @@ public final class NestStateStats {
     public Counted counted(String namespace) {
         Counters counters = byNamespace.get(namespace);
         return counters == null
-                ? new Counted(0, 0, 0, 0, 0, 0)
+                ? new Counted(0, 0, 0, 0, 0, 0, 0, 0)
                 : new Counted(counters.accesses.sum(), counters.backfills.sum(), counters.backfillNanos.sum(),
-                        counters.pendingHighWater.get(), counters.rootsRendered.sum(), counters.countingSinceMillis);
+                        counters.pendingHighWater.get(), counters.rootsRendered.sum(), counters.countingSinceMillis,
+                        counters.readKeys.sum() + counters.writeKeys.sum(), counters.coldKeys.sum());
     }
 
     /** Whether anything has been counted for {@code namespace} at all - absence being distinct from zero. */
@@ -193,9 +194,9 @@ public final class NestStateStats {
 
     /** One namespace's counts, as read together. Nanoseconds, because the trips being timed are short. */
     public record Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater,
-            long rootsRendered, long countingSinceMillis) {
+            long rootsRendered, long countingSinceMillis, long keyAccesses, long coldKeys) {
         public Counted(long accesses, long backfills, long backfillNanos, long pendingHighWater) {
-            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0);
+            this(accesses, backfills, backfillNanos, pendingHighWater, 0, 0, 0, 0);
         }
     }
 

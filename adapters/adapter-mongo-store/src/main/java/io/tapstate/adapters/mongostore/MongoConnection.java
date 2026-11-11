@@ -79,6 +79,9 @@ public final class MongoConnection implements AutoCloseable {
         this(settings, null, null, false, false);
     }
 
+    /** A separate explicit maintenance owner uses the same verified CONFIG endpoint. */
+    MongoConnectionSettings configurationSettings() { return settings; }
+
     /** A configuration domain preserves deployment authentication and verifies peers whenever TLS is enabled. */
     public static MongoConnection forConfiguration(MongoConnectionSettings settings) {
         return new MongoConnection(settings, null, null, true, false);
@@ -103,8 +106,7 @@ public final class MongoConnection implements AutoCloseable {
     }
 
     private static boolean validDatabase(String database) {
-        return database != null && !database.isBlank() && database.getBytes(StandardCharsets.UTF_8).length <= 63
-                && MongoDatabaseNames.isValid(database);
+        return database != null && !database.isBlank() && MongoDatabaseNames.isValid(database);
     }
 
     String selectedDatabase(ConnectionString connectionString) {
@@ -417,6 +419,7 @@ public final class MongoConnection implements AutoCloseable {
      */
     MongoClientSettings buildClientSettings(ConnectionString connectionString) {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
+                .addCommandListener(MongoCommandObservation.LISTENER)
                 .applyConnectionString(connectionString)
                 .addCommandListener(new com.mongodb.event.CommandListener() {
                     @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
@@ -509,24 +512,35 @@ public final class MongoConnection implements AutoCloseable {
      * every process of a deployment connects to its store as the same user.
      */
     public int endTransactionsLeftOpenBy(String processId) {
+        return endTransactionsLeftOpenBy(processId, () -> client().getDatabase("admin"), () -> {});
+    }
+
+    /** The discovery cursor and exact session-ending command share one remaining read allowance. */
+    public int endTransactionsLeftOpenBy(String processId, Duration allowance) {
+        var budget=new MongoReadBudget(allowance);
+        return endTransactionsLeftOpenBy(processId,()->budget.database(client().getDatabase("admin")),budget::requireRemaining);
+    }
+
+    private int endTransactionsLeftOpenBy(String processId,java.util.function.Supplier<MongoDatabase> admin,Runnable requireRemaining) {
         Objects.requireNonNull(processId, "processId");
-        MongoDatabase admin = client().getDatabase("admin");
         Document leftOpen = new Document("appName",
                         new Document("$regex", "(^| )" + Pattern.quote(processTag(processId)) + "$"))
                 .append("transaction", new Document("$exists", true));
         List<Document> sessions = new ArrayList<>();
-        StoreIo.run(() -> admin.aggregate(List.of(
+        StoreIo.run(() -> admin.get().aggregate(List.of(
                         new Document("$currentOp", new Document("allUsers", false).append("idleSessions", true)),
                         new Document("$match", leftOpen)))
                 .forEach(operation -> {
+                    requireRemaining.run();
                     if (operation.get("lsid") instanceof Document session && session.get("id") != null) {
                         sessions.add(new Document("id", session.get("id")));
                     }
                 }));
+        requireRemaining.run();
         if (sessions.isEmpty()) {
             return 0;
         }
-        StoreIo.run(() -> admin.runCommand(new Document("killSessions", sessions)));
+        StoreIo.run(() -> admin.get().runCommand(new Document("killSessions", sessions)));
         return sessions.size();
     }
 

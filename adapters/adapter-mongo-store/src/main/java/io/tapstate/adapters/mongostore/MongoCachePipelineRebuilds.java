@@ -59,6 +59,48 @@ final class MongoCachePipelineRebuilds implements PipelineCacheRebuilds {
         return new MongoRetiredPipelinePayloads(client,database,business,() -> active(original),operatorDatabases).reclaim(handle,currentNode);
     }
 
+    @Override public Set<String> originalDirectSources(PipelineRebuildPreparation original,WorkloadClaimFence currentNode) {
+        MongoPipelineStateRebuilds.requireOriginalPending(original);
+        var old=original.request().originalScope();
+        if(!business.equals(new CacheBusinessScope(old.clusterId(),old.bindingVersion(),old.cacheIncarnation())))throw fenced();
+        var result=StoreIo.call(() -> {
+            active(original);
+            try(var session=client.startSession()) {
+                return session.withTransaction(() -> {
+                    active(original);new MongoCacheBusinessIdentity(database,business).requireAdmissionState(session);
+                    new MongoCacheMetadataStructure(database,retention).verifyDirect();
+                    var expected=originalDirectChannels(session,original);
+                    var observed=new java.util.HashSet<DirectChannelContext>();var sources=new java.util.HashSet<String>();
+                    for(var value:SystemCollections.DIRECT_CHANNEL_OFFSETS.on(database).find(session,
+                            new Document("_id.scope",MongoPipelinePreparationFacts.scope(old)))) {
+                        var context=MongoDirectChannelRecords.progress(value).context();
+                        if(!context.scope().equals(old) || !observed.add(context) || !sources.add(context.sourceId()))throw rebuild(old);
+                    }
+                    if(expected!=null && !expected.equals(observed))throw rebuild(old);
+                    MongoCachePipelinePreparations.proveNode(session,database,business,currentNode);
+                    active(original);return Set.copyOf(sources);
+                },TRANSACTION);
+            }
+        });
+        MongoPipelineStateRebuilds.requireOriginalPending(original);return result;
+    }
+
+    private Set<DirectChannelContext> originalDirectChannels(ClientSession session,PipelineRebuildPreparation original) {
+        var request=original.request();var old=request.originalScope();var claims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
+        var row=claims.find(session,new Document("_id",MongoWorkloadClaimStore.id(request.originalClaim().key()))).first();
+        if(row==null)throw rebuild(old);
+        var claim=new MongoWorkloadClaimStore(claims).inStrictSession(session).decodeStored(row);var scope=storedScope(row,old);
+        if(scope.equals(request.targetScope())) {retained(session,original,row,claim);return null;}
+        if(!scope.equals(old) || !request.originalClaim().equals(WorkloadClaimFence.from(claim)))throw fenced();
+        if(MongoCachePipelinePreparations.phase(row,old)!=PipelineCachePreparations.Phase.PREPARED
+                || !original.previousPreparationId().equals(row.get("pipelinePreparation",Document.class).getString("preparationId")))throw rebuild(old);
+        var state=new MongoCachePipelineAccess(client,database,old,null,() -> active(original),retention).state(session);
+        requirePriorMarker(row,old,original.previousPreparationId(),state);
+        if(state.getLong("epoch")!=request.originalStateEpoch())throw rebuild(old);
+        return MongoPipelineSourcePreparations.retained(session,database,old).directChannels().stream()
+                .map(DirectChannelPreparation::context).collect(java.util.stream.Collectors.toSet());
+    }
+
     @Override public PipelineRebuildReceipt prepare(PipelineRebuildPreparation original, WorkloadClaimFence currentNode, Duration ttl, Instant touchTime) {
         // Verify the adapter-issued original before calling any accessor supplied across the boundary.
         MongoPipelineStateRebuilds.requireOriginalPending(original);

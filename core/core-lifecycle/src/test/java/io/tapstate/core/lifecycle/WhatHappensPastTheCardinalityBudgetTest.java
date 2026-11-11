@@ -93,8 +93,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.nest.accesses",
                         "tapstate.pipeline.nest.read.keys",
                         "tapstate.pipeline.nest.write.keys",
-                        "tapstate.pipeline.nest.cold.keys",
                         "tapstate.pipeline.nest.backfills",
+                        "tapstate.pipeline.nest.key.accesses",
+                        "tapstate.pipeline.nest.cold.keys",
                         "tapstate.pipeline.nest.backfill.time",
                         "tapstate.pipeline.nest.pending.high_water",
                         "tapstate.pipeline.nest.stored",
@@ -124,8 +125,9 @@ class WhatHappensPastTheCardinalityBudgetTest {
         }
         for (CardinalityBudget budget : List.of(CardinalityBudget.NEST_ENTRIES, CardinalityBudget.NEST_ACCESSES,
                 CardinalityBudget.NEST_BACKFILLS, CardinalityBudget.NEST_BACKFILL_TIME,
+                CardinalityBudget.NEST_KEY_ACCESSES, CardinalityBudget.NEST_COLD_KEYS,
                 CardinalityBudget.NEST_PENDING_HIGH_WATER, CardinalityBudget.NEST_STORED,
-                CardinalityBudget.NEST_DEAD_LETTERED)) {
+                CardinalityBudget.NEST_DEAD_LETTERED, CardinalityBudget.NEST_NAMESPACE_INFO)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.NEST_NAMESPACE);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
@@ -374,6 +376,21 @@ class WhatHappensPastTheCardinalityBudgetTest {
         return new MetricFact("tapstate.pipeline.lag", MetricType.GAUGE, "s", points);
     }
 
+    /** A namespace info reading whose origin labels vary with every namespace. */
+    private static MetricFact namespaceOriginsOver(int namespaces) {
+        List<MetricPoint> points = new ArrayList<>();
+        for (int index = 1; index <= namespaces; index++) {
+            String suffix = String.format("%04d", index);
+            points.add(MetricPoint.reading(Map.of(
+                    PIPELINE_ID, PIPELINE,
+                    NEST_NAMESPACE, "ns" + suffix,
+                    MetricAttributes.NEST_STEP, "step" + suffix,
+                    MetricAttributes.NEST_PATH, "[\"path" + suffix + "\"]",
+                    MetricAttributes.NEST_MAP, "state"), OBSERVED, 1L));
+        }
+        return new MetricFact("tapstate.pipeline.nest.namespace.info", MetricType.GAUGE, "1", points);
+    }
+
     @Test
     @DisplayName("an id applied again over other tables gets its budget back, because the fold gave up the old ones")
     void aFolderGivesUpWhatItNamedForAPipelineThatIsGone() {
@@ -417,6 +434,20 @@ class WhatHappensPastTheCardinalityBudgetTest {
         assertThat(overflowSeries(folded)).singleElement()
                 .satisfies(series -> assertThat(series.value()).isEqualTo(tables));
         assertThat(folded.points().stream().mapToLong(MetricPoint::value).max().orElseThrow()).isEqualTo(tables);
+    }
+
+    @Test
+    @DisplayName("namespace info folds origin labels with namespaces past its budget")
+    void namespaceInfoOriginsFoldIntoOneOverflowSeriesPerPipeline() {
+        MetricFact folded = CardinalityBudget.folder().fold(namespaceOriginsOver(1_200));
+
+        assertThat(folded.points()).hasSize(CardinalityBudget.NEST_NAMESPACE_INFO.distinctValues() + 1);
+        assertThat(overflowSeries(folded)).singleElement().satisfies(series -> {
+            assertThat(series.attributes()).containsEntry(PIPELINE_ID, PIPELINE).containsEntry(OVERFLOW, "true");
+            assertThat(series.attributes()).doesNotContainKeys(NEST_NAMESPACE, MetricAttributes.NEST_STEP,
+                    MetricAttributes.NEST_PATH, MetricAttributes.NEST_MAP);
+            assertThat(series.value()).isEqualTo(1L);
+        });
     }
 
     @Test

@@ -17,7 +17,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     static final String DIRECTORY_PROPERTY = "tapstate.installation.directory";
     static final String CAPABILITY_HEADER = "X-Tapstate-Setup-Capability";
     static final String CONNECTOR_ATTRIBUTE = OnPremInstallation.class.getName() + ".connector";
-    private static final Set<String> STORAGE_PATHS = Set.of("/api/storage/status", "/api/storage/test", "/api/storage/setup/commit", "/api/storage/setup/status",
+    private static final Set<String> STORAGE_PATHS = Set.of("/api/storage/status", "/api/storage/test", "/api/storage/setup/commit", "/api/storage/setup/status", "/api/storage/setup/activate",
             "/api/storage/recovery/plan", "/api/storage/recovery/confirm", "/api/storage/recovery/status");
     private final Object connectorIdentity = new Object();
     private final StorageRoot root;
@@ -31,15 +31,14 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     private SetupCapabilityService.Issued restored;
     private Connector connector;
     private volatile boolean closed;
-    private final boolean completedBeforeBoot;
+    private volatile boolean installationReady;
+    private volatile boolean startupCompletedDelivered;
     private MongoConfigurationDomain.InitialOpRecovery recoveryInvocation;
     private boolean credentialRequired = true;
     void requireCredential(boolean required) { credentialRequired = required; }
     @Override public boolean automaticAuthorization() { return !credentialRequired; }
-    private Runnable restartRequired = () -> {};
     private Runnable startupCompleted = () -> {};
     void onStartupCompleted(Runnable action) { startupCompleted = Objects.requireNonNull(action); }
-    void onRestartRequired(Runnable action) { restartRequired = Objects.requireNonNull(action); }
     @Override public Map<String,Object> initializationProgress() {
         var stage = files.stage();
         return root.initializationProgress().snapshot().filter(value -> value.operationId().equals(stage.scope().operationId()))
@@ -49,11 +48,9 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
     OnPremInstallation(StorageRoot root, InstallationFiles files, MongoProperties mongo, StorageSetupService.DefaultTarget target, Clock clock) {
         this.root = root; this.files = files; this.mongo = mongo; this.target = target; this.clock = clock;
         if (root.mode() != StorageBinding.Mode.OP) throw InstallationFiles.refused();
-        states = new InstallationSetupStates(files, () -> root.runtime().configuration().map(MongoConfigurationDomain::setupStates));
-        var retained = root.runtime().configuration().isPresent() ? states.load() : null;
-        this.completedBeforeBoot = files.stage().handoff() == InstallationFiles.Handoff.RESTART_REQUIRED
-                || files.stage().handoff() == InstallationFiles.Handoff.RESTARTED
-                || retained != null && retained.phase() == StorageSetupStateStore.Phase.COMPLETE;
+        states = new InstallationSetupStates(files, () -> root.runtime().configuration().map(MongoConfigurationDomain::setupStates),
+                root::completedInstallationActivationAllowed);
+        if (root.runtime().configuration().isPresent()) states.load();
         capabilities = new SetupCapabilityService(states, clock, files::requireOwner,
                 () -> requireManagementRequest(currentRequest()), this::requireFirstAdministratorReady);
         StorageBindingStore bindings = new StorageBindingStore() {
@@ -72,11 +69,16 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                 new MongoStorageConnectionProbe(mongo.getServerSelectionTimeout()), target, root::configurationEndpoint,
                 new AuditGate(record -> root.runtime().requireConfiguration().audit().record(record), clock), clock, root::requireActive,
                 this::continueSetup, root::coordinateSetup, this::prepareConfiguration, root.initializationProgress());
+        root.retainInstallationCompletion(() -> !installationReady, this::afterNormalStartup,
+                () -> !startupCompletedDelivered, this::afterReadyPublished);
     }
 
     InstallationFiles files() { return files; }
     StorageSetupService setups() { return setups; }
-    boolean normalStartupAllowed() { return completedBeforeBoot; }
+    boolean normalStartupAllowed() { return states.load().phase() == StorageSetupStateStore.Phase.COMPLETE; }
+    boolean firstAdministratorReady() {
+        return !closed && installationReady && root.phase() == StorageRoot.Phase.BUSINESS_READY && root.runtime().businessStarted();
+    }
 
     void attach(Connector connector) {
         if (this.connector != null) throw new IllegalStateException("installation connector is already attached");
@@ -133,7 +135,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         requireManagementRequest(request);
         if (!credentialRequired) {
             var state = states.load();
-            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE
+            var purpose = state.phase() == StorageSetupStateStore.Phase.COMPLETE && firstAdministratorReady()
                     ? StorageSetupStateStore.Purpose.FIRST_ADMIN : StorageSetupStateStore.Purpose.SETUP;
             return capabilities.authorizeLocal(state.scope(), purpose);
         }
@@ -162,7 +164,10 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.URI_WRITTEN, hash));
             active.run();
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CREATE_STARTED, hash));
-            MongoConfigurationDomain prepared = MongoConfigurationBootstrap.prepare(settings(files, mongo), expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation());
+            MongoConfigurationDomain prepared = MongoConfigurationBootstrap.prepareWithAlerts(settings(files, mongo),
+                    expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation(),
+                    new io.tapstate.core.alerting.AlarmKey.Scope(expected.installationId(), expected.clusterId()),
+                    io.tapstate.core.alerting.AlertChannelPolicy.Deployment.ON_PREM);
             adopt(prepared, connection);
             files.saveStage(files.stage().withHandoff(InstallationFiles.Handoff.CONFIGURED, hash));
             return null;
@@ -189,7 +194,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             adopt(MongoConfigurationBootstrap.resume(settings(files, mongo), expected.clusterId(), expected.installationId(), expected.operationId(), expected.generation()), connection);
         }
         var status = states.load();
-        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE && !completedBeforeBoot) {
+        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE) {
             files.locked(() -> { files.saveStage(files.stage().withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash())); return null; });
             var configuration = root.runtime().requireConfiguration();
             var preparation = configuration.bindings().cachePreparation();
@@ -203,32 +208,34 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
             }
             configuration.bindings().load().ifPresent(binding -> continueSetup(new StorageBindingCommit(binding,
                     configuration.bindings().cachePreparation().orElseThrow(StorageRuntime::unavailable), Optional.empty())));
-        } else if (status.phase() != StorageSetupStateStore.Phase.COMPLETE) throw StorageRuntime.unavailable();
-        else if (!completedBeforeBoot) markRestartRequired();
+        }
     }
 
     private void continueSetup(StorageBindingCommit committed) {
-        root.continueOnPremSetup(committed, target); markRestartRequired();
+        root.handoffActivation(committed, () -> root.continueOnPremSetup(committed, target));
     }
-    private void markRestartRequired() {
-        capabilities.close(); restored = null;
-        files.locked(() -> {
-            var current = files.stage();
-            files.saveStage(current.withScope(states.load().scope()).withHandoff(InstallationFiles.Handoff.RESTART_REQUIRED, current.configurationHash()));
-            files.removeCapability(); return null;
-        });
-        restartRequired.run();
-    }
-    void afterNormalStartup() {
-        if (!completedBeforeBoot) return;
+    synchronized void afterNormalStartup() {
+        if (closed) throw StorageRuntime.unavailable();
+        root.requireActive();
+        if (installationReady) return;
         var status = states.load();
-        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY) throw StorageRuntime.unavailable();
+        if (status.phase() != StorageSetupStateStore.Phase.COMPLETE || root.phase() != StorageRoot.Phase.BUSINESS_READY
+                || !root.runtime().businessStarted()) throw StorageRuntime.unavailable();
         files.locked(() -> {
-            var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.RESTARTED, stage.configurationHash()));
+            var stage = files.stage(); files.saveStage(stage.withScope(status.scope()).withHandoff(InstallationFiles.Handoff.CONFIGURED, stage.configurationHash()));
             if (files.capability().filter(value -> value.purpose() == StorageSetupStateStore.Purpose.SETUP).isPresent()) files.removeCapability();
             return null;
         });
+        capabilities.close(); restored = null;
+        installationReady = true;
+    }
+    synchronized void afterReadyPublished() {
+        if (closed) throw StorageRuntime.unavailable();
+        root.requireActive();
+        if (startupCompletedDelivered) return;
+        if (!firstAdministratorReady()) throw StorageRuntime.unavailable();
         startupCompleted.run();
+        startupCompletedDelivered = true;
     }
 
     StorageRecoveryService recoveryService() {
@@ -277,7 +284,6 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (!current.manifest().definitionHashes().equals(Map.of(source.id(), CanonicalHash.of(source)))
                 || !current.manifest().dependencyHash().equals(recoveryDependency(original.binding(), current.originalScope(), target.identity(master))))
             throw StorageRuntime.unavailable();
-        target.test(master, source, target.identity(master));
         Runnable owner = () -> {
             root.requireActive(); original.requireActive();
             if (closed || root.runtime().cleanupRequired() || root.runtime().current().orElseThrow(StorageRuntime::unavailable) != original) throw StorageRuntime.unavailable();
@@ -289,7 +295,7 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
                 || recoveryInvocation.plan().phase() != current.phase()) recoveryInvocation = configuration.startInitialOpRecovery(current, owner);
         var running = recoveryInvocation.plan();
         configuration.prepareInitialOpRecovery(original.cache(), recoveryInvocation, owner);
-        original.verifyAuthentication(); original.verifyBusiness(); target.test(master, source, target.identity(master)); owner.run();
+        original.verifyAuthentication(); original.verifyBusiness(); owner.run();
         var completed = running.phase() == StorageRecoveryCommands.Phase.COMPLETE ? running : commands.complete(running);
         Runnable completedOwner = () -> {
             owner.run();
@@ -298,42 +304,59 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         };
         completedOwner.run();
         configuration.bindings().guardedBy(completedOwner).complete(states.load().scope());
-        markRestartRequired(); return completed;
+        continueSetup(new StorageBindingCommit(original.binding(), original.preparation(), Optional.empty()));
+        return completed;
     }
+    static void requireActivationPreparation(MongoConfigurationDomain configuration, CachePreparation preparation) {
+        var current = configuration.recoveryCommands().current(preparation.authScope());
+        if (current.isEmpty()) { configuration.requireOriginalInitialPreparation(preparation); return; }
+        var completed = current.orElseThrow();
+        if (completed.phase() != StorageRecoveryCommands.Phase.COMPLETE
+                || !completed.originalScope().equals(preparation.authScope())
+                || completed.manifest().selection().extent() != StorageRecoveryCommands.Extent.CLUSTER
+                || !completed.manifest().affectedPipelineIds().isEmpty()) throw StorageRuntime.unavailable();
+        var source = configuration.initialOpRecoverySource(preparation.authScope(), true);
+        if (!completed.manifest().definitionHashes().equals(Map.of(source.id(), CanonicalHash.of(source)))
+                || configuration.recoveryCommands().find(completed.originalScope(), completed.operationId()).filter(completed::equals).isEmpty())
+            throw StorageRuntime.unavailable();
+    }
+
     static String recoveryDependency(StorageBinding binding, CacheAuthScope scope, StorageSetupService.ConnectorIdentity identity) {
         var setup = binding.setup();
         return CanonicalHash.ofText(JsonWriter.write(List.of("initial-op-installation", setup.clusterId(), setup.installationId(), setup.operationId(),
                 scope.bindingVersion(), scope.cacheIncarnation(), scope.authGeneration(), identity.artifactHash(), identity.specHash())));
     }
     private void requireFirstAdministratorReady() {
-        if (!completedBeforeBoot || files.stage().handoff() != InstallationFiles.Handoff.RESTARTED
-                || root.phase() != StorageRoot.Phase.BUSINESS_READY || !root.runtime().businessStarted()) throw StorageRuntime.unavailable();
+        if (!firstAdministratorReady()) throw StorageRuntime.unavailable();
         var configuration = root.runtime().requireConfiguration();
         var current = configuration.firstAdmin().load().orElseThrow(StorageRuntime::unavailable);
         if (current.phase() != FirstAdminStore.Phase.PENDING) throw InstallationFiles.refused();
         var original = root.runtime().current().orElseThrow(StorageRuntime::unavailable);
         original.verifyAuthentication(); original.verifyBusiness();
-        var source = (SourceResource)configuration.artifacts().get(original.binding().defaultSourceId()).orElseThrow(StorageRuntime::unavailable);
-        var master = master(source); target.test(master, source, target.identity(master));
+
     }
     StorageControlDispatcher.Snapshot snapshot(StorageControlAccess caller, Runnable active) {
         active.run(); var state = states.load();
         if (state.phase() != StorageSetupStateStore.Phase.LOCAL_SETUP) {
             var original = root.snapshot(caller, active);
             boolean complete = state.phase() == StorageSetupStateStore.Phase.COMPLETE;
-            boolean restart = complete && !completedBeforeBoot;
-            if (caller.initialInstallationRecovery()) {
+            boolean ready = complete && firstAdministratorReady();
+            if (caller.initialInstallationRecovery() && !root.initialActivationPending() && !root.initialActivationCanRetry()) {
                 var current = root.runtime().requireConfiguration().recoveryCommands().guardedBy(active).current(caller.cache());
                 return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), current.map(StorageRecoveryCommands.Plan::operationId).orElse(state.scope().operationId()),
                         original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
                         StorageControlDispatcher.BusinessPhase.AWAITING_REBUILD_CONFIRMATION, original.health(),
                         List.of("storage.status", "storage.setup.status", "storage.test", "storage.setup.commit", "storage.recovery.plan", "storage.recovery.confirm", "storage.recovery.status"), false);
             }
+            var businessPhase = original.businessPhase();
+            if (ready) businessPhase = StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED;
+            else if (complete && root.runtime().businessStarted()) businessPhase = StorageControlDispatcher.BusinessPhase.AUTH_READY;
             return new StorageControlDispatcher.Snapshot(original.mode(), original.clusterId(), state.scope().operationId(),
                     original.setupGeneration(), original.bindingVersion(), original.authGeneration(), original.stateVersion(), original.setupPhase(),
-                    restart ? StorageControlDispatcher.BusinessPhase.RESTART_REQUIRED : complete ? StorageControlDispatcher.BusinessPhase.FIRST_ADMIN_REQUIRED : original.businessPhase(),
-                    original.health(), complete ? List.of("storage.status", "storage.setup.status", restart ? "restart" : "first-admin")
-                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), restart,
+                    businessPhase,
+                    original.health(), ready ? List.of("storage.status", "storage.setup.status", "first-admin")
+                            : original.bindingVersion() > 0 ? List.of("storage.status", "storage.setup.status", "storage.setup.activate")
+                            : List.of("storage.status", "storage.test", "storage.setup.commit", "storage.setup.status"), false,
                     original.applicationDataVerification());
         }
         return new StorageControlDispatcher.Snapshot(StorageBinding.Mode.OP, state.scope().clusterId(), state.scope().operationId(),
@@ -362,5 +385,5 @@ final class OnPremInstallation implements InstallationHttpAccess, AutoCloseable 
         if (!(attributes instanceof org.springframework.web.context.request.ServletRequestAttributes servlet)) throw InstallationFiles.refused();
         return servlet.getRequest();
     }
-    @Override public void close() { closed = true; capabilities.close(); }
+    @Override public synchronized void close() { closed = true; capabilities.close(); }
 }

@@ -7,11 +7,9 @@ import java.util.OptionalLong;
  * What one namespace of a nest's state looks like while the run is going: how much of it there is, how
  * often it was reached for, and how much of that reaching had to go to the layer behind it.
  *
- * <p>The three answer questions that look at each other. {@code entries} alone says how full something is
- * but not whether that costs anything; {@code backfills} against {@code accesses} says how much of the
- * reaching is being served from memory, which is the difference between a state layer that is holding up
- * and one that has quietly turned into a disk seek per event; and {@code backfillMillis} says what each of
- * those seeks is worth, which is what turns a ratio into a time.
+ * <p>Logical accesses and loader callbacks retain their separate units. The optional key counters count
+ * requested keys, including absent values, and supply the two like units for the cold share. Keys are
+ * distinct within one operation, not across the run; a later visit to the same key counts again.
  *
  * <p>They are counts since the run began rather than rates, deliberately. A rate computed here would be an
  * average over the whole run - the one window in which a cliff that started five minutes ago is invisible.
@@ -36,17 +34,26 @@ import java.util.OptionalLong;
  *
  * @param entries how many keys the namespace holds in memory now
  * @param accesses how many times the state was reached for since the run began, read or written
- * @param backfills how many of those found nothing in memory and went to the layer behind
+ * @param backfills how many cold loader callbacks completed
  * @param backfillMillis how long those took in total
  * @param pendingHighWater the deepest one key of this namespace has been seen holding for something that
  *     has not arrived, since the run began
  * @param stored how many keys the layer behind the memory holds, where there is one to ask
+ * @param origin where in the pipeline's definition the namespace comes from, or null where the reporter
+ *     could not say
+ * @param keyAccesses the number of requested key accesses, where measured
+ * @param coldKeys the number of keys requested by completed cold loaders, where measured
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
         long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess,
-        OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin) {
+        OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin,
+        OptionalLong keyAccesses, OptionalLong coldKeys) {
 
     public NestStateReading {
+        if (keyAccess != null) {
+            keyAccesses = keyAccess.available() ? OptionalLong.of(keyAccess.attempts()) : OptionalLong.empty();
+            coldKeys = keyAccess.available() ? OptionalLong.of(keyAccess.coldLoads()) : OptionalLong.empty();
+        }
         rootsRendered = rootsRendered == null ? OptionalLong.empty() : rootsRendered;
         if (rootsRendered.isPresent() != (rootsRenderedSince != null))
             throw new IllegalArgumentException("rendered roots need a counting start");
@@ -55,27 +62,34 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess) {
         this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, keyAccess,
-                OptionalLong.empty(), null, null, null);
+                OptionalLong.empty(), null, null, null,
+                OptionalLong.empty(), OptionalLong.empty());
+    }
+
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestOrigin origin) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null,
+                OptionalLong.empty(), null, null, origin, OptionalLong.empty(), OptionalLong.empty());
     }
 
     public NestStateReading withRootsRendered(long rendered, Instant since) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, OptionalLong.of(rendered), since, commits, origin);
+                keyAccess, OptionalLong.of(rendered), since, commits, origin, keyAccesses, coldKeys);
     }
 
     public NestStateReading withCommits(StateCommitReading measured) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keyAccess, rootsRendered, rootsRenderedSince, measured, origin);
+                keyAccess, rootsRendered, rootsRenderedSince, measured, origin, keyAccesses, coldKeys);
     }
 
     public NestStateReading withContext(NestKeyAccess keys, NestOrigin placement) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                keys, rootsRendered, rootsRenderedSince, commits, placement);
+                keys, rootsRendered, rootsRenderedSince, commits, placement, keyAccesses, coldKeys);
     }
 
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater, OptionalLong stored) {
-        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null);
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, (NestOrigin) null);
     }
 
     /** A reading from a run with no cold layer to ask, whose state is however much is in memory. */
@@ -87,5 +101,26 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             OptionalLong stored) {
         this(entries, accesses, backfills, backfillMillis, 0L, stored);
+    }
+
+    /** The same reading, placed in the pipeline's definition. */
+    public NestStateReading withOrigin(NestOrigin origin) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, keyAccesses, coldKeys);
+    }
+
+    /** The same reading with independently measured key counters. */
+    public NestStateReading withKeyCounts(long keyAccesses, long coldKeys) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys));
+    }
+
+    /** A decrease in either measured key counter identifies a new counting lifetime. */
+    public boolean keyCountsRestartedSince(NestStateReading previous) {
+        return decreased(keyAccesses, previous.keyAccesses) || decreased(coldKeys, previous.coldKeys);
+    }
+
+    private static boolean decreased(OptionalLong current, OptionalLong previous) {
+        return current.isPresent() && previous.isPresent() && current.getAsLong() < previous.getAsLong();
     }
 }

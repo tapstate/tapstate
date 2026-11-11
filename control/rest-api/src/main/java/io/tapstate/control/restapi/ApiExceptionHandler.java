@@ -54,7 +54,23 @@ class ApiExceptionHandler {
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
         ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), rendered.message());
-        return ResponseEntity.status(statusFor(e.code())).cacheControl(CacheControl.noStore()).body(body);
+        HttpStatus status=statusFor(e.code());
+        if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
+                &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
+        return ResponseEntity.status(status).cacheControl(CacheControl.noStore()).body(body);
+    }
+
+    @ExceptionHandler(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition.class)
+    ResponseEntity<ApiError> handleValidationConflict(io.tapstate.control.core.ValidationConfigurationService.StaleDefinition failure){
+        MessageCatalog.Rendered rendered=catalog.render(failure.code(),failure.args());
+        return ResponseEntity.status(HttpStatus.CONFLICT).cacheControl(CacheControl.noStore())
+                .body(new ApiError(failure.code().code(),new TreeMap<>(failure.args()),rendered.message()));
+    }
+
+    @ExceptionHandler(UnavailableCodedException.class)
+    ResponseEntity<ApiError> handle(UnavailableCodedException e) {
+        var rendered = handle((TapstateException)e);
+        return ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).cacheControl(CacheControl.noStore()).body(rendered.getBody());
     }
 
     /**
@@ -122,7 +138,15 @@ class ApiExceptionHandler {
     // Status depends on the error contract, including when a code is shared by several endpoints.
     // A successful artifact removal whose cleanup fails remains a server error, not a retryable refusal.
     private static final Map<String, HttpStatus> HTTP_STATUSES = Map.ofEntries(
+            Map.entry("alert.invalid-configuration", HttpStatus.BAD_REQUEST),
+            Map.entry("alert.stale-action", HttpStatus.CONFLICT),
+            Map.entry("alert.command-conflict", HttpStatus.CONFLICT),
+            Map.entry("alert.command-expired", HttpStatus.CONFLICT),
+            Map.entry("alert.command-not-yet-valid", HttpStatus.CONFLICT),
+            Map.entry("alert.channel-unavailable", HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("actuation.source-schema-not-discovered", HttpStatus.CONFLICT),
+            Map.entry("control.storage-cache-database-occupied", HttpStatus.BAD_REQUEST),
+            Map.entry("control.storage-cache-database-occupied-suggested", HttpStatus.BAD_REQUEST),
             Map.entry("control.storage-databases-overlap", HttpStatus.BAD_REQUEST),
             Map.entry("control.storage-scope-conflict", HttpStatus.CONFLICT),
             Map.entry("control.storage-test-failed", HttpStatus.BAD_REQUEST),
@@ -165,6 +189,7 @@ class ApiExceptionHandler {
             Map.entry("artifact.pipeline-not-stopped", HttpStatus.CONFLICT),
             Map.entry("artifact.reclaim-incomplete", HttpStatus.INTERNAL_SERVER_ERROR),
             Map.entry("connector.not-found", HttpStatus.NOT_FOUND),
+            Map.entry("connector.test-timeout", HttpStatus.GATEWAY_TIMEOUT),
             Map.entry("pipeline.not-found", HttpStatus.NOT_FOUND),
             Map.entry("pipeline.already-exists", HttpStatus.CONFLICT),
             Map.entry("pipeline.id-mismatch", HttpStatus.BAD_REQUEST),

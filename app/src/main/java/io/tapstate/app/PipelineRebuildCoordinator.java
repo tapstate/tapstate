@@ -59,16 +59,44 @@ final class PipelineRebuildCoordinator {
             if (stores.consumers().guardedBy(guard).detachForRebuild(original,member,currentNode).isEmpty()) throw fenced();
         }
         var snapshot=ReadOnlyArtifactSnapshot.capture(stores.artifacts());
-        var pipeline=PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,request.originalScope().pipelineId()),snapshot);
+        var authored=StoredArtifacts.requirePipeline(snapshot,request.originalScope().pipelineId());
+        var pipeline=PipelineInlining.inline(authored,snapshot);
         var desired=new HashMap<String,SourceResource>();
         for(var ref:pipeline.sources())desired.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.id()),PipelineNode.Purpose.CAPTURE),StoredArtifacts.requireSource(snapshot,ref.id()));
         if(pipeline.serve() instanceof ServeBlock.Inline serve && serve.sync()!=null)for(var sync:serve.sync())desired.put(
                 RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),PipelineConnectorNodes.syncNodeId(sync)),PipelineNode.Purpose.SYNC),StoredArtifacts.requireSource(snapshot,sync.source()));
         // View identity is retained here; its deployment-owned target is reconciled by the binding operation.
         notes.reconcile(original,Map.copyOf(desired),guard);guard.run();stores.configuration().requirePending(original);
+        var direct=clearingDirectPostgres(request,snapshot,authored,pipeline);
+        if(!direct.isEmpty()) {
+            var originalSources=stores.cache().originalDirectSources(original,currentNode);guard.run();
+            var retained=new HashMap<String,SourceResource>();
+            direct.forEach((namespace,source) -> {if(originalSources.contains(source.id()))retained.put(namespace,source);});
+            if(!retained.isEmpty())notes.retireDirectPostgres(original,Map.copyOf(retained),guard);
+        }
         var receipt=stores.cache().prepare(original,currentNode,ttl,clock.instant());guard.run();
         guard.run();return stores.configuration().complete(receipt);
     }
+    /** A start may carry an accepted clearing stop until CONFIG completes its successor. */
+    static boolean clearsPrivateCapture(io.tapstate.core.lifecycle.DesiredState intent) {
+        return intent.purgeState() && (intent.targetState()==io.tapstate.core.lifecycle.PipelineState.STOPPED
+                || intent.targetState()==io.tapstate.core.lifecycle.PipelineState.RUNNING && intent.reassemble());
+    }
+    /** Current definitions bound candidates; original CACHE channels separately authorize their selection. */
+    static Map<String,SourceResource> clearingDirectPostgres(PipelineRebuildRequest request,ArtifactStore snapshot,
+            PipelineResource authored,PipelineResource pipeline) {
+        if(!clearsPrivateCapture(request.intent().desired()))return Map.of();
+        var direct=new HashMap<String,SourceResource>();
+        for(var ref:pipeline.sources()) {
+            if(!(ref instanceof SourceRef.Spec spec) || spec.srs())continue;
+            var source=StoredArtifacts.requireSource(snapshot,ref.id());
+            if(!source.connector().equals("postgres"))continue;
+            direct.put(RequiredNoteOwner.namespace(new PipelineNode(pipeline.id(),ref.id()),PipelineNode.Purpose.CAPTURE),source);
+        }
+        if(!direct.isEmpty() && !CanonicalHash.of(authored).equals(request.intent().desired().revision()))throw fenced();
+        return Map.copyOf(direct);
+    }
+
     private record Closure(PipelinePreparationInputs inputs,Map<String,String> dependencies) {}
     private Closure closure(PipelineIntentScope original) {
         var snapshot=ReadOnlyArtifactSnapshot.capture(stores.artifacts());var authored=StoredArtifacts.requirePipeline(snapshot,original.pipelineId());

@@ -22,15 +22,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final MongoConnection connection;
     private final com.mongodb.client.MongoClient client;
     private final com.mongodb.client.MongoDatabase database;
+    private final MongoClaimOperations claimOperations;
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
+    private boolean connectionClosed;
 
     private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
         this.operatorDatabases = operatorDatabases;
         this.connection = connection; this.client = connection.client(); this.database = connection.database(); this.rateRetention = rateRetention; this.targetFingerprint = targetFingerprint;
+        this.claimOperations = new MongoClaimOperations(client);
     }
 
     /** Connectivity alone creates no identity, schema, session, membership or business resource. */
@@ -149,12 +152,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public CacheAuthScope prepareFirstAuth(io.tapstate.spi.store.FirstCacheCreation invocation) {
         var original = MongoStorageBindingStore.consumeFirst(invocation, targetFingerprint);
         var preparation = original.preparation();
-        Runnable active = () -> { businessActive(); original.requireActive(); };
-        active.run();
+        Runnable active = () -> { businessActive(); MongoStorageBindingStore.requireFirstLocal(original); };
+        original.requireActive(); active.run();
         boolean emptyTarget = StoreIo.call(() -> { try (var names = database.listCollectionNames().iterator()) { return !names.hasNext(); } });
         var facts = facts(preparation.authScope());
         facts.beginFirstPreparation(preparation.operationId(), emptyTarget, active);
-        return finishAuth(facts, preparation.authScope(), preparation.operationId(), active);
+        original.requireActive();
+        var result = finishAuth(facts, preparation.authScope(), preparation.operationId(), active);
+        original.requireActive(); active.run(); return result;
     }
 
     /** A controlled continuation may complete retained facts but never recreate a missing identity. */
@@ -247,11 +252,105 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheBusinessPreparation(client, database, original, rateRetention, active).prepare();
     }
 
+    MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected) {
+        return validationPreparations(expected, () -> {});
+    }
+    MongoValidationCachePreparations validationPreparations(CacheBusinessScope expected, Runnable local) {
+        loadBusinessScope(expected);
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+        return new MongoValidationCachePreparations(client, database, expected, targetFingerprint, () -> { businessActive(); local.run(); });
+    }
+
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original) {
+        return validationClaims(new MongoValidationPreparations.Authority(original));
+    }
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Permission original, Runnable local) {
+        return validationClaims(new MongoValidationPreparations.Authority(original), local);
+    }
+
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original) {
+        return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original, Runnable local) {
+        var authority = new MongoValidationPreparations.Authority(original); requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
+    }
+
+    io.tapstate.spi.store.ValidationRunHistory validationHistory(MongoValidationPreparations.Permission original,Runnable local){
+        var authority=new MongoValidationPreparations.Authority(original);requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client,database,authority.subject().scope(),()->{businessActive();local.run();},authority);
+    }
+
+    WorkloadClaimStore validationClaims(MongoValidationPreparations.Closing original) {
+        return validationClaims(new MongoValidationPreparations.Authority(original));
+    }
+
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Closing original) {
+        return validationControl(new MongoValidationPreparations.Authority(original));
+    }
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Closing original, Runnable local) {
+        var authority = new MongoValidationPreparations.Authority(original); requireValidationPreparation(authority);
+        return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
+    }
+
+    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {
+        return validationClaims(original, () -> {});
+    }
+    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
+        Objects.requireNonNull(local);
+        requireValidationPreparation(original);
+        return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), () -> { businessActive(); local.run(); }, original);
+    }
+
+    private io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Authority original) {
+        requireValidationPreparation(original);
+        return new MongoValidationControlStore(client, database, original.subject().scope(), this::businessActive, original);
+    }
+
+    private void requireValidationPreparation(MongoValidationPreparations.Authority original) {
+        Objects.requireNonNull(original, "original").require(false);
+        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(original.binding().cache()))) throw MongoCacheIdentity.fenced();
+        loadBusinessScope(original.subject().scope());
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+    }
+
+    void prepareValidationSchema(io.tapstate.spi.store.CachePreparation original, String operation) {
+        businessActive();
+        facts(original.authScope()).prepareValidationSchema(original.businessScope(), operation, this::businessActive);
+    }
+
+    /** Explicit original recovery only; ordinary business admission still refuses partial schemas. */
+    void resumeValidationSchema(io.tapstate.spi.store.CachePreparation original, String operation) {
+        businessActive();
+        var schema = StoreIo.call(() -> SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(new Document("_id", "business")).first());
+        if (schema != null && Integer.valueOf(2).equals(schema.get("installedVersion"))
+                && schema.get("validation") instanceof Document marker && "PREPARING".equals(marker.get("phase")))
+            prepareValidationSchema(original, operation);
+    }
+
+    void verifyValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String operation, boolean configurationComplete) {
+        businessActive();
+        new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
+        facts(original.authScope()).verifyValidationMaintenance(original.businessScope(), operation, configurationComplete);
+    }
+
+    void verifyStoppedValidationMaintenance(io.tapstate.spi.store.CachePreparation original, String originalOperation) {
+        businessActive(); new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
+        facts(original.authScope()).verifyStoppedValidationMaintenance(original.businessScope(), originalOperation);
+    }
+
+    void verifyValidationReady(io.tapstate.spi.store.CachePreparation original, String operation) {
+        verifyValidationMaintenance(original, operation, true);
+        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+        businessActive();
+    }
+
     /** The claims share this exact cache client, original scope and owner lifecycle. */
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
+        claimOperations.requireAdmission();
         loadBusinessScope(expected);
         StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
-        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive);
+        return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
     }
 
     public io.tapstate.spi.store.ClusterMembershipStore clusterMembership(CacheBusinessScope expected) {
@@ -451,6 +550,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, null, () -> {}));
     }
+    /** Only the original prepared control header, without positions or operator state materialization. */
+    public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){
+        return pipelineAccess(scope,null,Objects.requireNonNull(local)).validationControlTransaction(SystemCollections.CACHE_PIPELINE_STATE,
+                (session,state)->MongoStateStore.toCheckpoint(state));
+    }
 
     /** A write view retains exactly the original claim; a later pass opens its own view. */
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
@@ -559,5 +663,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private static TapstateException unreadableIndex() {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "cache-auth", "field", "index"), null);
     }
-    @Override public void close() { if (closed.compareAndSet(false, true)) connection.close(); }
+    @Override public synchronized void close() {
+        if(connectionClosed)return;
+        claimOperations.closeIfIdle();
+        closed.set(true);
+        connection.close();
+        connectionClosed=true;
+    }
 }

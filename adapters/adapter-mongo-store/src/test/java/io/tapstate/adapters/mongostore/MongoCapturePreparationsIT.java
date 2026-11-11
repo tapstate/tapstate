@@ -34,6 +34,33 @@ class MongoCapturePreparationsIT {
     private static final WorkloadOwner OWNER=new WorkloadOwner("node-a","boot-a");
     private static final Duration TTL=Duration.ofMinutes(2);
     private static final Instant AT=Instant.parse("2026-10-19T16:00:00Z");
+    @ParameterizedTest @ValueSource(strings={"claim","header"})
+    void validationCaptureControlRejectsOversizedProjectedFactsBeforeDecode(String changed){
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f->{
+            var first=f.preparations().createFirst(f.issue(f.request));
+            if(changed.equals("claim"))SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.cache).updateOne(new Document("_id",MongoWorkloadClaimStore.id(first.claim().key())),new Document("$set",new Document("capturePreparation.padding","x".repeat(128*1024))));
+            else SystemCollections.SRS_CHAINS.on(f.cache).updateOne(new Document("_id",first.preparation().chainId()),new Document("$set",new Document("captureFence.padding","x".repeat(128*1024))));
+            var before=f.snapshot();
+            assertThatThrownBy(()->f.preparations().control(first.preparation(),"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+    @Test void validationControlProjectsIdentityWithoutCheckpointOrModelMaterialization(){
+        withFixture(CapturePreparation.Mode.SHARED_SRS,f->{
+            var first=f.preparations().createFirst(f.issue(f.request));var original=first.preparation();
+            var root=SystemCollections.SRS_CHAINS.on(f.cache);
+            root.updateOne(new Document("_id",original.chainId()),new Document("$set",new Document("epoch",1L)
+                    .append("servingTables",List.of("orders")).append("checkpoint",new Document("unreadable-payload","x".repeat(2*1024*1024)))));
+            var before=f.snapshot();var control=f.preparations().control(original,"orders");
+            assertThat(control.preparation()).isEqualTo(original);assertThat(control.claim()).isEqualTo(first.claim());
+            assertThat(control.epoch()).isOne();assertThat(control.servesTable()).isTrue();
+            assertThat(f.preparations().control(original,"missing").servesTable()).isFalse();
+            assertThatThrownBy(()->f.preparations().load(original)).isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+            root.updateOne(new Document("_id",original.chainId()),new Document("$set",new Document("recoveryControl",new Document("phase","CANCELLED"))));
+            assertThatThrownBy(()->f.preparations().control(original,"orders")).isInstanceOf(TapstateException.class);
+        });
+    }
 
     @Test void aReservedPhysicalReplacementBlocksOrdinaryLookupAndReadyPreservesCanonicalNotesWithoutRecreatingCache() {
         withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {

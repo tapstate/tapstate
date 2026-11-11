@@ -72,6 +72,24 @@ latest observation and can still return retained samples for a stopped pipeline.
 The current read faces are separate requests, not one transactional snapshot. If you need a diagnostic
 conclusion, read `pipeline.explain`; do not join the other responses and copy its rules.
 
+## Nest cold-layer counters
+
+`tapstate.pipeline.nest.accesses` retains its logical-operation accounting, and
+`tapstate.pipeline.nest.backfills` counts cold loader callbacks. A batched operation can cause several
+partition callbacks, so dividing these counters does not produce a cold percentage.
+
+`tapstate.pipeline.nest.key.accesses` and `tapstate.pipeline.nest.cold.keys` count requested keys in
+operations and cold loaders respectively, including keys with no stored value. Keys are deduplicated
+within an operation; later visits count again. The flat view spells these instruments
+`nestStateKeyAccesses.<namespace>` and `nestStateColdKeys.<namespace>`. The cold share uses their window
+deltas. Older observations without both instruments have no measured cold share. Existing callback
+timings and counters keep their units; callbacks are not physical database command counts.
+
+The cold-layer alert requires a cold share of at least 50% over at least 100 accesses. It applies that
+floor in keys when split read/write instrumentation is available and in logical accesses for older
+reporters with aggregate key counters. Small samples accumulate and missing measurements do not establish
+recovery. An active alert clears after two measured windows below 40%.
+
 ## Nest state metrics
 
 Read the `facts` array of `GET /api/pipelines/{id}/metrics`. Use `tapstate.nest.namespace` to
@@ -140,6 +158,9 @@ Rates are calculated at query time from adjacent samples and their real `observe
 sample records when its outbound counters started. A changed counter start or a decreased outbound
 counter begins a `COUNTER_RESET` segment, so a restart never becomes a negative rate or a spike across
 runs. A sufficiently long interval begins a `GAP` segment and is never interpolated.
+
+A run that has not yet delivered anything has no outbound counters and no counter start. Two adjacent
+samples in that state read as a measured zero (`delta` 0, rates 0), not as an unavailable series.
 
 Inbound counters are not returned as rates. Retained samples do not carry an independent start for
 each inbound series, so applying the outbound start to them would falsely describe a reset-aware rate.
@@ -328,8 +349,15 @@ An explanation reads one observation once and applies a fixed first-match order:
 2. `CODED_FAILURE`, preserving the original failure code, parameters, and rendered message as evidence.
 3. `RECONCILE_FAILURES` while a new or running pipeline repeatedly fails to converge.
 4. `NO_MOVEMENT` while a new or running pipeline has driven and loaded no rows.
-5. `FRONTIER_STALLED` when a chain reports a stalled frontier.
+5. `FRONTIER_STALLED` when a chain reports a stalled frontier for a table that has finished its
+   initial load.
 6. `NO_MATCH` when none of those conclusions is supported.
+
+A table still in its initial load has no durable position to advance yet, so a long-pinned frontier
+on it is not a stall. Such a table is one that `initialLoad` reports in any stage other than
+`LANDED` or, when the observation carries no `initialLoad`, one whose `snapshot` entry is not yet
+`landed`. When `initialLoad` is present, the explanation adds each table's stage as `initialLoad`
+evidence and no longer lists the load phase under `cannotSay`.
 
 The lifecycle `state` is returned unchanged. `freshness` is independently `FRESH`, `STALE`, or
 `UNKNOWN`; it is not a lifecycle state. When observation time is unavailable, `observedAt` and

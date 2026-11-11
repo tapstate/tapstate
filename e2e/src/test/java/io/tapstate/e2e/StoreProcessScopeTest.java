@@ -22,6 +22,18 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class StoreProcessScopeTest {
     private static final String STORE = "mongodb://127.0.0.1:1";
 
+    @Test void bootOutputMustMatchTheOriginalLaunchPidAndStartTime() {
+        String boot=java.util.UUID.randomUUID().toString(),token=java.util.UUID.randomUUID().toString();
+        var started=java.time.Instant.parse("2026-11-04T00:00:00Z");
+        String line="12:00:00 INFO [launch="+token+"] Process boot identity [boot_id="+boot+", pid=42, started_at="+started+"]\n";
+        assertThat(StoreProcessScope.bootFromOutput(line,token,42,started)).isEqualTo(boot);
+        for(String invalid:java.util.List.of("",line.replace(token,"another-launch"),line.replace("pid=42","pid=43"),
+                line.replace(started.toString(),started.plusSeconds(1).toString()),line.replace(boot,"malformed"),
+                line+line.replace(boot,java.util.UUID.randomUUID().toString()))) {
+            assertThatThrownBy(()->StoreProcessScope.bootFromOutput(invalid,token,42,started)).isInstanceOf(AssertionError.class);
+        }
+    }
+
     @Test
     void aLiveOwnedChildRefusesCleanupAndARetiredChildAllowsRetryWithoutTouchingAForeignChild(
             @TempDir Path scratch) throws Exception {

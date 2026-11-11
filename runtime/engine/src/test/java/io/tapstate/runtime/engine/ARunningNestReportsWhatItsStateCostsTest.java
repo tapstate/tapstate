@@ -124,6 +124,9 @@ class ARunningNestReportsWhatItsStateCostsTest {
         try {
             NestStateReading reading = awaitReading();
 
+            assertThat(reading.keyAccesses()).isPresent();
+            assertThat(reading.coldKeys()).isPresent();
+
             assertThat(reading.entries())
                     .describedAs("every root is being held, including the last one written - a reading left "
                             + "only on reads reports what was there before the final write and then goes "
@@ -266,7 +269,8 @@ class ARunningNestReportsWhatItsStateCostsTest {
         long deadline = System.nanoTime() + Duration.ofSeconds(30).toNanos();
         while (System.nanoTime() < deadline) {
             NestStateReading reading = engine.nestStateReadings(PIPELINE).get(namespace);
-            if (reading != null && reading.accesses() >= minimumAccesses) {
+            if (reading != null && reading.accesses() >= minimumAccesses
+                    && reading.keyAccesses().isPresent() && reading.coldKeys().isPresent()) {
                 return reading;
             }
             sleep();

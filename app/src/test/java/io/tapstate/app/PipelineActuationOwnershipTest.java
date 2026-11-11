@@ -352,10 +352,146 @@ class PipelineActuationOwnershipTest {
                 nanos::get);
     }
 
+    @Test void independentFailedRenewalDropsTheOriginalClaimBeforeTheNextPass() {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        org.mockito.Mockito.doReturn(Optional.empty()).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        assertThat(owner.permit("orders").granted()).isFalse();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"acquire","renew","unknown-commit"})
+    void closingDuringStoreIoNeverPublishesTheReturnedClaim(String operation) throws Exception {
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        boolean renew=operation.equals("renew");
+        if(renew){assertThat(owner.permit("orders").granted()).isTrue();nanos.addAndGet(RENEW.toNanos());}
+        org.mockito.stubbing.Answer<Object> blocked=call->{
+            entered.countDown();if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("store IO was not released");
+            if(renew)return claims.renew(call.getArgument(0),call.getArgument(1));
+            var acquired=claims.acquire(call.getArgument(0),call.getArgument(1),call.getArgument(2),call.getArgument(3));
+            if(operation.equals("unknown-commit"))throw StorageRuntime.unavailable();
+            return acquired;
+        };
+        if(renew)org.mockito.Mockito.doAnswer(blocked).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        else org.mockito.Mockito.doAnswer(blocked).when(boundary).acquire(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any());
+        try(var executor=java.util.concurrent.Executors.newFixedThreadPool(2)){
+            var result=executor.submit(()->owner.permit("orders"));
+            assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            executor.submit(owner::stopForShutdown).get(1,java.util.concurrent.TimeUnit.SECONDS);
+            org.assertj.core.api.Assertions.assertThatThrownBy(()->owner.awaitStopped(System.nanoTime()+Duration.ofMillis(30).toNanos()))
+                    .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            release.countDown();assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            owner.awaitStopped(System.nanoTime()+Duration.ofSeconds(3).toNanos());
+            assertThat(owner.permit("orders").granted()).isFalse();
+        }finally{release.countDown();owner.stopForShutdown();}
+    }
+
+    @Test void majorityLossDuringRenewalCannotPublishOrReviveTheOriginalGrant() throws Exception {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(call->{entered.countDown();
+            if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("renewal was not released");
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var result=executor.submit(()->owner.permit("orders"));
+            try {assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();membership.canCommit(Set.of("node-a"));}
+            finally {release.countDown();}
+            assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            membership.canCommit(Set.of("node-a","node-b"));
+            assertThat(owner.permit("orders").granted()).isFalse();
+        }finally {release.countDown();owner.stopForShutdown();}
+    }
+
+    @Test void aTopologyChangeDuringRenewalCannotPublishAnUnscopedClaim() {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        assertThat(owner.permit("orders").granted()).isTrue();
+        org.mockito.Mockito.doAnswer(call->{membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        assertThat(owner.permit("orders").granted()).isFalse();
+    }
+
+    @Test void boundSingleControlSurvivesDataPlaneLossButNotItsOriginalNodeProof() {
+        var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.SINGLE);
+        var gate=new ClusterMembershipGate(properties);
+        var node=claims.acquire(new WorkloadClaimKey("node-a",WorkloadClaimType.NODE_SESSION,"node-a"),NODE_A,1,TTL).claim();
+        gate.bindSingle(node);
+        var active=new java.util.concurrent.atomic.AtomicBoolean(true);gate.observeNodeSession(active::get);
+        var member=org.mockito.Mockito.mock(com.hazelcast.cluster.Member.class);
+        org.mockito.Mockito.when(member.getAttribute(ClusterMembershipGate.NODE_ID_ATTRIBUTE)).thenReturn("node-a");
+        org.mockito.Mockito.when(member.getAttribute(ClusterMembershipGate.BOOT_ID_ATTRIBUTE)).thenReturn("boot-a");
+        assertThat(gate.apply(List.of(member))).isTrue();
+        var dataPlane=new java.util.concurrent.atomic.AtomicBoolean(true);gate.observeDataPlane(dataPlane::get);
+        var owner=new PipelineActuationOwnership("node-a",NODE_A,gate,new ClusterWorkloadClaims(claims,gate),TTL,RENEW,nanos::get);
+        var original=owner.permit("orders");assertThat(original.granted()).isTrue();
+        dataPlane.set(false);nanos.addAndGet(RENEW.toNanos());
+        var retained=owner.permit("orders");assertThat(retained.granted()).isTrue();
+        assertThat(WorkloadClaimFence.from(retained.claim())).isEqualTo(WorkloadClaimFence.from(original.claim()));
+        assertThat(new ClusterWorkloadClaims(claims,gate).acquire(
+                new WorkloadClaimKey("node-a",WorkloadClaimType.CAPTURE,"new-capture"),NODE_A,1,TTL)).isEmpty();
+        assertThat(owner.permit("orders").granted()).isTrue();
+        active.set(false);nanos.addAndGet(RENEW.toNanos());
+        assertThat(owner.permit("orders").granted()).isFalse();
+        assertThat(owner.beginExecution("orders",WorkloadClaimFence.from(retained.claim())).allowed()).isFalse();
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"permit","begin"})
+    void queuedAdmissionSpendsItsOriginalBudgetBeforeTheIoHeldMonitor(String operation) throws Exception {
+        var boundary=org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class,
+                org.mockito.AdditionalAnswers.delegatesTo(claims));
+        var owner=new PipelineActuationOwnership("cluster-a",NODE_A,membership,
+                new ClusterWorkloadClaims(boundary,membership),TTL,RENEW,nanos::get);
+        var original=owner.permit("orders");assertThat(original.granted()).isTrue();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.doAnswer(call->{entered.countDown();
+            if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("renewal was not released");
+            return claims.renew(call.getArgument(0),call.getArgument(1));
+        }).when(boundary).renew(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any());
+        nanos.addAndGet(RENEW.toNanos());
+        try(var workers=java.util.concurrent.Executors.newFixedThreadPool(2)) {
+            var running=workers.submit(()->owner.permit("orders"));
+            assertThat(entered.await(2,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            var returned=new java.util.concurrent.CountDownLatch(1);var granted=new java.util.concurrent.atomic.AtomicBoolean(true);
+            var queued=workers.submit(()->{
+                new ShutdownAwait().complete(System.nanoTime()+Duration.ofMillis(100).toNanos(),()->{
+                    granted.set(operation.equals("permit")?owner.permit("other").granted()
+                            :owner.beginExecution("orders",WorkloadClaimFence.from(original.claim())).allowed());
+                });returned.countDown();
+            });
+            assertThat(returned.await(1,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+            queued.get();assertThat(granted).isFalse();
+            org.mockito.Mockito.verify(boundary,org.mockito.Mockito.times(1)).acquire(
+                    org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.any());
+            org.mockito.Mockito.verify(boundary,org.mockito.Mockito.never()).advanceExecution(
+                    org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyLong(),org.mockito.ArgumentMatchers.anySet());
+            owner.stopForShutdown();release.countDown();assertThat(running.get(2,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            owner.awaitStopped(System.nanoTime()+Duration.ofSeconds(2).toNanos());
+        }finally {release.countDown();owner.stopForShutdown();}
+    }
+
     private static ClusterMembershipGate eligibleGate() {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
         return gate;

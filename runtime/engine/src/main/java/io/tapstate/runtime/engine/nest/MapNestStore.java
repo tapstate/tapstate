@@ -287,9 +287,7 @@ final class MapNestStore<S> implements NestStore<S> {
     }
 
     private void countAccess() {
-        if (stats != null) {
-            stats.access(map.getName());
-        }
+        if (stats != null) stats.access(map.getName());
     }
 
     /**

@@ -31,6 +31,7 @@
     <jackson.version>2.21.4</jackson.version>
     <snakeyaml.version>2.6</snakeyaml.version>
     <cel.version>0.10.1</cel.version>
+    <cron-utils.version>9.2.1</cron-utils.version>
     <!-- GraalVM polyglot + the JavaScript language: the full-power escape-hatch evaluator that runs
          a js transform's script per event. The community language artifact (js-community) is the
          UPL-licensed open build (the Oracle GraalVM 'js' artifact carries the GFTC terms, the same
@@ -229,6 +230,11 @@
            to compile + type-check filter / computed expressions at validate time (never to
            evaluate). The single 'cel' aggregate artifact pulls its own transitive closure
            (guava / protobuf / antlr4 / re2j); those are allowlisted in core-dsl's enforcer. -->
+      <dependency>
+        <groupId>com.cronutils</groupId>
+        <artifactId>cron-utils</artifactId>
+        <version>${cron-utils.version}</version>
+      </dependency>
       <dependency>
         <groupId>dev.cel</groupId>
         <artifactId>cel</artifactId>

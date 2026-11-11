@@ -11,6 +11,9 @@ public interface ConnectorProvisioner {
     /** The ref for {@code connectorId}, or throws if the id resolves to no connector. */
     ConnectorRef resolve(String connectorId);
 
+    /** Narrow default-Source resolution preserves implementation defects for UNKNOWN diagnostics. */
+    default ConnectorRef resolveDefaultTest(String connectorId) { return resolve(connectorId); }
+
     /** Internal retained-context resolution; never substitute the currently registered artifact. */
     default ConnectorRef resolve(String connectorId, String contentHash) {
         if (contentHash == null || !contentHash.matches("[a-f0-9]{64}")) {

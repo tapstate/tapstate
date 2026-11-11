@@ -6,7 +6,8 @@ import io.tapstate.core.lifecycle.Stage;
  * Where a processor reports how long its stage's units of work have taken: the distribution so far and
  * the moment it began timing. A seam for the reason {@link DeliveryGauge} is one — the reading is taken
  * inside the run and read outside it — and, like it, one that reads nothing when a processor is driven
- * by hand outside a job, since a job's own statistics can only be written from the job's threads.
+ * by hand outside a job, since job handles must be acquired on the owning processor thread. An admitted worker may
+ * publish through handles that were prebound there, with one accumulator writer.
  */
 interface StageGauge {
 

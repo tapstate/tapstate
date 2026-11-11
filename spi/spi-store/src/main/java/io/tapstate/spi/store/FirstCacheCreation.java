@@ -5,6 +5,6 @@ public interface FirstCacheCreation {
     CachePreparation preparation();
     /** Consumed before callbacks or IO; loading configuration facts never reconstructs this capability. */
     void consume();
-    /** The original setup lifecycle remains fixed across cache transaction retries. */
+    /** Original CONFIG authority and lifetime proof; check outside protected CACHE callbacks. */
     void requireActive();
 }

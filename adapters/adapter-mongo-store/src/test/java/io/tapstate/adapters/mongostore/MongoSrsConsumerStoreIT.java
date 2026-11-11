@@ -37,6 +37,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -53,6 +54,37 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
+    @ParameterizedTest @ValueSource(strings={"revision","state","owner","detached","hash"})
+    void validationMembershipRefusesChangedOriginalCoordinates(String changed){
+        withBusiness(f->{
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+            var original=io.tapstate.spi.store.SrsConsumerRun.of(scope,member);var fence=member.commandFence();
+            var next=new io.tapstate.spi.store.SrsConsumerMembership(changed.equals("state")?new SrsConsumerContext(A.key(),A.stateGeneration()+1):A,
+                    changed.equals("revision")?member.revision()+1:member.revision(),changed.equals("detached"),changed.equals("detached")?Set.of():member.tables(),
+                    changed.equals("owner")?new WorkloadClaimFence(fence.key(),new WorkloadOwner("other","other-boot"),fence.claimGeneration(),fence.executionGeneration(),fence.topologyRevision()):fence);
+            var row=new MongoSrsConsumerRecords(SCOPE).membership(next);if(changed.equals("hash"))row.put("contentHash","a".repeat(64));
+            SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),row);
+            if(changed.equals("hash"))assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class);
+            else assertThat(f.consumers().attached(original,"orders")).isFalse();
+            assertThat(membership(f,A)).isEqualTo(row);
+        });
+    }
+    @Test void validationMembershipReadsOnlyItsOriginalRelationAndRejectsOversizedMetadata(){
+        withBusiness(f->{
+            var a=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            var original=io.tapstate.spi.store.SrsConsumerRun.of(new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration()),a);
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("progress",new Document("unrelated","x".repeat(512*1024)))));
+            var before=membership(f,A);
+            assertThat(f.consumers().attached(original,"orders")).isTrue();assertThat(f.consumers().attached(original,"missing")).isFalse();
+            assertThatThrownBy(()->f.consumers().find(A.key())).isInstanceOf(TapstateException.class);assertThat(membership(f,A)).isEqualTo(before);
+            var large=new TreeSet<String>();for(int index=0;index<1024;index++)large.add(index+"x".repeat(512));
+            var oversized=new io.tapstate.spi.store.SrsConsumerMembership(a.context(),a.revision(),false,large,a.commandFence());
+            SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),new MongoSrsConsumerRecords(SCOPE).membership(oversized));
+            assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+        });
+    }
 
     @Test void readLeaseFinishesOldEventsAndRevalidatesTheFirstEventOfTheNextCaptureEpoch() {
         withBusiness(f -> {
@@ -1213,6 +1245,119 @@ class MongoSrsConsumerStoreIT {
         return Map.copyOf(refs);
     }
     private static String ring(String table) { return "srs." + CHAIN + "." + table; }
+
+    @Test void fusedReadKeepsTheHistoricalModelAndItsExactEffectiveRange() {
+        withBusiness(f->{
+            var refs=publishSnapshotModels(f,Set.of("orders"));
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"seam",refs),f.fenceA())).isTrue();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+            var run=io.tapstate.spi.store.SrsConsumerRun.of(scope,member);
+            var next=new SrsModel(new SrsModelKey(CHAIN,"orders",SCOPE.cacheIncarnation(),1,1),ring("orders"),
+                    new SourceTable("orders",List.of(new SourceField("id","long")),List.of(),List.of()),100);
+            models(f).publish(next,f.captureFence());
+            assertThat(f.consumers().supportsReadEventVerification()).isTrue();
+            assertThat(f.consumers().verifyReadEvent(run,"orders",ring("orders"),99,1,0,f.captureFence()))
+                    .contains(models(f).requireEvent(refs.get("orders"),ring("orders"),99,f.captureFence()));
+            assertThat(f.consumers().verifyReadEvent(run,"orders",ring("orders"),100,1,1,f.captureFence())).contains(next);
+            for(long[] coordinates:List.of(new long[]{100,0},new long[]{99,1},new long[]{1,2}))
+                assertThatThrownBy(()->f.consumers().verifyReadEvent(run,"orders",ring("orders"),coordinates[0],1,coordinates[1],f.captureFence()))
+                        .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.SRS_EVENT_MODEL_UNAVAILABLE));
+            assertThatThrownBy(()->f.consumers().verifyReadEvent(run,"orders","another-ring",99,1,0,f.captureFence()))
+                    .isInstanceOf(TapstateException.class);
+            var capture=f.captureFence();var changed=new WorkloadClaimFence(capture.key(),capture.owner(),capture.claimGeneration()+1,capture.executionGeneration(),capture.topologyRevision());
+            assertThatThrownBy(()->f.consumers().verifyReadEvent(run,"orders",ring("orders"),99,1,0,changed))
+                    .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"revision","state","detached","table","snapshot","epoch","sequence","capture"})
+    void fusedReadRetainsConsumerAndEventRejections(String changed) {
+        withBusiness(f->{
+            var refs=publishSnapshotModels(f,Set.of("orders"));
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"seam",refs),f.fenceA())).isTrue();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration()+(changed.equals("state")?1:0));
+            var run=new io.tapstate.spi.store.SrsConsumerRun(scope,CHAIN,A.key().sourceId(),member.revision()+(changed.equals("revision")?1:0),
+                    f.fenceA().owner().nodeId(),f.fenceA().owner().bootId(),f.fenceA().claimGeneration(),f.fenceA().executionGeneration(),f.fenceA().topologyRevision());
+            if(changed.equals("detached"))f.consumers().detach(A,member.revision(),f.fenceA());
+            if(changed.equals("snapshot"))SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("snapshot.snapshotEpoch",1.0)));
+            if(changed.equals("state")){
+                assertThatThrownBy(()->f.consumers().verifyReadEvent(run,"orders",ring("orders"),0,1,0,f.captureFence()))
+                        .isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(IoError.SRS_CONSUMER_UNAVAILABLE));
+            }else if(Set.of("revision","detached","table").contains(changed)){
+                assertThat(f.consumers().verifyReadEvent(run,changed.equals("table")?"missing":"orders",ring("orders"),0,1,0,f.captureFence())).isEmpty();
+            }else assertThatThrownBy(()->f.consumers().verifyReadEvent(run,"orders",ring("orders"),changed.equals("sequence")?-1:0,
+                    changed.equals("epoch")?0:1,0,changed.equals("capture")?null:f.captureFence())).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void fusedRetriesAreReadOnlyAndConcurrentReadersKeepAllOriginalChecks() {
+        withBusiness(f->{
+            var refs=publishSnapshotModels(f,Set.of("orders"));var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"seam",refs),f.fenceA())).isTrue();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+            var run=io.tapstate.spi.store.SrsConsumerRun.of(scope,member);var before=cursor(f,A);var originalRoot=root(f);
+            var originalClaims=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find().sort(new Document("_id",1)).into(new java.util.ArrayList<>());
+            var guards=new java.util.concurrent.atomic.AtomicInteger();
+            var retrying=f.consumers().guardedBy(()->{
+                if(guards.incrementAndGet()==3){var retry=new com.mongodb.MongoException(112,"transient read fixture");
+                    retry.addLabel("TransientTransactionError");throw retry;}
+            });
+            assertThat(retrying.verifyReadEvent(run,"orders",ring("orders"),0,1,0,f.captureFence())).isPresent();
+            assertThat(guards.get()).isGreaterThan(3);
+            Runnable scalar=()->{
+                var held=f.consumers().progress(A).orElseThrow();assertThat(held.membershipRevision()).isEqualTo(member.revision());
+                assertThat(held.cursor().perTableSeq()).containsKey("orders");
+                assertThat(models(f).requireEvent(refs.get("orders"),ring("orders"),0,f.captureFence()).key()).isEqualTo(refs.get("orders"));
+            };
+            Runnable fused=()->assertThat(f.consumers().verifyReadEvent(run,"orders",ring("orders"),0,1,0,f.captureFence()).orElseThrow().key()).isEqualTo(refs.get("orders"));
+            scalar.run();fused.run();
+            long scalarNanos=readWave(scalar),fusedNanos=readWave(fused);
+            System.out.println("Concurrent original event verification: readers=4 events=32 scalarNanos="+scalarNanos+" fusedNanos="+fusedNanos);
+            assertThat(cursor(f,A)).isEqualTo(before);assertThat(root(f)).isEqualTo(originalRoot);
+            assertThat(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find().sort(new Document("_id",1)).into(new java.util.ArrayList<>())).isEqualTo(originalClaims);
+        });
+    }
+
+    private static long readWave(Runnable read) throws Exception {
+        try(var executor=Executors.newFixedThreadPool(4)){
+            var ready=new CountDownLatch(4);var release=new CountDownLatch(1);var futures=new java.util.ArrayList<java.util.concurrent.Future<?>>();
+            for(int worker=0;worker<4;worker++)futures.add(executor.submit(()->{
+                ready.countDown();try{if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("read wave was not released");}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+                for(int event=0;event<8;event++)read.run();
+            }));
+            assertThat(ready.await(5,TimeUnit.SECONDS)).isTrue();long started=System.nanoTime();release.countDown();
+            for(var future:futures)future.get(15,TimeUnit.SECONDS);
+            return System.nanoTime()-started;
+        }
+    }
+
+    @Test void concurrentFusedReadsCannotBorrowAReplacedMembership() {
+        withBusiness(f->{
+            var refs=publishSnapshotModels(f,Set.of("orders"));var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            assertThat(f.consumers().pinSnapshot(A,member.revision(),0,new SrsSnapshotPin(1,"seam",refs),f.fenceA())).isTrue();
+            var scope=new io.tapstate.spi.store.PipelineIntentScope(SCOPE.clusterId(),SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+            var run=io.tapstate.spi.store.SrsConsumerRun.of(scope,member);
+            var entered=new CountDownLatch(4);var release=new CountDownLatch(1);
+            var first=java.util.concurrent.ConcurrentHashMap.<Thread>newKeySet();
+            var guarded=f.consumers().guardedBy(()->{
+                if(first.add(Thread.currentThread())){entered.countDown();try{
+                    if(!release.await(5,TimeUnit.SECONDS))throw new AssertionError("membership barrier was not released");
+                }catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}}
+            });
+            try(var executor=Executors.newFixedThreadPool(4)){
+                var readers=new java.util.ArrayList<java.util.concurrent.Future<?>>();
+                for(int i=0;i<4;i++)readers.add(executor.submit(()->assertThat(guarded.verifyReadEvent(run,"orders",ring("orders"),0,1,0,f.captureFence())).isEmpty()));
+                try{
+                    assertThat(entered.await(5,TimeUnit.SECONDS)).isTrue();
+                    assertThat(f.consumers().attach(A,member.revision(),Set.of("orders"),f.fenceA())).isPresent();
+                    release.countDown();for(var reader:readers)reader.get(5,TimeUnit.SECONDS);
+                }finally{release.countDown();}
+            }
+        });
+    }
     private static MongoSrsModelStore models(Fixture f) { return new MongoSrsModelStore(f.client(), f.database(), SCOPE); }
 
     private static Document cursor(Fixture f, SrsConsumerContext context) { return SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).find(id(context)).first(); }

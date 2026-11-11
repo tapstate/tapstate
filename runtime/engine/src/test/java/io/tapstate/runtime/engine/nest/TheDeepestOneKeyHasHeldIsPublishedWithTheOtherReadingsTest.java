@@ -45,6 +45,25 @@ import org.junit.jupiter.api.Test;
  */
 class TheDeepestOneKeyHasHeldIsPublishedWithTheOtherReadingsTest {
 
+    @Test
+    void keyMetricsKeepTheirOwnUnitsAndRequireTheCompletePair() {
+        Map<String, Long> kinds = new java.util.HashMap<>(Map.of(
+                NestStateMetricNames.ACCESSES, 100L, NestStateMetricNames.BACKFILLS, 400L,
+                NestStateMetricNames.KEY_ACCESSES, 800L, NestStateMetricNames.COLD_KEYS, 400L));
+        NestStateReading reading = NestStateMetricNames.readingFrom(kinds, OptionalLong.empty());
+        assertThat(reading.accesses()).isEqualTo(100);
+        assertThat(reading.backfills()).isEqualTo(400);
+        assertThat(reading.keyAccesses()).hasValue(800);
+        assertThat(reading.coldKeys()).hasValue(400);
+        NestStateReading placed = reading.withOrigin(new io.tapstate.core.lifecycle.NestOrigin("doc", "[]", "state"));
+        assertThat(placed.keyAccesses()).hasValue(800);
+        assertThat(placed.coldKeys()).hasValue(400);
+        kinds.remove(NestStateMetricNames.COLD_KEYS);
+        NestStateReading incomplete = NestStateMetricNames.readingFrom(kinds, OptionalLong.empty());
+        assertThat(incomplete.keyAccesses()).isEmpty();
+        assertThat(incomplete.coldKeys()).isEmpty();
+    }
+
     private static final String NAMESPACE = "nest.p.step.$root";
     private static final String ANOTHER = "nest.p.step.policies";
 

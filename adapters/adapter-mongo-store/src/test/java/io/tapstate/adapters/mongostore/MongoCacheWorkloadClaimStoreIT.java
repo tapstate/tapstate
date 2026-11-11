@@ -54,6 +54,42 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void validationTenureUsesIndependentNativeClientsWithoutReleasingThePipeline() {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var production = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            try (var session = f.admin().startSession()) {
+                SystemCollections.VALIDATION_RUNS.prepareCollectionOn(f.database(), session);
+                session.withTransaction(() -> {
+                    var original = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).find(session,
+                            new Document("_id", MongoWorkloadClaimStore.id(KEY))).first();
+                    MongoValidationControlStore.prepareInTransaction(session, f.database(), PIPELINE,
+                            original.get("pipelinePreparation", Document.class).getString("preparationId"), true);
+                    return null;
+                });
+            }
+            var key = io.tapstate.spi.store.ValidationClaims.key(SCOPE.clusterId(), PIPELINE.pipelineId());
+            var granted = claims.acquire(key, OWNER, 1, TTL).claim();
+            var first = claims.advanceExecution(granted, 1, Set.of(OWNER.nodeId())).orElseThrow();
+            var firstOwner = io.tapstate.spi.store.ValidationClaims.owner(PIPELINE.pipelineId(), first);
+            try (var second = MongoCacheDomain.connect(f.binding(), Duration.ofSeconds(5), "validation-second-client")) {
+                var competing = second.workloadClaims(SCOPE);
+                assertThat(competing.read(key).orElseThrow().claim()).isEqualTo(first);
+                var nextNode = new WorkloadOwner("node-b", "boot-b");
+                assertThat(competing.acquire(key, nextNode, 1, TTL).claim().owner()).isEqualTo(OWNER);
+                assertThat(claims.release(first)).isTrue();
+                var replacement = competing.acquire(key, nextNode, 1, TTL).claim();
+                var next = competing.advanceExecution(replacement, 1, Set.of(nextNode.nodeId())).orElseThrow();
+                var nextOwner = io.tapstate.spi.store.ValidationClaims.owner(PIPELINE.pipelineId(), next);
+                assertThat(nextOwner.claimGeneration()).isGreaterThan(firstOwner.claimGeneration());
+                assertThat(nextOwner.executionGeneration()).isGreaterThan(firstOwner.executionGeneration());
+                assertThat(claims.renew(first, TTL)).isEmpty(); assertThat(claims.release(first)).isFalse();
+                assertThat(competing.read(key).orElseThrow().claim()).isEqualTo(next);
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(production);
+            }
+        });
+    }
+
     @Test void renewalDoesNotMistakeAnOldSnapshotForAnExpiredSameTenure() {
         withBusiness(f -> {
             String name = "held-renewal-" + UUID.randomUUID();
@@ -311,6 +347,251 @@ class MongoCacheWorkloadClaimStoreIT {
                 assertThat(identity(f.database()).getLong("claimAdmissionFence")).isZero();
             }
         });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"findAndModify","commitTransaction","listCollections"})
+    void boundedCallerRetainsTheCacheOwnerUntilItsActualTransactionCanBeCleaned(String blockedCommand) {
+        withBusiness(f -> {
+            var claims=(io.tapstate.spi.store.DeadlineWorkloadClaimStore)f.domain().workloadClaims(SCOPE);
+            var entered=new CountDownLatch(1);var release=new CountDownLatch(1);var ioReturned=new CountDownLatch(1);
+            failCommand(f,new Document("failCommands",List.of(blockedCommand)).append("blockConnection",true)
+                    .append("blockTimeMS",5000),new Document("times",1));
+            try(var caller=Executors.newSingleThreadExecutor()) {
+                long started=System.nanoTime();
+                var result=caller.submit(()->claims.withDeadline(started+Duration.ofSeconds(2).toNanos(),()->{
+                    entered.countDown();
+                    try {return claims.acquirePipeline(PIPELINE,OWNER,1,TTL);}
+                    finally {ioReturned.countDown();await(release);}
+                }));
+                assertThat(entered.await(1,TimeUnit.SECONDS)).isTrue();
+                assertThatThrownBy(()->result.get(3,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                assertThat(Duration.ofNanos(System.nanoTime()-started)).isLessThan(Duration.ofSeconds(3));
+                assertThat(ioReturned.await(1,TimeUnit.SECONDS)).as("the original IO also observes the shared budget").isTrue();
+                assertThatThrownBy(f.domain()::close).isInstanceOf(TapstateException.class);
+                var newCalls=new AtomicInteger();
+                assertThatThrownBy(()->claims.withDeadline(deadline(),newCalls::incrementAndGet)).isInstanceOf(TapstateException.class);
+                assertThat(newCalls).hasValue(0);
+            } finally {
+                release.countDown();
+                failCommand(f,new Document(),"off");
+                claims.awaitQuiescence(deadline());
+            }
+            // Cleanup used the original client and session retained through the failed close.
+            f.domain().close();
+        });
+    }
+
+    @Test void failedAbortKeepsTheExactOriginalSessionAndRetriesOnlyItsFinalization() {
+        withBusiness(f -> {
+            var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommand().containsKey("txnNumber"))commands.add(event.getCommand().clone());
+            }};
+            try(var observed=client(listener)) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,()->{
+                    if(commands.stream().anyMatch(c->c.containsKey("findAndModify")))throw MongoCacheBusinessIdentity.businessFenced();
+                },null,ownership);
+                var before=snapshot(f.database());
+                failCommand(f,new Document("failCommands",List.of("abortTransaction")).append("errorCode",2),"alwaysOn");
+                try {
+                    assertThatThrownBy(()->claims.withDeadline(deadline(),()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL)))
+                            .satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+                    assertThatThrownBy(ownership::closeIfIdle).isInstanceOf(TapstateException.class);
+                    observed.getDatabase("admin").runCommand(new Document("ping",1));
+                } finally {
+                    failCommand(f,new Document(),"off");
+                    claims.awaitQuiescence(deadline());
+                }
+                var original=commands.stream().filter(c->c.containsKey("startTransaction")).findFirst().orElseThrow();
+                assertThat(commands.stream().filter(c->c.containsKey("abortTransaction")).toList()).isNotEmpty()
+                        .allSatisfy(c->{assertThat(c.getDocument("lsid")).isEqualTo(original.getDocument("lsid"));
+                            assertThat(c.getNumber("txnNumber").longValue()).isEqualTo(original.getNumber("txnNumber").longValue());});
+                assertThat(commands.stream().filter(c->c.containsKey("findAndModify")).count()).isOne();
+                assertThat(snapshot(f.database())).isEqualTo(before);
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void unknownCommitRetriesOnlyTheOriginalCommitAndNeverReplaysTheClaimCallback() {
+        withBusiness(f -> {
+            var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommand().containsKey("txnNumber"))commands.add(event.getCommand().clone());
+            }};
+            try(var observed=client(listener)) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,ACTIVE,null,ownership);
+                failCommand(f,new Document("failCommands",List.of("commitTransaction")).append("closeConnection",true),new Document("times",2));
+                try {
+                    var result=claims.withDeadline(deadline(),()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL));
+                    assertThat(result.acquired()).isTrue();
+                } finally {
+                    failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());
+                }
+                var commits=commands.stream().filter(c->c.containsKey("commitTransaction")).toList();
+                assertThat(commits).hasSizeGreaterThanOrEqualTo(3).allSatisfy(c->{
+                    assertThat(c.getDocument("lsid")).isEqualTo(commits.getFirst().getDocument("lsid"));
+                    assertThat(c.getNumber("txnNumber").longValue()).isEqualTo(commits.getFirst().getNumber("txnNumber").longValue());
+                });
+                assertThat(commands.stream().filter(c->c.containsKey("findAndModify")).count()).isOne();
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void lateCommitUsesTheRemainingTransactionAllowanceAndRetainsItsUncertainSession() {
+        withBusiness(f -> {
+            var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var ready=new CountDownLatch(1);var release=new CountDownLatch(1);var ioReturned=new CountDownLatch(1);
+            var paused=new AtomicBoolean();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommand().containsKey("txnNumber"))commands.add(event.getCommand().clone());
+            }};
+            try(var observed=client(listener);var caller=Executors.newSingleThreadExecutor()) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,()->{
+                    if(commands.stream().anyMatch(c->c.containsKey("findAndModify"))&&paused.compareAndSet(false,true)) {
+                        ready.countDown();await(release);
+                    }
+                },null,ownership);
+                failCommand(f,new Document("failCommands",List.of("commitTransaction")).append("blockConnection",true)
+                        .append("blockTimeMS",3000),new Document("times",1));
+                try {
+                    long started=System.nanoTime();
+                    var result=caller.submit(()->claims.withDeadline(started+Duration.ofSeconds(2).toNanos(),()->{
+                        try{return claims.acquirePipeline(PIPELINE,OWNER,1,TTL);}
+                        finally{ioReturned.countDown();}
+                    }));
+                    assertThat(ready.await(1,TimeUnit.SECONDS)).isTrue();
+                    long pauseUntil=started+Duration.ofMillis(1200).toNanos();
+                    while(pauseUntil-System.nanoTime()>0)java.util.concurrent.locks.LockSupport.parkNanos(pauseUntil-System.nanoTime());
+                    release.countDown();
+                    assertThatThrownBy(()->result.get(2,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                    assertThat(ioReturned.await(500,TimeUnit.MILLISECONDS)).as("commit must not restart the callback allowance").isTrue();
+                    assertThatThrownBy(ownership::closeIfIdle).isInstanceOf(TapstateException.class);
+                } finally {
+                    release.countDown();failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());
+                }
+                assertThat(commands.stream().filter(c->c.containsKey("findAndModify")).count()).isOne();
+                assertThat(commands.stream().filter(c->c.containsKey("commitTransaction")).count()).isPositive();
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void aBoundedRevokedCallbackConfirmsAbortBeforeReleasingItsSession() {
+        withBusiness(f -> {
+            var changed=new AtomicBoolean();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommandName().equals("findAndModify"))changed.set(true);
+            }};
+            try(var observed=client(listener)) {
+                var ownership=new MongoClaimOperations(observed);var before=snapshot(f.database());
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,ACTIVE,null,ownership);
+                assertThatThrownBy(()->claims.withDeadline(deadline(),()->{
+                    if(changed.get())throw MongoCacheBusinessIdentity.businessFenced();
+                },()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL)))
+                        .satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+                ownership.closeIfIdle();
+                assertThat(snapshot(f.database())).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void boundedDuplicateKeyRetriesKeepTheOriginalDeadlineAndCallbackScope() {
+        withBusiness(f -> {
+            var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommandName().equals("findAndModify"))commands.add(event.getCommand().clone());
+            }};
+            try(var observed=client(listener)) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,ACTIVE,null,ownership);
+                failCommand(f,new Document("failCommands",List.of("findAndModify")).append("blockConnection",true)
+                        .append("blockTimeMS",200).append("errorCode",11000)
+                        .append("errorExtraInfo",new Document("keyPattern",new Document("_id",1))
+                                .append("keyValue",new Document("_id","original-claim"))),new Document("times",1));
+                try {assertThat(claims.withDeadline(deadline(),()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL)).acquired()).isTrue();}
+                finally {failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());}
+                assertThat(commands).hasSize(2).allSatisfy(c->assertThat(c.getString("findAndModify").getValue())
+                        .isEqualTo(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName()));
+                assertThat(commands.get(1).getNumber("maxTimeMS").longValue()).isLessThan(commands.get(0).getNumber("maxTimeMS").longValue());
+                assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(1L);
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void transientCommitReconcilesTheOriginalTransactionBeforeReplayingItsCallback() {
+        withBusiness(f -> {
+            var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
+                if(event.getCommand().containsKey("txnNumber"))commands.add(event.getCommand().clone());
+            }};
+            try(var observed=client(listener)) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,ACTIVE,null,ownership);
+                failCommand(f,new Document("failCommands",List.of("commitTransaction")).append("errorCode",251)
+                        .append("errorLabels",List.of("TransientTransactionError")),new Document("times",1));
+                try {assertThat(claims.withDeadline(deadline(),()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL)).acquired()).isTrue();}
+                finally {failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());}
+                var first=commands.stream().filter(c->c.containsKey("findAndModify")).findFirst().orElseThrow();
+                assertThat(commands.stream().filter(c->c.containsKey("abortTransaction")).toList()).anySatisfy(c->{
+                    assertThat(c.getDocument("lsid")).isEqualTo(first.getDocument("lsid"));
+                    assertThat(c.getNumber("txnNumber").longValue()).isEqualTo(first.getNumber("txnNumber").longValue());
+                });
+                assertThat(commands.stream().filter(c->c.containsKey("findAndModify")).count()).isEqualTo(2);
+                assertThat(identity(f.database()).getLong("claimAdmissionFence")).isEqualTo(1L);
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void lateAbortFirstUsesTheRemainingAllowanceAndRetainsAnyUnfinishedCleanup() {
+        withBusiness(f -> {
+            var mutated=new AtomicBoolean();var paused=new AtomicBoolean();
+            var ready=new CountDownLatch(1);var release=new CountDownLatch(1);var abortObserved=new CountDownLatch(1);
+            var firstAbortMillis=new java.util.concurrent.atomic.AtomicLong(-1);
+            var listener=new CommandListener(){
+                @Override public void commandStarted(CommandStartedEvent event){if(event.getCommandName().equals("findAndModify"))mutated.set(true);}
+                @Override public void commandFailed(CommandFailedEvent event){
+                    if(event.getCommandName().equals("abortTransaction")&&firstAbortMillis.compareAndSet(-1,event.getElapsedTime(TimeUnit.MILLISECONDS)))abortObserved.countDown();
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event){
+                    if(event.getCommandName().equals("abortTransaction")&&firstAbortMillis.compareAndSet(-1,event.getElapsedTime(TimeUnit.MILLISECONDS)))abortObserved.countDown();
+                }
+            };
+            try(var observed=client(listener);var caller=Executors.newSingleThreadExecutor()) {
+                var ownership=new MongoClaimOperations(observed);
+                var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,()->{
+                    if(mutated.get()&&paused.compareAndSet(false,true)){ready.countDown();await(release);throw MongoCacheBusinessIdentity.businessFenced();}
+                },null,ownership);
+                failCommand(f,new Document("failCommands",List.of("abortTransaction")).append("blockConnection",true)
+                        .append("blockTimeMS",3000),new Document("times",1));
+                try {
+                    long started=System.nanoTime();
+                    var result=caller.submit(()->claims.withDeadline(started+Duration.ofSeconds(2).toNanos(),
+                            ()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL)));
+                    assertThat(ready.await(1,TimeUnit.SECONDS)).isTrue();
+                    long pauseUntil=started+Duration.ofMillis(1200).toNanos();
+                    while(pauseUntil-System.nanoTime()>0)java.util.concurrent.locks.LockSupport.parkNanos(pauseUntil-System.nanoTime());
+                    release.countDown();
+                    assertThatThrownBy(()->result.get(2,TimeUnit.SECONDS)).hasCauseInstanceOf(TapstateException.class);
+                    assertThat(abortObserved.await(1,TimeUnit.SECONDS)).isTrue();
+                    assertThat(firstAbortMillis.get()).as("the first abort cannot restart the original two-second allowance").isBetween(0L,1000L);
+                    assertThatThrownBy(ownership::closeIfIdle).isInstanceOf(TapstateException.class);
+                } finally {release.countDown();failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());}
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    private static long deadline() {return System.nanoTime()+Duration.ofSeconds(10).toNanos();}
+    private static void failCommand(Fixture f,Document data,Object mode) {
+        f.admin().getDatabase("admin").runCommand(new Document("configureFailPoint","failCommand")
+                .append("mode",mode).append("data",data));
     }
 
     @Test void admissionExhaustionRefusesWithoutOverflowAndStillAllowsRetirement() {

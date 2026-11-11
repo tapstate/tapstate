@@ -39,6 +39,8 @@ import java.util.function.Predicate;
 @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
 @EnableWebSocket
 public class PipelineStreamConfiguration {
+    static final String STATUS_WATCH_PATH = "/api/pipelines/*/status/watch";
+    static final String LOGS_FOLLOW_PATH = "/api/pipelines/*/logs/follow";
 
     /** The poll cadence for both stream channels, ISO-8601 duration; a working single-node default. */
     private static final String DEFAULT_POLL_INTERVAL = "PT1S";
@@ -77,12 +79,12 @@ public class PipelineStreamConfiguration {
                                     observations,
                                     knownPipeline(pipelines),
                                     catalog, pipelineStreamScheduler, pollInterval),
-                            "/api/pipelines/*/status/watch")
+                            STATUS_WATCH_PATH)
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(
                             credentials, ControlOperations.PIPELINE_STATUS));
             registry.addHandler(
                             new PipelineLogsFollowHandler(logs, pipelineStreamScheduler, pollInterval),
-                            "/api/pipelines/*/logs/follow")
+                            LOGS_FOLLOW_PATH)
                     .addInterceptors(new PipelineStreamHandshakeInterceptor(
                             credentials, ControlOperations.PIPELINE_LOGS));
         };

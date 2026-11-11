@@ -77,8 +77,9 @@ public enum CardinalityBudget {
     NEST_ACCESSES("tapstate.pipeline.nest.accesses", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_READ_KEYS("tapstate.pipeline.nest.read.keys", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_WRITE_KEYS("tapstate.pipeline.nest.write.keys", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
-    NEST_COLD_KEYS("tapstate.pipeline.nest.cold.keys", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_BACKFILLS("tapstate.pipeline.nest.backfills", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_KEY_ACCESSES("tapstate.pipeline.nest.key.accesses", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    NEST_COLD_KEYS("tapstate.pipeline.nest.cold.keys", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
     NEST_BACKFILL_TIME("tapstate.pipeline.nest.backfill.time", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     /** A mark each namespace's own worst moment left: the peaks did not happen together, so they do not add. */
@@ -152,16 +153,23 @@ public enum CardinalityBudget {
     private final Set<String> overflowDimensions;
 
     CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold) {
-        this(instrument, openDimension, distinctValues, fold, openDimension == null ? Set.of() : Set.of(openDimension));
+        this(instrument, openDimension, distinctValues, fold,
+                openDimension == null ? Set.of() : Set.of(openDimension));
     }
 
     CardinalityBudget(String instrument, String openDimension, int distinctValues, Fold fold,
             Set<String> overflowDimensions) {
-        this.overflowDimensions = Set.copyOf(overflowDimensions);
         this.instrument = instrument;
         this.openDimension = openDimension;
         this.distinctValues = distinctValues;
         this.fold = fold;
+        this.overflowDimensions = Set.copyOf(overflowDimensions);
+        if (openDimension != null && !this.overflowDimensions.contains(openDimension)) {
+            throw new IllegalArgumentException("overflow dimensions must include the budget dimension");
+        }
+        if (openDimension == null && !this.overflowDimensions.isEmpty()) {
+            throw new IllegalArgumentException("a closed instrument cannot declare overflow dimensions");
+        }
     }
 
     /** The budget declared for {@code instrument}, or empty for a name that declares none. */

@@ -36,6 +36,19 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 class ScopedPipelineActuationOwnershipTest {
+    @Test void evaluationProofIsPureAndExpiresWithoutAnotherStoreRead() {
+        var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
+        var guard=owner.evaluationProof(FIRST,expected).orElseThrow();int before=reads.get();
+        guard.run();guard.run();assertThat(reads).hasValue(before);
+        nanos.addAndGet(TTL.toNanos());
+        assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
+    }
+    @Test void anExecutionAdvanceInvalidatesTheCapturedPureEvaluationProof() {
+        var owner=ownership();var permit=owner.permit(FIRST);var expected=WorkloadClaimFence.from(permit.claim());
+        var guard=owner.evaluationProof(FIRST,expected).orElseThrow();
+        owner.beginExecution(FIRST,expected);int before=reads.get();
+        assertThatThrownBy(guard::run).isInstanceOf(TapstateException.class);assertThat(reads).hasValue(before);
+    }
     private static final CacheBusinessScope BUSINESS = new CacheBusinessScope("cluster-a", 3, "cache-a");
     private static final PipelineIntentScope FIRST = scope(1);
     private static final Duration TTL = Duration.ofSeconds(30);
@@ -69,6 +82,54 @@ class ScopedPipelineActuationOwnershipTest {
         when(store.acquire(any(), any(), anyLong(), any())).thenThrow(new AssertionError("a scoped holder must not acquire by id"));
         return PipelineActuationOwnership.scoped(BUSINESS, OWNER, membership,
                 new ClusterWorkloadClaims(store, membership), TTL, RENEW, nanos::get);
+    }
+
+    @Test void majorityLossDuringScopedRenewalCannotPublishOrReviveTheOriginalExecution() throws Exception {
+        var owner=ownership();var permit=owner.permit(FIRST);
+        assertThat(owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim())).allowed()).isTrue();
+        var entered=new java.util.concurrent.CountDownLatch(1);var release=new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call->{entered.countDown();
+            if(!release.await(3,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("renewal was not released");
+            return raw.renew(call.getArgument(0),call.getArgument(1));
+        }).when(store).renew(any(),any());
+        nanos.addAndGet(RENEW.toNanos());
+        try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var result=executor.submit(()->owner.permit(FIRST));
+            try {assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();membership.canCommit(Set.of("node-a"));}
+            finally {release.countDown();}
+            assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            membership.canCommit(Set.of("node-a","node-b"));
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+        }finally {release.countDown();owner.stopForShutdown();}
+    }
+
+    @Test void aJoinDuringRenewalPreservesTheOriginalScopedExecution() {
+        var owner=ownership();var permit=owner.permit(FIRST);
+        var execution=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        assertThat(execution.allowed()).isTrue();
+        doAnswer(call->{membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c","node-d")));
+            membership.canCommit(Set.of("node-a","node-b","node-c"));
+            return raw.renew(call.getArgument(0),call.getArgument(1));
+        }).when(store).renew(any(),any());
+        nanos.addAndGet(RENEW.toNanos());var renewed=owner.permit(FIRST);
+        assertThat(renewed.granted()).isTrue();
+        assertThat(WorkloadClaimFence.from(renewed.claim())).isEqualTo(execution.claimFence());
+    }
+
+    @Test void rebaseAndAdvanceShareOneDeadlineThroughTheProductionObservationDecorator() {
+        ownership();
+        var bounded=mock(io.tapstate.spi.store.DeadlineWorkloadClaimStore.class,org.mockito.AdditionalAnswers.delegatesTo(store));
+        var deadlines=new java.util.ArrayList<Long>();
+        doAnswer(call->{deadlines.add(call.getArgument(0));((Runnable)call.getArgument(1)).run();return ((java.util.function.Supplier<?>)call.getArgument(2)).get();})
+                .when(bounded).withDeadline(anyLong(),any(),any());
+        var observed=ObservedWorkloadClaims.observe(bounded,(write,failure)->{});
+        var owner=PipelineActuationOwnership.scoped(BUSINESS,OWNER,membership,new ClusterWorkloadClaims(observed,membership),TTL,RENEW,nanos::get);
+        var permit=owner.permit(FIRST);var run=owner.beginExecution(FIRST,WorkloadClaimFence.from(permit.claim()));
+        assertThat(run.allowed()).isTrue();deadlines.clear();
+        membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c","node-d")));
+        membership.canCommit(Set.of("node-a","node-b","node-c"));
+        assertThat(owner.beginExecution(FIRST,run.claimFence()).allowed()).isTrue();
+        assertThat(deadlines).hasSize(2).containsOnly(deadlines.getFirst());
     }
 
     @Test void aFirstCommandCanProveOnlyItsExactZeroExecutionClaim() {
@@ -827,6 +888,7 @@ class ScopedPipelineActuationOwnershipTest {
         ClusterProperties properties = new ClusterProperties();
         properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         ClusterMembershipGate gate = new ClusterMembershipGate(properties);
+        gate.observeNodeSession(() -> true);
         gate.install(new ClusterMembership("cluster-a", 7, Set.of("node-a", "node-b", "node-c")));
         gate.canCommit(Set.of("node-a", "node-b"));
         return gate;

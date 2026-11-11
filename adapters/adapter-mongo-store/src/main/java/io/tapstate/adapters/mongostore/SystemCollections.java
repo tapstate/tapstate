@@ -201,6 +201,12 @@ public enum SystemCollections {
     CONFIG_PIPELINE_DRAFTS("pipeline_drafts", Database.CONFIG, MongoConfigurationDraftStore.class, Strategy.MIGRATED, 1,
             new IndexSpec(List.of("revision"), false, "pipeline_drafts_revision"),
             new IndexSpec(List.of("updatedAt"), false, "pipeline_drafts_updated_at")),
+    VALIDATION_TASKS("validation_tasks", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
+    VALIDATION_REPORTS("validation_reports", Database.CONFIG, MongoValidationAdmissionStore.class, Strategy.MIGRATED, 2),
+    VALIDATION_DIFFERENCES("validation_differences", Database.CONFIG, MongoValidationResultStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.report"), false, "validation_differences_report")),
+    VALIDATION_RUNS("validation_runs", Database.CACHE, MongoValidationControlStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.clusterId", "_id.pipelineId"), false, "validation_runs_pipeline")),
     CACHE_IDENTITY("cache_identity", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     CACHE_SCHEMA_MIGRATIONS("schema_migrations", Database.CACHE, MongoCacheIdentity.class, Strategy.MIGRATED, 1),
     OP_SESSIONS("op_sessions", Database.CACHE, MongoCacheDomain.class, Strategy.MIGRATED, 1,
@@ -263,6 +269,37 @@ public enum SystemCollections {
     CACHE_SNAPSHOT_ORDERS("snapshot_orders",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1),
     CACHE_SNAPSHOT_COUNTS("snapshot_counts",Database.CACHE,MongoSnapshotStateStore.class,Strategy.MIGRATED,1,
             new IndexSpec(List.of("_id.scope"),false,"snapshot_scope")),
+    ALERT_RULES("alert_rules", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_RECEIVERS("alert_receivers", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SUBSCRIPTIONS("alert_subscriptions", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_SILENCES("alert_silences", Database.CONFIG, MongoAlertConfigurationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_INSTANCES("alert_instances", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "status", "severityRank", "recentSecondOrder", "recentNanoOrder", "_id"), false, "alert_query_active")),
+    ALERT_EPISODES("alert_episodes", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history"),
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "formatVersion", "endReason", "endedSecondOrder", "endedNanoOrder", "_id"), false, "alert_query_ended")),
+    ALERT_TRANSITIONS("alert_transitions", Database.CONFIG, MongoAlertStateStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.alarm.authorityId", "_id.alarm.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.alarm"), false, "alert_alarm_history")),
+    ALERT_NOTIFICATION_SCHEDULES("alert_notification_schedules", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "nextCheckAt", "_id"), false, "alert_query_schedule_due")),
+    ALERT_DELIVERY_INTENTS("alert_delivery_intents", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "formatVersion", "nextCheckAt", "_id"), false, "alert_query_delivery_due"),
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "_id.purpose", "quotaMinute"), false, "alert_query_test_window")),
+    ALERT_TARGET_LIMITS("alert_target_limits", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_TEST_QUOTAS("alert_test_quotas", Database.CONFIG, MongoAlertNotificationStore.class, Strategy.MIGRATED, 2,
+            new IndexSpec(List.of("_id.authorityId", "_id.clusterId", "cleanupAt", "_id"), false, "alert_cleanup")),
+    ALERT_NODE_LIFECYCLES("alert_node_lifecycles", Database.CONFIG, MongoAlertNodeLifecycleStore.class, Strategy.MIGRATED, 1,
+            new IndexSpec(List.of("authorityId","clusterId","phase","nodeId","bootId"), false, "alert_query_node_lifecycle")),
     CONFIG_AI_PROVIDER_SETTINGS("ai_provider_settings", Database.CONFIG, MongoConfigurationAiProviderSettingsStore.class, Strategy.MIGRATED, 2);
 
     /** What happens to a collection's documents as the product's shape moves on. */
@@ -375,6 +412,12 @@ public enum SystemCollections {
         database.withWriteConcern(WriteConcern.ACKNOWLEDGED).createCollection(session, collectionName);
     }
 
+    /** Controlled feature preparation outside document transactions, after its operation is durable. */
+    void prepareCollectionOn(MongoDatabase database) {
+        if(kind!=Kind.COLLECTION)throw new IllegalStateException("only plain collections have this preparation path");
+        database.createCollection(collectionName);
+    }
+
     /**
      * A unique, uncommitted startup probe rather than a collection the product keeps.
      * The connection uses this handle only inside transactions it always aborts.
@@ -413,7 +456,12 @@ public enum SystemCollections {
 
     /** The stable identity binding this declaration to its storage contract inventory. */
     public String resourceId() {
-        return "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+        return switch (this) {
+            case ALERT_RULES, ALERT_RECEIVERS, ALERT_SUBSCRIPTIONS, ALERT_SILENCES, ALERT_INSTANCES,
+                    ALERT_EPISODES, ALERT_TRANSITIONS, ALERT_NOTIFICATION_SCHEDULES, ALERT_DELIVERY_INTENTS,
+                    ALERT_TARGET_LIMITS, ALERT_TEST_QUOTAS, ALERT_NODE_LIFECYCLES -> collectionName;
+            default -> "mongo." + database.name().toLowerCase(Locale.ROOT) + "." + collectionName;
+        };
     }
 
     public Class<?> owner() { return owner; }

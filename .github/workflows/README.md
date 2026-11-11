@@ -21,6 +21,30 @@ finish. A newer PR update can therefore wait for the active run.
 Fork pull requests retain the same tests and explicit missing-secret Sonar
 notice; manual trusted Sonar analysis remains a separate maintainer action.
 
+## Hundred-table verification
+
+`AHundredTablesShareTheSinksWritersIT` runs in the default verification inventory.
+It covers 100 tables with 3 rows each, 4 shared sink writers and 2 members. Startup
+remains bounded to 2 minutes; delivery is bounded to 4 minutes. Artifact apply
+retains the shared 30-second request budget. Model records are written in bounded
+groups using the original guarded transactions.
+
+The investigation and restoration context is tracked in
+[#911](https://github.com/tapstate/tapstate/issues/911). The original target,
+batch-isolation and writer-count assertions remain enabled. Default CI must
+retain an executed result for this case rather than count a skipped result as a
+pass.
+
+With JDK 21, Maven and an already-running Docker daemon, it can also run alone:
+
+```sh
+.github/scripts/hundred-table-diagnostic.sh
+```
+
+The independent entry requires a fresh report with one executed test and zero
+skips. It supplements the normal shard result and does not replace aggregate
+admission.
+
 ## Real connector fixture inputs
 
 The scheduled/manual Real connectors lane builds seven checked connector kinds,

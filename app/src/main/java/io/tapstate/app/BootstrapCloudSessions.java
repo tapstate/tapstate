@@ -8,7 +8,7 @@ import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
 
-/** One designated setup runtime's temporary sessions, atomically closed without migrating any cookie or tombstone. */
+/** One designated setup runtime's temporary sessions, handed to its original CACHE at first publication. */
 final class BootstrapCloudSessions implements CloudSessionStore, AutoCloseable {
     private final CloudSessionIdentity identity;
     private final Runnable requireSetup;
@@ -49,6 +49,14 @@ final class BootstrapCloudSessions implements CloudSessionStore, AutoCloseable {
     }
     @Override public synchronized void invalidate(CloudSessionIdentity expected, String jwt, Instant now) {
         active(); if (identity.equals(expected)) revoked.add(jwt);
+    }
+    synchronized void handoffTo(CloudSessionStore destination, Instant now) {
+        if (closed) return;
+        for (String jwt : revoked) destination.invalidate(identity, jwt, now);
+        for (CloudSessionRecord record : sessions.values()) {
+            if (!revoked.contains(record.jwtId()) && record.idleExpiresAt().isAfter(now)) destination.create(record);
+        }
+        close();
     }
     @Override public synchronized void close() { closed = true; sessions.clear(); revoked.clear(); }
     private static boolean sameSecret(String expected, String presented) {

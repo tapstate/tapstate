@@ -656,6 +656,7 @@ final class Synthetic {
                 + "  channel().put(\"releaseSettings\", new LinkedHashMap<>(context.getConnectionConfig()));"
                 + "  @SuppressWarnings(\"unchecked\") List<Object> released = (List<Object>) channel().get(\"released\");"
                 + "  released.add(String.valueOf(context.getStateMap().get(\"tapdata_pg_slot\")));"
+                + "  if (channel().containsKey(\"changeSlotOnRelease\")) channel().put(\"currentSlot\", \"changed-slot\");"
                 + "  if (channel().containsKey(\"hang\")) {"
                 + "    try {"
                 + "      Thread.sleep(Long.MAX_VALUE);"
@@ -675,6 +676,13 @@ final class Synthetic {
                 + "  if (channel().containsKey(\"unreachable\")) {"
                 + "    throw new IllegalStateException(\"connection refused\");"
                 + "  }"
+                + "});";
+        register += "functions.supportRunRawCommandFunction((context, sql, table, size, consumer) -> {"
+                + "  @SuppressWarnings(\"unchecked\") List<String> queries=(List<String>)channel().computeIfAbsent(\"queries\", key -> new java.util.concurrent.CopyOnWriteArrayList<String>());"
+                + "  queries.add(sql);"
+                + "  Map<String,Object> row=new LinkedHashMap<>();row.put(\"slot_count\",channel().getOrDefault(\"slotCount\",Long.valueOf(0)));"
+                + "  List<TapEvent> result=new ArrayList<>();result.add(TapInsertRecordEvent.create().table(table.getId()).after(row));"
+                + "  consumer.accept(result);"
                 + "});";
         String members = ""
                 + "@SuppressWarnings(\"unchecked\")"
@@ -1348,6 +1356,41 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.CodeOnlyTest", connectionTestSource("CodeOnlyTest", body));
     }
 
+    static Path testSettingsEcho(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.TestSettingsEcho", connectionTestSource("TestSettingsEcho",
+                "s.accept(new TestItem(\"URI\", TestItem.RESULT_SUCCESSFULLY, (String)c.getConnectionConfig().get(\"uri\"))); return ConnectionOptions.create();"));
+    }
+
+    static Path excessiveDiagnosticTest(Path dir, String kind) {
+        String body = switch (kind) {
+            case "items" -> "for(int i=0;i<1025;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY));";
+            case "sum" -> "for(int i=0;i<3;i++) s.accept(new TestItem(\"Check\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(50000)));";
+            case "parameters" -> "TapTestItemException e=new TapTestItemException(); String[] values=new String[1025]; java.util.Arrays.fill(values, \"x\"); e.setDynamicDescriptionParameters(values); s.accept(new TestItem(\"Check\",e,TestItem.RESULT_FAILED));";
+            default -> throw new IllegalArgumentException("unsupported diagnostic fixture");
+        };
+        return SyntheticJar.compileToJar(dir, "synthetic.ExcessiveDiagnostic", connectionTestSource("ExcessiveDiagnostic", body + "return ConnectionOptions.create();"));
+    }
+
+    static Path oversizedTestReport(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.OversizedReport", connectionTestSource("OversizedReport",
+                "s.accept(new TestItem(\"Connection\", TestItem.RESULT_SUCCESSFULLY, \"x\".repeat(200000))); return ConnectionOptions.create();"));
+    }
+
+    static Path thrownTypedTestDiagnostic(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.TypedTestDiagnostic", connectionTestSource("TypedTestDiagnostic",
+                "TapTestItemException failure = new TapTestItemException(); failure.setMessage(\"Login denied\");"
+                + "failure.setReason(\"bad credentials\"); failure.setSolution(\"check credentials\"); failure.setErrorCode(\"28000\"); throw failure;"));
+    }
+
+    static Path emptyTestReport(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.EmptyTestReport", connectionTestSource("EmptyTestReport", "return ConnectionOptions.create();"));
+    }
+
+    static Path defectTest(Path dir, String simpleName, String exception) {
+        return SyntheticJar.compileToJar(dir, "synthetic." + simpleName,
+                connectionTestSource(simpleName, "throw new " + exception + "(\"defect\");"));
+    }
+
     /** A connector whose connectionTest throws — the test could not be completed, a coded drive failure. */
     static Path throwingTest(Path dir) {
         String body = "throw new RuntimeException(\"test boom\");";
@@ -1540,6 +1583,21 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.OrdersConnector", src,
                 Map.of("orders-spec.json", "{\"id\":\"orders\"}"),
                 Map.of("PDK-API-Version", "1.3.5"));
+    }
+
+    static Path connectorMissingItsSuperclass(Path dir) {
+        String source = SELF_SCAN_IMPORTS + "class MissingBase {} "
+                + "@TapConnectorClass(\"orders-spec.json\") public class BrokenConnector extends MissingBase implements TapConnector {"
+                + INERT_CONNECTOR_BODY + "}";
+        var complete = SyntheticJar.compileToJar(dir.resolve("complete"), "synthetic.BrokenConnector", source,
+                Map.of("orders-spec.json", "{\"id\":\"orders\"}"), Map.of("PDK-API-Version", "1.3.5"));
+        var entries = new java.util.LinkedHashMap<String,byte[]>();
+        try (var jar = new java.util.jar.JarFile(complete.toFile())) {
+            for (var entry : jar.stream().filter(e -> !e.isDirectory() && !e.getName().equals("synthetic/MissingBase.class")
+                    && !e.getName().equals("META-INF/MANIFEST.MF")).toList())
+                try (var input = jar.getInputStream(entry)) { entries.put(entry.getName(), input.readAllBytes()); }
+        } catch (java.io.IOException failure) { throw new java.io.UncheckedIOException(failure); }
+        return SyntheticJar.jarWithEntries(dir.resolve("broken"), entries, Map.of("PDK-API-Version", "1.3.5"));
     }
 
     /** A jar with a plain class and no {@code @TapConnectorClass} anywhere — not a connector artifact. */

@@ -97,6 +97,8 @@ public final class OtelMetricsExport implements MetricsExport {
         producer.offer(pipelineId, state, observedAt, facts);
     }
 
+    @Override public void offerRuntime(Instant observedAt,List<MetricFact> facts) { producer.offerRuntime(observedAt,facts); }
+
     @Override
     public void forgetPipelinesOutside(Collection<String> pipelineIds) {
         producer.forgetPipelinesOutside(pipelineIds);

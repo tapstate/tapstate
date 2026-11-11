@@ -99,7 +99,7 @@ class PipelineDirectPreparationIT {
             var fence=WorkloadClaimFence.from(claims.advanceExecution(claims.readPipeline(f.scope).orElseThrow().claim(),1,Set.of(OWNER.nodeId())).orElseThrow());
             var stores=f.cache.srs(f.business(),ACTIVE);var member=sharedMember(stores.log(),true);var ports=new CopyOnWriteArrayList<NativeSharedPort>();
             var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
-            var gate=new ClusterMembershipGate(properties);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","fixture-third")));gate.canCommit(Set.of("node","node-b"));
+            var gate=new ClusterMembershipGate(properties);gate.observeNodeSession(() -> true);gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","fixture-third")));gate.canCommit(Set.of("node","node-b"));
             var ownership=PipelineActuationOwnership.scoped(f.business(),OWNER,gate,new ClusterWorkloadClaims(claims,gate),TTL,Duration.ofSeconds(10),System::nanoTime);
             var engine=mock(io.tapstate.runtime.engine.Engine.class);var actuator=mock(EngineLifecycleActuator.class);
             var configuration=spy(f.configuration);
@@ -532,11 +532,25 @@ class PipelineDirectPreparationIT {
         assertThat(ready.getAsBoolean()).isTrue();
     }
     private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner) {
+        return cacheOwnership(f, owner, () -> true);
+    }
+    private static CaptureOwnership cacheOwnership(Fixture f,WorkloadOwner owner,java.util.function.BooleanSupplier nodeSession) {
         var properties=new ClusterProperties();properties.setProfile(ClusterProperties.Profile.PRODUCTION_HA);
         var gate=new ClusterMembershipGate(properties);
+        if (nodeSession != null) gate.observeNodeSession(nodeSession);
         gate.install(new ClusterMembership("cluster",1,Set.of("node","node-b","fixture-third")));
         gate.canCommit(Set.of("node","node-b"));
         return spy(new CaptureOwnership("cluster",owner,gate,new ClusterWorkloadClaims(f.cache.workloadClaims(f.business()),gate),TTL));
+    }
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void anUnprovedNodeSessionNeverAllocatesACaptureClaim(boolean suppliedFalseProof) {
+        withFixture(f -> {
+            var ownership = cacheOwnership(f, OWNER, suppliedFalseProof ? () -> false : null);
+            var capture = new CaptureId("not-admitted");
+            assertThat(ownership.acquire(capture).acquired()).isFalse();
+            assertThat(f.cache.workloadClaims(f.business()).read(new WorkloadClaimKey(
+                    "cluster", WorkloadClaimType.CAPTURE, capture.value()))).isEmpty();
+        });
     }
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner() {return fixtureProvisioner("c".repeat(64));}
     private static io.tapstate.adapters.pdk.ConnectorProvisioner fixtureProvisioner(String hash) {
@@ -786,8 +800,7 @@ class PipelineDirectPreparationIT {
             });
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var ports=new CopyOnWriteArrayList<NativeDirectSnapshotPort>();var buffer=new SnapshotBuffer(8);
             var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
@@ -891,8 +904,7 @@ class PipelineDirectPreparationIT {
             });
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> {claims.release(call.getArgument(0));return null;}).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var ports=new ArrayList<DirectPort>();var buffer=new SnapshotBuffer(8);
             var member=mock(HazelcastInstance.class);var local=new ConcurrentHashMap<String,Object>();when(member.getUserContext()).thenReturn(local);
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
@@ -966,8 +978,7 @@ class PipelineDirectPreparationIT {
             when(ownership.renew(any())).thenAnswer(call -> claims.renew(call.getArgument(0),TTL));
             when(ownership.ttl()).thenReturn(TTL);
             doAnswer(call -> { claims.release(call.getArgument(0)); return null; }).when(ownership).release(any());
-            var provisioner=mock(io.tapstate.adapters.pdk.ConnectorProvisioner.class);
-            when(provisioner.resolve("mongodb")).thenReturn(new io.tapstate.adapters.pdk.ConnectorRef(List.of(),"not.loaded","2.0.8",null,null,"c".repeat(64),false));
+            var provisioner=fixtureProvisioner();
             var member=mock(HazelcastInstance.class); var buffer=new SnapshotBuffer(8); var opened=new CopyOnWriteArrayList<CaptureConfig>();
             try(var authorization=ExecutionAuthorization.scoped(f.business(),claims,Duration.ofSeconds(2),System::nanoTime,() -> true);
                 var runtime=new NativeSrsCaptureRunUnit(f.business(),f.cache.srs(f.business(),ACTIVE),member);

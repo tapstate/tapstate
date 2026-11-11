@@ -140,9 +140,15 @@ class PipelineDagBuilderAckTest {
         assertThat(dag.getVertex("serve.b").getMetaSupplier()).isNotInstanceOf(WriterRunStart.class);
 
         first.init(new TestProcessorMetaSupplierContext()
-                .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1));
+                .setHazelcastInstance(member).setTotalParallelism(1).setLocalParallelism(1).setJobId(37).setExecutionId(91));
 
         assertThat(sinkAck.started).containsExactly(((WriterRunStart) first).writersByChain());
+        assertThat(sinkAck.outputs).containsExactly(Map.of(
+                "view.v", Map.of("orders", List.of("view.v#0")),
+                "serve.a", Map.of("orders", List.of("serve.a#0"), "items", List.of("serve.a#0")),
+                "serve.b", Map.of("orders", List.of("serve.b#0"), "items", List.of("serve.b#0"))));
+        assertThat(sinkAck.executions).extracting(SinkAckFactory.ExecutionWriters::jobId).containsExactly(37L);
+        assertThat(sinkAck.executions).extracting(SinkAckFactory.ExecutionWriters::executionId).containsExactly(91L);
     }
 
     /** Acks that record every run started through them; each resolves to an ack recording nothing. */
@@ -151,6 +157,8 @@ class PipelineDagBuilderAckTest {
         private static final long serialVersionUID = 1L;
 
         private final List<Map<String, List<String>>> started = new ArrayList<>();
+        private final List<Map<String, Map<String, List<String>>>> outputs = new ArrayList<>();
+        private final List<ExecutionWriters> executions = new ArrayList<>();
 
         @Override
         public SinkAck resolve(HazelcastInstance on) {
@@ -161,6 +169,8 @@ class PipelineDagBuilderAckTest {
         public void beginRun(HazelcastInstance coordinator, Map<String, List<String>> writersByChain) {
             started.add(writersByChain);
         }
+        @Override public void beginRun(HazelcastInstance coordinator, RunWriters writers) { outputs.add(writers.byOutput()); beginRun(coordinator, writers.byStream()); }
+        @Override public void beginRun(HazelcastInstance coordinator, ExecutionWriters execution) { executions.add(execution); beginRun(coordinator, execution.writers()); }
     }
 
     /** Two sources, each its own vertex, with a view sink and a writer for every serve element. */

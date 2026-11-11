@@ -6,7 +6,11 @@ import java.util.*;
 
 /** Immutable original capture results consumed by one deferred Pipeline topology. */
 record PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> logged,Map<String,DirectSourceRun> direct,
-        Map<String,SnapshotOnlySource> snapshots,boolean freshFullLoad) {
+        Map<String,SnapshotOnlySource> snapshots,boolean freshFullLoad,PipelinePreparationInputs authoring,Set<String> sampledSources) {
+    PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> logged,Map<String,DirectSourceRun> direct,
+            Map<String,SnapshotOnlySource> snapshots,boolean freshFullLoad) {
+        this(original,logged,direct,snapshots,freshFullLoad,null,Set.of());
+    }
     record SnapshotOnlySource(String chain,Set<String> tables,long epoch) {
         SnapshotOnlySource {
             Objects.requireNonNull(chain,"chain"); tables=Set.copyOf(tables);
@@ -34,16 +38,27 @@ record PipelineCaptureBindings(ExecutionFence original,Map<String,LoggedSource> 
     }
     PipelineCaptureBindings {
         Objects.requireNonNull(original,"original"); logged = Map.copyOf(logged); direct = Map.copyOf(direct); snapshots=Map.copyOf(snapshots);
+        sampledSources=Set.copyOf(sampledSources);
+        var sources=new HashSet<>(logged.keySet());sources.addAll(direct.keySet());sources.addAll(snapshots.keySet());
+        if(!sampledSources.isEmpty() && (authoring==null || !sources.containsAll(sampledSources)))throw refused();
         if (original.scope() == null) throw new IllegalArgumentException("capture bindings require a physical Pipeline scope");
         if (!Collections.disjoint(logged.keySet(),direct.keySet()) || !snapshots.isEmpty() && (!logged.isEmpty() || !direct.isEmpty())
                 || snapshots.values().stream().map(SnapshotOnlySource::epoch).distinct().count()>1) throw refused();
-        for (var entry : direct.entrySet()) if (!entry.getKey().equals(entry.getValue().context().sourceId())
-                || !original.equals(entry.getValue().execution())) throw refused();
+        requireDirectBindings(original, direct);
         for (var entry : logged.entrySet()) {
             var run = entry.getValue().run();
             if (!entry.getKey().equals(run.sourceId()) || !original.equals(new ExecutionFence(run.scope(),run.originalClaim()))) throw refused();
         }
     }
+
+    private static void requireDirectBindings(
+            ExecutionFence original, Map<String, DirectSourceRun> direct) {
+        for (var entry : direct.entrySet()) {
+            if (!entry.getKey().equals(entry.getValue().context().sourceId())
+                    || !original.equals(entry.getValue().execution())) throw refused();
+        }
+    }
+
     LoggedSource require(String sourceId,String chain,String table) {
         var source = logged.get(sourceId);
         if (source == null || !source.run().miningChainId().equals(chain) || !source.recoveryAfter().containsKey(table)) throw refused();

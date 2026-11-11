@@ -18,11 +18,13 @@ public interface SrsConsumerStore {
     }
 
     Optional<SrsConsumerMembership> find(SrsConsumerKey key);
+    /** Bounded exact original relation only; no scan of other consumers, cursors or model bodies. */
+    default boolean attached(SrsConsumerRun original,String table){throw new io.tapstate.core.common.TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",original.miningChainId()),null);}
     SrsConsumerTopology attached(String miningChainId);
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
-    /** Whether this store verifies the original consumer and event model in one operation. */
+    /** An implementation may validate one event's original consumer and model in one guarded read. */
     default boolean supportsReadEventVerification() { return false; }
 
     /** Empty means the original consumer is unavailable; model and fence failures retain their errors. */

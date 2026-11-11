@@ -129,7 +129,7 @@ public final class Cli implements Runnable {
     static final String DATA_BROWSER_VERB = "data-browser";
 
     public static final Map<String, String> VERB_BY_OPERATION = Map.ofEntries(
-            Map.entry("storage.status", "storage"), Map.entry("storage.test", "storage"), Map.entry("storage.setup.commit", "storage"), Map.entry("storage.setup.status", "storage"),
+            Map.entry("storage.status", "storage"), Map.entry("storage.test", "storage"), Map.entry("storage.setup.commit", "storage"), Map.entry("storage.setup.status", "storage"), Map.entry("storage.setup.activate", "storage"),
             Map.entry("storage.recovery.plan", "storage"), Map.entry("storage.recovery.confirm", "storage"), Map.entry("storage.recovery.status", "storage"),
             Map.entry("configuration.export", "configuration"),
             Map.entry("configuration.import.preflight", "configuration"), Map.entry("configuration.import.commit", "configuration"), Map.entry("configuration.import.status", "configuration"),

@@ -24,16 +24,25 @@ import java.util.OptionalLong;
  * produce a negative over a negative, which is a ratio that can read like anything at all.
  *
  * @param accesses how many times the state was reached for during the window, read or written
- * @param backfills how many of those found nothing in memory and went to the layer behind
+ * @param backfills how many cold loader callbacks completed during the window
  * @param backfillMillis how long those took in total
  * @param entries how many keys the namespace holds in memory as of the later reading
  * @param stored how many keys there are altogether as of the later reading, where there is a layer to ask
+ * @param keyAccesses requested key accesses during the window, where measured
+ * @param coldKeys keys requested by completed cold loaders during the window, where measured
  */
 public record NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
-        OptionalLong stored, NestKeyAccess keyAccess) {
+        OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys, NestKeyAccess keyAccess) {
 
-    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries, OptionalLong stored) {
-        this(accesses, backfills, backfillMillis, entries, stored, null);
+    /** Compatibility window without key instrumentation. */
+    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
+            OptionalLong stored) {
+        this(accesses, backfills, backfillMillis, entries, stored, OptionalLong.empty(), OptionalLong.empty());
+    }
+
+    public NestStateWindow(long accesses, long backfills, long backfillMillis, long entries,
+            OptionalLong stored, OptionalLong keyAccesses, OptionalLong coldKeys) {
+        this(accesses, backfills, backfillMillis, entries, stored, keyAccesses, coldKeys, null);
     }
 
     public NestStateWindow {
@@ -54,7 +63,9 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
         return new NestStateWindow(current.accesses() - previous.accesses(),
                 current.backfills() - previous.backfills(),
                 current.backfillMillis() - previous.backfillMillis(),
-                current.entries(), current.stored(), current.keyAccess() == null ? null : current.keyAccess().since(previous.keyAccess()));
+                current.entries(), current.stored(), difference(previous.keyAccesses(), current.keyAccesses()),
+                difference(previous.coldKeys(), current.coldKeys()),
+                current.keyAccess() == null ? null : current.keyAccess().since(previous.keyAccess()));
     }
 
     /**
@@ -66,22 +77,28 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     public static NestStateWindow fromStart(NestStateReading current) {
         Objects.requireNonNull(current, "current");
         return new NestStateWindow(current.accesses(), current.backfills(), current.backfillMillis(),
-                current.entries(), current.stored(), current.keyAccess());
+                current.entries(), current.stored(), current.keyAccesses(), current.coldKeys(), current.keyAccess());
     }
 
     /**
-     * How much of the reaching during this window had to go to the layer behind memory, between 0 and 1.
-     * Absent where nothing was reached for: zero would be the healthy end of the same scale, so an idle
-     * namespace would read as the one thing this is watched for.
+     * The cold key share, using requested keys on both sides. Absent without both key counters or with
+     * no key accesses: missing instrumentation and an idle namespace must not look like healthy traffic.
      */
     public OptionalDouble servedFromCold() {
-        long attempts = pressureAccesses();
-        return attempts <= 0 || pressureBackfills() < 0 ? OptionalDouble.empty()
-                : OptionalDouble.of((double) pressureBackfills() / attempts);
+        return keyAccesses.isEmpty() || coldKeys.isEmpty() || keyAccesses.getAsLong() == 0
+                ? OptionalDouble.empty()
+                : OptionalDouble.of((double) coldKeys.getAsLong() / keyAccesses.getAsLong());
     }
 
-    public long pressureAccesses() { return keyAccess == null ? accesses : keyAccess.attempts(); }
-    public long pressureBackfills() { return keyAccess == null ? backfills : keyAccess.coldLoads(); }
+    /** Split key readings apply the pressure floor in keys. Older reporters retain the logical floor. */
+    public long pressureAccesses() {
+        return keyAccess == null ? accesses : keyAccesses.orElse(-1);
+    }
+
+    private static OptionalLong difference(OptionalLong previous, OptionalLong current) {
+        return previous.isPresent() && current.isPresent()
+                ? OptionalLong.of(current.getAsLong() - previous.getAsLong()) : OptionalLong.empty();
+    }
 
     /**
      * How much of the namespace is in memory, between 0 and 1. Absent where there is no layer behind the
@@ -113,6 +130,7 @@ public record NestStateWindow(long accesses, long backfills, long backfillMillis
     private static boolean startedOver(NestStateReading previous, NestStateReading current) {
         return current.accesses() < previous.accesses()
                 || current.backfills() < previous.backfills()
-                || current.backfillMillis() < previous.backfillMillis();
+                || current.backfillMillis() < previous.backfillMillis()
+                || current.keyCountsRestartedSince(previous);
     }
 }

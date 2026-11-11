@@ -79,6 +79,8 @@ class NestReadsAFirstTouchKeyOnceNotTwiceIT {
      */
     private static final String REACHES = "nestStateAccesses.";
     private static final String TRIPS = "nestStateBackfills.";
+    private static final String KEY_ACCESSES = "nestStateKeyAccesses.";
+    private static final String COLD_KEYS = "nestStateColdKeys.";
 
     /**
      * Far above the roots seeded, so nothing is ever evicted and every trip in the reading is a first
@@ -206,6 +208,10 @@ class NestReadsAFirstTouchKeyOnceNotTwiceIT {
                         + "time.%n  metrics: %s",
                         reaches, trips, ROOTS, 2L * ROOTS, MEMORY_BUDGET, ROOTS, control.metrics(pipelineId))
                 .isEqualTo((long) ROOTS);
+        // The existing single-key workload has one requested key per logical reach and cold callback.
+        // These additional instruments must travel through the real job and observation face too.
+        assertThat(control.metricTotal(pipelineId, KEY_ACCESSES)).hasValue(reaches);
+        assertThat(control.metricTotal(pipelineId, COLD_KEYS)).hasValue(trips);
     }
 
     /** Every seeded root, with the child table created and left empty. See the class note. */

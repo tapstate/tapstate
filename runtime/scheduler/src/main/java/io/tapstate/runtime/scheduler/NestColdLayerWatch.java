@@ -90,14 +90,13 @@ public final class NestColdLayerWatch {
         NestStateWindow window = baseline == null
                 ? NestStateWindow.fromStart(reading)
                 : NestStateWindow.between(baseline, reading);
-        if (window.pressureAccesses() < pressure.leastAccesses()) {
+        if (window.pressureAccesses() < pressure.leastAccesses() || window.servedFromCold().isEmpty()) {
             // Retain the last judged boundary, so several small samples can make a real window.
             // An idle or undersized sample says nothing about recovery from the previous pressure.
             held.put(namespace, new Seen(reading, baseline, wasOver, before == null ? 0 : before.healthyWindows()));
             return;
         }
-        if (window.keyAccess() != null && (window.pressureBackfills() < 0
-                || window.pressureBackfills() > window.pressureAccesses())) {
+        if (reading.keyAccess() != null && window.coldKeys().getAsLong() > window.keyAccesses().getAsLong()) {
             held.put(namespace, new Seen(reading, reading, wasOver, 0));
             return;
         }
@@ -119,7 +118,8 @@ public final class NestColdLayerWatch {
     private static boolean restarted(NestStateReading previous, NestStateReading current) {
         return current.accesses() < previous.accesses()
                 || current.backfills() < previous.backfills()
-                || current.backfillMillis() < previous.backfillMillis();
+                || current.backfillMillis() < previous.backfillMillis()
+                || current.keyCountsRestartedSince(previous);
     }
 
     /** Observe resets on every sample while accumulating traffic since the last judged boundary. */

@@ -3,6 +3,9 @@ package io.tapstate.runtime.scheduler;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
+import io.tapstate.core.lifecycle.MetricFact;
+import io.tapstate.core.lifecycle.MetricType;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateWindow;
 import io.tapstate.core.lifecycle.Observation;
@@ -44,6 +47,20 @@ import static org.assertj.core.api.Assertions.entry;
  * left unobserved rather than published as an empty doc.
  */
 class ObservationPublisherTest {
+
+    @Test
+    void keyInstrumentsAreAdditionalAndKeepTheLegacyFactsAndFlatValues() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = withWatch(NestColdLayerAlert.NONE,
+                id -> Map.of("nest.orders.doc.$root",
+                        new NestStateReading(8, 100, 400, 2_000).withKeyCounts(800, 400)));
+        wired.publish("orders");
+        assertThat(observations.read("orders").orElseThrow().metrics())
+                .containsEntry("nestStateAccesses.nest.orders.doc.$root", 100L)
+                .containsEntry("nestStateBackfills.nest.orders.doc.$root", 400L)
+                .containsEntry("nestStateKeyAccesses.nest.orders.doc.$root", 800L)
+                .containsEntry("nestStateColdKeys.nest.orders.doc.$root", 400L);
+    }
 
     private static final Instant T0 = Instant.parse("2026-07-01T00:00:00Z");
     private static final Instant OBSERVED_AT = Instant.parse("2026-07-01T12:34:56.789Z");
@@ -234,6 +251,59 @@ class ObservationPublisherTest {
     }
 
     /**
+     * A namespace is named by a digest of its coordinates, which keeps it apart from every other and tells a
+     * reader nothing. Where the reporter knows which step, level and map it is, that is published once per
+     * namespace as an info reading beside the counts, so a reader can name it without the names riding on
+     * every count's series. The flat face is unchanged: it has no spelling for a mapping, and the counts
+     * keep the keys every reader was built against.
+     */
+    @Test
+    void publishCarriesWhereEachNestNamespaceComesFromBesideItsCounts() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L, 0L,
+                        OptionalLong.empty(), new NestOrigin("order_doc", "[\"lines\"]", "state"))));
+
+        wired.publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        assertThat(published.facts())
+                .filteredOn(fact -> fact.name().equals("tapstate.pipeline.nest.namespace.info"))
+                .singleElement().satisfies(fact -> {
+                    assertThat(fact.type()).isEqualTo(MetricType.GAUGE);
+                    assertThat(fact.points()).singleElement().satisfies(point -> {
+                        assertThat(point.value()).isEqualTo(1L);
+                        assertThat(point.attributes()).containsOnly(
+                                entry("tapstate.pipeline.id", "orders"),
+                                entry("tapstate.nest.namespace", "nest.ab12.run.cd34"),
+                                entry("tapstate.nest.step", "order_doc"),
+                                entry("tapstate.nest.path", "[\"lines\"]"),
+                                entry("tapstate.nest.map", "state"));
+                    });
+                });
+        assertThat(published.metrics()).containsOnlyKeys(
+                "nestStateEntries.nest.ab12.run.cd34",
+                "nestStateAccesses.nest.ab12.run.cd34",
+                "nestStateBackfills.nest.ab12.run.cd34",
+                "nestStateBackfillMillis.nest.ab12.run.cd34",
+                "nestStatePendingHighWater.nest.ab12.run.cd34");
+    }
+
+    @Test
+    void aNamespaceWhoseOriginTheReporterCannotSayHasNoInfoReading() {
+        state.seed("orders", PipelineState.RUNNING);
+        ObservationPublisher wired = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> Map.of(), id -> SnapshotReading.NONE, id -> Map.of(),
+                id -> Map.of("nest.ab12.run.cd34", new NestStateReading(4_000L, 900L, 30L, 210L)));
+
+        wired.publish("orders");
+
+        assertThat(observations.read("orders").orElseThrow().facts()).extracting(MetricFact::name)
+                .doesNotContain("tapstate.pipeline.nest.namespace.info");
+    }
+
+    /**
      * The reading no other one can stand in for. What waits under a key lives inside that key's entry, so a
      * queue growing towards the limit that bounds it moves none of the numbers above - the namespace holds
      * the same entries, the layer behind it holds the same, and the key is hot enough to be served from
@@ -398,7 +468,7 @@ class ObservationPublisherTest {
         RecordingAlert alert = new RecordingAlert();
         ObservationPublisher wired = withWatch(alert,
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L))));
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 3_800L)));
 
         wired.publish("orders");
 
@@ -415,12 +485,12 @@ class ObservationPublisherTest {
         RecordingAlert alert = new RecordingAlert();
         Map<String, NestStateReading> readings = new HashMap<>();
         readings.put("nest.orders.doc.$root",
-                new NestStateReading(100L, 4_000L, 40L, 200L, OptionalLong.of(400_000L)));
+                new NestStateReading(100L, 4_000L, 40L, 200L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 40L));
         ObservationPublisher wired = withWatch(alert, id -> Map.copyOf(readings));
 
         wired.publish("orders");
         readings.put("nest.orders.doc.$root",
-                new NestStateReading(100L, 5_000L, 990L, 4_750L, OptionalLong.of(400_000L)));
+                new NestStateReading(100L, 5_000L, 990L, 4_750L, OptionalLong.of(400_000L)).withKeyCounts(5_000L, 990L));
         wired.publish("orders");
 
         // The totals read 20% served from storage and the interval between the passes read 95%. Judging the
@@ -449,7 +519,7 @@ class ObservationPublisherTest {
         };
         ObservationPublisher wired = withWatch(throwing,
                 id -> Map.of("nest.orders.doc.$root",
-                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L))));
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.of(400_000L)).withKeyCounts(4_000L, 3_800L)));
 
         assertThatThrownBy(() -> wired.publish("orders")).isInstanceOf(IllegalStateException.class);
 
@@ -574,7 +644,8 @@ class ObservationPublisherTest {
                 id -> OptionalLong.empty(), id -> { if (broken.get()) throw unavailable; return Map.of(); },
                 id -> SnapshotReading.NONE, id -> Map.of("chain", 4L),
                 id -> Map.of(broken.get() ? "unpublished" : "original",
-                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.empty())),
+                        new NestStateReading(100L, 4_000L, 3_800L, 19_000L, OptionalLong.empty())
+                                .withKeyCounts(4_000L, 3_800L)),
                 cold, id -> Map.of(broken.get() ? "unpublished" : "original", 96_000L), frontier,
                 id -> Map.of(), id -> Map.of(), id -> Map.of(), Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
         state.seed("orders", PipelineState.RUNNING);

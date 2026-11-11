@@ -89,6 +89,7 @@ class StorageSetupServiceTest {
         StorageConnectionProbe probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
             @Override public void test(StorageBinding.Connection input) {}
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         StorageSetupService service() {
             return new StorageSetupService(mode, binding, states, probe, target, () -> Optional.ofNullable(installedConfiguration),
@@ -98,16 +99,151 @@ class StorageSetupServiceTest {
         }
         Map<StorageSetupService.Layer,String> tested(StorageSetupService service, StorageSetupService.Candidate candidate) {
             var stamps = new EnumMap<StorageSetupService.Layer,String>(StorageSetupService.Layer.class);
-            for (var layer : StorageSetupService.Layer.values()) stamps.put(layer, service.test(SCOPE, () -> {}, candidate, layer).testStamp());
+            stamps.put(StorageSetupService.Layer.CACHE, service.test(SCOPE, () -> {}, candidate, StorageSetupService.Layer.CACHE).testStamp());
             return stamps;
         }
     }
+    @Test void cacheProofCommitsWithoutAnyMasterProbe() {
+        var f = new Fixture(); var probes = new ArrayList<String>();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {
+                probes.add(input.database());
+                if (input.database().equals("master")) throw new AssertionError("MASTER must not be contacted");
+            }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
+        };
+        var service = f.service();
+        var stamp = service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE).testStamp();
+        assertThat(service.commit("owner", SCOPE, () -> {}, CANDIDATE,
+                Map.of(StorageSetupService.Layer.CACHE, stamp)).bindingVersion()).isEqualTo(1);
+        assertThat(probes).contains("config", "cache").doesNotContain("master");
+        assertThat(f.target.tests).isZero();
+    }
+
+    @Test void cacheTestReportsTheEmptinessCheck() {
+        var result = new Fixture().service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE);
+        assertThat(result.checks()).contains("cache-database-empty", "transactional-crud", "index-permissions");
+    }
+
+    @Test void retestingTheBoundCacheDoesNotRequireItToBeEmpty() {
+        var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
+        service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps);
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {}
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { return CacheTestResult.occupied(null); }
+        };
+        var result = f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE);
+        assertThat(result.checks()).containsExactly("transactional-crud", "index-permissions");
+        var different = new StorageSetupService.Candidate(CANDIDATE.configuration(), connection("other"), CANDIDATE.master());
+        var retestService = f.service();
+        assertThatThrownBy(() -> retestService.test(SCOPE, () -> {}, different, StorageSetupService.Layer.CACHE))
+                .isInstanceOf(TapstateException.class);
+    }
+
+    @Test void opLocalSetupPreservesLayerAndCauseWhenRecheckFails() {
+        var f = new Fixture();
+        f.states.state = new StorageSetupStateStore.Status(SCOPE, StorageSetupStateStore.Phase.LOCAL_SETUP, 0);
+        var refused = new java.util.concurrent.atomic.AtomicBoolean();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {
+                if (refused.get()) throw new TapstateException(IoError.STORE_UNAUTHORIZED, Map.of(), null);
+            }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
+        };
+        var service = f.service(); var stamps = f.tested(service, CANDIDATE); refused.set(true);
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, CANDIDATE, stamps))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.STORAGE_TEST_FAILED);
+                    assertThat(failure.args()).containsEntry("layer", "CONFIG").containsEntry("causeCode", IoError.STORE_UNAUTHORIZED.code());
+                });
+    }
+
+    @Test void anUnsupportedOccupancyProbeCannotClaimAnEmptyDatabase() {
+        StorageConnectionProbe probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {}
+        };
+        assertThatThrownBy(() -> probe.testCache(CANDIDATE.cache()))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.CACHE_BUSINESS_FENCED));
+    }
+
+    @Test void occupiedCacheCandidateDoesNotReceiveATestStamp() {
+        var f = new Fixture();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {}
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) {
+                return CacheTestResult.occupied("cache_483921");
+            }
+        };
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED);
+                    assertThat(failure.args()).containsEntry("database", "cache")
+                            .containsEntry("suggestedDatabase", "cache_483921");
+                });
+    }
+
+    @Test void occupiedCacheWithoutAVerifiedSuggestionStillUsesAnActionableCode() {
+        var f = new Fixture();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {}
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) {
+                return CacheTestResult.occupied(null);
+            }
+        };
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED);
+                    assertThat(failure.args()).containsEntry("database", "cache")
+                            .doesNotContainKey("suggestedDatabase");
+                });
+    }
+
+    @Test void commitRechecksCacheEmptinessBeforeWritingTheBinding() {
+        var f = new Fixture();
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        f.probe = new StorageConnectionProbe() {
+            @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
+            @Override public void test(StorageBinding.Connection input) {}
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) {
+                return checks.getAndIncrement() == 0
+                        ? CacheTestResult.emptyDatabase()
+                        : CacheTestResult.occupied("cache_483921");
+            }
+        };
+        var service = f.service();
+        var stamp = service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE).testStamp();
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, CANDIDATE,
+                Map.of(StorageSetupService.Layer.CACHE, stamp)))
+                .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                    assertThat(failure.code()).isEqualTo(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED);
+                    assertThat(failure.args()).containsEntry("database", "cache")
+                            .containsEntry("suggestedDatabase", "cache_483921");
+                });
+        assertThat(f.binding.inserts).isZero();
+    }
+
+    @Test void aCacheProofDoesNotDependOnTheUncontactedMasterCandidate() {
+        var f = new Fixture(); var service = f.service();
+        var stamp = service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE).testStamp();
+        var changed = new StorageSetupService.Candidate(CANDIDATE.configuration(), CANDIDATE.cache(), connection("other_master"));
+        assertThat(service.commit("owner", SCOPE, () -> {}, changed,
+                Map.of(StorageSetupService.Layer.CACHE, stamp)).bindingVersion()).isEqualTo(1);
+        assertThat(f.target.tests).isZero();
+    }
+
     @Test void cloudConfigurationIsServerOwnedAndNeverRequiredFromTheBrowser() {
         var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
         var service = f.service();
         var cache = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/cache?tls=true", "cache", null);
         var master = new StorageBinding.Connection(StorageBinding.Connection.Kind.ATLAS, "mongodb://user:secret@customer/master?tls=true", "master", null);
-        assertThatCode(() -> service.test(SCOPE, () -> {}, new StorageSetupService.Candidate(null, cache, master), StorageSetupService.Layer.CONFIG))
+        assertThatCode(() -> service.test(SCOPE, () -> {}, new StorageSetupService.Candidate(null, cache, master), StorageSetupService.Layer.CACHE))
                 .doesNotThrowAnyException();
     }
 
@@ -119,10 +255,11 @@ class StorageSetupServiceTest {
             @Override public void test(StorageBinding.Connection input) {
                 if (committing.get()) {
                     var view = f.progress.snapshot(SCOPE).orElseThrow();
-                    assertThat(view.connectionChecks()).hasSize(3);
+                    assertThat(view.connectionChecks()).containsEntry(StorageSetupService.Layer.CACHE, f.time.instant());
                     assertThat(view.connectionChecks().values()).allMatch(f.time.instant()::equals);
                 }
             }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         var service = f.service();
         var stamps = f.tested(service, CANDIDATE);
@@ -141,11 +278,11 @@ class StorageSetupServiceTest {
     @Test void anOpCandidateCanBeTestedBeforeItsConfigurationUriIsInstalled() {
         var f = new Fixture(); f.installedConfiguration = null;
         var service = f.service();
-        assertThatCode(() -> service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CONFIG)).doesNotThrowAnyException();
+        assertThatCode(() -> service.test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE)).doesNotThrowAnyException();
     }
     @Test void cloudCannotReplaceItsPlatformConfiguration() {
         var f = new Fixture(); f.mode = StorageBinding.Mode.CLOUD;
-        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CONFIG))
+        assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE))
                 .isInstanceOf(TapstateException.class).hasMessage(ControlError.STORAGE_SCOPE_CONFLICT.code());
     }
     @Test void opCommitWaitsForTheOriginalConfigurationHandoff() {
@@ -159,7 +296,7 @@ class StorageSetupServiceTest {
     }
     @Test void formalLayerTestsPublishOneBindingAndAnExpiredRetryOnlyReadsTheOriginalResult() {
         var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
-        assertThat(f.target.tests).isEqualTo(1);
+        assertThat(f.target.tests).isZero();
         assertThat(service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps).setupPhase()).isEqualTo(StorageSetupStateStore.Phase.STORAGE_BOUND);
         f.time.now = f.time.now.plus(Duration.ofDays(1));
         assertThat(service.commit("admin", SCOPE, () -> {}, CANDIDATE, Map.of()).bindingVersion()).isEqualTo(1);
@@ -204,6 +341,7 @@ class StorageSetupServiceTest {
         f.probe = new StorageConnectionProbe() {
             @Override public StorageBinding.Connection normalize(StorageBinding.Connection input) { return input; }
             @Override public void test(StorageBinding.Connection input) { counter.incrementAndGet(); }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         var service = f.service(); var shared = new StorageSetupService.Candidate(CANDIDATE.configuration(), CANDIDATE.configuration(), CANDIDATE.master());
         assertThatThrownBy(() -> {
@@ -219,6 +357,7 @@ class StorageSetupServiceTest {
             @Override public void test(StorageBinding.Connection input) {
                 if (!allowed.get()) throw new TapstateException(ControlError.UNREACHABLE, Map.of(), null);
             }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         var service = f.service(); var stamps = f.tested(service, CANDIDATE); allowed.set(false);
         assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
@@ -231,11 +370,11 @@ class StorageSetupServiceTest {
         assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, changed, stamps)).isInstanceOf(TapstateException.class);
         assertThat(f.binding.inserts).isZero(); assertThat(f.audit).isEmpty();
     }
-    @Test void changingTheRegisteredArtifactOrSpecInvalidatesAllLayerProofs() {
+    @Test void aCacheProofDoesNotBindTheUntestedConnectorArtifact() {
         var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
         f.target.identity = new StorageSetupService.ConnectorIdentity("c".repeat(64), "b".repeat(64));
-        assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps)).isInstanceOf(TapstateException.class);
-        assertThat(f.binding.inserts).isZero();
+        assertThat(service.commit("admin", SCOPE, () -> {}, CANDIDATE, stamps).bindingVersion()).isEqualTo(1);
+        assertThat(f.binding.inserts).isOne();
     }
     @Test void anAuditDelayCannotTurnAnExpiredStampIntoAnAuthorizedWrite() {
         var f = new Fixture(); var service = f.service(); var stamps = f.tested(service, CANDIDATE);
@@ -253,7 +392,9 @@ class StorageSetupServiceTest {
         var f = new Fixture(); var service = f.service();
         assertThatThrownBy(() -> service.commit("admin", SCOPE, () -> {}, CANDIDATE, Map.of())).isInstanceOf(TapstateException.class);
         var other = new StorageSetupService.Candidate(connection("other_config"), CANDIDATE.cache(), CANDIDATE.master());
-        assertThatThrownBy(() -> service.test(SCOPE, () -> {}, other, StorageSetupService.Layer.CONFIG)).isInstanceOf(TapstateException.class);
+        var otherStamp = service.test(SCOPE, () -> {}, other, StorageSetupService.Layer.CACHE).testStamp();
+        assertThatThrownBy(() -> service.commit("owner", SCOPE, () -> {}, other,
+                Map.of(StorageSetupService.Layer.CACHE, otherStamp))).isInstanceOf(TapstateException.class);
         assertThat(f.binding.inserts).isZero();
     }
     @Test void aProbeRefusalCarriesOnlyItsLayerAndCanonicalCode() {
@@ -263,6 +404,7 @@ class StorageSetupServiceTest {
             @Override public void test(StorageBinding.Connection input) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", "sentinel-secret"), null);
             }
+            @Override public CacheTestResult testCache(StorageBinding.Connection input) { test(input); return CacheTestResult.emptyDatabase(); }
         };
         assertThatThrownBy(() -> f.service().test(SCOPE, () -> {}, CANDIDATE, StorageSetupService.Layer.CACHE))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> {

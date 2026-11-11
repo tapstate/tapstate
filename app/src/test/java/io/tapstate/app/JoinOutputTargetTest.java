@@ -339,14 +339,14 @@ class JoinOutputTargetTest {
             Map<String, Map<String, TargetTable>> into) {
         return new StoreBackedDagSource.SinkWriterBinder() {
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     TargetTable target, PipelineNode node) {
                 return (SupplierEx<SinkWriter>) () -> null;
             }
 
             @Override
-            public SupplierEx<? extends SinkWriter> bind(String connectorId,
+            public SupplierEx<SinkWriter> bind(String connectorId,
                     Map<String, Object> settings, WriteMode writeMode, DdlPolicy ddl,
                     Map<String, TargetTable> targets, PipelineNode node) {
                 into.put(connectorId, targets);

@@ -72,6 +72,34 @@ class NestColdLayerWatchTest {
     }
 
     @Test
+    void missingKeyInstrumentationNeitherRaisesNorClearsPressure() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", new NestStateReading(100, 200, 200, 200)));
+        assertThat(alert.crossed).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(200, 200)));
+        assertThat(alert.crossed).containsExactly("p1/ns");
+        watch.saw("p1", Map.of("ns", new NestStateReading(100, 400, 200, 200)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(500, 200)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(600, 200)));
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    @Test
+    void resettingOnlyKeyCountersDiscardsTheOldPartialWindow() {
+        NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
+        watch.saw("p1", Map.of("ns", reading(200, 200)));
+        watch.saw("p1", Map.of("ns", reading(280, 200)));
+        watch.saw("p1", Map.of("ns", reading(281, 210).withKeyCounts(40, 36)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(381, 210).withKeyCounts(140, 36)));
+        assertThat(alert.cleared).isEmpty();
+        watch.saw("p1", Map.of("ns", reading(481, 210).withKeyCounts(240, 36)));
+        assertThat(alert.cleared).containsExactly("p1/ns");
+    }
+
+    @Test
     void aSmallOrIdleSampleDoesNotClearPressureWhileEveryReadStillGoesToStorage() {
         NestColdLayerWatch watch = new NestColdLayerWatch(PRESSURE, alert);
 
@@ -256,7 +284,8 @@ class NestColdLayerWatchTest {
 
     /** A reading of a namespace holding 100 of its 10000 keys in memory, having served what is passed. */
     private static NestStateReading reading(long accesses, long backfills) {
-        return new NestStateReading(100, accesses, backfills, backfills, OptionalLong.of(10_000));
+        return new NestStateReading(100, accesses, backfills, backfills, OptionalLong.of(10_000))
+                .withKeyCounts(accesses, backfills);
     }
 
     /** Collects what was reported, named so a test asserts on the pipeline and namespace together. */

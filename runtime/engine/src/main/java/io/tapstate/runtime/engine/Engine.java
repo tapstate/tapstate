@@ -17,6 +17,7 @@ import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.StageReading;
+import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
@@ -25,6 +26,7 @@ import io.tapstate.runtime.engine.nest.NestSettings;
 import io.tapstate.runtime.engine.nest.NestStatePlacement;
 import io.tapstate.runtime.engine.nest.NestStateMetricNames;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.OperatorPlacement;
 import io.tapstate.spi.store.OperatorStateStores;
 import java.time.Duration;
 import java.time.Instant;
@@ -218,6 +220,8 @@ public final class Engine {
             this.originalManifest = originalManifest;
         }
         public long jobId() { return job.getId(); }
+        /** Original Job metadata only; no processor, reader or commit completion is inferred. */
+        public JobStatus status(){return job.getStatus();}
         public OperatorRunManifest operatorManifest() {
             if (originalManifest == null || !identity.equals(originalManifest.executionIdentity())
                     || !originalManifest.equals(requireOperatorManifest(job, job.getConfig()))) throw runRefused(pipelineId);
@@ -932,12 +936,13 @@ public final class Engine {
                         .merge(reading.kind(), measurement.value(), Math::max);
             }
         }
+        OperatorMapBindings bindings = member.getUserContext() == null ? null
+                : OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
         var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
                 .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
         var keySamples = io.tapstate.runtime.engine.nest.NestStateSamples.keyAccess(collected, dataMembers);
         var diagnostics = io.tapstate.runtime.engine.nest.NestStateSamples.diagnostics(collected);
-        var bindings = OperatorMapBindings.resolve(member, false);
         byNamespace.forEach((namespace, kinds) -> {
             var reading = NestStateMetricNames.readingFrom(kinds, stored(namespace));
             var measured = diagnostics.get(namespace);
@@ -945,13 +950,24 @@ public final class Engine {
                 if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
                 if (measured.commits() != null) reading = reading.withCommits(measured.commits());
             }
-            var origin = bindings == null ? null : bindings.placementOf(namespace)
-                    .filter(placement -> placement.resource() == io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE)
-                    .map(placement -> new io.tapstate.core.lifecycle.NestOrigin(placement.stepId(), placement.pathId(), placement.namespace()))
-                    .orElse(null);
-            readings.put(namespace, reading.withContext(keySamples.get(namespace), origin));
+            readings.put(namespace, reading.withContext(keySamples.get(namespace), originOf(bindings, namespace)));
         });
         return readings;
+    }
+
+    /**
+     * Where a namespace sits in the pipeline's definition, read off the placement its hot map was installed
+     * for on this member; null where this member holds no such map, which leaves the reading unnamed rather
+     * than wrongly named.
+     */
+    private static NestOrigin originOf(OperatorMapBindings bindings, String namespace) {
+        if (bindings == null) {
+            return null;
+        }
+        return bindings.placementOf(namespace)
+                .filter(placement -> placement.resource() == OperatorPlacement.Resource.NEST_STATE)
+                .map(placement -> new NestOrigin(placement.stepId(), placement.pathId(), placement.namespace()))
+                .orElse(null);
     }
 
     /**
