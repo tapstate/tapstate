@@ -57,16 +57,27 @@ public final class AggregateStepRules {
                 if (bodyOf(step, byId) instanceof TransformBody.Aggregate aggregate) {
                     refuseNameConflicts(step.id(), aggregate);
                     refuseUnsupportedInput(step, steps, byId);
+                    refuseFiltersUpstream(step.id(), pipeline, byId);
                 }
             }
         }
     }
 
     /**
-     * The filter steps between {@code step} and its source tables, nearest first. Each is safe only when
-     * the source it reads sends the row as it was before an update, which the caller knows and this does
-     * not.
+     * A filter step above the aggregate is refused. A filter handles one event at a time, so it can turn
+     * "this row stopped matching" into a removal only when the update says what the row was before, and
+     * no source declares that it always does. Without it the row's old contribution would stay in its
+     * group for good. The step's own {@code where:} has no such limit, because the step remembers the row.
      */
+    private static void refuseFiltersUpstream(String step, PipelineResource pipeline, Map<String, Resource> byId) {
+        List<String> filters = filtersUpstream(step, pipeline, byId);
+        if (!filters.isEmpty()) {
+            throw new TapstateException(AggregateError.UPSTREAM_FILTER_UNSAFE, Map.of("step", step,
+                    "filter", filters.getFirst(), "source", String.join(", ", pipeline.sourceIds())), null);
+        }
+    }
+
+    /** The filter steps between {@code step} and its source tables, nearest first. */
     public static List<String> filtersUpstream(String step, PipelineResource pipeline, Map<String, Resource> byId) {
         Map<String, Step> steps = new LinkedHashMap<>();
         if (pipeline.transforms() != null) {
