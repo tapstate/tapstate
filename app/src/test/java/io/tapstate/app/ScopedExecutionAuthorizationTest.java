@@ -55,6 +55,10 @@ class ScopedExecutionAuthorizationTest {
     }
 
     private ExecutionAuthorization guard() {
+        return guard(WINDOW);
+    }
+
+    private ExecutionAuthorization guard(Duration window) {
         when(store.readPipeline(any())).thenAnswer(call -> {
             reads.incrementAndGet();
             if (!call.getArgument(0).equals(current.get())) throw fenced();
@@ -63,7 +67,24 @@ class ScopedExecutionAuthorizationTest {
         when(store.read(any())).thenThrow(new AssertionError("metadata reads cannot authorize a scoped run"));
         when(store.recordExecutionFailure(any(), any(Boolean.class))).thenAnswer(call ->
                 raw.recordExecutionFailure(call.getArgument(0), call.getArgument(1)));
-        return ExecutionAuthorization.scoped(BUSINESS, store, WINDOW, nanos::get, nodeActive::get);
+        return ExecutionAuthorization.scoped(BUSINESS, store, window, nanos::get, nodeActive::get);
+    }
+
+    @Test void aWriterGuardAcceptsARefreshedProofForTheSameFence() {
+        var original = WorkloadClaimFence.from(run());
+        var fence = new ExecutionFence(FIRST, original);
+        try (var guard = guard(Duration.ofSeconds(1))) {
+            assertThat(guard.require(fence)).isEqualTo(original);
+            Runnable writer = guard.localProofGuard(fence);
+
+            nanos.set(Duration.ofMillis(1050).toNanos());
+            assertThat(guard.require(fence)).isEqualTo(original);
+            writer.run();
+
+            nodeActive.set(false);
+            assertThatThrownBy(writer::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        }
     }
 
     @Test void aScopedRunKeepsItsIdentityAndOwnerAcrossSerialization() throws Exception {

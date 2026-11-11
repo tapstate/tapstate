@@ -383,7 +383,7 @@ class ScopedSrsSinkAckFactoryTest {
                 requireActive.run();
                 return FENCE;
             });
-            when(authorization.pinLocalProof(any())).thenAnswer(call -> {
+            when(authorization.localProofGuard(any())).thenAnswer(call -> {
                 requireActive.run();
                 return requireActive;
             });

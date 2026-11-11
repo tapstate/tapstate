@@ -33,7 +33,7 @@ final class ScopedSrsConsumerAccess {
                 return;
             }
             if (!run.originalClaim().equals(claimed)) throw refused(run);
-            writerProof.set(authorization.pinLocalProof(fence));
+            writerProof.set(authorization.localProofGuard(fence));
             try {
                 operation.accept(writerStore);
             } finally {
