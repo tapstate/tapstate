@@ -289,6 +289,60 @@ class PipelineExplainServiceTest {
     }
 
     @Test
+    void anExplanationListsEachRollupFieldWithItsLevelFunctionFilterAndTheReferencesItReads() {
+        Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 5L), 5L,
+                NOW.minusSeconds(2));
+        Resource pipeline = new DslParser().parse("""
+                version: tapstate/v1
+                kind: pipeline
+                id: orders
+                source: source
+                transforms:
+                  - id: doc
+                    type: nest
+                    from: { t: transactions, i: items, pd: prizes, r: ratings }
+                    root:
+                      from: t
+                      key: [id]
+                      embed:
+                        - from: i
+                          on: { transaction_id: id }
+                          as: array
+                          path: item_movement
+                          arrayKey: [id]
+                          embed:
+                            - { from: pd, on: { id: prize_definition_id }, as: object, path: prize_definition }
+                          rollup:
+                            qty: { sum: $amount, default: 0 }
+                            reward_qty: { sum: $amount, filter: "=after.prize_definition.prize_code == 'reward'" }
+                        - from: r
+                          on: { trans_id: id }
+                          as: rollup
+                          arrayKey: [trans_id, rating_type]
+                          rollup:
+                            latest_score: { last: { value: $score, by: [ $model_date, $rating_type ] } }
+                serve:
+                  from: doc
+                  sync:
+                    - id: sink
+                      source: target
+                      write_mode: upsert
+                """);
+        ArtifactQueryService artifacts = artifactsOf(new LinkedHashMap<>(Map.of(ID, pipeline)));
+        PipelineExplainService explaining = new PipelineExplainService(artifacts, observations(observation),
+                Clock.fixed(NOW, ZoneOffset.UTC), (key, args) -> key);
+
+        assertThat(explaining.explain(ID).rollups()).containsExactly(
+                new PipelineExplanation.Rollup("doc", "$root", "item_movement", "qty", "sum", "$amount", null,
+                        List.of()),
+                new PipelineExplanation.Rollup("doc", "$root", "item_movement", "reward_qty", "sum", "$amount",
+                        "=after.prize_definition.prize_code == 'reward'", List.of("prize_definition")),
+                new PipelineExplanation.Rollup("doc", "$root", "$rollup[r]", "latest_score", "last",
+                        "$score by $model_date, $rating_type", null, List.of()));
+        assertThat(service(observation).explain(ID).rollups()).isEmpty();
+    }
+
+    @Test
     void anExplanationOfARunWithNoPlanRecordedCarriesNone() {
         Observation observation = observation(PipelineState.RUNNING, Map.of("recordCount", 5L), 5L,
                 NOW.minusSeconds(2));
@@ -372,6 +426,10 @@ class PipelineExplainServiceTest {
                           ddl: apply
                     """.formatted(id)));
         }
+        return artifactsOf(resources);
+    }
+
+    private static ArtifactQueryService artifactsOf(Map<String, Resource> resources) {
         return new ArtifactQueryService(new ArtifactStore() {
             @Override
             public void saveAll(List<Resource> artifacts) {

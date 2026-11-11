@@ -26,7 +26,13 @@ record PipelineExplanationResponse(
         @JsonInclude(JsonInclude.Include.ALWAYS) Next next,
         Pending pending,
         ExecutionPlanResponse plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        List<Rollup> rollups) {
+
+    /** One rollup field the pipeline declares, as written; absent when it declares none. */
+    record Rollup(String step, String level, String embed, String field, String function, String argument,
+            String filter, List<String> references) {
+    }
 
     record Evidence(String source, String field,
             @JsonInclude(JsonInclude.Include.ALWAYS) Object value) {
@@ -57,7 +63,11 @@ record PipelineExplanationResponse(
                 explanation.pending() == null ? null
                         : new Pending(explanation.pending().reason().name()),
                 ExecutionPlanResponse.of(explanation.plan()),
-                explanation.awaitingRebalance().isEmpty() ? null : explanation.awaitingRebalance());
+                explanation.awaitingRebalance().isEmpty() ? null : explanation.awaitingRebalance(),
+                explanation.rollups().isEmpty() ? null : explanation.rollups().stream()
+                        .map(r -> new Rollup(r.step(), r.level(), r.embed(), r.field(), r.function(), r.argument(),
+                                r.filter(), r.references().isEmpty() ? null : r.references()))
+                        .toList());
     }
 
     private static Evidence evidence(PipelineExplanation.Evidence evidence) {

@@ -130,8 +130,8 @@ public final class DslParser {
     private static final Set<String> EMBED_KEYS = Set.of(
             "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed", "rollup");
     /** The keys that qualify a rollup field's one function rather than naming it. */
-    private static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
-    private static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
+    static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
+    static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
     private static final Set<String> VIEW_INLINE_KEYS = Set.of(
             "id", "from", PRIMARY_KEY_FIELD, STORAGE_FIELD, "write_mode", "on_full_load", EXECUTION_FIELD);
     private static final Set<String> VIEW_USE_KEYS = Set.of("id", "use", "from");

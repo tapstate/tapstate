@@ -1,0 +1,15 @@
+version: tapstate/v1
+kind: source
+id: src_ins
+connector: oracle
+config:
+  host: 10.20.0.16
+  password: Ins_2026
+  service_name: INS
+  username: cdc_user
+mode: cdc
+tables: [CUSTOMERS, POLICIES, CLAIMS]
+srs:
+  retention: 30d
+  schema_evolution: track
+  queryable: true

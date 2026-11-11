@@ -6,6 +6,10 @@ import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.DdlPolicy;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.RollupResultType;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.ErrorPolicy;
 import io.tapstate.core.model.FieldRule;
@@ -415,7 +419,7 @@ public final class PipelineRepresentation {
             value.put("from", embed.from());
             value.put("on", embed.on());
             value.put("as", embed.as() == null ? null : embed.as().name());
-            if (embed.as() != EmbedAs.FLAT) {
+            if (embed.as() != EmbedAs.FLAT && embed.as() != EmbedAs.ROLLUP) {
                 value.put("path", embed.path());
             }
             value.put("key", embed.key());
@@ -423,8 +427,39 @@ public final class PipelineRepresentation {
             value.put("ignoreUpdates", embed.ignoreUpdates());
             value.put("trackKeyChanges", embed.trackKeyChanges());
             value.put("embed", embedValues(embed.embed()));
+            value.put("rollup", rollupValues(embed.rollup()));
             return Collections.unmodifiableMap(value);
         }).toList();
+    }
+
+    /** Rollup fields in the shape they are written in: one function key carrying its argument, then options. */
+    private static Map<String, Object> rollupValues(Map<String, RollupField> fields) {
+        if (fields == null) {
+            return null;
+        }
+        Map<String, Object> values = new LinkedHashMap<>();
+        fields.forEach((name, field) -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            Object argument = field.argument();
+            if (argument instanceof RollupPick pick) {
+                Map<String, Object> picked = new LinkedHashMap<>();
+                picked.put("value", pick.value());
+                picked.put("by", pick.by());
+                argument = Collections.unmodifiableMap(picked);
+            }
+            value.put(field.function().yaml(), argument);
+            if (field.filter() != null) {
+                value.put("filter", field.filter());
+            }
+            if (field.type() != null) {
+                value.put("type", field.type().yaml());
+            }
+            if (field.defaultValue() != null) {
+                value.put("default", field.defaultValue());
+            }
+            values.put(name, Collections.unmodifiableMap(value));
+        });
+        return Collections.unmodifiableMap(values);
     }
 
     private static Map<String, Object> fieldRuleValues(Map<String, FieldRule> rules) {
@@ -625,18 +660,75 @@ public final class PipelineRepresentation {
             if (as == EmbedAs.FLAT && arrayKey != null) {
                 throw malformed(entryPath + ".arrayKey is forbidden when as is flat");
             }
+            if (as == EmbedAs.ROLLUP && embedPath != null) {
+                throw malformed(entryPath + ".path is forbidden when as is rollup");
+            }
+            Map<String, RollupField> rollup = rollupFields(value.get("rollup"), entryPath + ".rollup");
+            if ((as == EmbedAs.OBJECT || as == EmbedAs.FLAT) && rollup != null) {
+                throw malformed(entryPath + ".rollup is forbidden when as is " + as.yaml());
+            }
+            if (as == EmbedAs.ROLLUP && (rollup == null || rollup.isEmpty())) {
+                throw malformed(entryPath + ".rollup is required when as is rollup");
+            }
             result.add(new Embed(
                     requiredText(value, "from", entryPath),
                     stringMap(requiredObject(value, "on", entryPath), entryPath + ".on"),
                     as,
-                    as == EmbedAs.FLAT ? null : requiredText(value, "path", entryPath),
+                    as == EmbedAs.FLAT || as == EmbedAs.ROLLUP ? null : requiredText(value, "path", entryPath),
                     key,
                     arrayKey,
                     booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), entryPath + ".ignoreUpdates"),
                     booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), entryPath + ".trackKeyChanges"),
-                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed")));
+                    embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed"),
+                    rollup));
         }
         return List.copyOf(result);
+    }
+
+    /** Rollup fields read back from their written shape; exactly one function key per field. */
+    private static Map<String, RollupField> rollupFields(Object raw, String path) {
+        if (raw == null) {
+            return null;
+        }
+        Map<String, Object> fields = object(raw, path);
+        Map<String, RollupField> result = new LinkedHashMap<>();
+        for (Map.Entry<String, Object> entry : fields.entrySet()) {
+            String fieldPath = path + "." + entry.getKey();
+            Map<String, Object> value = object(entry.getValue(), fieldPath);
+            List<RollupFunction> functions = new ArrayList<>();
+            for (String key : value.keySet()) {
+                if (!List.of("filter", "type", "default").contains(key)) {
+                    functions.add(RollupFunction.byYaml(key).orElseThrow(
+                            () -> malformed(fieldPath + "." + key + " is not a rollup function; one of "
+                                    + RollupFunction.spellings())));
+                }
+            }
+            if (functions.size() != 1) {
+                throw malformed(fieldPath + " must name exactly one rollup function");
+            }
+            RollupFunction function = functions.getFirst();
+            Object argument = value.get(function.yaml());
+            if (function == RollupFunction.FIRST || function == RollupFunction.LAST) {
+                Map<String, Object> pick = object(argument, fieldPath + "." + function.yaml());
+                Object by = pick.get("by");
+                List<String> order = by instanceof String single ? List.of(single)
+                        : stringsOrNull(by, fieldPath + "." + function.yaml() + ".by");
+                if (order == null || order.isEmpty()) {
+                    throw malformed(fieldPath + "." + function.yaml() + ".by is required");
+                }
+                argument = new RollupPick(requiredText(pick, "value", fieldPath + "." + function.yaml()), order);
+            } else if (!(argument instanceof String) && !(function == RollupFunction.COUNT
+                    && Boolean.TRUE.equals(argument))) {
+                throw malformed(fieldPath + "." + function.yaml() + " must be an expression"
+                        + (function == RollupFunction.COUNT ? " or true" : ""));
+            }
+            RollupResultType type = value.get("type") == null ? null
+                    : enumValue(value.get("type"), RollupResultType.values(), RollupResultType::yaml,
+                            fieldPath + ".type");
+            result.put(entry.getKey(), RollupField.of(function, argument,
+                    textOrNull(value.get("filter"), fieldPath + ".filter"), type, value.get("default")));
+        }
+        return result;
     }
 
     private static ViewBlock view(Map<String, Object> value) {

@@ -211,27 +211,41 @@ final class SchemaGenerator {
     }
 
     /**
-     * A flat embed merges into its parent and therefore has no target path or array identity. The other
-     * two shapes still require a path. This conditional belongs beside the generated record rather than
+     * A flat embed merges into its parent and therefore has no target path or array identity. A rollup embed
+     * renders no array, so it has no path either, and exists only for the rollup fields it must declare. The
+     * other two shapes still require a path. This conditional belongs beside the generated record rather than
      * in the checked-in artifact, so the schema remains reproducible from the model contract.
      */
     private static Json flatEmbedShape() {
-        Json flat = new Json.Obj(List.of(
+        Json noPath = not(required("path"));
+        Json noArrayKey = not(required("arrayKey"));
+        Json noRollup = not(required("rollup"));
+        Json rollupShape = new Json.Obj(List.of(
+                new Json.Entry("if", shapeIs("rollup")),
+                new Json.Entry("then", new Json.Obj(List.of(new Json.Entry("allOf",
+                        new Json.Arr(List.of(noPath, required("rollup"))))))),
+                new Json.Entry("else", required("path"))));
+        return new Json.Obj(List.of(
+                new Json.Entry("if", shapeIs("flat")),
+                new Json.Entry("then", new Json.Obj(List.of(new Json.Entry("allOf",
+                        new Json.Arr(List.of(noPath, noArrayKey, noRollup)))))),
+                new Json.Entry("else", rollupShape)));
+    }
+
+    private static Json shapeIs(String as) {
+        return new Json.Obj(List.of(
                 new Json.Entry("properties", new Json.Obj(List.of(
                         new Json.Entry("as", new Json.Obj(List.of(
-                                new Json.Entry("const", new Json.Str("flat")))))))),
+                                new Json.Entry("const", new Json.Str(as)))))))),
                 new Json.Entry("required", new Json.Arr(List.of(new Json.Str("as"))))));
-        Json noPath = new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
-                new Json.Entry("required", new Json.Arr(List.of(new Json.Str("path")))))))));
-        Json noArrayKey = new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
-                new Json.Entry("required", new Json.Arr(List.of(new Json.Str("arrayKey")))))))));
-        Json thenShape = new Json.Obj(List.of(new Json.Entry("allOf", new Json.Arr(List.of(noPath, noArrayKey)))));
-        Json elseShape = new Json.Obj(List.of(new Json.Entry("required",
-                new Json.Arr(List.of(new Json.Str("path"))))));
-        return new Json.Obj(List.of(
-                new Json.Entry("if", flat),
-                new Json.Entry("then", thenShape),
-                new Json.Entry("else", elseShape)));
+    }
+
+    private static Json required(String field) {
+        return new Json.Obj(List.of(new Json.Entry("required", new Json.Arr(List.of(new Json.Str(field))))));
+    }
+
+    private static Json not(Json schema) {
+        return new Json.Obj(List.of(new Json.Entry("not", schema)));
     }
 
     private static RecordComponent flattenedComponent(Class<?> record) {

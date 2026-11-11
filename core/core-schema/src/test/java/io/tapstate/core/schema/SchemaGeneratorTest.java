@@ -239,24 +239,43 @@ class SchemaGeneratorTest {
     }
 
     @Test
-    void flatEmbedOmitsPathAndArrayKeyWhileOtherShapesStillRequirePath() {
+    void flatAndRollupEmbedsOmitPathWhileOtherShapesStillRequireIt() {
         Json.Obj defs = (Json.Obj) generator.generateTree().get("$defs");
         Json.Obj embed = (Json.Obj) defs.get("Embed");
 
         assertThat(((Json.Arr) embed.get("required")).items())
                 .containsExactlyInAnyOrder(new Json.Str("from"), new Json.Str("on"), new Json.Str("as"));
         Json.Obj conditional = (Json.Obj) ((Json.Arr) embed.get("allOf")).items().getFirst();
-        Json.Obj when = (Json.Obj) conditional.get("if");
-        Json.Obj whenProperties = (Json.Obj) when.get("properties");
-        assertThat(((Json.Obj) whenProperties.get("as")).get("const")).isEqualTo(new Json.Str("flat"));
-        Json.Obj otherwise = (Json.Obj) conditional.get("else");
-        assertThat(((Json.Arr) otherwise.get("required")).items()).containsExactly(new Json.Str("path"));
+        assertThat(shapeOf(conditional)).isEqualTo(new Json.Str("flat"));
         Json.Arr flatRules = (Json.Arr) ((Json.Obj) conditional.get("then")).get("allOf");
-        assertThat(flatRules.items()).containsExactly(
-                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
-                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("path"))))))))),
-                new Json.Obj(List.of(new Json.Entry("not", new Json.Obj(List.of(
-                        new Json.Entry("required", new Json.Arr(List.of(new Json.Str("arrayKey"))))))))));
+        assertThat(flatRules.items()).containsExactly(not(required("path")), not(required("arrayKey")),
+                not(required("rollup")));
+
+        Json.Obj rollup = (Json.Obj) conditional.get("else");
+        assertThat(shapeOf(rollup)).isEqualTo(new Json.Str("rollup"));
+        Json.Arr rollupRules = (Json.Arr) ((Json.Obj) rollup.get("then")).get("allOf");
+        assertThat(rollupRules.items()).containsExactly(not(required("path")), required("rollup"));
+        assertThat(rollup.get("else")).isEqualTo(required("path"));
+
+        Json.Obj properties = (Json.Obj) embed.get("properties");
+        assertThat(properties.get("rollup")).isNotNull();
+        Json.Obj field = (Json.Obj) ((Json.Obj) defs.get("RollupField")).get("properties");
+        assertThat(field.get("count_distinct")).isNotNull();
+        assertThat(field.get("default")).isNotNull();
+        assertThat(field.get("last")).isNotNull();
+    }
+
+    private static Json shapeOf(Json.Obj conditional) {
+        Json.Obj when = (Json.Obj) conditional.get("if");
+        return ((Json.Obj) ((Json.Obj) when.get("properties")).get("as")).get("const");
+    }
+
+    private static Json.Obj required(String field) {
+        return new Json.Obj(List.of(new Json.Entry("required", new Json.Arr(List.of(new Json.Str(field))))));
+    }
+
+    private static Json.Obj not(Json.Obj schema) {
+        return new Json.Obj(List.of(new Json.Entry("not", schema)));
     }
 
     @Test
