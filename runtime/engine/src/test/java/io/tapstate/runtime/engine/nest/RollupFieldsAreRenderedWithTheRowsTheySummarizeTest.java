@@ -96,6 +96,24 @@ class RollupFieldsAreRenderedWithTheRowsTheySummarizeTest {
     }
 
     @Test
+    void aConvertedValueIsFoldedAsTheValueItCarriesWhileTheArrayKeepsTheCarrier() {
+        RootAssembly t1 = new RootAssembly();
+        t1.applyRoot(row("id", 1L, "player_id", 9L), at(1));
+        t1.applyElement(item(1L), row("id", 1L, "transaction_id", 1L, "prize_definition_id", 1L,
+                "amount", new io.tapstate.core.event.ConvertedValue(4L, "INT")), at(2), noPositions());
+        t1.applyElement(rating("A"), row("trans_id", 1L, "rating_type", "A", "model_date",
+                new io.tapstate.core.event.ConvertedValue(LocalDate.parse("2026-01-01"), "DATE"), "score", 5L),
+                at(3), noPositions());
+        t1.applyElement(rating("B"), row("trans_id", 1L, "rating_type", "B", "model_date",
+                new io.tapstate.core.event.ConvertedValue(LocalDate.parse("2026-02-01"), "DATE"), "score", 6L),
+                at(4), noPositions());
+        Map<String, Object> document = t1.render(TREE.slots(), prizes(5L, 3L), "t1").orElseThrow();
+        assertThat(document).containsEntry("qty", 4L).containsEntry("amount", 20L).containsEntry("latest_score", 6L);
+        assertThat(((Map<?, ?>) ((List<?>) document.get("item_movement")).getFirst()).get("amount"))
+                .isInstanceOf(io.tapstate.core.event.ConvertedValue.class);
+    }
+
+    @Test
     void theLatestRatingFallsBackWhenTheWinnerIsDeleted() {
         RootAssembly t1 = transaction();
         t1.deleteElement(rating("B"), at(10), noPositions());
