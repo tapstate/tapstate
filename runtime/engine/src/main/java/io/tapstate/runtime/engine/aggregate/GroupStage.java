@@ -61,8 +61,15 @@ public final class GroupStage {
 
     private final List<RollupSpec> fields;
     private final OrderedStateStore store;
+    private final java.util.function.LongSupplier clock;
 
     public GroupStage(AggregateStepSpec spec, OrderedStateStore store) {
+        this(spec, store, System::currentTimeMillis);
+    }
+
+    /** As above, with the clock a group's last good values and the start of a failure are dated by. */
+    public GroupStage(AggregateStepSpec spec, OrderedStateStore store, java.util.function.LongSupplier clock) {
+        this.clock = clock;
         this.fields = spec.fields();
         this.store = store;
         if (fields.size() > 0xFFFF) {
@@ -83,9 +90,18 @@ public final class GroupStage {
      * @param failedField the field the failure belongs to
      * @param conflicts events that carried an order already stored with different content, and were not applied
      * @param dropped   events older than what is stored
+     * @param lastGood  the values the group last had when every field could be given, or null when it never had any
+     * @param lastGoodAt when those values were first reached, in epoch milliseconds
+     * @param failedSince when the group stopped being givable, in epoch milliseconds; zero while it is
      */
     public record GroupOutcome(List<Object> group, boolean send, long members, Map<String, Object> values,
-            RollupError failure, Map<String, Object> failureArgs, String failedField, int conflicts, int dropped) {
+            RollupError failure, Map<String, Object> failureArgs, String failedField, int conflicts, int dropped,
+            Map<String, Object> lastGood, long lastGoodAt, long failedSince) {
+
+        GroupOutcome(List<Object> group, boolean send, long members, Map<String, Object> values,
+                RollupError failure, Map<String, Object> failureArgs, String failedField, int conflicts, int dropped) {
+            this(group, send, members, values, failure, failureArgs, failedField, conflicts, dropped, null, 0, 0);
+        }
     }
 
     /** Applies one drain's changes and returns the outcome of every group they named, after committing. */
@@ -142,7 +158,8 @@ public final class GroupStage {
             outcomes.merge(new Key(fold.group), fold.outcome, (before, now) -> new GroupOutcome(now.group(),
                     before.send() || now.send(), now.members(), now.values(), now.failure(), now.failureArgs(),
                     now.failedField(),
-                    before.conflicts() + now.conflicts(), before.dropped() + now.dropped()));
+                    before.conflicts() + now.conflicts(), before.dropped() + now.dropped(),
+                    now.lastGood(), now.lastGoodAt(), now.failedSince()));
         }
         batch.clear();
     }
@@ -209,6 +226,7 @@ public final class GroupStage {
                 }
             }
             totals.emptiedAt = totals.members == 0 ? last : null;
+            remember(totals, outcome(totals, true, 0, 0));
             fold.saves.put(key(group, TOTALS), writeTotals(totals));
             fold.counts.forEach((key, count) -> {
                 if (count.now != count.before) {
@@ -220,8 +238,32 @@ public final class GroupStage {
                 }
             });
         }
-        fold.outcome = outcome(totals, touched || again, conflicts, dropped);
+        GroupOutcome now = outcome(totals, touched || again, conflicts, dropped);
+        fold.outcome = new GroupOutcome(now.group(), now.send(), now.members(), now.values(), now.failure(),
+                now.failureArgs(), now.failedField(), now.conflicts(), now.dropped(),
+                totals.lastGood, totals.lastGoodAt, totals.failedSince);
         return fold;
+    }
+
+    /**
+     * Keeps what a failed group is shown as. Values every field could give replace the last good ones,
+     * dated when they were first reached, so storing the same values again changes nothing; the first
+     * fold that cannot give the group dates the failure, and later ones leave that date alone.
+     */
+    private void remember(Totals totals, GroupOutcome now) {
+        if (totals.members == 0) {
+            totals.lastGood = null;
+            totals.lastGoodAt = 0;
+            totals.failedSince = 0;
+        } else if (now.failure() == null) {
+            if (!now.values().equals(totals.lastGood)) {
+                totals.lastGood = now.values();
+                totals.lastGoodAt = clock.getAsLong();
+            }
+            totals.failedSince = 0;
+        } else if (totals.failedSince == 0) {
+            totals.failedSince = clock.getAsLong();
+        }
     }
 
     /** The distinct-value counts this fold can touch, read in one go: those of rows leaving and of rows arriving. */
@@ -588,6 +630,9 @@ public final class GroupStage {
         private final List<Object> group;
         private long members;
         private SourceOrder emptiedAt;
+        private Map<String, Object> lastGood;
+        private long lastGoodAt;
+        private long failedSince;
         private final FieldTotals[] fields;
 
         Totals(List<Object> group) {
@@ -642,6 +687,14 @@ public final class GroupStage {
                     StoredValues.write(out, state.bestValue);
                 }
             }
+            out.writeLong(totals.failedSince);
+            out.writeBoolean(totals.lastGood != null);
+            if (totals.lastGood != null) {
+                out.writeLong(totals.lastGoodAt);
+                for (RollupSpec field : fields) {
+                    StoredValues.write(out, totals.lastGood.get(field.field()));
+                }
+            }
         });
     }
 
@@ -667,6 +720,15 @@ public final class GroupStage {
                     state.bestKey = StoredValues.bytes(in);
                     state.bestValue = StoredValues.read(in);
                 }
+            }
+            totals.failedSince = in.readLong();
+            if (in.readBoolean()) {
+                totals.lastGoodAt = in.readLong();
+                Map<String, Object> held = new LinkedHashMap<>();
+                for (RollupSpec field : fields) {
+                    held.put(field.field(), StoredValues.read(in));
+                }
+                totals.lastGood = java.util.Collections.unmodifiableMap(held);
             }
             return totals;
         });

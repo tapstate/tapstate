@@ -42,8 +42,11 @@ aggregate.expression-invalid
 aggregate.input-not-supported
 aggregate.key-required
 aggregate.name-conflict
+aggregate.overflow
+aggregate.result-not-convertible
 aggregate.type-unknown
 aggregate.upstream-filter-unsafe
+aggregate.value-type-mismatch
 alert.channel-not-accepted
 alert.channel-result-unknown
 alert.channel-unavailable
