@@ -1519,7 +1519,7 @@ final class StoreBackedDagSource implements DagSource {
                     }
                 }
                 if (!inputs.isEmpty()) {
-                    reached.add(NodeColumns.of(inline.body(), inputs, null));
+                    reached.add(NodeColumns.of(inline.id(), inline.body(), inputs, null));
                 }
             } finally {
                 // A shared ancestor must be visited again from another fork. Only cycles on the
@@ -1594,7 +1594,7 @@ final class StoreBackedDagSource implements DagSource {
                                 && !inputs.containsKey(nest.root().from()))) {
                     continue;
                 }
-                NodeColumns columns = NodeColumns.of(step.body(), inputs, null);
+                NodeColumns columns = NodeColumns.of(step.id(), step.body(), inputs, null);
                 // A node that cannot say what it emits carries what reached it, so the chain of models
                 // does not stop here and take everything below it with it. Only where the answer is
                 // unknown: a node that did work its columns out keeps them.
