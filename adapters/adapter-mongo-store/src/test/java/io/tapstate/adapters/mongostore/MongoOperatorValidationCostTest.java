@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import com.mongodb.ClientSessionOptions;
 import com.mongodb.TransactionOptions;
 import com.mongodb.client.*;
 import com.mongodb.client.result.UpdateResult;
@@ -17,50 +18,73 @@ import static org.mockito.Mockito.*;
 
 /** Counts the actual validation calls without substituting the scoped operator implementation. */
 class MongoOperatorValidationCostTest {
-    @Test void operatorAttemptsReadCollectionDescriptionsOnceWithoutCachingTheNextTransaction() {
+    @Test void hotReadsReuseTheSameStructureProof() {
         var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
-        assertThat(f.descriptionReads).isEqualTo(1);
+        int descriptions = f.descriptionReads;
+        var indexes = Map.copyOf(f.indexReads);
+        assertThat(descriptions).isPositive();
+        assertThat(indexes).containsKeys("pipeline_state", "nest_state", "nest_shapes", "operator_cleanup");
+
         f.store.load(f.at.mapName(), "two");
-        assertThat(f.descriptionReads).isEqualTo(2);
-        assertThat(f.indexReads).containsEntry("pipeline_state", 2).containsEntry("nest_state", 2)
-                .containsEntry("nest_shapes", 2).containsEntry("operator_cleanup", 2);
+
+        assertThat(f.descriptionReads).isEqualTo(descriptions);
+        assertThat(f.indexReads).isEqualTo(indexes);
     }
 
-    @Test void retriesReadFreshCollectionDescriptionsAndStillCheckEveryIndex() {
-        var f = new Fixture(); f.attempts = 2;
+    @Test void retryRechecksEveryIndexAndReadsFreshDescriptions() {
+        var oneAttempt = new Fixture();
+        oneAttempt.store.load(oneAttempt.at.mapName(), "one");
+        var retried = new Fixture();
+        retried.attempts = 2;
+        retried.store.load(retried.at.mapName(), "one");
+
+        assertThat(retried.descriptionReads).isGreaterThan(oneAttempt.descriptionReads);
+        oneAttempt.indexReads.forEach((name, count) ->
+                assertThat(retried.indexReads).containsEntry(name, count * 2));
+    }
+
+    @Test void aWriteAfterAReadMustProveTheCollectionStillExists() {
+        var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
-        assertThat(f.descriptionReads).isEqualTo(2);
-        assertThat(f.indexReads).containsEntry("nest_state", 2).containsEntry("operator_cleanup", 2);
-    }
-
-    @Test void collectionRemovalBetweenTransactionsIsNotHiddenByDescriptionReuse() {
-        var f = new Fixture(); f.store.load(f.at.mapName(), "one");
         f.missingCollection = "nest_state";
-        assertThatThrownBy(() -> f.store.load(f.at.mapName(), "two"))
-                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        assertThatThrownBy(() -> f.store.save(f.at.mapName(), "two", new byte[]{1}))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
     @Test void aRetryCannotReuseACollectionDescriptionFromTheFailedAttempt() {
-        var f = new Fixture(); f.attempts = 2; f.afterAttempt = () -> f.missingCollection = "nest_shapes";
+        var f = new Fixture();
+        f.attempts = 2;
+        f.afterAttempt = () -> f.missingCollection = "nest_shapes";
         assertThatThrownBy(() -> f.store.load(f.at.mapName(), "one"))
-                .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
-        assertThat(f.descriptionReads).isEqualTo(2);
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
-    @Test void aBatchReadsItsClaimAndInventoryOncePerAttempt() {
+    @Test void aHotBatchDoesNotReopenTheClaimAndInventoryProof() {
         var f = new Fixture();
         assertThat(f.store.loadAll(f.at.mapName(), List.of("one", "two"))).isEmpty();
-        assertThat(f.finds).containsEntry("workload_claims", 1).containsEntry("operator_cleanup", 1)
-                .containsEntry("nest_shapes", 1).containsEntry("nest_state", 1);
-        assertThat(f.indexReads).containsEntry("operator_cleanup", 1);
+        var coldFinds = Map.copyOf(f.finds);
+        assertThat(coldFinds).containsKeys("workload_claims", "operator_cleanup", "nest_shapes", "nest_state");
+
+        assertThat(f.store.loadAll(f.at.mapName(), List.of("three", "four"))).isEmpty();
+
+        assertThat(f.finds).containsEntry("workload_claims", coldFinds.get("workload_claims"))
+                .containsEntry("operator_cleanup", coldFinds.get("operator_cleanup"))
+                .containsEntry("nest_shapes", coldFinds.get("nest_shapes"))
+                .containsEntry("nest_state", coldFinds.get("nest_state") + 1);
     }
 
     @Test void everyRetryRevalidatesTheClaimAndInventory() {
-        var f = new Fixture();
-        f.attempts = 2;
-        f.store.loadAll(f.at.mapName(), List.of("one", "two"));
-        assertThat(f.finds).containsEntry("workload_claims", 2).containsEntry("operator_cleanup", 2);
+        var oneAttempt = new Fixture();
+        oneAttempt.store.loadAll(oneAttempt.at.mapName(), List.of("one", "two"));
+        var retried = new Fixture();
+        retried.attempts = 2;
+        retried.store.loadAll(retried.at.mapName(), List.of("one", "two"));
+
+        assertThat(retried.finds).containsEntry("workload_claims", 2 * oneAttempt.finds.get("workload_claims"))
+                .containsEntry("operator_cleanup", 2 * oneAttempt.finds.get("operator_cleanup"));
     }
 
     @Test void aNewAttemptCannotReuseAnEarlierPreparation() {
@@ -73,20 +97,27 @@ class MongoOperatorValidationCostTest {
                         assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
-    @Test void successfulReadsDoNotCacheStructureAcrossTransactions() {
+    @Test void aWriteAfterAReadMustProveTheIndexStillExists() {
         var f = new Fixture();
         f.store.load(f.at.mapName(), "one");
         f.missingIndex = "operator_placement";
-        assertThatThrownBy(() -> f.store.load(f.at.mapName(), "two"))
-                .isInstanceOfSatisfying(TapstateException.class, failure ->
-                        assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        assertThatThrownBy(() -> f.store.save(f.at.mapName(), "two", new byte[]{1}))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
     }
 
-    @Test void writesKeepBothRealFences() {
+    @Test void hotWritesKeepTheLiveClaimAndInventoryFence() {
         var f = new Fixture();
         f.store.saveAll(f.at.mapName(), Map.of("one", new byte[]{1}, "two", new byte[]{2}));
-        assertThat(f.updates).containsEntry("workload_claims", 1).containsEntry("pipeline_state", 1);
-        assertThat(f.finds).containsEntry("workload_claims", 1).containsEntry("operator_cleanup", 1);
+        var coldUpdates = Map.copyOf(f.updates);
+        int inventoryReads = f.finds.get("operator_cleanup");
+        assertThat(coldUpdates).containsKeys("workload_claims", "pipeline_state");
+
+        f.store.save(f.at.mapName(), "three", new byte[]{3});
+
+        assertThat(f.updates).containsEntry("workload_claims", coldUpdates.get("workload_claims") + 1)
+                .containsEntry("pipeline_state", coldUpdates.get("pipeline_state"));
+        assertThat(f.finds).containsEntry("operator_cleanup", inventoryReads + 1);
     }
 
     private static final class Fixture {
@@ -146,6 +177,7 @@ class MongoOperatorValidationCostTest {
                 return result;
             });
             when(client.startSession()).thenReturn(session);
+            when(client.startSession(any(ClientSessionOptions.class))).thenReturn(session);
             when(session.withTransaction(any(TransactionBody.class), any(TransactionOptions.class))).thenAnswer(call -> {
                 Object result = null;
                 for (int i = 0; i < attempts; i++) { result = ((TransactionBody<?>) call.getArgument(0)).execute(); afterAttempt.run(); }
@@ -163,6 +195,14 @@ class MongoOperatorValidationCostTest {
             when(result.find(any(ClientSession.class), any(Bson.class))).thenAnswer(call -> {
                 finds.merge(name, 1, Integer::sum);
                 FindIterable<Document> read = mock(FindIterable.class);
+                when(read.projection(any(Bson.class))).thenAnswer(projection -> {
+                    if (projection.getArgument(0) instanceof Document fields && fields.containsKey("remaining")) {
+                        FindIterable<Document> clock = mock(FindIterable.class);
+                        when(clock.first()).thenReturn(new Document("remaining", 60_000L));
+                        return clock;
+                    }
+                    return read;
+                });
                 when(read.first()).thenAnswer(ignored -> rows.get(name));
                 when(read.iterator()).thenAnswer(ignored -> cursor(rows.containsKey(name) ? List.of(rows.get(name)) : List.of()));
                 return read;
