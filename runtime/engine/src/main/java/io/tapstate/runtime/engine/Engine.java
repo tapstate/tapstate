@@ -20,6 +20,7 @@ import io.tapstate.core.lifecycle.StageReading;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.runtime.engine.join.JoinRecomputeMetricNames;
+import io.tapstate.runtime.engine.aggregate.AggregateMetricNames;
 import io.tapstate.runtime.engine.nest.NestDeadLetterMetricNames;
 import io.tapstate.runtime.engine.nest.NestMemoryBudget;
 import io.tapstate.runtime.engine.nest.NestSettings;
@@ -565,6 +566,17 @@ public final class Engine {
      */
     public Map<String, Long> nestDeadLetters(String pipelineId) {
         return byChain(pipelineId, NestDeadLetterMetricNames::namespaceOf);
+    }
+
+    /**
+     * What the aggregate steps of the pipeline report about themselves, keyed by the reading's name, which
+     * is its kind and then the step; empty when it has no live job or no aggregate step.
+     *
+     * <p>The sizes among them are as of the last pass a step finished over its state, and a step that has
+     * not finished one reports none: absent is "not measured yet", and zero is "measured at nothing".
+     */
+    public Map<String, Long> aggregateReadings(String pipelineId) {
+        return byChain(pipelineId, AggregateMetricNames::readingOf);
     }
 
     /**

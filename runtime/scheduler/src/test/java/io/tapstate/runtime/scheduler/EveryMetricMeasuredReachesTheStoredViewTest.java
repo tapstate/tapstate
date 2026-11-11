@@ -108,6 +108,32 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
     }
 
     @Test
+    @DisplayName("what an aggregate step reports reaches the stored view under its step, and nothing is invented for a step that reported nothing")
+    void anAggregateStepsReadingsReachTheStoredView() {
+        state.create("orders", PipelineState.RUNNING.name(), AT);
+        ObservationPublisher publisher = everythingWired().withAggregateReadings(id -> Map.of(
+                "aggregateGroups.by_region", 3L, "aggregateFailedGroups.by_region", 1L,
+                "aggregateRows.by_region", 40L, "aggregateGroups.by_day", 4L));
+
+        publisher.publish("orders");
+
+        Observation published = observations.read("orders").orElseThrow();
+        assertThat(published.metrics())
+                .containsEntry("aggregateGroups.by_region", 3L)
+                .containsEntry("aggregateFailedGroups.by_region", 1L)
+                .containsEntry("aggregateRows.by_region", 40L)
+                .containsEntry("aggregateGroups.by_day", 4L)
+                // Not measured is not zero: a step that has not finished a pass reports no size, and
+                // one with no refused input reports no count of them.
+                .doesNotContainKeys("aggregateFailedGroups.by_day", "aggregateOrderConflicts.by_region");
+        MetricFact groups = published.facts().stream()
+                .filter(fact -> fact.name().equals("tapstate.pipeline.aggregate.groups")).findFirst().orElseThrow();
+        assertThat(groups.unit()).isEqualTo("{group}");
+        assertThat(groups.points()).hasSize(2).allSatisfy(point ->
+                assertThat(point.attributes()).containsKeys(MetricAttributes.PIPELINE_ID, MetricAttributes.AGGREGATE_STEP));
+    }
+
+    @Test
     @DisplayName("the stored view holds every metric it can carry, and says which face carries the rest")
     void theFlatViewCarriesAllButTheLoadAndSaysSo() {
         state.create("orders", PipelineState.RUNNING.name(), AT);

@@ -242,6 +242,38 @@ public final class GroupStage {
     }
 
     /**
+     * What one page of a count over the step's group state came to.
+     *
+     * @param next    where the next page starts, or null when this page was the last
+     * @param entries entries on the page
+     * @param groups  groups on the page that hold rows
+     * @param failed  those of them that cannot be given exactly now
+     * @param largest the most rows any of them holds
+     */
+    public record Counted(byte[] next, int entries, int groups, int failed, long largest) {
+    }
+
+    /** Counts one page of everything stored on the group side, in key order, and changes nothing. */
+    public Counted count(byte[] after, int limit) {
+        List<Entry> page = store.scan(new byte[0], new byte[] {(byte) 0xFF}, after, limit);
+        int groups = 0;
+        int failed = 0;
+        long largest = 0;
+        for (Entry entry : page) {
+            // Totals are the entries whose key starts with their kind; every other key starts with a
+            // group's first value or, for the one group of a step without groupBy, with a higher kind.
+            if (entry.key().length == 0 || entry.key()[0] != TOTALS) {
+                continue;
+            }
+            Totals totals = readTotals(entry.state());
+            groups++;
+            failed += totals.failedSince == 0 ? 0 : 1;
+            largest = Math.max(largest, totals.members);
+        }
+        return new Counted(page.size() < limit ? null : page.getLast().key(), page.size(), groups, failed, largest);
+    }
+
+    /**
      * Compares everything derived for {@code group} with what its stored rows give, and changes nothing.
      * It says whether the totals match the rows the step holds, and nothing about whether the step holds
      * the rows the source has.

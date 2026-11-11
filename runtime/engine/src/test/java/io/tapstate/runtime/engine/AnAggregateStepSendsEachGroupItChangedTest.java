@@ -24,6 +24,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.aggregate.AggregateMetricNames;
 import io.tapstate.runtime.engine.aggregate.AggregateProcessor;
 import io.tapstate.runtime.engine.aggregate.AggregateRequests;
 import io.tapstate.runtime.engine.aggregate.AggregateStores;
@@ -328,6 +329,45 @@ class AnAggregateStepSendsEachGroupItChangedTest {
         assertThat(lastPerGroup().get("EU").after())
                 .containsEntry("orders", 2L).containsEntry("revenue", new BigDecimal("140.50"));
         assertThat(AggregateRequests.runsOn(member, "sales", "by_region")).as("a stopped step takes no request").isFalse();
+    }
+
+    @Test
+    @DisplayName("a running step reports the size of its state as its last pass counted it")
+    void aRunningStepReportsWhatItHolds() throws Exception {
+        run(List.of(insert(1, 1, "EU", "open", "100.00"), insert(2, 2, "EU", "open", "40.50"),
+                insert(3, 3, "US", "open", "5.00")));
+        run(List.of(delete(3, 4, row(3, "US", "open", "5.00"))));
+
+        HELD = true;
+        try {
+            com.hazelcast.jet.Job job = start(List.of(insert(4, 5, "APAC", "open", "1.00")), YAML, ReplayFloorFactory.NONE);
+            Map<String, Long> read = Map.of();
+            long giveUp = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+            while (!read.containsKey("aggregateGroups.by_region") || !read.containsKey("aggregateInputs.by_region")) {
+                assertThat(System.nanoTime()).as("the step finishes a pass and its readings are collected").isLessThan(giveUp);
+                Thread.sleep(100);
+                read = Engine.highestIn(job.getMetrics(), AggregateMetricNames::readingOf);
+            }
+            assertThat(read)
+                    .containsEntry("aggregateRows.by_region", 3L)
+                    .containsEntry("aggregateGroups.by_region", 2L)
+                    .containsEntry("aggregateLargestGroupRows.by_region", 2L)
+                    .containsEntry("aggregateFailedGroups.by_region", 0L)
+                    // The deleted row and the group it left: no floor says a delivery cannot reach
+                    // back to either.
+                    .containsEntry("aggregateTombstones.by_region", 2L)
+                    .containsEntry("aggregateInputs.by_region", 1L)
+                    // Nothing was refused, and a count of nothing refused is not reported.
+                    .doesNotContainKey("aggregateOrderConflicts.by_region");
+            assertThat(read.get("aggregateStateEntries.by_region")).as("everything stored on both sides")
+                    .isEqualTo((long) STORES.get("by_region/MEMBERS").entries.size()
+                            + STORES.get("by_region/GROUPS").entries.size());
+            assertThat(read.get("aggregateStateWrites.by_region")).isPositive();
+            HELD = false;
+            job.join();
+        } finally {
+            HELD = false;
+        }
     }
 
     private static byte[] totalsKey(String region) {
