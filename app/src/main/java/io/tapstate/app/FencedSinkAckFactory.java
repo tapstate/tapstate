@@ -48,7 +48,7 @@ final class FencedSinkAckFactory implements SinkAckFactory {
     public SinkAck resolve(HazelcastInstance member) {
         ExecutionAuthorization authorization = ExecutionAuthorization.of(member);
         SinkAck guarded = guarded(delegate.resolve(member), fence, authorization);
-        return delegate instanceof ScopedSrsSinkAckFactory
+        return ValidationPipelineInitials.underlying(delegate) instanceof ScopedSrsSinkAckFactory
                 ? new DeferredSinkAck(guarded, () -> authorization.authorized(fence))
                 : guarded;
     }

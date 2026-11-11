@@ -43,7 +43,22 @@ final class DeferredSinkAck implements SinkAck {
         }
     }
 
+    @Override public void started(long jobId, long executionId) {
+        delegate.started(jobId, executionId);
+    }
+
     @Override public void bounded(String stream, SourceOrder through) {
+        // Initial-load readiness needs this exact boundary even if newer CDC progress is pending.
+        if (through.seq() == SourceOrder.SNAPSHOT_SEQ) {
+            if (failed) return;
+            try {
+                delegate.bounded(stream, through);
+            } catch (RuntimeException | Error failure) {
+                failed = true;
+                throw failure;
+            }
+            return;
+        }
         pending(stream).bound(through);
     }
 
