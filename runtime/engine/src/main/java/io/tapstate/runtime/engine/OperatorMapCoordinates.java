@@ -41,7 +41,7 @@ public final class OperatorMapCoordinates {
             case JOIN_FACTS -> "facts";
             case JOIN_WRITERS -> "writers";
             case JOIN_DIMENSIONS, JOIN_INDEXES -> Objects.requireNonNull(alias,"alias");
-            case NEST_STATE -> throw new IllegalArgumentException("not a Join resource");
+            case NEST_STATE, AGGREGATE_STATE -> throw new IllegalArgumentException("not a Join resource");
         };
     }
     public static OperatorPlacement nest(PipelineIntentScope scope,String database,String step,List<String> path,NestMap kind,String alias) {
