@@ -112,7 +112,7 @@ class ScopedSrsSinkAckFactoryTest {
         var permitted = new AtomicBoolean(); var unused = mock(SrsConsumerStore.class);
         var follower = new ScopedSrsConsumerAccess.Bound(RUN,unused,first.models(),() -> {
             if (!permitted.get()) throw ScopedSrsConsumerAccess.refused(RUN);
-        },first.reads());
+        },first.reads(),unused,first.authorization(),first.fence(),first.writerProof());
         var entered = new java.util.concurrent.CountDownLatch(1); var release = new java.util.concurrent.CountDownLatch(1);
         when(f.store.progress(RUN.context())).thenAnswer(call -> {
             entered.countDown(); assertThat(release.await(10,java.util.concurrent.TimeUnit.SECONDS)).isTrue(); return Optional.of(original);
@@ -376,7 +376,17 @@ class ScopedSrsSinkAckFactoryTest {
         final AtomicReference<SrsConsumerProgress> held = new AtomicReference<>();
         Fixture() {
             when(member.getUserContext()).thenReturn(context);
-            when(authorization.require(any())).thenAnswer(call -> { if (!active.get()) throw new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED,Map.of("pipeline","pipeline"),null); return FENCE; });
+            Runnable requireActive = () -> {
+                if (!active.get()) throw ScopedSrsConsumerAccess.refused(RUN);
+            };
+            when(authorization.require(any())).thenAnswer(call -> {
+                requireActive.run();
+                return FENCE;
+            });
+            when(authorization.pinLocalProof(any())).thenAnswer(call -> {
+                requireActive.run();
+                return requireActive;
+            });
             context.put(ExecutionAuthorization.USER_CONTEXT_KEY,authorization);
             SrsStoreViews views = (scope,guard) -> {
                 assertThat(scope).isEqualTo(RUN.cacheScope()); guard.run();
