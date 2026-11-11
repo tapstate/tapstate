@@ -243,6 +243,52 @@ db.orders.aggregate([
 ])
 ```
 
+### Totals beside the rows: rollup fields
+
+The order carries its lines; it can carry what you would otherwise compute from them on every read.
+Add a `rollup:` map to the `items` branch:
+
+```yaml
+        - from: i
+          on: { order_id: id }
+          as: array
+          path: items
+          arrayKey: [ id ]
+          trackKeyChanges: true
+          rollup:
+            item_count: { count: true }
+            total_qty:  { sum: $qty, default: 0 }
+          embed:
+            - from: opt
+              on: { item_id: id }
+              as: array
+              path: options
+              arrayKey: [ id ]
+```
+
+Apply and restart, then check every document against the source:
+
+```js
+db.orders.find({ $expr: { $or: [
+    { $ne: ["$item_count", { $size: { $ifNull: ["$items", []] } }] },
+    { $ne: ["$total_qty", { $sum: "$items.qty" }] } ] } }).count()       // 0
+db.orders.aggregate([{ $group: { _id: null, lines: { $sum: "$item_count" }, units: { $sum: "$total_qty" } } }])
+```
+
+```sql
+SELECT COUNT(*) AS lines, SUM(qty) AS units FROM order_items;           -- the same two numbers
+```
+
+The two fields are written in the same document as `items`, so no reader ever sees the array and its
+count disagree. An order with no lines has `item_count: 0` and, from its `default:`, `total_qty: 0`.
+
+A money total - `qty` times `unit_price` - is not here, and the reason is worth knowing: `unit_price` is a
+`DECIMAL(10,2)`, and arithmetic on decimals inside an expression is not available yet. Writing
+`total: { sum: "=after.qty * after.unit_price" }` is refused when you apply, with
+`nest.rollup-expression-invalid`, rather than computed through floating point. Summing one decimal column,
+such as `$unit_price`, is exact. [Rollup fields](../../nest/rollup-fields.md) has the whole set of
+functions and rules.
+
 ### Two shapes of "nothing"
 
 An order with no payments and an order that has not been shipped both look empty, but they are not
