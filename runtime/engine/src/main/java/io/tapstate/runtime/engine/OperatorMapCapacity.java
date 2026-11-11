@@ -13,6 +13,8 @@ public record OperatorMapCapacity(OperatorPlacement placement,long entriesHeldIn
         Objects.requireNonNull(placement,"placement");
         if (entriesHeldInMemory < 1 || entriesHeldInMemory > Integer.MAX_VALUE)
             throw new IllegalArgumentException("operator map capacity must be a positive supported entry count");
+        if (!placement.resource().keptInAMap())
+            throw new IllegalArgumentException("operator state that is not kept in a map has no map capacity");
         if (placement.resource() == OperatorPlacement.Resource.NEST_STATE)
             NestSettings.defaults().withEntriesHeldInMemory(entriesHeldInMemory);
     }

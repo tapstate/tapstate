@@ -58,7 +58,26 @@ public record DagBindings(
         Function<String, List<String>> sourceKeys,
         Function<ViewBlock, SupplierEx<? extends SinkWriter>> viewSinks,
         NestBinding nest,
-        JoinBinding join) {
+        JoinBinding join,
+        AggregateBinding aggregate) {
+
+    public DagBindings(
+            Function<String, ProcessorMetaSupplier> sourceVertices,
+            Function<Step, SupplierEx<? extends TransformPort>> transformPorts,
+            Function<SyncElement, SupplierEx<? extends SinkWriter>> sinkWriters,
+            Function<FromRef, List<String>> upstreams,
+            Function<String, List<String>> sourceKeys,
+            Function<ViewBlock, SupplierEx<? extends SinkWriter>> viewSinks,
+            NestBinding nest,
+            JoinBinding join) {
+        this(sourceVertices, transformPorts, sinkWriters, upstreams, sourceKeys, viewSinks, nest, join, null);
+    }
+
+    /** The same bindings with what the aggregate steps of the pipeline run on. */
+    public DagBindings withAggregate(AggregateBinding aggregate) {
+        return new DagBindings(sourceVertices, transformPorts, sinkWriters, upstreams, sourceKeys,
+                viewSinks, nest, join, aggregate);
+    }
 
     /** Bindings for a pipeline with no join in it, which therefore needs no join binding. */
     public DagBindings(
@@ -75,7 +94,7 @@ public record DagBindings(
     /** The same bindings with a join node's needs supplied. */
     public DagBindings withJoin(JoinBinding join) {
         return new DagBindings(sourceVertices, transformPorts, sinkWriters, upstreams, sourceKeys,
-                viewSinks, nest, join);
+                viewSinks, nest, join, aggregate);
     }
 
     /** Bindings for a pipeline with neither a view nor a nest, which therefore need neither. */
