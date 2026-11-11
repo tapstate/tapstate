@@ -1,0 +1,774 @@
+package io.tapstate.runtime.engine.aggregate;
+
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.aggregate.AggregateFailure;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
+import io.tapstate.core.dsl.aggregate.OrderedBytes;
+import io.tapstate.core.dsl.aggregate.RollupError;
+import io.tapstate.core.dsl.aggregate.RollupSpec;
+import io.tapstate.core.dsl.aggregate.RunningValue;
+import io.tapstate.core.dsl.aggregate.StateKind;
+import io.tapstate.core.dsl.aggregate.Aggregates;
+import io.tapstate.core.dsl.aggregate.ValueType;
+import io.tapstate.core.dsl.aggregate.Values;
+import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.model.RollupFunction;
+import io.tapstate.runtime.engine.aggregate.GroupChange.FieldInput;
+import io.tapstate.spi.store.OrderedStateStore;
+import io.tapstate.spi.store.OrderedStateStore.End;
+import io.tapstate.spi.store.OrderedStateStore.Entry;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.TreeMap;
+import java.util.TreeSet;
+
+/**
+ * The group side of an aggregate step: takes what the membership side says about input rows, keeps each
+ * group's stored rows and totals in step, and says which groups to send on.
+ *
+ * <p><b>Every value of a group is a function of the rows stored for it.</b> Each input row has one stored
+ * entry in its group, carrying what the row gives every field and the order of the event that wrote it. A
+ * change is applied only when its order is newer than the entry's, so an event delivered again changes
+ * nothing; one delivered again with the very order already stored only marks the group to be sent again,
+ * since the first sending may have been lost. The totals beside the entries are a convenience that is
+ * always written in the same commit as the entries it was computed from.
+ *
+ * <p>A group's changes go to the store whole: its entries, its totals, and the ordered entries that let a
+ * least or greatest value be found again after the current one leaves. Several groups share a commit when
+ * they fit. A group with more changes than one commit holds is committed in parts, and each part leaves
+ * the group consistent. Nothing is reported for a group until the commit holding it has returned.
+ */
+public final class GroupStage {
+
+    private static final int TOTALS = 0x01;
+    private static final int ROW = 0x02;
+    private static final int ORDERED = 0x03;
+    private static final int DISTINCT = 0x04;
+
+    private final List<RollupSpec> fields;
+    private final OrderedStateStore store;
+
+    public GroupStage(AggregateStepSpec spec, OrderedStateStore store) {
+        this.fields = spec.fields();
+        this.store = store;
+        if (fields.size() > 0xFFFF) {
+            throw new IllegalArgumentException("more fields than a group's keys can number");
+        }
+    }
+
+    /**
+     * What became of one group.
+     *
+     * @param group     the values of the group's key
+     * @param send      whether the group is to be sent on: something changed, or an event already applied
+     *                  arrived again
+     * @param members   how many input rows the group holds; a group with none is sent as a delete
+     * @param values    field name to value, when every field can be given exactly
+     * @param failure   why the group cannot be given, or null; {@code values} is then empty
+     * @param failureArgs what the failure knows about itself
+     * @param failedField the field the failure belongs to
+     * @param conflicts events that carried an order already stored with different content, and were not applied
+     * @param dropped   events older than what is stored
+     */
+    public record GroupOutcome(List<Object> group, boolean send, long members, Map<String, Object> values,
+            RollupError failure, Map<String, Object> failureArgs, String failedField, int conflicts, int dropped) {
+    }
+
+    /** Applies one drain's changes and returns the outcome of every group they named, after committing. */
+    public List<GroupOutcome> apply(List<GroupChange> changes) {
+        TreeMap<byte[], List<GroupChange>> byGroup = new TreeMap<>(Arrays::compareUnsigned);
+        for (GroupChange change : changes) {
+            byGroup.computeIfAbsent(OrderedBytes.ofKey(change.group()), key -> new ArrayList<>()).add(change);
+        }
+        Deque<Map.Entry<byte[], List<GroupChange>>> waiting = new ArrayDeque<>(byGroup.entrySet());
+        Map<Key, GroupOutcome> outcomes = new LinkedHashMap<>();
+        List<Fold> batch = new ArrayList<>();
+        Budget used = new Budget();
+        while (!waiting.isEmpty()) {
+            Map.Entry<byte[], List<GroupChange>> next = waiting.pollFirst();
+            List<GroupChange> all = next.getValue();
+            int take = all.size();
+            Fold fold = fold(next.getKey(), all);
+            while (!fold.fits(new Budget(), store.commitLimit())) {
+                if (take == 1) {
+                    throw new IllegalStateException("one input row of an aggregate group needs more than a "
+                            + "whole commit of " + store.commitLimit());
+                }
+                take = take / 2;
+                fold = fold(next.getKey(), all.subList(0, take));
+            }
+            if (!fold.fits(used, store.commitLimit())) {
+                commit(batch, outcomes);
+                used = new Budget();
+            }
+            batch.add(fold);
+            used.add(fold);
+            if (take < all.size()) {
+                // The rest of this group is read only once this part of it is stored.
+                commit(batch, outcomes);
+                used = new Budget();
+                waiting.addFirst(Map.entry(next.getKey(), all.subList(take, all.size())));
+            }
+        }
+        commit(batch, outcomes);
+        return List.copyOf(outcomes.values());
+    }
+
+    private void commit(List<Fold> batch, Map<Key, GroupOutcome> outcomes) {
+        List<Entry> saves = new ArrayList<>();
+        List<byte[]> deletes = new ArrayList<>();
+        for (Fold fold : batch) {
+            fold.saves.forEach((key, state) -> saves.add(new Entry(key, state)));
+            deletes.addAll(fold.deletes);
+        }
+        if (!saves.isEmpty() || !deletes.isEmpty()) {
+            store.commit(saves, deletes);
+        }
+        for (Fold fold : batch) {
+            outcomes.merge(new Key(fold.group), fold.outcome, (before, now) -> new GroupOutcome(now.group(),
+                    before.send() || now.send(), now.members(), now.values(), now.failure(), now.failureArgs(),
+                    now.failedField(),
+                    before.conflicts() + now.conflicts(), before.dropped() + now.dropped()));
+        }
+        batch.clear();
+    }
+
+    // ---- one group ----------------------------------------------------------------------------
+
+    private Fold fold(byte[] group, List<GroupChange> changes) {
+        Fold fold = new Fold(group);
+        List<byte[]> keys = new ArrayList<>();
+        keys.add(key(group, TOTALS));
+        TreeMap<byte[], StoredRow> rows = new TreeMap<>(Arrays::compareUnsigned);
+        for (GroupChange change : changes) {
+            rows.put(change.inputKey(), null);
+        }
+        rows.keySet().forEach(inputKey -> keys.add(rowKey(group, inputKey)));
+        List<byte[]> loaded = store.loadAll(keys);
+        Totals totals = loaded.get(0) == null ? new Totals(changes.get(0).group()) : readTotals(loaded.get(0));
+        // The map is sorted, so its order is also the order the rows were asked for in.
+        int at = 1;
+        for (Map.Entry<byte[], StoredRow> row : rows.entrySet()) {
+            byte[] state = loaded.get(at++);
+            row.setValue(state == null ? null : readRow(state));
+        }
+        fold.counts = distinctCounts(group, rows, changes);
+
+        boolean touched = false;
+        boolean again = false;
+        int conflicts = 0;
+        int dropped = 0;
+        SourceOrder last = null;
+        for (GroupChange change : changes) {
+            StoredRow stored = rows.get(change.inputKey());
+            byte[] payload = change.retracts() ? null : payload(change.inputs());
+            int order = stored == null ? 1 : change.order().compareTo(stored.order);
+            if (order < 0) {
+                dropped++;
+                continue;
+            }
+            if (order == 0) {
+                again = true;
+                if (!Arrays.equals(payload, stored.payload)) {
+                    conflicts++;
+                }
+                continue;
+            }
+            if (stored != null && stored.payload != null) {
+                takeOut(fold, totals, change.inputKey(), inputs(stored.payload), stored.unusable);
+                totals.members--;
+            }
+            StoredRow now = new StoredRow(change.order(), payload, 0L);
+            if (!change.retracts()) {
+                now = new StoredRow(change.order(), payload, putIn(fold, totals, change.inputKey(), change.inputs()));
+                totals.members++;
+            }
+            rows.put(change.inputKey(), now);
+            fold.saves.put(rowKey(group, change.inputKey()), writeRow(now));
+            touched = true;
+            last = change.order();
+        }
+        if (touched) {
+            for (int field = 0; field < fields.size(); field++) {
+                if (totals.fields[field].stale) {
+                    findBest(fold, totals.fields[field], field);
+                }
+            }
+            totals.emptiedAt = totals.members == 0 ? last : null;
+            fold.saves.put(key(group, TOTALS), writeTotals(totals));
+            fold.counts.forEach((key, count) -> {
+                if (count.now != count.before) {
+                    if (count.now == 0) {
+                        fold.deletes.add(key);
+                    } else {
+                        fold.saves.put(key, longBytes(count.now));
+                    }
+                }
+            });
+        }
+        fold.outcome = outcome(totals, touched || again, conflicts, dropped);
+        return fold;
+    }
+
+    /** The distinct-value counts this fold can touch, read in one go: those of rows leaving and of rows arriving. */
+    private TreeMap<byte[], Count> distinctCounts(byte[] group, Map<byte[], StoredRow> rows, List<GroupChange> changes) {
+        TreeMap<byte[], Count> counts = new TreeMap<>(Arrays::compareUnsigned);
+        for (int field = 0; field < fields.size(); field++) {
+            if (fields.get(field).function() != RollupFunction.COUNT_DISTINCT) {
+                continue;
+            }
+            for (StoredRow row : rows.values()) {
+                if (row != null && row.payload != null) {
+                    FieldInput input = inputs(row.payload).get(field);
+                    if (input.in()) {
+                        counts.put(distinctKey(group, field, input.value()), null);
+                    }
+                }
+            }
+            for (GroupChange change : changes) {
+                if (!change.retracts() && change.inputs().get(field).in()) {
+                    counts.put(distinctKey(group, field, change.inputs().get(field).value()), null);
+                }
+            }
+        }
+        if (!counts.isEmpty()) {
+            List<byte[]> keys = new ArrayList<>(counts.keySet());
+            List<byte[]> states = store.loadAll(keys);
+            for (int i = 0; i < keys.size(); i++) {
+                long held = states.get(i) == null ? 0 : longOf(states.get(i));
+                counts.put(keys.get(i), new Count(held));
+            }
+        }
+        return counts;
+    }
+
+    /** Adds one row's inputs to the group and returns which fields could not take theirs, one bit a field. */
+    private long putIn(Fold fold, Totals totals, byte[] inputKey, List<FieldInput> inputs) {
+        if (inputs.size() != fields.size()) {
+            throw new IllegalArgumentException("a row gives " + inputs.size() + " inputs to " + fields.size() + " fields");
+        }
+        long unusable = 0;
+        for (int field = 0; field < fields.size(); field++) {
+            FieldInput input = inputs.get(field);
+            if (!input.in()) {
+                continue;
+            }
+            RollupSpec spec = fields.get(field);
+            FieldTotals state = totals.fields[field];
+            switch (spec.function()) {
+                case COUNT, SUM, AVG -> {
+                    try {
+                        state.running.add(input.value());
+                    } catch (AggregateFailure notOfTheDeclaredType) {
+                        unusable |= bit(field);
+                        state.unusable++;
+                    }
+                }
+                case COUNT_DISTINCT -> {
+                    Count count = fold.counts.get(distinctKey(fold.group, field, input.value()));
+                    if (count.now++ == 0) {
+                        state.distinct++;
+                    }
+                    state.inputs++;
+                }
+                case MIN, MAX, FIRST, LAST -> {
+                    if (ordersByValue(spec) && !admits(spec.argumentType(), input.value())) {
+                        unusable |= bit(field);
+                        state.unusable++;
+                        continue;
+                    }
+                    byte[] key = orderedKey(fold.group, field, sortBytes(spec, input), inputKey);
+                    fold.deletes.remove(key);
+                    fold.saves.put(key, value(input.value()));
+                    state.inputs++;
+                    if (!state.stale && (state.bestKey == null || better(spec, key, state.bestKey))) {
+                        state.bestKey = key;
+                        state.bestValue = input.value();
+                    }
+                }
+            }
+        }
+        return unusable;
+    }
+
+    private void takeOut(Fold fold, Totals totals, byte[] inputKey, List<FieldInput> inputs, long unusable) {
+        for (int field = 0; field < fields.size(); field++) {
+            FieldInput input = inputs.get(field);
+            if (!input.in()) {
+                continue;
+            }
+            RollupSpec spec = fields.get(field);
+            FieldTotals state = totals.fields[field];
+            if ((unusable & bit(field)) != 0) {
+                state.unusable--;
+                continue;
+            }
+            switch (spec.function()) {
+                case COUNT, SUM, AVG -> state.running.retract(input.value());
+                case COUNT_DISTINCT -> {
+                    Count count = fold.counts.get(distinctKey(fold.group, field, input.value()));
+                    if (--count.now == 0) {
+                        state.distinct--;
+                    }
+                    state.inputs--;
+                }
+                case MIN, MAX, FIRST, LAST -> {
+                    byte[] key = orderedKey(fold.group, field, sortBytes(spec, input), inputKey);
+                    fold.saves.remove(key);
+                    fold.deletes.add(key);
+                    state.inputs--;
+                    if (state.bestKey != null && Arrays.equals(key, state.bestKey)) {
+                        state.lost = state.bestKey;
+                        state.bestKey = null;
+                        state.bestValue = null;
+                        state.stale = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Finds a field's winner again after the one it had left: the best of what the store holds, passing
+     * over entries this fold is removing, and of what this fold is adding.
+     */
+    private void findBest(Fold fold, FieldTotals state, int field) {
+        state.stale = false;
+        if (state.inputs == 0) {
+            return;
+        }
+        RollupSpec spec = fields.get(field);
+        End end = highest(spec) ? End.HIGHEST : End.LOWEST;
+        byte[] from = orderedPrefix(fold.group, field);
+        byte[] to = orderedPrefix(fold.group, field + 1);
+        byte[] bestKey = null;
+        byte[] bestState = null;
+        var added = fold.saves.subMap(from, true, to, false);
+        if (!added.isEmpty()) {
+            bestKey = end == End.HIGHEST ? added.lastKey() : added.firstKey();
+            bestState = added.get(bestKey);
+        }
+        // The winner that left is still in the store until this fold is committed. Nothing sorted beyond
+        // it, so the search starts just short of it and usually ends with its first read.
+        byte[] low = end == End.LOWEST && state.lost != null ? Arrays.copyOf(state.lost, state.lost.length + 1) : from;
+        byte[] high = end == End.HIGHEST && state.lost != null ? state.lost : to;
+        state.lost = null;
+        while (true) {
+            Optional<Entry> found = store.first(low, high, end);
+            if (found.isEmpty()) {
+                break;
+            }
+            byte[] key = found.get().key();
+            if (!fold.deletes.contains(key)) {
+                if (bestKey == null || better(spec, key, bestKey)) {
+                    bestKey = key;
+                    bestState = found.get().state();
+                }
+                break;
+            }
+            if (end == End.HIGHEST) {
+                high = key;
+            } else {
+                low = Arrays.copyOf(key, key.length + 1);
+            }
+        }
+        if (bestKey == null) {
+            throw new IllegalStateException("an aggregate group counts " + state.inputs + " inputs of field "
+                    + spec.field() + " and holds no ordered entry for any");
+        }
+        state.bestKey = bestKey;
+        state.bestValue = valueOf(bestState);
+    }
+
+    private GroupOutcome outcome(Totals totals, boolean send, int conflicts, int dropped) {
+        if (totals.members == 0) {
+            return new GroupOutcome(totals.group, send, 0, Map.of(), null, Map.of(), null, conflicts, dropped);
+        }
+        Map<String, Object> values = new LinkedHashMap<>();
+        for (int field = 0; field < fields.size(); field++) {
+            RollupSpec spec = fields.get(field);
+            FieldTotals state = totals.fields[field];
+            try {
+                if (state.unusable > 0) {
+                    return new GroupOutcome(totals.group, send, totals.members, Map.of(),
+                            RollupError.VALUE_TYPE_MISMATCH, Map.of("declared", spec.argumentType().spelled()),
+                            spec.field(), conflicts, dropped);
+                }
+                boolean contributed;
+                Object value;
+                if (state.running != null) {
+                    contributed = state.running.contributed();
+                    value = state.running.result();
+                } else if (spec.function() == RollupFunction.COUNT_DISTINCT) {
+                    contributed = state.inputs > 0;
+                    value = state.distinct;
+                } else {
+                    contributed = state.inputs > 0;
+                    value = state.bestValue;
+                }
+                if (!contributed && spec.defaultValue() != null) {
+                    value = spec.defaultValue();
+                } else if (spec.convert() != null) {
+                    value = Values.convert(value, spec.convert());
+                }
+                values.put(spec.field(), value);
+            } catch (AggregateFailure failure) {
+                return new GroupOutcome(totals.group, send, totals.members, Map.of(), failure.code(),
+                        failure.args(), spec.field(), conflicts, dropped);
+            }
+        }
+        return new GroupOutcome(totals.group, send, totals.members, java.util.Collections.unmodifiableMap(values),
+                null, Map.of(), null, conflicts, dropped);
+    }
+
+    // ---- what a field orders by and admits ----------------------------------------------------
+
+    private static boolean ordersByValue(RollupSpec spec) {
+        return spec.function() == RollupFunction.MIN || spec.function() == RollupFunction.MAX;
+    }
+
+    private static boolean highest(RollupSpec spec) {
+        return spec.function() == RollupFunction.MAX || spec.function() == RollupFunction.LAST;
+    }
+
+    private static byte[] sortBytes(RollupSpec spec, FieldInput input) {
+        return ordersByValue(spec) ? OrderedBytes.of(input.value()) : OrderedBytes.ofAll(input.by());
+    }
+
+    /** Whether {@code candidate} beats {@code held}: later for max and last, earlier for min and first. */
+    private static boolean better(RollupSpec spec, byte[] candidate, byte[] held) {
+        int order = Arrays.compareUnsigned(candidate, held);
+        return highest(spec) ? order > 0 : order < 0;
+    }
+
+    /** Whether a value is of the type its column was declared with; a type nobody declared admits anything. */
+    private static boolean admits(ValueType declared, Object value) {
+        return switch (declared.type()) {
+            case INT64 -> Values.numericKind(value) == TapstateType.INT64;
+            case DOUBLE -> Values.numericKind(value) == TapstateType.DOUBLE;
+            case DECIMAL -> (value instanceof BigDecimal d
+                    && (declared.scale() == null || d.stripTrailingZeros().scale() <= declared.scale()))
+                    || value instanceof BigInteger;
+            case STRING -> value instanceof CharSequence;
+            case BOOLEAN -> value instanceof Boolean;
+            default -> true;
+        };
+    }
+
+    private static long bit(int field) {
+        if (field >= Long.SIZE) {
+            throw new IllegalArgumentException("only the first " + Long.SIZE + " fields of a step can mark a row "
+                    + "they cannot use");
+        }
+        return 1L << field;
+    }
+
+    // ---- keys ---------------------------------------------------------------------------------
+
+    private static byte[] key(byte[] group, int kind) {
+        byte[] key = Arrays.copyOf(group, group.length + 1);
+        key[group.length] = (byte) kind;
+        return key;
+    }
+
+    private static byte[] rowKey(byte[] group, byte[] inputKey) {
+        return concat(key(group, ROW), inputKey);
+    }
+
+    private static byte[] orderedPrefix(byte[] group, int field) {
+        byte[] key = Arrays.copyOf(group, group.length + 3);
+        key[group.length] = (byte) ORDERED;
+        key[group.length + 1] = (byte) (field >>> 8);
+        key[group.length + 2] = (byte) field;
+        return key;
+    }
+
+    private static byte[] orderedKey(byte[] group, int field, byte[] sort, byte[] inputKey) {
+        return concat(concat(orderedPrefix(group, field), sort), inputKey);
+    }
+
+    private static byte[] distinctKey(byte[] group, int field, Object value) {
+        byte[] prefix = Arrays.copyOf(group, group.length + 3);
+        prefix[group.length] = (byte) DISTINCT;
+        prefix[group.length + 1] = (byte) (field >>> 8);
+        prefix[group.length + 2] = (byte) field;
+        return concat(prefix, OrderedBytes.of(value));
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] joined = Arrays.copyOf(a, a.length + b.length);
+        System.arraycopy(b, 0, joined, a.length, b.length);
+        return joined;
+    }
+
+    // ---- what is held while folding -----------------------------------------------------------
+
+    private record Key(byte[] bytes) {
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof Key key && Arrays.equals(bytes, key.bytes);
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(bytes);
+        }
+    }
+
+    private static final class Count {
+        private final long before;
+        private long now;
+
+        Count(long held) {
+            this.before = held;
+            this.now = held;
+        }
+    }
+
+    private static final class Budget {
+        private int operations;
+        private long bytes;
+
+        void add(Fold fold) {
+            operations += fold.operations();
+            bytes += fold.bytes();
+        }
+    }
+
+    private static final class Fold {
+        private final byte[] group;
+        private final TreeMap<byte[], byte[]> saves = new TreeMap<>(Arrays::compareUnsigned);
+        private final TreeSet<byte[]> deletes = new TreeSet<>(Arrays::compareUnsigned);
+        private TreeMap<byte[], Count> counts;
+        private GroupOutcome outcome;
+
+        Fold(byte[] group) {
+            this.group = group;
+        }
+
+        int operations() {
+            return saves.size() + deletes.size();
+        }
+
+        long bytes() {
+            long bytes = 0;
+            for (Map.Entry<byte[], byte[]> save : saves.entrySet()) {
+                bytes += save.getKey().length + save.getValue().length;
+            }
+            for (byte[] delete : deletes) {
+                bytes += delete.length;
+            }
+            return bytes;
+        }
+
+        boolean fits(Budget used, OrderedStateStore.Limit limit) {
+            return used.operations + operations() <= limit.operations() && used.bytes + bytes() <= limit.bytes();
+        }
+    }
+
+    /** One input row as stored in its group: the order that wrote it, and what it gives, or nothing once it left. */
+    private record StoredRow(SourceOrder order, byte[] payload, long unusable) {
+    }
+
+    private final class Totals {
+        private final List<Object> group;
+        private long members;
+        private SourceOrder emptiedAt;
+        private final FieldTotals[] fields;
+
+        Totals(List<Object> group) {
+            this.group = group;
+            this.fields = new FieldTotals[GroupStage.this.fields.size()];
+            for (int field = 0; field < fields.length; field++) {
+                RollupSpec spec = GroupStage.this.fields.get(field);
+                fields[field] = new FieldTotals();
+                if (Aggregates.of(spec.function()).stateKind() == StateKind.VALUE) {
+                    fields[field].running = RunningValue.of(spec.function(), spec.argumentType());
+                }
+            }
+        }
+    }
+
+    private static final class FieldTotals {
+        private RunningValue running;
+        private long inputs;
+        private long unusable;
+        private long distinct;
+        private byte[] bestKey;
+        private Object bestValue;
+        private boolean stale;
+        /** The winner that left, when one did: nothing beyond it is left to find. */
+        private byte[] lost;
+    }
+
+    // ---- stored forms -------------------------------------------------------------------------
+
+    private byte[] writeTotals(Totals totals) {
+        return written(out -> {
+            out.writeByte(1);
+            StoredValues.writeAll(out, totals.group);
+            out.writeLong(totals.members);
+            out.writeBoolean(totals.emptiedAt != null);
+            if (totals.emptiedAt != null) {
+                out.writeLong(totals.emptiedAt.epoch());
+                out.writeLong(totals.emptiedAt.seq());
+            }
+            for (int field = 0; field < fields.size(); field++) {
+                FieldTotals state = totals.fields[field];
+                out.writeLong(state.unusable);
+                if (state.running != null) {
+                    StoredValues.bytes(out, state.running.state());
+                    continue;
+                }
+                out.writeLong(state.inputs);
+                out.writeLong(state.distinct);
+                out.writeBoolean(state.bestKey != null);
+                if (state.bestKey != null) {
+                    StoredValues.bytes(out, state.bestKey);
+                    StoredValues.write(out, state.bestValue);
+                }
+            }
+        });
+    }
+
+    private Totals readTotals(byte[] bytes) {
+        return read(bytes, in -> {
+            version(in);
+            Totals totals = new Totals(StoredValues.readAll(in));
+            totals.members = in.readLong();
+            if (in.readBoolean()) {
+                totals.emptiedAt = new SourceOrder(in.readLong(), in.readLong());
+            }
+            for (int field = 0; field < fields.size(); field++) {
+                FieldTotals state = totals.fields[field];
+                state.unusable = in.readLong();
+                if (state.running != null) {
+                    RollupSpec spec = fields.get(field);
+                    state.running = RunningValue.restore(spec.function(), spec.argumentType(), StoredValues.bytes(in));
+                    continue;
+                }
+                state.inputs = in.readLong();
+                state.distinct = in.readLong();
+                if (in.readBoolean()) {
+                    state.bestKey = StoredValues.bytes(in);
+                    state.bestValue = StoredValues.read(in);
+                }
+            }
+            return totals;
+        });
+    }
+
+    private static byte[] writeRow(StoredRow row) {
+        return written(out -> {
+            out.writeByte(1);
+            out.writeLong(row.order.epoch());
+            out.writeLong(row.order.seq());
+            out.writeBoolean(row.payload != null);
+            if (row.payload != null) {
+                out.writeLong(row.unusable);
+                StoredValues.bytes(out, row.payload);
+            }
+        });
+    }
+
+    private static StoredRow readRow(byte[] bytes) {
+        return read(bytes, in -> {
+            version(in);
+            SourceOrder order = new SourceOrder(in.readLong(), in.readLong());
+            if (!in.readBoolean()) {
+                return new StoredRow(order, null, 0L);
+            }
+            long unusable = in.readLong();
+            return new StoredRow(order, StoredValues.bytes(in), unusable);
+        });
+    }
+
+    /** What a row gives the fields, as the bytes two deliveries of one event are compared by. */
+    private static byte[] payload(List<FieldInput> inputs) {
+        return written(out -> {
+            out.writeInt(inputs.size());
+            for (FieldInput input : inputs) {
+                out.writeBoolean(input.in());
+                if (input.in()) {
+                    StoredValues.write(out, input.value());
+                    StoredValues.writeAll(out, input.by());
+                }
+            }
+        });
+    }
+
+    private static List<FieldInput> inputs(byte[] payload) {
+        return read(payload, in -> {
+            int size = in.readInt();
+            List<FieldInput> inputs = new ArrayList<>();
+            for (int i = 0; i < size; i++) {
+                inputs.add(in.readBoolean() ? new FieldInput(true, StoredValues.read(in), StoredValues.readAll(in))
+                        : FieldInput.OUT);
+            }
+            return inputs;
+        });
+    }
+
+    private static byte[] value(Object value) {
+        return written(out -> StoredValues.write(out, value));
+    }
+
+    private static Object valueOf(byte[] bytes) {
+        return read(bytes, StoredValues::read);
+    }
+
+    private static byte[] longBytes(long value) {
+        return written(out -> out.writeLong(value));
+    }
+
+    private static long longOf(byte[] bytes) {
+        return read(bytes, DataInputStream::readLong);
+    }
+
+    private static void version(DataInputStream in) throws IOException {
+        int version = in.readUnsignedByte();
+        if (version != 1) {
+            throw new IOException("aggregate state of version " + version + " is not one this build reads");
+        }
+    }
+
+    private interface Writing {
+        void to(DataOutputStream out) throws IOException;
+    }
+
+    private interface Reading<T> {
+        T from(DataInputStream in) throws IOException;
+    }
+
+    private static byte[] written(Writing writing) {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (DataOutputStream out = new DataOutputStream(bytes)) {
+            writing.to(out);
+        } catch (IOException impossible) {
+            throw new UncheckedIOException(impossible);
+        }
+        return bytes.toByteArray();
+    }
+
+    private static <T> T read(byte[] bytes, Reading<T> reading) {
+        try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes))) {
+            return reading.from(in);
+        } catch (IOException unreadable) {
+            throw new IllegalStateException("aggregate state cannot be read", unreadable);
+        }
+    }
+}
