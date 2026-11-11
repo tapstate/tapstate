@@ -2316,7 +2316,11 @@ final class StoreBackedDagSource implements DagSource {
                         + "' was not compiled: the columns reaching it are not known");
             }
             return spec;
-        }, aggregateStores);
+        }, aggregateStores,
+                // What a step keeps to answer a second delivery is forgotten below the position the sinks
+                // have durably acknowledged, which only a run bound to an execution can read.
+                operators == null ? ReplayFloorFactory.NONE : new ScopedSrsReplayFloorFactory(scopedSources, scopedDirect),
+                io.tapstate.runtime.engine.aggregate.AggregateProcessor.Sweep.DEFAULT);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),

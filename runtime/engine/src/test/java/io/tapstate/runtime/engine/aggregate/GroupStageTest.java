@@ -38,6 +38,8 @@ class GroupStageTest {
         int commits;
         int firstReads;
 
+        private boolean swept;
+
         CountingStore(Limit limit) {
             this.limit = limit;
         }
@@ -83,7 +85,28 @@ class GroupStageTest {
 
         @Override
         public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
-            throw new UnsupportedOperationException("the data path never scans");
+            if (!swept) {
+                throw new UnsupportedOperationException("the data path never scans");
+            }
+            var range = after == null ? entries.subMap(from, true, to, false) : entries.subMap(after, false, to, false);
+            List<Entry> page = new ArrayList<>();
+            for (var entry : range.entrySet()) {
+                if (page.size() == limit) {
+                    break;
+                }
+                page.add(new Entry(entry.getKey(), entry.getValue()));
+            }
+            return page;
+        }
+
+        /** A store whose rows a sweep may page through; applying events still must not. */
+        CountingStore swept() {
+            swept = true;
+            return this;
+        }
+
+        int size() {
+            return entries.size();
         }
     }
 
