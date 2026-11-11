@@ -226,9 +226,12 @@ class ValidationJdbcCdcHintsIT {
         String count;
         do {
             assertThat(failures.get()).isNull();
+            // Slot creation can be active before a WAL sender is streaming.
             count = sql(source, mysql, mysql
                     ? "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE COMMAND LIKE 'Binlog Dump%';"
-                    : "SELECT COUNT(*) FROM pg_replication_slots WHERE database='" + DATABASE + "' AND active;").trim();
+                    : "SELECT COUNT(*) FROM pg_replication_slots WHERE database='" + DATABASE + "' AND active"
+                            + (active ? " AND active_pid IN (SELECT pid FROM pg_stat_replication WHERE state='streaming')" : "")
+                            + ";").trim();
             if (active ? count.equals("1") : count.equals("0")) return;
             Thread.sleep(50);
         } while (System.nanoTime() < deadline);

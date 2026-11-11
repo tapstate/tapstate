@@ -73,6 +73,90 @@ class MongoCacheDerivedSchemaStoreIT {
         });
     }
 
+    private static DerivedSchemaStore.Recording recording(String step, String type) {
+        return new DerivedSchemaStore.Recording(step, columns(type), "statement", "sources", "derivation");
+    }
+
+    @Test void batchRecordsShareOneOriginalTransaction() {
+        withFixture(f -> {
+            var transactions = new java.util.HashSet<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getDatabaseName().equals(f.database.getName()) && event.getCommandName().equals("update")
+                            && event.getCommand().getString("update").getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) {
+                        transactions.add(event.getCommand().get("lsid") + ":" + event.getCommand().get("txnNumber"));
+                    }
+                }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                f.writer(client, ACTIVE).recordBatch("orders", List.of(recording("a", "text"), recording("b", "text"), recording("c", "text")));
+                assertThat(transactions).as("all model writes use one guarded transaction").hasSize(1);
+                assertThat(f.rows().countDocuments()).isEqualTo(3);
+            }
+        });
+    }
+
+    @Test void aMalformedLaterModelRollsBackEarlierBatchWrites() {
+        withFixture(f -> {
+            f.writer().record("orders", "bad", columns("text"), "statement", "sources", "derivation");
+            f.rows().updateOne(new Document("_id", "orders.bad"), new Document("$set", new Document("versions", "broken")));
+            var before = f.snapshot();
+            assertUnreadable(() -> f.writer().recordBatch("orders", List.of(recording("first", "text"), recording("bad", "text"))));
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void batchWritesStillRefuseACommandLostAfterAnActualWrite() {
+        withFixture(f -> {
+            var before = f.snapshot();
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database.getName(), "update",
+                    SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) {
+                var writer = f.writer(witness.client, witness::refuseAfterCommand);
+                assertCode(() -> writer.recordBatch("orders", List.of(recording("a", "text"), recording("b", "text"))), IoError.CACHE_BUSINESS_FENCED);
+                witness.requireCommand();
+                assertThat(f.snapshot()).isEqualTo(before);
+            }
+        });
+    }
+
+    @Test void aConflictedBatchRetriesAgainstFreshHistoryWithoutDuplicatingVersions() {
+        withFixture(f -> {
+            f.writer().record("orders", "a", columns("initial"), "statement", "sources", "derivation");
+            var once = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (updates(event, "derived_schemas") && once.compareAndSet(false, true)) {
+                        f.rows().updateOne(new Document("_id", "orders.a"),
+                                new Document("$set", new Document("versions.0.statement", "concurrent")));
+                    }
+                }
+            };
+            try (var observed = client(listener)) {
+                f.writer(observed, ACTIVE).recordBatch("orders", List.of(recording("a", "changed"), recording("b", "text")));
+            }
+            assertThat(once).isTrue();
+            var row = f.rows().find(new Document("_id", "orders.a")).first();
+            var history = row.getList("versions", Document.class);
+            assertThat(history).hasSize(2);
+            assertThat(history.getFirst().getString("statement")).isEqualTo("concurrent");
+            assertThat(f.writer().latest("orders", "a").orElseThrow().version()).isEqualTo(1);
+            assertThat(f.writer().latest("orders", "b").orElseThrow().version()).isZero();
+        });
+    }
+
+    @Test void batchRefreshRetainsHistoryAndPins() {
+        withFixture(f -> {
+            var writer = f.writer(); record(writer, "text"); writer.pin("orders", "source.orders", 0);
+            writer.recordBatch("orders", List.of(new DerivedSchemaStore.Recording("source.orders", columns("text"), "edited", "new", "v2")));
+            assertThat(writer.latest("orders", "source.orders").orElseThrow().version()).isZero();
+            assertThat(writer.pinned("orders", "source.orders").orElseThrow().statement()).isEqualTo("edited");
+            writer.recordBatch("orders", List.of(recording("source.orders", "varchar")));
+            assertThat(writer.latest("orders", "source.orders").orElseThrow().version()).isEqualTo(1);
+            assertThat(writer.pinned("orders", "source.orders").orElseThrow().schema()).isEqualTo(columns("text"));
+        });
+    }
+
     @Test void aWideModelReadUsesOneOriginalMetadataTransactionAndOneExactKeyQuery() {
         withFixture(f -> {
             var steps = java.util.stream.IntStream.range(0,12).mapToObj(i -> "source.table-"+i).collect(java.util.stream.Collectors.toSet());

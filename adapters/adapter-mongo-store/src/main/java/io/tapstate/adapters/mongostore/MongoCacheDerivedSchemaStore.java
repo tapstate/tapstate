@@ -64,6 +64,26 @@ final class MongoCacheDerivedSchemaStore implements DerivedSchemaStore {
         });
     }
 
+    @Override public void recordBatch(String pipelineId, List<Recording> recordings) {
+        access.requirePipeline(Objects.requireNonNull(pipelineId, "pipelineId"));
+        var captured = List.copyOf(recordings).stream().map(recording -> {
+            String key = key(pipelineId, recording.stepId());
+            var schema = new DerivedSchema(0, recording.schema(), recording.statement(),
+                    recording.derivedFrom(), recording.derivedBy());
+            validateChange(pipelineId, key, schema);
+            return Map.entry(key, schema);
+        }).toList();
+        if (captured.isEmpty()) return;
+        access.metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, session -> {
+            for (var recording : captured) {
+                String key = recording.getKey();
+                var updated = applyChange(read(session, key), recording.getValue());
+                write(session, key, updated.versions(), updated.pin());
+            }
+            return null;
+        });
+    }
+
     @Override public void recordMany(String pipelineId, List<Change> changes) {
         recordMany(pipelineId, changes, false);
     }

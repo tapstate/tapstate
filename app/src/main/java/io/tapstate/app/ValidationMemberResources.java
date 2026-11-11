@@ -111,7 +111,7 @@ final class ValidationMemberResources implements AutoCloseable {
         /** Exact original STOP/receipt scalars only; task/spec materialization still needs a metadata frame. */
         Control admitOriginalStopControl(){
             require();if(!originalStopSlots.tryAcquire())throw limit("validation.originalStopControls");
-            try{var body=control(null,false);body.released().whenComplete((ignored,failed)->originalStopSlots.release());return body;}
+            try{return control(null,false);}
             catch(RuntimeException|Error failed){originalStopSlots.release();throw failed;}
         }
         /** The request scope, not this worker, retains and eventually returns this exact member's frame. */
@@ -241,7 +241,10 @@ final class ValidationMemberResources implements AutoCloseable {
         private void release(){
             final Throwable failure;
             synchronized(this){if(returned||!retiring||submitted&&!exited)return;returned=true;failure=bodyFailure;}
-            allocation.close();if(ownsFrame)frame.close();if(failure==null)released.complete(null);else released.completeExceptionally(failure);
+            allocation.close();if(ownsFrame)frame.close();
+            // Only original STOP controls are frameless; return their permit before notifying callers.
+            if(frame==null)originalStopSlots.release();
+            if(failure==null)released.complete(null);else released.completeExceptionally(failure);
         }
         @Override public void close(){synchronized(this){retiring=true;}release();}
     }

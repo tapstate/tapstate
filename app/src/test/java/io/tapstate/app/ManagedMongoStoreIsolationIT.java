@@ -1916,12 +1916,15 @@ class ManagedMongoStoreIsolationIT {
                 // Manual fixture writes have no desired intent; pin their exact claim through ordinary control.
                 PipelineActuationOwnership.Execution execution;
                 PipelineActuationOwnership.Control seedControl;
-                synchronized (ownership) {
+                // Keep fixture seeding atomic in the same IO-gate-before-monitor order as ownership calls.
+                var fixtureAdmission = (java.util.concurrent.locks.ReentrantLock)org.springframework.test.util.ReflectionTestUtils.getField(ownership, "ioAdmission");
+                fixtureAdmission.lock();
+                try {
                     var permit = ownership.permit(scope); assertThat(permit.granted()).isTrue();
                     execution = ownership.beginExecution(scope, WorkloadClaimFence.from(permit.claim()));
                     assertThat(execution.allowed()).isTrue();
                     seedControl = ownership.control(scope);
-                }
+                } finally { fixtureAdmission.unlock(); }
                 var pipelineFence = execution.claimFence();
                 var node = child.getBean(NodeSessionLease.class).currentFence().orElseThrow();
                 var captures = child.getBean(CaptureOwnership.class);
@@ -1985,12 +1988,13 @@ class ManagedMongoStoreIsolationIT {
                         .isInstanceOf(TapstateException.class);
                 PipelineActuationOwnership.Execution nextExecution;
                 PipelineActuationOwnership.Control nextSeedControl;
-                synchronized (ownership) {
+                fixtureAdmission.lock();
+                try {
                     var nextPermit = ownership.permit(scope); assertThat(nextPermit.granted()).isTrue();
                     nextExecution = ownership.beginExecution(scope, WorkloadClaimFence.from(nextPermit.claim()));
                     assertThat(nextExecution.allowed()).isTrue();
                     nextSeedControl = ownership.control(scope);
-                }
+                } finally { fixtureAdmission.unlock(); }
                 try (nextSeedControl) {
                     assertThat(nextSeedControl.claim()).isEqualTo(nextExecution.claimFence());
                     var nextCapture = captures.acquire(new io.tapstate.runtime.srs.CaptureId(directContext.captureId()));

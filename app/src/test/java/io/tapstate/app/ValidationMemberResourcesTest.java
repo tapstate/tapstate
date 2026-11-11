@@ -211,6 +211,23 @@ class ValidationMemberResourcesTest {
             assertThat(member.snapshot().metadataFrames()).isZero();assertThat(member.snapshot().processReserved().isEmpty()).isTrue();assertThat(member.snapshot().processors()).isZero();
         }finally{release.countDown();}
     }
+    @Test void originalStopPermitReturnsBeforeReleaseObserversRun()throws Exception{
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        try(var process=new ValidationMemberResources()){
+            var member=process.bind("cluster","node","boot",4,()->{});var stop=member.admitOriginalStopControl();
+            var observer=stop.released().thenRun(()->{
+                try(var next=member.admitOriginalStopControl()){
+                    next.close();assertThat(next.released().toCompletableFuture()).isCompleted();
+                }
+            });
+            try{
+                stop.execute(()->{entered.countDown();try{assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}});
+                assertThat(entered.await(2,TimeUnit.SECONDS)).isTrue();stop.close();release.countDown();
+                observer.toCompletableFuture().get(2,TimeUnit.SECONDS);
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
+            }finally{release.countDown();stop.close();}
+        }finally{release.countDown();}
+    }
     @Test void aMinimalWorkerReceiptPreservesFatalDiagnosisPriority()throws Exception{
         var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
         try(var process=new ValidationMemberResources()){

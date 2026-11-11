@@ -395,6 +395,9 @@ final class StoreBackedDagSource implements DagSource {
             @Override public void record(String pipeline,String step,Map<String,String> columns,String statement,String from,String by) {
                 store.derivedSchemas().record(pipeline,step,columns,statement,from,by);
             }
+            @Override public void recordBatch(String pipeline, List<io.tapstate.spi.store.DerivedSchemaStore.Recording> recordings) {
+                store.derivedSchemas().recordBatch(pipeline, recordings);
+            }
             @Override public void pin(String pipeline,String step,long version) { store.derivedSchemas().pin(pipeline,step,version); }
             @Override public Optional<io.tapstate.spi.store.DerivedSchema> pinned(String pipeline,String step) { return store.derivedSchemas().pinned(pipeline,step); }
             @Override public void delete(String pipeline) { store.derivedSchemas().delete(pipeline); }
@@ -1183,11 +1186,9 @@ final class StoreBackedDagSource implements DagSource {
             if (discovered == null) {
                 continue;
             }
-            for (String table : SourceTableSelection.resolve(source, discovered)) {
-                if (sourceSchemaCopy.copy(pipelineId, sourceId, table, discoveredTable(discovered, table))) {
-                    copied.add(SourceSchemaCopy.nodeId(sourceId, table));
-                }
-            }
+            copied.addAll(sourceSchemaCopy.copyBatch(pipelineId, sourceId,
+                    SourceTableSelection.resolve(source, discovered).stream()
+                            .map(table -> discoveredTable(discovered, table)).filter(Objects::nonNull).toList()));
         }
         return copied;
     }

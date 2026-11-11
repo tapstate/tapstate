@@ -34,6 +34,22 @@ class SourceSchemaCopyTest {
     private final SourceSchemaCopy copy = new SourceSchemaCopy(records);
 
     @Test
+    void configurationCopiesAreBoundedAndKeepEverySelectedModel() {
+        var store = org.mockito.Mockito.mock(io.tapstate.spi.store.DerivedSchemaStore.class);
+        var batches = new java.util.ArrayList<List<io.tapstate.spi.store.DerivedSchemaStore.Recording>>();
+        org.mockito.Mockito.doAnswer(call -> {
+            batches.add(List.copyOf(call.getArgument(1))); return null;
+        }).when(store).recordBatch(org.mockito.ArgumentMatchers.eq("flow"), org.mockito.ArgumentMatchers.anyList());
+        var tables = java.util.stream.IntStream.range(0, 65).mapToObj(i -> new SourceTable(
+                "table-" + i, orders(TapstateType.DECIMAL).fields(), List.of("o_id"), List.of())).toList();
+        var copied = new SourceSchemaCopy(store).copyBatch("flow", "src", tables);
+        assertThat(batches.stream().map(List::size)).containsExactly(32, 32, 1);
+        assertThat(batches.stream().flatMap(List::stream).map(io.tapstate.spi.store.DerivedSchemaStore.Recording::stepId).toList())
+                .containsExactlyElementsOf(copied).hasSize(65).doesNotHaveDuplicates();
+        assertThat(batches.getFirst().getFirst().schema()).isEqualTo(Map.of("o_id", "INT64 NULL", "o_total", "DECIMAL NULL"));
+    }
+
+    @Test
     @DisplayName("files the copy under sourceId.table even when the source selects a single table")
     void filesUnderSourceAndTable() {
         copy.copy("flow", "src", "orders", orders(TapstateType.DECIMAL));
