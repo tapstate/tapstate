@@ -78,6 +78,7 @@ import io.tapstate.control.core.SchemaQueryService;
 import io.tapstate.control.core.ResourceAttributionPolicy;
 import io.tapstate.control.core.StateDatabasePolicy;
 import io.tapstate.control.core.DataBrowserFollows;
+import io.tapstate.control.core.AggregateStepChecks;
 import io.tapstate.control.core.DerivedSchemas;
 import io.tapstate.control.core.DeploymentProfile;
 import io.tapstate.control.core.SourceConnectionResolver;
@@ -496,6 +497,13 @@ class ControlPlaneConfiguration {
         // available when a start has just been refused, which is exactly the moment a data plane may not
         // be running at all.
         return new StoreBackedDerivedSchemas(storePort, auditGate);
+    }
+
+    @Bean
+    AggregateStepChecks aggregateStepChecks(ObjectProvider<HazelcastInstance> member, AuditGate auditGate) {
+        // Answered by the running step on whichever member runs it; a node with no data plane has no
+        // member to ask through and says the step is not running.
+        return new ClusterAggregateStepChecks(member.getIfAvailable(), auditGate);
     }
 
     @Bean

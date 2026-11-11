@@ -60,7 +60,10 @@ public enum AggregateError implements TapstateErrorCode {
     STEP_NOT_RUNNING("aggregate.step-not-running", Set.of("pipeline", "step")),
 
     /** A group named for a check or a repair does not read as a group of the step. */
-    GROUP_INVALID("aggregate.group-invalid", Set.of("step", "reason"));
+    GROUP_INVALID("aggregate.group-invalid", Set.of("step", "reason")),
+
+    /** A running step did not take or answer a check or a repair in the time allowed. */
+    STEP_BUSY("aggregate.step-busy", Set.of("pipeline", "step"));
 
     /** The step's code for a reason the shared function library reports under its own name. */
     public static AggregateError of(RollupError reason) {

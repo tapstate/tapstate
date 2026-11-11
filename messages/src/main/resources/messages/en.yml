@@ -1514,3 +1514,6 @@ aggregate.step-not-running:
 aggregate.group-invalid:
   message: "That does not name a group of aggregate step `{step}`: {reason}."
   solution: "Name the group by every name under the step's `groupBy:`, as `name=value` pairs; a name with no value means null. Copy a group as a check printed it."
+aggregate.step-busy:
+  message: "Aggregate step `{step}` of pipeline `{pipeline}` did not answer in time."
+  solution: "The step answers a check or a repair between its own updates, a few at a time. Nothing was left half done: ask again, and narrow the request to one group if the step is under heavy load."
