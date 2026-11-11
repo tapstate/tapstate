@@ -3,7 +3,7 @@ package io.tapstate.runtime.engine.aggregate;
 import com.hazelcast.core.HazelcastInstance;
 import java.io.Serializable;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -46,22 +46,23 @@ public final class AggregateRequests {
 
     /**
      * @param action what to do
-     * @param group  the one group to do it to, as its key values, or null for a page of the step's groups
+     * @param group  the one group to do it to, as the text of each of its key values by name, or null for
+     *               a page of the step's groups; a name with a null value is the null of that column
      * @param after  for a page: where the page before ended, or null to start from the first group
      * @param groups for a page: how many groups to take, at most {@link #MAX_GROUPS}
      */
-    public record Request(Action action, List<Object> group, byte[] after, int groups) implements Serializable {
+    public record Request(Action action, Map<String, String> group, byte[] after, int groups) implements Serializable {
         private static final long serialVersionUID = 1L;
 
         public Request {
             Objects.requireNonNull(action, "action");
-            group = group == null ? null : Collections.unmodifiableList(new ArrayList<>(group));
+            group = group == null ? null : new LinkedHashMap<>(group);
             if (group == null && (groups < 1 || groups > MAX_GROUPS)) {
                 throw new IllegalArgumentException("a page takes 1 to " + MAX_GROUPS + " groups");
             }
         }
 
-        public static Request one(Action action, List<Object> group) {
+        public static Request one(Action action, Map<String, String> group) {
             return new Request(action, Objects.requireNonNull(group, "group"), null, 1);
         }
 
@@ -73,37 +74,49 @@ public final class AggregateRequests {
     /**
      * One group that was not simply clean.
      *
-     * @param group       the group's key values
+     * @param group       the group, as the text of each of its key values by name
      * @param verdict     {@code mismatch} or {@code inconclusive}; {@code clean} only for a group listed
      *                    because it cannot be given
      * @param fields      the fields whose derived state differed from the group's rows
      * @param failure     the code under which the group cannot be given exactly now, or null
      * @param failedField the field that code is about, or null
      */
-    public record Finding(List<Object> group, String verdict, List<String> fields, String failure,
+    public record Finding(Map<String, String> group, String verdict, List<String> fields, String failure,
             String failedField) implements Serializable {
         private static final long serialVersionUID = 1L;
 
         public Finding {
-            group = Collections.unmodifiableList(new ArrayList<>(group));
-            fields = List.copyOf(fields);
+            group = new LinkedHashMap<>(group);
+            fields = new ArrayList<>(fields);
         }
     }
 
     /**
-     * @param groups    how many groups were looked at
-     * @param findings  the groups that differed, could not be decided, or cannot be given
-     * @param next      where the next page starts, or null when no group is left
-     * @param conflicts events the step did not apply since it started, because they carried an order
-     *                  already stored with other content or came for a row through another input
-     * @param withheld  times since it started that the step sent a group at its last good values
+     * @param groups      how many groups were looked at
+     * @param findings    the groups that differed, could not be decided, or cannot be given
+     * @param next        where the next page starts, or null when no group is left
+     * @param conflicts   events the step did not apply since it started, because they carried an order
+     *                    already stored with other content or came for a row through another input
+     * @param withheld    times since it started that the step sent a group at its last good values
+     * @param refusal     the code the request was refused under, with nothing done, or null
+     * @param refusalArgs what that code is told
      */
-    public record Report(int groups, List<Finding> findings, byte[] next, long conflicts, long withheld)
-            implements Serializable {
+    public record Report(int groups, List<Finding> findings, byte[] next, long conflicts, long withheld,
+            String refusal, Map<String, String> refusalArgs) implements Serializable {
         private static final long serialVersionUID = 1L;
 
         public Report {
-            findings = List.copyOf(findings);
+            findings = new ArrayList<>(findings);
+            refusalArgs = new LinkedHashMap<>(refusalArgs);
+        }
+
+        public Report(int groups, List<Finding> findings, byte[] next, long conflicts, long withheld) {
+            this(groups, findings, next, conflicts, withheld, null, Map.of());
+        }
+
+        /** A request that was not carried out: the code travels as its text, never as the constant. */
+        public static Report refused(String code, Map<String, String> args) {
+            return new Report(0, List.of(), null, 0, 0, Objects.requireNonNull(code, "code"), args);
         }
     }
 

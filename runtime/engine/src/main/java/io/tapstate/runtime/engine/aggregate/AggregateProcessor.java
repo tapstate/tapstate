@@ -8,6 +8,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.AggregateRow;
 import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateError;
+import io.tapstate.core.dsl.aggregate.AggregateGroupKey;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.dsl.aggregate.Contribution;
 import io.tapstate.core.dsl.aggregate.OrderedBytes;
@@ -193,7 +194,14 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             List<List<Object>> asked;
             byte[] next = null;
             if (request.group() != null) {
-                asked = List.of(request.group());
+                try {
+                    asked = List.of(AggregateGroupKey.parse(spec, request.group()));
+                } catch (TapstateException notAGroup) {
+                    Map<String, String> args = new LinkedHashMap<>();
+                    notAGroup.args().forEach((name, value) -> args.put(name, String.valueOf(value)));
+                    waiting.answer().complete(AggregateRequests.Report.refused(notAGroup.code().code(), args));
+                    return;
+                }
             } else {
                 GroupStage.Groups page = groups.groups(request.after(), request.groups());
                 asked = page.groups();
@@ -216,7 +224,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
                     }
                 }
                 if (audit.verdict() != GroupStage.Verdict.CLEAN || audit.failure() != null) {
-                    findings.add(new AggregateRequests.Finding(group, audit.verdict().name().toLowerCase(java.util.Locale.ROOT),
+                    findings.add(new AggregateRequests.Finding(AggregateGroupKey.shown(spec, group), audit.verdict().name().toLowerCase(java.util.Locale.ROOT),
                             audit.fields(), audit.failure() == null ? null : AggregateError.of(audit.failure()).code(),
                             audit.failedField()));
                 }
