@@ -3,6 +3,9 @@ package io.tapstate.runtime.engine.nest;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.core.dsl.RollupFold;
+import io.tapstate.core.dsl.aggregate.RollupElement;
+import io.tapstate.core.dsl.aggregate.RollupError;
 import io.tapstate.core.model.EmbedAs;
 import io.tapstate.runtime.engine.ReplayFloor;
 
@@ -645,14 +648,31 @@ public final class RootAssembly implements Serializable {
      */
     public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
             Map<String, Map<Object, Map<String, Object>>> resolved) {
+        return render(slots, resolved, UNNAMED_ROOT);
+    }
+
+    /**
+     * As above, naming the document {@code root} in a refusal a rollup field raises while it is rendered: an
+     * overflow or a value of the wrong type is a fact about one document, and the author has to find it.
+     */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
         Objects.requireNonNull(slots, "slots");
         Objects.requireNonNull(resolved, "resolved");
         if (!rootPresent) {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots, resolved, true);
+        renderInto(document, children, slots, resolved, true, root, RollupLevel.ROOT);
         return Optional.of(document);
+    }
+
+    /** How a refusal names a document whose key the caller did not pass. */
+    private static final String UNNAMED_ROOT = "(document)";
+
+    /** The level a rollup field lands on, as a refusal names it. */
+    private record RollupLevel(String name) {
+        static final RollupLevel ROOT = new RollupLevel("$root");
     }
 
     /**
@@ -686,7 +706,8 @@ public final class RootAssembly implements Serializable {
                         absent.add(field);
                     }
                 }
-            } else if (!rendered.containsKey(slot.path())) {
+            } else if (slot.path() != null && !rendered.containsKey(slot.path())) {
+                // A rollup level renders no path of its own, and its fields are written even when null.
                 absent.add(slot.path());
             }
         }
@@ -1166,7 +1187,8 @@ public final class RootAssembly implements Serializable {
 
     private void renderInto(Map<String, Object> document,
             Map<String, Map<List<Object>, ElementNode>> held, List<EmbedSlot> slots,
-            Map<String, Map<Object, Map<String, Object>>> resolved, boolean rememberTopLevelFlatFields) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, boolean rememberTopLevelFlatFields,
+            String root, RollupLevel level) {
         Map<String, String> occupied = new LinkedHashMap<>();
         for (String field : document.keySet()) {
             occupied.put(field, "the parent row");
@@ -1175,7 +1197,9 @@ public final class RootAssembly implements Serializable {
             if (slot.as() == EmbedAs.FLAT) {
                 continue;
             }
-            occupied.putIfAbsent(slot.path(), slot.diagnosticPath());
+            if (slot.path() != null) {
+                occupied.putIfAbsent(slot.path(), slot.diagnosticPath());
+            }
             if (slot.isReference()) {
                 // Read off the row this level already carries. The columns holding the reference are ones
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
@@ -1204,14 +1228,29 @@ public final class RootAssembly implements Serializable {
                         }
                     }
                     case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
+                    case ROLLUP -> throw new IllegalStateException("a rollup level is never a reference");
                 }
                 continue;
             }
             Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
             switch (slot.as()) {
-                case ARRAY -> document.put(slot.path(), liveOf(elements, slot, resolved));
+                case ARRAY -> {
+                    if (slot.rollups().isEmpty()) {
+                        document.put(slot.path(), liveOf(elements, slot, resolved, root));
+                    } else {
+                        List<RollupElement> live = liveElementsOf(elements, slot, resolved, root);
+                        List<Map<String, Object>> rendered = new ArrayList<>(live.size());
+                        for (RollupElement element : live) {
+                            rendered.add(element.rendered());
+                        }
+                        document.put(slot.path(), rendered);
+                        writeRollups(document, slot, live, root, level, occupied);
+                    }
+                }
+                case ROLLUP -> writeRollups(document, slot, liveElementsOf(elements, slot, resolved, root), root,
+                        level, occupied);
                 case OBJECT -> latestOf(elements)
-                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved)));
+                        .ifPresent(element -> document.put(slot.path(), renderOne(element, slot, resolved, root)));
                 case FLAT -> throw new IllegalStateException("flat slots are rendered in the flat pass");
             }
         }
@@ -1230,7 +1269,7 @@ public final class RootAssembly implements Serializable {
                 Map<List<Object>, ElementNode> elements = held.get(slot.stateField());
                 Optional<ElementNode> only = onlyLiveFlat(elements, slot);
                 if (only.isPresent()) {
-                    flat = renderOne(only.get(), slot, resolved);
+                    flat = renderOne(only.get(), slot, resolved, root);
                 }
             }
             if (flat != null) {
@@ -1240,23 +1279,80 @@ public final class RootAssembly implements Serializable {
     }
 
     private Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,
-            Map<String, Map<Object, Map<String, Object>>> resolved) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
         Map<String, Object> rendered = new LinkedHashMap<>(element.fields());
-        renderInto(rendered, element.children(), slot.children(), resolved, false);
+        renderInto(rendered, element.children(), slot.children(), resolved, false, root,
+                new RollupLevel(slot.diagnosticPath()));
         return rendered;
     }
 
     private List<Map<String, Object>> liveOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
-            Map<String, Map<Object, Map<String, Object>>> resolved) {
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
         List<Map<String, Object>> live = new ArrayList<>();
         if (elements != null) {
             for (ElementNode element : elements.values()) {
                 if (!element.deleted()) {
-                    live.add(renderOne(element, slot, resolved));
+                    live.add(renderOne(element, slot, resolved, root));
                 }
             }
         }
         return live;
+    }
+
+    /**
+     * The live elements of a level a rollup folds over: each rendered exactly as the array would show it -
+     * references resolved, its own levels' rollups written - with its key and the references it names that
+     * rendered absent. A reference that names nothing (its key all null) is not missing; it was never there.
+     */
+    private List<RollupElement> liveElementsOf(Map<List<Object>, ElementNode> elements, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
+        List<RollupElement> live = new ArrayList<>();
+        if (elements == null) {
+            return live;
+        }
+        for (Map.Entry<List<Object>, ElementNode> entry : elements.entrySet()) {
+            ElementNode element = entry.getValue();
+            if (element.deleted()) {
+                continue;
+            }
+            Map<String, Object> rendered = renderOne(element, slot, resolved, root);
+            Set<String> missing = new LinkedHashSet<>();
+            for (EmbedSlot child : slot.children()) {
+                if (!child.isReference() || child.path() == null) {
+                    continue;
+                }
+                List<Object> named = NestKeys.valuesOf(element.fields(), child.referenceFields());
+                if (named.stream().allMatch(Objects::isNull)) {
+                    continue;
+                }
+                Object at = rendered.get(child.path());
+                if (at == null || (at instanceof List<?> list && list.isEmpty())) {
+                    missing.add(child.path());
+                }
+            }
+            live.add(new RollupElement(entry.getKey(), rendered, missing));
+        }
+        return live;
+    }
+
+    /**
+     * Writes a level's rollup fields on the map that holds the level, refusing a field whose name the map
+     * already carries. A null result is written as a null rather than left out: a field that stops being
+     * written is left standing in a keyed target at its last value, which is the one thing an incomplete
+     * total must not do.
+     */
+    private static void writeRollups(Map<String, Object> document, EmbedSlot slot, List<RollupElement> live,
+            String root, RollupLevel level, Map<String, String> occupied) {
+        Map<String, Object> values = RollupFold.apply(slot.rollups(), live, root);
+        for (Map.Entry<String, Object> value : values.entrySet()) {
+            String field = value.getKey();
+            if (document.containsKey(field)) {
+                throw new TapstateException(RollupError.FIELD_CONFLICT, Map.of("field", field,
+                        "level", level.name(), "other", occupied.getOrDefault(field, "a field the row carries")), null);
+            }
+            document.put(field, value.getValue());
+            occupied.putIfAbsent(field, slot.diagnosticPath() + " rollup field");
+        }
     }
 
     /** The one live row of a flat embed, refusing a one-to-many relationship at runtime. */

@@ -128,6 +128,7 @@ class StructuralKeyDerivationTest {
         assertWhitelist(DslParser.STEP_USE_KEYS, Step.Use.class, Set.of("options"));
         assertWhitelist(DslParser.SOURCE_REF_KEYS, SourceRef.Spec.class, Set.of());
         assertWhitelist(DslParser.NEST_STATE_KEYS, NestStateStorage.class, Set.of());
+        assertWhitelist(DslParser.ROLLUP_PICK_KEYS, io.tapstate.core.model.RollupPick.class, Set.of());
         assertWhitelist(DslParser.EXECUTION_KEYS, ExecutionSpec.class, Set.of());
         assertWhitelist(DslParser.BATCH_KEYS, BatchSpec.class, Set.of());
     }
@@ -289,13 +290,16 @@ class StructuralKeyDerivationTest {
             "NO_ENGINE_OPTIONS", "NEST_ROOT_KEYS", "EMBED_KEYS", "VIEW_INLINE_KEYS", "VIEW_USE_KEYS",
             "STORAGE_KEYS", "HOT_KEYS", "WARM_KEYS", "COLD_KEYS",
             "SERVE_USE_KEYS", "SERVE_INLINE_KEYS", "RENAME_KEYS", "QUERY_KEYS", "SETTINGS_KEYS",
-            "VIEW_DEF_KEYS", "SERVE_DEF_KEYS");
+            "VIEW_DEF_KEYS", "SERVE_DEF_KEYS",
+            // A rollup field's keys are its one function plus these qualifiers; the function keys are
+            // read from the RollupFunction vocabulary, so only the qualifiers are a whitelist.
+            "ROLLUP_OPTION_KEYS");
 
     /** The whitelists the tests above re-derive from a record. */
     private static final Set<String> DERIVED = Set.of(
             "SOURCE_KEYS", "PIPELINE_KEYS", "TRANSFORM_DEF_KEYS", "METADATA_KEYS", "SRS_KEYS",
             "TABLE_SPEC_KEYS", "SYNC_KEYS", "PUSH_KEYS", "STEP_BASE_KEYS", "STEP_USE_KEYS",
-            "SOURCE_REF_KEYS", "NEST_STATE_KEYS", "EXECUTION_KEYS", "BATCH_KEYS");
+            "SOURCE_REF_KEYS", "NEST_STATE_KEYS", "EXECUTION_KEYS", "BATCH_KEYS", "ROLLUP_PICK_KEYS");
 
     /** The required-key sets, re-derived above from their record's {@code @Doc(required = true)}. */
     private static final Set<String> REQUIRED_DERIVED = Set.of(

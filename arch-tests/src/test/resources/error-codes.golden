@@ -251,6 +251,9 @@ dsl.missing-field
 dsl.missing-reference
 dsl.mode-mismatch
 dsl.mode-required-for-read
+dsl.rollup-function-unknown
+dsl.rollup-level-without-fields
+dsl.rollup-on-single-row-embed
 dsl.row-expression-needs-discovery
 dsl.row-expression-type-unknown
 dsl.row-expression-type-unsupported
@@ -358,6 +361,14 @@ nest.reference-fanout-limit-exceeded
 nest.reference-tracking-requires-before-image
 nest.referenced-level-carries-embeds
 nest.resolver-vertex-limit-exceeded
+nest.rollup-evaluation-failed
+nest.rollup-expression-invalid
+nest.rollup-field-conflict
+nest.rollup-on-reference-embed
+nest.rollup-overflow
+nest.rollup-result-not-convertible
+nest.rollup-type-unknown
+nest.rollup-value-type-mismatch
 nest.root-fanout-limit-exceeded
 nest.root-key-required
 nest.sibling-embeds-target-different-parent-keys

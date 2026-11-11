@@ -74,6 +74,15 @@ public final class RollupExpressions {
         throw new IllegalArgumentException("not a rollup expression: " + written);
     }
 
+    /**
+     * The element fields a written rollup expression names directly ({@code $amount} names {@code amount},
+     * {@code =after.prize.value * 2} names {@code prize}), for a reader that has to say what a field depends
+     * on without checking it.
+     */
+    public static Set<String> fieldsRead(String written) {
+        return namedFields(expressionOf(written));
+    }
+
     /** The untyped check of a value expression, or null when it compiles. */
     static String untypedValueError(String expr) {
         return error(UNTYPED_VALUE, expr);
