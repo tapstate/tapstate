@@ -34,7 +34,7 @@ class RegistrationGrowthBatchingTest {
         Set<Object> before = new LinkedHashSet<>(Set.of("old"));
         f.states.put("a", before);
         f.store.addAll(Map.of("a", Set.of("new"), "b", Set.of("second")));
-        assertThat(f.calls).isEqualTo(1);
+        assertThat(f.calls).isEqualTo(2);
         assertThat(before).containsExactly("old");
         assertThat(f.states.get("a")).containsExactlyInAnyOrder("old", "new");
         assertThat(f.states.get("b")).containsExactly("second");
@@ -44,7 +44,7 @@ class RegistrationGrowthBatchingTest {
         Fixture f = new Fixture();
         f.protectionFailure = true;
         f.store.addAll(Map.of("a", Set.of("first"), "b", Set.of("second")));
-        assertThat(f.calls).isEqualTo(2);
+        assertThat(f.calls).isEqualTo(4);
         assertThat(f.states).containsEntry("a", Set.of("first")).containsEntry("b", Set.of("second"));
     }
 
@@ -54,8 +54,8 @@ class RegistrationGrowthBatchingTest {
         Map<Object, Set<Object>> additions = Map.of("a", Set.of("first"), "b", Set.of("second"));
         assertThatThrownBy(() -> f.store.addAll(additions))
                 .isInstanceOf(IllegalStateException.class).hasMessage("injected store failure");
-        assertThat(f.calls).isEqualTo(1);
-        assertThat(f.states).hasSize(1);
+        assertThat(f.calls).isEqualTo(2);
+        assertThat(f.states).hasSize(2);
     }
 
     @SuppressWarnings("unchecked")
@@ -72,8 +72,14 @@ class RegistrationGrowthBatchingTest {
             map = (IMap<Object, Set<Object>>) Proxy.newProxyInstance(IMap.class.getClassLoader(),
                     new Class<?>[] {IMap.class}, (proxy, method, args) -> switch (method.getName()) {
                         case "getName" -> "refs";
-                        case "executeOnKeys" -> apply((Set<Object>) args[0],
-                                (EntryProcessor<Object, Set<Object>, ?>) args[1]);
+                        case "submitToKey" -> {
+                            try {
+                                apply(Set.of(args[0]), (EntryProcessor<Object, Set<Object>, ?>) args[1]);
+                                yield java.util.concurrent.CompletableFuture.completedFuture(null);
+                            } catch (Exception failure) {
+                                yield java.util.concurrent.CompletableFuture.failedFuture(failure);
+                            }
+                        }
                         default -> throw new AssertionError("unexpected map call: " + method.getName());
                     });
             store = new MapNestStore<>(map);

@@ -134,9 +134,9 @@ class StorageRootConfiguration {
     }
     @Bean @org.springframework.context.annotation.Lazy
     InstalledConnectorTests installedConnectorTests(ConnectorPluginProperties properties, Clock clock,
-            org.springframework.core.env.Environment environment) {
+            org.springframework.core.env.Environment environment, CloudRuntimeSettings cloud) {
         return new InstalledConnectorTests(properties, clock, CloudConnectorSeedReadiness.localSelectionFileNames(
-                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY))));
+                "true".equals(environment.getProperty(WebDistribution.DEVELOPMENT_CONFIRMATION_PROPERTY))), cloud.cloud());
     }
     @Bean @org.springframework.context.annotation.Lazy
     StorageSetupService.DefaultTarget storageDefaultTarget(ObjectProvider<InstalledConnectorTests> connectors) {
@@ -178,7 +178,7 @@ class StorageRootConfiguration {
                 new AuditGate(configuration.audit(), clock), clock, root::requireActive,
                 committed -> {
                     if (root.mode() == StorageBinding.Mode.CLOUD)
-                        root.handoffActivation(committed, () -> root.continueCloudSetup(committed, target, original -> factories.getObject().create(original)));
+                        root.handoffCloudSetup(committed, target, original -> factories.getObject().create(original));
                 }, root::coordinateSetup, (expected, tested, active) -> {},
                 root.mode() == StorageBinding.Mode.CLOUD ? root.initializationProgress() : null);
     }

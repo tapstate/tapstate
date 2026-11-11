@@ -939,9 +939,19 @@ public final class Engine {
         OperatorMapBindings bindings = member.getUserContext() == null ? null
                 : OperatorMapBindings.resolve(member, false);
         Map<String, NestStateReading> readings = new HashMap<>();
-        byNamespace.forEach((namespace, kinds) -> readings.put(namespace,
-                NestStateMetricNames.readingFrom(kinds, stored(namespace))
-                        .withOrigin(originOf(bindings, namespace))));
+        var dataMembers = member.getCluster().getMembers().stream().filter(value -> !value.isLiteMember())
+                .map(value -> value.getUuid().toString()).collect(java.util.stream.Collectors.toSet());
+        var keySamples = io.tapstate.runtime.engine.nest.NestStateSamples.keyAccess(collected, dataMembers);
+        var diagnostics = io.tapstate.runtime.engine.nest.NestStateSamples.diagnostics(collected);
+        byNamespace.forEach((namespace, kinds) -> {
+            var reading = NestStateMetricNames.readingFrom(kinds, stored(namespace));
+            var measured = diagnostics.get(namespace);
+            if (measured != null) {
+                if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
+                if (measured.commits() != null) reading = reading.withCommits(measured.commits());
+            }
+            readings.put(namespace, reading.withContext(keySamples.get(namespace), originOf(bindings, namespace)));
+        });
         return readings;
     }
 

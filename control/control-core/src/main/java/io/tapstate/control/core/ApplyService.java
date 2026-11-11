@@ -21,6 +21,7 @@ import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SchemaStore;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceTable;
@@ -277,6 +278,15 @@ public final class ApplyService {
 
     private CandidateWorkspacePlan planResourcesAndWorkspace(
             List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope) {
+        return planResourcesAndWorkspace(submitted, preconditions, validationScope, null);
+    }
+
+    private record PublicationReads(ArtifactStore.ReadableInventory inventory, Resource previous,
+            Optional<String> managedSource, Map<String, Optional<DiscoveredSourceModel>> models) {}
+
+    private CandidateWorkspacePlan planResourcesAndWorkspace(
+            List<Resource> submitted, Map<String, String> preconditions, ValidationScope validationScope,
+            PublicationReads publication) {
         Objects.requireNonNull(submitted, "submitted");
         Objects.requireNonNull(preconditions, "preconditions");
         Objects.requireNonNull(validationScope, "validationScope");
@@ -288,7 +298,7 @@ public final class ApplyService {
                         null);
             }
         }
-        store.managedDefaultSourceId().ifPresent(managed -> {
+        (publication == null ? store.managedDefaultSourceId() : publication.managedSource()).ifPresent(managed -> {
             for (Resource resource : submitted) {
                 if (resource instanceof PipelineResource pipeline && pipeline.sourceIds().contains(managed)
                         || resource instanceof SourceResource source && storeMarked(source))
@@ -297,7 +307,8 @@ public final class ApplyService {
             }
         });
         Set<String> submittedIds = submitted.stream().map(Resource::id).collect(java.util.stream.Collectors.toSet());
-        List<Resource> storedResources = ReadableArtifactInventory.list(store);
+        List<Resource> storedResources = publication == null ? ReadableArtifactInventory.list(store)
+                : publication.inventory().resources();
         List<Resource> candidate = new ArrayList<>();
         for (Resource stored : storedResources) {
             if (!submittedIds.contains(stored.id())) {
@@ -317,7 +328,8 @@ public final class ApplyService {
                     Map.of("reason", "Cloud allows exactly one MongoDB Atlas state store without capture settings"),
                     null);
         }
-        TapstateCatalog liveCatalog = catalog.get();
+        TapstateCatalog liveCatalog = publication == null ? catalog.get()
+                : publication.inventory().connectorCatalog().orElseGet(catalog);
         List<Resource> validationResources = validationResources(candidate, submitted, validationScope);
         stateDatabasePolicy.validate(validationResources);
         Workspace workspace = Workspace.of(validationResources, liveCatalog);
@@ -330,7 +342,7 @@ public final class ApplyService {
         }
         // Read once and handed to both: the gate judges the batch against it, then the advisory pass
         // advises on the same reading rather than paying a second round trip for a possibly different one.
-        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources);
+        Map<String, List<DiscoveredTable>> discovered = discoveredTables(validationResources, publication);
         RowExpressionTypeRules.validate(validationResources, discovered);
         WriteKeyRules.validate(validationResources, discovered);
         // Judged over the submitted resources and resolved against the whole candidate workspace.
@@ -361,7 +373,8 @@ public final class ApplyService {
         for (Resource submittedResource : submitted) {
             Resource resource = validatedById.get(submittedResource.id());
             Resource recorded = resource instanceof PipelineResource pipeline
-                    ? withOwnSrsSwitches(pipeline, batchSources) : resource;
+                    ? withOwnSrsSwitches(pipeline, batchSources, publication == null
+                            ? store.get(pipeline.id()).orElse(null) : publication.previous()) : resource;
             String canonicalForm = writer.write(recorded);
             prepared.add(new PreparedArtifact(recorded, canonicalForm, CanonicalHash.of(recorded)));
         }
@@ -392,9 +405,9 @@ public final class ApplyService {
      * materialize again, one revision per apply on a file nobody touched.
      */
     private PipelineResource withOwnSrsSwitches(
-            PipelineResource pipeline, Map<String, SourceResource> batchSources) {
+            PipelineResource pipeline, Map<String, SourceResource> batchSources, Resource existing) {
         Map<String, Boolean> alreadyRecorded = new LinkedHashMap<>();
-        if (store.get(pipeline.id()).orElse(null) instanceof PipelineResource stored) {
+        if (existing instanceof PipelineResource stored) {
             for (SourceRef ref : stored.sources()) {
                 if (ref instanceof SourceRef.Spec spec) {
                     alreadyRecorded.put(spec.id(), spec.srs());
@@ -596,15 +609,48 @@ public final class ApplyService {
 
     /** Prepares a publication with the verified publisher's server-managed resource attribution. */
     public ApplyPlan planDraftPublication(String principal, Resource resource) {
+        return captureDraftPublication(principal, resource).plan();
+    }
+
+    record DraftPublicationPlan(ApplyPlan plan, SchemaDerivation.PublishedInputs inputs) {}
+
+    DraftPublicationPlan captureDraftPublication(String principal, Resource resource) {
         Objects.requireNonNull(principal, "principal");
-        return attributed(principal, planDraftPublication(resource));
+        Objects.requireNonNull(resource, "resource");
+        var dependencySlice = resource instanceof PipelineResource pipeline
+                ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
+        var inventory = dependencySlice.orElseGet(store::readableInventory);
+        var previous = dependencySlice.isPresent() || inventory.exactLookupIds().contains(resource.id())
+                ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
+                : store.get(resource.id());
+        var reads = new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
+                new LinkedHashMap<>());
+        var planned = planResourcesAndWorkspace(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE, reads);
+        var plan = planned.plan();
+        var prepared = plan.artifacts().getFirst();
+        if (live != null && prepared.resource() instanceof PipelineResource replacement) {
+            live.refuseBufferingChangeWhileLive(
+                    previous.filter(PipelineResource.class::isInstance).map(PipelineResource.class::cast).orElse(null),
+                    replacement);
+        }
+        Resource attributed = attribution.attribute(principal, prepared.resource(), previous.orElse(null));
+        var publishedPlan = new ApplyPlan(List.of(new PreparedArtifact(attributed, writer.write(attributed), CanonicalHash.of(attributed))),
+                plan.warnings(), plan.preconditions(), plan.workspacePreconditions());
+        var definitions = new LinkedHashMap<String, Resource>();
+        for (Resource value : planned.resources()) {
+            if (plan.workspacePreconditions().containsKey(value.id())) definitions.put(value.id(), value);
+        }
+        definitions.put(attributed.id(), attributed);
+        return new DraftPublicationPlan(publishedPlan,
+                new SchemaDerivation.PublishedInputs(definitions, reads.models(), reads.managedSource()));
     }
 
     /** Re-derives the published pipeline's schema after the artifact transaction has committed. */
-    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId) {
+    public List<ValidationDiagnostic> refreshPublishedPipeline(String pipelineId,
+            SchemaDerivation.PublishedInputs inputs, long stateGeneration) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         try {
-            derivation.derive(pipelineId);
+            derivation.derivePublishedDraft(pipelineId, inputs, stateGeneration);
             return List.of();
         } catch (TapstateException failure) {
             return List.of(new ValidationDiagnostic(ControlError.SCHEMA_DERIVATION_INCOMPLETE.code(),
@@ -713,10 +759,6 @@ public final class ApplyService {
         return new ApplyResult(result.outcomes(), warnings);
     }
 
-    private ApplyPlan attributed(String principal, ApplyPlan planned) {
-        return attributedWithSnapshots(principal, planned).plan();
-    }
-
     private AttributedPlan attributedWithSnapshots(String principal, ApplyPlan planned) {
         List<PreparedArtifact> attributed = new ArrayList<>();
         Map<String, String> existingHashes = new LinkedHashMap<>();
@@ -767,7 +809,7 @@ public final class ApplyService {
         ONLINE_SOURCE
     }
 
-    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources) {
+    private Map<String, List<DiscoveredTable>> discoveredTables(List<Resource> resources, PublicationReads publication) {
         Map<String, List<DiscoveredTable>> bySource = new LinkedHashMap<>();
         if (resources.stream().noneMatch(PipelineResource.class::isInstance)) {
             return bySource;
@@ -776,7 +818,9 @@ public final class ApplyService {
             if (!(resource instanceof SourceResource source)) {
                 continue;
             }
-            schemas.get(source.id())
+            var observed = publication == null ? schemas.get(source.id())
+                    : publication.models().computeIfAbsent(source.id(), schemas::get);
+            observed
                     .filter(discovered -> discovered.connectorId().equals(source.connector()))
                     .ifPresent(discovered -> {
                         List<DiscoveredTable> tables = new ArrayList<>();

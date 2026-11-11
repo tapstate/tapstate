@@ -39,7 +39,12 @@ class ViewCatalogServiceTest {
         var artifacts=new ArtifactQueryService(store);var reads=new AtomicInteger();
         ObservationStore observations=new ObservationStore() {
             public void save(Observation ignored){throw new AssertionError("read only");}
-            public Optional<Observation> read(String id){reads.incrementAndGet();return Optional.of(sample);}
+            public Optional<Observation> read(String id){throw new AssertionError("catalog must use the batch");}
+            public Map<String,Observation> readAll(List<String> ids) {
+                assertThat(ids).containsExactly("pipeline");
+                reads.incrementAndGet();
+                return sample == null ? Map.of() : Map.of("pipeline", sample);
+            }
             public void delete(String ignored){throw new AssertionError("read only");}
         };
         SchemaStore schemaStore=new SchemaStore() {

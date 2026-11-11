@@ -60,6 +60,7 @@ class ScopedEngineLifecycleActuatorTest {
             onDatabasePrepare.run(); ((Runnable)call.getArgument(4)).run(); return null;
         }).when(views).prepareOperatorDatabase(eq(SCOPE),anyString(),any(),anyString(),any());
         when(ownership.proveClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
+        when(ownership.proveStartClaim(eq(SCOPE),any())).thenAnswer(call -> active.get() && held.get().equals(call.getArgument(1)));
         when(engine.captureRun("p")).thenReturn(Optional.of(previous));
         when(previous.operatorManifest()).thenReturn(manifest(1));
         when(previous.awaitTerminal(any())).thenReturn(true); when(previous.isCarryingAJob()).thenReturn(true);

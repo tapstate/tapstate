@@ -7,6 +7,8 @@ import io.tapstate.runtime.srs.SourcePlacement;
 import io.tapstate.spi.store.StorePort;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 import io.tapstate.core.model.Resource;
 
 /** Definition-backed output coordinates; querying them neither starts nor validates a write. */
@@ -31,5 +33,11 @@ final class StoreBackedPipelineOutputNames implements PipelineOutputNames {
     @Override
     public Description describe(PipelineResource pipeline, Map<String, Resource> resources) {
         return source.outputNameDetails(pipeline, resources);
+    }
+
+    @Override
+    public Function<PipelineResource, Description> forCatalog(Map<String, Resource> resources,
+            Function<String, Optional<Resource>> lookup) {
+        return source.catalogOutputNames(resources, lookup);
     }
 }

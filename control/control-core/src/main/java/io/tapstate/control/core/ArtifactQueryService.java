@@ -67,7 +67,34 @@ public final class ArtifactQueryService {
 
     /** Lists typed stored resources and their canonical hashes without exposing canonical text. */
     public List<StoredResource> listResources() {
-        return ReadableArtifactInventory.list(store).stream().map(this::typedView).toList();
+        return resourceInventory().resources();
+    }
+
+    public List<StoredResource> listResources(String kind) { return resourceInventory(kind).resources(); }
+
+    public record ResourceInventory(List<StoredResource> resources,
+            Optional<io.tapstate.core.catalog.TapstateCatalog> connectorCatalog, Optional<String> managedDefaultSourceId,
+            java.util.Set<String> exactLookupIds) { }
+
+    public ResourceInventory resourceInventory() {
+        return projectInventory(store.readableInventory());
+    }
+
+    public Optional<StoredResource> getResource(String kind, String id) {
+        return resourceInventory(kind, id).resources().stream().findFirst();
+    }
+
+    public ResourceInventory resourceInventory(String kind, String id) {
+        return projectInventory(store.readableInventory(kind, id));
+    }
+
+    public ResourceInventory resourceInventory(String kind) {
+        return projectInventory(store.readableInventory(kind));
+    }
+
+    private ResourceInventory projectInventory(ArtifactStore.ReadableInventory inventory) {
+        return new ResourceInventory(inventory.resources().stream().map(this::typedView).toList(),
+                inventory.connectorCatalog(), inventory.managedDefaultSourceId(), inventory.exactLookupIds());
     }
 
     /**

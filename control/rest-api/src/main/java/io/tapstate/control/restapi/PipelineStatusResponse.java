@@ -76,7 +76,17 @@ record PipelineStatusResponse(
     /** Builds a catalog status without inventing a runtime observation when none has been published yet. */
     static PipelineStatusResponse of(PipelineCatalogItem item, MessageCatalog catalog, Clock clock) {
         PipelineCatalogItem.Status status = item.status();
-        PipelineState state = status.observedState() == null ? PipelineState.NEW : status.observedState();
+        PipelineState state = status.observedState();
+        if (state == null && status.state() != null) {
+            state = switch (status.state()) {
+                case NEW, RUNNING, PAUSED, STOPPED, COMPLETED, FAILED -> PipelineState.valueOf(status.state().name());
+                default -> null;
+            };
+        }
+        if (state == null && item.hasArtifact() && status.displayState() != PipelineCatalogItem.UiState.RECOVERY_REQUIRED) {
+            throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,
+                    Map.of("id", item.id(), "field", "checkpoint"), null);
+        }
         Instant observedAt = status.observedAt();
         return new PipelineStatusResponse(item.id(), state, status.displayState(),
                 failure(status.failure(), catalog), observedAt, observedAt == null ? null

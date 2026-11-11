@@ -1,6 +1,7 @@
 package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.schema.TapTable;
+import io.tapdata.entity.schema.value.TapValue;
 import io.tapdata.entity.utils.DataMap;
 import io.tapdata.pdk.apis.entity.FilterResults;
 import io.tapdata.pdk.apis.entity.Projection;
@@ -44,7 +45,9 @@ final class PdkValidationSession {
         PdkValidationCursor.Decoder prepare(TapTable model, PdkValidationCodecs codecs);
     }
 
-    /** Supplies session-owned native equality values under this connector's loader and fixed model. */
+    /** Supplies session-owned equality values under this connector's loader and fixed model.
+     * TapValues are converted using the queried fields and registry. Native values are already encoded.
+     */
     @FunctionalInterface interface MatchEncoding {
         Map<String, ?> encode(TapTable model, PdkValidationCodecs codecs, ValidationKey logicalKey);
     }
@@ -392,6 +395,13 @@ final class PdkValidationSession {
             // The admitted encoder owns nested/native values. Never expose its map to connector mutation.
             values.put(field, value);
         }
+        if (values.values().stream().anyMatch(TapValue.class::isInstance)) {
+            codecs.encodeLookupMatch(model, values);
+            for (String field : fields) {
+                Object value = values.get(field);
+                if (value == null || value instanceof TapValue<?, ?>) throw codecs.unavailable(field);
+            }
+        }
         checkActive();
         return values;
     }
@@ -472,6 +482,13 @@ final class PdkValidationSession {
         } finally { discovery.seal(); }
         TapTable model = discovery.result();
         if (model.getNameFieldMap() == null || model.getNameFieldMap().size() > 4096) throw protocol();
+        if (scan instanceof Metadata) {
+            for (var field : scan.projection()) {
+                if (!model.getNameFieldMap().containsKey(field))
+                    throw new TapstateException(ValidationError.RULE_UNSUPPORTED,
+                            Map.of("node", connectorId, "field", field, "rule", "key-field-missing"), null);
+            }
+        }
         if (!model.getNameFieldMap().keySet().containsAll(scan.ascendingKeys())
                 || !model.getNameFieldMap().keySet().containsAll(scan.matchFields())
                 || !model.getNameFieldMap().keySet().containsAll(scan.projection())) throw protocol();

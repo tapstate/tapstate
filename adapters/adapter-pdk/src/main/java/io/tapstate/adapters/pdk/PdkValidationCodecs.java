@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
+import io.tapdata.entity.schema.TapTable;
 import io.tapdata.entity.schema.type.TapType;
 import io.tapdata.entity.schema.type.TapNumber;
 import io.tapdata.entity.schema.type.TapJson;
@@ -224,6 +225,14 @@ final class PdkValidationCodecs {
                 || value instanceof LocalDateTime || value instanceof OffsetDateTime || value instanceof ZonedDateTime
                 || value instanceof byte[] || value instanceof ByteBuffer || value instanceof Map<?, ?>
                 || value instanceof List<?>;
+    }
+
+    void encodeLookupMatch(TapTable model, Map<String, Object> values) {
+        try {
+            new PdkConversionManager(registry).transformFromTapValueMap(values, null, model.getNameFieldMap());
+        } catch (RuntimeException failure) {
+            throw failed("lookup.match", failure);
+        }
     }
 
     String binding() { return binding; }

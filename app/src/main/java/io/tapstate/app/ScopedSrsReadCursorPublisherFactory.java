@@ -28,7 +28,20 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
     }
     @Override public io.tapstate.runtime.srs.SrsEventModelVerifier modelVerifier(HazelcastInstance member,String ring) {
         if (ring == null || ring.isBlank()) throw new IllegalArgumentException("blank original ring");
-        var bound = ScopedSrsConsumerAccess.bind(member,run); var models = bound.models().guardedBy(bound.requireActive());
+        var bound = ScopedSrsConsumerAccess.bind(member,run);
+        if (bound.store().supportsReadBatchVerification()) {
+            return (io.tapstate.runtime.srs.SrsEventModelVerifier.Batch) (items, firstSequence) -> {
+                bound.requireClaim(null);
+                var events = new java.util.ArrayList<io.tapstate.spi.store.SrsConsumerStore.ReadEvent>(items.size());
+                long sequence = firstSequence;
+                for (var item : items) {
+                    events.add(new io.tapstate.spi.store.SrsConsumerStore.ReadEvent(
+                            sequence++, item.epoch(), item.schemaVer(), item.captureFence()));
+                }
+                if (!bound.store().verifyReadEvents(run, table, ring, events)) throw ScopedSrsConsumerAccess.refused(run);
+                bound.requireClaim(null);
+            };
+        }
         if(bound.store().supportsReadEventVerification())return (item,sequence)->{
             bound.requireClaim(null);
             var model=bound.store().verifyReadEvent(run,table,ring,sequence,item.epoch(),item.schemaVer(),item.captureFence())
@@ -37,6 +50,7 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
             if(!expected.equals(model.key()) || !ring.equals(model.ringName()))throw unavailable(ring,item);
             bound.requireClaim(null);
         };
+        var models = bound.models().guardedBy(bound.requireActive());
         return (item,sequence) -> {
             bound.requireClaim(null); var progress = bound.progress();
             if (!progress.cursor().perTableSeq().containsKey(table)) throw ScopedSrsConsumerAccess.refused(run);
@@ -53,7 +67,10 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
                 java.util.Map.of("ring",ring,"epoch",String.valueOf(item.epoch()),"version",String.valueOf(item.schemaVer())),null);
     }
     @Override public Optional<ChainPosition> confirmedPosition(HazelcastInstance member) {
-        var held = progress(member);
+        return confirmedPosition(progress(member));
+    }
+
+    private Optional<ChainPosition> confirmedPosition(io.tapstate.spi.store.SrsConsumerProgress held) {
         return Optional.ofNullable(held.cursor().sinkAckedByTable().get(table))
                 .filter(position -> position.order().epoch() > 0 && position.order().seq() >= 0 && position.order().seq() < Long.MAX_VALUE);
     }
@@ -63,8 +80,17 @@ final class ScopedSrsReadCursorPublisherFactory implements SrsReadCursorPublishe
         return held;
     }
     @Override public OptionalLong recoverySequence(HazelcastInstance member) {
-        var held = progress(member); var floor = held.ringDoneThrough().get(table);
+        return recoverySequence(progress(member));
+    }
+
+    private OptionalLong recoverySequence(io.tapstate.spi.store.SrsConsumerProgress held) {
+        var floor = held.ringDoneThrough().get(table);
         if (floor == null) throw ScopedSrsConsumerAccess.refused(run);
         return OptionalLong.of(floor);
+    }
+
+    @Override public RecoveryProgress recoveryProgress(HazelcastInstance member) {
+        var held = progress(member);
+        return new RecoveryProgress(recoverySequence(held), confirmedPosition(held));
     }
 }

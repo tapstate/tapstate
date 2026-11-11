@@ -4,6 +4,8 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheAuthScope;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.WorkloadClaimStore;
+import io.tapstate.spi.store.WorkloadClaimKey;
+import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SessionStore;
 import io.tapstate.spi.store.CloudSessionStore;
@@ -83,6 +85,24 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     void requireRecoveryTarget(StorageBinding binding) {
         businessActive();
         if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
+    }
+    boolean lacksSnapshotRead() { return MongoValidationClaimObservation.lacksSnapshotRead(client); }
+
+    java.util.Optional<io.tapstate.spi.store.WorkloadClaimReading> observeValidationClaim(
+            MongoValidationClaimObservation observation, MongoValidationPreparationFacts.Subject subject) {
+        businessActive();
+        var result = observation.cache(database, subject);
+        businessActive();
+        return result;
+    }
+    java.util.Optional<MongoConfigurationDomain.ValidationAccess.ClosedCountLedger> observeClosedCountLedger(
+            MongoValidationClaimObservation observation, MongoValidationPreparationFacts.Subject subject,
+            io.tapstate.core.validation.ValidationOwner current) {
+        businessActive();
+        if (lacksSnapshotRead()) return java.util.Optional.empty();
+        var result = observation.closedCountLedger(database, subject, current);
+        businessActive();
+        return result;
     }
     boolean emptyForAuthenticationRecovery() {
         businessActive();
@@ -210,8 +230,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public CloudSessionStore cloudSessions(CacheAuthScope scope, MongoReadBudget budget) {
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
         Objects.requireNonNull(budget, "budget").requireRemaining();
-        return new MongoCacheCloudSessionStore(facts(scope), connection.database(),
-                () -> verifyAuthPresence(scope.mode(), budget), budget);
+        // This view is owned by an admitted HTTP operation. Installation and recovery validate structures;
+        // its transaction still reads current identity, schema, revocation and session facts.
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> {}, budget);
     }
 
     /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */
@@ -272,8 +293,18 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return validationControl(new MongoValidationPreparations.Authority(original));
     }
     io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original, Runnable local) {
-        var authority = new MongoValidationPreparations.Authority(original); requireValidationPreparation(authority);
-        return new MongoValidationControlStore(client, database, authority.subject().scope(), () -> { businessActive(); local.run(); }, authority);
+        return validationControl(original, null, local);
+    }
+    io.tapstate.spi.store.ValidationControlStore validationControl(MongoValidationPreparations.Permission original,
+            io.tapstate.core.validation.ValidationOwner countOwner, Runnable local) {
+        var authority = new MongoValidationPreparations.Authority(original, countOwner);
+        requireValidationPreparation(authority);
+        return validationControlHandle(authority, local);
+    }
+
+    io.tapstate.spi.store.ValidationControlStore validationControlHandle(MongoValidationPreparations.Authority authority, Runnable local) {
+        return new MongoValidationControlStore(client, database, authority.subject().scope(),
+                () -> { businessActive(); local.run(); }, authority);
     }
 
     io.tapstate.spi.store.ValidationRunHistory validationHistory(MongoValidationPreparations.Permission original,Runnable local){
@@ -296,9 +327,17 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original) {
         return validationClaims(original, () -> {});
     }
-    private WorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
+    MongoCacheWorkloadClaimStore validationCountClaims(MongoValidationPreparations.Permission original, Runnable local) {
+        businessActive(); local.run();
+        // ValidationAccess already holds the exact verified binding. Claim operations recheck their durable fences.
+        return validationClaimHandle(new MongoValidationPreparations.Authority(original), local);
+    }
+    private MongoCacheWorkloadClaimStore validationClaims(MongoValidationPreparations.Authority original, Runnable local) {
         Objects.requireNonNull(local);
         requireValidationPreparation(original);
+        return validationClaimHandle(original, local);
+    }
+    private MongoCacheWorkloadClaimStore validationClaimHandle(MongoValidationPreparations.Authority original, Runnable local) {
         return new MongoCacheWorkloadClaimStore(client, database, original.subject().scope(), () -> { businessActive(); local.run(); }, original);
     }
 
@@ -308,8 +347,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
 
     private void requireValidationPreparation(MongoValidationPreparations.Authority original) {
-        Objects.requireNonNull(original, "original").require(false);
-        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(original.binding().cache()))) throw MongoCacheIdentity.fenced();
+        var binding = original.binding();
+        if (!targetFingerprint.equals(MongoStorageBindingStore.targetFingerprint(binding.cache()))) throw MongoCacheIdentity.fenced();
         loadBusinessScope(original.subject().scope());
         StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
     }
@@ -374,17 +413,48 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
     @Override public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
+        return srs(expected, requireActive, false, false);
+    }
+
+    /** One validated view for the synchronous reads of a start plan. */
+    public io.tapstate.spi.store.SrsStores startPlanningSrs(CacheBusinessScope expected, Runnable requireActive) {
+        return srs(expected, requireActive, true, false);
+    }
+
+    private final ThreadLocal<CacheBusinessScope> admittedCaptureStartup = new ThreadLocal<>();
+
+    public <T> T withCaptureStartup(CacheBusinessScope expected, java.util.function.Supplier<T> step) {
+        businessActive();
+        var previous = admittedCaptureStartup.get();
+        admittedCaptureStartup.set(Objects.requireNonNull(expected));
+        try { return step.get(); }
+        finally {
+            if (previous == null) admittedCaptureStartup.remove();
+            else admittedCaptureStartup.set(previous);
+        }
+    }
+
+    public io.tapstate.spi.store.SrsStores runtimeSrs(CacheBusinessScope expected, Runnable requireActive) {
+        return srs(expected, requireActive, false, true);
+    }
+
+    private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean planning, boolean runtime) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        structure.verifySrs(); active.run();
-        var models = new MongoSrsModelStore(client, database, expected, active, structure::verifySrs);
+        if (runtime) structure.verifySrsRuntime(); else structure.verifySrs();
+        active.run();
+        Runnable verifyStructure = planning ? () -> {} : () -> {
+            if (!runtime || !expected.equals(admittedCaptureStartup.get())) structure.verifySrs();
+        };
+        var lease = MongoSrsLease.selected();
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
         return new io.tapstate.spi.store.SrsStores(
-                new MongoSrsChainStore(client, database, expected, active, structure::verifySrs), models,
+                new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
-                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models),
-                new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs));
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(), runtime));
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,
@@ -405,6 +475,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }
 
+    /** Read planning keeps the business fence and reuses admitted collection structure. */
+    public io.tapstate.spi.store.SchemaStore admittedStartSchemas(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheSchemaStore(new MongoCacheMetadataAccess(client, database, expected,
+                SystemCollections.CACHE_SOURCE_SCHEMAS, () -> { businessActive(); requireActive.run(); }, false));
+    }
+
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
         var registry = new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
         registry.verify(); return registry;
@@ -421,7 +497,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
     private MongoCacheMetadataAccess metadataAccess(CacheBusinessScope expected, SystemCollections table, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        var access = new MongoCacheMetadataAccess(client, database, expected, table, () -> { businessActive(); requireActive.run(); });
+        var access = new MongoCacheMetadataAccess(client, database, expected, table,
+                () -> { businessActive(); requireActive.run(); }, false);
         access.verify(); return access;
     }
 
@@ -429,6 +506,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public io.tapstate.spi.store.PipelineCachePreparations pipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); });
+    }
+
+    /** The native member has already verified the business collections during storage admission. */
+    public io.tapstate.spi.store.PipelineCachePreparations admittedPipelinePreparations(CacheBusinessScope expected, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); }, true);
     }
 
     public io.tapstate.spi.store.PipelineCacheRetirements pipelineRetirements(CacheBusinessScope expected,Runnable requireActive) {
@@ -558,6 +641,71 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public io.tapstate.spi.store.StateStore pipelineStates(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         return new MongoCachePipelineStateStore(pipelineAccess(scope, Objects.requireNonNull(original, "original"), requireActive));
+    }
+
+    /** Read observations and their existing checkpoint and claim fences in one CACHE snapshot. */
+    public record PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+            boolean runningObservationUnavailable, io.tapstate.core.lifecycle.PipelineState checkpoint) {
+        public PipelineObservationReading(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                boolean runningObservationUnavailable) {
+            this(observation, runningObservationUnavailable, null);
+        }
+    }
+
+    public java.util.Map<String, PipelineObservationReading> pipelineObservationBatch(
+            java.util.List<io.tapstate.spi.store.PipelineIntentScope> scopes, Runnable active, boolean includeDisplayState) {
+        if (scopes.isEmpty()) return java.util.Map.of();
+        var first = scopes.getFirst();
+        var business = new CacheBusinessScope(first.clusterId(), first.bindingVersion(), first.cacheIncarnation());
+        if (scopes.stream().anyMatch(scope -> !business.equals(new CacheBusinessScope(
+                scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))))
+            throw MongoCachePipelineAccess.fenced();
+        var accesses = scopes.stream().map(scope -> pipelineAccess(scope, null, active)).toList();
+        var ids = scopes.stream().map(io.tapstate.spi.store.PipelineIntentScope::pipelineId).toList();
+        var keys = accesses.stream().map(MongoCachePipelineObservationStore::claimKey).toList();
+        return accesses.getFirst().observationTransaction(session -> {
+            var states = observationRows(session, SystemCollections.CACHE_PIPELINE_STATE, ids);
+            var claims = MongoCachePipelineObservationStore.claims(session, accesses.getFirst(), keys);
+            var readings = new java.util.ArrayList<MongoCachePipelineObservationStore.Reading>();
+            var result = new java.util.HashMap<String, PipelineObservationReading>();
+            for (var access : accesses) {
+                try {
+                    readings.add(MongoCachePipelineObservationStore.reading(session, access, states.get(access.scope.pipelineId()),
+                            claims.get(MongoCachePipelineObservationStore.claimKey(access))));
+                } catch (TapstateException failure) {
+                    if (failure.code() != IoError.CACHE_BUSINESS_FENCED
+                            && failure.code() != IoError.WORKLOAD_CLAIM_FENCED) throw failure;
+                    // The ordinary reader classifies a concurrently replaced scope.
+                }
+            }
+            if (!readings.isEmpty()) {
+                var observationKeys = readings.stream().map(MongoCachePipelineObservationStore.Reading::key).toList();
+                var observations = observationRows(session, SystemCollections.CACHE_PIPELINE_OBSERVATION, observationKeys);
+                var terminal = MongoCachePipelineObservationStore.terminalDetails(session, accesses.getFirst(), readings, observations);
+                var unavailable = includeDisplayState
+                        ? MongoCachePipelineObservationStore.unavailableRunning(session, accesses.getFirst(), readings, observations)
+                        : java.util.Set.<String>of();
+                for (var reading : readings) {
+                    var observation = MongoCachePipelineObservationStore.select(
+                            reading, observations.get(reading.key()), terminal.get(reading.pipeline()));
+                    var recovery = includeDisplayState ? MongoStateStore.leaseRecovery(reading.state()) : null;
+                    boolean recovering = recovery != null && reading.actual() == io.tapstate.core.lifecycle.PipelineState.RUNNING
+                            && (observation.isEmpty() || reading.claim().getLong("executionGeneration") <= recovery.failedExecution());
+                    if (recovering) observation = java.util.Optional.empty();
+                    result.put(reading.pipeline(), new PipelineObservationReading(
+                            observation, observation.isEmpty() && (recovering || unavailable.contains(reading.pipeline())), reading.actual()));
+                }
+            }
+            return java.util.Map.copyOf(result);
+        });
+    }
+
+    private java.util.Map<Object, Document> observationRows(com.mongodb.client.ClientSession session,
+            SystemCollections table, java.util.List<?> ids) {
+        var result = new java.util.HashMap<Object, Document>();
+        for (var row : table.on(database).find(session, new Document("_id", new Document("$in", ids))))
+            result.put(row.get("_id"), row);
+        return result;
     }
 
     /** Missing projections are unknown; they do not permit creation of a missing checkpoint. */

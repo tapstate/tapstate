@@ -549,7 +549,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             reapSettled();
         } while (writeWhatIsDue());
         reportWaiting();
-        return inFlight.isEmpty() && queued.isEmpty();
+        boolean done = inFlight.isEmpty() && queued.isEmpty();
+        if (ack != null && done) ack.flush(true);
+        return done;
     }
 
     /**
@@ -690,7 +692,11 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             return;
         }
         closed = true;
-        writer.close();
+        try {
+            if (ack != null) ack.flushOnClose();
+        } finally {
+            writer.close();
+        }
     }
 
     /** Removes every settled write, surfacing the cause of a failed one so it fails the job. */
@@ -728,6 +734,7 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
         });
         if (frontier != null) {
             releaseHeld();
+        if (ack != null) ack.flush(false);
             reportTrailing();
         }
     }
@@ -964,7 +971,9 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             // A gauge per processor, not one shared: the handles it keeps belong to the sink that took the
             // reading, and a shared one would have each sink's readings land under the other's.
             var next=new java.util.concurrent.atomic.AtomicInteger();
-            return openedTogether(count, () -> new SinkProcessor(openWriter(writerFactory,totalOne?0:memberIndex,next.getAndIncrement()), sinkAck, frontierFactory.get(),
+            IndexedSinkWriterFactory.Opening opening = writerFactory instanceof IndexedSinkWriterFactory indexed
+                    ? indexed.opening() : (member, local) -> writerFactory.get();
+            return openedTogether(count, () -> new SinkProcessor(opening.open(totalOne?0:memberIndex,next.getAndIncrement()), sinkAck, frontierFactory.get(),
                     DEFAULT_MAX_IN_FLIGHT, maxRecords, new JetFrontierGauge(),
                     new JetDeliveryGauge(), System::currentTimeMillis, vertexName, totalOne,
                     edgesFactory == null ? null : edgesFactory.get(), maxWaitMillis, System::nanoTime));

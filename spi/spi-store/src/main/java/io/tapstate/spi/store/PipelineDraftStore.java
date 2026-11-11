@@ -51,6 +51,13 @@ public interface PipelineDraftStore {
     /** Atomically writes the candidate Artifact and advances the draft publication markers. */
     PipelineDraftMutation publish(PipelineDraft.Publication publication);
 
+    record Published(PipelineDraftMutation mutation, long stateGeneration) {}
+
+    /** Native stores return the generation written by the same CONFIG transaction. */
+    default Published publishWithGeneration(PipelineDraft.Publication publication) {
+        return new Published(publish(publication), 0);
+    }
+
     /**
      * Atomically replaces a pipeline's definition while it is still {@code expectedArtifactHash}, and carries
      * the change into the pipeline's draft when the draft is based on that definition. Answers

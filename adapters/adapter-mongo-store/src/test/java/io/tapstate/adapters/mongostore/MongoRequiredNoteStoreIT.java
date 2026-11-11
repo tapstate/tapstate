@@ -731,6 +731,29 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
+    void sharedStartupUsesTheSameOriginAndRejectsTheClearedScope() {
+        withNotes(f -> {
+            var shared = f.notes.initialize(chain("physical"));
+            var original = origin("database-x");
+            assertThat(f.notes.prepareSharedOrigin(shared, original)).isEqualTo(original);
+            assertThat(f.notes.prepareSharedOrigin(shared, original)).isEqualTo(original);
+            assertThatThrownBy(() -> f.notes.prepareSharedOrigin(shared, origin("database-y")))
+                    .satisfies(MongoRequiredNoteStoreIT::originMismatch);
+
+            assertThat(f.notes.compareAndSet(shared, "slot", 0, bytes("payload"), false)).isTrue();
+            assertThat(f.notes.compareAndSet(shared, "slot", 1, null, true)).isTrue();
+            var startup = f.notes.sharedStartup(shared);
+            assertThat(startup.origin()).isEqualTo(original);
+            assertThat(startup.carries()).isEmpty();
+            assertThat(startup.blocked()).isEqualTo(f.notes.allCarryBlocked(shared));
+
+            f.notes.clear(shared, true);
+            assertThatThrownBy(() -> f.notes.sharedStartup(shared)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            assertThatThrownBy(() -> f.notes.prepareSharedOrigin(shared, original)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+        });
+    }
+
+    @Test
     void preparingAnOriginIsIdempotentButNeverAdoptsANewConnectionOrArtifact() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);

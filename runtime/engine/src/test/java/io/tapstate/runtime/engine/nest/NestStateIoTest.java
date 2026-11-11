@@ -22,6 +22,244 @@ import org.junit.jupiter.api.Test;
 
 class NestStateIoTest {
     @Test
+    void oneSuccessfulStoreCallRecordsItsKeysAndCommandsAndARefusalRecordsNothing() {
+        var measured = new ArrayList<List<Long>>();
+        NestStateIo.Committed sink = (keys, trips, nanos) -> measured.add(List.of(keys, trips));
+        NestStateIo.commit(sink, 40, () -> {
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+        });
+        assertThatThrownBy(() -> NestStateIo.commit(sink, 1, () -> {
+            io.tapstate.spi.store.StoreRoundTrips.observed();
+            throw new IllegalStateException("store refused");
+        })).isInstanceOf(IllegalStateException.class);
+        NestStateIo.commit(sink, 1, () -> {});
+        assertThat(measured).containsExactly(List.of(40L, 2L), List.of(1L, 0L));
+    }
+
+    @Test
+    void aFreshWriteWaveSharesItsFirstDurableBatch() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        List<Thread> threads = new ArrayList<>();
+        List<FutureTask<Void>> tasks = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                String key = "wave-" + i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of(key, new byte[] {1})); return null; });
+                tasks.add(task);
+                start(task, threads);
+                if (i == 0) awaitAllBlockedInsideIo(threads);
+            }
+            awaitAllBlockedInsideIo(threads);
+            assertThat(store.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.batches.getFirst()).containsExactlyInAnyOrder("wave-0", "wave-1", "wave-2");
+            assertThat(tasks).noneMatch(FutureTask::isDone);
+            assertThat(store.saved).isEmpty();
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) task.get(5, TimeUnit.SECONDS);
+            assertThat(store.writeCalls.get()).isEqualTo(1);
+            assertThat(store.saved).hasSize(3);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void sparseWriteCompletesWithoutAnotherArrival() throws Exception {
+        BlockingStore store = new BlockingStore();
+        store.release.countDown();
+        NestStateIo io = new NestStateIo(store, "ns");
+        FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of("one", new byte[] {1})); return null; });
+        Thread thread = new Thread(task);
+        thread.start();
+        task.get(5, TimeUnit.SECONDS);
+        thread.join(5_000);
+        assertThat(store.saved).containsOnlyKeys("one");
+        assertThat(store.writeCalls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void gatheredWriteFailuresReachEveryCallerAndPartialWritesCanBeReplayed() throws Exception {
+        assertGatheredWriteFailure(new IllegalStateException("partial write failure"));
+    }
+
+    @Test
+    void fatalGatheredWriteFailuresPreserveTheOriginalErrorAndReleaseAllCallers() throws Exception {
+        assertGatheredWriteFailure(new AssertionError("fatal write failure"));
+    }
+
+    private static void assertGatheredWriteFailure(Throwable failure) throws Exception {
+        BlockingStore store = new BlockingStore();
+        store.failure = failure;
+        store.partialWrite = true;
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        List<Thread> threads = new ArrayList<>();
+        List<FutureTask<Void>> tasks = new ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                String key = "retry-" + i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of(key, new byte[] {1})); return null; });
+                tasks.add(task); start(task, threads);
+                if (i == 0) awaitAllBlockedInsideIo(threads);
+            }
+            assertThat(store.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.batches.getFirst()).hasSize(3);
+            assertThat(tasks).noneMatch(FutureTask::isDone);
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) {
+                assertThatThrownBy(() -> task.get(5, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class)
+                        .hasCause(failure);
+            }
+            assertThat(store.saved).hasSize(1);
+            store.failure = null;
+            io.saveAll(Map.of("retry-0", new byte[] {1}, "retry-1", new byte[] {1}, "retry-2", new byte[] {1}));
+            assertThat(store.saved).hasSize(3);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void interruptingTheGatherLeaderStillWaitsForDurabilityAndRestoresItsFlag() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.MILLISECONDS.toNanos(250));
+        List<Thread> threads = new ArrayList<>();
+        FutureTask<Boolean> task = new FutureTask<>(() -> {
+            io.saveAll(Map.of("leader", new byte[] {1}));
+            return Thread.currentThread().isInterrupted();
+        });
+        try {
+            start(task, threads);
+            awaitAllBlockedInsideIo(threads);
+            threads.getFirst().interrupt();
+            assertThat(store.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(task.isDone()).isFalse();
+            assertThat(store.saved).isEmpty();
+            store.release.countDown();
+            assertThat(task.get(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.saved).containsOnlyKeys("leader");
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void arrivalsDoNotExtendTheOldestWriteDeadline() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.MILLISECONDS.toNanos(100));
+        List<Thread> threads = new ArrayList<>();
+        List<FutureTask<Void>> tasks = new ArrayList<>();
+        try {
+            for (int i = 0; i < 10; i++) {
+                String key = "stream-" + i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of(key, new byte[] {1})); return null; });
+                tasks.add(task); start(task, threads);
+                if (i == 0) awaitAllBlockedInsideIo(threads);
+                // Deliberately keep arrivals spanning several gather windows, without filling capacity.
+                Thread.sleep(50);
+            }
+            assertThat(store.entered.getCount()).isZero();
+            assertThat(store.batches.getFirst().size()).isLessThan(10);
+            assertThat(tasks).noneMatch(FutureTask::isDone);
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) task.get(5, TimeUnit.SECONDS);
+            assertThat(store.saved).hasSize(10);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void aDuplicateWriteEndsGatheringButNeverCollapsesTheOlderValue() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        List<Thread> threads = new ArrayList<>();
+        List<FutureTask<Void>> tasks = new ArrayList<>();
+        try {
+            for (byte i = 1; i <= 2; i++) {
+                byte value = i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of("same", new byte[] {value})); return null; });
+                tasks.add(task); start(task, threads); awaitAllBlockedInsideIo(threads);
+            }
+            assertThat(store.entered.await(500, TimeUnit.MILLISECONDS)).isTrue();
+            assertThat(tasks).noneMatch(FutureTask::isDone);
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) task.get(5, TimeUnit.SECONDS);
+            assertThat(store.writtenValues).containsExactly(1, 2);
+            assertThat(store.saved.get("same")).containsExactly((byte) 2);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void admissionThatCannotFitEndsGatheringBeforeTheWindowExpires() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        List<Thread> threads = new ArrayList<>();
+        byte[] value = new byte[4 * 1024 * 1024];
+        FutureTask<Void> first = new FutureTask<>(() -> { io.saveAll(Map.of("first", value)); return null; });
+        FutureTask<Void> second = new FutureTask<>(() -> { io.saveAll(Map.of("second", value)); return null; });
+        try {
+            start(first, threads); awaitAllBlockedInsideIo(threads);
+            start(second, threads);
+            assertThat(store.entered.await(500, TimeUnit.MILLISECONDS)).isTrue();
+            assertThat(store.batches.getFirst()).containsExactly("first");
+            assertThat(first.isDone()).isFalse(); assertThat(second.isDone()).isFalse();
+            store.release.countDown(); first.get(5, TimeUnit.SECONDS); second.get(5, TimeUnit.SECONDS);
+            assertThat(store.saved).hasSize(2);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void oversizedWriteKeepsItsOwnImmediateBackendCall() throws Exception {
+        BlockingStore store = new BlockingStore();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        List<Thread> threads = new ArrayList<>();
+        FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of("wide", new byte[9 * 1024 * 1024])); return null; });
+        try {
+            start(task, threads);
+            assertThat(store.entered.await(500, TimeUnit.MILLISECONDS)).isTrue();
+            assertThat(store.batches.getFirst()).containsExactly("wide");
+            store.release.countDown(); task.get(5, TimeUnit.SECONDS);
+        } finally { close(store, threads); }
+    }
+
+    @Test
+    void isolatedWritesStopGatheringAndAConcurrentWaveRestoresIt() throws Exception {
+        BlockingStore store = new BlockingStore();
+        store.release.countDown();
+        NestStateIo io = new NestStateIo(store, "ns", TimeUnit.SECONDS.toNanos(1));
+        io.saveAll(Map.of("quiet-0", new byte[] {1}));
+        io.saveAll(Map.of("quiet-1", new byte[] {1}));
+        List<Thread> threads = new ArrayList<>();
+        FutureTask<Void> quiet = new FutureTask<>(() -> { io.saveAll(Map.of("quiet-2", new byte[] {1})); return null; });
+        try {
+            start(quiet, threads);
+            quiet.get(500, TimeUnit.MILLISECONDS);
+            for (Thread thread : threads) thread.join(5_000);
+            threads.clear();
+            store.entered = new CountDownLatch(1); store.release = new CountDownLatch(1);
+            List<FutureTask<Void>> tasks = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                String key = "concurrent-" + i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of(key, new byte[] {1})); return null; });
+                tasks.add(task); start(task, threads);
+                if (i == 0) assertThat(store.entered.await(500, TimeUnit.MILLISECONDS)).isTrue();
+            }
+            awaitAllBlockedInsideIo(threads);
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) task.get(5, TimeUnit.SECONDS);
+            for (Thread thread : threads) thread.join(5_000);
+            threads.clear(); tasks.clear();
+            store.entered = new CountDownLatch(1); store.release = new CountDownLatch(1);
+            store.batches.clear();
+            for (int i = 0; i < 3; i++) {
+                String key = "restored-" + i;
+                FutureTask<Void> task = new FutureTask<>(() -> { io.saveAll(Map.of(key, new byte[] {1})); return null; });
+                tasks.add(task); start(task, threads);
+                if (i == 0) awaitAllBlockedInsideIo(threads);
+            }
+            assertThat(store.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(store.batches.getFirst()).containsExactlyInAnyOrder("restored-0", "restored-1", "restored-2");
+            assertThat(tasks).noneMatch(FutureTask::isDone);
+            store.release.countDown();
+            for (FutureTask<Void> task : tasks) task.get(5, TimeUnit.SECONDS);
+        } finally { close(store, threads); }
+    }
+
+    @Test
     void partitionReadsWaitingOnOneBackendCallAreSentAsOneFollowingBatch() throws Exception {
         BlockingStore store = new BlockingStore();
         NestStateIo io = new NestStateIo(store, "ns");
@@ -244,13 +482,15 @@ class NestStateIoTest {
     }
 
     private static final class BlockingStore implements KeyedStateStore {
-        private final CountDownLatch entered = new CountDownLatch(1);
-        private final CountDownLatch release = new CountDownLatch(1);
+        private CountDownLatch entered = new CountDownLatch(1);
+        private CountDownLatch release = new CountDownLatch(1);
         private final AtomicInteger readCalls = new AtomicInteger();
         private final AtomicInteger writeCalls = new AtomicInteger();
         private final Map<String, byte[]> saved = new ConcurrentHashMap<>();
+        private final List<List<String>> batches = new CopyOnWriteArrayList<>();
         private final List<Integer> writtenValues = new CopyOnWriteArrayList<>();
         private volatile Throwable failure;
+        private boolean partialWrite;
 
         @Override public Map<String, byte[]> loadAll(String namespace, Collection<String> keys) {
             readCalls.incrementAndGet();
@@ -262,7 +502,12 @@ class NestStateIoTest {
         }
         @Override public void saveAll(String namespace, Map<String, byte[]> states) {
             writeCalls.incrementAndGet();
+            batches.add(List.copyOf(states.keySet()));
             block();
+            if (partialWrite && failure != null) {
+                Map.Entry<String, byte[]> first = states.entrySet().iterator().next();
+                saved.put(first.getKey(), first.getValue());
+            }
             throwFailureIfAny();
             states.values().forEach(value -> writtenValues.add((int) value[0]));
             saved.putAll(states);

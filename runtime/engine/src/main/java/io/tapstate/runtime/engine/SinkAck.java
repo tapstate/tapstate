@@ -59,6 +59,12 @@ public interface SinkAck extends Serializable {
         bounded(chain, through);
     }
 
+    /** Saves any due progress, or the final confirmed prefix when the input has ended. */
+    default void flush(boolean complete) { }
+
+    /** Saves pending progress on shutdown while the original writer is still authorized. */
+    default void flushOnClose() { }
+
     /**
      * This ack, reporting as the writer {@code writerId}. Where several writers land one pipeline's changes,
      * how far the pipeline has landed a chain is the lowest of what each has landed, so each has to report as

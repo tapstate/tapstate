@@ -43,6 +43,9 @@ public final class SrsCaptureWriter implements AutoCloseable {
     private boolean streamPrepared;
     private long revision;
     private long batchOrder;
+    private final boolean batchCheckpoints;
+    private boolean checkpointInEpoch;
+    private SrsCaptureCheckpoint pendingCheckpoint;
 
     /** The caller has already allocated this epoch and published its immutable serving selection. */
     public SrsCaptureWriter(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
@@ -51,6 +54,13 @@ public final class SrsCaptureWriter implements AutoCloseable {
     }
     public SrsCaptureWriter(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
                             SrsStores stores, HazelcastInstance member, Runnable requireActive, boolean priorCacheHistory) {
+        this(scope, opened, originalCapture, stores, member, requireActive, priorCacheHistory, false);
+    }
+
+    SrsCaptureWriter(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+            SrsStores stores, HazelcastInstance member, Runnable requireActive, boolean priorCacheHistory,
+            boolean batchCheckpoints) {
+        this.batchCheckpoints = batchCheckpoints;
         this.scope = Objects.requireNonNull(scope, "scope");
         this.opened = Objects.requireNonNull(opened, "opened");
         this.fence = Objects.requireNonNull(originalCapture, "originalCapture");
@@ -68,8 +78,8 @@ public final class SrsCaptureWriter implements AutoCloseable {
         this.models = stores.models().guardedBy(this::requireActive);
         this.log = stores.log();
         this.revision = opened.checkpointRevision();
-        this.batchOrder = opened.checkpoint() != null && opened.checkpoint().position().order().epoch() == opened.epoch()
-                ? Math.max(0, opened.checkpoint().position().order().seq()) : 0;
+        this.checkpointInEpoch = opened.checkpoint() != null && opened.checkpoint().position().order().epoch() == opened.epoch();
+        this.batchOrder = checkpointInEpoch ? Math.max(0, opened.checkpoint().position().order().seq()) : 0;
         requireActive();
     }
 
@@ -238,7 +248,8 @@ public final class SrsCaptureWriter implements AutoCloseable {
         ready();
         if (opened.pendingFreshFull() != null) return;
         if (opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch()) {
-            checkpoint(new ChainPosition(SourceOrder.snapshotRow(opened.epoch()), position.token()));
+            pendingCheckpoint = checkpointAt(new ChainPosition(SourceOrder.snapshotRow(opened.epoch()), position.token()));
+            flushCheckpoint();
         }
     }
 
@@ -266,18 +277,31 @@ public final class SrsCaptureWriter implements AutoCloseable {
         position.ifPresent(token -> {
             if (batchOrder >= Long.MAX_VALUE - 1) throw unproven();
             long next = batchOrder + 1;
-            checkpoint(new ChainPosition(new SourceOrder(opened.epoch(), next), token.token()));
+            pendingCheckpoint = checkpointAt(new ChainPosition(new SourceOrder(opened.epoch(), next), token.token()));
+            if (!batchCheckpoints || !checkpointInEpoch) flushCheckpoint();
             batchOrder = next;
         });
     }
 
-    private void checkpoint(ChainPosition position) {
+    private SrsCaptureCheckpoint checkpointAt(ChainPosition position) {
+        return new SrsCaptureCheckpoint(position, Map.copyOf(frontiers), positionEditsRestricted);
+    }
+
+    synchronized void flushCheckpoint() {
+        var expected = pendingCheckpoint;
+        if (expected == null) return;
         requireActive();
-        var expected = new SrsCaptureCheckpoint(position, Map.copyOf(frontiers), positionEditsRestricted);
         SrsChainState saved = chains.checkpoint(opened.miningChainId(), revision, expected, fence).orElseThrow(this::unproven);
         if (!expected.equals(saved.checkpoint()) || saved.checkpointRevision() != revision + 1) throw unproven();
         requireActive();
         revision = saved.checkpointRevision();
+        checkpointInEpoch = true;
+        pendingCheckpoint = null;
+    }
+
+    synchronized void finishCheckpointing() {
+        flushCheckpoint();
+        close();
     }
 
     private void ready() {

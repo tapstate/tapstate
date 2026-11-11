@@ -6,6 +6,9 @@ import io.tapstate.spi.capture.*;
 import io.tapstate.spi.store.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
@@ -14,6 +17,11 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private final SrsStoreViews views;
     private final HazelcastInstance member;
     private final SourceAcknowledgements acknowledgements;
+    private final ScheduledThreadPoolExecutor checkpoints = new ScheduledThreadPoolExecutor(1, task -> {
+        Thread thread = new Thread(task, "tapstate-srs-checkpoints");
+        thread.setDaemon(true);
+        return thread;
+    });
     private final CaptureObservation.Factory observations;
     private final Set<Tail> tails = ConcurrentHashMap.newKeySet();
     private final Set<CaptureRun> snapshots = ConcurrentHashMap.newKeySet();
@@ -38,6 +46,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                     stores.log(),stores.consumers().guardedBy(guard));
         };
         this.acknowledgements = new SourceAcknowledgements();
+        checkpoints.setRemoveOnCancelPolicy(true);
     }
 
     /** Only a physical CAPTURE owner opens this handle; no Pipeline consumer owns or closes it. */
@@ -47,9 +56,15 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     }
     public synchronized Tail startTail(CacheBusinessScope scope,SrsChainState opened,WorkloadClaimFence originalCapture,
             CaptureConfig config,CaptureStart start,Function<SrsCaptureWriter,CapturePort> ports,Runnable requireActive, boolean priorCacheHistory) {
+        return startTail(scope, opened, originalCapture, config, start, ports, requireActive, priorCacheHistory, false);
+    }
+
+    public synchronized Tail startTail(CacheBusinessScope scope, SrsChainState opened, WorkloadClaimFence originalCapture,
+            CaptureConfig config, CaptureStart start, Function<SrsCaptureWriter, CapturePort> ports,
+            Runnable requireActive, boolean priorCacheHistory, boolean skipEmptyStartupAck) {
         Runnable fixed = guard(requireActive); fixed.run();
         var stores = views.srs(scope,fixed);
-        var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed,priorCacheHistory);
+        var writer = new SrsCaptureWriter(scope,opened,originalCapture,stores,member,fixed,priorCacheHistory,true);
         var health = new CaptureHealth(); var owned = new Tail(writer,null,health,requireActive); tails.add(owned);
         try {
             var port = Objects.requireNonNull(ports.apply(writer),"prepared capture port");
@@ -58,8 +73,12 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
                     observation -> writer.start(port,config,start,health,observation));
             owned.subscription = source; fixed.run();
             owned.opening = null;
-            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed),opened.miningChainId(),opened.epoch(),source,health,fixed);
-            fixed.run(); return owned;
+            boolean awaitingCheckpoint = opened.checkpoint() == null || opened.checkpoint().position().order().epoch() != opened.epoch();
+            owned.subscription = acknowledgements.follow(stores.chains().guardedBy(fixed), opened.miningChainId(),
+                    opened.epoch(), source, health, fixed, skipEmptyStartupAck && awaitingCheckpoint);
+            fixed.run();
+            owned.checkpointTask = checkpoints.scheduleWithFixedDelay(owned::flushScheduled, 10, 10, TimeUnit.SECONDS);
+            return owned;
         } catch (RuntimeException | Error failure) {
             writer.close(); closeAfter(failure,owned::close); throw failure;
         }
@@ -248,14 +267,28 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         @SuppressWarnings("java:S3077")
         private volatile Runnable opening;
         private final CaptureHealth health;
+        private ScheduledFuture<?> checkpointTask;
         private final Runnable owner;
         private final AtomicBoolean ended = new AtomicBoolean();
         private Tail(SrsCaptureWriter writer,Subscription subscription,CaptureHealth health,Runnable owner) {
             this.writer = writer; this.subscription = subscription; this.health = health; this.owner = owner;
         }
         public CaptureHealth health() { return health; }
+        public synchronized void finishCheckpointing() {
+            if (!ended.get() && health.failure().isEmpty()) writer.finishCheckpointing();
+            if (checkpointTask != null) checkpointTask.cancel(false);
+        }
+        private synchronized void flushScheduled() {
+            try {
+                if (!ended.get() && health.failure().isEmpty()) writer.flushCheckpoint();
+            } catch (RuntimeException | Error failure) {
+                writer.close();
+                health.fail(failure);
+            }
+        }
         @Override public synchronized void close() {
             if (ended.get()) return;
+            if (checkpointTask != null) checkpointTask.cancel(false);
             writer.close(); if(subscription!=null)subscription.close(); writer.stopSources();
             if(opening!=null)opening.run();
             ended.set(true); tails.remove(this);
@@ -320,6 +353,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
         for (var run : List.copyOf(snapshots)) first = closeAfter(first,() -> stopSnapshot(run));
         for (var tail : List.copyOf(tails)) first = closeAfter(first,tail::close);
         for(var pending:List.copyOf(pendingCloses.keySet()))first=closeAfter(first,() -> closePending(pending));
+        checkpoints.shutdownNow();
         first = closeAfter(first,acknowledgements::close);
         if (first instanceof RuntimeException runtime) throw runtime;
         if (first instanceof Error error) throw error;

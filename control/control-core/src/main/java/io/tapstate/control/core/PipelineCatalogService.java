@@ -9,6 +9,8 @@ import io.tapstate.spi.store.DesiredStore;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftSummary;
+import io.tapstate.spi.store.StorePort;
+import io.tapstate.spi.store.StorePort.PipelineCatalogState;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -30,6 +32,7 @@ public final class PipelineCatalogService {
     private final DesiredStore desired;
     private final PipelineObservationQueryService observations;
     private final java.util.function.Predicate<String> recoveryRequired;
+    private final java.util.function.Function<List<String>, Map<String, PipelineCatalogState>> batch;
 
     public PipelineCatalogService(
             ArtifactQueryService artifacts,
@@ -40,6 +43,18 @@ public final class PipelineCatalogService {
     }
     public PipelineCatalogService(ArtifactQueryService artifacts,PipelineDraftService drafts,DesiredStore desired,
             PipelineObservationQueryService observations,java.util.function.Predicate<String> recoveryRequired) {
+        this(artifacts, drafts, desired, observations, recoveryRequired, ids -> Map.of());
+    }
+
+    public PipelineCatalogService(ArtifactQueryService artifacts, PipelineDraftService drafts,
+            PipelineObservationQueryService observations, StorePort store) {
+        this(artifacts, drafts, store.desired(), observations, store::pipelineRecoveryRequired, store::pipelineCatalogStates);
+    }
+
+    private PipelineCatalogService(ArtifactQueryService artifacts, PipelineDraftService drafts, DesiredStore desired,
+            PipelineObservationQueryService observations, java.util.function.Predicate<String> recoveryRequired,
+            java.util.function.Function<List<String>, Map<String, PipelineCatalogState>> batch) {
+        this.batch = batch;
         this.recoveryRequired=Objects.requireNonNull(recoveryRequired);
         this.artifacts = Objects.requireNonNull(artifacts, "artifacts");
         this.drafts = Objects.requireNonNull(drafts, "drafts");
@@ -55,7 +70,7 @@ public final class PipelineCatalogService {
     /** Reads the same merged projection as the catalog for one Pipeline id. */
     public Optional<PipelineCatalogItem> find(String id) {
         Objects.requireNonNull(id, "id");
-        ArtifactSummary artifact = artifacts.getResource(id)
+        ArtifactSummary artifact = artifacts.getResource("pipeline", id)
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .map(stored -> new ArtifactSummary((PipelineResource) stored.resource(), stored.contentHash()))
                 .orElse(null);
@@ -65,7 +80,8 @@ public final class PipelineCatalogService {
                         value.publishedDraftRevision(), value.publishedArtifactHash(), value.createdAt(),
                         value.updatedAt(), value.updatedBy()))
                 .orElse(null);
-        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact));
+        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact,
+                artifact == null ? null : batch.apply(List.of(id)).get(id)));
     }
 
     /** Returns only the requested catalog window; per-pipeline status reads happen after this slice. */
@@ -74,7 +90,7 @@ public final class PipelineCatalogService {
             throw new IllegalArgumentException("pipeline catalog offset must be non-negative and limit positive");
         }
         Map<String, ArtifactSummary> artifactById = new HashMap<>();
-        for (StoredResource stored : artifacts.listResources()) {
+        for (StoredResource stored : artifacts.listResources("pipeline")) {
             Resource resource = stored.resource();
             if (resource instanceof PipelineResource pipeline) {
                 artifactById.put(pipeline.id(), new ArtifactSummary(pipeline, stored.contentHash()));
@@ -91,9 +107,10 @@ public final class PipelineCatalogService {
         if (offset >= ids.size()) return List.of();
         int end = (int) Math.min((long) ids.size(), (long) offset + limit);
         List<String> pageIds = new ArrayList<>(ids).subList(offset, end);
+        var states = batch.apply(pageIds.stream().filter(artifactById::containsKey).toList());
         List<PipelineCatalogItem> items = new ArrayList<>(pageIds.size());
         for (String id : pageIds) {
-            items.add(toItem(id, draftById.get(id), artifactById.get(id)));
+            items.add(toItem(id, draftById.get(id), artifactById.get(id), states.get(id)));
         }
         return List.copyOf(items);
     }
@@ -107,16 +124,23 @@ public final class PipelineCatalogService {
         return hasArtifact || drafts.find(id).isPresent();
     }
 
-    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact) {
+    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact, PipelineCatalogState stateFacts) {
         boolean hasArtifact = artifact != null;
-        boolean needsRecovery=hasArtifact && recoveryRequired.test(id);
-        PipelineStatus observation = hasArtifact ? observations.findStatus(id).orElse(null) : null;
+        boolean needsRecovery = stateFacts == null && hasArtifact && recoveryRequired.test(id);
+        PipelineStatus observation = stateFacts != null
+                ? stateFacts.observation().map(observations::statusOf).orElse(null)
+                : hasArtifact ? observations.findStatus(id).orElse(null) : null;
         PipelineState observed = observation == null ? null : observation.observedState();
         PipelineState effective = observation == null ? null : observation.state();
+        PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
+        if (effective == null && stateFacts != null && stateFacts.runningObservationUnavailable()
+                && checkpoint == PipelineState.RUNNING) effective = checkpoint;
         PipelineState target;
         PipelineCatalogItem.IntentReadFailure intentReadFailure = null;
         try {
-            target = hasArtifact ? desired.read(id).map(state -> state.targetState()).orElse(null) : null;
+            if (stateFacts != null && stateFacts.intentFailure().isPresent()) throw stateFacts.intentFailure().orElseThrow();
+            target = stateFacts != null ? stateFacts.desired().map(state -> state.targetState()).orElse(null)
+                    : hasArtifact ? desired.read(id).map(state -> state.targetState()).orElse(null) : null;
         } catch (TapstateException unreadable) {
             if (unreadable.code() != IoError.DOCUMENT_UNREADABLE) {
                 throw unreadable;
@@ -128,7 +152,7 @@ public final class PipelineCatalogService {
         }
         boolean recoveryAtRest=needsRecovery && (observed==null || observed==PipelineState.NEW || observed==PipelineState.STOPPED);
         PipelineCatalogItem.DisplayState state = recoveryAtRest
-                ? observed==null?PipelineCatalogItem.DisplayState.UNAVAILABLE:PipelineCatalogItem.DisplayState.valueOf(observed.name())
+                ? observed == null ? null : PipelineCatalogItem.DisplayState.valueOf(observed.name())
                 : displayState(target, effective, intentReadFailure == null);
 
         String description = draft != null ? draft.description() : descriptionOf(artifact);
@@ -138,7 +162,8 @@ public final class PipelineCatalogService {
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
         PipelineCatalogItem.DisplayState runtimeState = observation != null && observed != effective
-                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name()) : state;
+                ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name())
+                : checkpoint == null ? state : PipelineCatalogItem.DisplayState.valueOf(checkpoint.name());
         return new PipelineCatalogItem(
                 id,
                 name,
@@ -150,7 +175,8 @@ public final class PipelineCatalogService {
                 hasArtifact,
                 new PipelineCatalogItem.Status(
                         runtimeState,
-                        recoveryAtRest?PipelineCatalogItem.UiState.RECOVERY_REQUIRED:PipelineCatalogItem.UiState.of(state, hasArtifact),
+                        recoveryAtRest ? PipelineCatalogItem.UiState.RECOVERY_REQUIRED
+                                : PipelineCatalogItem.UiState.of(state, hasArtifact),
                         target,
                         observed,
                         observation == null ? null : observation.failure(),

@@ -26,3 +26,8 @@ tapstate:
 #   tapstate.metrics.export.otlp.endpoint: http://collector:4318/v1/metrics   # push over OTLP
 #   tapstate.metrics.export.otlp.protocol: http-protobuf                      # or grpc (then host:port)
 #   tapstate.metrics.export.otlp.interval: 60s
+
+# Explicit opt-in: changing the root logger alone does not enable request profiling.
+logging:
+  level:
+    io.tapstate.diagnostics.http: INFO

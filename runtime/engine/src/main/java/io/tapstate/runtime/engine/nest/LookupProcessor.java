@@ -51,6 +51,7 @@ import java.util.Set;
 final class LookupProcessor extends AbstractProcessor implements Staged {
 
     static final int ROW_BATCH_LIMIT = 16;
+    private static final int REGISTRATION_BATCH_LIMIT = DrainFolding.MAX_KEYS_HELD;
     private static final long ROW_BATCH_BYTES = 8L * 1024 * 1024;
 
     @Override
@@ -184,7 +185,7 @@ final class LookupProcessor extends AbstractProcessor implements Staged {
         long bytes = 0;
         for (Object item : inbox) {
             if (!(item instanceof Envelope event) || event.op() != io.tapstate.core.event.Op.READ
-                    || registrations.size() == ROW_BATCH_LIMIT) return registrations;
+                    || registrations.size() == REGISTRATION_BATCH_LIMIT) return registrations;
             Map<String, Object> row = NestKeys.rowOf(event);
             List<Object> referrer = NestKeys.valuesOf(row, lookup.referrerIdentity(), lookup.mapName());
             if (referrers.contains(referrer)) return registrations;

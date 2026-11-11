@@ -119,9 +119,20 @@ public final class PipelineObservationQueryService {
     public record Read(PipelineStatus status, PipelineMetrics metrics, PipelineSnapshot snapshot) { }
     public Optional<Read> findRead(String pipelineId) {
         Objects.requireNonNull(pipelineId,PIPELINE_ID_ARGUMENT);
-        return observations.read(pipelineId).map(value->new Read(statusOf(value),
+        return observations.read(pipelineId).map(this::publication);
+    }
+
+    Map<String, Read> findReads(List<String> ids) {
+        if (ids.isEmpty()) return Map.of();
+        var result = new java.util.HashMap<String, Read>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, publication(value)));
+        return Map.copyOf(result);
+    }
+
+    private Read publication(Observation value) {
+        return new Read(statusOf(value),
                 new PipelineMetrics(value.pipelineId(),value.metrics(),value.positions(),value.facts()),
-                new PipelineSnapshot(value.pipelineId(),value.snapshot())));
+                new PipelineSnapshot(value.pipelineId(),value.snapshot()));
     }
 
     /** Returns an observed status with its current execution plan, without requiring an observation to exist. */
@@ -144,7 +155,13 @@ public final class PipelineObservationQueryService {
                 status.observedAt(), null, List.of(), status.observedState()), item.id()));
     }
 
-    private PipelineStatus statusOf(Observation observation) {
+    Map<String, PipelineStatus> findStatuses(List<String> ids) {
+        var result = new java.util.HashMap<String, PipelineStatus>();
+        observations.readAll(ids).forEach((id, value) -> result.put(id, statusOf(value)));
+        return Map.copyOf(result);
+    }
+
+    PipelineStatus statusOf(Observation observation) {
         var stored = new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(), observation.observedAt());
         if (observation.failure() != null || (observation.state() != PipelineState.RUNNING
                 && observation.state() != PipelineState.PAUSED)) return stored;

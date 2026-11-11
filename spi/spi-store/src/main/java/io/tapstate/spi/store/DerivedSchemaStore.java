@@ -2,6 +2,7 @@ package io.tapstate.spi.store;
 
 import java.util.Map;
 import java.util.Optional;
+import java.util.List;
 
 /**
  * The side record of what a pipeline step works its own columns out to be, keyed by the pipeline and
@@ -69,12 +70,31 @@ public interface DerivedSchemaStore {
     }
 
     /** Records a bounded group in order; backends may share one transaction for the group. */
-    default void recordBatch(String pipelineId, java.util.List<Recording> recordings) {
-        for (Recording recording : java.util.List.copyOf(recordings)) {
+    default void recordBatch(String pipelineId, List<Recording> recordings) {
+        for (Recording recording : List.copyOf(recordings)) {
             record(pipelineId, recording.stepId(), recording.schema(), recording.statement(),
                     recording.derivedFrom(), recording.derivedBy());
         }
     }
+
+    record Change(String stepId, DerivedSchema derivation) {}
+
+    /** Records changes in submission order while retaining each step's version and pin rules. */
+    default void recordMany(String pipelineId, List<Change> changes) {
+        for (Change change : changes) {
+            var value = change.derivation();
+            record(pipelineId, change.stepId(), value.schema(), value.statement(), value.derivedFrom(), value.derivedBy());
+        }
+    }
+
+    /** Records the run's derivations and pins the versions just recorded. */
+    default void recordAndPinMany(String pipelineId, List<Change> changes) {
+        recordMany(pipelineId, changes);
+        for (Change change : changes)
+            latest(pipelineId, change.stepId()).ifPresent(value -> pin(pipelineId, change.stepId(), value.version()));
+    }
+
+    default boolean supportsStartupBatch() { return false; }
 
     /**
      * Notes which version of a step's history a run is holding on to. Written by the assembly a run is

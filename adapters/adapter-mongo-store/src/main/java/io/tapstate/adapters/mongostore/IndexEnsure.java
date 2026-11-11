@@ -89,10 +89,7 @@ public final class IndexEnsure {
     }
 
     private static void create(com.mongodb.client.ClientSession session, MongoCollection<Document> collection, SystemCollections.IndexSpec index) {
-        Document keys = new Document();
-        for (String key : index.keys()) {
-            keys.append(key, 1);
-        }
+        Document keys = index.keyDocument();
         IndexOptions options = new IndexOptions().name(index.indexName()).unique(index.unique());
         if (index.expireAfterSeconds() != null) {
             options.expireAfter(index.expireAfterSeconds(), TimeUnit.SECONDS);

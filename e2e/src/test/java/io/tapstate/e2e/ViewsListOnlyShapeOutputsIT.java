@@ -209,14 +209,14 @@ class ViewsListOnlyShapeOutputsIT {
                     assertThat(target.listCollectionNames()).containsExactly(collection);
                     var observations = client.getDatabase(storage.cacheDatabase()).getCollection("pipeline_observation");
                     Await.until("current-run counts reach the native cache projection", Duration.ofSeconds(30), () -> {
-                        Document observed = observations.find(new Document("_id", "p")).first();
+                        Document observed = observations.find(new Document("pipelineId", "p").append("state", "RUNNING")).first();
                         if (observed == null || !(observed.get("initialLoad") instanceof Document load)
                                 || !(load.get("tables") instanceof Document tables)
                                 || !(tables.get("orders") instanceof Document orders)) return false;
                         return Long.valueOf(1).equals(orders.get("rowsRead"));
                     }, () -> control.logs("p"));
-                    var storedObservation = observations.find(new Document("_id", "p")).first();
-                    assertThat(storedObservation.get("scope", Document.class).getString("pipelineId")).isEqualTo("p");
+                    var storedObservation = observations.find(new Document("pipelineId", "p").append("state", "RUNNING")).first();
+                    assertThat(storedObservation.get("_id", Document.class).get("scope", Document.class).getString("pipelineId")).isEqualTo("p");
                     Map<?, ?> snapshot = (Map<?, ?>) JsonReader.parse(control.sourceRequest(
                             "GET", "/api/pipelines/p/snapshot", null, null, 200).body());
                     Map<?, ?> load = (Map<?, ?>) snapshot.get("initialLoad");

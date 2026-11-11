@@ -14,6 +14,10 @@ class StorageControlAccessTest {
         boolean firstAdminComplete;
         States(Purpose purpose) { status = new Status(SETUP, purpose == Purpose.SETUP ? Phase.CONFIG_PREPARED : Phase.COMPLETE, purpose == Purpose.SETUP ? 0 : 1); }
         @Override public StorageSetupStateStore guardedBy(Runnable active) { active.run(); return this; }
+        @Override public View loadView() { return new View(load(), java.util.Optional.empty(), java.util.Optional.empty()); }
+        @Override public View requireCurrentView(StorageSetupScope expected, Purpose purpose) {
+            requireCurrent(expected, purpose); return loadView();
+        }
         @Override public Status load() { return status; }
         @Override public Status rotate(StorageSetupScope expected, Purpose purpose) {
             requireCurrent(expected,purpose);

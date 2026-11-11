@@ -43,6 +43,9 @@ public enum EngineError implements TapstateErrorCode {
      */
     EXECUTION_NOT_AUTHORIZED("engine.execution-not-authorized", Set.of("pipeline")),
 
+    EXECUTION_LEASE_LOST("engine.execution-lease-lost", Set.of("pipeline")),
+    EXECUTION_RENEWAL_FAILED("engine.execution-renewal-failed", Set.of("pipeline")),
+
     /**
      * A run could not be started because the previous run of the same pipeline was still ending:
      * {@code pipeline} is the pipeline, {@code seconds} how long the wait for the old job to be over

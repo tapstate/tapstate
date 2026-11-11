@@ -229,19 +229,18 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private synchronized WriteResult deliver(List<Envelope> records) {
-        EncodedBatch batch = encodedRows(records);
-        Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
-        if (rowsByTable.isEmpty()) {
-            return new WriteResult(0);
-        }
-        if (mode == WriteMode.APPEND && rowsByTable.size() > 1) {
-            // APPEND has no rollback or idempotency contract. Reject before the first connector call so a
-            // retry cannot duplicate an earlier table after a later table fails.
-            throw writeFailed(connector.connectorId(), new IllegalStateException(
-                    "append mode rejects a multi-table batch before any connector write"));
-        }
         try {
             return connector.underLoader(() -> {
+                EncodedBatch batch = encodedRows(records);
+                Map<String, List<TapRecordEvent>> rowsByTable = batch.rows();
+                if (rowsByTable.isEmpty()) {
+                    return new WriteResult(0);
+                }
+                if (mode == WriteMode.APPEND && rowsByTable.size() > 1) {
+                    // Reject before the first write so a retry cannot duplicate an earlier table.
+                    throw writeFailed(connector.connectorId(), new IllegalStateException(
+                            "append mode rejects a multi-table batch before any connector write"));
+                }
                 if (!batch.keys().isEmpty()) {
                     if (!identityPrepared) prepareTargets();
                     batch.keys().forEach((stream, keys) -> PdkMongoIdentityGuard.verify(connector, identities.get(stream), keys));
@@ -304,7 +303,7 @@ final class PdkSinkWriter implements SinkWriter {
             TapTable table = target != null
                     ? tableModel(entry.getKey(), target)
                     : TargetTapTable.bare(rows.get(0).getTableId());
-            preparation.prepare(target, table);
+            preparation.prepareForWrite(target, table);
             if (target != null) {
                 // The connector receives both a table model and record events; its write path may
                 // route by the event table id, so both must name the resolved target collection.
@@ -332,7 +331,10 @@ final class PdkSinkWriter implements SinkWriter {
     }
 
     private TapRecordEvent encode(Envelope env) {
-        return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions());
+        TargetTable target = projectedTarget(env.src(), targets.get(env.src()));
+        var fields = target == null ? Map.<String, io.tapdata.entity.schema.TapField>of()
+                : tableModel(env.src(), target).getNameFieldMap();
+        return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions(), fields);
     }
 
     /** Reforge a row envelope into an insert (append mode): the row's payload becomes an inserted row. */

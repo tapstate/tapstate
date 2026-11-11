@@ -25,13 +25,27 @@ final class ScopedSinkStateProvider {
         return open(member,run,config,provisioner,sharing,"writer:0:0");
     }
     PdkSinkPort open(HazelcastInstance member,ConfiguredSinkRun run,SinkConfig config,ConnectorProvisioner provisioner,SharedSinkConnectors sharing,String slot) {
+        return open(member, run, config, provisioner, sharing, slot, new WriterStartup());
+    }
+    static final class WriterStartup {
+        private ConnectorRef artifact;
+        private final PdkSinkPreparations.OpeningFacts ready = new PdkSinkPreparations.OpeningFacts();
+    }
+    PdkSinkPort open(HazelcastInstance member,ConfiguredSinkRun run,SinkConfig config,ConnectorProvisioner provisioner,
+            SharedSinkConnectors sharing,String slot,WriterStartup startup) {
         var authorization=ExecutionAuthorization.of(member);var original=authorization.require(run.original());
         Runnable active=() -> {if(!original.equals(authorization.require(run.original())))throw fenced();};
         active.run();if(!run.node().equals(config.node()))throw fenced();
         var fixed=Map.of(run.primary().namespace(),run.primary().token(),run.global().namespace(),run.global().token());
         var scopes=ConnectorNoteScopes.of(notes,namespace -> {var token=fixed.get(namespace);if(token==null)throw fenced();return token;},active);
-        ConnectorProvisioner exact=id -> {active.run();if(!config.connectorId().equals(id))throw fenced();var ref=provisioner.resolve(id,run.artifactHash());active.run();return ref;};
-        var receipts=new PdkSinkPreparations(cache.sinkPreparations(run.original().scope(),original,active),run.original().scope(),run.node(),run.purpose(),config.onFullLoad(),config.fullLoad());
+        ConnectorProvisioner exact=id -> {
+            active.run();
+            if(!config.connectorId().equals(id))throw fenced();
+            if (startup.artifact == null) startup.artifact = provisioner.resolve(id,run.artifactHash());
+            active.run();
+            return startup.artifact;
+        };
+        var receipts=new PdkSinkPreparations(cache.sinkPreparations(run.original().scope(),original,active),run.original().scope(),run.node(),run.purpose(),config.onFullLoad(),config.fullLoad(),startup.ready);
         Runnable local=()->{if(!original.equals(authorization.requireLocal(run.original())))throw fenced();};
         return PdkSinkPort.withScopedState(exact,sharing,run.purpose(),scopes,original,receipts)
                 .withOperationObserver(operations.get().open(run,config,slot,active,local))

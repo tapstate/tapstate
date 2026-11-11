@@ -75,7 +75,7 @@ public final class SrsRingSource {
                     return new CheckedReader(reader,verifier);
                 })
                 .fillBufferFn((CheckedReader state, SourceBuilder.SourceBuffer<SrsItem> buffer) ->
-                        state.reader().fill((item, seq) -> { state.verifier().verify(item,seq); buffer.add(item); }, FILL_BATCH))
+                        state.reader().fill(state.verifier(), (item, seq) -> buffer.add(item), FILL_BATCH))
                 .build();
     }
     private record CheckedReader(SrsRingReader reader,SrsEventModelVerifier verifier) {}

@@ -50,19 +50,23 @@ public final class PipelineViewService {
         if (offset < 0 || limit < 1) {
             throw new IllegalArgumentException("pipeline page offset must be non-negative and limit positive");
         }
-        List<StoredResource> matching = artifacts.listResources().stream()
+        List<StoredResource> matching = artifacts.listResources("pipeline").stream()
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .sorted(Comparator.comparing(stored -> stored.resource().id()))
                 .toList();
         if (offset >= matching.size()) return List.of();
         int end = (int) Math.min((long) matching.size(), (long) offset + limit);
-        return matching.subList(offset, end).stream().map(this::view).toList();
+        var page = matching.subList(offset, end);
+        var statuses = observations == null ? Map.<String, PipelineStatus>of()
+                : observations.findStatuses(page.stream().map(stored -> stored.resource().id()).toList());
+        var sources = new java.util.HashMap<String, Optional<StoredResource>>();
+        return page.stream().map(stored -> view(stored, statuses.get(stored.resource().id()), sources)).toList();
     }
 
     /** Returns the typed Pipeline view when the id resolves to a stored Pipeline. */
     public Optional<PipelineView> find(String id) {
         Objects.requireNonNull(id, "id");
-        return artifacts.getResource(id)
+        return artifacts.getResource("pipeline", id)
                 .filter(stored -> stored.resource() instanceof PipelineResource)
                 .map(this::view);
     }
@@ -74,18 +78,29 @@ public final class PipelineViewService {
                 PipelineError.NOT_FOUND, Map.of("id", id), null));
     }
 
+    void requireDefinition(String id) {
+        if (artifacts.getResource("pipeline", id).isEmpty()) {
+            throw new TapstateException(PipelineError.NOT_FOUND, Map.of("id", id), null);
+        }
+    }
+
     private PipelineView view(StoredResource stored) {
         PipelineResource pipeline = pipeline(stored.resource());
-        PipelineStatus status = observations == null ? null : observations.findStatus(pipeline.id()).orElse(null);
-        var view = representation.toView(pipeline, stored.contentHash(), sourceSummaries(pipeline), status);
+        PipelineStatus status = observations == null ? null : observations.findStatuses(List.of(pipeline.id())).get(pipeline.id());
+        return view(stored, status, new java.util.HashMap<>());
+    }
+
+    private PipelineView view(StoredResource stored, PipelineStatus status, Map<String, Optional<StoredResource>> sources) {
+        PipelineResource pipeline = pipeline(stored.resource());
+        var view = representation.toView(pipeline, stored.contentHash(), sourceSummaries(pipeline, sources), status);
         return outputNames == null ? view : view.withOutputTargets(outputNames.resolve(pipeline));
     }
 
-    private List<PipelineSourceSummary> sourceSummaries(PipelineResource pipeline) {
+    private List<PipelineSourceSummary> sourceSummaries(PipelineResource pipeline, Map<String, Optional<StoredResource>> sources) {
         List<PipelineSourceSummary> summaries = new ArrayList<>(pipeline.sources().size());
         for (SourceRef sourceRef : pipeline.sources()) {
             String sourceId = sourceRef.id();
-            StoredResource stored = artifacts.getResource(sourceId).orElse(null);
+            StoredResource stored = sources.computeIfAbsent(sourceId, id -> artifacts.getResource("source", id)).orElse(null);
             if (stored == null || !(stored.resource() instanceof SourceResource source)) {
                 summaries.add(PipelineSourceSummary.unresolved(sourceId));
                 continue;

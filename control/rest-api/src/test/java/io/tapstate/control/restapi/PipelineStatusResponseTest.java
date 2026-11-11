@@ -139,6 +139,21 @@ class PipelineStatusResponseTest {
     }
 
     @Test
+    void usesAuthoritativeRunningWithoutInventingAnObservation() {
+        var status = new PipelineCatalogItem.Status(PipelineCatalogItem.DisplayState.RUNNING,
+                PipelineCatalogItem.UiState.RUNNING, PipelineState.RUNNING, null, null, null);
+        var item = new PipelineCatalogItem("orders", "Orders", null, "cdc", null, OBSERVED_AT,
+                "content-hash", true, status);
+
+        var response = PipelineStatusResponse.of(item, catalog);
+
+        assertThat(response.state()).isEqualTo(PipelineState.RUNNING);
+        assertThat(response.displayState()).isEqualTo(PipelineCatalogItem.UiState.RUNNING);
+        assertThat(response.observedState()).isNull();
+        assertThat(response.observedAt()).isNull();
+    }
+
+    @Test
     void catalogProjectionPreservesTheAgeOfAnExistingObservation() {
         PipelineCatalogItem item = catalogItem(PipelineCatalogItem.UiState.RUNNING,
                 PipelineState.RUNNING, PipelineState.RUNNING);

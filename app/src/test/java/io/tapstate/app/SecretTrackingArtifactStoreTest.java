@@ -16,6 +16,25 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class SecretTrackingArtifactStoreTest {
 
+    @Test void readableListingForwardsNativeBatchAndSharesOneLiveCatalogWithSourceProjection() {
+        var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
+        org.mockito.Mockito.when(delegate.listStored()).thenReturn(List.of());
+        var first = source("first", "first-list-secret"); var second = source("second", "second-list-secret");
+        org.mockito.Mockito.when(delegate.readableInventory("source")).thenAnswer(ignored ->
+                new ArtifactStore.ReadableInventory(List.of(first, second), Optional.empty()));
+        org.mockito.Mockito.when(delegate.managedDefaultSourceId()).thenReturn(Optional.empty());
+        var reads = new java.util.concurrent.atomic.AtomicInteger(); var redactor = new SecretRedactor();
+        var decorated = new SecretTrackingArtifactStore(delegate, () -> { reads.incrementAndGet(); return TapstateCatalog.load(); }, redactor);
+        var service = new io.tapstate.control.core.SourceProjectionService(org.mockito.Mockito.mock(io.tapstate.control.core.ApplyService.class),
+                new io.tapstate.control.core.ArtifactQueryService(decorated), org.mockito.Mockito.mock(io.tapstate.control.core.ArtifactMutationService.class),
+                new io.tapstate.control.core.SourceRepresentation(() -> { throw new AssertionError("list must use its captured catalog"); }));
+        assertThat(service.list()).hasSize(2); assertThat(reads.get()).isEqualTo(1);
+        assertThat(redactor.redact("first-list-secret second-list-secret")).isEqualTo("******** ********");
+        assertThat(service.list()).hasSize(2); assertThat(reads.get()).isEqualTo(2);
+        org.mockito.Mockito.verify(delegate, org.mockito.Mockito.times(2)).readableInventory("source");
+        org.mockito.Mockito.verify(delegate, org.mockito.Mockito.never()).get(org.mockito.ArgumentMatchers.anyString());
+    }
+
     @Test void productionReadDecorationPreservesManagedTargetAuthority() {
         var delegate = new RecordingStore(); delegate.managed = "views";
         delegate.save(new SourceResource("views", null, "mongodb", Map.of("uri", "mongodb://host/master"), null, null, null, null));

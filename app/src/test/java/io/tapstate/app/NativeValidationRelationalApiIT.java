@@ -111,7 +111,7 @@ class NativeValidationRelationalApiIT {
         }
     }
 
-    @Test @Timeout(180) void mysqlNonBinaryTextKeysAreRefusedDuringPreflight()throws Exception{verify(true,true);}
+    @Test @Timeout(180) void mysqlAndMongoTextKeysUseTheSameOrdering()throws Exception{verify(true,true);}
     private void verify(boolean mysql)throws Exception{verify(mysql,false);}
     @Test @Timeout(180) void postgresWideNativePageIsChargedBeforeQueryAndPreservesAllRows()throws Exception{verify(false,false,true);}
     private void verify(boolean mysql,boolean textOnly)throws Exception{verify(mysql,textOnly,false);}
@@ -201,15 +201,17 @@ class NativeValidationRelationalApiIT {
                 if(textOnly){
                     artifacts.create(new PipelineResource("text_flow",null,List.of(SourceRef.spec("input",false)),null,null,
                             new ServeBlock.Inline("serve",FromClause.list(FromRef.literal("input.text_orders")),List.of(new SyncElement("out","target",null,new RenameSpec(null,null,"checked_",null),null)),null,null),null,null));
-                    for(var method:List.of("COUNT","UNIQUE_KEY","FULL_COLUMN")){
-                        var input=Map.of("pipelineId","text_flow","taskId","full","expectedRevision","0","method",method,
+                    for(var method:List.of("UNIQUE_KEY","FULL_COLUMN")){
+                        String task=method.toLowerCase(Locale.ROOT);
+                        var input=Map.of("pipelineId","text_flow","taskId",task,"expectedRevision","0","method",method,
                                 "mappings",List.of(Map.of("mappingId","text","outputId","out","sourceId","input","table","text_orders")),
-                                "confirmations",method.equals("COUNT")?Map.of():Map.of("text",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
-                        if(method.equals("COUNT"))assertThat(post(http,write,"evaluate",input)).containsEntry("method","COUNT");
-                        else assertThatThrownBy(()->post(http,write,"evaluate",input)).isInstanceOfSatisfying(org.springframework.web.client.HttpClientErrorException.class,
-                                refused->{assertThat(refused.getStatusCode().value()).isEqualTo(400);assertThat(refused.getResponseBodyAsString()).contains("validation.rule-unsupported","native-text-ordering-unproven");});
+                                "confirmations",Map.of("text",Map.of("id",UUID.randomUUID().toString(),"fields",List.of(Map.of("source","id","target","id")))));
+                        var evaluated=post(http,write,"evaluate",input);
+                        var saved=post(http,write,"save",Map.of("input",input,"fingerprint",evaluated.get("fingerprint"),"commandId",UUID.randomUUID().toString(),"historyLimit",10,"scheduleEnabled",false));
+                        var operation=Map.<String,Object>of("context",evaluated.get("context"),"pipeline","text_flow","task",task,
+                                "taskGeneration",saved.get("taskGeneration"),"revision","1","sequence","1","command",UUID.randomUUID().toString());
+                        assertThat(run(http,write,read,operation)).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount","0");
                     }
-                    assertThat(child.getBean(com.hazelcast.core.HazelcastInstance.class).getJet().getJobs()).isEmpty();
                     return;
                 }
                 if("inference".equals(nested)){
@@ -416,11 +418,11 @@ class NativeValidationRelationalApiIT {
                             &&Boolean.FALSE.equals(current.get("controlUnknown"))&&"STARTING".equals(current.get("state"))&&retried.compareAndSet(false,true)){
                         var retry=post(http,write,"start",operation);assertThat(retry.get("original")).isEqualTo(operation);assertThat(retry.get("run")).isEqualTo(start.get("run"));
                     }
-                    var report=get(http,read,"/api/pipelines/flow/validation-tasks/"+operation.get("task")+"/reports/"+start.get("run")+"?generation="+operation.get("taskGeneration")+"&sequence="+operation.get("sequence"));
+                    var report=get(http,read,"/api/pipelines/"+operation.get("pipeline")+"/validation-tasks/"+operation.get("task")+"/reports/"+start.get("run")+"?generation="+operation.get("taskGeneration")+"&sequence="+operation.get("sequence"));
                     assertThat(report).containsEntry("terminal","COMPLETED").containsEntry("closed",true);completed.set(report);
                 });}catch(org.awaitility.core.ConditionTimeoutException failed){
             throw new AssertionError("original="+operation+"; initial="+start+"; progress="+post(http,read,"progress",operation)
-                    +"; task="+get(http,read,"/api/pipelines/flow/validation-tasks/"+operation.get("task")),failed);
+                    +"; task="+get(http,read,"/api/pipelines/"+operation.get("pipeline")+"/validation-tasks/"+operation.get("task")),failed);
         }
         assertThat(post(http,read,"progress",operation)).containsEntry("state","COMPLETED");return completed.get();
     }

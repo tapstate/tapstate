@@ -25,6 +25,14 @@
         "Only verified whole-empty CACHE may obtain a new scope; partial loss and conflicting identity refuse."
       ]
     },
+    "connector-catalog": {
+      "goal": "Rebuild the derived connector catalog and Cloud bundled registration metadata and icons from verified artifacts.",
+      "entry": "SeedSweepRunner after CACHE admission for Cloud; normal connector registration or seed sweep for on-premises.",
+      "prerequisites": [
+        "Cloud uses the eight immutable image JARs and matching release lock. Store the existing content-addressed spec before publishing its catalog document.",
+        "On-premises derives the catalog from the existing connector registration path."
+      ]
+    },
     "derived-cache": {
       "goal": "Recreate derivable data from original definitions and verified artifacts after storage admission.",
       "entry": "Registered connector test/discovery, artifact registration or current runtime observation.",
@@ -1051,6 +1059,38 @@
         "Matching Source/header and schema aggregate backup for restoration",
         "Supported original component 1/2 or exact original query-preparation operation, complete declared namespace and paired backup."
       ]
+    },
+    "operator-generations-validation-count-r1": {
+      "goal": "Retain the exact original explicit clear-state full identity and its immutable authoring/input/dependency closure; later edits cannot reuse its model-handoff authority. The separately confirmed partial shared loss entry replaces only the affected physical namespace and leaves all affected Pipelines stopped for individually confirmed full.",
+      "entry": "A newly confirmed explicit clear-state full writes strict stateRebuild formatVersion 2 in the original CONFIG begin transaction, after original intent, input and complete dependency verification; completedFull recognizes only the same still-current COMPLETE target. Additional entry: exact single shared SRS impact preflight and explicit confirmation, original writer drain, guarded namespace replacement and per-Pipeline explicit clear-state full.",
+      "prerequisites": [
+        "Existing ordinary entry only: Strict version 2 is exactly the existing version 1 stateRebuild fields plus inputClosureHash, with the existing result added only on completion. inputClosureHash is the canonical hash of the exact existing encoded PipelinePreparationInputs and lexically sorted complete dependencyHashes map from the original confirmed request. It is written and retained with the original operation, preparation, scopes and confirmationHash in the same CONFIG transaction/CAS.",
+        "Existing ordinary entry only: At first model handoff and its subsequent CONFIG guard, recompute the exact current input/dependency digest, verify all current referenced resources and canonical hashes, compare the original fixed digest, and require the original ACTIVE target, COMPLETE preparation, operation and strict completed result. Dependency IDs, hashes, input selections and direct-channel identities all contribute; equality grants no extra scope.",
+        "Existing ordinary entry only: Existing version 1 pending/completed facts keep their strict original shapes and ordinary replay behavior. They cannot authorize this new model handoff; no migration, inference, missing-proof backfill or current-only substitute is allowed. A new explicit clear-state full is required to create version 2 proof.",
+        "Existing ordinary entry only: Completed-full handles are minted and revalidated by the original CONFIG adapter; a caller-supplied origin/hash or arbitrary SPI implementation is not proof. CACHE separately checks the exact original rebuild marker, target and claims in its existing transaction, while CONFIG checks remain outside that transaction before and after it. There is no cross-domain atomicity promise.",
+        "Existing ordinary entry only: All previously reviewed pending-full pin-first retry, model/cut, membership, size and monotonic position-edit restriction contracts remain unchanged. A retired/deleted origin, reused Pipeline ID, later full or changed preparation cannot reuse a prior proof.",
+        "Only a separately and explicitly confirmed single canonical shared SRS recovery may replace its current physical chain namespace. Its original configuration binding, capture birth/preparation and CAPTURE claim, complete root/consumer relations and progress controls must be trustworthy; payload loss never grants ordinary first creation. Unknown control, conflicting identity or unproved prior source/target drain refuses.",
+        "The typed control-only preflight binds the exact old effective preparation, CAPTURE fence, root/control digest, complete non-detached consumer keys and revisions, original Pipeline scopes and complete current authoring dependency hashes. Paused, stopped, completed and unleased retained relations are included. Missing model/event bodies cannot be replaced with latest, guessed bounds, fake events, source checkpoints, ACKs or trims.",
+        "CONFIG storage_recovery.pendingRecovery has an additional strict formatVersion 2 SHARED_SRS variant for exactly one canonical/current physical chain. It retains the operation, original scope, immutable confirmation, actual affected IDs and a bounded sharedSrs control annex; its combined BSON is at most 262144 bytes. Existing PIPELINE/CLUSTER version 1 variants retain their shapes and behavior.",
+        "CONFIG capture_preparations retains its immutable original birth. A strict version 2 optional currentRecovery annex fixes formatVersion 1, operationId, planHash, previousPhysicalChain, previousPreparationId, physicalChain and phase RESERVED or READY. The operation UUID is the new preparationId; the replacement physical ID deterministically hashes the exact business scope, canonical chain and operation UUID. A single flat predecessor is kept, never a recursive lineage. Retries reuse the same IDs.",
+        "CONFIG operator_generations has an optional sharedRecovery annex exactly formatVersion 1, operationId and originalScope. It is only a scope-bound requirement for explicit clear-state full, never capture creation or business authority. The joint start transaction installs or replaces it only on an exact ACTIVE, COMPLETE-prepared current scope with no in-flight full/retirement, leaves original generation, operationId, preparation and stateRebuild intact, and writes STOPPED intents for the actual affected scopes. No unrelated Pipeline is changed.",
+        "Ordinary START/resume, intent CAS and execution preparation consume the scope gate. STOPPED controls and explicitly requested purge/full remain operable. Only the winning existing full completion transaction, proving the exact original scope and marker, removes it while completing the original rebuild and purge consumption; completed-result replay cannot remove a newer marker. Verified retirement/recreate handles the old scope marker without copying it to a new generation.",
+        "CONFIG reservation and guarded publication use the existing configuration version contention point. New canonical capture/attach/full admission refuses RESERVED mappings, including every Pipeline whose full needs that mapping; previously issued operations still compete on the actual CACHE root. CONFIG proof runs before and after CACHE work, never inside a CACHE transaction or under a claim of cross-database atomicity.",
+        "A dedicated opaque recovery handle binds the original CONFIG reservation and exact original CACHE control view. One actual CACHE client/session transaction proves the current NODE and ended original CAPTURE/affected Pipeline tenures, safely advances the known canonical CAPTURE counters/annex, expires only exact old Pipeline tenures while preserving their private claims/state/notes, detaches the complete old shared relations and removes their corresponding offsets, retires the old root and creates the entirely empty replacement physical root. A normal AlreadyIssued or caller-built SPI value supplies no such authority.",
+        "The old srs_chains root has a strict version 2 recoveryControl annex exactly formatVersion 1, operationId, planHash, replacementChain, phase CANCELLED or RETIRED, and controlHash. The digest binds the exact typed poststage root/relationship controls and detached-cursor absence, excluding itself. Every ordinary old-domain load/write/model/log/epoch/consumer path refuses before reading lost payload. Dedicated typed retired control reads reprove exact relations, scopes, counts/revisions and absent offsets; they cannot blindly skip an old root or require all old roots to name the latest Pipeline gate operation.",
+        "RETIRED plus the exact new physical root and CAPTURE annex is the joint CACHE commit receipt. If application is absent or unknown, cancellation must first arbitrate with it in the same CACHE root CAS, prove the old effective annex and complete emptiness of the replacement namespace, and record CANCELLED for the exact old operation/plan. A late application cannot pass a winning cancellation; a winning application is completed, never rolled back. Unknown evidence keeps the reservation closed.",
+        "Only the exact CACHE CANCELLED receipt permits a protected same-operation RUNNING to PLANNED preflight transition. RESERVED and all prior STOPPED/scope gates stay; physical/preparation IDs do not change. The actual current closure and configuration version produce a new planHash/controlRevision and require new explicit human confirmation. A new reservation attempt CAS consumes the exact prior cancellation. The generic plan/transition entry cannot confer this permission, and scope expansion never reuses an old operational isolation confirmation.",
+        "A shared-specific completion guard proves the original RUNNING reservation and exact physical/preparation/CACHE receipt, then atomically publishes mapping READY and joint COMPLETE. It does not reinterpret later authoring or run the generic current-definition completion check. Original affected scopes remain stopped/gated; subsequent per-Pipeline full separately confirms all current source/selection/dependency/target/retirement inputs. Existing-state continuation is never silently converted into full.",
+        "All native writers, planners and readers resolve one trusted effective physical chain and use matching ring/model/consumer keys. The canonical CAPTURE read identity and the original canonical shared notes namespace remain stable; the new physical identity must never create empty replacement necessary notes or change their original connector/config/artifact origin. Position-edit restrictions follow canonical historical identity across replacement namespaces.",
+        "For A reading S1 and S2, B reading S1 and C reading S2, only damaged S1 and actual A/B are jointly recovered. A later explicit full may detach A from healthy S2 and update ordinary membership counters, but cannot reset S2 epoch/checkpoint/models or C authorization/cursor/execution. No running, stopped or completed Pipeline is automatically started.",
+        "No new collection, protocol lease, event history, stored model body or credential is added by this control contract. CONFIG retains one current bounded plan, one current mapping plus flat predecessor per canonical capture, and one scope gate per affected Pipeline. Each actual recovery leaves an old quarantined physical namespace and retirement marker; precise final destruction is outside this entry, required identity cannot be discarded for a budget and insufficient capacity refuses. Existing ordinary model/log/retention and pending-full budgets and validation remain.",
+        "The recovery CAPTURE claim annex is exactly formatVersion 2, original (the complete immutable version 1 birth row), physicalChain and preparationId. The preparationId equals the fixed operation UUID. Its CONFIG currentRecovery keeps only previousPhysicalChain and previousPreparationId as a flat predecessor; canonical predecessor coordinates must match the immutable birth. The Pipeline sharedRecovery marker never changes original operationId/preparation/stateRebuild and is consumed only by the winning exact old-scope full completion, never by replay or an unrelated generation.",
+        "Independent validationPreparation is initialized as UNASSIGNED by original Pipeline authoring or controlled schema preparation. Version-2 absence is unknown, not first use.",
+        "Validation generation/revision, original scope/preparationId, optional closingOperationId and one nonrecursive proven-closed predecessor are retained within 8 KiB per Pipeline. Closing gates admissions before final CLOSED; issued unborn CACHE work requires an original cancellation/retirement receipt.",
+        "Same-ID recreation and explicit Cluster CACHE recovery reuse their verified original lifecycle paths. Normal production stop/start or full rebuild does not reset validation authority; old queries and reports cannot regain rights.",
+        "validationCountOwner formatVersion 1 holds generation, preparationId, nodeId, bootId, claimGeneration, executionGeneration, and topologyRevision. It has authority only when it matches the current COMPLETE validationPreparation and the current scope. Older rows without it remain readable and a verified manual COUNT acquisition creates it. A different Pipeline lifetime never inherits this authority.",
+        "First COUNT acquisition publishes the exact committed CACHE birth and lease under the original ISSUED preparation only when CONFIG advances that original to COMPLETE. An expired or mismatching original is discarded. No replay creates another lease or revives a superseded owner."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1285,6 +1325,10 @@
     "composed-validation-alert-source-schema-v1": {
       "atomicDomain": "CONFIG",
       "fencing": "Same CONFIG client/session with resource revision/CAS, original scope and configuration_version where applicable; never a runtime lease mirror. Controlled first enrollment, preparation phase/cursor and Source writes serialize through the original CONFIG client/session and configuration_version. Each transaction publishes one Source header with its original operation cursor. Unknown commits read the same operation/header; existing UUIDs are never reallocated. Old writers must be stopped before first enrollment; no cross-client or remote maintenance atomicity is claimed. The alert version-1 to version-2 upgrade conditionally changes only its bounded component slot and the original configuration_version singleton in one actual CONFIG transaction; preserve all Source preparation and other component facts, and reconcile unknown commits by the original operation. Query preparation serializes its original operation/phase/cursor and final capability marker through the existing CONFIG schema aggregate; it does not claim index DDL is in a document transaction. Same-session protected alert writes still use the existing configuration singleton and original actor/resource/key fences. Operational evidence, lifecycle state, episode transitions and required planning share the original CONFIG CAS transaction. Original Source UUID/binding revision or CONFIG-held CACHE/MASTER binding fences the observation. External I/O precedes the transaction; local guards remain pure. Node lifecycle capability 5 adds the separate CONFIG alert_node_lifecycles collection and one non-unique ascending scope/phase/node/boot index. Controlled same-version preparation stops old writers, marks the existing bounded query preparation as PREPARING for index-contract version 2, preserves original installation/authority/query operation identities, creates/verifies the new namespace and sixth query index outside document transactions, and publishes capability 5 with READY cursor 6 by CONFIG CAS. Interrupted preparation resumes only that original operation/phase/cursor; unmarked partial namespaces are refused. The entire alerting marker remains at most 2 KiB; ordinary opening performs no migration. Global schema, Source slot, key, authoring revision and alert counter are preserved. Explicit same-version preparation with old writers stopped conditionally advances only installed alert capability 5 to operation-domain capability 6 by CONFIG CAS. Preserve the existing original query/node preparation operation, index-contract version 2 and READY cursor 6; no DDL, extra preparation history or global/Source/key/authoring-revision/alert-counter changes. The whole component marker stays at most 2 KiB. Ordinary opening never rewrites alarm qualifiers or splits legacy heads. Unsupported older binaries pause writes and takeover. Rule evaluation revisions refer to the durable semantic binding of the original rule, independently of its authoring CAS revision. Names and severity-only edits keep the same active episode, occurrence, input frontier, timers and original frozen deliveries; actual criteria, selector, enabled-state or type changes advance the semantic binding, including semantic ABA. Numerically equal bounded decimal parameters compare by value. An evaluation command carries its expected authoring revision only in memory and checks it in the same CONFIG transaction; an older command may use its embedded rule revision only when that value actually equals the current authoring revision. Missing expected authority is not replaced with the latest value. Retain lawful original late results and never revive canceled work. Controlled same-version maintenance with old writers quiescent advances only the existing alerting marker from capability 6 to capability 7 by CONFIG CAS after verifying original CONFIG/key and exact indexes. Preserve original operation identities, READY cursor 6, index-contract version 2, global schema, Source slot, configuration revision and alert counter. The whole marker remains at most 2 KiB; no new slot, collection, index, DDL or business-row migration. New installations publish the same capability; ordinary opening never enrolls or rewrites rules."
+    },
+    "operator-generations-validation-count-r1": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Existing ordinary CONFIG transactions remain. The shared operation start atomically verifies the original immutable plan, complete current dependency/scope revisions, reserves one fixed effective mapping and installs only exact affected old-scope gates and STOPPED intents. CACHE executes independently with an adapter-issued narrow handle and separate transaction, with CONFIG checks outside that transaction. Protected reconfirm requires the exact CACHE CANCELLED arbitration receipt; completion requires the original reservation and exact RETIRED/new-namespace/CAPTURE receipt without reinterpreting later authoring. The winning per-Pipeline explicit full completion removes only its original scope gate. No cross-instance atomicity is promised. Manual COUNT CONFIG writes conditionally touch the same operator_generations row and compare the exact current validationCountOwner and preparation. CACHE commits separately under its live lease."
     }
   },
   "resources": [
@@ -2245,15 +2289,15 @@
     },
     {
       "id": "mongo.config.operator_generations",
-      "resourceVersion": 4,
-      "proposalVersion": 5,
+      "resourceVersion": 5,
+      "proposalVersion": 6,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "operator_generations"
       ],
-      "responsibility": "Stable Pipeline state generations, preparation and bounded previous/target recovery scopes. A separate validationPreparation field records only independent validation first-birth/closure authority for this Pipeline; it does not issue production preparation, store production models, or provide a validation oracle.",
+      "responsibility": "Stable Pipeline state generations, preparation and bounded previous/target recovery scopes. A separate validationPreparation field records only independent validation first-birth/closure authority for this Pipeline; it does not issue production preparation, store production models, or provide a validation oracle. A single optional validationCountOwner v1 annex binds manual COUNT write authority to the current validation preparation and owner tenure.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoPipelineStateMappings",
         "io.tapstate.adapters.mongostore.MongoStorageRecoveryCommands",
@@ -2266,9 +2310,9 @@
         "io.tapstate.adapters.mongostore.MongoPipelineStateRebuilds",
         "io.tapstate.adapters.mongostore.MongoValidationPreparations"
       ],
-      "recovery": "operator-generations-validation-r3",
-      "consistency": "shared-srs-config",
-      "growth": "One bounded stateRebuild annex per Pipeline; the strict version 2 variant adds one 64-character hexadecimal inputClosureHash. It replaces no prior scopes or confirmation facts, stores no schema bodies, secrets or unbounded history, and never backfills proof for version 1. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. The independent validation preparation field adds at most 8 KiB per Pipeline, with one current state and at most one flat closed predecessor, not a request history.",
+      "recovery": "operator-generations-validation-count-r1",
+      "consistency": "operator-generations-validation-count-r1",
+      "growth": "One bounded stateRebuild annex per Pipeline; the strict version 2 variant adds one 64-character hexadecimal inputClosureHash. It replaces no prior scopes or confirmation facts, stores no schema bodies, secrets or unbounded history, and never backfills proof for version 1. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. The independent validation preparation field adds at most 8 KiB per Pipeline, with one current state and at most one flat closed predecessor, not a request history. The optional validationCountOwner is at most 1 KiB BSON per Pipeline, with no retained epochs.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoPipelineStateMappingsIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCachePipelineRebuildsIT.java",
@@ -2790,14 +2834,14 @@
     {
       "id": "mongo.cache.workload_claims",
       "resourceVersion": 4,
-      "proposalVersion": 4,
+      "proposalVersion": 5,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "workload_claims"
       ],
-      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under an independent CONFIG validation capability and a valid NODE_SESSION. Cancellation and closed-predecessor replacement preserve known counters; ordinary validation admission does not depend on production claims/state and refuses missing original state.",
+      "responsibility": "Runtime NODE/Pipeline/CAPTURE leases, epochs and write fences. Independent VALIDATION ownership per Cluster/Pipeline uses the existing complete lease/generation fence. Its original claim and validation control are born together under an independent CONFIG validation capability and a valid NODE_SESSION. Cancellation and closed-predecessor replacement preserve known counters; ordinary validation admission does not depend on production claims/state and refuses missing original state. A first manual COUNT validation claim may retain a server-timed initial owner and execution lease in the original CACHE birth transaction. Authority requires the same CONFIG preparation to be COMPLETE.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore",
         "io.tapstate.adapters.mongostore.MongoCaptureCachePreparations",
@@ -2812,7 +2856,7 @@
       ],
       "recovery": "shared-srs-replacement-workload_claims",
       "consistency": "shared-srs-cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction.",
+      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget. Partial shared recovery keeps the bounded current controls and quarantined old physical namespaces described by its recovery profile; no retry-generated identities or automatic old-data destruction. Manual COUNT uses the existing single claim and its existing fields, with no extra rows or lease history.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoSrsConsumerStoreIT.java",
@@ -3103,25 +3147,26 @@
     {
       "id": "mongo.cache.connector_catalog",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "connector_catalog"
       ],
-      "responsibility": "Derived connector catalog metadata.",
+      "responsibility": "Derived connector catalog metadata. Cloud rows also hold a bundledArtifact subdocument with the JAR SHA-256, PDK API version, SEED source and optional media type and binary icon. Each row is published atomically under its original CACHE scope after its spec is stored.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
       ],
-      "recovery": "derived-cache",
+      "recovery": "connector-catalog",
       "consistency": "cache",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "growth": "On-premises retains its existing one-row-per-connector behavior. Cloud is bounded to eight rows per CACHE scope and at most 1 MiB of icon bytes per row. Cloud stores no JAR bytes.",
       "evidence": [
-        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java"
+        "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
+        "app/src/test/java/io/tapstate/app/CloudConnectorSeedReadinessIT.java"
       ]
     },
     {
@@ -3662,6 +3707,30 @@
       "growth": "Bounded download size and one spool per attempt; removed on exit.",
       "evidence": [
         "cli/src/test/java/io/tapstate/cli/PublishedConnectorArtifactsTest.java"
+      ]
+    },
+    {
+      "id": "temporary.validation-sort",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "TEMPORARY_FILES",
+      "layer": "TEMPORARY",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${java.io.tmpdir}/tapstate-validation-*.rows"
+      ],
+      "responsibility": "Private process-owned sorted runs of converted validation rows for a single table side. The comparison starts after both complete reads are sorted. Each run is published to its reader only after its bytes have been flushed. Close releases files on exhaustion, success, error and cancellation. A retry starts a new PDK read.",
+      "writers": [
+        "io.tapstate.app.ValidationSortedRows"
+      ],
+      "readers": [
+        "io.tapstate.app.ValidationSortedRows"
+      ],
+      "recovery": "temporary-files",
+      "consistency": "file-cache",
+      "growth": "Local sorting is selected only when the PDK count for the side is below ten million rows. Memory is bounded by a chunk and a logarithmic set of runs. Disk use scales with the encoded input and temporary merge output without a fixed byte cap. Disk write failures abort validation.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ValidationSortedRowsTest.java"
       ]
     },
     {
@@ -4228,14 +4297,14 @@
     {
       "id": "mongo.config.validation_tasks",
       "resourceVersion": 2,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_tasks"
       ],
-      "responsibility": "Pipeline-bound validation configuration and bounded report-birth permissions. Task row format 2 additionally retains one FULL scheduled-admission high-watermark for the current configuration revision; manual FULL starts preserve it. No request history or per-occurrence rows.",
+      "responsibility": "Pipeline-bound validation configuration and bounded report-birth permissions. Task row format 2 additionally retains one FULL scheduled-admission high-watermark for the current configuration revision; manual FULL starts preserve it. No request history or per-occurrence rows. Comparison format 2 retains ordered source and target key paths for runtime binding; format 1 remains readable.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
       ],
@@ -4244,7 +4313,7 @@
       ],
       "recovery": "validation-scheduled-watermark-v2",
       "consistency": "validation-config-scheduled-watermark-v4",
-      "growth": "Two current permissions/counters per task and one FULL watermark <=1 KiB actual BSON, counted inside the existing <=16 KiB admission-metadata allowance. No new collection, index, TTL, event history, lease or per-run tombstone. Existing task/CONFIG total budgets remain unchanged; capacity rejects before mutation.",
+      "growth": "Two current permissions/counters per task and one FULL watermark <=1 KiB actual BSON, counted inside the existing <=16 KiB admission-metadata allowance. No new collection, index, TTL, event history, lease or per-run tombstone. Existing task/CONFIG total budgets remain unchanged; capacity rejects before mutation. Paths use the existing task comparison and configuration byte bounds.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java"
@@ -4253,14 +4322,14 @@
     {
       "id": "mongo.config.validation_reports",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_reports"
       ],
-      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one.",
+      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one. Report snapshots accept comparison formats 1 and 2. Per-pair failures are published to the original report and open epoch in the same CONFIG transaction.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationResultStore",
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
@@ -4271,7 +4340,7 @@
       ],
       "recovery": "validation-configuration",
       "consistency": "validation-config-r3",
-      "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights.",
+      "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights. At most one failure per mapping ordinal, up to 1024, with a bounded error code, side, and reason of at most 256 UTF-8 bytes. Failures count toward the existing header and report byte caps.",
       "evidence": [
         "spi/spi-store/src/test/java/io/tapstate/spi/store/ValidationResultStoreContractTest.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationAdmissionStoreIT.java",
@@ -4308,14 +4377,14 @@
     {
       "id": "mongo.cache.validation_runs",
       "resourceVersion": 2,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "validation_runs"
       ],
-      "responsibility": "Original validation runs and Pipeline owner/counting control, task-mode slots and problem-limit latch, with separate immutable run identities and six execution states. No business rows, pending keys or resumable checkpoints. Birth/control/run identities retain independent CONFIG generation/preparation. One current Pipeline root also arbitrates PREPARED/CANCELLED/RETIRED first-birth outcomes and the closing gate; no production pipelineScope authorizes it.",
+      "responsibility": "Original validation runs and Pipeline owner/counting control, task-mode slots and problem-limit latch, with separate immutable run identities and six execution states. No business rows, pending keys or resumable checkpoints. Birth/control/run identities retain independent CONFIG generation/preparation. One current Pipeline root also arbitrates PREPARED/CANCELLED/RETIRED first-birth outcomes and the closing gate; no production pipelineScope authorizes it. Immutable run snapshots accept comparison formats 1 and 2; original retirement and recovery retain the same fenced run identity.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationControlStore",
         "io.tapstate.adapters.mongostore.MongoValidationCachePreparations"
@@ -4326,7 +4395,7 @@
       ],
       "recovery": "validation-control-r3",
       "consistency": "validation-cache-r3",
-      "growth": "One current Pipeline control with <=8 KiB preparation metadata and bounded active-run references. Ended and pending-history controls count toward original retention and byte budgets. No lease/event history; exhausted storage refuses new validation without stopping synchronization.",
+      "growth": "One current Pipeline control with <=8 KiB preparation metadata and bounded active-run references. Ended and pending-history controls count toward original retention and byte budgets. No lease/event history; exhausted storage refuses new validation without stopping synchronization. Deferred key paths use the existing bounded immutable snapshot; pair failures are retained in CONFIG reports.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",

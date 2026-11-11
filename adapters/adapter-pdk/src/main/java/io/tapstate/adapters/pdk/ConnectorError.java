@@ -52,6 +52,8 @@ public enum ConnectorError implements TapstateErrorCode {
      */
     REGISTRATION_CONFLICT("connector.registration-conflict", Set.of(Parameters.CONNECTOR, "existing", "incoming")),
 
+    CLOUD_UPLOAD_DISABLED("connector.cloud-upload-disabled", Set.of()),
+
     /**
      * A runtime register names a connector outside the officially supported set, so it is refused
      * rather than stored. This is a support boundary, not a defect in the artifact: the set grows as

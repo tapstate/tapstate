@@ -53,6 +53,11 @@ public interface SrsLogStore {
         return new SrsLogBounds(largestSequence(ring), -1L);
     }
 
+    /** A same-snapshot batch for ordinary, already published rings; an empty result requests the exact path. */
+    default Optional<Map<String, SrsLogBounds>> publishedBounds(String chain, java.util.Set<String> rings) {
+        return Optional.empty();
+    }
+
     /**
      * Supplies only numbering metadata while the ring infrastructure initializes or migrates a ring.
      * An adapter may inspect a quarantined ring's original, verified control receipt and existing

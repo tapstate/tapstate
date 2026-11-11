@@ -93,10 +93,17 @@ final class MongoCacheMetadataStructure {
         verify(List.of(table), remainingMillis);
     }
 
-    void verifySrs() {
-        verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
-                SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
-                SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS));
+    private static final List<SystemCollections> SRS_TABLES = List.of(
+            SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.SRS_CHAINS,
+            SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_EVENTS,
+            SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS);
+
+    void verifySrs() { verify(SRS_TABLES); }
+
+    void verifySrsRuntime() {
+        var tables = new java.util.ArrayList<>(SRS_TABLES);
+        tables.add(SystemCollections.CACHE_PIPELINE_STATE);
+        verify(tables);
     }
 
     void verifyDirect() {

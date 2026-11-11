@@ -97,11 +97,16 @@ public final class StartCheckEvaluator {
      */
     public StartEvaluation evaluate(String pipelineId, PipelineResource definition, String contentHash,
             Optional<DesiredState> prior, StartIntent intent) {
+        return evaluate(pipelineId, definition, contentHash, prior, intent, Optional.empty());
+    }
+
+    StartEvaluation evaluate(String pipelineId, PipelineResource definition, String contentHash,
+            Optional<DesiredState> prior, StartIntent intent, Optional<io.tapstate.spi.store.DesiredStore.StartIntent> original) {
         Instant started = clock.instant();
         StartPlan plan = null;
         TapstateException planUnavailable = null;
         try {
-            plan = planner.plan(definition, prior, intent);
+            plan = planner.plan(definition, prior, intent, original);
         } catch (TapstateException coded) {
             planUnavailable = coded;
         }

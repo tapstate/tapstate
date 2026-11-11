@@ -59,6 +59,54 @@ class PipelineAlertRuntimeTest {
             assertThat(episode.diagnostics().history().latest().trace().text()).contains("connection reset").doesNotContain("original-source-secret");
         }
     }
+    @Test void queuedCacheSamplesCoalesceAcrossBothCapabilitiesWithoutSkippingRecovery() throws Exception {
+        var original=AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule=new AlertConfiguration.Rule(original.header(),"Cache health","cluster.storage-unavailable",1,
+                new AlertConfiguration.Resources(Set.of("cluster-storage"),true,Set.of()),Map.of(),null,true,null)
+                .validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(),anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule),null));
+        var resource=new AlarmKey.Resource("cluster-storage","cache","cache:1");
+        String digest="a".repeat(64);
+        var entered=new CountDownLatch(1);
+        var release=new CountDownLatch(1);
+        var first=new AtomicBoolean(true);
+        try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host,
+                BuiltinAlarmTypes.catalog(),null,null,Set.of("cluster-storage-health")),intentStore,
+                (scope,claim)->Optional.empty(),()->{},fixture.clock)){
+            runtime.tick();drained(runtime);
+            var read=OperationalEvidence.Capability.CACHE_READ;
+            var write=OperationalEvidence.Capability.CACHE_WRITE;
+            runtime.cacheInput(resource,digest,()->{
+                if(!first.compareAndSet(true,false))return;
+                entered.countDown();
+                try {assertThat(release.await(5,TimeUnit.SECONDS)).isTrue();}
+                catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}
+            },new AlertInput.Operational(T,digest,read,true));
+            try {
+                assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                for(int i=1;i<=80;i++){
+                    runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(i),digest,read,true));
+                    runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(i),digest,write,true));
+                }
+                runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(100),digest,read,false));
+                runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(150),digest,write,true));
+                runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(200),digest,read,true));
+                for(int i=201;i<=280;i++){
+                    runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(i),digest,read,true));
+                    runtime.cacheInput(resource,digest,()->{},new AlertInput.Operational(T.plusMillis(i),digest,write,true));
+                }
+                fixture.now.set(T.plusMillis(280));
+                assertThat(runtime.health().queuedInputs()).isLessThanOrEqualTo(8);
+                assertThat(runtime.health().rejected()).isZero();
+            } finally {release.countDown();}
+            drained(runtime);
+            var head=rows.values().iterator().next().value();
+            assertThat(runtime.health().rejected()).isZero();
+            assertThat(head.snapshot().status()).isEqualTo(AlertSnapshot.Status.RESOLVED);
+            assertThat(head.episode().value().firedAt()).isEqualTo(T.plusMillis(100));
+            assertThat(head.episode().value().recoveredAt()).isEqualTo(T.plusMillis(200));
+        } finally {release.countDown();}
+    }
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void removedResourceReconciliationReadsOnlyHeadsThatStillNeedRetirement(boolean retired) {

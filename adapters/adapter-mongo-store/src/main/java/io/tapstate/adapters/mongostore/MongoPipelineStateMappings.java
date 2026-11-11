@@ -92,14 +92,20 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     }
 
     void requireActive(ClientSession session, String pipelineId) {
+        requireActiveRow(session, pipelineId);
+    }
+
+    Document requireActiveRow(ClientSession session, String pipelineId) {
         var schema = validationSchema(session);
         if (schema != null) {
             var row = mappings.find(session, new Document("_id", pipelineId)).first();
             if (row == null || !(row.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
             MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(schema).clusterId(), pipelineId);
         }
-        PipelineStateMapping state = decode(pipelineId, mappings.find(session, new Document("_id", pipelineId)).first());
+        Document current = mappings.find(session, new Document("_id", pipelineId)).first();
+        PipelineStateMapping state = decode(pipelineId, current);
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw retirementRequired(pipelineId);
+        return current;
     }
 
     private Document validationSchema(ClientSession session) {

@@ -172,6 +172,7 @@ connector.artifact-unreadable
 connector.capability-missing
 connector.capture-failed
 connector.class-not-found
+connector.cloud-upload-disabled
 connector.config-type-mismatch
 connector.discover-failed
 connector.instance-limit-reached
@@ -276,7 +277,9 @@ dsl.unwind-needs-an-element-key
 dsl.unwind-needs-an-upsert-target
 dsl.upsert-needs-key
 engine.cluster-refused-the-state
+engine.execution-lease-lost
 engine.execution-not-authorized
+engine.execution-renewal-failed
 engine.frontier-order-not-encodable
 engine.frontier-pinned
 engine.job-failed

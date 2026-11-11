@@ -8,6 +8,8 @@ import java.util.Set;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
+import java.util.function.Function;
 
 /** Read-only names of configured outputs, without requiring a runnable write model. */
 @FunctionalInterface
@@ -43,6 +45,11 @@ public interface PipelineOutputNames {
     /** Providers without physical input metadata leave freshness explicitly unavailable. */
     default Description describe(PipelineResource pipeline, Map<String, Resource> resources) {
         return new Description(resolve(pipeline), Map.of());
+    }
+
+    default Function<PipelineResource, Description> forCatalog(Map<String, Resource> resources,
+            Function<String, Optional<Resource>> lookup) {
+        return pipeline -> describe(pipeline, resources);
     }
 
     default Result resolve(PipelineResource pipeline) {

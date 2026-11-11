@@ -1,5 +1,6 @@
 package io.tapstate.core.lifecycle;
 
+import java.time.Instant;
 import java.util.OptionalLong;
 
 /**
@@ -44,20 +45,51 @@ import java.util.OptionalLong;
  * @param coldKeys the number of keys requested by completed cold loaders, where measured
  */
 public record NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-        long pendingHighWater, OptionalLong stored, NestOrigin origin,
+        long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess,
+        OptionalLong rootsRendered, Instant rootsRenderedSince, StateCommitReading commits, NestOrigin origin,
         OptionalLong keyAccesses, OptionalLong coldKeys) {
 
-    /** Compatibility reading without key instrumentation. Missing counters are not measured zeroes. */
+    public NestStateReading {
+        if (keyAccess != null) {
+            keyAccesses = keyAccess.available() ? OptionalLong.of(keyAccess.attempts()) : OptionalLong.empty();
+            coldKeys = keyAccess.available() ? OptionalLong.of(keyAccess.coldLoads()) : OptionalLong.empty();
+        }
+        rootsRendered = rootsRendered == null ? OptionalLong.empty() : rootsRendered;
+        if (rootsRendered.isPresent() != (rootsRenderedSince != null))
+            throw new IllegalArgumentException("rendered roots need a counting start");
+    }
+
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
-            long pendingHighWater, OptionalLong stored, NestOrigin origin) {
-        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, origin,
+            long pendingHighWater, OptionalLong stored, NestKeyAccess keyAccess) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, keyAccess,
+                OptionalLong.empty(), null, null, null,
                 OptionalLong.empty(), OptionalLong.empty());
     }
 
-    /** A reading whose namespace's place in the definition is not known to the reporter. */
+    public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
+            long pendingHighWater, OptionalLong stored, NestOrigin origin) {
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null,
+                OptionalLong.empty(), null, null, origin, OptionalLong.empty(), OptionalLong.empty());
+    }
+
+    public NestStateReading withRootsRendered(long rendered, Instant since) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, OptionalLong.of(rendered), since, commits, origin, keyAccesses, coldKeys);
+    }
+
+    public NestStateReading withCommits(StateCommitReading measured) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keyAccess, rootsRendered, rootsRenderedSince, measured, origin, keyAccesses, coldKeys);
+    }
+
+    public NestStateReading withContext(NestKeyAccess keys, NestOrigin placement) {
+        return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
+                keys, rootsRendered, rootsRenderedSince, commits, placement, keyAccesses, coldKeys);
+    }
+
     public NestStateReading(long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater, OptionalLong stored) {
-        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, null);
+        this(entries, accesses, backfills, backfillMillis, pendingHighWater, stored, (NestOrigin) null);
     }
 
     /** A reading from a run with no cold layer to ask, whose state is however much is in memory. */
@@ -74,13 +106,13 @@ public record NestStateReading(long entries, long accesses, long backfills, long
     /** The same reading, placed in the pipeline's definition. */
     public NestStateReading withOrigin(NestOrigin origin) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, keyAccesses, coldKeys);
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, keyAccesses, coldKeys);
     }
 
     /** The same reading with independently measured key counters. */
     public NestStateReading withKeyCounts(long keyAccesses, long coldKeys) {
         return new NestStateReading(entries, accesses, backfills, backfillMillis, pendingHighWater, stored,
-                origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys));
+                keyAccess, rootsRendered, rootsRenderedSince, commits, origin, OptionalLong.of(keyAccesses), OptionalLong.of(coldKeys));
     }
 
     /** A decrease in either measured key counter identifies a new counting lifetime. */

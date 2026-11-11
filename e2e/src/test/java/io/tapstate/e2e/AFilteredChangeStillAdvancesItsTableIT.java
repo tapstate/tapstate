@@ -81,9 +81,9 @@ class AFilteredChangeStillAdvancesItsTableIT {
                                 && tableSequence(offset, "activity") >= 3;
                     }, () -> String.valueOf(documents.consumerOffset(chain, consumer)));
             assertThat(rowCount(target, "orders")).as("the dropped order never becomes a target row").isEqualTo(2);
-            assertThat(sequence(control.resumePoint(PIPELINE).get("token")))
-                    .as("the resume point passes the dropped change without another passing order")
-                    .isGreaterThanOrEqualTo(2);
+            Await.until("the resume point passes the dropped change without another passing order",
+                    Duration.ofSeconds(30), () -> sequence(control.resumePoint(PIPELINE).get("token")) >= 2,
+                    () -> String.valueOf(control.resumePoint(PIPELINE)));
             assertThat(control.state(PIPELINE)).contains(PipelineState.RUNNING);
         }
     }

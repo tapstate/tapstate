@@ -185,6 +185,11 @@ class NestReadsAFirstTouchKeyOnceNotTwiceIT {
 
         long reaches = settled[0];
         long trips = settled[1];
+        // The new key-unit facts are additional public readings, not renamed legacy calls. This
+        // real connector witness also rejects a publisher that never exposes the new counters.
+        assertThat(control.metricTotal(pipelineId, "nestStateReadKeys.")).hasValue((long) ROOTS);
+        assertThat(control.metricTotal(pipelineId, "nestStateWriteKeys.")).hasValue((long) ROOTS);
+        assertThat(control.metricTotal(pipelineId, "nestStateColdKeys.")).hasValue((long) ROOTS);
         assertThat(reaches)
                 .as("the state was reached %d times over %d roots, where the pair a level performs is to "
                         + "read a key's state out and write it back. This is asserted beside the trips "

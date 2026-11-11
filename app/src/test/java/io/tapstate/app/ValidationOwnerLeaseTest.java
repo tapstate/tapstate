@@ -67,7 +67,10 @@ class ValidationOwnerLeaseTest {
         AtomicLong time = new AtomicLong();
         AtomicInteger stopped = new AtomicInteger();
         try (var lease = lease(store, a, time, stopped)) {
+            assertThat(lease.observesLive()).isTrue();
             time.set(TTL.toNanos());
+            assertThat(lease.observesLive()).isFalse();
+            assertThat(stopped).hasValue(0);
             lease.checkDeadline();
             assertThat(lease.authorized()).isFalse();
             assertThat(lease.lossReason()).isEqualTo(ValidationOwnerLease.LossReason.EXPIRED);

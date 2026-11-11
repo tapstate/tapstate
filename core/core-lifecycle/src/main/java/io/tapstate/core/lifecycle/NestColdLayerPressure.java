@@ -61,7 +61,7 @@ public record NestColdLayerPressure(double servedFromCold, long leastAccesses) {
      * threshold is met from below by a continuous quantity, so reaching it exactly is reaching it.
      */
     public boolean isOver(NestStateWindow window) {
-        if (window.accesses() < leastAccesses) {
+        if (window.pressureAccesses() < leastAccesses) {
             return false;
         }
         OptionalDouble share = window.servedFromCold();

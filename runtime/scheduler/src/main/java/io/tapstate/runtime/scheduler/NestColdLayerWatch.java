@@ -74,19 +74,40 @@ public final class NestColdLayerWatch {
     private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading) {
         Seen before = held.get(namespace);
         boolean wasOver = before != null && before.over();
+        if (reading.keyAccess() != null && !reading.keyAccess().available()) {
+            // Do not retain a partial delta or manufacture a healthy zero from a missing field.
+            held.put(namespace, new Seen(reading, null, wasOver, 0));
+            return;
+        }
+        boolean changedSource = before != null && (reading.keyAccess() != null || before.latest().keyAccess() != null)
+                && (reading.keyAccess() == null || !reading.keyAccess().follows(before.latest().keyAccess()));
+        if (changedSource) {
+            held.put(namespace, new Seen(reading, reading, wasOver, 0));
+            return;
+        }
         NestStateReading baseline = before == null || restarted(before.latest(), reading)
                 ? null : before.baseline();
         NestStateWindow window = baseline == null
                 ? NestStateWindow.fromStart(reading)
                 : NestStateWindow.between(baseline, reading);
-        if (window.accesses() < pressure.leastAccesses() || window.servedFromCold().isEmpty()) {
+        if (window.pressureAccesses() < pressure.leastAccesses() || window.servedFromCold().isEmpty()) {
             // Retain the last judged boundary, so several small samples can make a real window.
             // An idle or undersized sample says nothing about recovery from the previous pressure.
-            held.put(namespace, new Seen(reading, baseline, wasOver));
+            held.put(namespace, new Seen(reading, baseline, wasOver, before == null ? 0 : before.healthyWindows()));
+            return;
+        }
+        if (reading.keyAccess() != null && window.coldKeys().getAsLong() > window.keyAccesses().getAsLong()) {
+            held.put(namespace, new Seen(reading, reading, wasOver, 0));
             return;
         }
         boolean nowOver = pressure.isOver(window);
-        held.put(namespace, new Seen(reading, reading, nowOver));
+        int healthy = 0;
+        if (wasOver && !nowOver) {
+            boolean belowRecovery = window.servedFromCold().orElse(1) < pressure.servedFromCold() * 0.8;
+            healthy = belowRecovery ? before.healthyWindows() + 1 : 0;
+            nowOver = healthy < 2;
+        }
+        held.put(namespace, new Seen(reading, reading, nowOver, healthy));
         if (nowOver && !wasOver) {
             alert.crossed(pipelineId, namespace, window);
         } else if (!nowOver && wasOver) {
@@ -102,6 +123,6 @@ public final class NestColdLayerWatch {
     }
 
     /** Observe resets on every sample while accumulating traffic since the last judged boundary. */
-    private record Seen(NestStateReading latest, NestStateReading baseline, boolean over) {
+    private record Seen(NestStateReading latest, NestStateReading baseline, boolean over, int healthyWindows) {
     }
 }

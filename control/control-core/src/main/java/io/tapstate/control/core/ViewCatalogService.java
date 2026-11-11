@@ -1,6 +1,5 @@
 package io.tapstate.control.core;
 
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.PipelineInputs;
 import io.tapstate.core.model.FromClause;
 import java.util.Set;
@@ -18,10 +17,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 
 /** Builds the Views read from stored definitions and one observation per maintaining pipeline. */
 public final class ViewCatalogService {
@@ -61,24 +62,40 @@ public final class ViewCatalogService {
     }
 
     public Catalog catalog() {
+        var inventory = artifacts.resourceInventory();
         Map<String, Resource> resources = new LinkedHashMap<>();
-        for (StoredResource stored : artifacts.listResources()) {
+        for (StoredResource stored : inventory.resources()) {
             resources.put(stored.resource().id(), stored.resource());
         }
+        var resolved = new HashMap<String, Optional<Resource>>();
+        java.util.function.Function<String, Optional<Resource>> lookup = id -> resolved.computeIfAbsent(id, key ->
+                inventory.exactLookupIds().contains(key) ? Optional.of(resources.get(key))
+                        : artifacts.getResource(key).map(StoredResource::resource));
+        var describe = outputs.forCatalog(resources, lookup);
+        var targetStats = browser.catalogStats(lookup);
         List<PipelineOutputNames.Unresolved> unresolved = new ArrayList<>();
-        List<ViewCatalogItem> result = new ArrayList<>();
+        Map<String, PipelineOutputNames.Description> descriptions = new LinkedHashMap<>();
         for (Resource resource : resources.values()) {
             if (!(resource instanceof PipelineResource pipeline)) continue;
-            var publication=observations.findRead(pipeline.id()).orElse(null);
+            var description = describe.apply(pipeline);
+            unresolved.addAll(description.names().unresolved());
+            if (!description.names().outputs().isEmpty()) descriptions.put(pipeline.id(), description);
+        }
+        var publications = observations.findReads(List.copyOf(descriptions.keySet()));
+        List<ViewCatalogItem> result = new ArrayList<>();
+        for (var entry : descriptions.entrySet()) {
+            String pipelineId = entry.getKey();
+            var description = entry.getValue();
+            var publication = publications.get(pipelineId);
             PipelineStatus status = publication == null ? null : publication.status();
             PipelineMetrics metrics = publication == null ? null : publication.metrics();
             PipelineSnapshot snapshot = publication == null ? null : publication.snapshot();
-            PipelineOutputNames.Description description = outputs.describe(pipeline, resources);
-            unresolved.addAll(description.names().unresolved());
             for (PipelineOutputNames.Output output : description.names().outputs()) {
-                result.add(item(output.kind(), pipeline.id(), pipeline.id() + ":" + output.identity(),
+                var stats = resources.get(output.connection()) instanceof SourceResource
+                        ? targetStats.apply(output.connection(), output.table()).orElse(null) : null;
+                result.add(item(output.kind(), pipelineId, pipelineId + ":" + output.identity(),
                         output.connection(), output.table(), status, metrics, snapshot, resources,
-                        description.inputs().getOrDefault(output.identity(), Set.of()), description.qualifiedTables()));
+                        description.inputs().getOrDefault(output.identity(), Set.of()), description.qualifiedTables(), stats));
             }
         }
         result.sort(Comparator.comparing(ViewCatalogItem::pipelineId).thenComparing(ViewCatalogItem::id));
@@ -87,23 +104,14 @@ public final class ViewCatalogService {
 
     private ViewCatalogItem item(String kind, String pipelineId, String id, String sourceId,
             String collection, PipelineStatus pipelineStatus, PipelineMetrics metrics,
-            PipelineSnapshot snapshot, Map<String, Resource> resources,Set<PipelineInputs.Input> inputs,Set<String> qualifiedTables) {
+            PipelineSnapshot snapshot, Map<String, Resource> resources, Set<PipelineInputs.Input> inputs,
+            Set<String> qualifiedTables, DataBrowserStatsReport stats) {
         Resource resource = resources.get(sourceId);
         String database = resource instanceof SourceResource source ? database(source) : null;
-        Long documents = null;
-        Long sizeBytes = null;
-        if (resource instanceof SourceResource) {
-            try {
-                DataBrowserStatsReport stats = browser.stats(sourceId, collection);
-                documents = stats.numOfRows();
-                sizeBytes = stats.storageSize();
-            } catch (TapstateException unavailable) {
-                // A declared output can precede its first collection. Keep the row and leave its size unknown.
-            }
-        }
         return new ViewCatalogItem(id, kind,
                 new ViewCatalogItem.Location(sourceId, database, collection), pipelineId,
-                freshness(pipelineStatus, metrics, snapshot,inputs,qualifiedTables), documents, sizeBytes, null);
+                freshness(pipelineStatus, metrics, snapshot,inputs,qualifiedTables),
+                stats == null ? null : stats.numOfRows(), stats == null ? null : stats.storageSize(), null);
     }
 
     private ViewCatalogItem.Freshness freshness(PipelineStatus status, PipelineMetrics metrics,

@@ -32,8 +32,32 @@ final class MongoCachePipelineStateStore implements StateStore {
             access.proveClaim(session);
             long epoch = current.getLong("epoch");
             if (epoch != expectedEpoch) return new CasOutcome.Fenced(epoch);
-            access.updateState(session, current, new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli()), true);
-            return new CasOutcome.Applied(new CheckpointDoc(pipelineId, nextStateJson, epoch + 1, Instant.ofEpochMilli(touchTime.toEpochMilli())));
+            var values = new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli());
+            var previous = MongoStateStore.leaseRecovery(current);
+            boolean failed = io.tapstate.core.lifecycle.StateJson.of(io.tapstate.core.lifecycle.PipelineState.FAILED).equals(nextStateJson);
+            if (previous != null && !failed) values.append("leaseRecovery", null);
+            access.updateState(session, current, values, true);
+            return new CasOutcome.Applied(new CheckpointDoc(pipelineId, nextStateJson, epoch + 1,
+                    Instant.ofEpochMilli(touchTime.toEpochMilli()), failed ? previous : null));
+        });
+    }
+
+    @Override public CasOutcome recordLeaseRecovery(String pipelineId, CheckpointDoc expected,
+            CheckpointDoc.LeaseRecovery recovery, Instant at) {
+        access.requirePipeline(pipelineId);
+        return access.transaction(session -> {
+            Document current = access.state(session);
+            var checkpoint = MongoStateStore.toCheckpoint(current);
+            if (checkpoint.epoch() != expected.epoch()
+                    || !Objects.equals(checkpoint.leaseRecovery(), expected.leaseRecovery()))
+                return new CasOutcome.Fenced(checkpoint.epoch());
+            access.proveClaim(session);
+            var value = new Document("intentRevision", recovery.intentRevision())
+                    .append("failedExecution", recovery.failedExecution()).append("attempts", recovery.attempts())
+                    .append("retryAfter", recovery.retryAfter().toEpochMilli());
+            access.updateState(session, current, new Document("leaseRecovery", value), false);
+            return new CasOutcome.Applied(new CheckpointDoc(pipelineId, checkpoint.stateJson(), checkpoint.epoch(),
+                    checkpoint.touchTime(), recovery));
         });
     }
 

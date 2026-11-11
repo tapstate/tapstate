@@ -42,6 +42,35 @@ class ScopedConvergenceTest {
             new RecordingActuator(), CLOCK);
     private final ObservationPublisher publisher = new ObservationPublisher(poisonState(), poisonObservations());
 
+    @Test void leaseRecoveryBudgetSurvivesPassesAndUserStopCanKeepProgress() {
+        prepare(PipelineState.RUNNING);
+        var execution = new AtomicLong(1);
+        var loss = new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        var replacement = new ForwardingActuator(actuator) {
+            @Override public Optional<LeaseLoss> leaseLoss(String id) {
+                return Optional.of(new LeaseLoss(execution.get(), loss));
+            }
+        };
+        var running = intent(PipelineState.RUNNING);
+        for (int attempt = 1; attempt <= 3; attempt++) {
+            var tick = new PipelineConverger(poisonDesired(), poisonState(), new RecordingActuator(),
+                    Clock.fixed(T0.plusSeconds(attempt * 11L), ZoneOffset.UTC));
+            var result = tick.convergeScoped(running, state, replacement, RebuildAdmission.never(), ignored -> {}, () -> true);
+            assertThat(result.status()).isEqualTo(ConvergeStatus.RECOVERING);
+            assertThat(state.read("orders").orElseThrow().leaseRecovery().attempts()).isEqualTo(attempt);
+            execution.incrementAndGet();
+        }
+        var tick = new PipelineConverger(poisonDesired(), poisonState(), new RecordingActuator(),
+                Clock.fixed(T0.plusSeconds(44), ZoneOffset.UTC));
+        assertThat(tick.convergeScoped(running, state, replacement, RebuildAdmission.never(), ignored -> {}, () -> true).status())
+                .isEqualTo(ConvergeStatus.FAILED);
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PipelineState.FAILED));
+        assertThat(tick.convergeScoped(intent(PipelineState.STOPPED), state, replacement, RebuildAdmission.never(),
+                ignored -> {}, () -> true).status()).isEqualTo(ConvergeStatus.CONVERGED);
+        assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(PipelineState.STOPPED));
+        assertThat(actuator.calls().stream().filter("start:orders"::equals).count()).isEqualTo(3);
+    }
+
     @Test void aCapturedIntentAndItsBoundPortsSurviveAnEpochRetry() {
         prepare(PipelineState.NEW);
         AtomicBoolean raced = new AtomicBoolean();
@@ -180,6 +209,15 @@ class ScopedConvergenceTest {
         Observation published = observations.read("orders").orElseThrow();
         assertThat(published.state()).isEqualTo(PipelineState.PAUSED);
         assertThat(published.metrics()).containsEntry("reconcileFailuresInARow", 4L);
+    }
+
+    @Test void aFailedStopPassCannotPublishThatStoppingFinished() {
+        prepare(PipelineState.STOPPED);
+        var observations = new MemoryObservations();
+        publisher.publishReconcileFailureScoped(SCOPE, state, observations, 1);
+        assertThat(observations.read("orders")).isEmpty();
+        assertThat(publisher.publishScoped(SCOPE, state, observations, null).orElseThrow().state())
+                .isEqualTo(PipelineState.STOPPED);
     }
 
     @Test void aFailedPassPreservesItsLastProjectionReasonAndPositions() {

@@ -68,6 +68,40 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 Clock.fixed(AT, ZoneOffset.UTC));
     }
 
+    @Test void nestCommitDistributionsAndRootCountUseTheExistingFactsOutput() {
+        var keys = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_KEYS, 8);
+        var trips = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_ROUND_TRIPS, 4);
+        var duration = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_DURATION, 0.005);
+        var commits = new io.tapstate.core.lifecycle.StateCommitReading(1, keys, trips, duration, 2, LOAD_BEGAN);
+        var reading = new NestStateReading(1, 2, 3, 4)
+                .withContext(new io.tapstate.core.lifecycle.NestKeyAccess(8, 8, 0, "run"),
+                        new io.tapstate.core.lifecycle.NestOrigin("order-doc", "[]", "state"))
+                .withRootsRendered(6, LOAD_BEGAN).withCommits(commits);
+        var facts = everythingWired().facts("orders", PipelineState.RUNNING, AT, Map.of("root", reading),
+                Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), loaded());
+        var named = new HashMap<String, MetricFact>();
+        facts.forEach(fact -> named.put(fact.name(), fact));
+        assertThat(named).containsKeys("tapstate.pipeline.nest.read.keys", "tapstate.pipeline.nest.roots.rendered",
+                "tapstate.pipeline.nest.namespace.info", "tapstate.pipeline.state.commit.groups",
+                "tapstate.pipeline.state.commit.keys", "tapstate.pipeline.state.commit.round_trips",
+                "tapstate.pipeline.state.commit.duration", "tapstate.pipeline.state.evictions");
+        assertThat(named.get("tapstate.pipeline.state.commit.keys").unit()).isEqualTo("{key}");
+        assertThat(named.get("tapstate.pipeline.state.commit.keys").points()).singleElement()
+                .satisfies(point -> {
+                    assertThat(point.attributes()).containsEntry(MetricAttributes.NEST_NAMESPACE, "root");
+                    assertThat(point.histogram()).isEqualTo(keys);
+                });
+        assertThat(named.get("tapstate.pipeline.nest.roots.rendered").points()).singleElement()
+                .satisfies(point -> assertThat(point.value()).isEqualTo(6L));
+    }
+
+    private static io.tapstate.core.lifecycle.HistogramValue histogram(io.tapstate.core.lifecycle.HistogramBounds bounds, double value) {
+        var buckets = new java.util.ArrayList<Long>(java.util.Collections.nCopies(bounds.buckets(), 0L));
+        int bucket = (int) bounds.bounds().stream().takeWhile(bound -> value > bound).count();
+        buckets.set(bucket, 1L);
+        return bounds.value(1, value, buckets);
+    }
+
     /** One table's finished load, with a total, so both of the load's measurements are in play. */
     private static SnapshotReading loaded() {
         return new SnapshotReading(Map.of("orders", new TableSnapshot(90_000L, 120_000L, 75)), LOAD_BEGAN);

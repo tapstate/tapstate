@@ -2,6 +2,7 @@ package io.tapstate.adapters.pdk;
 
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.FromTapValueCodec;
+import io.tapdata.entity.codec.FromTapValueCodecV2;
 import io.tapdata.entity.codec.filter.TapCodecsFilterManager;
 import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.value.*;
@@ -187,12 +188,17 @@ final class PdkValueConversions {
     /** Preserve the distinction between an absent image and a present, empty document. */
     Optional<Map<String, Object>> write(Map<String, Object> row,
             java.util.function.Function<ConvertedValue, Object> legacy) {
+        return write(row, Map.of(), legacy);
+    }
+
+    Optional<Map<String, Object>> write(Map<String, Object> row, Map<String, TapField> targetFields,
+            java.util.function.Function<ConvertedValue, Object> legacy) {
         if (row == null) {
             return Optional.empty();
         }
         Map<String, Object> restored = new LinkedHashMap<>(row.size());
         row.forEach((key, value) -> restored.put(key, restore(value, legacy)));
-        target.transformFromTapValueMap(restored);
+        target.transformFromTapValueMap(restored, null, targetFields);
         return Optional.of(restored);
     }
 
@@ -201,6 +207,15 @@ final class PdkValueConversions {
 
         private RetainingTargetCodecs(TapCodecsRegistry delegate) {
             this.delegate = delegate;
+        }
+
+        @Override
+        public <T extends TapValue<?, ?>> FromTapValueCodecV2<T> getCustomFromTapValueCodecV2(Class<T> type) {
+            var codec = delegate.getCustomFromTapValueCodecV2(type);
+            if (codec == null) {
+                return null;
+            }
+            return (value, field) -> retain(value, codec.fromTapValue(value, field));
         }
 
         @Override
@@ -217,12 +232,12 @@ final class PdkValueConversions {
             if (codec == null) {
                 return null;
             }
-            return value -> {
-                Object result = codec.fromTapValue(value);
-                // Retain before the PDK iterator acts: for an array element, returning null can
-                // remove a whole container rather than leave a box for a later pass to unwrap.
-                return result == null ? value.getValue() : result;
-            };
+            return value -> retain(value, codec.fromTapValue(value));
+        }
+
+        private static Object retain(TapValue<?, ?> value, Object result) {
+            // A codec returning null must not drop the portable value or its container.
+            return result == null ? value.getValue() : result;
         }
     }
 

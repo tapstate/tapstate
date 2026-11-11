@@ -153,6 +153,10 @@ class ScopedOperatorMapsTest {
         var member = Hazelcast.newHazelcastInstance(config(bindings));
         try (var registry = OperatorMapBindings.bindTo(member,(binding,active) -> cold.guarded(binding,current,scope,active))) {
             registry.install(bindings);
+            for (var binding : bindings) {
+                assertThat(registry.isRootNestState(binding.mapName()))
+                        .isEqualTo(binding.placement().equals(positions.getFirst()));
+            }
             var traveling = io.tapstate.runtime.engine.nest.NestBinding.onMap(manifest).forStep(SCOPE.pipelineId(),"nested");
             var bytes = new java.io.ByteArrayOutputStream();
             try (var out = new java.io.ObjectOutputStream(bytes)) { out.writeObject(traveling); }

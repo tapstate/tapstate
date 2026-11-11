@@ -73,6 +73,15 @@ final class InMemoryStateStore implements StateStore {
         return outcome;
     }
 
+    @Override public CasOutcome recordLeaseRecovery(String id, CheckpointDoc expected,
+            CheckpointDoc.LeaseRecovery recovery, Instant at) {
+        var old = docs.get(id);
+        if (!old.equals(expected)) return new CasOutcome.Fenced(old.epoch());
+        var next = new CheckpointDoc(id, old.stateJson(), old.epoch(), old.touchTime(), recovery);
+        docs.put(id, next);
+        return new CasOutcome.Applied(next);
+    }
+
     void onBeforeSwap(Runnable hook) {
         this.beforeSwap = hook;
     }

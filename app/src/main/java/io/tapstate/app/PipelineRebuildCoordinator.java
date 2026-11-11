@@ -40,7 +40,13 @@ final class PipelineRebuildCoordinator {
         var request=new PipelineRebuildRequest(operation,pass.intent(),pass.claim(),state.epoch(),closure.inputs(),closure.dependencies());
         retired.require(request,manifest);requireActiveNode.run();
         var original=stores.configuration().begin(request);
-        return execute(original,manifest);
+        try {
+            return execute(original,manifest);
+        } catch (TapstateException failure) {
+            // Reconcile must retry the registered operation. The normal lifecycle failure
+            // path would advance the original checkpoint epoch frozen by begin().
+            throw new IllegalStateException("Pending pipeline rebuild " + operation, failure);
+        }
     }
     /** Reading an existing pending operation never creates another generation or reissues first-creation authority. */
     Optional<PipelinePreparation> resume(PipelineIntentScope originalScope,Optional<OperatorRunManifest> manifest) {

@@ -119,7 +119,7 @@ public final class PipelineStartService {
         StartCheckReport report = evaluator.report(started, taken.answered());
         DesiredState desired;
         try {
-            desired = lifecycle.start(principal, pipelineId, started.contentHash(), auditDetail(report, applied));
+            desired = lifecycle.start(principal, pipelineId, started.contentHash(), auditDetail(report, applied), startable, started.plan());
         } catch (TapstateException refused) {
             if (applied.stream().anyMatch(each -> each.contentHash() != null)) {
                 throw new StartRefusal(refused.code(), refused.args(), null, applied, refused);
@@ -131,7 +131,7 @@ public final class PipelineStartService {
 
     private StartEvaluation evaluate(String pipelineId, PipelineLifecycleService.Startable startable,
             PipelineResource definition, StartIntent intent) {
-        return evaluator.evaluate(pipelineId, definition, startable.artifact().contentHash(), startable.prior(), intent);
+        return evaluator.evaluate(pipelineId, definition, startable.artifact().contentHash(), startable.prior(), intent, java.util.Optional.of(startable.intent()));
     }
 
     /**
