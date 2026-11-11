@@ -78,6 +78,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 ?pdk.withOperationObserver(operations.open(identity,domain,guard,local)):port;
     }
     private final Map<ExecutionFence,Session> sessions=new LinkedHashMap<>();
+    // Retiring a run can check its capture while holding a CACHE transaction, without waiting on maintenance.
+    private final Set<ExecutionFence> startingOrActiveCaptures = ConcurrentHashMap.newKeySet();
     private final Map<String,Owner> owners=new LinkedHashMap<>();
     private final AtomicReference<Predicate<String>> driving=new AtomicReference<>(id -> true);
     private final AtomicBoolean closed=new AtomicBoolean();
@@ -242,11 +244,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
 
     @Override public PipelineCaptureCoordinator forRun(PipelineIntentScope commandScope,WorkloadClaimFence command,ExecutionFence original) {
+        requireRun(commandScope,command,original);
+        return new Run(commandScope,command,original);
+    }
+    boolean hasCaptureForRetirement(PipelineIntentScope commandScope, WorkloadClaimFence command, ExecutionFence original) {
+        requireRun(commandScope,command,original);
+        return startingOrActiveCaptures.contains(original);
+    }
+    private void requireRun(PipelineIntentScope commandScope,WorkloadClaimFence command,ExecutionFence original) {
         active(); Objects.requireNonNull(commandScope); Objects.requireNonNull(command); Objects.requireNonNull(original);
         if (original.scope()==null || !business(commandScope).equals(stores.scope()) || !business(original.scope()).equals(stores.scope())
                 || !commandScope.pipelineId().equals(original.pipelineId()) || !command.key().clusterId().equals(commandScope.clusterId())
                 || command.key().type()!=WorkloadClaimType.PIPELINE_ACTUATION || !command.key().resourceId().equals(commandScope.pipelineId())) throw refused();
-        return new Run(commandScope,command,original);
     }
     @Override public void startCapture(String pipeline) { throw refused(); }
     @Override public void stopCapture(String pipeline,boolean purge) { throw refused(); }
@@ -255,7 +264,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         active(); var captured = sessions.values().stream().filter(session -> session.original.scope().equals(scope)).toList();
         if (ceiling == null && !captured.isEmpty()) throw refused();
         for (var session : captured) requireNotLater(session.original, ceiling);
-        for (var session : captured) { stop(session); sessions.remove(session.original, session); }
+        for (var session : captured) { stop(session); forgetSession(session); }
     }
     synchronized boolean hasScope(PipelineIntentScope scope) {
         active(); return sessions.keySet().stream().anyMatch(original -> original.scope().equals(scope));
@@ -311,7 +320,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         @Override public void stopCapture(String pipeline,boolean purge) {
             requireId(pipeline);
             if (purge) throw refused();
-            synchronized (ScopedPipelineCaptureCoordinator.this) { var session=sessions.get(original); if(session!=null) {stop(session);sessions.remove(original,session);} }
+            synchronized (ScopedPipelineCaptureCoordinator.this) { var session=sessions.get(original); if(session!=null) {stop(session);forgetSession(session);} }
         }
         @Override public PipelineCaptureBindings captureBindings() { return session().bindings; }
         @Override public ValidationCaptureRoute validationRoute(String alias,String table) {
@@ -368,6 +377,17 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         return new ValidationCaptureRoute(held.original,alias,table,state.preparation(),expected,channel,epoch,membership);
     }
     private synchronized void start(Run run, ArtifactStore artifacts, SourceModelSnapshot models) {
+        startingOrActiveCaptures.add(run.original);
+        try {
+            startOwned(run, artifacts, models);
+        } finally {
+            if (!sessions.containsKey(run.original)) startingOrActiveCaptures.remove(run.original);
+        }
+    }
+    private void forgetSession(Session session) {
+        if (sessions.remove(session.original, session)) startingOrActiveCaptures.remove(session.original);
+    }
+    private void startOwned(Run run, ArtifactStore artifacts, SourceModelSnapshot models) {
         active();
         requirePipeline(run.original);
         Objects.requireNonNull(artifacts);
@@ -400,7 +420,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         } catch (RuntimeException | Error failure) {
             try {
                 stop(session);
-                sessions.remove(run.original, session);
+                forgetSession(session);
             } catch (RuntimeException | Error cleanup) {
                 if (cleanup != failure) failure.addSuppressed(cleanup);
             }
@@ -1546,7 +1566,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         closed.set(true);
         owners.values().forEach(owner -> owner.ended.set(true));
         for(var session:List.copyOf(sessions.values())) {
-            try {stop(session);sessions.remove(session.original,session);}
+            try {stop(session);forgetSession(session);}
             catch(RuntimeException|Error failure){if(first==null)first=failure;else if(first!=failure)first.addSuppressed(failure);}
         }
         for(var owner:List.copyOf(owners.values())) {

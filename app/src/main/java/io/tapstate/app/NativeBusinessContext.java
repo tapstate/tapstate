@@ -689,6 +689,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
+            if (!(captures instanceof ScopedPipelineCaptureCoordinator scopedCaptures)) throw ThreeLayerStorePort.refused();
             var rebuilds = new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(owner.port.artifacts(), owner.port.schemas(),
                     owner.original.cache(), owner.context.getBean(SrsStores.class).consumers(), changes,
                     owner.original.cache().pipelineRebuilds(scope, owner.memberStorage::requireNode)),
@@ -700,7 +701,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                         if (job.isPresent() && (job.orElseThrow().isCarryingAJob()
                                 || manifest.isEmpty() || !job.orElseThrow().operatorManifest().equals(manifest.orElseThrow()))) throw ThreeLayerStorePort.refused();
                         if (manifest.isPresent() && manifest.orElseThrow().executionIdentity() instanceof ExecutionFence original
-                                && captures.forRun(request.originalScope(), request.originalClaim(), original).isCapturing(request.originalScope().pipelineId())) throw ThreeLayerStorePort.refused();
+                                && scopedCaptures.hasCaptureForRetirement(request.originalScope(), request.originalClaim(), original)) throw ThreeLayerStorePort.refused();
                     }, cluster.getWorkloadClaimTtl(), clock);
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
