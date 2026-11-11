@@ -39,6 +39,8 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
     private final AtomicReference<ValidationLocalBudget.Reservation> working=new AtomicReference<>();
     private final AtomicReference<ValidationOrderedMerge> active=new AtomicReference<>();
     private final ValidationFailureLatch failure=new ValidationFailureLatch();
+    // Each latch is atomic. The next mapping replaces it only after all readers have drained.
+    @SuppressWarnings("java:S3077")
     private volatile ValidationFailureLatch pairFailure = new ValidationFailureLatch();
     // Publishes read metadata or cleanup handles; atomic close and exit receipts own their lifetime.
     @SuppressWarnings("java:S3077")
@@ -165,24 +167,13 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
         awaitClosed(guard);
         var resource = resource(table);
         var connection = new ConnectionConfig(resource.id(), resource.connector(), resource.config());
-        var counter = new PdkValidationCounts(connection, artifact(resource),
-                new PdkValidationCounts.Request(table.table()), () -> { require(); guard.run(); });
+        var connector = artifact(resource);
+        var request = new PdkValidationCounts.Request(table.table());
         var read = admit(METADATA_BYTES, side(source));
-        var cleanup = new CompletableFuture<Void>();
         try {
-            var exited = counter.callExited();
-            exited.whenComplete((ignored, error) -> {
-                if (counter.drained()) cleanup.complete(null);
-            });
-            read.attach(() -> {
-                counter.close();
-                if (counter.drained()) cleanup.complete(null);
-            }, exited, CompletableFuture.completedFuture(null), cleanup);
-            return counter.countIfSupported();
-        } catch (RuntimeException failed) {
-            if (!counter.drained()) throw failed;
-            throw tableFailure(failed, side(source));
+            return read.count(new PdkValidationCounts(connection, connector, request, () -> { require(); guard.run(); }));
         } finally {
+            if (read.closer == null) read.unopened();
             try { read.close(); } finally { read.opened(); }
         }
     }
@@ -302,6 +293,23 @@ final class NativeValidationPdkRows implements NativeValidationFullJob.Plan {
             rows.whenComplete((ignored,error)->{stage(error);signal(2);});
             cleanup.whenComplete((ignored,error)->{if(error==null)signal(16);else NativeValidationCancellation.record(failure,error,requested);});
             if(requested||closed)close();
+        }
+        OptionalLong count(PdkValidationCounts counter) {
+            var cleanup = new CompletableFuture<Void>();
+            try {
+                var exited = counter.callExited();
+                exited.whenComplete((ignored, error) -> {
+                    if (counter.drained()) cleanup.complete(null);
+                });
+                attach(() -> {
+                    counter.close();
+                    if (counter.drained()) cleanup.complete(null);
+                }, exited, CompletableFuture.completedFuture(null), cleanup);
+                return counter.countIfSupported();
+            } catch (RuntimeException failed) {
+                if (!counter.drained()) throw failed;
+                throw tableFailure(failed, side);
+            }
         }
         void opened(){signal(8);}
         void unopened(){signal(1|2|4|16);}

@@ -86,7 +86,7 @@ final class ThreeLayerStorePort implements StorePort {
         var scope = activeScope(pipelineId, header.mapping());
         if (header.intentFailure().isPresent()) throw header.intentFailure().orElseThrow();
         var desired = header.desired().orElse(null);
-        if (!io.tapstate.control.core.LivePipelines.isAtRest(null, desired)) {
+        if (desired != null && !io.tapstate.control.core.LivePipelines.isAtRest(null, desired)) {
             throw new TapstateException(ActuationError.SCHEMA_SYNC_WHILE_RUNNING,
                     Map.of("pipeline", scope.pipelineId(), "state", PipelineState.NEW.name(),
                             "desired", desired.targetState().name()), null);

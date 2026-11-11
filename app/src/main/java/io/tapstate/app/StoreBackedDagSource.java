@@ -3837,11 +3837,15 @@ final class StoreBackedDagSource implements DagSource {
             Function<String, Optional<Resource>> lookup) {
         var live = artifacts();
         ArtifactStore catalogArtifacts = new ArtifactStore() {
-            private Optional<String> managedDefault;
+            private Optional<String> managedDefault = Optional.empty();
+            private boolean managedDefaultLoaded;
             private List<Resource> allResources;
 
             @Override public Optional<String> managedDefaultSourceId() {
-                if (managedDefault == null) managedDefault = live.managedDefaultSourceId();
+                if (!managedDefaultLoaded) {
+                    managedDefault = live.managedDefaultSourceId();
+                    managedDefaultLoaded = true;
+                }
                 return managedDefault;
             }
             @Override public Optional<Resource> get(String id) { return lookup.apply(id); }

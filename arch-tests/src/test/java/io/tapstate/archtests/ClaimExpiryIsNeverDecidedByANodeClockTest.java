@@ -93,9 +93,10 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
                         && call.getName().equals("leaseUntil"))
                 .collect(Collectors.groupingBy(call -> call.getOrigin().getFullName(), Collectors.counting()));
 
-        assertThat(reads.entrySet()).allSatisfy(entry ->
-                assertThat(entry.getValue()).as("stored deadline reads in %s", entry.getKey())
-                        .isLessThanOrEqualTo(auditedReads.getOrDefault(entry.getKey(), 0L)));
+        var unapprovedReads = reads.entrySet().stream()
+                .filter(entry -> entry.getValue() > auditedReads.getOrDefault(entry.getKey(), 0L))
+                .toList();
+        assertThat(unapprovedReads).as("stored deadline reads beyond audited sites").isEmpty();
     }
 
     /** The guarded classes, asserting each one still exists rather than silently covering fewer of them. */

@@ -477,6 +477,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
     }
 
     private WorkloadClaimReading reading(Document document) {
+        if (document == null) throw unreadableClaim();
         if (strict && !(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();
         if (nodeBacked(document)) {
             var claim = read(document);

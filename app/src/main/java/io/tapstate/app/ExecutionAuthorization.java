@@ -101,6 +101,8 @@ final class ExecutionAuthorization implements AutoCloseable {
     private record ProofResult(Entry entry, boolean denied) {}
 
     private static final class ScopedProof {
+        // A single volatile publication carries the immutable result and its original fence.
+        @SuppressWarnings("java:S3077")
         volatile ProofResult result = new ProofResult(null, false);
         volatile String readFailure;
         volatile long lastUsed = System.nanoTime();
@@ -556,6 +558,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                 Map.of("detail", "authorization-proof-unavailable " + key.type().name()), null);
     }
 
+    // Each ScopedProof is private and is the common monitor used by its waiters and publishers.
+    @SuppressWarnings("java:S2445")
     private void refreshScopedProofs() {
         sweepLeases();
         long now = System.nanoTime();
@@ -627,6 +631,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 || coded.code() == IoError.PIPELINE_INTENT_FENCED;
     }
 
+    @SuppressWarnings("java:S2445")
     private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result, boolean scopeRead) {
         // Publish and retire older scopes in one order. No store calls take either monitor.
         synchronized (scopedProofs) {
@@ -670,6 +675,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         });
     }
 
+    @SuppressWarnings("java:S2445")
     private void retireOlderScopes(ReadKey newer) {
         scopedProofs.forEach((key, proof) -> {
             if (key.scope() == null || !key.pipelineId().equals(newer.pipelineId())
@@ -783,6 +789,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     @Override
+    @SuppressWarnings("java:S2445")
     public void close() {
         closed.set(true); entries.clear(); nextReadNanos.clear();
         leases.keySet().forEach(this::dropLeases);

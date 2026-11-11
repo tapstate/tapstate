@@ -59,10 +59,14 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
         });
         resources.put(pipeline.id(), Optional.of(pipeline));
         ArtifactStore captured = new ArtifactStore() {
-            private Optional<String> managed;
+            private Optional<String> managed = Optional.empty();
+            private boolean managedLoaded;
             private List<Resource> all;
             @Override public Optional<String> managedDefaultSourceId() {
-                if (managed == null) managed = live.managedDefaultSourceId();
+                if (!managedLoaded) {
+                    managed = live.managedDefaultSourceId();
+                    managedLoaded = true;
+                }
                 return managed;
             }
             @Override public Optional<Resource> get(String id) { return resources.computeIfAbsent(id, live::get); }

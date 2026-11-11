@@ -1131,7 +1131,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         void require() {
             active();
-            if (ended.get() || !fence.equals(execution.authorization().requireCapture(stores.scope(), fence))
+            if (ended.get()) throw refused();
+            if (!fence.equals(execution.authorization().requireCapture(stores.scope(), fence))
                     || ended.get()) throw refused();
         }
         boolean drainingReports(){return reportDrainStarted!=null;}

@@ -63,6 +63,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private MongoValidationPreparations validationPreparations;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private record VerifiedAlertSchema(Document marker, long verifiedAt) {}
+    // Verification replaces the whole snapshot. Readers only compare the published BSON marker.
+    @SuppressWarnings("java:S3077")
     private volatile VerifiedAlertSchema verifiedAlertSchema;
     private ScheduledExecutorService alertSchemaVerifier;
 

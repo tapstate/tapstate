@@ -278,10 +278,13 @@ final class PipelineActuationOwnership {
         /** Highest candidate already probed; lower retries share its bounded contact interval. */
         private PipelineIntentScope probedScope;
         private long nextScopeProbeNanos;
+        // Claims and renewal failures carry immutable snapshots across the ownership and renewal paths.
+        @SuppressWarnings("java:S3077")
         private volatile WorkloadClaim claim;
         // The renewer never needs the ownership monitor or ordinary IO admission to read or publish this proof.
         private final java.util.concurrent.atomic.AtomicReference<ScopedLease> scopedLease =
                 new java.util.concurrent.atomic.AtomicReference<>();
+        @SuppressWarnings("java:S3077")
         private volatile RenewalFailure renewalFailure;
         private long leaseDeadlineNanos;
 

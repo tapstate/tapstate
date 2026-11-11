@@ -377,7 +377,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                 &&head.episode().diagnostics().status()!=AlertStateRecord.DiagnosticStatus.NOT_APPLICABLE)
                             &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plus(healthyCoalescingWindow(head.snapshot()))))continue;
                 }
-                accept(binding,next,input,shared,cacheSample==null?null:before);
+                accept(binding, next, input, shared, cacheSample != null, before);
             }
         }finally{settled.run();}},settled,cacheSample);
     }
@@ -486,11 +486,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
     }
     private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input) {
-        accept(binding,sequence,input,false,null);
+        accept(binding, sequence, input, false, false, Optional.empty());
     }
-    private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared,
-            Optional<AlertStore.Stored<AlertStateRecord.Head>> cacheState) {
-        var outcome = services.get().evaluator().accept(binding, sequence, input, cacheState);
+    private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input, boolean shared,
+            boolean stateLoaded, Optional<AlertStore.Stored<AlertStateRecord.Head>> cachedState) {
+        var outcome = services.get().evaluator().accept(binding, sequence, input, stateLoaded, cachedState);
         String deferral = outcome==AlertEvaluationHost.Result.BUSY ? (shared ? null : cacheHeartbeatDeferralRefusal(binding,input)) : "not-busy";
         if(outcome==AlertEvaluationHost.Result.BUSY && deferral==null)return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) {
