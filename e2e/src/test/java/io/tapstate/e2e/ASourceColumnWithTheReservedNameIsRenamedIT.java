@@ -34,7 +34,6 @@ import org.junit.jupiter.api.Test;
 class ASourceColumnWithTheReservedNameIsRenamedIT {
 
     private static final Duration TIMEOUT = Duration.ofSeconds(90);
-    private static final Duration POLL = Duration.ofMillis(250);
 
     private static final String SOURCE_ID = "src_reserved";
     private static final String TARGET_ID = "tgt_reserved";
@@ -103,16 +102,9 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
 
     private static void awaitColumn(
             MongoEndpoints mongo, EndpointAddress target, Map<Integer, String> expected, String what) {
-        long deadline = System.nanoTime() + TIMEOUT.toNanos();
-        Map<Integer, String> last = Map.of();
-        while (System.nanoTime() - deadline < 0) {
-            last = renamedById(mongo, target);
-            if (last.equals(expected)) {
-                return;
-            }
-            sleep();
-        }
-        assertThat(last).as("`%s` by id in the target after %s", RENAMED, what).isEqualTo(expected);
+        Await.until("`" + RENAMED + "` by id in the target after " + what + " to be " + expected, TIMEOUT,
+                () -> renamedById(mongo, target).equals(expected),
+                () -> String.valueOf(renamedById(mongo, target)));
     }
 
     private static Map<Integer, String> renamedById(MongoEndpoints mongo, EndpointAddress target) {
@@ -174,14 +166,5 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
                     - source: %s
                 """.formatted(PIPELINE_ID, SOURCE_ID, TABLE, TARGET_ID));
         return resources;
-    }
-
-    private static void sleep() {
-        try {
-            Thread.sleep(POLL.toMillis());
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new AssertionError("interrupted while waiting on the target", e);
-        }
     }
 }
