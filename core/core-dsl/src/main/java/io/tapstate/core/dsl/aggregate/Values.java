@@ -74,6 +74,10 @@ public final class Values {
      * none in common.
      */
     public static int compare(Object a, Object b) {
+        if (numericKind(a) == TapstateType.INT64 && numericKind(b) == TapstateType.INT64) {
+            // the common key and ordering: two integers compare without building two decimals
+            return Long.compare(((Number) a).longValue(), ((Number) b).longValue());
+        }
         if (a instanceof Number x && b instanceof Number y) {
             if (!finite(x) || !finite(y)) {
                 return Double.compare(x.doubleValue(), y.doubleValue());
