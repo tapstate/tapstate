@@ -1466,7 +1466,7 @@ aggregate.input-not-supported:
   message: "Aggregate step `{step}` reads `{from}`, which is {kind}."
   solution: "An aggregate step reads one source table, or a `filter`, `map` or `union` step over source tables. To put totals into an assembled document, aggregate the table first and embed the result with a nest."
 aggregate.upstream-filter-unsafe:
-  message: "Aggregate step `{step}` reads the filter step `{filter}`, and source `{source}` does not send a row as it was before an update, so a row that stops matching would stay in its group."
+  message: "Aggregate step `{step}` reads the filter step `{filter}`, and source `{source}` does not guarantee to send a row as it was before an update, so a row that stops matching would stay in its group."
   solution: "Move the condition into the aggregate step's `where:`. The step remembers each row, so it removes a row that stops matching whether or not the source says what the row was."
 aggregate.key-required:
   message: "Aggregate step `{step}` reads `{from}`, which has no primary key, and names no `key:`."

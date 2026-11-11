@@ -85,11 +85,25 @@ class AggregateStepRulesTest {
     }
 
     @Test
-    @DisplayName("a source table, and a filter, map or union over source tables, are inputs the step accepts")
+    @DisplayName("a filter above the step is refused, naming the filter and pointing at where")
+    void aFilterAboveTheStepIsRefused() {
+        refused(() -> Workspace.of(batch("""
+                  - { id: open, from: [ orders ], type: filter, expr: "after.status == 'open'" }
+                  - { id: slim, from: [ open ], type: map, fields: { note: false } }
+                  - id: by_region
+                    from: [ slim ]
+                    type: aggregate
+                    key: [ id ]
+                    fields: { orders: { count: true } }
+                """)), AggregateError.UPSTREAM_FILTER_UNSAFE,
+                Map.of("step", "by_region", "filter", "open", "source", "src_orders"));
+    }
+
+    @Test
+    @DisplayName("a source table, and a map or union over source tables, are inputs the step accepts")
     void statelessInputsAreAccepted() {
         assertThatCode(() -> Workspace.of(batch("""
-                  - { id: open, from: [ orders ], type: filter, expr: "after.status == 'open'" }
-                  - { id: both, from: [ open, refunds ], type: union }
+                  - { id: both, from: [ orders, refunds ], type: union }
                   - { id: slim, from: [ both ], type: map, fields: { note: false } }
                   - id: by_region
                     from: [ slim ]
@@ -104,7 +118,7 @@ class AggregateStepRulesTest {
     void aStepThatChangesRowCountIsRefusedAsInput() {
         refused(() -> Workspace.of(batch("""
                   - { id: lines, from: [ orders ], type: unwind, path: items, element_key: sku }
-                  - { id: kept, from: [ lines ], type: filter, expr: "true" }
+                  - { id: kept, from: [ lines ], type: map, fields: { note: false } }
                   - id: by_region
                     from: [ kept ]
                     type: aggregate
