@@ -3,6 +3,8 @@ package io.tapstate.core.model.canonical;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.EmbedAs;
+import io.tapstate.core.model.RollupField;
+import io.tapstate.core.model.RollupPick;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
@@ -387,7 +389,7 @@ public final class CanonicalWriter {
             b.scalar("from", e.from());
             b.freeMap("on", new TreeMap<>(e.on()));
             b.scalar("as", e.as().yaml());
-            if (e.as() != EmbedAs.FLAT) {
+            if (e.as() != EmbedAs.FLAT && e.as() != EmbedAs.ROLLUP) {
                 b.scalar("path", e.path());
             }
             b.scalarSeq("key", e.key());
@@ -397,9 +399,44 @@ public final class CanonicalWriter {
             if (e.embed() != null) {
                 b.put("embed", embeds(e.embed()));
             }
+            if (e.rollup() != null) {
+                b.put("rollup", rollupFields(e.rollup()));
+            }
             items.add(b.build());
         }
         return new Node.SeqN(items);
+    }
+
+    /**
+     * Rollup fields in declaration order: the order is where the author put them and is what the document
+     * shows, so sorting would rewrite a source nobody edited.
+     */
+    private Node rollupFields(Map<String, RollupField> fields) {
+        B b = new B();
+        for (Map.Entry<String, RollupField> entry : fields.entrySet()) {
+            RollupField field = entry.getValue();
+            B f = new B();
+            Object argument = field.argument();
+            if (argument instanceof RollupPick pick) {
+                B p = new B();
+                p.scalar("value", pick.value());
+                if (pick.by().size() == 1) {
+                    p.scalar("by", pick.by().getFirst());
+                } else {
+                    p.scalarSeq("by", pick.by());
+                }
+                f.putRequired(field.function().yaml(), p.build());
+            } else {
+                f.putRequired(field.function().yaml(), scalar(argument));
+            }
+            f.scalar("filter", field.filter());
+            f.scalar("type", field.type() == null ? null : field.type().yaml());
+            if (field.defaultValue() != null) {
+                f.put("default", literalValue(field.defaultValue()));
+            }
+            b.putRequired(entry.getKey(), f.build());
+        }
+        return b.build();
     }
 
     private Node fromClause(FromClause from) {
