@@ -9,11 +9,17 @@ import io.tapstate.core.dsl.aggregate.RollupSpec;
 import io.tapstate.core.dsl.aggregate.ValueType;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
+import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.ServeBlock;
+import io.tapstate.core.model.ServeResource;
 import io.tapstate.core.model.Step;
+import io.tapstate.core.model.SyncElement;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.TransformResource;
+import io.tapstate.core.model.ViewBlock;
+import io.tapstate.core.model.ViewResource;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -60,6 +66,7 @@ public final class AggregateStepRules {
                     refuseFiltersUpstream(step.id(), pipeline, byId);
                 }
             }
+            refuseTargetsThatKeepRows(pipeline, steps, byId);
         }
     }
 
@@ -75,6 +82,80 @@ public final class AggregateStepRules {
             throw new TapstateException(AggregateError.UPSTREAM_FILTER_UNSAFE, Map.of("step", step,
                     "filter", filters.getFirst(), "source", String.join(", ", pipeline.sourceIds())), null);
         }
+    }
+
+    /**
+     * A target that reads an aggregate step may not keep its rows through a full load. A full load builds
+     * every group again from the rows the source holds now, and a group whose rows are gone is not among
+     * them: the step cannot name it once its old state is cleared, so nothing would ever delete its row.
+     */
+    private static void refuseTargetsThatKeepRows(PipelineResource pipeline, Map<String, Step> steps,
+            Map<String, Resource> byId) {
+        if (pipeline.view() != null) {
+            FromRef from = switch (pipeline.view()) {
+                case ViewBlock.Inline inline -> inline.from();
+                case ViewBlock.Use use -> use.from();
+            };
+            OnFullLoad policy = switch (pipeline.view()) {
+                case ViewBlock.Inline inline -> inline.onFullLoad();
+                case ViewBlock.Use use -> byId.get(use.use()) instanceof ViewResource definition
+                        ? definition.onFullLoad()
+                        : null;
+            };
+            String id = switch (pipeline.view()) {
+                case ViewBlock.Inline inline -> inline.id();
+                case ViewBlock.Use use -> use.id() != null ? use.id() : use.use();
+            };
+            String step = from == null ? null : aggregateAbove(List.of(from), steps, byId, new LinkedHashSet<>());
+            refuseKeeping(step, id, policy);
+        }
+        if (pipeline.serve() != null) {
+            FromClause from = switch (pipeline.serve()) {
+                case ServeBlock.Inline inline -> inline.from();
+                case ServeBlock.Use use -> use.from();
+            };
+            List<SyncElement> sync = switch (pipeline.serve()) {
+                case ServeBlock.Inline inline -> inline.sync();
+                case ServeBlock.Use use -> byId.get(use.use()) instanceof ServeResource definition
+                        ? definition.sync()
+                        : null;
+            };
+            if (from == null || sync == null) {
+                return;
+            }
+            String step = aggregateAbove(refsOf(from), steps, byId, new LinkedHashSet<>());
+            for (SyncElement element : sync) {
+                refuseKeeping(step, element.id() != null ? element.id() : element.source(), element.onFullLoad());
+            }
+        }
+    }
+
+    private static void refuseKeeping(String step, String target, OnFullLoad policy) {
+        OnFullLoad effective = policy == null ? OnFullLoad.APPEND : policy;
+        if (step != null && effective == OnFullLoad.APPEND) {
+            throw new TapstateException(AggregateError.REBUILD_NEEDS_CLEAR,
+                    Map.of("step", step, "target", String.valueOf(target), "policy", effective.yaml()), null);
+        }
+    }
+
+    /** The nearest aggregate step that {@code refs} read, directly or through other steps, or null. */
+    private static String aggregateAbove(Collection<FromRef> refs, Map<String, Step> steps,
+            Map<String, Resource> byId, Set<String> visited) {
+        for (FromRef ref : refs) {
+            if (!(ref instanceof FromRef.Literal literal) || steps.get(literal.ref()) == null
+                    || !visited.add(literal.ref())) {
+                continue;
+            }
+            Step upstream = steps.get(literal.ref());
+            if (bodyOf(upstream, byId) instanceof TransformBody.Aggregate) {
+                return upstream.id();
+            }
+            String above = aggregateAbove(refsOf(upstream.from()), steps, byId, visited);
+            if (above != null) {
+                return above;
+            }
+        }
+        return null;
     }
 
     /** The filter steps between {@code step} and its source tables, nearest first. */

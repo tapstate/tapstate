@@ -1499,3 +1499,9 @@ aggregate.value-type-mismatch:
 aggregate.result-not-convertible:
   message: "Aggregate step `{step}`, field `{field}` of group {group} is the {from} value that `type: {to}` cannot hold exactly."
   solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal). The group keeps its last good values meanwhile."
+aggregate.definition-changed:
+  message: "Aggregate step `{step}` holds state built by a different definition: its {changed} changed."
+  solution: "The stored rows and totals are valid only for the definition that built them, so the step does not start on them. Rebuild the pipeline from a full load, which clears the step's state and its target, or restore the previous definition."
+aggregate.rebuild-needs-clear:
+  message: "Target `{target}` reads the aggregate step `{step}` and is set to `on_full_load: {policy}`, which keeps the rows it already holds."
+  solution: "A full load rebuilds every group, and a group that no longer exists would stay in the target. Set `on_full_load: clear` on the target, or `fail` to refuse a full load while it holds rows."

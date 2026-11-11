@@ -17,3 +17,4 @@ serve:
   sync:
     - id: dw
       source: tgt_sales
+      on_full_load: clear

@@ -45,7 +45,13 @@ public enum AggregateError implements TapstateErrorCode {
     VALUE_TYPE_MISMATCH("aggregate.value-type-mismatch", Set.of("step", "field", "group", "declared", "actual")),
 
     /** Running: a field's {@code type:} cannot hold its group's value exactly; the group is held. */
-    RESULT_NOT_CONVERTIBLE("aggregate.result-not-convertible", Set.of("step", "field", "group", "from", "to"));
+    RESULT_NOT_CONVERTIBLE("aggregate.result-not-convertible", Set.of("step", "field", "group", "from", "to")),
+
+    /** The stored state was built by a different definition of the step. */
+    DEFINITION_CHANGED("aggregate.definition-changed", Set.of("step", "changed")),
+
+    /** A target fed by the step would keep its existing rows through a full load. */
+    REBUILD_NEEDS_CLEAR("aggregate.rebuild-needs-clear", Set.of("step", "target", "policy"));
 
     /** The step's code for a reason the shared function library reports under its own name. */
     public static AggregateError of(RollupError reason) {

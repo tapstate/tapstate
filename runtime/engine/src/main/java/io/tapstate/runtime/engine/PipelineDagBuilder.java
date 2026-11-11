@@ -7,6 +7,7 @@ import com.hazelcast.jet.core.Processor;
 import com.hazelcast.jet.core.ProcessorMetaSupplier;
 import com.hazelcast.jet.core.ProcessorSupplier;
 import com.hazelcast.jet.core.Vertex;
+import io.tapstate.core.dsl.aggregate.AggregateDefinition;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.lifecycle.AwaitedLoad;
 import io.tapstate.core.model.BatchSpec;
@@ -489,10 +490,11 @@ public final class PipelineDagBuilder {
                     Map<Integer, List<String>> carried = chains == null ? null : chains.perOrdinal(upstream);
                     AggregateStepSpec spec = bindings.aggregate().specs().apply(step);
                     AggregateStores stores = bindings.aggregate().stores();
+                    AggregateDefinition definition = AggregateDefinition.of(upstream, spec);
                     String name = step.id();
                     SupplierEx<Processor> processors = axes == null
-                            ? () -> new AggregateProcessor(name, spec, stores, null)
-                            : () -> new AggregateProcessor(name, spec, stores,
+                            ? () -> new AggregateProcessor(name, spec, definition, stores, null)
+                            : () -> new AggregateProcessor(name, spec, definition, stores,
                                     new LevelBounds(carried, axes, LevelBounds.HOLDS_NOTHING));
                     Vertex vertex = dag.newVertex(name,
                             TotalOne.passingBounds(ProcessorSupplier.of(processors), name, axes, carried));

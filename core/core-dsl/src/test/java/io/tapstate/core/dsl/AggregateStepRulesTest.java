@@ -50,6 +50,10 @@ class AggregateStepRulesTest {
     }
 
     private static String pipeline(String transforms) {
+        return pipeline(transforms, "sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: clear } ]");
+    }
+
+    private static String pipeline(String transforms, String sync) {
         return """
                 version: tapstate/v1
                 kind: pipeline
@@ -59,8 +63,42 @@ class AggregateStepRulesTest {
                 %s
                 serve:
                   from: by_region
-                  sync: [ { id: dw, source: tgt, write_mode: upsert } ]
-                """.formatted(transforms.stripTrailing());
+                  %s
+                """.formatted(transforms.stripTrailing(), sync);
+    }
+
+    private static List<Resource> batch(String transforms, String sync) {
+        DslParser parser = new DslParser();
+        return List.of(parser.parse(SOURCE), parser.parse(TARGET), parser.parse(pipeline(transforms, sync)));
+    }
+
+    private static final String BY_REGION = """
+              - id: by_region
+                from: [ orders ]
+                type: aggregate
+                key: [ id ]
+                fields: { orders: { count: true } }
+            """;
+
+    @Test
+    @DisplayName("a target that keeps its rows through a full load is refused, whether it says append or says nothing")
+    void aTargetThatKeepsItsRowsIsRefused() {
+        refused(() -> Workspace.of(batch(BY_REGION, "sync: [ { id: dw, source: tgt, write_mode: upsert } ]")),
+                AggregateError.REBUILD_NEEDS_CLEAR, Map.of("step", "by_region", "target", "dw", "policy", "append"));
+        refused(() -> Workspace.of(batch(BY_REGION,
+                        "sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: append } ]")),
+                AggregateError.REBUILD_NEEDS_CLEAR, Map.of("step", "by_region", "target", "dw", "policy", "append"));
+    }
+
+    @Test
+    @DisplayName("a target that clears, or refuses a full load while it holds rows, is accepted")
+    void aTargetThatClearsOrFailsIsAccepted() {
+        assertThatCode(() -> Workspace.of(batch(BY_REGION,
+                "sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: clear } ]")))
+                .doesNotThrowAnyException();
+        assertThatCode(() -> Workspace.of(batch(BY_REGION,
+                "sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: fail } ]")))
+                .doesNotThrowAnyException();
     }
 
     private static List<Resource> batch(String transforms) {
