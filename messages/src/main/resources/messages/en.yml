@@ -1480,3 +1480,6 @@ aggregate.expression-invalid:
 aggregate.type-unknown:
   message: "Aggregate step `{step}`, field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved."
   solution: "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+aggregate.evaluation-failed:
+  message: "Aggregate step `{step}` could not evaluate its {part} `{expression}` on a row: {reason}"
+  solution: "The expression passed its checks and then failed on the values of one row, for example a division by zero or a conversion of text that is not a number. Guard the expression against such values, or exclude the rows with `where:`."

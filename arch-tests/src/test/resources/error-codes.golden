@@ -37,6 +37,7 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+aggregate.evaluation-failed
 aggregate.expression-invalid
 aggregate.input-not-supported
 aggregate.key-required
