@@ -39,6 +39,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
     private static final String TARGET_ID = "tgt_reserved";
     private static final String PIPELINE_ID = "reserved_pipeline";
     private static final String TABLE = "events";
+    private static final String KEYED_TABLE = "keyed_events";
 
     private static final String RESERVED = "__tap";
     private static final String RENAMED = "__tap_src";
@@ -66,7 +67,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
 
             // Discovered first: the warning is computed from the columns the source was found to have.
             control.discoverSchema(SOURCE_ID, "mysql", mysql);
-            List<ControlPlane.Warning> warnings = control.apply(workspace(mysql, targetUri));
+            List<ControlPlane.Warning> warnings = control.apply(workspace(mysql, targetUri, TABLE));
 
             assertThat(warnings)
                     .as("applying a pipeline over a table with a column named `%s` said nothing about "
@@ -100,6 +101,51 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
         }
     }
 
+    @Test
+    @DisplayName("a table keyed by a column named __tap is keyed and updated under __tap_src")
+    void aKeyColumnIsKeyedUnderTheNewName() throws Exception {
+        String targetUri = SharedMongo.replicaSetUrl("reserved_key_target");
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        try (PreparedNativeStore storage = PreparedNativeStore.create();
+                MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            ControlPlane control = NumericSource.connected(server, storage);
+            control.discoverSchema(SOURCE_ID, "mysql", mysql);
+            control.apply(workspace(mysql, targetUri, KEYED_TABLE));
+            control.lifecycle(PIPELINE_ID, LifecycleVerb.START);
+
+            awaitValues(mongo, target, Map.of(1, 10, 2, 20, 3, 30), "the snapshot of the keyed rows");
+
+            // An update finds its document by the key. Were rows keyed by a name the target never
+            // received, the change would land as a fourth document instead of changing the second.
+            execute(mysql, "UPDATE " + KEYED_TABLE + " SET v = 99 WHERE `" + RESERVED + "` = 2");
+            awaitValues(mongo, target, Map.of(1, 10, 2, 99, 3, 30), "an update addressed by the key");
+
+            // And a delete removes it by the same key.
+            execute(mysql, "DELETE FROM " + KEYED_TABLE + " WHERE `" + RESERVED + "` = 3");
+            awaitValues(mongo, target, Map.of(1, 10, 2, 99), "a delete addressed by the key");
+        }
+    }
+
+    private static void awaitValues(
+            MongoEndpoints mongo, EndpointAddress target, Map<Integer, Integer> expected, String what) {
+        Await.until("`v` by `" + RENAMED + "` in the target after " + what + " to be " + expected, TIMEOUT,
+                () -> valuesByKey(mongo, target).equals(expected),
+                () -> String.valueOf(mongo.documents(target, KEYED_TABLE)));
+    }
+
+    /** Every document counted, so a change that landed as a new document shows as a wrong size. */
+    private static Map<Integer, Integer> valuesByKey(MongoEndpoints mongo, EndpointAddress target) {
+        Map<Integer, Integer> values = new LinkedHashMap<>();
+        List<Document> documents = mongo.documents(target, KEYED_TABLE);
+        for (Document document : documents) {
+            if (document.get(RENAMED) instanceof Number key && document.get("v") instanceof Number v) {
+                values.put(key.intValue(), v.intValue());
+            }
+        }
+        return values.size() == documents.size() ? values : Map.of();
+    }
+
     private static void awaitColumn(
             MongoEndpoints mongo, EndpointAddress target, Map<Integer, String> expected, String what) {
         Await.until("`" + RENAMED + "` by id in the target after " + what + " to be " + expected, TIMEOUT,
@@ -124,6 +170,9 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
                 + "` VARCHAR(32), v INT)");
         execute(settings, "INSERT INTO " + TABLE + " (id, `" + RESERVED
                 + "`, v) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'c', 30)");
+        execute(settings, "DROP TABLE IF EXISTS " + KEYED_TABLE);
+        execute(settings, "CREATE TABLE " + KEYED_TABLE + " (`" + RESERVED + "` INT PRIMARY KEY, v INT)");
+        execute(settings, "INSERT INTO " + KEYED_TABLE + " (`" + RESERVED + "`, v) VALUES (1, 10), (2, 20), (3, 30)");
     }
 
     private static void execute(Map<String, Object> settings, String sql) throws Exception {
@@ -133,7 +182,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
         }
     }
 
-    private static Map<String, String> workspace(Map<String, Object> config, String targetUri) {
+    private static Map<String, String> workspace(Map<String, Object> config, String targetUri, String table) {
         Map<String, String> resources = new LinkedHashMap<>();
         resources.put("src_reserved.tap.yml", """
                 version: tapstate/v1
@@ -144,7 +193,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
                 mode: cdc
                 tables: [ %s ]
                 """.formatted(SOURCE_ID, config.get("host"), config.get("port"), config.get("database"),
-                config.get("username"), config.get("password"), TABLE));
+                config.get("username"), config.get("password"), table));
         resources.put("tgt_reserved.tap.yml", """
                 version: tapstate/v1
                 kind: source
@@ -164,7 +213,7 @@ class ASourceColumnWithTheReservedNameIsRenamedIT {
                   from: all_rows
                   sync:
                     - source: %s
-                """.formatted(PIPELINE_ID, SOURCE_ID, TABLE, TARGET_ID));
+                """.formatted(PIPELINE_ID, SOURCE_ID, table, TARGET_ID));
         return resources;
     }
 }
