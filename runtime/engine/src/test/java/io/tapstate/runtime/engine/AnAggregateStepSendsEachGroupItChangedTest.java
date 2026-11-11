@@ -24,6 +24,7 @@ import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
+import io.tapstate.runtime.engine.aggregate.AggregateProcessor;
 import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -214,11 +215,31 @@ class AnAggregateStepSendsEachGroupItChangedTest {
         assertThat(lastPerGroup()).containsKey("US");
     }
 
+    @Test
+    @DisplayName("a row that is gone is forgotten once the event that removed it cannot be delivered again")
+    void whatASecondDeliveryCannotNeedIsForgotten() {
+        run(List.of(insert(1, 1, "EU", "open", "100.00"), insert(2, 2, "US", "open", "5.00")));
+        run(List.of(delete(1, 3, row(1, "EU", "open", "100.00"))));
+        assertThat(STORES.get("by_region/MEMBERS").entries).as("the deleted row is kept to answer a replay").hasSize(2);
+
+        // Deliveries resume above everything sent so far, and the step sweeps whenever it is idle.
+        run(List.of(insert(3, 4, "US", "open", "1.00")), YAML, member -> chain -> Optional.of(new SourceOrder(1, 4)));
+
+        assertThat(STORES.get("by_region/MEMBERS").entries).as("rows 2 and 3 remain").hasSize(2);
+        // The definition, and for US its totals, two rows and two entries behind the greatest amount.
+        assertThat(STORES.get("by_region/GROUPS").entries).as("nothing of the emptied group remains").hasSize(6);
+        assertThat(lastPerGroup().get("US").after()).containsEntry("orders", 2L);
+    }
+
     private void run(List<Envelope> events) {
         run(events, YAML);
     }
 
     private void run(List<Envelope> events, String yaml) {
+        run(events, yaml, ReplayFloorFactory.NONE);
+    }
+
+    private void run(List<Envelope> events, String yaml, ReplayFloorFactory floor) {
         PipelineResource pipeline = (PipelineResource) new DslParser().parse(yaml);
         Step.Inline step = (Step.Inline) pipeline.transforms().getFirst();
         Map<String, ValueType> columns = new LinkedHashMap<>();
@@ -240,7 +261,8 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 element -> sink,
                 ref -> ref instanceof FromRef.Literal literal ? List.of(literal.ref()) : List.of(),
                 sourceId -> List.of("orders"))
-                .withAggregate(new AggregateBinding(ignored -> spec, stores));
+                .withAggregate(new AggregateBinding(ignored -> spec, stores, floor,
+                        new AggregateProcessor.Sweep(200, 0, 0)));
         member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings)).join();
     }
 

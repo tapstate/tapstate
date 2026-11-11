@@ -144,6 +144,53 @@ public final class GroupStage {
         return List.copyOf(outcomes.values());
     }
 
+    /**
+     * A row's leaving of a group that cannot be delivered again.
+     *
+     * @param group    the values of the group the row left
+     * @param inputKey the row
+     * @param order    the order of the event that took the row out
+     */
+    public record Leaving(List<Object> group, byte[] inputKey, SourceOrder order) {
+    }
+
+    /**
+     * Drops the record that a row left a group, for leavings nothing can deliver again. The record exists
+     * to recognise that event and the ones before it when they are delivered twice; once none of them can
+     * be, it recognises nothing. A row that has since come back, or left again later, is not touched.
+     *
+     * @return how many records were dropped
+     */
+    public int forget(List<Leaving> leavings) {
+        List<byte[]> keys = new ArrayList<>();
+        for (Leaving leaving : leavings) {
+            keys.add(rowKey(OrderedBytes.ofKey(leaving.group()), leaving.inputKey()));
+        }
+        List<byte[]> loaded = keys.isEmpty() ? List.of() : store.loadAll(keys);
+        TreeSet<byte[]> deletes = new TreeSet<>(Arrays::compareUnsigned);
+        for (int i = 0; i < keys.size(); i++) {
+            if (loaded.get(i) == null) {
+                continue;
+            }
+            StoredRow stored = readRow(loaded.get(i));
+            if (stored.payload == null && stored.order.compareTo(leavings.get(i).order()) <= 0) {
+                deletes.add(keys.get(i));
+            }
+        }
+        List<byte[]> part = new ArrayList<>();
+        for (byte[] key : deletes) {
+            part.add(key);
+            if (part.size() == store.commitLimit().operations()) {
+                store.commit(List.of(), part);
+                part = new ArrayList<>();
+            }
+        }
+        if (!part.isEmpty()) {
+            store.commit(List.of(), part);
+        }
+        return deletes.size();
+    }
+
     private void commit(List<Fold> batch, Map<Key, GroupOutcome> outcomes) {
         List<Entry> saves = new ArrayList<>();
         List<byte[]> deletes = new ArrayList<>();
@@ -227,7 +274,13 @@ public final class GroupStage {
             }
             totals.emptiedAt = totals.members == 0 ? last : null;
             remember(totals, outcome(totals, true, 0, 0));
-            fold.saves.put(key(group, TOTALS), writeTotals(totals));
+            if (totals.members == 0) {
+                // A group with no rows has nothing a later fold needs: one that finds no totals starts
+                // from none, and reports the group as empty again if its last leaving is delivered twice.
+                fold.deletes.add(key(group, TOTALS));
+            } else {
+                fold.saves.put(key(group, TOTALS), writeTotals(totals));
+            }
             fold.counts.forEach((key, count) -> {
                 if (count.now != count.before) {
                     if (count.now == 0) {

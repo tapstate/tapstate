@@ -18,6 +18,8 @@ import io.tapstate.core.lifecycle.Stage;
 import io.tapstate.core.lifecycle.Staged;
 import io.tapstate.runtime.engine.LevelBounds;
 import io.tapstate.runtime.engine.OperatorMapCoordinates.AggregateStore;
+import io.tapstate.runtime.engine.ReplayFloor;
+import io.tapstate.runtime.engine.ReplayFloorFactory;
 import io.tapstate.runtime.engine.SettledPositions;
 import io.tapstate.runtime.engine.StageTimer;
 import io.tapstate.runtime.engine.aggregate.GroupChange.FieldInput;
@@ -59,7 +61,26 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     static final String MARKER_FIELD = "__tap";
     static final String MARKER_OWNER = "aggregate";
 
-    /** Sorts before every entry of a group, whose keys start at 0x01. */
+    /**
+     * How often stored rows are swept for what a second delivery can no longer need.
+     *
+     * @param rows        rows looked at in one page
+     * @param pageMillis  the least time between two pages, which bounds what the sweep adds to the load
+     * @param passMillis  the least time between the end of one pass over the rows and the start of the next
+     */
+    public record Sweep(int rows, long pageMillis, long passMillis) implements java.io.Serializable {
+
+        /** A page of rows a second, and a pass over them a minute after the last. */
+        public static final Sweep DEFAULT = new Sweep(200, 1_000, 60_000);
+
+        public Sweep {
+            if (rows < 1 || pageMillis < 0 || passMillis < 0) {
+                throw new IllegalArgumentException("a sweep reads at least one row and waits no negative time");
+            }
+        }
+    }
+
+    /** No group entry has this key: an entry's key is its group's bytes and then a kind, never zero. */
     private static final byte[] DEFINITION_KEY = {0x00};
 
     private final String step;
@@ -67,7 +88,16 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     private final AggregateDefinition definition;
     private final AggregateStores stores;
     private final LevelBounds bounds;
+    private final ReplayFloorFactory replayFloor;
+    private final Sweep sweep;
     private final List<String> groupNames;
+
+    private ReplayFloor floor = ReplayFloor.NONE;
+    /** Where the sweep's next page starts; null at the start of a pass. */
+    private byte[] sweptThrough;
+    private long nextSweepAt;
+    private long forgottenRows;
+    private long forgottenLeavings;
 
     private MembershipStage membership;
     private GroupStage groups;
@@ -86,6 +116,18 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
      */
     public AggregateProcessor(String step, AggregateStepSpec spec, AggregateDefinition definition,
             AggregateStores stores, LevelBounds bounds) {
+        this(step, spec, definition, stores, bounds, ReplayFloorFactory.NONE, Sweep.DEFAULT);
+    }
+
+    /**
+     * @param definition  what the step is defined as now; state built by another definition refuses the run
+     * @param replayFloor where a restart would resume each chain; what lies below it is never delivered
+     *                    again, which is what lets the step forget the rows and leavings kept for it
+     */
+    public AggregateProcessor(String step, AggregateStepSpec spec, AggregateDefinition definition,
+            AggregateStores stores, LevelBounds bounds, ReplayFloorFactory replayFloor, Sweep sweep) {
+        this.replayFloor = Objects.requireNonNull(replayFloor, "replayFloor");
+        this.sweep = Objects.requireNonNull(sweep, "sweep");
         this.step = Objects.requireNonNull(step, "step");
         this.spec = Objects.requireNonNull(spec, "spec");
         this.definition = Objects.requireNonNull(definition, "definition");
@@ -111,6 +153,24 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         admit(byGroup);
         this.membership = new MembershipStage(stores.open(context.hazelcastInstance(), step, AggregateStore.MEMBERS));
         this.groups = new GroupStage(spec, byGroup);
+        this.floor = replayFloor.resolve(context.hazelcastInstance());
+        this.nextSweepAt = System.currentTimeMillis() + sweep.pageMillis();
+    }
+
+    /**
+     * Looks at one page of stored rows when it is time to. It runs between drains on the thread that
+     * applies events, so it never meets a row half applied, and a page is small enough not to hold a
+     * drain back. With no floor to read there is nothing it could forget, and it reads nothing.
+     */
+    private void sweepWhenDue() {
+        if (floor == ReplayFloor.NONE || System.currentTimeMillis() < nextSweepAt) {
+            return;
+        }
+        MembershipStage.Reclaimed page = membership.reclaim(floor, groups, sweptThrough, sweep.rows());
+        forgottenRows += page.rows();
+        forgottenLeavings += page.leavings();
+        sweptThrough = page.next();
+        nextSweepAt = System.currentTimeMillis() + (sweptThrough == null ? sweep.passMillis() : sweep.pageMillis());
     }
 
     /**
@@ -153,6 +213,8 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
                 }
                 taken = 0;
             }
+            // Under steady input the idle call may not come for a long time; the sweep paces itself.
+            sweepWhenDue();
         } finally {
             timer.end(started);
         }
@@ -174,7 +236,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             SettledPositions.fold(positions, event.positions());
             rowEvents(event, events);
         }
-        MembershipStage.Outcome told = membership.apply(events, Map.of());
+        MembershipStage.Outcome told = membership.apply(events);
         dropped += told.dropped();
         conflicts += told.conflicts() + told.spansInputs();
         for (GroupOutcome outcome : groups.apply(told.changes())) {
@@ -281,7 +343,13 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
 
     @Override
     public boolean tryProcess() {
-        return drain();
+        if (!drain()) {
+            return false;
+        }
+        if (taken == 0) {
+            sweepWhenDue();
+        }
+        return true;
     }
 
     @Override
@@ -312,5 +380,15 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     /** Events older than what is stored for their row. */
     public long dropped() {
         return dropped;
+    }
+
+    /** Rows that were gone and have been forgotten, because nothing can deliver their removal again. */
+    public long forgottenRows() {
+        return forgottenRows;
+    }
+
+    /** Records of a row leaving a group that have been dropped for the same reason. */
+    public long forgottenLeavings() {
+        return forgottenLeavings;
     }
 }

@@ -2,6 +2,7 @@ package io.tapstate.runtime.engine.aggregate;
 
 import io.tapstate.core.dsl.aggregate.OrderedBytes;
 import io.tapstate.core.event.SourceOrder;
+import io.tapstate.runtime.engine.ReplayFloor;
 import io.tapstate.runtime.engine.aggregate.GroupChange.FieldInput;
 import io.tapstate.spi.store.OrderedStateStore;
 import io.tapstate.spi.store.OrderedStateStore.Entry;
@@ -14,9 +15,11 @@ import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.TreeMap;
 
 /**
@@ -92,13 +95,8 @@ public final class MembershipStage {
     public record Outcome(List<GroupChange> changes, int dropped, int conflicts, int spansInputs) {
     }
 
-    /**
-     * Applies one drain's events, commits, and returns what to tell the group side.
-     *
-     * @param settled chain to the order through which everything has been sent on and will not be
-     *                delivered again; a chain not named has nothing settled
-     */
-    public Outcome apply(List<RowEvent> events, Map<String, SourceOrder> settled) {
+    /** Applies one drain's events, commits, and returns what to tell the group side. */
+    public Outcome apply(List<RowEvent> events) {
         TreeMap<byte[], List<RowEvent>> byRow = new TreeMap<>(Arrays::compareUnsigned);
         for (RowEvent event : events) {
             byRow.computeIfAbsent(event.inputKey(), key -> new ArrayList<>()).add(event);
@@ -143,13 +141,7 @@ public final class MembershipStage {
                 tell(changes, inputKey, before, again);
             }
             if (applied != null) {
-                List<Left> left = new ArrayList<>();
-                SourceOrder through = settled.get(now.chain);
-                for (Left earlier : now.left) {
-                    if (through == null || earlier.order.compareTo(through) > 0) {
-                        left.add(earlier);
-                    }
-                }
+                List<Left> left = new ArrayList<>(now.left);
                 if (before != null && before.group != null && !sameGroup(before.group, now.group)) {
                     left.add(new Left(before.group, now.order));
                 }
@@ -186,6 +178,71 @@ public final class MembershipStage {
         }
         return Arrays.equals(OrderedBytes.ofKey(a), OrderedBytes.ofKey(b));
     }
+
+    /**
+     * What one page of a sweep came to.
+     *
+     * @param next     where the next page starts, or null when this page was the last
+     * @param rows     input rows forgotten whole: gone, with nothing left to tell
+     * @param leavings records of a row leaving a group that were dropped
+     */
+    public record Reclaimed(byte[] next, int rows, int leavings) {
+    }
+
+    /**
+     * Sweeps one page of stored rows and forgets what can no longer matter: a group a row left, once the
+     * event that took it out cannot be delivered again, and a row that is gone, once the event that
+     * removed it cannot be. Both exist only to answer a second delivery, and {@code floor} says where
+     * deliveries resume. A chain whose floor is not known keeps everything.
+     *
+     * <p>The group side forgets first. Stopped between the two, the row still remembers the leaving and
+     * the next sweep finds it again; the other way round the group side would keep its record for good.
+     *
+     * @param after the last key of the page before, or null to start from the beginning
+     * @param limit how many rows to look at
+     */
+    public Reclaimed reclaim(ReplayFloor floor, GroupStage groups, byte[] after, int limit) {
+        List<Entry> page = store.scan(FIRST_KEY, PAST_EVERY_KEY, after, limit);
+        Map<String, Optional<SourceOrder>> floors = new HashMap<>();
+        List<GroupStage.Leaving> told = new ArrayList<>();
+        List<Entry> saves = new ArrayList<>();
+        List<byte[]> deletes = new ArrayList<>();
+        for (Entry entry : page) {
+            Stored stored = read(entry.state());
+            Optional<SourceOrder> resumesAt = floors.computeIfAbsent(stored.chain, floor::of);
+            if (resumesAt.isEmpty()) {
+                continue;
+            }
+            List<Left> kept = new ArrayList<>();
+            for (Left left : stored.left) {
+                if (left.order.compareTo(resumesAt.get()) < 0) {
+                    told.add(new GroupStage.Leaving(left.group, entry.key(), left.order));
+                } else {
+                    kept.add(left);
+                }
+            }
+            if (stored.group == null && kept.isEmpty() && stored.order.compareTo(resumesAt.get()) < 0) {
+                deletes.add(entry.key());
+            } else if (kept.size() < stored.left.size()) {
+                saves.add(new Entry(entry.key(), write(new Stored(stored.chain, stored.order, stored.group, kept))));
+            }
+        }
+        groups.forget(told);
+        // Trimmed rows are small, so a part is bounded by its count alone.
+        int most = store.commitLimit().operations();
+        for (int at = 0; at < saves.size(); at += most) {
+            store.commit(List.copyOf(saves.subList(at, Math.min(saves.size(), at + most))), List.of());
+        }
+        for (int at = 0; at < deletes.size(); at += most) {
+            store.commit(List.of(), List.copyOf(deletes.subList(at, Math.min(deletes.size(), at + most))));
+        }
+        byte[] next = page.size() < limit ? null : page.getLast().key();
+        return new Reclaimed(next, deletes.size(), told.size());
+    }
+
+    private static final byte[] FIRST_KEY = {};
+    /** Above every key: a key starts with the tag of its first value, and no tag is this high. */
+    private static final byte[] PAST_EVERY_KEY = {(byte) 0xFF};
 
     private void commit(List<Entry> saves) {
         OrderedStateStore.Limit limit = store.commitLimit();
