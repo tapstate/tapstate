@@ -110,9 +110,10 @@ class BuiltinResourceSignalsTest {
         now.set(Instant.EPOCH.plusMillis(1500));signals.cacheOperation(false,null);
         now.set(Instant.EPOCH.plusMillis(1600));signals.cacheOperation(false,unavailable);
         now.set(Instant.EPOCH.plusMillis(1700));signals.cacheOperation(false,null);
-        var input=org.mockito.ArgumentCaptor.forClass(AlertInput.class);
-        verify(runtime,times(10)).resourceInput(any(),eq("cluster.storage-unavailable"),eq(0L),anyString(),any(),input.capture());
-        var values=input.getAllValues().stream().map(v->(AlertInput.Operational)v).toList();
+        var input=org.mockito.ArgumentCaptor.forClass(AlertInput.Operational.class);
+        verify(runtime,times(10)).cacheInput(eq(new AlarmKey.Resource("cluster-storage", "cache", "cache:1")),
+                anyString(), any(), input.capture());
+        var values=input.getAllValues();
         assertThat(values.stream().filter(v->!v.succeeded()).count()).isEqualTo(3);
         assertThat(values.get(1).capability()).isEqualTo(OperationalEvidence.Capability.CACHE_WRITE);
         assertThat(values.get(2).observedAt()).isEqualTo(Instant.EPOCH.plusSeconds(1));

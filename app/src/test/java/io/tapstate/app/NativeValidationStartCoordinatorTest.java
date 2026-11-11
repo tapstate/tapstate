@@ -536,7 +536,11 @@ class NativeValidationStartCoordinatorTest {
                 try(var response=coordinator.read(operation(coordinator.context()))){
                     assertThat(response.value().outcome()).isEqualTo(ValidationOperation.Outcome.UNKNOWN);assertThat(resources.snapshot().metadataFrames()).isEqualTo(4);
                 }
-                assertThat(resources.snapshot().metadataFrames()).isEqualTo(3);assertThat(resources.snapshot().processReserved().bytes()).isEqualTo(2L*1024*1024);
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> {
+                    var after = resources.snapshot();
+                    assertThat(after.metadataFrames()).isEqualTo(3);
+                    assertThat(after.processReserved().bytes()).isEqualTo(2L * 1024 * 1024);
+                });
             }
         }
     }

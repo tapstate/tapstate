@@ -274,7 +274,7 @@ class CloudStorageContinuationTest {
                     .when(f.configuration).prepareAuthenticationRecovery(eq(f.cache), any());
             f.root.managedAuthentication();
             assertThat(f.root.runtime().current().orElseThrow().preparation().authScope()).isEqualTo(next.authScope());
-            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(next), any(MongoReadBudget.class));
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(next), any(MongoReadBudget.class));
             assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
             verify(f.cache, times(1)).prepareFirstAuth(f.grant);
@@ -329,7 +329,7 @@ class CloudStorageContinuationTest {
             assertThatThrownBy(() -> f.continueWith(business)).isInstanceOf(TapstateException.class);
             f.continueWith(business);
             assertThat(f.root.initializationProgress().quotaExceeded()).isFalse();
-            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
+            doThrow(StorageRuntime.unavailable()).when(f.configuration).requireRequestAuthenticationPublished(eq(PREPARATION), any(MongoReadBudget.class));
             assertThatThrownBy(() -> f.root.authenticateCredentials("tcs_ZGlhZ25vc3RpYw.unverified-secret"))
                     .isInstanceOfSatisfying(TapstateException.class,
                             failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));

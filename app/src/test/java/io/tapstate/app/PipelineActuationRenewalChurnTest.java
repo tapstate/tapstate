@@ -29,7 +29,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
-import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.Test;
 
@@ -49,8 +48,6 @@ class PipelineActuationRenewalChurnTest {
             var owner = PipelineActuationOwnership.scoped(new CacheBusinessScope("cluster-a", 1, "cache-a"),
                     new WorkloadOwner("node-a", "boot-a"), membership,
                     new ClusterWorkloadClaims(io.store, membership), TTL, INTERVAL, io.nanos::get);
-            var field = PipelineActuationOwnership.class.getDeclaredField("ioAdmission");field.setAccessible(true);
-            io.gate = (ReentrantLock) field.get(owner);
             String stable = io.names.getFirst();
             var actors = new ArrayList<Future<?>>();
             Future<?> driver = null;
@@ -129,7 +126,6 @@ class PipelineActuationRenewalChurnTest {
         private final AtomicBoolean stopping = new AtomicBoolean();
         private final AtomicReference<Throwable> problem = new AtomicReference<>();
         private final ConcurrentHashMap<String, Integer> lanes = new ConcurrentHashMap<>();
-        private final AtomicReferenceArray<Thread> laneThreads = new AtomicReferenceArray<>(LANES + 1);
         private final AtomicReferenceArray<String> current = new AtomicReferenceArray<>(LANES + 1);
         private final List<BlockingQueue<String>> queues = new ArrayList<>();
         private final Set<String> desired = ConcurrentHashMap.newKeySet();
@@ -141,7 +137,6 @@ class PipelineActuationRenewalChurnTest {
         private final CountDownLatch ready = new CountDownLatch(LANES);
         private final List<String> names = new ArrayList<>();
         private final WorkloadClaimStore store;
-        private ReentrantLock gate;
 
         private ChurningIo() {
             for (int lane = 0; lane <= LANES; lane++) queues.add(new LinkedBlockingQueue<>());
@@ -153,7 +148,7 @@ class PipelineActuationRenewalChurnTest {
             assertThat(names.stream().map(String::hashCode).distinct().count()).isEqualTo(1);
             store = (WorkloadClaimStore) Proxy.newProxyInstance(WorkloadClaimStore.class.getClassLoader(),
                     new Class<?>[]{DeadlineWorkloadClaimStore.class}, (proxy, method, args) -> {
-                        if (method.getName().equals("withDeadline")) {
+                        if (method.getName().equals("withDeadline") || method.getName().equals("withRenewalDeadline")) {
                             return bounded((long) args[0], args.length == 3 ? (Runnable) args[1] : () -> {},
                                     (Supplier<?>) args[args.length - 1]);
                         }
@@ -192,14 +187,14 @@ class PipelineActuationRenewalChurnTest {
             if (renewed.isPresent() && lane != null && lane > 0 && !stopping.get()) {
                 queues.get(lane).add(id);
                 long until = System.nanoTime() + Duration.ofSeconds(1).toNanos();
-                while (!stopping.get() && !gate.hasQueuedThread(laneThreads.get(lane)) && System.nanoTime() < until) Thread.sleep(1);
-                if (!stopping.get()) assertThat(gate.hasQueuedThread(laneThreads.get(lane))).isTrue();
+                while (!stopping.get() && id.equals(current.get(lane)) && System.nanoTime() < until) Thread.sleep(1);
+                if (!stopping.get()) assertThat(current.get(lane)).as("the successor advanced while renewal IO was still active").isNotEqualTo(id);
             }
             return renewed;
         }
 
         private void replaceRenewedClaims(PipelineActuationOwnership owner, int lane) {
-            laneThreads.set(lane, Thread.currentThread());ready.countDown();
+            ready.countDown();
             try {
                 while (!stopping.get()) {
                     String old = queues.get(lane).poll(100, TimeUnit.MILLISECONDS);
