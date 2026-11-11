@@ -212,8 +212,15 @@ public final class GroupStage {
      * @param fields  the fields whose derived state differed, in declared order, with {@link #MEMBERS}
      *                first when the count of rows itself differed
      * @param outcome after a repair, the group as it is now, to be sent on; null after a check
+     * @param failure why the group, computed from its rows, cannot be given exactly; null when it can
+     * @param failedField the field that failure is about
      */
-    public record Audit(List<Object> group, Verdict verdict, List<String> fields, GroupOutcome outcome) {
+    public record Audit(List<Object> group, Verdict verdict, List<String> fields, GroupOutcome outcome,
+            RollupError failure, String failedField) {
+
+        Audit(List<Object> group, Verdict verdict, List<String> fields, GroupOutcome outcome) {
+            this(group, verdict, fields, outcome, null, null);
+        }
     }
 
     /**
@@ -249,7 +256,9 @@ public final class GroupStage {
         if (rebuilt == null) {
             return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
         }
-        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, null);
+        GroupOutcome now = outcome(rebuilt.totals, false, 0, 0);
+        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, null,
+                now.failure(), now.failedField());
     }
 
     /**
@@ -300,7 +309,8 @@ public final class GroupStage {
         GroupOutcome shown = new GroupOutcome(now.group(), true, now.members(), now.values(), now.failure(),
                 now.failureArgs(), now.failedField(), 0, 0,
                 rebuilt.totals.lastGood, rebuilt.totals.lastGoodAt, rebuilt.totals.failedSince);
-        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, shown);
+        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, shown,
+                now.failure(), now.failedField());
     }
 
     /**

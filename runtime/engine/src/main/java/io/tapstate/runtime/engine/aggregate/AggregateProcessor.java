@@ -90,6 +90,10 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     private final LevelBounds bounds;
     private final ReplayFloorFactory replayFloor;
     private final Sweep sweep;
+    /** The pipeline the step belongs to, under which it can be asked to check or repair; null when it cannot. */
+    private final String pipeline;
+    private AggregateRequests.Inbox requests;
+    private com.hazelcast.core.HazelcastInstance member;
     private final List<String> groupNames;
 
     private ReplayFloor floor = ReplayFloor.NONE;
@@ -126,6 +130,16 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
      */
     public AggregateProcessor(String step, AggregateStepSpec spec, AggregateDefinition definition,
             AggregateStores stores, LevelBounds bounds, ReplayFloorFactory replayFloor, Sweep sweep) {
+        this(null, step, spec, definition, stores, bounds, replayFloor, sweep);
+    }
+
+    /**
+     * @param pipeline the pipeline the step belongs to; with one, the step answers checks and repairs
+     *                 addressed to it on the member it runs on
+     */
+    public AggregateProcessor(String pipeline, String step, AggregateStepSpec spec, AggregateDefinition definition,
+            AggregateStores stores, LevelBounds bounds, ReplayFloorFactory replayFloor, Sweep sweep) {
+        this.pipeline = pipeline;
         this.replayFloor = Objects.requireNonNull(replayFloor, "replayFloor");
         this.sweep = Objects.requireNonNull(sweep, "sweep");
         this.step = Objects.requireNonNull(step, "step");
@@ -154,7 +168,71 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         this.membership = new MembershipStage(stores.open(context.hazelcastInstance(), step, AggregateStore.MEMBERS));
         this.groups = new GroupStage(spec, byGroup);
         this.floor = replayFloor.resolve(context.hazelcastInstance());
+        if (pipeline != null) {
+            this.member = context.hazelcastInstance();
+            this.requests = AggregateRequests.register(member, pipeline, step);
+        }
         this.nextSweepAt = System.currentTimeMillis() + sweep.pageMillis();
+    }
+
+    /** How many entries of one group a check or a repair holds in memory; a larger group is inconclusive. */
+    static final int AUDIT_ENTRIES = 50_000;
+
+    /**
+     * Answers one waiting check or repair. It runs where events are applied and between two drains, so
+     * the groups it reads are not being written, and what a repair sends on is queued behind everything
+     * already owed downstream.
+     */
+    private void answerOneRequest() {
+        AggregateRequests.Waiting waiting = requests == null ? null : requests.poll();
+        if (waiting == null) {
+            return;
+        }
+        try {
+            AggregateRequests.Request request = waiting.request();
+            List<List<Object>> asked;
+            byte[] next = null;
+            if (request.group() != null) {
+                asked = List.of(request.group());
+            } else {
+                GroupStage.Groups page = groups.groups(request.after(), request.groups());
+                asked = page.groups();
+                next = page.next();
+            }
+            List<AggregateRequests.Finding> findings = new ArrayList<>();
+            long ts = System.currentTimeMillis();
+            for (List<Object> group : asked) {
+                GroupStage.Audit audit = request.action() == AggregateRequests.Action.REPAIR
+                        ? groups.repair(group, AUDIT_ENTRIES)
+                        : groups.check(group, AUDIT_ENTRIES);
+                GroupOutcome outcome = audit.outcome();
+                if (outcome != null) {
+                    // Sent on with no source position: it is the group as stored, not the effect of an event.
+                    if (outcome.failure() != null && outcome.members() > 0) {
+                        withheldGroups++;
+                        pending.add(held(outcome, ts));
+                    } else {
+                        pending.add(row(outcome, ts));
+                    }
+                }
+                if (audit.verdict() != GroupStage.Verdict.CLEAN || audit.failure() != null) {
+                    findings.add(new AggregateRequests.Finding(group, audit.verdict().name().toLowerCase(java.util.Locale.ROOT),
+                            audit.fields(), audit.failure() == null ? null : AggregateError.of(audit.failure()).code(),
+                            audit.failedField()));
+                }
+            }
+            waiting.answer().complete(new AggregateRequests.Report(asked.size(), findings, next, conflicts, withheldGroups));
+        } catch (RuntimeException failed) {
+            waiting.answer().completeExceptionally(failed);
+            throw failed;
+        }
+    }
+
+    @Override
+    public void close() {
+        if (requests != null) {
+            AggregateRequests.unregister(member, pipeline, step, requests);
+        }
     }
 
     /**
@@ -215,6 +293,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             }
             // Under steady input the idle call may not come for a long time; the sweep paces itself.
             sweepWhenDue();
+            answerOneRequest();
         } finally {
             timer.end(started);
         }
@@ -348,6 +427,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         }
         if (taken == 0) {
             sweepWhenDue();
+            answerOneRequest();
         }
         return true;
     }

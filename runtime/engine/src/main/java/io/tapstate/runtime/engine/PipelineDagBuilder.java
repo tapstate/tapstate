@@ -493,10 +493,11 @@ public final class PipelineDagBuilder {
                     AggregateDefinition definition = AggregateDefinition.of(upstream, spec);
                     ReplayFloorFactory aggregateFloor = bindings.aggregate().replayFloor();
                     AggregateProcessor.Sweep sweep = bindings.aggregate().sweep();
+                    String pipelineId = pipeline.id();
                     String name = step.id();
                     SupplierEx<Processor> processors = axes == null
-                            ? () -> new AggregateProcessor(name, spec, definition, stores, null, aggregateFloor, sweep)
-                            : () -> new AggregateProcessor(name, spec, definition, stores,
+                            ? () -> new AggregateProcessor(pipelineId, name, spec, definition, stores, null, aggregateFloor, sweep)
+                            : () -> new AggregateProcessor(pipelineId, name, spec, definition, stores,
                                     new LevelBounds(carried, axes, LevelBounds.HOLDS_NOTHING), aggregateFloor, sweep);
                     Vertex vertex = dag.newVertex(name,
                             TotalOne.passingBounds(ProcessorSupplier.of(processors), name, axes, carried));

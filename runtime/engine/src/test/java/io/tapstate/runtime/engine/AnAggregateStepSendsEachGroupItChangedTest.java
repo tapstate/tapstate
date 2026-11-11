@@ -25,6 +25,7 @@ import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Step;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.runtime.engine.aggregate.AggregateProcessor;
+import io.tapstate.runtime.engine.aggregate.AggregateRequests;
 import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.WriteResult;
@@ -82,6 +83,7 @@ class AnAggregateStepSendsEachGroupItChangedTest {
     private static final List<Envelope> WRITTEN = Collections.synchronizedList(new ArrayList<>());
     /** What the source of the next run emits; a job carries no events of its own. */
     private static volatile List<Envelope> SCRIPT = List.of();
+    private static volatile boolean HELD;
 
     private HazelcastInstance member;
 
@@ -240,6 +242,10 @@ class AnAggregateStepSendsEachGroupItChangedTest {
     }
 
     private void run(List<Envelope> events, String yaml, ReplayFloorFactory floor) {
+        start(events, yaml, floor).join();
+    }
+
+    private com.hazelcast.jet.Job start(List<Envelope> events, String yaml, ReplayFloorFactory floor) {
         PipelineResource pipeline = (PipelineResource) new DslParser().parse(yaml);
         Step.Inline step = (Step.Inline) pipeline.transforms().getFirst();
         Map<String, ValueType> columns = new LinkedHashMap<>();
@@ -263,7 +269,69 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 sourceId -> List.of("orders"))
                 .withAggregate(new AggregateBinding(ignored -> spec, stores, floor,
                         new AggregateProcessor.Sweep(200, 0, 0)));
-        member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings)).join();
+        return member.getJet().newJob(PipelineDagBuilder.build(pipeline, bindings));
+    }
+
+    private AggregateRequests.Report ask(AggregateRequests.Request request) throws Exception {
+        long giveUp = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (true) {
+            var answer = AggregateRequests.offer(member, "sales", "by_region", request);
+            if (answer.isPresent()) {
+                return answer.get().get(30, java.util.concurrent.TimeUnit.SECONDS);
+            }
+            assertThat(System.nanoTime()).as("the step registers once it runs").isLessThan(giveUp);
+            Thread.sleep(20);
+        }
+    }
+
+    @Test
+    @DisplayName("a running step checks its groups against their rows when asked, and a repair sends the group again")
+    void aRunningStepAnswersACheckAndARepair() throws Exception {
+        run(List.of(insert(1, 1, "EU", "open", "100.00"), insert(3, 2, "US", "open", "5.00")));
+        Stored groups = STORES.get("by_region/GROUPS");
+        byte[] eu = totalsKey("EU");
+        byte[] stale = groups.entries.get(eu);
+        run(List.of(insert(2, 3, "EU", "open", "40.50")));
+        // The totals of when EU held one order, beside the rows of two.
+        groups.entries.put(eu, stale);
+        WRITTEN.clear();
+
+        HELD = true;
+        try {
+            com.hazelcast.jet.Job job = start(List.of(), YAML, ReplayFloorFactory.NONE);
+
+            AggregateRequests.Report found = ask(AggregateRequests.Request.page(AggregateRequests.Action.CHECK, null, 10));
+            assertThat(found.groups()).isEqualTo(2);
+            assertThat(found.next()).isNull();
+            assertThat(found.findings()).singleElement().satisfies(finding -> {
+                assertThat(finding.group()).containsExactly("EU");
+                assertThat(finding.verdict()).isEqualTo("mismatch");
+                assertThat(finding.fields()).containsExactly("(rows)", "orders", "revenue");
+            });
+            assertThat(WRITTEN).as("a check sends nothing").isEmpty();
+
+            AggregateRequests.Report repaired = ask(AggregateRequests.Request.one(AggregateRequests.Action.REPAIR, List.of("EU")));
+            assertThat(repaired.findings()).singleElement()
+                    .satisfies(finding -> assertThat(finding.fields()).containsExactly("(rows)", "orders", "revenue"));
+
+            AggregateRequests.Report after = ask(AggregateRequests.Request.page(AggregateRequests.Action.CHECK, null, 10));
+            assertThat(after.findings()).isEmpty();
+            HELD = false;
+            job.join();
+        } finally {
+            HELD = false;
+        }
+        assertThat(lastPerGroup().get("EU").after())
+                .containsEntry("orders", 2L).containsEntry("revenue", new BigDecimal("140.50"));
+        assertThat(AggregateRequests.runsOn(member, "sales", "by_region")).as("a stopped step takes no request").isFalse();
+    }
+
+    private static byte[] totalsKey(String region) {
+        byte[] group = io.tapstate.core.dsl.aggregate.OrderedBytes.ofKey(List.of(region));
+        byte[] key = new byte[group.length + 1];
+        key[0] = 0x01;
+        System.arraycopy(group, 0, key, 1, group.length);
+        return key;
     }
 
     private static Map<Object, Envelope> lastPerGroup() {
@@ -310,7 +378,8 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 }
                 next++;
             }
-            return true;
+            // A held source keeps the job running, the way a live pipeline is, until the test lets go.
+            return !HELD;
         }
     }
 
