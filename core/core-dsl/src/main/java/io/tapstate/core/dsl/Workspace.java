@@ -47,6 +47,7 @@ public final class Workspace {
         ModeRules.validate(byId.values());
         RenameRules.validate(byId.values());
         UnwindRules.validate(byId.values());
+        AggregateStepRules.validate(byId.values());
         return new Workspace(byId);
     }
 

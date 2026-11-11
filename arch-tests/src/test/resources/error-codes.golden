@@ -37,6 +37,12 @@ actuation.view-storage-tier-unsupported
 actuation.view-store-is-a-capture-source
 actuation.view-store-not-configured
 actuation.view-store-unreachable
+aggregate.expression-invalid
+aggregate.input-not-supported
+aggregate.key-required
+aggregate.name-conflict
+aggregate.type-unknown
+aggregate.upstream-filter-unsafe
 alert.channel-not-accepted
 alert.channel-result-unknown
 alert.channel-unavailable

@@ -1462,3 +1462,21 @@ io.store-quota-exceeded:
   solution: "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
 control.storage-quota-exceeded:
   message: "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again."
+aggregate.input-not-supported:
+  message: "Aggregate step `{step}` reads `{from}`, which is {kind}."
+  solution: "An aggregate step reads one source table, or a `filter`, `map` or `union` step over source tables. To put totals into an assembled document, aggregate the table first and embed the result with a nest."
+aggregate.upstream-filter-unsafe:
+  message: "Aggregate step `{step}` reads the filter step `{filter}`, and source `{source}` does not send a row as it was before an update, so a row that stops matching would stay in its group."
+  solution: "Move the condition into the aggregate step's `where:`. The step remembers each row, so it removes a row that stops matching whether or not the source says what the row was."
+aggregate.key-required:
+  message: "Aggregate step `{step}` reads `{from}`, which has no primary key, and names no `key:`."
+  solution: "Add `key: [<columns>]` naming the columns that identify one input row. After a `union` of tables whose keys overlap, include the column that tells the tables apart."
+aggregate.name-conflict:
+  message: "Aggregate step `{step}` uses the name `{name}` for both a group and a field."
+  solution: "The output row holds the group names and the fields side by side. Rename one of them."
+aggregate.expression-invalid:
+  message: "Aggregate step `{step}`, `{field}`: its {part} does not check: {reason}"
+  solution: "Expressions read the input row as `after`, and `$column` names one of its columns. Check the names against the discovered model with `tapstate desc`."
+aggregate.type-unknown:
+  message: "Aggregate step `{step}`, field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved."
+  solution: "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."

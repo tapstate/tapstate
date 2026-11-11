@@ -1,6 +1,10 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.AggregateStepRules;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
+import io.tapstate.core.dsl.aggregate.ValueType;
+import io.tapstate.core.model.RollupFunction;
 import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.StringType;
 import io.tapstate.core.dsl.RowExpressions;
@@ -197,6 +201,12 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * and nothing here may work a row's shape out from one of those.
      */
     static NodeColumns of(TransformBody body, Map<String, NodeColumns> inputs, JoinPlan compiledJoin) {
+        return of(null, body, inputs, compiledJoin);
+    }
+
+    /** The same, for a caller that can say which step this is, so a refusal can name it. */
+    static NodeColumns of(String step, TransformBody body, Map<String, NodeColumns> inputs,
+            JoinPlan compiledJoin) {
         return switch (body) {
             case TransformBody.Js ignored ->
                     unknown("js: a script settles its own columns while it runs, not before");
@@ -212,13 +222,46 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             // not to touch a column, so folding them together would make a later change to one of
             // them silently a change to the other.
             case TransformBody.Union ignored -> merged(inputs.values());
-            // The group names and the fields, typed by the functions. Until the typed output of the
-            // function library is wired here, the step says it has no answer rather than guess one.
-            case TransformBody.Aggregate ignored ->
-                    unknown("aggregate: the output columns of a grouped step are not worked out yet");
+            case TransformBody.Aggregate aggregate ->
+                    grouped(step == null ? "aggregate" : step, aggregate, merged(inputs.values()));
             case TransformBody.Nest nest -> rootOf(nest, inputs);
             case TransformBody.Join ignored -> published(compiledJoin);
         };
+    }
+
+    /**
+     * What a grouped step produces: the group names, then the fields, each typed by its function. None
+     * of the input's columns travels on, and the rows are told apart by the group names alone.
+     *
+     * <p>Every expression is checked against the input here, so a group expression or a field that does
+     * not hold is refused with the step's code when the pipeline is applied. A group value may be null,
+     * as in SQL, and so may every field but a count: a group whose rows all carry null has no sum.
+     */
+    private static NodeColumns grouped(String step, TransformBody.Aggregate aggregate, NodeColumns upstream) {
+        if (!upstream.known()) {
+            return upstream;
+        }
+        Map<String, ValueType> input = new LinkedHashMap<>();
+        upstream.columns().forEach((name, declared) -> {
+            TapstateType type = JoinSchemaDrift.typeOf(declared);
+            NumericType numeric = upstream.numericTypes().get(name);
+            input.put(name, type == TapstateType.DECIMAL
+                    ? ValueType.decimal(numeric == null ? null : numeric.scale()) : ValueType.of(type));
+        });
+        AggregateStepSpec spec = AggregateStepRules.shape(step, aggregate, input, true);
+        Map<String, String> columns = new LinkedHashMap<>();
+        Map<String, NumericType> numbers = new LinkedHashMap<>();
+        spec.outputColumns().forEach((name, type) -> {
+            boolean count = spec.fields().stream().anyMatch(field -> field.field().equals(name)
+                    && (field.function() == RollupFunction.COUNT
+                            || field.function() == RollupFunction.COUNT_DISTINCT));
+            columns.put(name, JoinSchemaDrift.declaredType(type.type(), !count));
+            if (type.type() == TapstateType.DECIMAL && type.scale() != null) {
+                numbers.put(name, new NumericType(null, null, null, null, null, null, 38, type.scale()));
+            }
+        });
+        return new NodeColumns(columns, spec.outputKey(), null, identityOrigins(columns), false,
+                numbers, Set.of(), Map.of());
     }
 
     /**

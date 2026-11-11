@@ -1,0 +1,60 @@
+package io.tapstate.core.dsl.aggregate;
+
+import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.TapstateErrorCode;
+
+import java.util.Set;
+
+/**
+ * The refusals of an aggregate step that are judged before a row arrives: what it reads, how its input
+ * rows are identified, and whether its names and expressions hold against the input's columns. A field
+ * naming no known function is refused where the field is written, with the code a rollup field gets.
+ *
+ * <p>Codes are an external contract and append-only.
+ */
+public enum AggregateError implements TapstateErrorCode {
+
+    /** The step reads something other than one source table or a filter, map or union over source tables. */
+    INPUT_NOT_SUPPORTED("aggregate.input-not-supported", Set.of("step", "from", "kind")),
+
+    /**
+     * A filter step sits between the source and the step, and the source does not send the row as it was
+     * before an update: a row that stops matching would stay in its group.
+     */
+    UPSTREAM_FILTER_UNSAFE("aggregate.upstream-filter-unsafe", Set.of("step", "filter", "source")),
+
+    /** The input has no primary key and the step names no {@code key}. */
+    KEY_REQUIRED("aggregate.key-required", Set.of("step", "from")),
+
+    /** One name is used twice across the group names and the fields. */
+    NAME_CONFLICT("aggregate.name-conflict", Set.of("step", "name")),
+
+    /** A key column, group expression, predicate, argument, ordering, filter, type or default does not check. */
+    EXPRESSION_INVALID("aggregate.expression-invalid", Set.of("step", "field", "part", "reason")),
+
+    /** A sum or average reads a value whose numeric type nothing resolved. */
+    TYPE_UNKNOWN("aggregate.type-unknown", Set.of("step", "field", "expression"));
+
+    private final String code;
+    private final Set<String> placeholders;
+
+    AggregateError(String code, Set<String> placeholders) {
+        this.code = code;
+        this.placeholders = placeholders;
+    }
+
+    @Override
+    public String code() {
+        return code;
+    }
+
+    @Override
+    public Severity severity() {
+        return Severity.ERROR;
+    }
+
+    @Override
+    public Set<String> placeholders() {
+        return placeholders;
+    }
+}
