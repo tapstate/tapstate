@@ -61,8 +61,17 @@ public final class RollupFold {
         for (int i = 0; i < n; i++) {
             accumulators[i] = Aggregates.of(specs.get(i).function()).init(specs.get(i).argumentType());
         }
+        boolean needsBinding = false;
+        for (RollupSpec spec : specs) {
+            needsBinding |= !bare(spec.argument()) || !bare(spec.filter());
+            for (String order : spec.by()) {
+                needsBinding |= !bare(order);
+            }
+        }
         for (RollupElement element : ordered) {
-            Map<String, Object> row = bound(element.values());
+            // Binding copies the element for the expression language; a field that only reads columns by name
+            // reads them straight off the element instead, which is most fields and nearly all of the cost.
+            Map<String, Object> row = needsBinding ? bound(element.values()) : element.values();
             for (int i = 0; i < n; i++) {
                 RollupSpec spec = specs.get(i);
                 if (incomplete[i]) {
@@ -127,6 +136,10 @@ public final class RollupFold {
      */
     private static Object evaluate(RollupSpec spec, String expr, boolean predicate, Map<String, Object> row,
             String root) {
+        String column = bareColumn(expr);
+        if (column != null && !predicate) {
+            return row.get(column);
+        }
         CelRuntime.Program program = PROGRAMS.computeIfAbsent((predicate ? "?" : "=") + expr, key -> {
             try {
                 return RUNTIME.createProgram(RollupExpressions.evaluableAst(expr, predicate));
@@ -143,6 +156,19 @@ public final class RollupFold {
             throw new TapstateException(RollupError.EVALUATION_FAILED, Map.of("field", spec.field(),
                     "root", root, "expression", expr, "reason", String.valueOf(e.getMessage())), e);
         }
+    }
+
+    /** The column {@code expr} only reads ({@code after.amount}), or null when it does anything more. */
+    private static String bareColumn(String expr) {
+        if (expr == null || !expr.startsWith("after.")) {
+            return null;
+        }
+        String column = expr.substring("after.".length());
+        return RollupExpressions.isColumnName(column) ? column : null;
+    }
+
+    private static boolean bare(String expr) {
+        return expr == null || bareColumn(expr) != null;
     }
 
     private static TapstateException coded(AggregateFailure failure, RollupSpec spec, String root) {
