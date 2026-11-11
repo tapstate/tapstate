@@ -8,6 +8,8 @@ import java.util.Objects;
 /** Explicit compiled coordinates shared by manifest assembly and the stores that consume it. */
 public final class OperatorMapCoordinates {
     public enum NestMap { STATE, PARKING, LOOKUP, REFERENCES }
+    /** The two stores of an aggregate step: where each input row is, and what each group holds. */
+    public enum AggregateStore { MEMBERS, GROUPS }
     private OperatorMapCoordinates() {}
 
     /** A readable canonical JSON array; root and every authored path retain distinct identities. */
@@ -46,6 +48,12 @@ public final class OperatorMapCoordinates {
     }
     public static OperatorPlacement nest(PipelineIntentScope scope,String database,String step,List<String> path,NestMap kind,String alias) {
         return new OperatorPlacement(scope,database,OperatorPlacement.Resource.NEST_STATE,step,path(path),nestNamespace(kind,alias));
+    }
+    public static String aggregateNamespace(AggregateStore kind) {
+        return switch(Objects.requireNonNull(kind,"kind")) { case MEMBERS -> "members"; case GROUPS -> "groups"; };
+    }
+    public static OperatorPlacement aggregate(PipelineIntentScope scope,String database,String step,AggregateStore kind) {
+        return new OperatorPlacement(scope,database,OperatorPlacement.Resource.AGGREGATE_STATE,step,"root",aggregateNamespace(kind));
     }
     public static OperatorPlacement join(PipelineIntentScope scope,String database,String step,OperatorPlacement.Resource kind,String alias) {
         return new OperatorPlacement(scope,database,kind,step,"root",joinNamespace(kind,alias));

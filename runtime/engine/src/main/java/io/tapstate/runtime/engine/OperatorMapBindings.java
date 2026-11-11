@@ -9,6 +9,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
 import io.tapstate.spi.store.NestReleaseStore;
 import io.tapstate.spi.store.OperatorPlacement;
+import io.tapstate.spi.store.OrderedStateStore;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -39,10 +40,15 @@ public final class OperatorMapBindings implements AutoCloseable {
         final OperatorMapBinding binding;
         final AtomicBoolean active = new AtomicBoolean(true);
         KeyedStateStore store;
+        OrderedStateStore ordered;
         Bound(OperatorMapBinding binding) { this.binding = binding; }
-        void initialize() { store = forMap(this, Objects.requireNonNull(provider.open(binding, this::requireActive), "operator state handle")); }
+        void initialize() {
+            KeyedStateStore cold = Objects.requireNonNull(provider.open(binding, this::requireActive), "operator state handle");
+            store = forMap(this, cold);
+            ordered = !binding.placement().resource().keptInAMap() && cold instanceof OrderedStateStore direct ? forStage(this, direct) : null;
+        }
         void requireActive() { if (closed || !active.get()) throw fenced(); }
-        void retire() { active.set(false); store = null; }
+        void retire() { active.set(false); store = null; ordered = null; }
     }
     private HazelcastInstance member;
     private final Provider provider;
@@ -180,6 +186,17 @@ public final class OperatorMapBindings implements AutoCloseable {
         return original.store;
     }
 
+    /**
+     * The store an aggregate stage reads and commits through. There is no map in between: the stage holds
+     * what it read only for the commit it is forming, and every operation asks again whether this
+     * execution's binding is still the installed one.
+     */
+    public synchronized OrderedStateStore aggregate(String name) {
+        Bound original = require(name);
+        if (original.binding.placement().resource() != OperatorPlacement.Resource.AGGREGATE_STATE || original.ordered == null) throw fenced();
+        return original.ordered;
+    }
+
     public synchronized KeyedStateStore initializingNest(String namespace, String configuredDatabase) {
         return initializing(namespace, true, configuredDatabase);
     }
@@ -290,6 +307,15 @@ public final class OperatorMapBindings implements AutoCloseable {
             @Override public void delete(String namespace, String key) { check(namespace); cold.delete(coldName, key); }
             @Override public void dropNamespace(String namespace) { check(namespace); cold.dropNamespace(coldName); }
             @Override public long count(String namespace) { check(namespace); return cold.count(coldName); }
+        };
+    }
+    private OrderedStateStore forStage(Bound original, OrderedStateStore cold) {
+        return new OrderedStateStore() {
+            @Override public List<byte[]> loadAll(List<byte[]> keys) { original.requireActive(); return cold.loadAll(keys); }
+            @Override public void commit(List<Entry> saves, List<byte[]> deletes) { original.requireActive(); cold.commit(saves, deletes); }
+            @Override public Limit commitLimit() { return cold.commitLimit(); }
+            @Override public Optional<Entry> first(byte[] from, byte[] to, End end) { original.requireActive(); return cold.first(from, to, end); }
+            @Override public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) { original.requireActive(); return cold.scan(from, to, after, limit); }
         };
     }
     private Bound require(String name) { requireOpen(); Bound held = hotMaps.get(name); if (held == null) throw fenced(); held.requireActive(); return held; }
