@@ -556,6 +556,15 @@ dsl.join-input-not-a-table:
 dsl.join-input-is-a-pattern:
   message: "Join `{step}` at {path} binds alias `{alias}` to the pattern `/{pattern}/`, but a join input must name one source table."
   solution: "Write the table's name instead of a pattern, for example `{alias}: orders`. A join reads one table per alias: its SQL names that table's columns and its rows are keyed on that table's primary key. A pattern names a set that can change, so it is refused even where it matches a single table today."
+dsl.rollup-function-unknown:
+  message: "Rollup field `{field}` at {path} names `{function}` as its function; a rollup field names exactly one of {known}."
+  solution: "Write one function key with its argument, for example `{field}: { sum: $amount }`. The qualifiers `filter`, `type` and `default` go beside it."
+dsl.rollup-on-single-row-embed:
+  message: "The embed at {path} is `as: {as}` and holds at most one row, so it cannot carry rollup fields."
+  solution: "Read the row's columns directly, or declare the embed `as: array` (or `as: rollup` when the rows should not be shown) if it gathers many rows."
+dsl.rollup-level-without-fields:
+  message: "The embed at {path} is `as: rollup` but declares no `rollup:` fields, so it would be held and never shown."
+  solution: "Add the fields to compute over it under `rollup:`, or declare it `as: array` to render its rows."
 dsl.malformed-yaml:
   message: "Malformed YAML: {detail}."
   solution: "Fix the YAML syntax; the line and column point at the problem."
@@ -1124,6 +1133,30 @@ nest.parent-absent:
 nest.state-served-from-cold-layer:
   message: "Nest namespace {namespace} completed {backfills} cold loader callbacks for {accesses} logical state accesses; cold key share {share}, {millis} per callback; {entries} of {stored} entries are in memory ({resident})."
   solution: "Inspect cold-key traffic, backend latency and batching. Increase the in-memory entry budget only when the measured working set and available memory justify it."
+nest.rollup-on-reference-embed:
+  message: "The embed at {embedPath} is one its parent points at, so it holds at most one row and cannot carry rollup fields."
+  solution: "Read the referenced row's columns directly, for example in a rollup field one level up: `=after.<path>.<column>`."
+nest.rollup-field-conflict:
+  message: "Rollup field `{field}` on {level} is already taken by {other}."
+  solution: "Rename the rollup field. Columns, embed paths, flat fields and rollup fields share one namespace per level, and none overwrites another by declaration order."
+nest.rollup-expression-invalid:
+  message: "Rollup field `{field}`: its {part} does not check: {reason}"
+  solution: "Arguments, orderings and filters read the element as `after`: its own columns, its references' columns (`after.<path>.<column>`) and its child levels' rollup fields. Check the names against the discovered model with `tapstate desc`."
+nest.rollup-type-unknown:
+  message: "Rollup field `{field}` sums or averages `{expression}`, whose numeric type nothing resolved."
+  solution: "Discover the source so the column has a type, or compute over a column whose type is known. A sum's type is fixed when the pipeline is applied, so it is never guessed from the values."
+nest.rollup-overflow:
+  message: "Rollup field `{field}` of document {root} does not fit in {type}."
+  solution: "The value is not rounded or wrapped. Check the source rows for an outlier; a total that truly needs more digits than a decimal(38) holds cannot be a rollup field."
+nest.rollup-value-type-mismatch:
+  message: "Rollup field `{field}` of document {root} met a {actual} value where its column was declared {declared}."
+  solution: "The value is not coerced. Fix the row, or rediscover the source if the column's declared type has changed."
+nest.rollup-result-not-convertible:
+  message: "Rollup field `{field}` of document {root} is the {from} value that `type: {to}` cannot hold exactly."
+  solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal)."
+nest.rollup-evaluation-failed:
+  message: "Rollup field `{field}` of document {root} could not evaluate `{expression}`: {reason}"
+  solution: "Check the element's values against what the expression expects; a field the element does not carry reads as null, any other failure stops the document rather than guessing."
 nest.key-change-tracking-requires-before-image:
   message: "Stream {alias} tracks structural key changes, but the row an update of source table {table} replaces does not carry {columns}."
   solution: "Configure that source to send whole row images rather than minimal ones - on MySQL that is binlog_row_image=FULL, on PostgreSQL a full replica identity on the table - or turn key tracking off for that stream. A minimal image sends the columns identifying the row and nothing else, so the earlier row arrives without the one this compares and reads as a row that used to hang under nothing."

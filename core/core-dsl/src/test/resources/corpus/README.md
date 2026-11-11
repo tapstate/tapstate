@@ -43,6 +43,7 @@ cdc read, and `srs.enabled: false`.
 | `s13-srs-disabled-passthrough` | §4 | cdc with the Shared Record Store off | `srs.enabled: false` — D14 lightweight passthrough path (read amendment) |
 | `s14-srs-override-on-source-ref` | §4 / X13 | per-source-reference Shared Record Store switch | object and bare-string `source:` elements in one list; scalar sugar does not apply to a single object |
 | `s15-unwind-order-lines` | §5 | one row per element of a list | `type: unwind` with all five payload keys, keyed by `element_key` with the ordinal carried alongside |
+| `s17-modeling-nest-rollup` | §5 | nest with rollup fields | `rollup:` on an `as: array` embed (`count: true`, a filtered `sum` with `default:`), and an `as: rollup` level carrying a `last` with a list `by` |
 
 ## invalid/ — minimal self-contained violation batches
 
@@ -78,6 +79,9 @@ together):
 | `unwind-needs-an-upsert-target` | an unwind whose rows reach a sync that appends, where a delete is written as another row | unwind |
 | `join-input-not-a-table` | a join's `from:` map names another step of the pipeline rather than a source table | §5 |
 | `join-input-is-a-pattern` | a join's `from:` map binds an alias to a `/…/` pattern rather than one table | §5 |
+| `rollup-function-unknown` | a rollup field names no function from the library, an unknown one, or more than one | nest rollup |
+| `rollup-on-single-row-embed` | `rollup:` on an `as: object` or `as: flat` embed, which holds at most one row | nest rollup |
+| `rollup-level-without-fields` | `as: rollup` with no `rollup:` fields, a level that would be held and never shown | nest rollup |
 
 Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general grammar rule):
 
@@ -115,6 +119,9 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g17-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
 | `g18-unwind-without-an-element-key` | unwind-needs-an-element-key | `type: unwind` with neither `element_key` nor `include_array_index` |
 | `g19-unwind-into-an-append-target` | unwind-needs-an-upsert-target | a keyed `type: unwind` served to a sync with `write_mode: append` |
+| `g20-rollup-function-unknown` | rollup-function-unknown | rollup field `total: { summ: ... }`, a typo of `sum` |
+| `g21-rollup-on-object-embed` | rollup-on-single-row-embed | `rollup:` on an `as: object` embed |
+| `g22-rollup-level-without-fields` | rollup-level-without-fields | `as: rollup` with no `rollup:` map |
 
 Connector-dimension variants (capability matrix, config field checks) are validated against the
 bundled catalog by plan task C3. The catalog's mode signal is trusted only where it is reliable —

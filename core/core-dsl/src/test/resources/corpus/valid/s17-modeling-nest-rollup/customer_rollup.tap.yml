@@ -1,0 +1,39 @@
+# Modeling pipeline: nest with rollup fields - a count and a filtered sum over an array, and a latest
+# value over a level kept only for its rollups.
+version: tapstate/v1
+kind: pipeline
+id: customer_rollup
+source: src_ins
+transforms:
+  - id: clean
+    from: [CUSTOMERS]
+    type: map
+    fields: { customer_id: $CUST_ID, name: $CUST_NAME }
+  - id: c360
+    type: nest
+    from: { customer: clean, policy: POLICIES, claim: CLAIMS }
+    root:
+      from: customer
+      key: [customer_id]
+      embed:
+        - from: policy
+          on: { CUST_ID: customer_id }
+          as: array
+          path: policies
+          arrayKey: [POLICY_ID]
+          rollup:
+            policy_count: { count: true }
+            active_premium: { sum: $PREMIUM, filter: "=after.STATUS == 'active'", default: 0 }
+        - from: claim
+          on: { CUST_ID: customer_id }
+          as: rollup
+          arrayKey: [CLAIM_ID]
+          rollup:
+            latest_claim: { last: { value: $CLAIM_ID, by: [ $FILED_AT, $CLAIM_ID ] } }
+view:
+  id: customer_rollup
+  from: c360
+  primary_key: customer_id
+serve:
+  from: customer_rollup
+  query: [ { type: rest } ]

@@ -1511,9 +1511,39 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         if (map.get("plan") != null && plan == null || awaitingRebalance == null) {
             return null;
         }
+        List<ExplainOutcome.Rollup> rollups = explanationRollups(map.get("rollups"));
+        if (rollups == null) {
+            return null;
+        }
         return new ExplainOutcome.Found(pipelineId, state, kind, message, (String) rawObservedAt,
                 rawAge == null ? null : ((Number) rawAge).longValue(), freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups);
+    }
+
+    /** The rollup fields an explanation lists; absent is none, and anything malformed is no answer. */
+    private static List<ExplainOutcome.Rollup> explanationRollups(Object raw) {
+        if (raw == null) {
+            return List.of();
+        }
+        if (!(raw instanceof List<?> list)) {
+            return null;
+        }
+        List<ExplainOutcome.Rollup> rollups = new ArrayList<>();
+        for (Object item : list) {
+            if (!(item instanceof Map<?, ?> r)) {
+                return null;
+            }
+            List<String> references = r.get("references") == null ? List.of() : strings(r.get("references"));
+            if (!(r.get("step") instanceof String step) || !(r.get("level") instanceof String level)
+                    || !(r.get("embed") instanceof String embed) || !(r.get("field") instanceof String field)
+                    || !(r.get("function") instanceof String function) || references == null) {
+                return null;
+            }
+            rollups.add(new ExplainOutcome.Rollup(step, level, embed, field, function,
+                    r.get("argument") instanceof String argument ? argument : null,
+                    r.get("filter") instanceof String filter ? filter : null, references));
+        }
+        return rollups;
     }
 
     private static ExplainOutcome.Plan explanationPlan(Object raw) {

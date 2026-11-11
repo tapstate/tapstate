@@ -1,0 +1,3 @@
+rule: rollup-level-without-fields
+path: transforms[1].root.embed[0].as
+note: "a rollup level renders nothing but its rollup fields, and this one declares none"

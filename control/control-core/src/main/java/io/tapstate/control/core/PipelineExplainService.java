@@ -8,6 +8,12 @@ import io.tapstate.control.core.PipelineExplanation.Next;
 import io.tapstate.control.core.PipelineExplanation.NextAction;
 import io.tapstate.control.core.PipelineExplanation.Source;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.dsl.RollupExpressions;
+import io.tapstate.core.model.Embed;
+import io.tapstate.core.model.PipelineResource;
+import io.tapstate.core.model.RollupPick;
+import io.tapstate.core.model.Step;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.lifecycle.ExecutionPlan;
 import io.tapstate.core.lifecycle.ExecutionPlans;
 import io.tapstate.core.lifecycle.FrontierStallPressure;
@@ -25,9 +31,11 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.function.Supplier;
 
@@ -85,7 +93,79 @@ public final class PipelineExplainService {
         Observation observation = observations.read(pipelineId).orElseThrow(() -> unobserved(pipelineId));
         ExecutionPlan plan = plans.current(List.of(pipelineId)).get(pipelineId);
         return diagnose(pipelineId, observation)
-                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()));
+                .withPlan(plan, plan == null ? List.of() : plan.notPlannedFor(members.get()))
+                .withRollups(rollupsOf(pipelineId));
+    }
+
+    /**
+     * The rollup fields the pipeline's stored definition declares, in tree order. Read from the definition
+     * rather than from the run, since what a field is computed from is a property of what was applied.
+     */
+    private List<PipelineExplanation.Rollup> rollupsOf(String pipelineId) {
+        List<PipelineExplanation.Rollup> rollups = new ArrayList<>();
+        artifacts.getResource(pipelineId).map(StoredResource::resource).ifPresent(resource -> {
+            if (resource instanceof PipelineResource pipeline && pipeline.transforms() != null) {
+                for (Step step : pipeline.transforms()) {
+                    if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                            && nest.root() != null) {
+                        collectRollups(step.id(), nest.root().embed(), List.of(), rollups);
+                    }
+                }
+            }
+        });
+        return rollups;
+    }
+
+    private static void collectRollups(String step, List<Embed> embeds, List<String> parent,
+            List<PipelineExplanation.Rollup> into) {
+        if (embeds == null) {
+            return;
+        }
+        String level = parent.isEmpty() ? "$root" : String.join(".", parent);
+        for (Embed embed : embeds) {
+            List<String> path = new ArrayList<>(parent);
+            path.add(embed.treeSegment());
+            Set<String> referencePaths = new LinkedHashSet<>();
+            if (embed.embed() != null) {
+                for (Embed child : embed.embed()) {
+                    if (child.path() != null) {
+                        referencePaths.add(child.path());
+                    }
+                }
+            }
+            embed.rollupFields().forEach((name, field) -> {
+                Object argument = field.argument();
+                List<String> written = new ArrayList<>();
+                String shown;
+                if (argument instanceof RollupPick pick) {
+                    written.add(pick.value());
+                    written.addAll(pick.by());
+                    shown = pick.value() + " by " + String.join(", ", pick.by());
+                } else if (argument instanceof String expression) {
+                    written.add(expression);
+                    shown = expression;
+                } else {
+                    shown = String.valueOf(argument);
+                }
+                if (field.filter() != null) {
+                    written.add(field.filter());
+                }
+                // Which of the embed's children the expressions read. Only a child the element points at can
+                // render absent while the element lives, and only those make the field null; reading a
+                // gathered child is listed too, since the author asked what the field depends on.
+                Set<String> read = new LinkedHashSet<>();
+                for (String expression : written) {
+                    for (String fieldRead : RollupExpressions.fieldsRead(expression)) {
+                        if (referencePaths.contains(fieldRead)) {
+                            read.add(fieldRead);
+                        }
+                    }
+                }
+                into.add(new PipelineExplanation.Rollup(step, level, String.join(".", path), name,
+                        field.function().yaml(), shown, field.filter(), List.copyOf(read)));
+            });
+            collectRollups(step, embed.embed(), path, into);
+        }
     }
 
     private PipelineExplanation diagnose(String pipelineId, Observation observation) {

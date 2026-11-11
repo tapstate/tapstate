@@ -33,7 +33,8 @@ public record PipelineExplanation(
         Next next,
         Pending pending,
         ExecutionPlan plan,
-        List<String> awaitingRebalance) {
+        List<String> awaitingRebalance,
+        List<Rollup> rollups) {
 
     public PipelineExplanation {
         Objects.requireNonNull(pipelineId, "pipelineId");
@@ -45,12 +46,21 @@ public record PipelineExplanation(
         cannotSay = List.copyOf(Objects.requireNonNull(cannotSay, "cannotSay"));
         // Absent reads as none: the wire omits an empty list, and an explanation read back from it names nobody.
         awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
+        rollups = rollups == null ? List.of() : List.copyOf(rollups);
         if ((observedAt == null) != (observedAgeMillis == null)) {
             throw new IllegalArgumentException("observation time and age are both present or both absent");
         }
         if (kind == Kind.NO_MATCH && cannotSay.isEmpty()) {
             throw new IllegalArgumentException("a no-match explanation names what it cannot say");
         }
+    }
+
+    /** An explanation that lists no rollup fields. */
+    public PipelineExplanation(String pipelineId, PipelineState state, Kind kind, String message,
+            Instant observedAt, Long observedAgeMillis, Freshness freshness, List<Evidence> evidence,
+            List<String> cannotSay, Next next, Pending pending, ExecutionPlan plan, List<String> awaitingRebalance) {
+        this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay, next,
+                pending, plan, awaitingRebalance, List.of());
     }
 
     /** An explanation of a run with no plan recorded. */
@@ -72,7 +82,30 @@ public record PipelineExplanation(
      */
     public PipelineExplanation withPlan(ExecutionPlan plan, List<String> awaitingRebalance) {
         return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
-                evidence, cannotSay, next, pending, plan, awaitingRebalance);
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, rollups);
+    }
+
+    /** The same explanation, listing the rollup fields the pipeline declares. */
+    public PipelineExplanation withRollups(List<Rollup> declared) {
+        return new PipelineExplanation(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness,
+                evidence, cannotSay, next, pending, plan, awaitingRebalance, declared);
+    }
+
+    /**
+     * One rollup field the pipeline declares: the nest step, the level it lands on, the embed it is computed
+     * over, its function and argument as written, its filter, and the references it reads - the ones whose
+     * absence makes it null rather than a smaller number.
+     */
+    public record Rollup(String step, String level, String embed, String field, String function, String argument,
+            String filter, List<String> references) {
+        public Rollup {
+            Objects.requireNonNull(step, "step");
+            Objects.requireNonNull(level, "level");
+            Objects.requireNonNull(embed, "embed");
+            Objects.requireNonNull(field, "field");
+            Objects.requireNonNull(function, "function");
+            references = references == null ? List.of() : List.copyOf(references);
+        }
     }
 
     public enum Kind {

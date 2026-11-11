@@ -3493,7 +3493,8 @@ final class StoreBackedDagSource implements DagSource {
                         resolvedTable,
                         discovered.primaryKey(),
                         uniqueIndexesOf(discovered),
-                        discovered.fields().stream().map(field -> field.name()).toList()))
+                        discovered.fields().stream().map(field -> field.name()).toList(),
+                        rollupTypesOf(discovered)))
                 .orElseGet(() -> new NestTable(resolvedTable, List.of()));
     }
 
@@ -3503,6 +3504,18 @@ final class StoreBackedDagSource implements DagSource {
      * non-unique indexes are dropped here rather than downstream: an index that does not identify a row
      * is not a candidate, and carrying it further would only give the compiler more to reject.
      */
+    private static Map<String, io.tapstate.core.dsl.aggregate.ValueType> rollupTypesOf(SourceTable table) {
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        for (var field : table.fields()) {
+            // A decimal keeps the scale it was declared with, which is the scale its sums are exact at. The
+            // precision is not carried: a sum widens to 38 digits whatever the column held.
+            Integer scale = field.type() == io.tapstate.core.common.TapstateType.DECIMAL
+                    && field.numericType() != null ? field.numericType().scale() : null;
+            types.put(field.name(), new io.tapstate.core.dsl.aggregate.ValueType(field.type(), scale));
+        }
+        return types;
+    }
+
     private static List<List<String>> uniqueIndexesOf(SourceTable table) {
         List<List<String>> unique = new ArrayList<>();
         for (SourceIndex index : table.indexes()) {

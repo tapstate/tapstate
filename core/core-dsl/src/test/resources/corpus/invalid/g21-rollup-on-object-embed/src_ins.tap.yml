@@ -1,0 +1,10 @@
+# §14.2 — Oracle -> SRS -> transforms -> nest -> view -> REST (end-to-end modeling).
+# Owns the SRS; shared by every pipeline that references it (also s03 narrative).
+version: tapstate/v1
+kind: source
+id: src_ins
+connector: oracle
+config: { host: 10.20.0.16, service_name: INS, username: cdc_user, password: Ins_2026 }
+mode: cdc
+tables: [ CUSTOMERS, POLICIES, CLAIMS ]
+srs: { retention: 30d, schema_evolution: track, queryable: true }
