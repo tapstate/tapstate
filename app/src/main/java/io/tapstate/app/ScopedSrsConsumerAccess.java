@@ -33,11 +33,18 @@ final class ScopedSrsConsumerAccess {
                 return;
             }
             if (!run.originalClaim().equals(claimed)) throw refused(run);
-            writerProof.set(authorization.localProofGuard(fence));
-            try {
-                operation.accept(writerStore);
-            } finally {
-                writerProof.remove();
+            for (;;) {
+                ExecutionAuthorization.WriterProofUnavailable unavailable;
+                try {
+                    writerProof.set(authorization.localProofGuard(fence));
+                    operation.accept(writerStore);
+                    return;
+                } catch (ExecutionAuthorization.WriterProofUnavailable expired) {
+                    unavailable = expired;
+                } finally {
+                    writerProof.remove();
+                }
+                authorization.awaitWriterProof(fence, unavailable);
             }
         }
 

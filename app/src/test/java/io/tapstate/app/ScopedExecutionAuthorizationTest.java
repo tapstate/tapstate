@@ -87,6 +87,44 @@ class ScopedExecutionAuthorizationTest {
         }
     }
 
+    @Test void aWriterCanWaitOutsideItsTransactionUntilTheSameProofReturns() throws Exception {
+        var original = WorkloadClaimFence.from(run());
+        var fence = new ExecutionFence(FIRST, original);
+        var unavailable = new AtomicBoolean();
+        try (var guard = guard(Duration.ofSeconds(1)); var writer = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            when(store.readPipeline(FIRST)).thenAnswer(call -> {
+                if (unavailable.get()) throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                        Map.of("detail", "MongoOperationTimeoutException"), null);
+                return raw.read(KEY);
+            });
+            assertThat(guard.require(fence)).isEqualTo(original);
+            var check = guard.localProofGuard(fence);
+            unavailable.set(true);
+            nanos.set(Duration.ofMillis(1050).toNanos());
+            var gap = org.junit.jupiter.api.Assertions.assertThrows(ExecutionAuthorization.WriterProofUnavailable.class, check::run);
+            var recovery = writer.submit(() -> guard.awaitWriterProof(fence, gap));
+            unavailable.set(false);
+            recovery.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            check.run();
+        }
+    }
+
+    @Test void writerRecoveryStopsAtTheLastProvedLeaseDeadline() {
+        var original = WorkloadClaimFence.from(run());
+        var fence = new ExecutionFence(FIRST, original);
+        try (var guard = guard(Duration.ofSeconds(1))) {
+            assertThat(guard.require(fence)).isEqualTo(original);
+            var check = guard.localProofGuard(fence);
+            when(store.readPipeline(FIRST)).thenThrow(new TapstateException(IoError.STORE_UNAVAILABLE,
+                    Map.of("detail", "MongoOperationTimeoutException"), null));
+            nanos.set(Duration.ofMillis(1050).toNanos());
+            var gap = org.junit.jupiter.api.Assertions.assertThrows(ExecutionAuthorization.WriterProofUnavailable.class, check::run);
+            nanos.set(TTL.toNanos());
+            assertThatThrownBy(() -> guard.awaitWriterProof(fence, gap)).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        }
+    }
+
     @Test void aScopedRunKeepsItsIdentityAndOwnerAcrossSerialization() throws Exception {
         ExecutionFence original = new ExecutionFence(FIRST, WorkloadClaimFence.from(run()));
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();

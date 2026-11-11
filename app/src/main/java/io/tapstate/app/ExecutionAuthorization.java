@@ -67,7 +67,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(ExecutionAuthorization.class);
 
     /** The exact claim this member last read for one pipeline, and when that reading expires locally. */
-    private record Entry(WorkloadClaimFence claim, long deadlineNanos) {
+    private record Entry(WorkloadClaimFence claim, long deadlineNanos, long leaseDeadlineNanos) {
     }
 
     private record ReadKey(String pipelineId, PipelineIntentScope scope, WorkloadClaimType type) {
@@ -96,6 +96,7 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     private static final class ScopedProof {
         volatile ProofResult result = new ProofResult(null, false);
+        volatile String readFailure;
         volatile long lastUsed = System.nanoTime();
         volatile boolean scopeProved;
         final AtomicBoolean storeReading = new AtomicBoolean();
@@ -273,9 +274,73 @@ final class ExecutionAuthorization implements AutoCloseable {
 
     /** Checks the current local proof for the original fence, without store IO. */
     Runnable localProofGuard(ExecutionFence fence) {
-        Runnable require = () -> requireLocal(fence);
+        Runnable require = () -> requireWriterProof(fence);
         require.run();
         return require;
+    }
+
+    private void requireWriterProof(ExecutionFence fence) {
+        if (businessScope == null) {
+            requireLocal(fence);
+            return;
+        }
+        var key = ReadKey.of(fence);
+        var proof = scopedProofs.get(key);
+        if (proof == null) throw writerRefused(fence);
+        proof.lastUsed = System.nanoTime();
+        var entry = requireWriterLease(fence, proof);
+        if (nanoTime.getAsLong() - entry.deadlineNanos() >= 0)
+            throw new WriterProofUnavailable(proof, entry.leaseDeadlineNanos());
+    }
+
+    private Entry requireWriterLease(ExecutionFence fence, ScopedProof proof) {
+        var result = proof.result;
+        var entry = result.entry();
+        if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean() || result.denied()
+                || entry == null || !matches(entry.claim(), fence)
+                || nanoTime.getAsLong() - entry.leaseDeadlineNanos() >= 0) throw writerRefused(fence);
+        return entry;
+    }
+
+    /** A pre-commit guard may suspend an acknowledgement, but the transaction must exit before waiting. */
+    static final class WriterProofUnavailable extends RuntimeException {
+        private final ScopedProof proof;
+        private final long leaseDeadline;
+
+        private WriterProofUnavailable(ScopedProof proof, long leaseDeadline) {
+            this.proof = proof;
+            this.leaseDeadline = leaseDeadline;
+        }
+    }
+
+    void awaitWriterProof(ExecutionFence fence, WriterProofUnavailable unavailable) {
+        var key = ReadKey.of(fence);
+        var proof = unavailable.proof;
+        LOG.info("Waiting for SRS acknowledgement proof for {} claim={} execution={} remainingMs={} lastRead={}",
+                fence.pipelineId(), fence.claimGeneration(), fence.executionGeneration(),
+                TimeUnit.NANOSECONDS.toMillis(unavailable.leaseDeadline - nanoTime.getAsLong()), proof.readFailure);
+        synchronized (proof) {
+            while (true) {
+                long left = unavailable.leaseDeadline - nanoTime.getAsLong();
+                if (left <= 0 || scopedProofs.get(key) != proof) throw writerRefused(fence);
+                var entry = requireWriterLease(fence, proof);
+                if (nanoTime.getAsLong() - entry.deadlineNanos() < 0) break;
+                proof.lastUsed = System.nanoTime();
+                requestScopedProof(key, proof);
+                try {
+                    TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw writerRefused(fence);
+                }
+            }
+        }
+        LOG.info("Recovered SRS acknowledgement proof for {} claim={} execution={}",
+                fence.pipelineId(), fence.claimGeneration(), fence.executionGeneration());
+    }
+
+    private static TapstateException writerRefused(ExecutionFence fence) {
+        return new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", fence.pipelineId()), null);
     }
 
     /** The current matching entry, refreshing it under the same rules as the boolean guard. */
@@ -472,15 +537,18 @@ final class ExecutionAuthorization implements AutoCloseable {
         ProofResult result = null;
         try {
             var reading = readExecutionProof(key, proof, startedAt);
+            proof.readFailure = null;
             if (reading.isEmpty()) {
                 result = new ProofResult(null, true);
             } else {
                 var observed = reading.orElseThrow();
-                long held = Math.min(windowNanos, observed.leaseRemaining().toNanos());
-                result = new ProofResult(new Entry(WorkloadClaimFence.from(observed.claim()), startedAt + held),
+                long lease = observed.leaseRemaining().toNanos();
+                long held = Math.min(windowNanos, lease);
+                result = new ProofResult(new Entry(WorkloadClaimFence.from(observed.claim()), startedAt + held, startedAt + lease),
                         held <= 0);
             }
         } catch (RuntimeException unavailable) {
+            proof.readFailure = unavailable instanceof TapstateException coded ? coded.getMessage() : unavailable.getClass().getSimpleName();
             if (definitiveRefusal(unavailable)) {
                 result = new ProofResult(null, true);
             } else {
@@ -631,7 +699,7 @@ final class ExecutionAuthorization implements AutoCloseable {
             entries.remove(key);
             return null;
         }
-        Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held);
+        Entry refreshed = new Entry(WorkloadClaimFence.from(current.get().claim()), startedAt + held, startedAt + leaseRemaining.toNanos());
         entries.put(key, refreshed);
         return refreshed;
     }

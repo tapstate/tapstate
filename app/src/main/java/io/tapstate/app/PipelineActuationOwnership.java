@@ -1002,6 +1002,11 @@ final class PipelineActuationOwnership {
                 reading = scope == null ? claims.read(expected.key()) : claims.readPipeline(scope);
                 break;
             } catch (RuntimeException unavailable) {
+                if (scope != null && !retryTimeout && retryableRenewal(unavailable)) {
+                    if (unavailable instanceof TapstateException coded && coded.code() == IoError.STORE_UNAVAILABLE) throw coded;
+                    throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                            Map.of("detail", "pipeline claim read timed out"), unavailable);
+                }
                 if (!retryTimeout || !claimIoTimedOut(unavailable)) return false;
                 if (attempt != 0 || !admission.current()) {
                     throw new TapstateException(IoError.STORE_UNAVAILABLE,
