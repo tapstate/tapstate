@@ -19,6 +19,7 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.LivePipelines;
 import io.tapstate.control.core.AccessTokenService;
 import io.tapstate.control.core.DocumentKeyAdvisories;
+import io.tapstate.control.core.AggregateSizingAdvisories;
 import io.tapstate.control.core.NestSizingAdvisories;
 import io.tapstate.control.core.ExecutionAdvisories;
 import io.tapstate.control.core.PlanAdvisories;
@@ -428,7 +429,11 @@ class ControlPlaneConfiguration {
                 PlanAdvisories.all(
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
-                        new ExecutionAdvisories()),
+                        new ExecutionAdvisories(),
+                        // What each aggregate step will keep in state. Said for every one, since the
+                        // state is the only copy of what its totals come from and its size is known
+                        // from the definition before anything is deployed.
+                        new AggregateSizingAdvisories()),
                 derivation, livePipelines, attribution, stateDatabasePolicy);
     }
 

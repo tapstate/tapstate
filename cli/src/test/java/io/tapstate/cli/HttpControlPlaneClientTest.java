@@ -1817,6 +1817,28 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void explainDecodesWhatAnAggregateStepKeepsAndLeavesTheUnknownNull() throws Exception {
+        AtomicReference<CapturedRequest> seen = new AtomicReference<>();
+        HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,
+                "{\"pipelineId\":\"pl1\",\"state\":\"RUNNING\",\"kind\":\"NO_MATCH\","
+                        + "\"message\":\"No diagnostic rule matched.\",\"freshness\":\"UNKNOWN\","
+                        + "\"evidence\":[],\"cannotSay\":[\"The observation has no time.\"],\"next\":null,"
+                        + "\"aggregates\":[{\"step\":\"by_region\",\"entriesPerRow\":3,"
+                        + "\"keptInputFields\":[\"most\"],\"inputRows\":1000,\"estimatedEntries\":3000},"
+                        + "{\"step\":\"by_day\",\"entriesPerRow\":2,\"storedEntries\":12}]}", seen);
+        try {
+            ExplainOutcome outcome = new HttpControlPlaneClient().explain(baseOf(server), "tok-abc", "pl1");
+
+            assertThat(outcome).isInstanceOf(ExplainOutcome.Found.class);
+            assertThat(((ExplainOutcome.Found) outcome).aggregates()).containsExactly(
+                    new ExplainOutcome.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, null),
+                    new ExplainOutcome.Aggregate("by_day", 2, List.of(), null, null, 12L));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void explainDecodesTypedEvidenceAndNullableNext() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/explain", 200,

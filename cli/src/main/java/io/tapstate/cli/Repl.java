@@ -5610,6 +5610,25 @@ final class Repl {
                     + " -- joined after this run was planned; given no part of it until a rebalance");
         }
         answer.rollups().forEach(rollup -> out.println(rollupLine(rollup)));
+        answer.aggregates().forEach(aggregate -> out.println(aggregateLine(aggregate)));
+    }
+
+    /**
+     * What one aggregate step keeps: the entries per input row, which the definition decides, the total
+     * that comes to where the input's size is known, and what the running step last counted. A number
+     * nobody knows is said to be unknown; left out, the line would read as a step that costs nothing.
+     */
+    static String aggregateLine(ExplainOutcome.Aggregate aggregate) {
+        StringBuilder line = new StringBuilder("  aggregate  ").append(aggregate.step()).append(": ")
+                .append(aggregate.entriesPerRow()).append(" state entries per input row");
+        if (!aggregate.keptInputFields().isEmpty()) {
+            line.append(" (2, and 1 each for ").append(String.join(", ", aggregate.keptInputFields())).append(')');
+        }
+        line.append(aggregate.estimatedEntries() == null ? "; input size unknown, so no estimate"
+                : "; about " + aggregate.estimatedEntries() + " for " + aggregate.inputRows() + " input rows");
+        line.append(aggregate.storedEntries() == null ? "; not counted yet"
+                : "; " + aggregate.storedEntries() + " stored at the last count");
+        return line.toString();
     }
 
     /**
