@@ -125,7 +125,11 @@ class RuntimeConvergenceConfiguration {
                 id -> captureCoordinator.initialLoad(id,
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
-                Clock.systemUTC());
+                Clock.systemUTC())
+                // What each aggregate step holds and what it could not apply or give exactly. A group
+                // held at its last good values is marked in its own row, but only a reader of that row
+                // sees the mark; this is where the pipeline says it has any.
+                .withAggregateReadings(engine::aggregateReadings);
     }
 
     /**

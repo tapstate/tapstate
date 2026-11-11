@@ -78,6 +78,15 @@ class WhatHappensPastTheCardinalityBudgetTest {
     void theBudgetTableIsTheDocumentedOne() {
         assertThat(Arrays.stream(CardinalityBudget.values()).map(CardinalityBudget::instrument))
                 .containsExactlyInAnyOrder(
+                        "tapstate.pipeline.aggregate.rows",
+                        "tapstate.pipeline.aggregate.groups",
+                        "tapstate.pipeline.aggregate.state.entries",
+                        "tapstate.pipeline.aggregate.tombstones",
+                        "tapstate.pipeline.aggregate.group.rows.largest",
+                        "tapstate.pipeline.aggregate.groups.failed",
+                        "tapstate.pipeline.aggregate.inputs",
+                        "tapstate.pipeline.aggregate.state.writes",
+                        "tapstate.pipeline.aggregate.order_conflicts",
                         "tapstate.pipeline.records",
                         "tapstate.pipeline.bytes",
                         "tapstate.pipeline.lag",
@@ -134,6 +143,14 @@ class WhatHappensPastTheCardinalityBudgetTest {
         for (CardinalityBudget budget : List.of(CardinalityBudget.JOIN_RECOMPUTE_ROWS,
                 CardinalityBudget.JOIN_RECOMPUTE_ROWS_TOTAL)) {
             assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.JOIN_NAMESPACE);
+            assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
+        }
+        for (CardinalityBudget budget : List.of(CardinalityBudget.AGGREGATE_ROWS, CardinalityBudget.AGGREGATE_GROUPS,
+                CardinalityBudget.AGGREGATE_STATE_ENTRIES, CardinalityBudget.AGGREGATE_TOMBSTONES,
+                CardinalityBudget.AGGREGATE_LARGEST_GROUP, CardinalityBudget.AGGREGATE_FAILED_GROUPS,
+                CardinalityBudget.AGGREGATE_INPUTS, CardinalityBudget.AGGREGATE_STATE_WRITES,
+                CardinalityBudget.AGGREGATE_ORDER_CONFLICTS)) {
+            assertThat(budget.openDimension()).as(budget.name()).contains(MetricAttributes.AGGREGATE_STEP);
             assertThat(budget.distinctValues()).as(budget.name()).isEqualTo(1_000);
         }
         assertThat(CardinalityBudget.ERRORS.openDimension()).contains(CODE);
@@ -485,6 +502,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                 .filter(budget -> budget.fold() == CardinalityBudget.Fold.HIGHEST)
                 .map(CardinalityBudget::instrument))
                 .containsExactlyInAnyOrder(
+                        "tapstate.pipeline.aggregate.group.rows.largest",
                         "tapstate.pipeline.lag",
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",

@@ -3,6 +3,7 @@ package io.tapstate.runtime.engine.aggregate;
 import com.hazelcast.jet.core.AbstractProcessor;
 import com.hazelcast.jet.core.Inbox;
 import com.hazelcast.jet.core.Processor;
+import com.hazelcast.jet.core.metrics.Metrics;
 import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.AggregateRow;
@@ -34,6 +35,7 @@ import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Objects;
 
 /**
@@ -100,7 +102,15 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     private ReplayFloor floor = ReplayFloor.NONE;
     /** Where the sweep's next page starts; null at the start of a pass. */
     private byte[] sweptThrough;
+    /** Where the count of the group side continues; meaningful while {@link #countingGroups}. */
+    private byte[] countedThrough;
+    /** Whether the pass has finished the stored rows and is counting the group side. */
+    private boolean countingGroups;
+    /** What the pass under way has counted so far: rows, waiting records, entries, groups, failed, largest. */
+    private final long[] counting = new long[6];
     private long nextSweepAt;
+    private long inputs;
+    private final long[] stateWrites = new long[1];
     private long forgottenRows;
     private long forgottenLeavings;
 
@@ -164,9 +174,10 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     @Override
     protected void init(Processor.Context context) {
         this.timer = StageTimer.of(stage(), context);
-        OrderedStateStore byGroup = stores.open(context.hazelcastInstance(), step, AggregateStore.GROUPS);
+        OrderedStateStore byGroup = counted(stores.open(context.hazelcastInstance(), step, AggregateStore.GROUPS));
         admit(byGroup);
-        this.membership = new MembershipStage(stores.open(context.hazelcastInstance(), step, AggregateStore.MEMBERS));
+        this.membership = new MembershipStage(
+                counted(stores.open(context.hazelcastInstance(), step, AggregateStore.MEMBERS)));
         this.groups = new GroupStage(spec, byGroup);
         this.floor = replayFloor.resolve(context.hazelcastInstance());
         if (pipeline != null) {
@@ -174,6 +185,41 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             this.requests = AggregateRequests.register(member, pipeline, step);
         }
         this.nextSweepAt = System.currentTimeMillis() + sweep.pageMillis();
+    }
+
+    /** {@code store}, with every commit to it counted. */
+    private OrderedStateStore counted(OrderedStateStore store) {
+        return new OrderedStateStore() {
+            @Override
+            public List<byte[]> loadAll(List<byte[]> keys) {
+                return store.loadAll(keys);
+            }
+
+            @Override
+            public void commit(List<Entry> saves, List<byte[]> deletes) {
+                store.commit(saves, deletes);
+                stateWrites[0]++;
+            }
+
+            @Override
+            public Limit commitLimit() {
+                return store.commitLimit();
+            }
+
+            @Override
+            public Optional<Entry> first(byte[] from, byte[] to, End end) {
+                return store.first(from, to, end);
+            }
+
+            @Override
+            public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+                return store.scan(from, to, after, limit);
+            }
+        };
+    }
+
+    private void report(String kind, long value) {
+        Metrics.metric(AggregateMetricNames.nameOf(kind, step)).set(value);
     }
 
     /** How many entries of one group a check or a repair holds in memory; a larger group is inconclusive. */
@@ -244,19 +290,51 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
     }
 
     /**
-     * Looks at one page of stored rows when it is time to. It runs between drains on the thread that
+     * Looks at one page of the step's state when it is time to. It runs between drains on the thread that
      * applies events, so it never meets a row half applied, and a page is small enough not to hold a
-     * drain back. With no floor to read there is nothing it could forget, and it reads nothing.
+     * drain back.
+     *
+     * <p>A pass goes over the stored rows, forgetting what no delivery can reach any more, and then over
+     * the group side, and counts as it goes. The sizes it reports are those of the pass that last
+     * finished: a number assembled from half of one pass and half of the one before would be the size of
+     * no state the step ever had. With no floor to read nothing is forgotten, and the pass still counts.
      */
     private void sweepWhenDue() {
-        if (floor == ReplayFloor.NONE || System.currentTimeMillis() < nextSweepAt) {
+        if (System.currentTimeMillis() < nextSweepAt) {
             return;
         }
-        MembershipStage.Reclaimed page = membership.reclaim(floor, groups, sweptThrough, sweep.rows());
-        forgottenRows += page.rows();
-        forgottenLeavings += page.leavings();
-        sweptThrough = page.next();
-        nextSweepAt = System.currentTimeMillis() + (sweptThrough == null ? sweep.passMillis() : sweep.pageMillis());
+        boolean finished;
+        if (!countingGroups) {
+            MembershipStage.Reclaimed page = membership.reclaim(floor, groups, sweptThrough, sweep.rows());
+            forgottenRows += page.rows();
+            forgottenLeavings += page.leavings();
+            counting[0] += page.members();
+            counting[1] += page.waiting();
+            counting[2] += page.kept();
+            sweptThrough = page.next();
+            countingGroups = sweptThrough == null;
+            countedThrough = null;
+            finished = false;
+        } else {
+            GroupStage.Counted page = groups.count(countedThrough, sweep.rows());
+            counting[2] += page.entries();
+            counting[3] += page.groups();
+            counting[4] += page.failed();
+            counting[5] = Math.max(counting[5], page.largest());
+            countedThrough = page.next();
+            finished = countedThrough == null;
+        }
+        if (finished) {
+            report(AggregateMetricNames.ROWS, counting[0]);
+            report(AggregateMetricNames.WAITING, counting[1]);
+            report(AggregateMetricNames.STATE_ENTRIES, counting[2]);
+            report(AggregateMetricNames.GROUPS, counting[3]);
+            report(AggregateMetricNames.FAILED_GROUPS, counting[4]);
+            report(AggregateMetricNames.LARGEST_GROUP, counting[5]);
+            java.util.Arrays.fill(counting, 0);
+            countingGroups = false;
+        }
+        nextSweepAt = System.currentTimeMillis() + (finished ? sweep.passMillis() : sweep.pageMillis());
     }
 
     /**
@@ -324,6 +402,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             rowEvents(event, events);
         }
         MembershipStage.Outcome told = membership.apply(events);
+        inputs += events.size();
         dropped += told.dropped();
         conflicts += told.conflicts() + told.spansInputs();
         for (GroupOutcome outcome : groups.apply(told.changes())) {
@@ -341,6 +420,13 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         }
         if (!positions.isEmpty()) {
             pending.add(new SettledPositions(positions));
+        }
+        report(AggregateMetricNames.INPUTS, inputs);
+        report(AggregateMetricNames.STATE_WRITES, stateWrites[0]);
+        // Reported only once there is one: an input that was not applied leaves no other trace, and a
+        // zero on every pass is what a count nobody wired would look like too.
+        if (conflicts > 0) {
+            report(AggregateMetricNames.CONFLICTS, conflicts);
         }
         taken = count;
     }

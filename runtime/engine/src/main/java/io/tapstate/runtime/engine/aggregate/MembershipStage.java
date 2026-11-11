@@ -185,8 +185,12 @@ public final class MembershipStage {
      * @param next     where the next page starts, or null when this page was the last
      * @param rows     input rows forgotten whole: gone, with nothing left to tell
      * @param leavings records of a row leaving a group that were dropped
+     * @param members  rows of the page that are in a group
+     * @param waiting  what the page still keeps only to answer a second delivery: rows that are gone, and
+     *                 records of a row leaving a group
+     * @param kept     entries of the page still stored after it
      */
-    public record Reclaimed(byte[] next, int rows, int leavings) {
+    public record Reclaimed(byte[] next, int rows, int leavings, int members, int waiting, int kept) {
     }
 
     /**
@@ -207,10 +211,16 @@ public final class MembershipStage {
         List<GroupStage.Leaving> told = new ArrayList<>();
         List<Entry> saves = new ArrayList<>();
         List<byte[]> deletes = new ArrayList<>();
+        int members = 0;
+        int waiting = 0;
         for (Entry entry : page) {
             Stored stored = read(entry.state());
             Optional<SourceOrder> resumesAt = floors.computeIfAbsent(stored.chain, floor::of);
+            if (stored.group != null) {
+                members++;
+            }
             if (resumesAt.isEmpty()) {
+                waiting += stored.left.size() + (stored.group == null ? 1 : 0);
                 continue;
             }
             List<Left> kept = new ArrayList<>();
@@ -223,7 +233,10 @@ public final class MembershipStage {
             }
             if (stored.group == null && kept.isEmpty() && stored.order.compareTo(resumesAt.get()) < 0) {
                 deletes.add(entry.key());
-            } else if (kept.size() < stored.left.size()) {
+                continue;
+            }
+            waiting += kept.size() + (stored.group == null ? 1 : 0);
+            if (kept.size() < stored.left.size()) {
                 saves.add(new Entry(entry.key(), write(new Stored(stored.chain, stored.order, stored.group, kept))));
             }
         }
@@ -237,7 +250,7 @@ public final class MembershipStage {
             store.commit(List.of(), List.copyOf(deletes.subList(at, Math.min(deletes.size(), at + most))));
         }
         byte[] next = page.size() < limit ? null : page.getLast().key();
-        return new Reclaimed(next, deletes.size(), told.size());
+        return new Reclaimed(next, deletes.size(), told.size(), members, waiting, page.size() - deletes.size());
     }
 
     private static final byte[] FIRST_KEY = {};
