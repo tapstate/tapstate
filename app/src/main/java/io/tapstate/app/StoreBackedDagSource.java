@@ -11,6 +11,7 @@ import io.tapstate.adapters.transform.UnwindSpec;
 import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.dsl.PipelineInputs;
+import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
@@ -33,7 +34,9 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.BatchSpec;
 import io.tapstate.core.model.ExecutionSpec;
 import io.tapstate.runtime.engine.ChainAxes;
+import io.tapstate.runtime.engine.AggregateBinding;
 import io.tapstate.runtime.engine.DagBindings;
+import io.tapstate.runtime.engine.aggregate.AggregateStores;
 import io.tapstate.runtime.engine.ExecutionShape;
 import io.tapstate.runtime.engine.DagTraceBinding;
 import io.tapstate.runtime.engine.FrontierBinding;
@@ -560,6 +563,11 @@ final class StoreBackedDagSource implements DagSource {
     /** Builds the official topology with finite sources and run-scoped, no-external-write sinks. */
     DAG previewDag(PipelineResource pipeline, String sampleMap,
             String materializerMap, DagTraceBinding trace, String previewExecutionId) {
+        if (pipeline.transforms() != null
+                && pipeline.transforms().stream().anyMatch(step -> AggregateSteps.of(step) != null)) {
+            // A preview keeps no state behind it, and an aggregate step has nowhere else to keep its groups.
+            throw previewRefused("a pipeline with an aggregate step cannot be previewed");
+        }
         Map<String, SourceVertex> vertices = sourceVertices(pipeline);
         Map<String, String> sourceKeyByTable = sourceKeyByTable(vertices);
         Map<String, List<String>> sourceKeysById = sourceKeysById(vertices);
@@ -1415,7 +1423,60 @@ final class StoreBackedDagSource implements DagSource {
                     ? TargetModelResolver.keyedOn(model, nest.root().key())
                     : new TargetTable(root.name(), List.of()));
         }
+        // An aggregate step publishes a table of its own, named by the step and keyed by its group names.
+        // One whose input cannot be described yet still contributes the name, for the reason a nest does.
+        Map<String, AggregateStepSpec> aggregates =
+                compiledAggregates(pipeline, bySourceTable, sourceVertices, compiledJoins);
+        for (Step step : pipeline.transforms()) {
+            if (AggregateSteps.of(step) != null) {
+                AggregateStepSpec spec = aggregates.get(step.id());
+                assembled.put(step.id(), spec != null ? AggregateSteps.target(spec)
+                        : new TargetTable(step.id(), List.of()));
+            }
+        }
         return assembled;
+    }
+
+    /**
+     * Each aggregate step as a run executes it, compiled against the discovered columns that reach it. A
+     * step whose input cannot be described is left out; a step that can be described and does not hold
+     * is refused here with its own code.
+     */
+    private Map<String, AggregateStepSpec> compiledAggregates(
+            PipelineResource pipeline, Map<String, TargetTable> bySourceTable,
+            Map<String, SourceVertex> sourceVertices, Map<String, CompiledJoin> compiledJoins) {
+        Map<String, AggregateStepSpec> byStep = new LinkedHashMap<>();
+        if (pipeline.transforms() == null
+                || pipeline.transforms().stream().noneMatch(step -> AggregateSteps.of(step) != null)) {
+            return byStep;
+        }
+        Map<String, String> sourceKeyByTable = sourceKeyByTable(sourceVertices);
+        Map<String, List<String>> sourceKeysById = sourceKeysById(sourceVertices);
+        Set<String> stepIds = stepIds(pipeline);
+        Map<String, NodeColumns> derived = deriveSteps(pipeline, sourceVertices, sourceKeyByTable,
+                sourceKeysById, stepIds, compiledJoins, this::discoveredColumns).columns();
+        for (Step step : pipeline.transforms()) {
+            TransformBody.Aggregate aggregate = AggregateSteps.of(step);
+            if (aggregate == null) {
+                continue;
+            }
+            Map<String, NodeColumns> inputs = inputsOf(refsOf(step.from()), sourceVertices, sourceKeyByTable,
+                    sourceKeysById, stepIds, derived, this::discoveredColumns, false);
+            NodeColumns input = inputs == null ? null : NodeColumns.merged(inputs.values());
+            if (input == null || !input.known()) {
+                continue;
+            }
+            // The rows of one table carry that table's key; rows of several have no key in common.
+            Set<String> streams = streamsReaching(pipeline, step.from(), sourceKeyByTable, sourceKeysById,
+                    sourceVertices, stepIds);
+            TargetTable table = streams.size() == 1 ? bySourceTable.get(streams.iterator().next()) : null;
+            List<String> tableKey = table == null ? List.of() : table.fields().stream()
+                    .filter(TargetField::primaryKey).map(TargetField::name).toList();
+            byStep.put(step.id(), AggregateSteps.compile(step, aggregate, input, tableKey,
+                    refsOf(step.from()).stream().map(StoreBackedDagSource::referenceOf)
+                            .collect(java.util.stream.Collectors.joining(", "))));
+        }
+        return byStep;
     }
 
     /**
@@ -1527,6 +1588,7 @@ final class StoreBackedDagSource implements DagSource {
             if (!(stepOf(pipeline, key) instanceof Step.Inline inline)
                     || inline.body() instanceof TransformBody.Nest
                     || inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate
                     || !visiting.add(key)) {
                 continue;
             }
@@ -2239,6 +2301,22 @@ final class StoreBackedDagSource implements DagSource {
         Map<String, String> sourceIdByTable = sourceIdByTable(pipeline, sourceVertices);
         StartFrom freshStart = freshRingStart(pipeline);
         Map<String, StoreBackedSinkAckFactory.SourceProgress> progress = progressByTable(pipeline);
+        Map<String, AggregateStepSpec> aggregates = compiledAggregates(
+                pipeline, sourceTargets(sourceVertices), sourceVertices, compiledJoins);
+        // Aggregate state is committed under the execution's claim; a run bound to no execution has none.
+        AggregateStores aggregateStores = manifest != null ? AggregateStores.bound(manifest)
+                : (member, step, kind) -> {
+                    throw new IllegalStateException("aggregate step '" + step
+                            + "' needs operator state bound to an execution, and this run has none");
+                };
+        AggregateBinding aggregateBinding = new AggregateBinding(step -> {
+            AggregateStepSpec spec = aggregates.get(step.id());
+            if (spec == null) {
+                throw new IllegalStateException("aggregate step '" + step.id()
+                        + "' was not compiled: the columns reaching it are not known");
+            }
+            return spec;
+        }, aggregateStores);
         return new DagBindings(
                 key -> sourceVertex(sourceVertices.get(key), axes, snapshotOnly, snapshotEpoch, freshStart,
                         progress.get(sourceVertices.get(key).stream()).kind() == ConsumerProgressKind.DIRECT_SOURCE,captureBindings, sourceEpochs.get(sourceVertices.get(key).stream())),
@@ -2256,7 +2334,8 @@ final class StoreBackedDagSource implements DagSource {
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
+                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)))
+                .withAggregate(aggregateBinding);
     }
 
     private Map<String, Long> sourceEpochs(
@@ -2732,7 +2811,8 @@ final class StoreBackedDagSource implements DagSource {
             // shape the product's own valid corpus writes, so the validator accepted a pipeline the
             // builder then would not build. Its identity is the target model registered for the step,
             // which the branch below reads like any other single stream's.
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
+            if (step instanceof Step.Inline inline && (inline.body() instanceof TransformBody.Join
+                    || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 return;
             }
@@ -3063,7 +3143,8 @@ final class StoreBackedDagSource implements DagSource {
             // Assemblies replace terminal streams, but every source feeding them contributes freshness.
             if (!sourceInputs && step instanceof Step.Inline inline
                     && (inline.body() instanceof TransformBody.Nest
-                            || inline.body() instanceof TransformBody.Join)) {
+                            || inline.body() instanceof TransformBody.Join
+                            || inline.body() instanceof TransformBody.Aggregate)) {
                 streams.add(step.id());
                 continue;
             }
@@ -4263,6 +4344,10 @@ final class StoreBackedDagSource implements DagSource {
                 table = nestTable(assemblyRoot(step), tables).name();
                 names.put(stream, new TargetTable(table, List.of()));
                 continue;
+            } else if (AggregateSteps.of(step) != null) {
+                // An aggregate's rows land in a table named by the step, whatever its input is called.
+                names.put(stream, new TargetTable(stream, List.of()));
+                continue;
             }
             if (table != null) {
                 names.put(stream, names.getOrDefault(table, new TargetTable(table, List.of())));
@@ -4273,6 +4358,11 @@ final class StoreBackedDagSource implements DagSource {
 
     /** The source reference that determines an assembly's physical output name and source ownership. */
     private static FromRef assemblyRoot(Step step) {
+        if (AggregateSteps.of(step) != null) {
+            // An aggregate reads one input; what it publishes belongs to the source of that input.
+            List<FromRef> refs = refsOf(step.from());
+            return refs.size() == 1 ? refs.getFirst() : null;
+        }
         if (!(step instanceof Step.Inline inline) || !(step.from() instanceof FromClause.Aliases aliases)) {
             return null;
         }
