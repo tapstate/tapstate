@@ -216,6 +216,172 @@ class GroupStageTest {
                 }
             }
             assertThat(store.commits).isPositive();
+            // Whatever came and went, every group still matches its own rows, and the groups listed are
+            // the ones that hold rows.
+            store.swept();
+            List<List<Object>> listed = new ArrayList<>();
+            byte[] after = null;
+            do {
+                GroupStage.Groups page = stage.groups(after, 2);
+                listed.addAll(page.groups());
+                after = page.next();
+            } while (after != null);
+            assertThat(listed).as("groups listed under %s", limit)
+                    .containsExactlyInAnyOrderElementsOf(
+                            live.values().stream().map(order -> List.<Object>of(order.region())).distinct().toList());
+            for (List<Object> group : listed) {
+                GroupStage.Audit audit = stage.check(group, 10_000);
+                assertThat(audit.verdict()).as("%s under %s: %s", group, limit, audit.fields())
+                        .isEqualTo(GroupStage.Verdict.CLEAN);
+            }
+        }
+    }
+
+    private static byte[] totalsKey(String region) {
+        byte[] group = io.tapstate.core.dsl.aggregate.OrderedBytes.ofKey(List.of(region));
+        byte[] key = new byte[group.length + 1];
+        key[0] = 0x01;
+        System.arraycopy(group, 0, key, 1, group.length);
+        return key;
+    }
+
+    private static List<GroupChange> threeOrders() {
+        return List.of(
+                GroupChange.set(List.of("EU"), id(1), new SourceOrder(1, 1), new Order("EU", new BigDecimal("5.00"), "ann", 1L).inputs()),
+                GroupChange.set(List.of("EU"), id(2), new SourceOrder(1, 2), new Order("EU", new BigDecimal("9.00"), "bob", 2L).inputs()),
+                GroupChange.set(List.of("US"), id(3), new SourceOrder(1, 3), new Order("US", new BigDecimal("1.00"), "cy", 3L).inputs()));
+    }
+
+    @Test
+    void totalsThatDoNotMatchTheirRowsAreNamedByFieldAndARepairWritesThemAgain() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders().subList(0, 1));
+        byte[] stale = store.entries.get(totalsKey("EU"));
+        stage.apply(threeOrders().subList(1, 3));
+        assertThat(stage.check(List.of("EU"), 1000).verdict()).isEqualTo(GroupStage.Verdict.CLEAN);
+
+        // The totals of when the group held one order, beside the entries of two.
+        store.entries.put(totalsKey("EU"), stale);
+
+        GroupStage.Audit found = stage.check(List.of("EU"), 1000);
+        assertThat(found.verdict()).isEqualTo(GroupStage.Verdict.MISMATCH);
+        assertThat(found.fields()).as("the least is 5.00 either way and is not named")
+                .containsExactly(GroupStage.MEMBERS, "orders", "revenue", "average", "most", "buyers", "last_buyer");
+        assertThat(found.outcome()).isNull();
+        assertThat(stage.check(List.of("US"), 1000).verdict()).as("another group is not touched by it")
+                .isEqualTo(GroupStage.Verdict.CLEAN);
+
+        GroupStage.Audit repaired = stage.repair(List.of("EU"), 1000);
+
+        assertThat(repaired.verdict()).isEqualTo(GroupStage.Verdict.MISMATCH);
+        assertThat(repaired.outcome().send()).isTrue();
+        assertThat(repaired.outcome().members()).isEqualTo(2);
+        assertThat(repaired.outcome().values()).containsEntry("orders", 2L)
+                .containsEntry("revenue", new BigDecimal("14.00")).containsEntry("most", new BigDecimal("9.00"));
+        assertThat(stage.check(List.of("EU"), 1000).verdict()).isEqualTo(GroupStage.Verdict.CLEAN);
+    }
+
+    @Test
+    void aLostOrderedEntryIsFoundUnderItsFieldAndPutBack() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders());
+        byte[] group = io.tapstate.core.dsl.aggregate.OrderedBytes.ofKey(List.of("EU"));
+        // Field 3 is "least": drop the entry of its smallest value.
+        byte[] prefix = Arrays.copyOf(group, group.length + 3);
+        prefix[group.length] = 0x03;
+        prefix[group.length + 2] = 3;
+        byte[] lost = store.entries.ceilingKey(prefix);
+        assertThat(Arrays.copyOf(lost, prefix.length)).isEqualTo(prefix);
+        store.entries.remove(lost);
+
+        assertThat(stage.check(List.of("EU"), 1000).fields()).containsExactly("least");
+        GroupStage.Audit repaired = stage.repair(List.of("EU"), 1000);
+
+        assertThat(repaired.fields()).containsExactly("least");
+        assertThat(store.entries).containsKey(lost);
+        assertThat(stage.check(List.of("EU"), 1000).verdict()).isEqualTo(GroupStage.Verdict.CLEAN);
+    }
+
+    @Test
+    void aRepairOfAGroupThatMatchesWritesItsTotalsAndSendsTheGroupAgain() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders());
+
+        GroupStage.Audit repaired = stage.repair(List.of("US"), 1000);
+
+        assertThat(repaired.verdict()).isEqualTo(GroupStage.Verdict.CLEAN);
+        assertThat(repaired.outcome().send()).isTrue();
+        assertThat(repaired.outcome().values()).containsEntry("revenue", new BigDecimal("1.00"));
+    }
+
+    @Test
+    void aGroupTooLargeToHoldIsInconclusiveAndNothingIsWritten() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders());
+        store.entries.put(totalsKey("EU"), store.entries.get(totalsKey("US")));
+        int commits = store.commits;
+
+        assertThat(stage.check(List.of("EU"), 3).verdict()).isEqualTo(GroupStage.Verdict.INCONCLUSIVE);
+        GroupStage.Audit repair = stage.repair(List.of("EU"), 3);
+
+        assertThat(repair.verdict()).isEqualTo(GroupStage.Verdict.INCONCLUSIVE);
+        assertThat(repair.outcome()).isNull();
+        assertThat(store.commits).isEqualTo(commits);
+    }
+
+    @Test
+    void aRepairThatDoesNotFitOneCommitChangesNothing() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders());
+        byte[] group = io.tapstate.core.dsl.aggregate.OrderedBytes.ofKey(List.of("EU"));
+        // Drop every ordered entry of the group: putting them back takes more than two writes.
+        store.entries.subMap(Arrays.copyOf(group, group.length + 1), true, concat(group, 0x05), false)
+                .keySet().removeIf(key -> key[group.length] == 0x03);
+        GroupStage tight = new GroupStage(SPEC, new Narrowed(store, new OrderedStateStore.Limit(2, 1 << 20)));
+        int before = store.entries.size();
+
+        assertThat(tight.repair(List.of("EU"), 1000).verdict()).isEqualTo(GroupStage.Verdict.INCONCLUSIVE);
+
+        assertThat(store.entries).hasSize(before);
+    }
+
+    private static byte[] concat(byte[] group, int kind) {
+        byte[] key = Arrays.copyOf(group, group.length + 1);
+        key[group.length] = (byte) kind;
+        return key;
+    }
+
+    /** The same entries behind a smaller commit. */
+    private record Narrowed(CountingStore store, Limit limit) implements OrderedStateStore {
+
+        @Override
+        public List<byte[]> loadAll(List<byte[]> keys) {
+            return store.loadAll(keys);
+        }
+
+        @Override
+        public void commit(List<Entry> saves, List<byte[]> deletes) {
+            throw new AssertionError("a repair that does not fit one commit writes nothing");
+        }
+
+        @Override
+        public Limit commitLimit() {
+            return limit;
+        }
+
+        @Override
+        public Optional<Entry> first(byte[] from, byte[] to, End end) {
+            return store.first(from, to, end);
+        }
+
+        @Override
+        public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+            return store.scan(from, to, after, limit);
         }
     }
 

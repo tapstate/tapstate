@@ -191,6 +191,226 @@ public final class GroupStage {
         return deletes.size();
     }
 
+    // ---- checking a group against its own rows --------------------------------------------------
+
+    /** What a check or a repair of one group found. */
+    public enum Verdict {
+        /** Everything derived from the group's rows is what those rows give. */
+        CLEAN,
+        /** Something derived differs from what the rows give; a repair has rewritten it. */
+        MISMATCH,
+        /** The group holds more than could be read or rewritten in one go; nothing is claimed or changed. */
+        INCONCLUSIVE
+    }
+
+    /** The name a difference in how many rows a group counts is reported under. */
+    public static final String MEMBERS = "(rows)";
+
+    /**
+     * @param group   the group's key values
+     * @param verdict what was found
+     * @param fields  the fields whose derived state differed, in declared order, with {@link #MEMBERS}
+     *                first when the count of rows itself differed
+     * @param outcome after a repair, the group as it is now, to be sent on; null after a check
+     */
+    public record Audit(List<Object> group, Verdict verdict, List<String> fields, GroupOutcome outcome) {
+    }
+
+    /**
+     * A page of the groups that hold rows.
+     *
+     * @param next where the next page starts, or null when this page was the last
+     */
+    public record Groups(List<List<Object>> groups, byte[] next) {
+    }
+
+    /** The groups holding at least one row, in key order, {@code limit} at a time. */
+    public Groups groups(byte[] after, int limit) {
+        List<Entry> page = store.scan(new byte[] {(byte) TOTALS}, new byte[] {(byte) ROW}, after, limit);
+        List<List<Object>> groups = new ArrayList<>();
+        for (Entry entry : page) {
+            groups.add(readTotals(entry.state()).group);
+        }
+        return new Groups(groups, page.size() < limit ? null : page.getLast().key());
+    }
+
+    /**
+     * Compares everything derived for {@code group} with what its stored rows give, and changes nothing.
+     * It says whether the totals match the rows the step holds, and nothing about whether the step holds
+     * the rows the source has.
+     *
+     * <p>It must run on the thread that applies events, between drains: nothing then writes the group
+     * while it is read, so a difference is a defect and never a matter of timing.
+     *
+     * @param most how many entries of the group may be held in memory; a larger group is inconclusive
+     */
+    public Audit check(List<Object> group, int most) {
+        Rebuilt rebuilt = rebuild(group, most);
+        if (rebuilt == null) {
+            return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
+        }
+        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, null);
+    }
+
+    /**
+     * Writes everything derived for {@code group} again from its stored rows, in one commit, and returns
+     * the group to be sent on. A row that is wrong or missing is not something this can mend: only the
+     * source row changing, or a rebuild, does that.
+     */
+    public Audit repair(List<Object> group, int most) {
+        Rebuilt rebuilt = rebuild(group, most);
+        if (rebuilt == null) {
+            return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
+        }
+        List<Entry> saves = new ArrayList<>();
+        List<byte[]> deletes = new ArrayList<>();
+        long bytes = 0;
+        for (Map.Entry<byte[], byte[]> wanted : rebuilt.wanted.entrySet()) {
+            if (!Arrays.equals(wanted.getValue(), rebuilt.held.get(wanted.getKey()))) {
+                saves.add(new Entry(wanted.getKey(), wanted.getValue()));
+                bytes += wanted.getKey().length + wanted.getValue().length;
+            }
+        }
+        for (byte[] held : rebuilt.held.keySet()) {
+            if (!rebuilt.wanted.containsKey(held)) {
+                deletes.add(held);
+                bytes += held.length;
+            }
+        }
+        byte[] totalsKey = totalsKey(rebuilt.fold.group);
+        if (rebuilt.totals.members == 0) {
+            if (rebuilt.storedTotals != null) {
+                deletes.add(totalsKey);
+                bytes += totalsKey.length;
+            }
+        } else {
+            remember(rebuilt.totals, outcome(rebuilt.totals, true, 0, 0));
+            byte[] written = writeTotals(rebuilt.totals);
+            saves.add(new Entry(totalsKey, written));
+            bytes += totalsKey.length + written.length;
+        }
+        OrderedStateStore.Limit limit = store.commitLimit();
+        if (saves.size() + deletes.size() > limit.operations() || bytes > limit.bytes()) {
+            return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
+        }
+        if (!saves.isEmpty() || !deletes.isEmpty()) {
+            store.commit(saves, deletes);
+        }
+        GroupOutcome now = outcome(rebuilt.totals, true, 0, 0);
+        GroupOutcome shown = new GroupOutcome(now.group(), true, now.members(), now.values(), now.failure(),
+                now.failureArgs(), now.failedField(), 0, 0,
+                rebuilt.totals.lastGood, rebuilt.totals.lastGoodAt, rebuilt.totals.failedSince);
+        return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, shown);
+    }
+
+    /**
+     * A group computed again from its rows.
+     *
+     * @param held    the derived entries the store holds for the group, apart from its totals
+     * @param wanted  the derived entries its rows give
+     */
+    private record Rebuilt(Fold fold, Totals totals, byte[] storedTotals, TreeMap<byte[], byte[]> held,
+            TreeMap<byte[], byte[]> wanted, List<String> differing) {
+    }
+
+    private Rebuilt rebuild(List<Object> values, int most) {
+        byte[] group = OrderedBytes.ofKey(values);
+        byte[] storedTotals = store.loadAll(List.of(totalsKey(group))).getFirst();
+        byte[] from = key(group, ROW);
+        byte[] to = key(group, DISTINCT + 1);
+        TreeMap<byte[], byte[]> all = new TreeMap<>(Arrays::compareUnsigned);
+        byte[] after = null;
+        while (true) {
+            List<Entry> page = store.scan(from, to, after, AUDIT_PAGE);
+            page.forEach(entry -> all.put(entry.key(), entry.state()));
+            if (all.size() > most) {
+                return null;
+            }
+            if (page.size() < AUDIT_PAGE) {
+                break;
+            }
+            after = page.getLast().key();
+        }
+        byte[] derivedFrom = key(group, ORDERED);
+        TreeMap<byte[], byte[]> held = new TreeMap<>(all.subMap(derivedFrom, true, to, false));
+        Fold fold = new Fold(group);
+        fold.counts = new TreeMap<>(Arrays::compareUnsigned);
+        all.subMap(key(group, DISTINCT), true, to, false)
+                .forEach((key, state) -> fold.counts.put(key, Count.again(longOf(state))));
+        Totals totals = new Totals(values);
+        TreeMap<byte[], byte[]> wanted = new TreeMap<>(Arrays::compareUnsigned);
+        long unusableDiffers = 0;
+        for (Map.Entry<byte[], byte[]> entry : all.subMap(from, true, derivedFrom, false).entrySet()) {
+            StoredRow row = readRow(entry.getValue());
+            if (row.payload == null) {
+                continue;
+            }
+            List<FieldInput> inputs = inputs(row.payload);
+            for (int field = 0; field < fields.size(); field++) {
+                if (fields.get(field).function() == RollupFunction.COUNT_DISTINCT && inputs.get(field).in()) {
+                    fold.counts.computeIfAbsent(distinctKey(group, field, inputs.get(field).value()),
+                            key -> Count.again(0));
+                }
+            }
+            byte[] inputKey = Arrays.copyOfRange(entry.getKey(), from.length, entry.getKey().length);
+            long unusable = putIn(fold, totals, inputKey, inputs);
+            totals.members++;
+            if (unusable != row.unusable) {
+                unusableDiffers |= unusable ^ row.unusable;
+                held.put(entry.getKey(), entry.getValue());
+                wanted.put(entry.getKey(), writeRow(new StoredRow(row.order, row.payload, unusable)));
+            }
+        }
+        wanted.putAll(fold.saves);
+        fold.counts.forEach((key, count) -> {
+            if (count.now > 0) {
+                wanted.put(key, longBytes(count.now));
+            }
+        });
+        Totals stored = storedTotals == null ? null : readTotals(storedTotals);
+        if (stored != null) {
+            // When the group was last good is history, not something its rows give.
+            totals.lastGood = stored.lastGood;
+            totals.lastGoodAt = stored.lastGoodAt;
+            totals.failedSince = stored.failedSince;
+        }
+        List<String> differing = new ArrayList<>();
+        if ((stored == null ? 0 : stored.members) != totals.members) {
+            differing.add(MEMBERS);
+        }
+        for (int field = 0; field < fields.size(); field++) {
+            boolean same = (unusableDiffers & bit(field)) == 0
+                    && sameEntries(held, wanted, orderedPrefix(group, field), orderedPrefix(group, field + 1))
+                    && sameEntries(held, wanted, distinctPrefix(group, field), distinctPrefix(group, field + 1));
+            if (same && totals.members > 0) {
+                same = stored != null && result(stored, field).equals(result(totals, field));
+            }
+            if (!same) {
+                differing.add(fields.get(field).field());
+            }
+        }
+        return new Rebuilt(fold, totals, storedTotals, held, wanted, List.copyOf(differing));
+    }
+
+    private static boolean sameEntries(TreeMap<byte[], byte[]> held, TreeMap<byte[], byte[]> wanted,
+            byte[] from, byte[] to) {
+        var a = held.subMap(from, true, to, false);
+        var b = wanted.subMap(from, true, to, false);
+        if (a.size() != b.size()) {
+            return false;
+        }
+        var other = b.entrySet().iterator();
+        for (Map.Entry<byte[], byte[]> entry : a.entrySet()) {
+            Map.Entry<byte[], byte[]> match = other.next();
+            if (!Arrays.equals(entry.getKey(), match.getKey()) || !Arrays.equals(entry.getValue(), match.getValue())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static final int AUDIT_PAGE = 256;
+
     private void commit(List<Fold> batch, Map<Key, GroupOutcome> outcomes) {
         List<Entry> saves = new ArrayList<>();
         List<byte[]> deletes = new ArrayList<>();
@@ -216,7 +436,7 @@ public final class GroupStage {
     private Fold fold(byte[] group, List<GroupChange> changes) {
         Fold fold = new Fold(group);
         List<byte[]> keys = new ArrayList<>();
-        keys.add(key(group, TOTALS));
+        keys.add(totalsKey(group));
         TreeMap<byte[], StoredRow> rows = new TreeMap<>(Arrays::compareUnsigned);
         for (GroupChange change : changes) {
             rows.put(change.inputKey(), null);
@@ -277,9 +497,9 @@ public final class GroupStage {
             if (totals.members == 0) {
                 // A group with no rows has nothing a later fold needs: one that finds no totals starts
                 // from none, and reports the group as empty again if its last leaving is delivered twice.
-                fold.deletes.add(key(group, TOTALS));
+                fold.deletes.add(totalsKey(group));
             } else {
-                fold.saves.put(key(group, TOTALS), writeTotals(totals));
+                fold.saves.put(totalsKey(group), writeTotals(totals));
             }
             fold.counts.forEach((key, count) -> {
                 if (count.now != count.before) {
@@ -495,39 +715,50 @@ public final class GroupStage {
         }
         Map<String, Object> values = new LinkedHashMap<>();
         for (int field = 0; field < fields.size(); field++) {
-            RollupSpec spec = fields.get(field);
-            FieldTotals state = totals.fields[field];
-            try {
-                if (state.unusable > 0) {
-                    return new GroupOutcome(totals.group, send, totals.members, Map.of(),
-                            RollupError.VALUE_TYPE_MISMATCH, Map.of("declared", spec.argumentType().spelled()),
-                            spec.field(), conflicts, dropped);
-                }
-                boolean contributed;
-                Object value;
-                if (state.running != null) {
-                    contributed = state.running.contributed();
-                    value = state.running.result();
-                } else if (spec.function() == RollupFunction.COUNT_DISTINCT) {
-                    contributed = state.inputs > 0;
-                    value = state.distinct;
-                } else {
-                    contributed = state.inputs > 0;
-                    value = state.bestValue;
-                }
-                if (!contributed && spec.defaultValue() != null) {
-                    value = spec.defaultValue();
-                } else if (spec.convert() != null) {
-                    value = Values.convert(value, spec.convert());
-                }
-                values.put(spec.field(), value);
-            } catch (AggregateFailure failure) {
-                return new GroupOutcome(totals.group, send, totals.members, Map.of(), failure.code(),
-                        failure.args(), spec.field(), conflicts, dropped);
+            FieldResult result = result(totals, field);
+            if (result.failure != null) {
+                return new GroupOutcome(totals.group, send, totals.members, Map.of(), result.failure,
+                        result.args, fields.get(field).field(), conflicts, dropped);
             }
+            values.put(fields.get(field).field(), result.value);
         }
         return new GroupOutcome(totals.group, send, totals.members, java.util.Collections.unmodifiableMap(values),
                 null, Map.of(), null, conflicts, dropped);
+    }
+
+    /** What one field of a group comes to: its value, or why it cannot be given. */
+    private record FieldResult(Object value, RollupError failure, Map<String, Object> args) {
+    }
+
+    private FieldResult result(Totals totals, int field) {
+        RollupSpec spec = fields.get(field);
+        FieldTotals state = totals.fields[field];
+        try {
+            if (state.unusable > 0) {
+                return new FieldResult(null, RollupError.VALUE_TYPE_MISMATCH,
+                        Map.of("declared", spec.argumentType().spelled()));
+            }
+            boolean contributed;
+            Object value;
+            if (state.running != null) {
+                contributed = state.running.contributed();
+                value = state.running.result();
+            } else if (spec.function() == RollupFunction.COUNT_DISTINCT) {
+                contributed = state.inputs > 0;
+                value = state.distinct;
+            } else {
+                contributed = state.inputs > 0;
+                value = state.bestValue;
+            }
+            if (!contributed && spec.defaultValue() != null) {
+                value = spec.defaultValue();
+            } else if (spec.convert() != null) {
+                value = Values.convert(value, spec.convert());
+            }
+            return new FieldResult(value, null, Map.of());
+        } catch (AggregateFailure failure) {
+            return new FieldResult(null, failure.code(), failure.args());
+        }
     }
 
     // ---- what a field orders by and admits ----------------------------------------------------
@@ -577,6 +808,24 @@ public final class GroupStage {
     private static byte[] key(byte[] group, int kind) {
         byte[] key = Arrays.copyOf(group, group.length + 1);
         key[group.length] = (byte) kind;
+        return key;
+    }
+
+    /**
+     * Where a group's totals are kept: the kind first, then the group. Every other entry of a group
+     * starts with the group, which keeps a group's entries together; the totals start with their kind,
+     * which keeps the totals of all groups together, so the groups can be listed without reading their rows.
+     * No group's bytes start with a kind: the first byte of a value is its type's tag, and no tag is a kind.
+     */
+    private static byte[] totalsKey(byte[] group) {
+        return concat(new byte[] {(byte) TOTALS}, group);
+    }
+
+    private static byte[] distinctPrefix(byte[] group, int field) {
+        byte[] key = Arrays.copyOf(group, group.length + 3);
+        key[group.length] = (byte) DISTINCT;
+        key[group.length + 1] = (byte) (field >>> 8);
+        key[group.length + 2] = (byte) field;
         return key;
     }
 
@@ -631,6 +880,13 @@ public final class GroupStage {
         Count(long held) {
             this.before = held;
             this.now = held;
+        }
+
+        /** A count held as {@code held} and counted again from nothing. */
+        static Count again(long held) {
+            Count count = new Count(held);
+            count.now = 0;
+            return count;
         }
     }
 
