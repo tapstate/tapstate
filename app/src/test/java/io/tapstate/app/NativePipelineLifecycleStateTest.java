@@ -86,14 +86,19 @@ class NativePipelineLifecycleStateTest {
         assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
     }
 
-    @Test void recognizedClusterTurnoverLeavesTheStoreProjectionAvailable() {
-        for (var unavailable : List.of(new com.hazelcast.core.HazelcastInstanceNotActiveException(),
-                new com.hazelcast.spi.exception.RetryableHazelcastException("changing membership"),
-                new IllegalStateException("Master address unknown: instance is not yet initialized or is shut down"))) {
-            when(engine.captureRun("orders")).thenThrow(unavailable);
-            assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
-            doReturn(Optional.of(run)).when(engine).captureRun("orders");
-        }
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings = {"inactive", "retryable", "master"})
+    void recognizedClusterTurnoverLeavesTheStoreProjectionAvailable(String kind) {
+        RuntimeException unavailable = switch (kind) {
+            case "inactive" -> new com.hazelcast.core.HazelcastInstanceNotActiveException();
+            case "retryable" -> new com.hazelcast.spi.exception.RetryableHazelcastException("changing membership");
+            default -> new IllegalStateException("Master address unknown: instance is not yet initialized or is shut down");
+        };
+        when(engine.captureRun("orders")).thenThrow(unavailable);
+        assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
+        verify(engine).captureRun("orders");
+    }
+
+    @Test void unexpectedEngineDefectsAreNotHiddenByTheOptionalRead() {
         when(run.status()).thenThrow(new IllegalStateException("broken invariant"));
         org.assertj.core.api.Assertions.assertThatThrownBy(() -> lifecycle.currentState("orders", SCOPE))
                 .isInstanceOf(IllegalStateException.class).hasMessage("broken invariant");
@@ -105,35 +110,38 @@ class NativePipelineLifecycleStateTest {
         assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
     }
 
-    @Test void aDifferentCacheOrStateGenerationCannotReuseTheNamedJob() {
-        assertThat(lifecycle.currentState("orders", new PipelineIntentScope("cluster", 1, "other-cache", "orders", 2))).isEmpty();
-        assertThat(lifecycle.currentState("orders", new PipelineIntentScope("cluster", 1, "cache", "orders", 3))).isEmpty();
-        assertThat(lifecycle.currentState("orders", null)).isEmpty();
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings = {"cache", "generation", "absent"})
+    void aDifferentCacheOrStateGenerationCannotReuseTheNamedJob(String kind) {
+        var scope = switch (kind) {
+            case "cache" -> new PipelineIntentScope("cluster", 1, "other-cache", "orders", 2);
+            case "generation" -> new PipelineIntentScope("cluster", 1, "cache", "orders", 3);
+            default -> null;
+        };
+        assertThat(lifecycle.currentState("orders", scope)).isEmpty();
+        if (scope != null) verify(engine).captureRun("orders");
     }
 
-    @Test void missingOrReplacedPlanAndExpiredClaimCannotProveRunning() {
-        when(plans.current(List.of("orders"))).thenReturn(Map.of());
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings = {"missing", "claim", "execution", "topology", "expired"})
+    void missingOrReplacedPlanAndExpiredClaimCannotProveRunning(String kind) {
+        ExecutionPlan replacement = switch (kind) {
+            case "missing" -> null;
+            case "claim" -> new ExecutionPlan("orders", 8L, 4L, 5L, List.of(), List.of(), Instant.EPOCH);
+            case "execution" -> new ExecutionPlan("orders", 3L, 8L, 5L, List.of(), List.of(), Instant.EPOCH);
+            case "topology" -> new ExecutionPlan("orders", 3L, 4L, 8L, List.of(), List.of(), Instant.EPOCH);
+            default -> PLAN;
+        };
+        when(plans.current(List.of("orders"))).thenReturn(replacement == null ? Map.of() : Map.of("orders", replacement));
+        if (kind.equals("expired")) authorized.set(false);
         assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
-        for (var replacement : List.of(new ExecutionPlan("orders", 8L, 4L, 5L, List.of(), List.of(), Instant.EPOCH),
-                new ExecutionPlan("orders", 3L, 8L, 5L, List.of(), List.of(), Instant.EPOCH),
-                new ExecutionPlan("orders", 3L, 4L, 8L, List.of(), List.of(), Instant.EPOCH))) {
-            when(plans.current(List.of("orders"))).thenReturn(Map.of("orders", replacement));
-            assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
-        }
-        when(plans.current(List.of("orders"))).thenReturn(Map.of("orders", PLAN));
-        authorized.set(false);
-        assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
+        verify(engine).captureRun("orders");
     }
 
-    @Test void replacementOrRevocationDuringTheEngineReadDiscardsItsResult() {
-        doAnswer(call -> { authorized.set(false); return JobStatus.RUNNING; }).when(run).status();
+    @ParameterizedTest @org.junit.jupiter.params.provider.ValueSource(strings = {"claim", "context", "plan"})
+    void replacementOrRevocationDuringTheEngineReadDiscardsItsResult(String kind) {
+        if (kind.equals("claim")) doAnswer(call -> { authorized.set(false); return JobStatus.RUNNING; }).when(run).status();
+        else if (kind.equals("context")) doAnswer(call -> { active.set(false); return JobStatus.RUNNING; }).when(run).status();
+        else when(plans.current(List.of("orders"))).thenReturn(Map.of("orders", PLAN), Map.of());
         assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
-        authorized.set(true);
-        doAnswer(call -> { active.set(false); return JobStatus.RUNNING; }).when(run).status();
-        assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
-        active.set(true);
-        doReturn(JobStatus.RUNNING).when(run).status();
-        when(plans.current(List.of("orders"))).thenReturn(Map.of("orders", PLAN), Map.of());
-        assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
+        verify(run).status();
     }
 }
