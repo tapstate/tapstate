@@ -83,8 +83,11 @@ class SettledMongoCdcFrontierIT {
                     () -> control.snapshotRowsRead(PIPELINE).getOrDefault("orders", -1L) == 2L,
                     () -> control.snapshotRowsRead(PIPELINE).toString());
             Await.until("the snapshot to be durably landed", TIMEOUT,
-                    () -> control.snapshotTable(PIPELINE, "orders").filter(progress -> progress.landed()).isPresent(),
-                    () -> control.snapshotTable(PIPELINE, "orders").toString());
+                    () -> {
+                        var progress = control.snapshotTables(PIPELINE).get("orders");
+                        return progress != null && progress.landed();
+                    },
+                    () -> control.snapshotTables(PIPELINE).toString());
             assertThat(control.metricsNamed(PIPELINE, "frontierGap").getOrDefault("frontierGap.orders", 0L))
                     .as("the settled snapshot starts without a frontier gap")
                     .isZero();

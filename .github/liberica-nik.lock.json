@@ -1,0 +1,22 @@
+{
+  "releaseTag": "toolchain-liberica-nik-23.1.12-1-jdk21.0.12-11",
+  "directory": "bellsoft-liberica-vm-openjdk21-23.1.12",
+  "platforms": {
+    "darwin-arm64": {
+      "file": "bellsoft-liberica-vm-openjdk21.0.12+11-23.1.12+1-macos-aarch64.tar.gz",
+      "sha256": "506c7bada2bb7fc58dca348f75b457b5979d5e26c193d06560646fb8fda7dd02"
+    },
+    "darwin-x64": {
+      "file": "bellsoft-liberica-vm-openjdk21.0.12+11-23.1.12+1-macos-amd64.tar.gz",
+      "sha256": "f547684e8967c294820c3653f66056288d34d0f7eac37826ef5d40546b23a890"
+    },
+    "linux-x64": {
+      "file": "bellsoft-liberica-vm-openjdk21.0.12+11-23.1.12+1-linux-amd64.tar.gz",
+      "sha256": "9efd9adad645bc52a07237ff1fb231d6185a0ee033f95ac96757eaf6e182acd0"
+    },
+    "linux-arm64": {
+      "file": "bellsoft-liberica-vm-openjdk21.0.12+11-23.1.12+1-linux-aarch64.tar.gz",
+      "sha256": "a6368317bd81fd8406b9b57c78cab6b6fb8d7d4c354e6fb2a02684c0f144d846"
+    }
+  }
+}

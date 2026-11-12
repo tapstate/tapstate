@@ -129,11 +129,11 @@ class NestPendingLimitFailsTheJobIT {
                                 + "%d.%n  documents: %s%n  metrics: %s", ORPHANS, ABSENT_ROOT, PENDING_LIMIT,
                                 mongo.documents(EndpointAddress.uri(targetUri), PARENT_TABLE).size(), control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
 
-                await(() -> control.failureCode(pipelineId).isPresent());
                 assertThat(control.failureCode(pipelineId))
                         .as("which bound it was. A run that died of anything else satisfies the state "
                                 + "above and says nothing about this one.%n  logs: %s",

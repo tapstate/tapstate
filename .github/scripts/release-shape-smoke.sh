@@ -318,9 +318,18 @@ has "and refuses a branch that exists"    version 'already exists'
 # blocks by being something the gate needs. Both halves are asserted, because either one going away
 # retires the gate in silence -- drop the smokes and the job still builds and still passes; drop the
 # dependency and a red smoke stops blocking anything downstream of it.
-has "the smokes gate 2 is made of are run"    cli-native 'native-smoke\.sh'
-has "and so is the sidecar's"                 cli-native 'mcp-smoke\.sh'
-has "and a red smoke blocks the gate"         gates      'needs:.*cli-native'
+has "the native build uses the shared workflow" cli-native 'uses: [.]\/[.]github/workflows/cli-native\.yml'
+has "and uses the pinned source" cli-native 'source-sha: \$\{\{ needs\.version\.outputs\.sha \}\}'
+has "and uses the computed release version" cli-native 'release-version: \$\{\{ needs\.version\.outputs\.version \}\}'
+workflow_saved="$workflow"
+workflow="$here/../workflows/cli-native.yml"
+has "the native build installs the locked toolchain" cli-native 'install-liberica-nik\.sh'
+has "the installer comes from the workflow revision or PR head" cli-native 'ref: \$\{\{ github\.event\.pull_request\.head\.sha \|\| github\.sha \}\}'
+has "the native build can select an older release source" cli-native 'ref: \$\{\{ inputs\.source-sha \}\}'
+has "the native CLI smoke runs" cli-native 'native-smoke\.sh'
+has "and so does the sidecar smoke" cli-native 'mcp-smoke\.sh'
+workflow="$workflow_saved"
+has "and a red smoke blocks the gate" gates 'needs:.*cli-native'
 
 # --- the gate is upstream of the draft -------------------------------------------------------------
 has "the draft waits on the gate"             draft  'needs:.*gates'
@@ -382,7 +391,7 @@ has "the performance lane is judged by the same reader as every other check" \
 # from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
 # diverges only on the case the input exists for, and there it builds the wrong line's code under the
 # right line's version number and publishes it -- with nothing red anywhere.
-for j in cli-native server-image cloud-server-jar cloud-image connectors join-perf gates draft publish; do
+for j in server-image cloud-server-jar cloud-image connectors join-perf gates draft publish; do
   has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
 done
 # And the release that comes out says so, which is the half a reader can check afterwards.

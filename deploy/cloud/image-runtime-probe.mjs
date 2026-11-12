@@ -207,6 +207,13 @@ async function exchange(base, code) {
   return cookieHeader(response.headers.get('set-cookie') ?? '');
 }
 
+async function logout(base, cookie) {
+  const response = await request(base, '/auth/logout', { method: 'POST',
+    headers: { Cookie: cookie, Origin: new URL(base).origin } });
+  assert.equal(response.status, 204);
+  assert((response.headers.get('set-cookie') ?? '').includes('Max-Age=0'));
+}
+
 async function awaitState(read, accept) {
   const until = Date.now() + 120000;
   do {
@@ -234,17 +241,22 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     const committed = await jsonRequest(base, '/api/storage/setup/commit',
       { ...original, testStamps: { CACHE: tested.testStamp } }, temporary);
     assert(['STORAGE_BOUND', 'COMPLETE'].includes(committed.setupPhase));
-    stage = 'same-process setup completes and retires temporary authentication';
+    stage = 'same-process setup completes and preserves the setup session';
     await awaitState(async () => (await request(base, '/auth/storage-entry')).json(),
       (value) => value.entry === 'LOGIN');
+    const initialized = await awaitState(() => jsonRequest(base, '/api/storage/status', {}, temporary),
+      (value) => value.businessPhase === 'READY' && value.applicationDataVerification.status === 'PASSED');
+    assert.equal(initialized.setupPhase, 'COMPLETE');
+    stage = 'setup session logout and revocation';
+    await logout(base, temporary);
     assert.equal((await request(base, '/api/storage/status', { method: 'POST',
       headers: { Cookie: temporary, 'Content-Type': 'application/json' }, body: '{}' })).status, 401);
     stage = 'formal SDK reauthentication and business readiness';
     const cookie = await exchange(base, FORMAL_CODE);
-    const ready = await awaitState(() => jsonRequest(base, '/api/storage/status', {}, cookie),
-      (value) => value.businessPhase === 'READY' && value.applicationDataVerification.status === 'PASSED');
+    const ready = await jsonRequest(base, '/api/storage/status', {}, cookie);
     assert.equal(ready.setupPhase, 'COMPLETE');
-    console.log('PASS: real image Cloud setup, temporary session retirement and formal reauthentication');
+    assert.equal(ready.businessPhase, 'READY');
+    console.log('PASS: real image Cloud setup, session continuity, logout and formal reauthentication');
     stage = 'anonymous API rejection';
     assert.equal((await request(base, '/api/connectors')).status, 401);
     stage = 'SDK exchange and local Cookie creation';
@@ -279,10 +291,7 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
   } else if (phase === 'logout') {
     stage = 'local session logout and revocation';
     const saved = JSON.parse(readFileSync(statePath, 'utf8'));
-    const response = await request(base, '/auth/logout', { method: 'POST',
-      headers: { Cookie: saved.cookie, Origin: new URL(base).origin } });
-    assert.equal(response.status, 204);
-    assert((response.headers.get('set-cookie') ?? '').includes('Max-Age=0'));
+    await logout(base, saved.cookie);
     assert.equal((await request(base, '/api/connectors', { headers: { Cookie: saved.cookie } })).status, 401);
   } else if (phase === 'seed-refused') {
     stage = 'invalid seed keeps the diagnostic root but cannot publish business';

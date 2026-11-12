@@ -60,5 +60,5 @@ steps:
   - await: { doc: { views.point_state: { where: { id: 1 }, expect: { customer.id: 100, customer.name: ada } } } }
   - cdc: { src_point_orders.point_orders: { update: { where: { id: 1 }, set: { cust_ref: 200 } } } }
   - await: { state: FAILED }
-  - assert: { failure_code: nest.reference-tracking-requires-before-image }
+  - await: { failure_code: nest.reference-tracking-requires-before-image }
   - assert: { count: { views.point_state: 1 } }
