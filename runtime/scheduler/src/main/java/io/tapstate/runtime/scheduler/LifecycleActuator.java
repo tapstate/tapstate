@@ -45,6 +45,15 @@ public interface LifecycleActuator {
      */
     Optional<Throwable> failure(String pipelineId);
 
+    /** A terminal Jet execution that was rejected by its original lease fence. */
+    record LeaseLoss(long executionGeneration, Throwable cause) {}
+
+    default Optional<Throwable> terminalLeaseFailure(String pipelineId) { return Optional.empty(); }
+
+    default Optional<LeaseLoss> leaseLoss(String pipelineId) { return Optional.empty(); }
+
+    default boolean recoveredJobRunning(String pipelineId) { return isCarryingAJob(pipelineId); }
+
     /**
      * Whether this exact bounded execution ended successfully, including every target write. A quiet
      * stream, an absent job, and an earlier execution's terminal job never establish completion.

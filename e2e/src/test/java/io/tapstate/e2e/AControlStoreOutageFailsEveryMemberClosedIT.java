@@ -188,8 +188,9 @@ class AControlStoreOutageFailsEveryMemberClosedIT {
                     // the outage was the store and nothing else.
                     store.thaw();
                     Await.until("the store to answer these members again", RECOVERY,
-                            () -> control.state(PIPELINE).isPresent(),
-                            () -> "the read face says " + stateOn(control));
+                            () -> PipelineState.RUNNING.name().equals(control.pipelineStatus(PIPELINE).get("state")),
+                            () -> "the read face says " + control.pipelineStatus(PIPELINE));
+                    assertThat(control.pipelineStatus(PIPELINE)).doesNotContainKey("observedState");
 
                     // With the store answering and nothing rejoined yet, this read reaches the engine
                     // half for the only stretch in this case where it can: the durable half of the

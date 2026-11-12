@@ -5,6 +5,7 @@ import io.tapstate.core.event.ChainPosition;
 
 import java.io.Serializable;
 import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.function.LongConsumer;
 
 /**
@@ -51,4 +52,11 @@ public interface SrsReadCursorPublisherFactory extends Serializable {
     default java.util.OptionalLong recoverySequence(HazelcastInstance member) {
         return java.util.OptionalLong.empty();
     }
+
+    /** Reads both startup coordinates from one progress observation when the store supports it. */
+    default RecoveryProgress recoveryProgress(HazelcastInstance member) {
+        return new RecoveryProgress(recoverySequence(member), confirmedPosition(member));
+    }
+
+    record RecoveryProgress(OptionalLong sequence, Optional<ChainPosition> confirmed) {}
 }

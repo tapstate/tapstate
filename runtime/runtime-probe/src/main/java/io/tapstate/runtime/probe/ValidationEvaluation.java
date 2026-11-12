@@ -21,7 +21,11 @@ public abstract class ValidationEvaluation implements AutoCloseable {
     }
     /** Previous spec is server-loaded, never accepted as a trusted client model. */
     public record Request(ValidationTaskStore.Selection selection,List<Choice> choices,ValidationMethod method,
-            Map<String,Confirmation> confirmations,ValidationTaskSpec previous,Instant deadline) {
+            Map<String,Confirmation> confirmations,ValidationTaskSpec previous,Instant deadline,boolean inspectMetadata,ValidationMethod previousMethod) {
+        public Request(ValidationTaskStore.Selection selection,List<Choice> choices,ValidationMethod method,
+                Map<String,Confirmation> confirmations,ValidationTaskSpec previous,Instant deadline) {
+            this(selection,choices,method,confirmations,previous,deadline,true,null);
+        }
         public Request {
             if(selection==null||method==null||deadline==null||choices==null||choices.isEmpty()||choices.size()>ValidationTaskSpec.MAX_MAPPINGS
                     ||confirmations==null||confirmations.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("request");

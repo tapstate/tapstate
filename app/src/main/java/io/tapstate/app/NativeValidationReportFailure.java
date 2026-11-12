@@ -32,6 +32,27 @@ final class NativeValidationReportFailure {
         return new ValidationReportMetadata.Failure(code,params,clip(failure.getClass().getName(),256),
                 safe(message,1024,redactor),clip(details.toString(),4096),failure instanceof Error);
     }
+    static RuntimeException forTable(RuntimeException failure, io.tapstate.core.validation.ValidationTableFailure.Side side) {
+        var coded = codedCause(failure);
+        if (coded == null) return failure;
+        var code = coded.code();
+        if (code == io.tapstate.core.validation.ValidationError.READ_FAILED
+                || code == io.tapstate.core.validation.ValidationError.READ_PROTOCOL_VIOLATION
+                || code == io.tapstate.core.validation.ValidationError.RULE_UNSUPPORTED
+                || code == io.tapstate.core.validation.ValidationError.INCOMPATIBLE_KEY
+                || code == io.tapstate.core.validation.ValidationError.CODEC_FAILED
+                || code == io.tapstate.core.validation.ValidationError.CODEC_VALUE_UNAVAILABLE
+                || code == io.tapstate.adapters.pdk.ConnectorError.CAPABILITY_MISSING
+                || code == io.tapstate.core.validation.ValidationError.INVALID_CONTRACT
+                    && tableModelChanged(coded.args().get("field"))) {
+            return new io.tapstate.runtime.engine.validation.ValidationPairException(side, coded);
+        }
+        return failure;
+    }
+    private static boolean tableModelChanged(Object field) {
+        return field instanceof String name && (name.equals("directRows.savedModelChanged")
+                || name.startsWith("pdkRead.modelChanged.") || name.startsWith("pdkRead.codecChanged."));
+    }
     static String code(Throwable failure){var coded=codedCause(failure);return coded==null?null:coded.code().code();}
     /** Unwrap only execution carriers; a programmer failure remains the diagnosis in its own right. */
     private static TapstateException codedCause(Throwable failure){

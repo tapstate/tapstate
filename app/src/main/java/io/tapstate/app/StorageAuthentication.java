@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoReadBudget;
 import io.tapstate.control.core.*;
@@ -91,65 +93,61 @@ final class StorageAuthentication implements AutoCloseable {
     CredentialAuthenticator credentials() { return CredentialAuthenticator.scoped(this::authenticate); }
 
     private Optional<CredentialAuthentication> authenticate(String presented) {
-        if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
-        long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
-        var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
-        Epoch original = selected();
-        if (cloud.cloud()) return pending.validate(original, presented, deadline,
-                () -> authenticate(original, presented, budget), original::requireLocallyActive);
-        return authenticate(original, presented, budget);
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_ATTEMPT)) {
+            if (current.get() == null && bootstrap != null) return bootstrap.authenticate(presented);
+            long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
+            var budget = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
+            Epoch original = selected();
+            if (cloud.cloud()) return pending.validate(original, presented, deadline,
+                    () -> authenticate(original, presented, budget), original::requireLocallyActive);
+            return authenticate(original, presented, budget);
+        }
     }
 
     private Optional<CredentialAuthentication> authenticate(Epoch original, String presented, MongoReadBudget budget) {
-        Optional<VerifiedToken> verified;
-        Optional<CredentialEvidence> evidence;
-        Optional<String> organization = Optional.empty();
-        if (cloud.cloud()) {
-            // The fenced session transaction checks CACHE identity and structure before reading.
-            // Check CONFIG first, then publish only after the full final CACHE/index validation.
-            original.requirePublished(budget);
-            var authenticated = authenticateCloud(original, presented, budget);
-            verified = authenticated.map(AuthenticatedCloudSession::identity);
-            organization = authenticated.map(value -> value.clusterContext().organizationId());
-            original.requireLocallyActive();
-            evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
-                    Optional.empty(), original::requireLocallyActive));
-        } else {
-            var authenticated = original.authenticateTagged(presented, budget);
-            verified = authenticated.map(AuthenticatedIdentity::identity);
-            evidence = authenticated.map(value -> new CredentialEvidence(value.type(), value.configurationBinding(), () -> {
+        try (var diagnosticStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_VERIFY)) {
+            Optional<VerifiedToken> verified;
+            Optional<CredentialEvidence> evidence;
+            Optional<String> organization = Optional.empty();
+            if (cloud.cloud()) {
+                // Admission reads current publication once; the CACHE transaction is the session boundary.
+                original.requirePublished(budget, true);
+                var authenticated = authenticateCloud(original, presented, budget);
+                verified = authenticated.map(AuthenticatedCloudSession::identity);
+                organization = authenticated.map(value -> value.clusterContext().organizationId());
                 original.requireLocallyActive();
-                if (value.type() == CredentialType.HUMAN_JWT
-                        && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
-            }, value.humanToken()));
+                evidence = verified.map(ignored -> new CredentialEvidence(CredentialType.CLOUD_SESSION,
+                        Optional.empty(), original::requireLocallyActive));
+            } else {
+                var authenticated = original.authenticateTagged(presented, budget);
+                verified = authenticated.map(AuthenticatedIdentity::identity);
+                evidence = authenticated.map(value -> new CredentialEvidence(value.type(), value.configurationBinding(), () -> {
+                    original.requireLocallyActive();
+                    if (value.type() == CredentialType.HUMAN_JWT
+                            && original.signer.verify(presented).filter(value.identity()::equals).isEmpty()) throw unauthenticated();
+                }, value.humanToken()));
+            }
+            if (!cloud.cloud() && verified.isPresent()) {
+                original.requireActive(budget);
+            }
+            if (verified.isEmpty()) return Optional.empty();
+            if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
+            VerifiedToken identity = verified.orElseThrow();
+            return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
+                    organization, () -> {
+                        try (var revalidationStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.AUTH_REVALIDATE)) {
+                            // Revalidation is a later IO operation, not the lifetime of the original request.
+                            long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
+                            var revalidation = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
+                            var checked = cloud.cloud()
+                                    ? pending.validate(original, presented, deadline,
+                                            () -> authenticate(original, presented, revalidation), original::requireLocallyActive)
+                                            .map(CredentialAuthentication::token)
+                                    : original.authenticate(presented, revalidation);
+                            if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
+                        }
+                    }, evidence));
         }
-        // The last CACHE transaction validates both scope and this exact session's revocation. A
-        // scope-only check after the first session read would miss a denial committed in between.
-        if (cloud.cloud() && verified.isPresent()) {
-            original.requireActive(budget);
-            var checked = authenticateCloud(original, presented, budget);
-            original.requireLocallyActive();
-            if (!checked.map(AuthenticatedCloudSession::identity).equals(verified)
-                    || !checked.map(value -> value.clusterContext().organizationId()).equals(organization)) return Optional.empty();
-        } else if (cloud.cloud() || verified.isPresent()) {
-            // A vanished session must not hide a concurrent scope or structure failure as a bad cookie.
-            original.requireActive(budget);
-        }
-        if (verified.isEmpty()) return Optional.empty();
-        if (cloud.cloud() && organization.isEmpty()) return Optional.empty();
-        VerifiedToken identity = verified.orElseThrow();
-        return Optional.of(new CredentialAuthentication(identity, Optional.of(original.bound.preparation().authScope()),
-                organization, () -> {
-                    // Revalidation is a later IO operation, not the lifetime of the original request.
-                    long deadline = System.nanoTime() + AUTHORIZATION_READ_BUDGET.toNanos();
-                    var revalidation = new MongoReadBudget(AUTHORIZATION_READ_BUDGET);
-                    var checked = cloud.cloud()
-                            ? pending.validate(original, presented, deadline,
-                                    () -> authenticate(original, presented, revalidation), original::requireLocallyActive)
-                                    .map(CredentialAuthentication::token)
-                            : original.authenticate(presented, revalidation);
-                    if (checked.filter(identity::equals).isEmpty()) throw unauthenticated();
-                }, evidence));
     }
 
     /** Converts the original successful verification, including its exact mechanism, into a local alert request. */
@@ -201,29 +199,40 @@ final class StorageAuthentication implements AutoCloseable {
                     new CloudSessionService(sessions, identity, secrets, clock, observer), observer, egressAddresses);
         }
         boolean incomplete() {
-            try { return configuration.setupStates().load().phase() != StorageSetupStateStore.Phase.COMPLETE
-                    && configuration.bindings().cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true); }
+            return incomplete(setupView());
+        }
+        boolean incomplete(StorageSetupStateStore.View view) {
+            return view.status().phase() != StorageSetupStateStore.Phase.COMPLETE
+                    && view.cachePreparation().map(value -> value.authScope().authGeneration() == 1).orElse(true);
+        }
+        StorageSetupStateStore.View setupView() {
+            try { return configuration.setupStates().loadView(); }
             catch (TapstateException unavailable) { throw StorageRuntime.unavailable(); }
         }
-        void requireActive() {
+        void requireLocallyActive() {
             if (closed || current.get() != null) throw unauthenticated();
-            var actual = configuration.setupStates().load();
-            if (!actual.scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
-                    || !incomplete()) throw unauthenticated();
+            sessions.requireLocallyActive();
+        }
+        void requireActive() {
+            requireLocallyActive();
+            var view = setupView();
+            if (!view.status().scope().equals(setup) || !cloud.clusterId().equals(setup.clusterId())
+                    || !incomplete(view)) throw unauthenticated();
         }
         Optional<CredentialAuthentication> authenticate(String credential) {
-            requireActive();
+            requireLocallyActive();
             var verified = managed.authenticateWithContext(credential);
             if (verified.isEmpty()) return Optional.empty();
             var session = verified.orElseThrow();
             var organization = Optional.ofNullable(session.clusterContext().organizationId());
             if (organization.isEmpty()) return Optional.empty();
-            var identity = session.identity(); requireActive();
+            var identity = session.identity(); requireLocallyActive();
             return Optional.of(new CredentialAuthentication(identity, Optional.empty(), organization, () -> {
                 requireActive();
                 if (managed.authenticate(credential).filter(identity::equals).isEmpty()) throw unauthenticated();
                 requireActive();
-            }));
+            }, Optional.of(new CredentialEvidence(CredentialType.CLOUD_SESSION, Optional.empty(), this::requireLocallyActive)),
+                    Optional.of(setup)));
         }
     }
 
@@ -297,9 +306,13 @@ final class StorageAuthentication implements AutoCloseable {
             requireLocallyActive();
         }
         void requirePublished(MongoReadBudget budget) {
+            requirePublished(budget, false);
+        }
+        void requirePublished(MongoReadBudget budget, boolean admission) {
             requireLocallyActive();
             try {
-                configuration.requireAuthenticationPublished(bound.preparation(), budget);
+                if (admission) configuration.requireRequestAuthenticationPublished(bound.preparation(), budget);
+                else configuration.requireAuthenticationPublished(bound.preparation(), budget);
             }
             catch (TapstateException unavailable) {
                 LOG.warn("Storage authentication check failed [stage=configuration-publication, error_code={}]", unavailable.code().code());

@@ -54,8 +54,8 @@ class NativeValidationMetadataIT {
                 var original=f.tasks.read("flow","task").orElseThrow();long revision=f.configuration.configurationRevision();
                 try(var result=probe.inspect(new ValidationTaskStore.Selection("flow",List.of("out")),choices(),ValidationMethod.COUNT,Map.of(),clock.instant().plusSeconds(30))){
                     assertThat(result.mappings()).hasSize(2).allSatisfy(mapping->{
-                        assertThat(mapping.source().countOperation()).isEqualTo(PdkValidationCounts.Operation.DOCUMENT_COUNT);
-                        assertThat(mapping.target().countOperation()).isEqualTo(PdkValidationCounts.Operation.DOCUMENT_COUNT);
+                        assertThat(mapping.source().countOperation()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+                        assertThat(mapping.target().countOperation()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
                         assertThat(mapping.source().model()).isNull();assertThat(mapping.target().model()).isNull();
                     });
                     assertThat(result.declarations().original().configurationRevision()).isEqualTo(revision);
@@ -139,14 +139,14 @@ class NativeValidationMetadataIT {
                     for(var pair:List.of(new ValidationTaskCompiler.Pair("id","payload"),new ValidationTaskCompiler.Pair("id","approximate"))){
                         var incompatible=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(pair));
                         assertThatThrownBy(()->ValidationTaskCompiler.compile(result,Map.of("orders",incompatible,"items",confirmed),null))
-                                .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining(pair.target().equals("payload")?"native-text-ordering-unproven":"key-domain-mismatch");
+                                .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("key-domain-mismatch");
                     }
                     var textId=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("_id","payload")));
-                    assertThatThrownBy(()->ValidationTaskCompiler.compile(result,Map.of("orders",textId,"items",confirmed),null))
-                            .isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("native-text-ordering-unproven");
+                    assertThat(ValidationTaskCompiler.compile(result,Map.of("orders",textId,"items",confirmed),null)
+                            .comparison().mappings().getFirst().keys().target().getFirst().logicalTypes()).containsExactly("text");
                     var nativeId=new ValidationTaskCompiler.Confirmation(UUID.randomUUID(),List.of(new ValidationTaskCompiler.Pair("_id","_id")));
                     assertThat(ValidationTaskCompiler.compile(result,Map.of("orders",nativeId,"items",confirmed),null).comparison().mappings().getFirst().keys().source().getFirst().logicalTypes())
-                            .containsExactly("object-id");
+                            .containsExactly("text");
                     var mappings=compiled.comparison().mappings();var hashes=new HashMap<>(compiled.comparison().dependencyHashes());hashes.remove("flow");hashes.put("other","a".repeat(64));
                     var foreign=new ValidationTaskSpec("other",hashes,1,ValidationTaskCompiler.RULES_VERSION,mappings);
                     assertThatThrownBy(()->ValidationTaskCompiler.compile(result,confirmations,foreign)).isInstanceOf(io.tapstate.core.common.TapstateException.class).hasMessageContaining("previousPipeline");
@@ -169,7 +169,7 @@ class NativeValidationMetadataIT {
                 try(var result=service.evaluate(input)){
                     fingerprint=result.view().fingerprint();assertThat(fingerprint).isNotBlank();
                     assertThat(result.view().mappings()).singleElement().satisfies(mapping->{
-                        assertThat(mapping.target().table()).isEqualTo("checked_orders");assertThat(mapping.source().countOperation()).isEqualTo("DOCUMENT_COUNT");
+                        assertThat(mapping.target().table()).isEqualTo("checked_orders");assertThat(mapping.source().countOperation()).isEqualTo("PARTITION_FILTER");
                         assertThat(mapping.source().fields()).isEmpty();
                     });assertThat(f.resources.snapshot().metadataFrames()).isOne();
                 }

@@ -57,15 +57,34 @@ class SingleWritePathRulesTest {
      */
     private static final String MIGRATION_PACKAGE = "io.tapstate.adapters.mongostore.migration.";
 
-    /** A call that writes desired pipeline intent: {@code DesiredStore.save}. */
+    /** External entry points for a desired intent write, including the deferred start path. */
     private static final DescribedPredicate<JavaMethodCall> WRITES_DESIRED_INTENT =
             new DescribedPredicate<>("a call that writes desired pipeline intent") {
                 @Override
                 public boolean test(JavaMethodCall call) {
                     return call.getTargetOwner().isAssignableTo(DesiredStore.class)
-                            && call.getName().equals("save");
+                            && (call.getName().equals("save") || call.getName().equals("saveStart"))
+                            && !isDesiredStoreOverloadDelegation(call);
                 }
             };
+
+    private static boolean isDesiredStoreOverloadDelegation(JavaMethodCall call) {
+        var owner = call.getOriginOwner();
+        if (!owner.equals(call.getTargetOwner()) || !call.getOrigin().getName().equals("saveStart")) {
+            return false;
+        }
+        int originArguments = call.getOrigin().getRawParameterTypes().size();
+        int targetArguments = call.getTarget().getRawParameterTypes().size();
+        if (owner.isEquivalentTo(DesiredStore.class)) {
+            return originArguments == 2 && call.getName().equals("save") && targetArguments == 1
+                    || originArguments == 3 && call.getName().equals("saveStart") && targetArguments == 2;
+        }
+        // The native store's two-argument overload forwards to its own three-argument overload.
+        return originArguments == 2 && call.getName().equals("saveStart") && targetArguments == 3
+                && owner.isAnonymousClass()
+                && owner.getEnclosingClass().filter(type ->
+                        type.getName().equals("io.tapstate.app.ThreeLayerStorePort")).isPresent();
+    }
 
     @BeforeAll
     static void importTapstateClasses() {

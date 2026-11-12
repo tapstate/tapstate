@@ -48,6 +48,8 @@ public interface ValidationReportAdmission {
 
     /** Atomically advances the exact mode sequence and stores OPEN; a prior nonclosed permission blocks it. */
     Reservation reserve(Start start);
+    /** Atomically reserves an original start and creates its report where supported. */
+    default java.util.Optional<Reservation> reserveAndOpen(Open command) { return java.util.Optional.empty(); }
     /** Same CONFIG transaction/fence as the launch ticket; legacy coverage never grants scheduling. */
     default Reservation reserveScheduled(Start start, java.time.Instant due, io.tapstate.core.validation.ValidationSchedule.Calculator calculator) { throw invalid("start.scheduledAdmissionUnsupported"); }
     /** Original OPEN -> BORN plus original report insert in one CONFIG transaction; missing BORN report is loss. */

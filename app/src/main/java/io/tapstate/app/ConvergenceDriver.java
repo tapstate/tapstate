@@ -13,7 +13,6 @@ import io.tapstate.runtime.scheduler.RebuildAdmission;
 import io.tapstate.spi.store.PipelineIntentStore;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineStoreViews;
-import io.tapstate.spi.store.WorkloadClaimFence;
 import java.util.Objects;
 import java.util.function.Function;
 import io.tapstate.spi.metrics.MetricsExport;
@@ -23,6 +22,7 @@ import java.util.Collection;
 import java.util.function.Consumer;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.function.BooleanSupplier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,11 +52,19 @@ final class ConvergenceDriver {
     record ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable requireActive,
             Function<PipelineConvergencePass, LifecycleActuator> actuators,
             Function<PipelineConvergencePass, RebuildAdmission> rebuilds,
-            Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts) {
+            Consumer<Collection<String>> retainRebuilds, PipelineAlertFeed alerts,
+            Consumer<PipelineIntentStore.PendingStart> prepareStart,
+            Consumer<String> resumeRebuild) {
         ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
                 Function<PipelineConvergencePass, LifecycleActuator> actuators,
                 Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain) {
             this(intents, stores, active, actuators, rebuilds, retain, PipelineAlertFeed.none());
+        }
+        ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable active,
+                Function<PipelineConvergencePass, LifecycleActuator> actuators,
+                Function<PipelineConvergencePass, RebuildAdmission> rebuilds, Consumer<Collection<String>> retain,
+                PipelineAlertFeed alerts) {
+            this(intents, stores, active, actuators, rebuilds, retain, alerts, null, null);
         }
         ScopedPorts {
             Objects.requireNonNull(intents, "intents"); Objects.requireNonNull(stores, "stores");
@@ -150,7 +158,16 @@ final class ConvergenceDriver {
                     permit = actuation.permit(pipelineId);
                 } else {
                     var snapshot = scoped.intents().loadForActuation(pipelineId);
-                    if (snapshot.isEmpty() || snapshot.get().deleted()) continue;
+                    if (snapshot.isEmpty()) {
+                        var pendingStart = scoped.prepareStart() == null
+                                ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
+                        if (pendingStart.isPresent()) prepareStart(pendingStart.orElseThrow());
+                        else if (scoped.resumeRebuild() != null) {
+                            scoped.resumeRebuild().accept(pipelineId);
+                        }
+                        continue;
+                    }
+                    if (snapshot.get().deleted()) continue;
                     if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
                         throw new TapstateException(
                                 IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
@@ -158,8 +175,9 @@ final class ConvergenceDriver {
                     permit = actuation.permit(snapshot.get().scope());
                     if (permit.granted()) {
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
-                        pass = new PipelineConvergencePass(snapshot.get(), WorkloadClaimFence.from(permit.claim()),
+                        pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
                                 scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
+                        actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
                     }
                 }
                 if (!permit.granted()) {
@@ -175,8 +193,9 @@ final class ConvergenceDriver {
                 ConvergeResult result = scoped == null ? converger.converge(pipelineId)
                         : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
                                 scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
-                                        originalPass.state(), originalPass.observations(), null),
+                                        originalPass.state(), originalPass.observationSample(), null),
                                 () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
+                if (result.status() == ConvergeStatus.RECOVERING) continue;
                 ObservationFailure failure = null;
                 if (result.status() == ConvergeStatus.FAILED) {
                     // The job died on its own; the converge side moved the pipeline to the observable FAILED
@@ -189,7 +208,7 @@ final class ConvergenceDriver {
                             failure.code(), result.failure().orElse(null));
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observations(), failure);
+                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
                 PipelineConvergencePass sampledPass = pass;
                 projection.ifPresent(published -> {
                     if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
@@ -214,7 +233,7 @@ final class ConvergenceDriver {
                 try {
                     if (scoped == null) publisher.publishReconcileFailure(pipelineId, failures);
                     else if (pass != null) publisher.publishReconcileFailureScoped(
-                            pass.scope(), pass.state(), pass.observations(), failures);
+                            pass.scope(), pass.state(), pass.observationSample(), failures);
                 } catch (RuntimeException unpublishable) {
                     // The read face is unreachable too (e.g. the same store backs both), so nothing can be
                     // surfaced this tick; the warning above is the only record.
@@ -246,6 +265,17 @@ final class ConvergenceDriver {
             sampler.forgetPipelinesOutside(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void prepareStart(PipelineIntentStore.PendingStart pending) {
+        try {
+            scoped.requireActive().run();
+            scoped.prepareStart().accept(pending);
+        } catch (TapstateException failure) {
+            if (!(failure.code() instanceof IoError error) || (error != IoError.DOCUMENT_UNREADABLE
+                    && error != IoError.PIPELINE_STATE_REBUILD_REQUIRED && error != IoError.PIPELINE_INTENT_FENCED)) throw failure;
+            scoped.intents().failStart(pending, error);
+        }
     }
 
     private void alert(Runnable action) {

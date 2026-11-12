@@ -30,7 +30,7 @@ public final class SourceSchemaQueryService {
      */
     public Optional<SchemaReport> find(String sourceId) {
         Objects.requireNonNull(sourceId, "sourceId");
-        SourceResource source = artifacts.get(sourceId)
+        SourceResource source = artifacts.readableInventory("source", sourceId).resources().stream().findFirst()
                 .filter(SourceResource.class::isInstance)
                 .map(SourceResource.class::cast)
                 .orElseThrow(() -> new TapstateException(SourceError.NOT_FOUND, Map.of("id", sourceId), null));

@@ -33,8 +33,12 @@ import java.util.Objects;
 final class PdkValidationRows implements PdkValidationCursor.Decoder {
     enum Shape { AUTO, EXACT_NUMBER, FLOAT32, FLOAT64, TEXT, OBJECT_ID, BOOLEAN, BINARY, JSON, OBJECT, ARRAY,
         DATE, TIME, LOCAL_DATE_TIME, INSTANT }
-    record Rule(Shape shape, PdkValidationTemporal.LegacyEncoding temporalEncoding) {
+    record Rule(Shape shape, PdkValidationTemporal.LegacyEncoding temporalEncoding, boolean portableText) {
         static final Rule AUTO = new Rule(Shape.AUTO, null);
+        static final Rule PORTABLE_TEXT = new Rule(Shape.TEXT, null, true);
+        Rule(Shape shape, PdkValidationTemporal.LegacyEncoding temporalEncoding) {
+            this(shape, temporalEncoding, false);
+        }
         Rule { Objects.requireNonNull(shape, "shape"); }
         static Rule of(Shape shape) { return new Rule(shape, null); }
     }
@@ -105,7 +109,7 @@ final class PdkValidationRows implements PdkValidationCursor.Decoder {
         Payload payload = payload(selected, fieldModel == null ? null : fieldModel.nativeType(), field, rule);
         // Connector-native BSON classes can live in loaders isolated from the host's BSON classes.
         @SuppressWarnings("java:S1872")
-        boolean objectId=rawValue&&raw!=null&&raw.getClass().getName().equals("org.bson.types.ObjectId");
+        boolean objectId=!rule.portableText()&&rawValue&&raw!=null&&raw.getClass().getName().equals("org.bson.types.ObjectId");
         if(objectId){
             // The runtime class establishes the domain. The chosen codec must retain its exact
             // canonical identity; never classify a business string by its printed appearance.

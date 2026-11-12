@@ -59,6 +59,20 @@ class MongoCacheDerivedSchemaStoreIT {
     }
     private static void record(DerivedSchemaStore store, String type) { store.record("orders", "source.orders", columns(type), "statement", "sources", "derivation"); }
 
+    @Test void aStartupBatchPinsTheVersionsItRecords() {
+        withFixture(f -> {
+            var store = f.writer();
+            record(store, "text");
+            store.recordAndPinMany("orders", List.of(
+                    new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(0, columns("bigint"), "statement", "sources", "derivation")),
+                    new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(0, columns("text"), "statement", "sources", "derivation"))));
+            assertThat(store.pinned("orders", "source.orders")).hasValueSatisfying(pin -> assertThat(pin.version()).isEqualTo(1));
+            assertThat(store.pinned("orders", "source.customers")).hasValueSatisfying(pin -> assertThat(pin.version()).isZero());
+            record(store, "text");
+            assertThat(store.pinned("orders", "source.orders")).hasValueSatisfying(pin -> assertThat(pin.schema()).isEqualTo(columns("bigint")));
+        });
+    }
+
     private static DerivedSchemaStore.Recording recording(String step, String type) {
         return new DerivedSchemaStore.Recording(step, columns(type), "statement", "sources", "derivation");
     }
@@ -223,6 +237,43 @@ class MongoCacheDerivedSchemaStoreIT {
             assertThat(reader.latest("orders", "source.orders").orElseThrow().schema().keySet()).containsExactly("order.id", "note");
             writer.pin("orders", "source.orders", 1); assertThat(reader.pinned("orders", "source.orders").orElseThrow().version()).isEqualTo(1);
             assertThat(f.rows().countDocuments()).isEqualTo(1); assertThat(f.claimWrites()).isEqualTo(5); assertThat(f.admissions()).isEqualTo(1);
+        });
+    }
+
+    @Test void publicationBatchKeepsHistoryAndPinsWithOneHistoryReadAndOneWrite() {
+        withFixture(f -> {
+            var writer = f.writer();
+            record(writer, "text");
+            writer.pin("orders", "source.orders", 0);
+            var historyReads = new java.util.concurrent.atomic.AtomicInteger();
+            var historyWrites = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database.getName())) return;
+                    var table = event.getCommand().get(event.getCommandName());
+                    if (table == null || !table.isString()
+                            || !table.asString().getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) return;
+                    if (event.getCommandName().equals("find")) historyReads.incrementAndGet();
+                    if (event.getCommandName().equals("update")) historyWrites.incrementAndGet();
+                }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var batch = new MongoCacheDerivedSchemaStore(new MongoCachePipelineAccess(client,
+                        client.getDatabase(f.database.getName()), SCOPE, WorkloadClaimFence.from(f.claim), ACTIVE));
+                batch.recordMany("orders", List.of(
+                        new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("text"), "edited", "source", "v2")),
+                        new DerivedSchemaStore.Change("source.orders", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("varchar"), "changed", "source", "v3")),
+                        new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(
+                                0, columns("text"), "new", "source", "v1"))));
+            }
+            assertThat(historyReads).hasValue(1);
+            assertThat(historyWrites).hasValue(1);
+            assertThat(writer.pinned("orders", "source.orders").orElseThrow().derivedBy()).isEqualTo("v2");
+            assertThat(writer.latest("orders", "source.orders").orElseThrow().version()).isEqualTo(1);
+            assertThat(writer.latest("orders", "source.customers").orElseThrow().version()).isZero();
         });
     }
 

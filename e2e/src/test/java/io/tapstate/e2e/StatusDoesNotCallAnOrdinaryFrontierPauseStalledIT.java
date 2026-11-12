@@ -76,11 +76,12 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
             var business = configuration.bindings().cachePreparation().orElseThrow().businessScope();
             var scope = configuration.intents().load(pipeline).orElseThrow().scope();
             var claim = cache.workloadClaims(business).readPipeline(scope).orElseThrow().claim();
+            var epoch = cache.pipelineStates(scope).read(pipeline).orElseThrow().epoch();
             cache.pipelineObservations(scope, WorkloadClaimFence.from(claim), () -> {}).save(new Observation(
                     pipeline,
                     PipelineState.RUNNING,
                     Map.of("recordCount", 11L, "frontierStalledMillis.shipments", 9L, "frontierStalledMillis.orders", 196L),
-                    Map.of(), Map.of(), null, Instant.now()));
+                    Map.of(), Map.of(), null, Instant.now()), epoch);
         }
     }
 }

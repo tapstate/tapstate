@@ -1649,7 +1649,7 @@ public final class MongoSrsMetaStore implements SrsMetaStore {
 
     /** Whether {@code fence} is the live claim, by a write to it, inside {@code session}'s transaction. */
     private boolean provesClaim(ClientSession session, WorkloadClaimFence fence) {
-        return workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_SINK_CLAIM)
+        return workloadClaims.updateOne(session, WorkloadClaimDocuments.livePipeline(session, workloadClaims, fence), PROVE_SINK_CLAIM)
                 .getMatchedCount() == 1;
     }
 

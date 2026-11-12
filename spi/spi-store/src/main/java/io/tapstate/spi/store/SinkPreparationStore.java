@@ -51,6 +51,9 @@ public interface SinkPreparationStore {
     /** Controlled planning freezes one complete original target roster before a target may be opened. */
     void prepareTargets(List<Input> originalTargets);
     Snapshot load(Input originalTarget);
+    default List<Snapshot> loadMany(List<Input> originalTargets) {
+        return originalTargets.stream().map(this::load).toList();
+    }
     /** Issues the target call once; an already issued unknown attempt is never another permission. */
     Attempt begin(Input originalTarget);
     Snapshot complete(Attempt originalAttempt,Result originalResult);

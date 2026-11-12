@@ -50,6 +50,10 @@ final class MongoPipelineSourcePreparations {
         var row = table.find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
         if (row == null) throw rebuild(scope);
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
+        return retained(row, scope);
+    }
+
+    static PipelinePreparationInputs retained(Document row, PipelineIntentScope scope) {
         try {
             if (!scope.equals(MongoPipelinePreparationFacts.scope(row.get("pipelineScope",Document.class)))) throw rebuild(scope);
             MongoCachePipelinePreparations.phase(row,scope);

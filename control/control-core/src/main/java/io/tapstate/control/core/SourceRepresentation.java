@@ -138,6 +138,11 @@ public final class SourceRepresentation {
                 contentHash);
     }
 
+    /** Captured only for this list operation; subsequent operations still read the live catalog. */
+    public SourceRepresentation withCatalog(TapstateCatalog captured) {
+        return new SourceRepresentation(captured);
+    }
+
     private ConnectorCatalogEntry connector(String connector) {
         try {
             return catalog.get().byId(connector);

@@ -63,6 +63,21 @@ class ScopedSrsReadCursorPublisherFactoryTest {
         new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12);
         verify(f.models).requireEvent(MODEL,RING,12,CAPTURE);verify(f.models,never()).load(any());verify(f.store,never()).advanceReadSequence(any(),anyLong(),anyString(),anyLong(),any());
     }
+    @Test void combinedVerifierUsesTheStoreAndKeepsTheOriginalExecutionGuard() {
+        var f = new Fixture();
+        when(f.store.supportsReadEventVerification()).thenReturn(true);
+        when(f.store.verifyReadEvent(RUN, "orders", RING, 12, 3, 2, CAPTURE)).thenReturn(Optional.of(ACTUAL));
+        var verifier = new ScopedSrsReadCursorPublisherFactory(RUN, "orders").modelVerifier(f.member, RING);
+        verifier.verify(item(), 12);
+        verify(f.store).verifyReadEvent(RUN, "orders", RING, 12, 3, 2, CAPTURE);
+        verify(f.store, never()).progress(any());
+        verifyNoInteractions(f.models);
+
+        f.active.set(false);
+        assertThatThrownBy(() -> verifier.verify(item(), 13)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::refused);
+        verify(f.store, never()).verifyReadEvent(RUN, "orders", RING, 13, 3, 2, CAPTURE);
+    }
+
     @Test void eventModelVerifierPropagatesMissingModelWithoutFallingBackToLatest() {
         var f=new Fixture();f.held.set(progress(4,5L,null));when(f.models.requireEvent(MODEL,RING,12,CAPTURE)).thenThrow(modelUnavailable());
         assertThatThrownBy(() -> new ScopedSrsReadCursorPublisherFactory(RUN,"orders").modelVerifier(f.member,RING).verify(item(),12)).satisfies(ScopedSrsReadCursorPublisherFactoryTest::missingModel);

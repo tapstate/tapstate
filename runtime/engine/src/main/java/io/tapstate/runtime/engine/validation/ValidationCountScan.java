@@ -22,6 +22,7 @@ public final class ValidationCountScan {
     private final List<Mapping> mappings;
     private final Runnable requireCurrent;
     private final Consumer<ValidationCountCheck> publish;
+    private final java.util.function.BiConsumer<String, ValidationPairException> publishFailure;
     private final AtomicBoolean attempted = new AtomicBoolean(), cancelled = new AtomicBoolean();
     private volatile boolean complete;
     private volatile int completedMappings;
@@ -29,6 +30,12 @@ public final class ValidationCountScan {
 
     public ValidationCountScan(ValidationRunIdentity identity, ValidationRunSpec spec, List<Mapping> mappings,
             Runnable requireCurrent, Consumer<ValidationCountCheck> publish) {
+        this(identity, spec, mappings, requireCurrent, publish, (mapping, failed) -> { throw failed.diagnosis(); });
+    }
+    public ValidationCountScan(ValidationRunIdentity identity, ValidationRunSpec spec, List<Mapping> mappings,
+            Runnable requireCurrent, Consumer<ValidationCountCheck> publish,
+            java.util.function.BiConsumer<String, ValidationPairException> publishFailure) {
+        this.publishFailure = Objects.requireNonNull(publishFailure);
         this.identity = Objects.requireNonNull(identity); this.spec = Objects.requireNonNull(spec);
         this.mappings = List.copyOf(mappings); this.requireCurrent = Objects.requireNonNull(requireCurrent); this.publish = Objects.requireNonNull(publish);
         if (identity.mode() != ValidationMode.FULL || spec.method() != ValidationMethod.COUNT
@@ -45,11 +52,18 @@ public final class ValidationCountScan {
         for (int index = 0; index < mappings.size(); index++) {
             check(); var mapping = mappings.get(index); var declared = spec.task().mappings().get(index);
             readingMapping=mapping.id();
-            var source = Objects.requireNonNull(mapping.source().read(this::check)); check();
-            if (!source.table().equals(declared.source())) throw invalid("sourceTable");
-            var target = Objects.requireNonNull(mapping.target().read(this::check)); check();
-            if (!target.table().equals(declared.target())) throw invalid("targetTable");
-            publish.accept(new ValidationCountCheck(identity, mapping.id(), declared.outputId(), source.count(), target.count(), source.read(), target.read()));
+            ValidationCountCheck result = null;
+            try {
+                var source = Objects.requireNonNull(mapping.source().read(this::check)); check();
+                if (!source.table().equals(declared.source())) throw invalid("sourceTable");
+                var target = Objects.requireNonNull(mapping.target().read(this::check)); check();
+                if (!target.table().equals(declared.target())) throw invalid("targetTable");
+                result = new ValidationCountCheck(identity, mapping.id(), declared.outputId(), source.count(), target.count(), source.read(), target.read());
+            } catch (ValidationPairException failure) {
+                check();
+                publishFailure.accept(mapping.id(), failure);
+            }
+            if (result != null) publish.accept(result);
             check();
             completedMappings=index+1;readingMapping=null;
         }

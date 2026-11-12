@@ -17,7 +17,7 @@ import java.util.concurrent.CompletionStage;
  * piece of a superseded run stops writing to the target instead of writing into it beside the current run.
  *
  * <p>Per batch, not per record: the guard is answered locally from a reading the member refreshes on a
- * bounded schedule, and asking it is a comparison of two numbers.
+ * bounded schedule. Scoped PDK writers check the same proof at the connector call.
  *
  * <p>Refusing throws rather than dropping the batch silently. The records are not lost — nothing has
  * acknowledged them, and the run that is current re-reads them from the durable position — and a sink that
@@ -52,12 +52,24 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
     @Override
     public SinkWriter getEx() throws Exception {return forWriter(0,0);}
     @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception {
+        return open((member, local) -> delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
+                ? indexed.forWriter(member, local) : delegate.get(), memberIndex, localIndex);
+    }
+
+    @Override public Opening opening() {
+        Opening batch = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed
+                ? indexed.opening() : (member, local) -> delegate.get();
+        return (member, local) -> open(batch, member, local);
+    }
+
+    private SinkWriter open(Opening opening, int memberIndex, int localIndex) throws Exception {
         ExecutionAuthorization authorization = ExecutionAuthorization.local();
         authorization.require(fence);
-        SinkWriter opened = delegate instanceof io.tapstate.runtime.engine.IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):delegate.get();
+        SinkWriter opened = opening.open(memberIndex, localIndex);
         try {
             authorization.require(fence);
-            return guarded(opened, fence, authorization);
+            boolean checkBatch = !(delegate instanceof PdkSinkWriterFactory pdk && pdk.guardsWritesFor(fence));
+            return new FencedSinkWriter(opened, fence, authorization, checkBatch);
         } catch (RuntimeException | Error failure) {
             try {
                 opened.close();
@@ -71,7 +83,7 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
     /** {@code writer}, asking {@code authorization} for {@code fence}'s run before each batch. */
     static SinkWriter guarded(
             SinkWriter writer, ExecutionFence fence, ExecutionAuthorization authorization) {
-        return new FencedSinkWriter(writer, fence, authorization);
+        return new FencedSinkWriter(writer, fence, authorization, true);
     }
 
     /** Writers held to the run, over tables whose preparing is held to it too. */
@@ -83,6 +95,7 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
             return writers.getEx();
         }
         @Override public SinkWriter forWriter(int memberIndex,int localIndex)throws Exception{return writers.forWriter(memberIndex,localIndex);}
+        @Override public Opening opening() { return writers.opening(); }
 
         @Override
         public void prepareTargets(HazelcastInstance coordinator) {
@@ -96,6 +109,7 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
         private final SinkWriter delegate;
         private final ExecutionFence fence;
         private final ExecutionAuthorization authorization;
+        private final boolean checkBatch;
         /**
          * Set as closing starts, before the delegate is let go. A write still under way then is ended by the
          * closing - a connector let go under a write fails it - and the run is closing because something
@@ -105,15 +119,17 @@ final class FencedSinkWriterFactory implements io.tapstate.runtime.engine.Indexe
          */
         private volatile boolean closing;
 
-        private FencedSinkWriter(SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization) {
+        private FencedSinkWriter(SinkWriter delegate, ExecutionFence fence, ExecutionAuthorization authorization,
+                boolean checkBatch) {
             this.delegate = delegate;
             this.fence = fence;
             this.authorization = authorization;
+            this.checkBatch = checkBatch;
         }
 
         @Override
         public CompletionStage<WriteResult> write(List<Envelope> records) {
-            authorization.require(fence);
+            if (checkBatch) authorization.require(fence);
             try {
                 return delegate.write(records).whenComplete((ignored, failure) -> fileIfTheSinks(failure));
             } catch (RuntimeException failure) {

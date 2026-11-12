@@ -64,7 +64,7 @@ class SystemCollectionsGatesTest {
         Set<String> expectedResources = new HashSet<>(
                 Arrays.stream(SystemCollections.values()).map(SystemCollections::resourceId).toList());
         expectedResources.addAll(Set.of("local.installation", "local.connector-cache",
-                "temporary.connector-registration", "temporary.connector-trust", "temporary.connector-download",
+                "temporary.connector-registration", "temporary.connector-trust", "temporary.connector-download", "temporary.validation-sort",
                 "user.cli-context", "user.cli-auth", "user.workspace", "user.local-stack", "user.alias-links", "build.catalog"));
         assertThat(rows.keySet()).containsExactlyInAnyOrderElementsOf(expectedResources);
         // Every declaration, including file resources, retains its contract and bytecode-owner checks.

@@ -42,6 +42,7 @@ class AiProviderSettingsWiringTest {
                 "mongodb://localhost/tapstate", null, Duration.ofSeconds(1)));
         set(connection, "client", client);
         set(connection, "databaseName", "tapstate");
+        set(connection, "database", database);
         set(connection, "sourceConfigKeyring", mock(SourceConfigKeyringHandle.class));
 
         AiProviderSettingsStore store = new StoreConfiguration().aiProviderSettingsStore(connection);

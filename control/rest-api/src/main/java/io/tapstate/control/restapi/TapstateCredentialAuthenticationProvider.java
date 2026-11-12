@@ -1,6 +1,8 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.CredentialAuthenticator;
+import io.tapstate.control.core.CredentialAuthentication;
+import io.tapstate.control.core.CredentialEvidence;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.TapstatePrincipal;
 import io.tapstate.control.core.TokenService;
@@ -45,7 +47,12 @@ final class TapstateCredentialAuthenticationProvider implements AuthenticationPr
                 ? TapstatePrincipal.machineToken(verified)
                 : CloudSessionService.isSessionToken(credential.credential())
                         ? TapstatePrincipal.cloudSession(verified) : TapstatePrincipal.humanJwt(verified);
-        return new TapstateAuthentication(principal, original);
+        // Authentication is fixed at HTTP entry. Later guards retain the selected owner's
+        // local lifetime; the next HTTP request authenticates its credential again.
+        Runnable active = original.evidence().map(CredentialEvidence::requireLocallyActive).orElse(() -> {});
+        var request = new CredentialAuthentication(original.token(), original.storageScope(),
+                original.organizationId(), active, original.evidence(), original.setupScope());
+        return new TapstateAuthentication(principal, request);
     }
 
     @Override

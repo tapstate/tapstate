@@ -101,22 +101,39 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
 
     Optional<WorkloadClaimReading> readOwner(String pipeline) {
         requireActive();
-        // Selection reads data, not an execution grant. A remote Pipeline considered here must not
-        // consume this member's local owner registry. Native preparation still proves both domains.
-        var prepared = configuration.prepareValidationAccess(pipeline, scope, cache, node.get(), this::requireActive);
-        var reading = prepared.claims().read(ValidationClaims.key(scope.clusterId(), pipeline)); requireActive(); return reading;
+        // Routing observes the claim; the selected member prepares and proves its own authority.
+        var reading = configuration.routeValidationClaim(pipeline, scope, cache, node.get(), this::requireActive);
+        requireActive(); return reading;
     }
     Optional<WorkloadClaimReading> readPreparedOwner(String pipeline) {
         requireActive();var existing=configuration.loadValidationAccess(pipeline,scope,cache,this::requireActive);
         var reading=existing.claims().read(ValidationClaims.key(scope.clusterId(),pipeline));requireActive();return reading;
     }
 
-    @Override public Result reserve(Request request) {
-        requireActive();var attempt=new ReserveAttempt(request);var failures=new ValidationFailureLatch();
+    io.tapstate.runtime.probe.ValidationOperation.OwnerLease observeOwner(ValidationOwner original) {
+        requireActive();
+        Pipeline pipeline;
+        synchronized (pipelines) { pipeline = pipelines.get(original.pipelineId()); }
+        var current = pipeline == null ? null : pipeline.owner;
+        if (current != null && original.equals(current.lease.owner()) && !current.retired.get()
+                && current.lease.observesLive() && pipeline.owner == current) {
+            // The owner can retire while its lease is being observed.
+            if (!current.retired.get()) return io.tapstate.runtime.probe.ValidationOperation.OwnerLease.LIVE;
+        }
+        var reading = configuration.observeValidationClaim(original.pipelineId(), scope, cache, this::requireActive);
+        requireActive();
+        return ValidationOwnerRouter.projectOwnerLease(original, reading);
+    }
+
+    @Override public Result reserve(Request request) { return reserve(request, false); }
+
+    @Override public Result reserve(Request request, boolean manualCountHint) {
+        requireActive();var attempt=new ReserveAttempt(request, manualCountHint);var failures=new ValidationFailureLatch();
         var local=pipeline(request.pipeline());attempt.local=local;
         if(!local.lock.tryLock()){unpin(local);return new Result(Outcome.BUSY,null,null);}
         Result result=null;Throwable bodyFailure=null,cleanupFailure=null;
-        try{result=attempt.prepare();}catch(RuntimeException|Error failed){bodyFailure=failed;}
+        try{result=MongoConfigurationDomain.duringValidationStartup(attempt::prepare);}
+        catch(RuntimeException|Error failed){bodyFailure=failed;}
         try{attempt.cleanup();}catch(RuntimeException|Error failed){cleanupFailure=failed;}
         if(bodyFailure!=null)failures.record(bodyFailure);
         if(cleanupFailure!=null){
@@ -127,11 +144,14 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     }
     /** One caller owns preparation and cleanup; failures escape only after lock and pin release. */
     private final class ReserveAttempt {
-        private final Request request;private Pipeline local;private Reservation operation;private Handoff handoff;
-        private ReserveAttempt(Request request){this.request=request;}
+        private final Request request;
+        private final boolean manualCountHint;
+        private Pipeline local;private Reservation operation;private Handoff handoff;
+        private ReserveAttempt(Request request, boolean manualCountHint){this.request=request;this.manualCountHint=manualCountHint;}
         private Result prepare(){
             try {
-                refreshLifetime(local);
+                boolean manualCount = manualCountHint && request.mode().equals("FULL");
+                var replacementGeneration = discardStaleLifetime(local, manualCount);
                 reap(local);
                 for(var previous:local.operations.values())if(sameBlock(previous.request,request)&&previous.blocked.contains(request.command()))
                     return new Result(Outcome.REJECTED,null,ValidationError.EXECUTION_CANCELLED.code());
@@ -148,7 +168,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 }
                 operation = new Reservation(local, request);operation.previous=handoff==null?null:handoff.receipt();operation.blocked=handoff==null?Set.of():handoff.blocked();local.operations.put(key, operation);
                 operation.preparing = true;
-                int frames=retainedFrames(request);Owner borrowed=null;long borrowedGeneration=0;
+                // The coordinator read the exact task revision. The retained input read below still verifies the method.
+                int frames = manualCount ? 1 : retainedFrames(request);
+                Owner borrowed=null;long borrowedGeneration=0;
                 if(frames==2&&local.owner!=null&&!local.owner.retired.get()&&local.owner.lease.authorized()){
                     var current=local.owner;
                     if(current.quotaMetadata!=null&&current.quotaGeneration==current.countingGeneration){
@@ -158,10 +180,20 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 }
                 var metadata=resources.admitRetainedMetadataAfterControls(frames,Math.max(1,HANDOFF_NANOS-(handoffClock.getAsLong()-operation.created)),NativeValidationOwnerReservations.this::requireActive,operation.cancelled::get);operation.metadata=metadata.getFirst();
                 if(metadata.size()==2)operation.quotaMetadata=metadata.getLast();
-                var task = task(request); var definitions = configuration.validationTasks(NativeValidationOwnerReservations.this::requireActive);
-                var inputs = definitions.inputs(task, request.configurationRevision());
-                if (inputs.isEmpty()) return operation.reject();
-                operation.declarations = ValidationSavedDeclarations.inspect(inputs.orElseThrow(), configuration.bindings().load().orElseThrow(() -> unauthorized(request.pipeline())).defaultSourceId());
+                var task = task(request);
+                Runnable active = NativeValidationOwnerReservations.this::requireActive;
+                var definitions = manualCount ? null : configuration.validationTasks(active);
+                if (manualCount) {
+                    var inputs = configuration.boundValidationInputs(task, request.configurationRevision(), active);
+                    if (inputs.isEmpty()) return operation.reject();
+                    var boundInputs = inputs.orElseThrow();
+                    operation.declarations = ValidationSavedDeclarations.inspect(boundInputs.inputs(), boundInputs.defaultSourceId());
+                } else {
+                    var inputs = definitions.inputs(task, request.configurationRevision());
+                    if (inputs.isEmpty()) return operation.reject();
+                    operation.declarations = ValidationSavedDeclarations.inspect(inputs.orElseThrow(),
+                            configuration.bindings().load().orElseThrow(() -> unauthorized(request.pipeline())).defaultSourceId());
+                }
                 var saved = operation.declarations.original().task();
                 operation.spec = new ValidationRunSpec(saved.comparison(), ValidationMode.valueOf(request.mode()),
                         request.mode().equals("FULL") ? saved.settings().full().method() : ValidationMethod.FULL_COLUMN);
@@ -172,14 +204,24 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                 operation.startup=startup.inspect(operation.declarations,operation.spec);operation.dataEnvelope=envelope(saved,operation.spec);
                 operation.unbound = resources.reserve(operation.startup.controlOnly()?CONTROL_ENVELOPE:operation.dataEnvelope, operation.startup.controlOnly()?0:1);
                 operation.claimUncertain = true;
-                var owner = ensureOwner(local); operation.claimUncertain = false; if (owner == null) return operation.redirect();
-                operation.owner = owner; operation.access = local.access; owner.lease.require();
+                if (replacementGeneration != null && !access(local).generation().equals(replacementGeneration))
+                    throw unauthorized(local.pipeline);
+                var selectedOwner = ensureOwner(local, manualCount);
+                operation.claimUncertain = false;
+                if (selectedOwner == null) return operation.redirect();
+                var owner = selectedOwner.owner();
+                operation.owner = owner; owner.lease.require();
+                if (manualCount && owner.countAccess == null) owner.countAccess = local.access.forManualCount(owner.lease.owner());
+                operation.access = manualCount ? owner.countAccess : local.access;
                 if(borrowed!=null&&(borrowed!=owner||borrowedGeneration!=owner.countingGeneration))return operation.reject();
                 if(operation.quotaMetadata!=null){owner.quotaMetadata=operation.quotaMetadata;owner.quotaGeneration=owner.countingGeneration;}
-                if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
-                NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
-                        known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
-                var current = definitions.read(request.pipeline(), request.task()).orElse(null);
+                if (!selectedOwner.obsoleteChecked() && !closeObsolete(local, owner, manualCount))
+                    throw invalid("owner.obsoletePermissions");
+                if (!manualCount || needsQuota(operation.spec)) {
+                    NativeValidationReportHistory.reconcile(local.access,node.get(),saved,java.time.Clock.systemUTC(),
+                            known->local.access.control().expire(new ValidationControlStore.Expiration(owner.lease.owner(),known)));
+                }
+                var current = (manualCount ? configuration.validationTasks(active) : definitions).read(request.pipeline(), request.task()).orElse(null);
                 if (current == null || !current.task().equals(task) || current.revision() != request.configurationRevision() || current.closed()
                         || current.mode(operation.spec.mode()).nextStartSequence() != request.startSequence()) return operation.reject();
                 if (current.mode(operation.spec.mode()).permission() != null && current.mode(operation.spec.mode()).permission().phase() != ValidationTaskStore.Phase.CLOSED)
@@ -316,50 +358,123 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         }finally{local.lock.unlock();unpin(local);}
     }
 
-    private Owner ensureOwner(Pipeline local) {
+    private record SelectedOwner(Owner owner, boolean obsoleteChecked) {}
+
+    private SelectedOwner ensureOwner(Pipeline local, boolean manualCount) {
         var current = local.owner;
         if (current != null && !current.retired.get() && current.lease.authorized()) {
-            if (current.countingGeneration == 0) return initializeOwner(local, current);
-            var snapshot = access(local).control().snapshot(current.lease.owner());
-            if (!(snapshot.closed() && snapshot.active().isEmpty() && current.lease.owner().equals(snapshot.ledgerOwner())
-                    && snapshot.countingGeneration() == current.countingGeneration)) return current;
-            current.retire(); current.lease.close(); local.owner = null;
+            if (current.countingGeneration == 0) return initializeOwner(local, current, manualCount);
+            var observed = closedCountLedger(current, manualCount);
+            if (observed.isPresent()) {
+                var ledger = observed.orElseThrow();
+                if (!current.lease.owner().equals(ledger.owner()) || ledger.countingGeneration() != current.countingGeneration)
+                    return new SelectedOwner(current, false);
+            } else {
+                var snapshot = ownerControl(local, current, manualCount).snapshot(current.lease.owner());
+                if (!(snapshot.closed() && snapshot.active().isEmpty() && current.lease.owner().equals(snapshot.ledgerOwner())
+                        && snapshot.countingGeneration() == current.countingGeneration)) return new SelectedOwner(current, false);
+            }
+            current.retire();
+            if (!manualCount) current.lease.close();
+            local.owner = null;
         } else if (current != null) { current.retire(); local.owner = null; }
-        var access = access(local); var claims = new ClusterWorkloadClaims(access.claims(), membership);
-        var key = ValidationClaims.key(scope.clusterId(), local.pipeline); var actualNode = node.get();
-        var previous = claims.read(key);
-        if (previous.filter(WorkloadClaimReading::leased).isPresent()) {
-            var held = previous.orElseThrow().claim();
-            if (!held.owner().equals(actualNode.owner())) return null;
-            // Registry absence is never permission to adopt an old execution, even on this boot.
-            if (!claims.release(held)) throw unauthorized(local.pipeline);
+        var actualNode = node.get();
+        long startedPreparation = System.nanoTime();
+        var initialTopology = membership.committed();
+        if (manualCount && local.access == null) {
+            if (initialTopology == null) throw unauthorized(local.pipeline);
+            local.access = configuration.prepareCountValidationAccess(local.pipeline, scope, cache, actualNode,
+                    initialTopology.revision(), ttl, this::requireActive);
         }
-        long askedAt = System.nanoTime(); var topology = membership.committed();
-        if (topology == null) throw unauthorized(local.pipeline);
-        var acquired = claims.acquire(key, actualNode.owner(), topology.revision(), ttl).orElseThrow(() -> unauthorized(local.pipeline));
-        if (!acquired.acquired()) return null;
-        var advanced = claims.advanceExecution(acquired.claim(), topology.revision(), Set.of(actualNode.owner().nodeId()));
-        if (advanced.isEmpty()) { claims.release(acquired.claim()); throw unauthorized(local.pipeline); }
-        var owner = new Owner(local, advanced.orElseThrow(), claims, askedAt); local.owner = owner;
-        owner.lease.maintain(timers.renewals, timers.deadlines, renewal, Duration.ofMillis(250)); owner.lease.require();
-        return initializeOwner(local, owner);
-    }
-
-    private Owner initializeOwner(Pipeline local, Owner owner) {
         var access = access(local);
-        if (!closeObsolete(local, owner)) throw invalid("owner.obsoletePermissions");
-        var snapshot = access.control().snapshot(owner.lease.owner());
-        for (var old : snapshot.active()) {
-            if (old.run().identity().owner().claimGeneration() >= owner.lease.owner().claimGeneration()) throw invalid("owner.unexpectedActiveRun");
-            var outcome = access.control().terminateLostOwner(new ValidationControlStore.LostOwner(owner.lease.owner(), old.run(), old.run().report()));
-            if (outcome == ValidationControlStore.Mutation.STALE) throw invalid("owner.obsoleteRun");
+        var key = ValidationClaims.key(scope.clusterId(), local.pipeline);
+        final long askedAt;
+        final WorkloadClaim granted;
+        final ClusterWorkloadClaims claims;
+        MongoConfigurationDomain.ValidationAccess countAccess = null;
+        if (manualCount) {
+            var topology = membership.committed();
+            if (topology == null) throw unauthorized(local.pipeline);
+            askedAt = startedPreparation;
+            var acquired = access.acquireCountTenure(actualNode, topology.revision(), ttl);
+            if (acquired.isEmpty()) return null;
+            var tenure = acquired.orElseThrow();
+            if (!topology.equals(membership.committed())) throw unauthorized(local.pipeline);
+            granted = tenure.claim();
+            claims = new ClusterWorkloadClaims(tenure.claims(), membership);
+            countAccess = tenure.access();
+        } else {
+            claims = new ClusterWorkloadClaims(access.claims(), membership);
+            var previous = claims.read(key);
+            if (previous.filter(WorkloadClaimReading::leased).isPresent()) {
+                var held = previous.orElseThrow().claim();
+                if (!held.owner().equals(actualNode.owner())) return null;
+                // Registry absence is never permission to adopt an old execution, even on this boot.
+                if (!claims.release(held)) throw unauthorized(local.pipeline);
+            }
+            askedAt = System.nanoTime();
+            var topology = membership.committed();
+            if (topology == null) throw unauthorized(local.pipeline);
+            var acquired = claims.acquire(key, actualNode.owner(), topology.revision(), ttl).orElseThrow(() -> unauthorized(local.pipeline));
+            if (!acquired.acquired()) return null;
+            var advanced = claims.advanceExecution(acquired.claim(), topology.revision(), Set.of(actualNode.owner().nodeId()));
+            if (advanced.isEmpty()) { claims.release(acquired.claim()); throw unauthorized(local.pipeline); }
+            granted = advanced.orElseThrow();
         }
-        snapshot = access.control().snapshot(owner.lease.owner());
-        if (!snapshot.active().isEmpty() || !snapshot.closed() || snapshot.countingGeneration() == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
-        owner.countingGeneration = snapshot.countingGeneration() + 1; return owner;
+        var owner = new Owner(local, granted, claims, askedAt);
+        owner.countAccess = countAccess;
+        local.owner = owner;
+        owner.lease.maintain(timers.renewals, timers.deadlines, renewal, Duration.ofMillis(250)); owner.lease.require();
+        return initializeOwner(local, owner, manualCount);
     }
 
-    private boolean closeObsolete(Pipeline pipeline, Owner owner) {
+    private SelectedOwner initializeOwner(Pipeline local, Owner owner, boolean manualCount) {
+        if (!closeObsolete(local, owner, manualCount)) throw invalid("owner.obsoletePermissions");
+        var observed = closedCountLedger(owner, manualCount);
+        if (observed.isPresent()) {
+            long generation = observed.orElseThrow().countingGeneration();
+            if (generation == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
+            owner.countingGeneration = generation + 1;
+            return new SelectedOwner(owner, true);
+        }
+        var control = ownerControl(local, owner, manualCount);
+        var snapshot = control.snapshot(owner.lease.owner());
+        // Reuse only a clean check from this reservation after the COUNT epoch was registered.
+        boolean reusable = manualCount && owner.countAccess != null && snapshot.active().isEmpty();
+        if (!snapshot.active().isEmpty()) {
+            // Recovery must validate the obsolete report under its original identity.
+            var recovery = manualCount && owner.countAccess != null ? access(local).control() : control;
+            for (var old : snapshot.active()) {
+                if (old.run().identity().owner().claimGeneration() >= owner.lease.owner().claimGeneration()) throw invalid("owner.unexpectedActiveRun");
+                var outcome = recovery.terminateLostOwner(new ValidationControlStore.LostOwner(owner.lease.owner(), old.run(), old.run().report()));
+                if (outcome == ValidationControlStore.Mutation.STALE) throw invalid("owner.obsoleteRun");
+            }
+            snapshot = control.snapshot(owner.lease.owner());
+        }
+        if (!snapshot.active().isEmpty() || !snapshot.closed() || snapshot.countingGeneration() == Long.MAX_VALUE) throw invalid("owner.countingGeneration");
+        owner.countingGeneration = snapshot.countingGeneration() + 1;
+        return new SelectedOwner(owner, reusable);
+    }
+
+    private static Optional<MongoConfigurationDomain.ValidationAccess.ClosedCountLedger> closedCountLedger(Owner owner, boolean manualCount) {
+        return manualCount && owner.countAccess != null
+                ? owner.countAccess.observeClosedCountLedger(owner.lease.owner()) : Optional.empty();
+    }
+
+    private ValidationControlStore ownerControl(Pipeline pipeline, Owner owner, boolean manualCount) {
+        if (manualCount && owner.countAccess != null)
+            return owner.countAccess.countHandles().orElseThrow().control();
+        return access(pipeline).control();
+    }
+
+    private boolean closeObsolete(Pipeline pipeline, Owner owner, boolean manualCount) {
+        if (manualCount && owner.countAccess != null) {
+            owner.lease.require();
+            if (owner.countAccess.countPermissionsCurrent(owner.lease.owner())) {
+                owner.lease.require();
+                return true;
+            }
+        }
         for (int pass = 0; pass < 104; pass++) { owner.lease.require(); if (access(pipeline).closeObsoletePermissions(owner.lease.owner(), 20)) return true; }
         return false;
     }
@@ -368,20 +483,22 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         if (pipeline.access == null) pipeline.access = configuration.prepareValidationAccess(pipeline.pipeline, scope, cache, node.get(), this::requireActive);
         return pipeline.access;
     }
-    private void refreshLifetime(Pipeline pipeline) {
+    private UUID discardStaleLifetime(Pipeline pipeline, boolean manualCount) {
         var old = pipeline.access;
-        if (old == null) return;
+        if (old == null) return null;
         // Only a proven different CONFIG lifecycle permits a fresh preparation. Transport failure,
         // stale owner proof or a retry of the same lifetime never causes rebinding or adoption.
-        var current = configuration.currentValidationGeneration(pipeline.pipeline, scope, this::requireActive);
-        if (old.generation().equals(current)) return;
+        var current = manualCount
+                ? configuration.observeCountValidationGeneration(pipeline.pipeline, scope, cache, this::requireActive)
+                : configuration.currentValidationGeneration(pipeline.pipeline, scope, this::requireActive);
+        if (old.generation().equals(current)) return null;
         if (pipeline.owner != null) {
             var retired = pipeline.owner; retired.retire(); process.cleanup(retired.lease::close); pipeline.owner = null;
         }
+        pipeline.access = null;
         for (var entry : pipeline.operations.values()) entry.close();
-        var replacement = configuration.prepareValidationAccess(pipeline.pipeline, scope, cache, node.get(), this::requireActive);
-        if (!replacement.generation().equals(current)) throw unauthorized(pipeline.pipeline);
-        pipeline.access = replacement;
+        // The incoming task must still be eligible before preparing the replacement lifetime.
+        return current;
     }
     private Pipeline pipeline(String id) {
         if (id == null || id.isBlank()) throw invalid("owner.pipeline"); ValidationError.fieldName(id, "owner.pipeline");
@@ -486,7 +603,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         long now = handoffClock.getAsLong();
         var failures = new ValidationFailureLatch();
         for (var pipeline : pipelines.values()) {
-            for (var entry : pipeline.operations.values()) if (!entry.activated && now - entry.created >= HANDOFF_NANOS) attempt(failures, entry::close);
+            for (var entry : pipeline.operations.values()) attempt(failures, () -> entry.expireHandoff(now));
             var owner = pipeline.owner;
             if (owner != null && !owner.retired.get() && now - owner.created >= HANDOFF_NANOS && pipeline.operations.values().stream().allMatch(value -> value.cancelled.get())) {
                 attempt(failures, () -> { try { owner.retire(); } finally { process.cleanup(owner.lease::close); } });
@@ -502,6 +619,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
 
     final class Reservation implements AutoCloseable {
         final Pipeline pipeline; final Request request; final long created = handoffClock.getAsLong();
+        private long acceptedAt;
         final AtomicBoolean cancelled = new AtomicBoolean(), stopSignalled = new AtomicBoolean();
         volatile boolean preparing, activated, accepted, superseded, completed, locallyDisposed, claimUncertain, unknown, reportPending; volatile String reason;
         // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
@@ -625,11 +743,22 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
                     && (!accepted || completed || locallyDisposed || superseded) && (bound == null || bound.fullyReleased());
         }
         private boolean closedHandoff() { return accepted && (!activated || completed&&terminalWithoutReport) && !unknown && cancelled.get() && metadata == null && bound != null && bound.fullyReleased(); }
-        private Result reply() {
+        private synchronized void expireHandoff(long now) {
+            // Preparation owns its own metadata deadline. The activation window starts only
+            // after the reservation is ready for the caller to take it.
+            if (!preparing && !activated && now - (accepted ? acceptedAt : created) >= HANDOFF_NANOS) close();
+        }
+
+        private synchronized Result reply() {
             if (unknown) return new Result(Outcome.UNKNOWN, null, reason);
             if (cancelled.get()) return new Result(Outcome.REJECTED, null, reason);
             if (bound == null) return new Result(Outcome.UNKNOWN, null, reason);
-            requireReserved(); accepted = true; return new Result(Outcome.ACCEPTED, owner.lease.owner(), null);
+            requireReserved();
+            if (!accepted) {
+                acceptedAt = handoffClock.getAsLong();
+                accepted = true;
+            }
+            return new Result(Outcome.ACCEPTED, owner.lease.owner(), null);
         }
         private Result reject() { cancelled.set(true); return new Result(Outcome.REJECTED, null, reason); }
         private Result redirect() { cancelled.set(true); return new Result(Outcome.REDIRECT, null, reason); }
@@ -663,6 +792,7 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
     private final class Owner {
         final Pipeline pipeline; final AtomicBoolean retired = new AtomicBoolean(); final ValidationOwnerLease lease; final long created = handoffClock.getAsLong();
         volatile long countingGeneration,quotaGeneration;
+        MongoConfigurationDomain.ValidationAccess countAccess;
         // Publishes lifecycle handles or snapshots; reservation, pipeline and handle guards protect mutation.
         @SuppressWarnings("java:S3077")
         volatile ValidationMemberResources.Metadata quotaMetadata;

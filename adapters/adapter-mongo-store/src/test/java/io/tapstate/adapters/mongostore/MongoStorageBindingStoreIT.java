@@ -52,6 +52,28 @@ class MongoStorageBindingStoreIT {
             StorageBinding.Connection.Kind.MONGODB, "mongodb://cache-user:cache-secret@cache.invalid/cache?tls=true",
             "cache", "CA-material-sentinel");
 
+    @Test void requestPublicationReadsOneSnapshotAndDoesNotAuditBusinessBodies() {
+        withPrepared(f -> {
+            var initial = f.domain.bindings().commitWithFirstCache(SCOPE, StorageBinding.Mode.CLOUD, CACHE, source("atlas-store", "master"));
+            f.domain.bindings().complete(SCOPE);
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                f.domain.requireRequestAuthenticationPublished(initial.preparation(), new MongoReadBudget(Duration.ofSeconds(5)));
+                assertThat(((Number)((Map<?,?>)diagnostics.snapshot().get("mongo")).get("started")).intValue()).isEqualTo(1);
+                assertThat(diagnostics.snapshot().get("complete")).isEqualTo(true);
+            }
+            SystemCollections.SOURCES.on(f.database).updateOne(new Document("_id", "atlas-store"),
+                    new Document("$set", new Document("body", "broken-business-definition")));
+            f.domain.requireRequestAuthenticationPublished(initial.preparation(), new MongoReadBudget(Duration.ofSeconds(5)));
+            assertThatThrownBy(f.domain.bindings()::load).isInstanceOf(TapstateException.class);
+            String next = UUID.randomUUID().toString();
+            SystemCollections.STORAGE_RECOVERY.on(f.database).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("recoveryId", UUID.randomUUID().toString()).append("phase", "AUTH_RECOVERY_READY")
+                            .append("revision", 1L).append("authGeneration", 2L).append("cacheIncarnation", next)));
+            assertThatThrownBy(() -> f.domain.requireRequestAuthenticationPublished(initial.preparation(), new MongoReadBudget(Duration.ofSeconds(5))))
+                    .isInstanceOf(TapstateException.class);
+        });
+    }
+
     @Test
     void eachResourceConflictUsesItsOwnCollectionCollationAfterRecreation() {
         for (var resource : List.of(SystemCollections.PIPELINES, SystemCollections.TRANSFORM_DEFINITIONS,
