@@ -14,6 +14,10 @@ import java.nio.channels.Channels;
 import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -22,9 +26,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
+import static java.nio.file.StandardOpenOption.CREATE_NEW;
 import static java.nio.file.StandardOpenOption.DELETE_ON_CLOSE;
 import static java.nio.file.StandardOpenOption.READ;
 import static java.nio.file.StandardOpenOption.WRITE;
@@ -38,6 +44,11 @@ final class ValidationSortedRows implements ValidationRowCursor {
     private record Entry(ValidationKey key, ValidationValues.Row values) {}
     private record Run(FileChannel file, long size) {}
     private static final Comparator<Entry> ORDER = Comparator.comparing(Entry::key);
+    private static final Set<StandardOpenOption> SPILL_OPTIONS = Set.of(CREATE_NEW, READ, WRITE, DELETE_ON_CLOSE);
+    private static final FileAttribute<?> SPILL_DIRECTORY_MODE =
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rwx------"));
+    private static final FileAttribute<?> SPILL_FILE_MODE =
+            PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------"));
 
     private final ValidationRowCursor input;
     private final Function<ValidationValues.Row, ValidationKey> key;
@@ -46,6 +57,7 @@ final class ValidationSortedRows implements ValidationRowCursor {
     private final long chunkLimit;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final Set<FileChannel> files = new HashSet<>();
+    private Path spillDirectory;
     private final List<Run> levels = new ArrayList<>();
     private final List<Entry> chunk = new ArrayList<>();
     private final PriorityQueue<RunReader> heads = new PriorityQueue<>(Comparator.comparing(reader -> reader.head, ORDER));
@@ -165,16 +177,13 @@ final class ValidationSortedRows implements ValidationRowCursor {
     private FileChannel openFile() throws IOException {
         synchronized (files) {
             active();
-            var path = Files.createTempFile("tapstate-validation-", ".rows");
-            try {
-                var file = FileChannel.open(path, READ, WRITE, DELETE_ON_CLOSE);
-                files.add(file);
-                return file;
-            } catch (IOException | RuntimeException failed) {
-                try { Files.deleteIfExists(path); }
-                catch (IOException cleanup) { failed.addSuppressed(cleanup); }
-                throw failed;
+            if (spillDirectory == null) {
+                spillDirectory = Files.createTempDirectory("tapstate-validation-", SPILL_DIRECTORY_MODE);
             }
+            var path = spillDirectory.resolve(UUID.randomUUID() + ".rows");
+            var file = FileChannel.open(path, SPILL_OPTIONS, SPILL_FILE_MODE);
+            files.add(file);
+            return file;
         }
     }
 
@@ -207,6 +216,10 @@ final class ValidationSortedRows implements ValidationRowCursor {
                 catch (IOException failed) { failures.record(ioFailure(failed)); }
             }
             files.clear();
+            if (spillDirectory != null) {
+                try { Files.deleteIfExists(spillDirectory); }
+                catch (IOException failed) { failures.record(ioFailure(failed)); }
+            }
         }
         try { input.close(); }
         catch (RuntimeException | Error failed) { failures.record(failed); }
