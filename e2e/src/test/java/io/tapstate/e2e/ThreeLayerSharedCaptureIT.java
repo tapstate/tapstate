@@ -252,14 +252,18 @@ class ThreeLayerSharedCaptureIT {
             Await.until("real CDC after the new Mongo full",columnBound,() -> columnRows(mongo,source).equals(columnRows(mongo,target)),
                     () -> "target="+columnRows(mongo,target));
             Await.answered("the new-model CDC acknowledgement",columnBound,() -> control.durablePosition(pipeline,"orders").filter(value -> !value.equals(fullAck)));
-            Await.until("the real checkpoint to consume the pending model handoff",columnBound,() -> {
+            var root=Await.answered("the checkpoint to reference the explicit full's sampled model",columnBound,() -> {
                 var current=cache.getCollection("srs_chains").find(new Document("_id",chain)).first();
-                return current!=null && current.get("resumeOverride")==null && current.get("checkpoint") instanceof Document checkpoint
-                        && Boolean.TRUE.equals(checkpoint.get("positionEditsRestricted"));
-            },() -> "model handoff checkpoint is not yet committed");
-            var root=cache.getCollection("srs_chains").find(new Document("_id",chain)).first();
+                if(current==null || current.get("resumeOverride")!=null
+                        || !(current.get("checkpoint") instanceof Document sampledCheckpoint)
+                        || sampledCheckpoint.getLong("epoch")<snapshot.getLong("snapshotEpoch")) return Optional.empty();
+                return sampledCheckpoint.getList("tables",Document.class).stream()
+                        .filter(table -> "orders".equals(table.getString("table")) && modelKey.equals(table.get("model"))
+                                && table.getLong("sequence")>=model.getLong("ddlSequence"))
+                        .findFirst().map(table -> current);
+            });
             assertThat(root.get("resumeOverride")).isNull();
-            var checkpoint=root.get("checkpoint",Document.class);assertThat(checkpoint).containsEntry("positionEditsRestricted",true);
+            var checkpoint=root.get("checkpoint",Document.class);
             assertThat(checkpoint.getLong("epoch")).isGreaterThanOrEqualTo(snapshot.getLong("snapshotEpoch"));
             var tableCheckpoint=checkpoint.getList("tables",Document.class).stream().filter(value -> "orders".equals(value.getString("table"))).findFirst().orElseThrow();
             assertThat(tableCheckpoint.get("model")).isEqualTo(modelKey);
