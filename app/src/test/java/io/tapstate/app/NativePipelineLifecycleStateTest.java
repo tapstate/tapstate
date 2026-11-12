@@ -15,7 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 class NativePipelineLifecycleStateTest {
     private static final PipelineIntentScope SCOPE = new PipelineIntentScope("cluster", 1, "cache", "orders", 2);
@@ -104,9 +104,9 @@ class NativePipelineLifecycleStateTest {
                 .isInstanceOf(IllegalStateException.class).hasMessage("broken invariant");
     }
 
-    @ParameterizedTest @EnumSource(value = JobStatus.class, names = {"STARTING", "COMPLETING", "FAILED", "COMPLETED"})
-    void onlyAnActualActiveEngineStateCanSupplyTheRead(JobStatus status) {
-        when(run.status()).thenReturn(status);
+    @ParameterizedTest @ValueSource(strings = {"STARTING", "COMPLETING", "FAILED", "COMPLETED"})
+    void onlyAnActualActiveEngineStateCanSupplyTheRead(String status) {
+        when(run.status()).thenReturn(JobStatus.valueOf(status));
         assertThat(lifecycle.currentState("orders", SCOPE)).isEmpty();
     }
 
