@@ -40,6 +40,13 @@ window the response omits `state`, `observedState`, `observedAt`, and `observedA
 reports `state: "NEW"`, `displayState: "DRAFT"`, and `hasArtifact: false`. The observation fields describe
 the last runtime observation, and `observedAgeMillis` is calculated from its timestamp.
 
+A current engine job can report `state: "RUNNING"` and `displayState: "RUNNING"` before monitoring
+publishes its first observation. This read verifies the current execution identity; a requested start
+or a checkpoint written before job submission is not enough. `observedState`, `observedAt`, and
+`observedAgeMillis` remain absent in that window. Metrics freshness does not hold back the lifecycle
+label. If the current execution cannot be verified yet, the known transition remains visible instead
+of claiming that the job is running.
+
 When runtime state is available but desired intent cannot be read, the response preserves the runtime
 state and includes an `intentReadFailure` object with `code`, `params`, and `message`. If an applied
 Pipeline has no usable runtime state or known transition, the endpoint returns HTTP 500 with
