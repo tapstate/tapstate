@@ -588,7 +588,7 @@ class ThreeLayerSharedCaptureIT {
                 long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
                         .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("find"))
                                 .append("namespace", sourceDb + ".orders").append("appName", appName)
-                                .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
+                                .append("blockConnection", true).append("blockTimeMS", 30000))).get("count")).longValue();
                 var fullCount = new Document("_id.scope.pipelineId", "reader_a").append("_id.scope.stateGeneration", 2L);
                 try (var starter = Executors.newSingleThreadExecutor()) {
                     var start = starter.submit(() -> control.lifecycle("reader_a", LifecycleVerb.START));
@@ -599,7 +599,8 @@ class ThreeLayerSharedCaptureIT {
                         assertThat(cache.getCollection("snapshot_counts").countDocuments(fullCount)).isZero();
                         mongo.update(source, "orders", Map.of("id", 2L), Map.of("seq", 222L));
                         awaitRows(mongo, source, targetB, Duration.ofSeconds(8));
-                        Await.answered("the unaffected consumer's target confirmation during the held full start", Duration.ofSeconds(5),
+                        // The sink can batch durable acknowledgements for ten seconds before observation catches up.
+                        Await.answered("the unaffected consumer's target confirmation during the held full start", Duration.ofSeconds(20),
                                 () -> control.durablePosition("reader_b", "orders").filter(value -> !value.equals(beforeAck)));
                         assertThat(heldRead(admin, appName, sourceDb).map(op -> op.get("opid"))).contains(held);
                         assertThat(cache.getCollection("snapshot_counts").countDocuments(fullCount)).isZero();
