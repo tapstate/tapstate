@@ -3442,6 +3442,7 @@ final class StoreBackedDagSource implements DagSource {
         if (pipeline.transforms() == null) {
             return byAlias;
         }
+        Map<String, NodeColumns>[] stepColumns = new Map[1];
         for (Step step : pipeline.transforms()) {
             if (!(step instanceof Step.Inline inline) || !(inline.body() instanceof TransformBody.Nest)) {
                 continue;
@@ -3450,7 +3451,7 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             aliases.aliases().forEach((alias, ref) -> {
-                NestTable resolved = nestTable(ref, sourceTables);
+                NestTable resolved = withStepColumns(nestTable(ref, sourceTables), ref, stepColumns, pipeline);
                 NestTable existing = byAlias.putIfAbsent(alias, resolved);
                 if (existing != null && !existing.name().equals(resolved.name())) {
                     throw new IllegalStateException("alias '" + alias + "' names table '" + existing.name()
@@ -3460,6 +3461,46 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         return byAlias;
+    }
+
+    /**
+     * An alias that names another step - a {@code map}, a {@code union} - reads that step's output, which has
+     * no table behind it and so no key; but its columns and their types are worked out like any other node's.
+     * They are what a rollup over the level computes in: without them a {@code sum} over a mapped or merged
+     * level would have no type to be exact in and could not be declared at all. The key stays the author's
+     * to declare. A step whose columns nobody can work out stays untyped, as before.
+     */
+    @SuppressWarnings("unchecked")
+    private NestTable withStepColumns(NestTable table, FromRef ref, Map<String, NodeColumns>[] stepColumns,
+            PipelineResource pipeline) {
+        if (!table.fields().isEmpty() || !(ref instanceof FromRef.Literal literal)
+                || !(stepOf(pipeline, literal.ref()) instanceof Step.Inline)) {
+            return table;
+        }
+        if (stepColumns[0] == null) {
+            try {
+                Map<String, SourceVertex> vertices = sourceVertices(pipeline);
+                stepColumns[0] = deriveSteps(pipeline, vertices, sourceKeyByTable(vertices), sourceKeysById(vertices),
+                        stepIds(pipeline), compiledJoins(pipeline, sourceTablesByName(vertices)),
+                        this::discoveredColumns).columns();
+            } catch (RuntimeException underivable) {
+                stepColumns[0] = Map.of();
+            }
+        }
+        NodeColumns columns = stepColumns[0].get(literal.ref());
+        if (columns == null || !columns.known()) {
+            return table;
+        }
+        Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
+        columns.columns().forEach((name, declared) -> {
+            io.tapstate.core.common.TapstateType type = JoinSchemaDrift.typeOf(declared);
+            var numeric = columns.numericTypes().get(name);
+            Integer scale = type == io.tapstate.core.common.TapstateType.DECIMAL && numeric != null
+                    ? numeric.scale() : null;
+            types.put(name, new io.tapstate.core.dsl.aggregate.ValueType(type, scale));
+        });
+        return new NestTable(table.name(), table.primaryKey(), table.uniqueIndexes(),
+                List.copyOf(columns.columns().keySet()), types);
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
