@@ -24,6 +24,8 @@ public enum ControlError implements TapstateErrorCode {
      */
     AI_NOT_CONFIGURED("control.ai-not-configured", Set.of()),
     AI_PROVIDER_AUTH_FAILED("control.ai-provider-auth-failed", Set.of()),
+    AI_PROVIDER_REQUEST_REJECTED("control.ai-provider-request-rejected", Set.of()),
+    AI_PROVIDER_RATE_LIMITED("control.ai-provider-rate-limited", Set.of()),
     AI_PROVIDER_FAILED("control.ai-provider-failed", Set.of()),
     AI_INVALID_PROPOSAL("control.ai-invalid-proposal", Set.of()),
     AI_OVERLOADED("control.ai-overloaded", Set.of()),
