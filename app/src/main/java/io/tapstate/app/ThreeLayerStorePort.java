@@ -500,6 +500,19 @@ final class ThreeLayerStorePort implements StorePort {
                     pending == null ? null : pending.editedAt(), false);
         });
     }
+    Optional<ConsumerOffset> sinkOffset(String pipeline, String source, String chain) {
+        var original = scope(pipeline);
+        Runnable guard = () -> {
+            active();
+            if (!original.equals(scope(pipeline))) throw refused();
+        };
+        var context = new io.tapstate.spi.store.SrsConsumerContext(
+                new io.tapstate.spi.store.SrsConsumerKey(chain, pipeline, source), original.stateGeneration());
+        var offset = bound.cache().srs(business(), guard).consumers().cursor(context);
+        guard.run();
+        return offset;
+    }
+
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {
         var shared = stores.chains().load(chain);
         if (shared.isEmpty()) return directPosition(chain);

@@ -31,3 +31,4 @@ tapstate:
 logging:
   level:
     io.tapstate.diagnostics.http: INFO
+    io.tapstate.diagnostics.pipeline: INFO

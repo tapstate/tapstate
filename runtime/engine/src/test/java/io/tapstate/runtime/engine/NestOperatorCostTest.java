@@ -294,7 +294,19 @@ class NestOperatorCostTest {
                         + "cold numbers below are about a path nothing walked")
                 .isPositive();
 
-        assertOneRowPerEvent(report, root, 1);
+        // Guarded reference touches may probe absent roots before their INSERT edge arrives.
+        // Those probes share a loadAll and the INSERT reuses their absence, so calls depend on
+        // edge ordering while the number of keys read and written remains exact.
+        Counters rootWork = report.namespaces().get(root);
+        assertThat(report.emitted()).isEqualTo(ROOTS);
+        assertThat(rootWork.keyAccesses()).isEqualTo(2L * ROOTS);
+        assertThat(rootWork.coldKeys()).isEqualTo(ROOTS);
+        assertThat(rootWork.coldSaves()).isEqualTo(ROOTS);
+        assertThat(rootWork.accesses()).isGreaterThan(ROOTS).isLessThanOrEqualTo(2L * ROOTS);
+        assertThat(rootWork.coldLoads()).isPositive().isLessThanOrEqualTo(ROOTS);
+        assertThat(rootWork.coldLoads() - rootWork.coldBatches() + rootWork.coldBatchedKeys())
+                .as("scalar reads plus the keys carried by bulk reads")
+                .isEqualTo(ROOTS);
         // Every cold key is still fetched exactly once. Concurrent partition loads can now share a
         // backend request, so call count is a ceiling, while the key count below remains exact.
         assertThat(batches.coldLoads())
@@ -500,7 +512,8 @@ class NestOperatorCostTest {
             Trips trips = TRIPS.getOrDefault(namespace, new Trips());
             counters.put(namespace, new Counters(counted.accesses(), counted.backfills(),
                     counted.backfillNanos(), trips.loads.get(), trips.saves.get(), trips.deletes.get(),
-                    trips.bytes.get(), trips.batches.get(), trips.batchedKeys.get()));
+                    trips.bytes.get(), trips.batches.get(), trips.batchedKeys.get(),
+                    counted.keyAccesses(), counted.coldKeys()));
         }
         return new Snapshot(counters, EMITTED.get(), DOCUMENT_BYTES.get());
     }
@@ -611,6 +624,8 @@ class NestOperatorCostTest {
         report.namespaces().forEach((namespace, delta) -> {
             out.append("  [").append(namespace).append("]\n");
             out.append(per("state accesses per event", delta.accesses(), report.events()));
+            out.append(per("state keys per event", delta.keyAccesses(), report.events()));
+            out.append(per("cold keys per event", delta.coldKeys(), report.events()));
             out.append(per("trips behind the map per event", delta.backfills(), report.events()));
             out.append(per("cold reads per event", delta.coldLoads(), report.events()));
             out.append(per("cold writes per event", delta.coldSaves(), report.events()));
@@ -970,16 +985,18 @@ class NestOperatorCostTest {
 
     /** What one namespace had cost by some moment. */
     private record Counters(long accesses, long backfills, long backfillNanos, long coldLoads,
-            long coldSaves, long coldDeletes, long coldBytes, long coldBatches, long coldBatchedKeys) {
+            long coldSaves, long coldDeletes, long coldBytes, long coldBatches, long coldBatchedKeys,
+            long keyAccesses, long coldKeys) {
 
-        static final Counters NONE = new Counters(0, 0, 0, 0, 0, 0, 0, 0, 0);
+        static final Counters NONE = new Counters(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
 
         Counters minus(Counters earlier) {
             return new Counters(accesses - earlier.accesses, backfills - earlier.backfills,
                     backfillNanos - earlier.backfillNanos, coldLoads - earlier.coldLoads,
                     coldSaves - earlier.coldSaves, coldDeletes - earlier.coldDeletes,
                     coldBytes - earlier.coldBytes, coldBatches - earlier.coldBatches,
-                    coldBatchedKeys - earlier.coldBatchedKeys);
+                    coldBatchedKeys - earlier.coldBatchedKeys,
+                    keyAccesses - earlier.keyAccesses, coldKeys - earlier.coldKeys);
         }
     }
 

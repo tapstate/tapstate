@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.concurrent.*;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 
 /** Reads the current job without waiting for metrics or changing its claim. */
 final class NativePipelineLifecycleState implements AutoCloseable {
@@ -70,7 +71,11 @@ final class NativePipelineLifecycleState implements AutoCloseable {
 
     private Optional<PipelineState> readCurrent(String pipeline, PipelineIntentScope scope) {
         try {
-            return current(pipeline, scope);
+            return PipelineDiagnostics.measure(pipeline, Phase.PIPELINE_LIFECYCLE_READ, () -> {
+                var state = current(pipeline, scope);
+                if (state.isEmpty()) PipelineDiagnostics.event("lifecycle_unavailable");
+                return state;
+            });
         } catch (RuntimeException failure) {
             if (!HazelcastLivePipelineRuns.theClusterIsChanging(failure)) throw failure;
             return Optional.empty();
@@ -83,6 +88,8 @@ final class NativePipelineLifecycleState implements AutoCloseable {
         var run = engine.captureRun(pipeline).orElse(null);
         if (run == null || !(run.operatorManifest().executionIdentity() instanceof ExecutionFence fence)
                 || !scope.equals(fence.scope())) return Optional.empty();
+        PipelineDiagnostics.execution(fence);
+        PipelineDiagnostics.job(run.jobId());
         var plan = plans.current(List.of(pipeline)).get(pipeline);
         if (!matches(plan, fence) || !authorized.test(fence)) return Optional.empty();
         PipelineState state = switch (run.status()) {
@@ -92,6 +99,7 @@ final class NativePipelineLifecycleState implements AutoCloseable {
         };
         if (state == null || !active.getAsBoolean() || !authorized.test(fence)
                 || !Objects.equals(plan, plans.current(List.of(pipeline)).get(pipeline))) return Optional.empty();
+        PipelineDiagnostics.event("authorized_state_" + state.name());
         return Optional.of(state);
     }
 

@@ -4,7 +4,6 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import java.time.Duration;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongSupplier;
@@ -60,9 +59,9 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     private final long backoffNanos;
     private final long detectionWindowNanos;
     private final LongSupplier nanoTime;
-    private final Map<String, Attempts> attempts = new HashMap<>();
+    private final Map<String, Attempts> attempts = new java.util.concurrent.ConcurrentHashMap<>();
     /** The refusal last logged for each pipeline, so the same refusal of the same run is logged once. */
-    private final Map<String, Refusal> refusals = new HashMap<>();
+    private final Map<String, Refusal> refusals = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Which run a refusal was about, and why it was refused. */
     private record Refusal(long executionGeneration, PipelineActuationOwnership.Departure why) {}

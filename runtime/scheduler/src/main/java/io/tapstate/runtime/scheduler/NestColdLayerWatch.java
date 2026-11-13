@@ -33,8 +33,7 @@ import java.util.Set;
  * be differenced against each other's counts — and a joined name would answer that with a separator that
  * has to be absent from every pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>State changes are serialized while independent Pipeline observations may arrive concurrently.
  */
 public final class NestColdLayerWatch {
 
@@ -52,7 +51,7 @@ public final class NestColdLayerWatch {
      * stopped or just resumed being served from memory. Namespaces of this pipeline that are not in
      * {@code readings} are forgotten.
      */
-    public void saw(String pipelineId, Map<String, NestStateReading> readings) {
+    public synchronized void saw(String pipelineId, Map<String, NestStateReading> readings) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
         Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
@@ -64,7 +63,7 @@ public final class NestColdLayerWatch {
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */
-    Set<String> watching() {
+    synchronized Set<String> watching() {
         Set<String> held = new HashSet<>();
         byPipeline.forEach((pipelineId, namespaces) ->
                 namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));

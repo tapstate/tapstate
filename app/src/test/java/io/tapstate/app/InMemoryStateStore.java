@@ -6,8 +6,6 @@ import io.tapstate.core.lifecycle.EpochCas;
 import io.tapstate.spi.store.StateStore;
 
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -19,8 +17,8 @@ import java.util.Set;
  */
 final class InMemoryStateStore implements StateStore {
 
-    private final Map<String, CheckpointDoc> docs = new HashMap<>();
-    private final Set<String> failing = new HashSet<>();
+    private final Map<String, CheckpointDoc> docs = new java.util.concurrent.ConcurrentHashMap<>();
+    private final Set<String> failing = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     void failFor(String pipelineId) {
         failing.add(pipelineId);
