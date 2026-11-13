@@ -178,6 +178,110 @@ class NestRollupWorkloadShapesIT {
             ) m ON m.txn_id = t.id
             GROUP BY t.id""";
 
+    // ---- redemptions priced through a definition referenced by code ---------------------------------------
+
+    /**
+     * Redemption items reference their prize definition by its code rather than its id, and an item's amount
+     * is the quantity used, negated. The transaction's amount prices every item through that definition, so a
+     * definition's price change reaches every transaction using it, an item re-pointed to another code is
+     * priced by the other definition, and an item naming a code nothing defines leaves the amount null until
+     * the definition arrives - never a total that silently left that item out.
+     */
+    @ParameterizedTest
+    @EnumSource(Tiers.class)
+    void aRedemptionIsPricedThroughADefinitionItReferencesByCode(Tiers tier) throws Exception {
+        String suffix = tier.name().toLowerCase(Locale.ROOT);
+        Map<String, Object> mysql = SharedMySql.settings("rollup_redeem_src_" + suffix);
+        sql(mysql,
+                "CREATE TABLE redemption_txn (id INT PRIMARY KEY, member_id INT NOT NULL)",
+                "CREATE TABLE redemption_item (id INT PRIMARY KEY, txn_id INT NOT NULL, prize_code VARCHAR(32) NOT NULL,"
+                        + " amount_used INT NOT NULL)",
+                "CREATE TABLE prize_definition (id INT PRIMARY KEY, prize_code VARCHAR(32) NOT NULL UNIQUE,"
+                        + " prize_value INT NOT NULL)",
+                "INSERT INTO redemption_txn VALUES (1, 501), (2, 502), (3, 503)",
+                "INSERT INTO prize_definition VALUES (10, 'reward-points', 1), (11, 'dining-credit', 25),"
+                        + " (12, 'hotel-night', 400)",
+                "INSERT INTO redemption_item VALUES (1, 1, 'reward-points', 300), (2, 1, 'dining-credit', 2),"
+                        + " (3, 2, 'dining-credit', 1), (4, 2, 'hotel-night', 1)");
+        String targetUri = SharedMongo.replicaSetUrl("rollup_redeem_tgt_" + suffix);
+        EndpointAddress target = EndpointAddress.uri(targetUri);
+        String pipeline = "rollup_redeem_" + suffix;
+
+        try (PreparedNativeStore storage = PreparedNativeStore.create(); MongoEndpoints mongo = new MongoEndpoints();
+                ServerHandle server = tier.launch(storage)) {
+            ControlPlane control = start(server, storage, mysql,
+                    List.of("redemption_txn", "redemption_item", "prize_definition"), targetUri, "pipeline.tap.yml",
+                    redemptionPipeline(pipeline), pipeline);
+            String collection = pipeline + "_redemption_txn";
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after the snapshot");
+
+            sql(mysql, "UPDATE prize_definition SET prize_value = 30 WHERE prize_code = 'dining-credit'");
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after a definition used by two transactions repriced");
+            sql(mysql, "UPDATE redemption_item SET prize_code = 'hotel-night' WHERE id = 2");
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after an item was re-pointed to another code");
+            sql(mysql, "INSERT INTO redemption_item VALUES (5, 3, 'spa-voucher', 1)");
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after an item named a code nothing defines");
+            assertThat(mongo.fetch(target, collection, Map.of("id", 3)).orElseThrow()).containsEntry("amount", null);
+            sql(mysql, "INSERT INTO prize_definition VALUES (13, 'spa-voucher', 120)");
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after the missing definition arrived");
+            sql(mysql, "DELETE FROM redemption_item WHERE id = 1");
+            converge(mongo, target, collection, mysql, REDEMPTION_SQL, "after an item was deleted");
+            control.lifecycle(pipeline, LifecycleVerb.PAUSE);
+        }
+    }
+
+    private static String redemptionPipeline(String id) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: shapes-mysql
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - id: redemption_movement
+                    type: map
+                    from: [ redemption_item ]
+                    fields:
+                      amount: "=after.amount_used * -1"
+                      amount_used: false
+                  - id: redemption_doc
+                    type: nest
+                    from: { t: redemption_txn, m: redemption_movement, pd: prize_definition }
+                    root:
+                      from: t
+                      key: [ id ]
+                      embed:
+                        - from: m
+                          on: { txn_id: id }
+                          as: array
+                          path: item_movement
+                          key: [ id ]
+                          arrayKey: [ id ]
+                          embed:
+                            - { from: pd, on: { prize_code: prize_code }, as: object, path: prize_definition, key: [ prize_code ] }
+                          rollup:
+                            qty:    { sum: $amount, default: 0 }
+                            amount: { sum: "=after.amount * after.prize_definition.prize_value", default: 0 }
+                serve:
+                  from: redemption_doc
+                  sync:
+                    - source: shapes-store
+                      rename: { prefix: %s_ }
+                      execution: { parallelism: 1 }
+                """.formatted(id, id);
+    }
+
+    /** The redemption's rollups: amount is null while any item names a code nothing defines. */
+    private static final String REDEMPTION_SQL = """
+            SELECT t.id,
+                   COALESCE(SUM(-i.amount_used), 0) AS qty,
+                   CASE WHEN SUM(i.id IS NOT NULL AND pd.id IS NULL) > 0 THEN NULL
+                        ELSE COALESCE(SUM(-i.amount_used * pd.prize_value), 0) END AS amount
+            FROM redemption_txn t
+            LEFT JOIN redemption_item i ON i.txn_id = t.id
+            LEFT JOIN prize_definition pd ON pd.prize_code = i.prize_code
+            GROUP BY t.id""";
+
     // ---- the player ------------------------------------------------------------------------------------------
 
     @ParameterizedTest
