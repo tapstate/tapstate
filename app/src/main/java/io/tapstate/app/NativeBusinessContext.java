@@ -722,11 +722,12 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                                         }
                                     })));
         }
-        @Bean PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
-                PipelineActuationOwnership ownership) {
+        @Bean(destroyMethod = "close") PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
+                PipelineActuationOwnership ownership, HazelcastExecutionPlans plans, HazelcastInstance member) {
             return new NativePipelineStatusDiagnostics(owner.original.preparation().businessScope(),
                     owner.configuration.intents(), owner.configuration.preparations(), engine, ownership, owner.active::get,
-                    owner.original.cache()::pipelineStates);
+                    owner.original.cache()::pipelineStates,
+                    new NativePipelineLifecycleState(engine, plans, ExecutionAuthorization.of(member)::observedAuthorization, owner.active::get));
         }
         @Bean(initMethod = "start", destroyMethod = "")
         RetiredPipelinePayloadCleanup retiredPipelinePayloadCleanup(NativeBusinessContext owner, NodeSessionLease node) {

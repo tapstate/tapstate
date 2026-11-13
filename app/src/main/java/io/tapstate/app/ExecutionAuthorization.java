@@ -315,6 +315,25 @@ final class ExecutionAuthorization implements AutoCloseable {
         return authorizedEntry(fence) != null;
     }
 
+    /** Optional display reads must never wait for a missing authorization proof. */
+    boolean observedAuthorization(ExecutionFence fence) {
+        Objects.requireNonNull(fence, "fence");
+        if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean()) return false;
+        ReadKey key = ReadKey.of(fence);
+        if (businessScope == null) {
+            var entry = entries.get(key);
+            return entry != null && nanoTime.getAsLong() - entry.deadlineNanos() < 0 && matches(entry.claim(), fence);
+        }
+        var proof = scopedProofs.computeIfAbsent(key, ignored -> new ScopedProof());
+        proof.lastUsed = System.nanoTime();
+        var result = proof.result;
+        if (!proof.superseded && liveMatch(result, entry -> matches(entry.claim(), fence)) && proof.result == result)
+            return true;
+        boolean olderExecution = result.entry() != null && precedes(result.entry(), fence);
+        synchronized (proof) { requestScopedProof(key, proof, olderExecution); }
+        return false;
+    }
+
     /** Rechecks only an already-published proof and its original deadline, without store IO. */
     WorkloadClaimFence requireLocal(ExecutionFence fence) {
         Objects.requireNonNull(fence,"fence");

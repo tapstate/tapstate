@@ -18,7 +18,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.StateStore;
 
 /** Diagnoses one retained SINGLE engine loss without writing a checkpoint, observation or claim. */
-final class NativePipelineStatusDiagnostics implements PipelineStatusDiagnostics {
+final class NativePipelineStatusDiagnostics implements PipelineStatusDiagnostics, AutoCloseable {
     private final CacheBusinessScope original;
     private final PipelineIntentStore intents;
     private final PipelineStatePreparations preparations;
@@ -26,13 +26,31 @@ final class NativePipelineStatusDiagnostics implements PipelineStatusDiagnostics
     private final PipelineActuationOwnership ownership;
     private final BooleanSupplier active;
     private final Function<PipelineIntentScope, StateStore> states;
+    private final NativePipelineLifecycleState lifecycle;
 
     NativePipelineStatusDiagnostics(CacheBusinessScope original, PipelineIntentStore intents,
             PipelineStatePreparations preparations, Engine engine, PipelineActuationOwnership ownership, BooleanSupplier active,
             Function<PipelineIntentScope, StateStore> states) {
+        this(original, intents, preparations, engine, ownership, active, states, null);
+    }
+
+    NativePipelineStatusDiagnostics(CacheBusinessScope original, PipelineIntentStore intents,
+            PipelineStatePreparations preparations, Engine engine, PipelineActuationOwnership ownership, BooleanSupplier active,
+            Function<PipelineIntentScope, StateStore> states, NativePipelineLifecycleState lifecycle) {
         this.original = original; this.intents = intents; this.preparations = preparations;
         this.engine = engine; this.ownership = ownership; this.active = active; this.states = states;
+        this.lifecycle = lifecycle;
     }
+
+    @Override public Optional<PipelineState> currentState(String pipeline, PipelineIntentScope scope) {
+        return lifecycle == null ? Optional.empty() : lifecycle.currentState(pipeline, scope);
+    }
+
+    @Override public java.util.Map<String, PipelineState> currentStates(java.util.Map<String, PipelineIntentScope> scopes) {
+        return lifecycle == null ? java.util.Map.of() : lifecycle.currentStates(scopes);
+    }
+
+    @Override public void close() { if (lifecycle != null) lifecycle.close(); }
 
     @Override public Optional<ObservationFailure> failure(String pipeline, PipelineState observed) {
         if ((observed != PipelineState.RUNNING && observed != PipelineState.PAUSED) || !active.getAsBoolean()
