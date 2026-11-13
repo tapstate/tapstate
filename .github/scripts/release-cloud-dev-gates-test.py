@@ -6,6 +6,7 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "release.yml"
+CLI_WORKFLOW = WORKFLOW.with_name("cli-native.yml")
 
 
 def jobs_of(workflow):
@@ -49,13 +50,13 @@ def require_completeness_before_dev(workflow):
     assert holder in ancestors(jobs, "cloud-dev"), (
         f"distribution-completeness gate ({holder}) must succeed before Cloud dev publication"
     )
-    # With default success conditions, a failed or skipped prerequisite blocks its descendants.
-    for name in ancestors(jobs, "publish") | {"publish"}:
+    for name in ancestors(jobs, "cloud-ghcr") | {"cloud-ghcr"}:
         assert not re.search(r"^    (?:if|continue-on-error):", jobs[name], re.MULTILINE), (
             f"{name} must not override failed-prerequisite blocking"
         )
+    assert {"cloud-image", "gates"} <= ancestors(jobs, "draft")
     assert "cloud-dev" in ancestors(jobs, "approve")
-    assert "approve" in ancestors(jobs, "publish")
+    assert {"approve", "publish"} <= ancestors(jobs, "cloud-ghcr")
 
 
 class CloudDevReleaseGatesTest(unittest.TestCase):
@@ -64,6 +65,12 @@ class CloudDevReleaseGatesTest(unittest.TestCase):
 
     def test_a_failed_distribution_check_blocks_dev_and_approval(self):
         require_completeness_before_dev(self.workflow)
+
+    def test_release_checks_have_no_temporary_exception(self):
+        cli = CLI_WORKFLOW.read_text()
+        for marker in ("v080-exception", "skip_release_tests", "skip-release-tests"):
+            self.assertNotIn(marker, self.workflow)
+            self.assertNotIn(marker, cli)
 
     def test_removing_the_completeness_dependency_is_detected(self):
         mutated = re.sub(r"(  cloud-dev:\n.*?^    needs:) [^\n]+", r"\1 [version, gates]",

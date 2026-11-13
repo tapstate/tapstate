@@ -21,11 +21,17 @@ public interface StorePort {
     record PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
             java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
             java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
-            io.tapstate.core.lifecycle.PipelineState checkpoint) {
+            io.tapstate.core.lifecycle.PipelineState checkpoint, PipelineIntentScope scope) {
+        public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
+                java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
+                java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable,
+                io.tapstate.core.lifecycle.PipelineState checkpoint) {
+            this(observation, desired, intentFailure, runningObservationUnavailable, checkpoint, null);
+        }
         public PipelineCatalogState(java.util.Optional<io.tapstate.core.lifecycle.Observation> observation,
                 java.util.Optional<io.tapstate.core.lifecycle.DesiredState> desired,
                 java.util.Optional<io.tapstate.core.common.TapstateException> intentFailure, boolean runningObservationUnavailable) {
-            this(observation, desired, intentFailure, runningObservationUnavailable, null);
+            this(observation, desired, intentFailure, runningObservationUnavailable, null, null);
         }
     }
 

@@ -50,7 +50,7 @@ hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still m
 has "the publish job waits on the approval" publish 'needs:.*approve'
 has "the approval waits for the Cloud dev candidate" approve 'needs:.*cloud-dev'
 has "the approval uses the protected release environment" approve '^    environment: release$'
-has "Cloud dev starts only after the release gates" cloud-dev 'needs:.*gates'
+has "Cloud dev starts only after the draft checks" cloud-dev 'needs:.*draft'
 has "Cloud dev reuses its existing workflow" cloud-dev 'uses: [.]\/[.]github/workflows/cloud-cluster-dev[.]yml'
 has "Cloud dev consumes the selected release version" cloud-dev 'version:.*needs[.]version[.]outputs[.]version'
 has "Cloud dev consumes the frozen Tapstate commit" cloud-dev 'source-sha:.*needs[.]version[.]outputs[.]sha'
@@ -345,7 +345,7 @@ else
   bad "the connector lane starts as early as it can" \
       "wanted exactly 'needs: version', got: $(job connectors | grep -E '^    needs:' | head -1)"
 fi
-has  "the draft body comes from the gate"     draft  'body_path'
+has  "the draft uses the release notes it assembles" draft 'body_path: release-notes[.]md'
 has  "and GitHub appends its own list"        draft  'generate_release_notes: true'
 
 # The draft is a draft, and creates no tag until somebody publishes it.

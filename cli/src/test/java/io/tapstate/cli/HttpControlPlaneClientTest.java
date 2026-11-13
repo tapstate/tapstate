@@ -1719,6 +1719,17 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void anUnobservedTransitionCanOmitRuntimeState() throws Exception {
+        HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                "{\"pipelineId\":\"pl1\",\"displayState\":\"STARTING\","
+                        + "\"desiredState\":\"RUNNING\",\"hasArtifact\":true}", new AtomicReference<>());
+        try {
+            assertThat(new HttpControlPlaneClient().status(baseOf(server), "tok", "pl1"))
+                    .isEqualTo(new StatusOutcome.NoObservation());
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void statusCarriesTheCodedFailureOfAPipelineWhoseJobDied() throws Exception {
         AtomicReference<CapturedRequest> seen = new AtomicReference<>();
         HttpServer server = apiServer("/api/pipelines/pl1/status", 200,

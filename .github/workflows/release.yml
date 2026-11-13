@@ -3,15 +3,12 @@
 # The person says how big the change is (`bump`) and, if it is not the tip of the default branch,
 # which commit ships (`commit`). Everything else is worked out: the version number, every file that
 # pins it, the assets, the checksums, the platform minimums, whether this release is the newest line.
-# There is deliberately no input for the version, for the release notes, for skipping a check, or for
-# "docs are ready" -- a switch a person can flip is not a check, and each one is another way to
-# produce a release that did not go the standard way.
 #
 # One dispatch, two halves, with a person in the middle:
 #
 #   1. machine   work out the version -> write it into all six places that pin it -> build and smoke
 #                four native CLI binaries -> build both server image architectures into a local
-#                archive -> pass every gate -> build and push the pinned Cloud dev candidate and
+#                archive -> pass the applicable gates -> build and push the pinned Cloud dev candidate and
 #                create a DRAFT release, which is private and creates no tag
 #   2. person    validate the Cloud dev image by digest, then read the draft on the Releases page,
 #                edit the body if it needs it, and Approve or Reject in Actions
@@ -79,7 +76,6 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
-      main_ci: ${{ steps.main-ci.outcome }}
       web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
@@ -112,14 +108,10 @@ jobs:
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
 
-      # The v0.8.0 release can start from the default branch while its CI is running.
-      # Explicit commit releases and all other versions still require the checks.
       # Let the script's own exit code fail the step. It explains its refusal in its own words --
       # including the difference between a check still running and one that has concluded red, which
       # need different answers from a person -- and a wrapper here would restate that less well.
       - name: the required checks are green on that commit
-        id: main-ci
-        if: steps.next.outputs.tag != 'v0.8.0' || inputs.commit != '' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -835,9 +827,7 @@ jobs:
     # Two of the eight are not steps here, because they are already the reason this job can run at
     # all, and re-asserting them would be this workflow grading its own dependency graph:
     #
-    #   2. the release smoke tests are green   `cli-native` runs the native and MCP smokes against
-    #                                          each produced binary; a red one fails that job and
-    #                                          nothing downstream of it starts
+    #   2. the release smoke tests run in cli-native and cloud-image against the built artifacts
     #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
     #                                          asset before the draft is assembled
     #
@@ -871,7 +861,6 @@ jobs:
       #    set is read from the branch's rules at this moment rather than copied into this file, and
       #    every name in it has to be present before any conclusion is looked at.
       - name: 1. the required checks are green on this commit
-        if: needs.version.outputs.main_ci != 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -937,10 +926,81 @@ jobs:
             --sha "${{ needs.version.outputs.sha }}" \
             --bump "${{ inputs.bump }}"
 
-      # 5. The notes exist, assembled rather than remembered. Assembling them here rather than in the
-      #    job that creates the draft is what makes this a gate: a range that cannot be collected, or
-      #    a base tag that is not in this history, stops the release instead of producing a release
-      #    with an empty body.
+      # Before the tag exists, deliberately. Publishing is irreversible, and a token that turns out not
+      # to reach one of the satellites afterwards leaves a released tapstate whose documentation
+      # repository never got the tag -- and there the tag is not bookkeeping, it is what makes the
+      # documentation public. This is the only gate here about a credential rather than about the code.
+      - name: 7. the satellite token reaches every satellite
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          .github/scripts/satellites.sh reach
+
+      - name: what the gate decided
+        run: |
+          {
+            echo "### Release gate for ${{ needs.version.outputs.tag }}"
+            echo
+            echo "| | gate | where it was decided |"
+            echo "|---|---|---|"
+            echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
+            echo "| 2 | release smoke green | \`cli-native\` and \`cloud-image\` |"
+            echo "| 3 | distribution complete | \`draft\`, before the release is assembled |"
+            echo "| 4 | documentation for the range has landed | this job |"
+            echo "| 5 | release notes assemble | draft, before the release is assembled |"
+            echo "| 6 | real-connector lane green on that commit | this job |"
+            echo "| 7 | satellite token reaches every satellite | this job |"
+            echo "| 8 | join performance lane green on that commit | this job |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  cloud-dev:
+    # Reuse the dev build, but never resolve a second version or a moving source ref.
+    # The version job already checked that the selected product commit belongs to main's history.
+    # The draft waits for the applicable release gates and checks distribution completeness.
+    needs: [version, draft]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/cloud-cluster-dev.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
+      source-sha: ${{ needs.version.outputs.sha }}
+      web-sha: ${{ needs.version.outputs.web_sha }}
+    secrets: inherit
+
+  draft:
+    needs: [version, cli-native, server-image, gates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the draft release
+    outputs:
+      url: ${{ steps.create.outputs.url }}
+      # The handle everything downstream uses. A release's tag name is not one: the approver is asked
+      # to edit this draft's body, and an edit that does not re-send `tag_name` blanks it to
+      # `untagged-<hex>`, after which a lookup by tag misses a release sitting right there.
+      id: ${{ steps.create.outputs.id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0   # Assemble the notes from the full release range.
+      # The completeness check asks the compose file which image a quickstart user runs, so the tree it
+      # asks has to be the tree this release was built from.
+      - name: write the release version into every file that pins one
+        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      # Take only the CLI assets. An unfiltered download pulls in whatever else the other jobs upload,
+      # so this job's success came to depend on artifacts it never uses, and one that failed to download
+      # sank the whole release step.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tapstate-*.tar.gz
+          path: staging
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-image
+          path: image
+      # Assemble the release notes and measured platform minimums before creating the draft.
       - uses: actions/download-artifact@v4
         with:
           pattern: cli-minimum-*
@@ -982,106 +1042,10 @@ jobs:
             --glibc-req "${GLIBC_REQ}" \
             > release-notes.md
           test -s release-notes.md
-      # Both halves of what the next job needs from this one: the body it publishes, and the asset
-      # whose numbers that body quotes. One measurement, so the sentence a reader is given and the
-      # check made on their machine cannot drift apart.
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-notes
-          path: |
-            release-notes.md
-            platform-minimums.txt
-          if-no-files-found: error
-
-      # Before the tag exists, deliberately. Publishing is irreversible, and a token that turns out not
-      # to reach one of the satellites afterwards leaves a released tapstate whose documentation
-      # repository never got the tag -- and there the tag is not bookkeeping, it is what makes the
-      # documentation public. This is the only gate here about a credential rather than about the code.
-      - name: 7. the satellite token reaches every satellite
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
-        run: |
-          .github/scripts/satellites.sh reach
-
-      - name: what the gate decided
-        env:
-          MAIN_CI: ${{ needs.version.outputs.main_ci }}
-        run: |
-          {
-            echo "### Release gate for ${{ needs.version.outputs.tag }}"
-            echo
-            echo "| | gate | where it was decided |"
-            echo "|---|---|---|"
-            if [ "$MAIN_CI" = skipped ]; then
-              echo "| 1 | required CI on \`${{ needs.version.outputs.sha }}\` | skipped for v0.8.0 |"
-            else
-              echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
-            fi
-            echo "| 2 | release smoke green | \`cli-native\`, which this job needs |"
-            echo "| 3 | distribution complete | \`draft\`, before the release is assembled |"
-            echo "| 4 | documentation for the range has landed | this job |"
-            echo "| 5 | release notes assemble | this job |"
-            echo "| 6 | real-connector lane green on that commit | this job |"
-            echo "| 7 | satellite token reaches every satellite | this job |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  cloud-dev:
-    # Reuse the dev build, but never resolve a second version or a moving source ref.
-    # The version job already checked that the selected product commit belongs to main's history.
-    # Distribution completeness is checked in draft, beyond the checks in the gates job.
-    needs: [version, gates, draft]
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/cloud-cluster-dev.yml
-    with:
-      version: ${{ needs.version.outputs.version }}
-      source-sha: ${{ needs.version.outputs.sha }}
-      web-sha: ${{ needs.version.outputs.web_sha }}
-    secrets: inherit
-
-  draft:
-    needs: [version, cli-native, server-image, gates]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # create the draft release
-    outputs:
-      url: ${{ steps.create.outputs.url }}
-      # The handle everything downstream uses. A release's tag name is not one: the approver is asked
-      # to edit this draft's body, and an edit that does not re-send `tag_name` blanks it to
-      # `untagged-<hex>`, after which a lookup by tag misses a release sitting right there.
-      id: ${{ steps.create.outputs.id }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.version.outputs.sha }}
-      # The completeness check asks the compose file which image a quickstart user runs, so the tree it
-      # asks has to be the tree this release was built from.
-      - name: write the release version into every file that pins one
-        run: .github/scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      # Take only the CLI assets. An unfiltered download pulls in whatever else the other jobs upload,
-      # so this job's success came to depend on artifacts it never uses, and one that failed to download
-      # sank the whole release step.
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: tapstate-*.tar.gz
-          path: staging
-          merge-multiple: true
-      - uses: actions/download-artifact@v4
-        with:
-          name: server-image
-          path: image
-      # The body the gate assembled, and the minimums asset whose numbers that body quotes. Both are
-      # taken from the gate rather than rebuilt here: a body assembled twice can differ from the one
-      # that was checked, and a release whose notes were never gated is what gate 5 exists to prevent.
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-notes
-          path: notes
       - name: checksums (per-asset .sha256 + aggregate checksums.txt)
         shell: bash
         run: |
-          cp notes/platform-minimums.txt staging/
+          cp platform-minimums.txt staging/
           cd staging
           for f in tapstate-*.tar.gz; do sha256sum "$f" > "$f.sha256"; done
           sha256sum tapstate-*.tar.gz > checksums.txt
@@ -1118,11 +1082,11 @@ jobs:
           # of every other version -- not here, and never by hand.
           draft: true
           name: tapstate ${{ needs.version.outputs.tag }}
-          # The body was assembled and checked under gate 5. `body_path`, never an inline body: the
+          # The release body was assembled and checked above. `body_path`, never an inline body: the
           # four disclosures in it -- what an insert-only target can end up with, what a positioning
           # change stream can miss, that this is not for production, and that delivery is at-least-once
           # -- are load-bearing, and as a literal here nothing could assert they were still present.
-          body_path: notes/release-notes.md
+          body_path: release-notes.md
           # GitHub's own list of merged pull requests, appended after that body. It is the backstop for
           # everything nobody wrote a sentence for, and it is the reason the assembled body never
           # writes a "## What's Changed" of its own.

@@ -173,6 +173,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
     /** Draft publication changes one Pipeline and therefore only that Pipeline's private identities. */
     long publishPipelineInTransaction(ClientSession session, PipelineResource pipeline, String expectedHash,
             Map<String, String> dependencies) {
+        ConfigurationVersion.advanceForPublication(session, versions, client);
         var snapshot = new LinkedHashMap<String, Optional<Document>>();
         var ids = new java.util.LinkedHashSet<>(dependencies.keySet());
         ids.add(pipeline.id());
@@ -183,9 +184,9 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         Document observed = captured.apply(pipeline.id());
         Resource existing = observed == null ? null : decode(observed);
         if (existing != null && !(existing instanceof PipelineResource)
-                || !Objects.equals(expectedHash, existing == null ? null : CanonicalHash.of(existing))) return 0;
+                || !Objects.equals(expectedHash, existing == null ? null : CanonicalHash.of(existing)))
+            throw new Refused(pipeline.id(), ArtifactMutation.VERSION_CONFLICT);
 
-        ConfigurationVersion.advance(session, versions, client);
         for (var expected : dependencies.entrySet()) {
             Document row = captured.apply(expected.getKey());
             if (row == null || !expected.getValue().equals(row.getString("contentHash")))
@@ -197,21 +198,20 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         var after = privateNodes(pipeline, captured);
         ArtifactWrite write = expectedHash == null ? ArtifactWrite.createOnly(pipeline)
                 : ArtifactWrite.replaceOnly(pipeline, expectedHash);
-        write(session, write, observed);
-        return reservePublishedScopes(session, pipeline.id(), before, after);
+        Document operator = write(session, write, observed);
+        return reservePublishedScopes(session, pipeline.id(), before, after, operator);
     }
 
     private long reservePublishedScopes(ClientSession session, String pipeline,
-            Set<PipelineConnectorNodes.Identity> prior, Set<PipelineConnectorNodes.Identity> current) {
-        if (prior.isEmpty() && current.isEmpty()) return MongoPipelineStateMappings.decode(pipeline,
-                mappings.find(session, new Document("_id", pipeline)).first()).stateGeneration();
+            Set<PipelineConnectorNodes.Identity> prior, Set<PipelineConnectorNodes.Identity> current, Document operator) {
+        // Artifact write already validated or created this mapping in this same transaction.
+        long generation = MongoPipelineStateMappings.decode(pipeline, Objects.requireNonNull(operator)).stateGeneration();
+        if (prior.isEmpty() && current.isEmpty()) return generation;
         var cluster = identity.find(session, new Document("_id", "cluster")).first();
         if (cluster == null || !MongoConfigurationDomain.LAYOUT.equals(cluster.get("layoutId"))
                 || !(cluster.get("bindingVersion") instanceof Long binding) || binding < 1
                 || !(cluster.get("clusterId") instanceof String clusterId) || clusterId.isBlank())
             throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
-        var operator = stateMappings.requireActiveRow(session, pipeline);
-        long generation = MongoPipelineStateMappings.decode(pipeline, operator).stateGeneration();
         var global = new RequiredNoteOwner(binding, "pdk.global-state", RequiredNoteOwner.Kind.GLOBAL, clusterId, 0);
         var known = prior.stream().map(node -> RequiredNoteOwner.forNode(binding, node.node(), node.purpose(), generation)).toList();
         var added = current.stream().filter(node -> !prior.contains(node))
@@ -477,8 +477,9 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         write(session, write, find(session, write.resource().id()));
     }
 
-    private void write(ClientSession session, ArtifactWrite write, Document observed) {
+    private Document write(ClientSession session, ArtifactWrite write, Document observed) {
         Resource resource = write.resource();
+        Document pipelineMapping = null;
         if (write.intent() == ArtifactWrite.Intent.CREATE_ONLY && observed != null) {
             throw new Refused(resource.id(), ArtifactMutation.ALREADY_EXISTS);
         }
@@ -492,12 +493,12 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         if (observed != null) {
             requireUnmanaged(observed);
             if ("pipeline".equals(observed.getString("kind"))) {
-                stateMappings.requireActive(session, resource.id());
+                pipelineMapping = stateMappings.requireActiveRow(session, resource.id());
                 if (!"pipeline".equals(resource.kind())) stateMappings.refuseRemoval(session, resource.id());
             }
         }
         if ("pipeline".equals(resource.kind()) && (observed == null || !"pipeline".equals(observed.getString("kind")))) {
-            stateMappings.create(session,resource.id(),() -> bindings.cachePreparationForTransaction(session)
+            pipelineMapping = stateMappings.createRow(session,resource.id(),() -> bindings.cachePreparationForTransaction(session)
                     .orElseThrow(MongoPipelineRetirementFacts::fenced).businessScope());
         }
         MongoSourceIdentitySchema.State sourceState = null;
@@ -515,6 +516,7 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         }
         collection(resource.kind()).replaceOne(session, new Document("_id", resource.id()), encoded,
                 new ReplaceOptions().upsert(true));
+        return pipelineMapping;
     }
 
     private <T> T transaction(java.util.function.Function<ClientSession, T> body,
