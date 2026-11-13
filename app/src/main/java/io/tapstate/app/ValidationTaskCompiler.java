@@ -37,8 +37,8 @@ final class ValidationTaskCompiler {
                         ||!projected.target().equals(confirmed.fields().stream().map(Pair::target).toList()))
                     throw unsupported(draft.mappingId(),"keys","key-confirmation-preflight-required");
             }
-            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model(),metadata.nativeBson(draft.source().sourceId()));
-            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model(),metadata.nativeBson(draft.target().sourceId()));
+            var sourceRules=ValidationKeyMetadata.describe(actual.source().model().model());
+            var targetRules=ValidationKeyMetadata.describe(actual.target().model().model());
             var source=new ArrayList<ValidationKeyBinding.Component>();var target=new ArrayList<ValidationKeyBinding.Component>();
             for(var pair:confirmed.fields()){
                 var from=component(sourceRules,pair.source(),draft.mappingId());var to=component(targetRules,pair.target(),draft.mappingId());
@@ -56,6 +56,57 @@ final class ValidationTaskCompiler {
         var comparison=new ValidationTaskSpec(selected.original().selection().pipelineId(),selected.original().dependencyHashes(),revision,RULES_VERSION,mappings);
         comparison.requireFor(method,ValidationMode.FULL);metadata.require();return new Compiled(comparison,fingerprint(comparison,method,metadata.mappings(),selected.original().parentGeneration()),method);
     }
+    static Compiled compileDeclaration(NativeValidationMetadata.Scope metadata, Map<String,Confirmation> confirmations,
+            ValidationTaskSpec previous, ValidationMethod previousMethod) {
+        var selected = metadata.declarations();
+        var method = metadata.method();
+        var previousMappings = new HashMap<String,ValidationTaskSpec.Mapping>();
+        if (previous != null) previous.mappings().forEach(mapping -> previousMappings.put(mapping.mappingId(), mapping));
+        var mappings = new ArrayList<ValidationTaskSpec.Mapping>();
+        for (var declared : selected.mappings()) {
+            var draft = declared.mapping();
+            if (method == ValidationMethod.COUNT) {
+                mappings.add(draft);
+                continue;
+            }
+            var confirmed = Objects.requireNonNull(confirmations.get(draft.mappingId()));
+            var keys = ValidationTaskSpec.Keys.deferred(confirmed.id().toString(),
+                    confirmed.fields().stream().map(pair -> List.of(pair.source())).toList(),
+                    confirmed.fields().stream().map(pair -> List.of(pair.target())).toList());
+            var old = previousMappings.get(draft.mappingId());
+            var dependencies = selected.original().dependencyHashes();
+            if (method == previousMethod && old != null && old.keys() != null && !old.keys().deferred()
+                    && old.keys().confirmationId().equals(keys.confirmationId())
+                    && old.keys().sourcePaths().equals(keys.sourcePaths()) && old.keys().targetPaths().equals(keys.targetPaths())
+                    && draft.outputId().equals(old.outputId()) && draft.outputKind() == old.outputKind()
+                    && draft.source().equals(unbound(old.source())) && draft.target().equals(unbound(old.target()))
+                    && sameDependency(previous, dependencies, draft.source().sourceId())
+                    && sameDependency(previous, dependencies, draft.target().sourceId())) {
+                mappings.add(old);
+            } else {
+                mappings.add(new ValidationTaskSpec.Mapping(draft.mappingId(), draft.outputKind(), draft.outputId(),
+                        draft.source(), draft.target(), keys));
+            }
+        }
+        long revision = previous == null ? 1 : previous.mappingRevision();
+        if (previous != null && !previous.mappings().equals(mappings)) {
+            if (revision >= Long.MAX_VALUE - 1) throw invalid("mappingRevision");
+            revision++;
+        }
+        var comparison = new ValidationTaskSpec(selected.original().selection().pipelineId(),
+                selected.original().dependencyHashes(), revision, RULES_VERSION, mappings);
+        comparison.requireFor(method, ValidationMode.FULL);
+        return new Compiled(comparison, fingerprint(comparison, method, List.of(), selected.original().parentGeneration()), method);
+    }
+
+    private static boolean sameDependency(ValidationTaskSpec previous, Map<String,String> dependencies, String id) {
+        return Objects.equals(previous.dependencyHashes().get(id), dependencies.get(id));
+    }
+
+    private static ValidationTaskSpec.Table unbound(ValidationTaskSpec.Table table) {
+        return new ValidationTaskSpec.Table(table.nodeId(), table.sourceId(), table.database(), table.schema(), table.table(), null, null);
+    }
+
     private static ValidationTaskSpec.Table bind(ValidationTaskSpec.Table table,NativeValidationMetadata.Side observed){
         var metadata=Objects.requireNonNull(observed.model());if(!table.table().equals(metadata.model().name()))throw invalid("modelTable");
         return new ValidationTaskSpec.Table(table.nodeId(),table.sourceId(),table.database(),table.schema(),table.table(),metadata.binding().modelVersion(),metadata.binding().codecBinding());

@@ -317,6 +317,20 @@ class MongoCapturePreparationsIT {
             assertThat(f.snapshot()).isEqualTo(before);
         });
     }
+
+    @Test void firstCaptureRejectsAnOrphanedSrsModelBeforeCreatingClaimOrChain() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var grant = f.issue(f.request);
+            var original = grant.preparation();
+            SystemCollections.SRS_MODELS.on(f.cache).insertOne(
+                    new Document("_id", new Document("chain", original.chainId()).append("fixture", "orphan")));
+            var before = f.snapshot();
+            assertCode(() -> f.preparations().createFirst(grant), IoError.CAPTURE_STATE_REBUILD_REQUIRED);
+            assertThat(f.captureRows()).isEmpty();
+            assertThat(SystemCollections.SRS_CHAINS.on(f.cache).countDocuments()).isZero();
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
     @ParameterizedTest @ValueSource(strings={"formatVersion","mode","preparationId","unknown"})
     void malformedConfigFactsAreNotDefaultedOrReissued(String field) {
         withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {

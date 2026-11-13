@@ -108,16 +108,37 @@ public final class PdkValidationReads {
         public CompletionStage<Void> cleanupCompleted(){return PdkValidationReads.cleanupCompleted(reader);}
     }
 
+    public enum ModelScope {
+        LEGACY, STRUCTURAL;
+
+        public static ModelScope forSavedVersion(String version) {
+            return version.startsWith(PdkValidationModelVersion.STRUCTURAL_SCOPE_PROFILE + ":") ? STRUCTURAL : LEGACY;
+        }
+
+        private String version(TapTable model, ConnectorRef artifact) {
+            return this == STRUCTURAL ? PdkValidationModelVersion.structuralScopeVersion(model, artifact)
+                    : PdkValidationModelVersion.scopeVersion(model, artifact);
+        }
+    }
+
     private PdkValidationReads(){}
 
     /** Projection is empty for the complete model, or the exact confirmed keys for key-only reads. */
     public static MetadataRead inspect(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
             String table, List<String> projection, Runnable requireCurrent, ExecutorService query,
             ExecutorService decode, ValidationValues.Limits rowLimits) {
+        return inspect(connection, artifact, configurationHash, table, projection, ModelScope.LEGACY,
+                requireCurrent, query, decode, rowLimits);
+    }
+
+    public static MetadataRead inspect(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
+            String table, List<String> projection, ModelScope scope, Runnable requireCurrent, ExecutorService query,
+            ExecutorService decode, ValidationValues.Limits rowLimits) {
         inputs(connection,artifact,configurationHash);
+        Objects.requireNonNull(scope, "model scope");
         var result=new AtomicReference<Metadata>();
         var reader=deferred(table,query,decode,submit->PdkValidationSession.inspect(connection.connectorId(),artifact,connection.settings(),table,projection,model->{
-            String version=PdkValidationModelVersion.scopeVersion(model,artifact);
+            String version=scope.version(model,artifact);
             var structural=PdkSchemaDiscoverer.structuralModel(List.of(model)).tables().getFirst();
             if(!table.equals(structural.name()))throw invalid("metadata.tableScope");
             var described=new Metadata(structural,new Binding(version,
@@ -142,11 +163,19 @@ public final class PdkValidationReads {
             String table, Binding expected, List<ValidationKeyBinding.Component> keys, boolean fullColumns,
             Runnable requireCurrent, ExecutorService query, ExecutorService decode, int capacity,
             ValidationValues.Limits rowLimits,int nativeFieldLimit) {
+        return scan(connection, artifact, configurationHash, table, expected, keys, fullColumns,
+                requireCurrent, query, decode, capacity, rowLimits, nativeFieldLimit, true);
+    }
+
+    private static ValidationReadHandle scan(ConnectionConfig connection, ConnectorRef artifact, String configurationHash,
+            String table, Binding expected, List<ValidationKeyBinding.Component> keys, boolean fullColumns,
+            Runnable requireCurrent, ExecutorService query, ExecutorService decode, int capacity,
+            ValidationValues.Limits rowLimits, int nativeFieldLimit, boolean requireTextModel) {
         if(nativeFieldLimit<1||nativeFieldLimit>POSTGRES_NATIVE_FIELDS)throw new IllegalArgumentException("invalid native field bound");
         inputs(connection,artifact,configurationHash); var confirmed=List.copyOf(keys); var fields=fields(confirmed);
         return deferred(table,query,decode,submit->PdkValidationSession.scan(connection.connectorId(),artifact,connection.settings(),expected.codecBinding(),
                 new PdkValidationSession.Scan(table,fields,fullColumns?List.of():fields,Math.min(capacity,64)),
-                (model,codecs)->decoder(model,codecs,artifact,configurationHash,expected,confirmed,rowLimits),
+                (model,codecs)->decoder(model,codecs,artifact,configurationHash,expected,confirmed,rowLimits,requireTextModel),
                 requireCurrent,submit,decode,capacity,rowLimits,nativeFieldLimit));
     }
 
@@ -165,8 +194,9 @@ public final class PdkValidationReads {
         if(confirmed.size()!=logicalKey.parts().size())throw invalid("lookupKeyArity");
         for(int index=0;index<confirmed.size();index++)
             if(confirmed.get(index).domain()!=logicalKey.parts().get(index).kind())throw invalid("lookupKeyDomain");
+        // The confirmed logical key is checked after the connector's conversion.
         var reader=scan(connection,artifact,configurationHash,table,expected,confirmed,fullColumns,
-                requireCurrent,query,decode,capacity,rowLimits);
+                requireCurrent,query,decode,capacity,rowLimits,POSTGRES_NATIVE_FIELDS,false);
         return new ManagedRead(){
             private final ValidationFailureLatch failure=new ValidationFailureLatch();
             private final AtomicReference<Row> failedRelease=new AtomicReference<>();
@@ -223,19 +253,27 @@ public final class PdkValidationReads {
 
     private static PdkValidationCursor.Decoder decoder(TapTable model, PdkValidationCodecs codecs,
             ConnectorRef artifact, String configurationHash, Binding expected,
-            List<ValidationKeyBinding.Component> keys, ValidationValues.Limits rowLimits) {
+            List<ValidationKeyBinding.Component> keys, ValidationValues.Limits rowLimits, boolean requireTextModel) {
         requireModel(model,artifact,configurationHash,expected,"beforeQuery");
+        var portableTextFields=new java.util.HashSet<String>();
         for(var component:keys){
             String field=component.path().getFirst();var actual=model.getNameFieldMap().get(field);
             if(actual==null||actual.getTapType()==null||actual.getTapType().getClass()==TapRaw.class)
                 throw unsupported(field,"key-model-unknown");
+            if(component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("text"))){
+                if(requireTextModel && !(actual.getTapType() instanceof io.tapdata.entity.schema.type.TapString))
+                    throw unsupported(field,"key-model-unknown");
+                portableTextFields.add(field);
+                continue;
+            }
             boolean nativeId=artifact.className().equals("io.tapdata.mongodb.MongodbConnector")&&actual.getDataType()!=null
                     &&actual.getDataType().replace("_","").equalsIgnoreCase("OBJECTID");
             boolean idDomain=component.domain()==ValidationKey.Kind.TEXT&&component.logicalTypes().equals(Set.of("object-id"));
             if(nativeId!=idDomain)
                 throw unsupported(field,"native-object-id-key-domain");
         }
-        var decoder=new PdkValidationRows(model,codecs,path->PdkValidationRows.Rule.AUTO,rowLimits,
+        var decoder=new PdkValidationRows(model,codecs,path->path.size()==1&&portableTextFields.contains(path.getFirst())
+                ?PdkValidationRows.Rule.PORTABLE_TEXT:PdkValidationRows.Rule.AUTO,rowLimits,
                 artifact.className().equals("io.tapdata.mongodb.MongodbConnector"));
         String currentModel=PdkValidationModelVersion.of(model,artifact);
         return raw->{
@@ -253,7 +291,7 @@ public final class PdkValidationReads {
     }
 
     private static void requireModel(TapTable model, ConnectorRef artifact, String configurationHash, Binding expected,String phase){
-        String actual=PdkValidationModelVersion.scopeVersion(model,artifact);
+        String actual=ModelScope.forSavedVersion(expected.modelVersion()).version(model,artifact);
         if(!actual.equals(expected.modelVersion()))throw invalid("modelChanged."+phase+"."+model.getId());
         if(!PdkValidationModelVersion.codecBinding(artifact,configurationHash,actual)
                 .equals(expected.codecBinding()))throw invalid("codecChanged."+phase+"."+model.getId());

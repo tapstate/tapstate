@@ -35,5 +35,5 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { failure_code: transform.expression-failed }
+  - await: { failure_code: transform.expression-failed }
   - assert: { count: { views.order_state: 0 } }

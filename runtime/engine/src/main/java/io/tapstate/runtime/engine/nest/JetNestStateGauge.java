@@ -35,6 +35,31 @@ final class JetNestStateGauge implements NestStateGauge {
     }
 
     @Override
+    public void rootsReading(String namespace, long rootsRendered, long countingSinceMillis) {
+        metric(NestStateMetricNames.ROOTS_RENDERED, namespace).set(rootsRendered);
+        metric(NestStateMetricNames.ROOTS_RENDERED_SINCE, namespace).set(countingSinceMillis);
+    }
+
+    @Override
+    public void commitReading(String namespace, NestStateStats.Commits commits, long evictions) {
+        metric(NestStateMetricNames.COMMIT_GROUPS, namespace).set(commits.groups());
+        metric(NestStateMetricNames.COMMIT_KEYS_SUM, namespace).set(commits.keySum());
+        metric(NestStateMetricNames.COMMIT_ROUND_TRIPS_SUM, namespace).set(commits.roundTripSum());
+        metric(NestStateMetricNames.COMMIT_NANOS_SUM, namespace).set(commits.durationNanos());
+        metric(NestStateMetricNames.COMMIT_SINCE, namespace).set(commits.countingSinceMillis());
+        metric(NestStateMetricNames.EVICTIONS, namespace).set(evictions);
+        buckets(NestStateMetricNames.COMMIT_KEYS_BUCKET, namespace, commits.keyBuckets());
+        buckets(NestStateMetricNames.COMMIT_ROUND_TRIPS_BUCKET, namespace, commits.roundTripBuckets());
+        buckets(NestStateMetricNames.COMMIT_NANOS_BUCKET, namespace, commits.durationBuckets());
+    }
+
+    private void buckets(String kind, String namespace, long[] counts) {
+        for (int i = 0; i < counts.length; i++) {
+            metric(kind + i, namespace).set(counts[i]);
+        }
+    }
+
+    @Override
     public void keyReading(String namespace, long keyAccesses, long coldKeys) {
         metric(NestStateMetricNames.KEY_ACCESSES, namespace).set(keyAccesses);
         metric(NestStateMetricNames.COLD_KEYS, namespace).set(coldKeys);
@@ -42,5 +67,16 @@ final class JetNestStateGauge implements NestStateGauge {
 
     private Metric metric(String kind, String namespace) {
         return byName.computeIfAbsent(NestStateMetricNames.nameOf(kind, namespace), Metrics::metric);
+    }
+
+    @Override public void keyAccess(String namespace, io.tapstate.core.lifecycle.NestKeyAccess reading) {
+        keyPublisher(namespace).accept(reading);
+    }
+
+    @Override public java.util.function.Consumer<io.tapstate.core.lifecycle.NestKeyAccess> keyPublisher(String namespace) {
+        Metric reads = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.READ_KEYS, namespace));
+        Metric writes = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.WRITE_KEYS, namespace));
+        Metric cold = Metrics.threadSafeMetric(NestStateMetricNames.nameOf(NestStateMetricNames.COLD_KEYS, namespace));
+        return reading -> { reads.set(reading.reads()); writes.set(reading.writes()); cold.set(reading.coldLoads()); };
     }
 }

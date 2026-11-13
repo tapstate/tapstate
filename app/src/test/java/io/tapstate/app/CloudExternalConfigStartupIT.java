@@ -69,6 +69,8 @@ class CloudExternalConfigStartupIT {
             "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern HTTP_PORT = Pattern.compile("Tomcat started on port (\\d+)");
+    private static final Pattern BUNDLED_REGISTRATION = Pattern.compile(
+            "SeedSweepRunner\\s*: Seed(?:ed)? connector '([^']+)' \\(([0-9a-f]{64})\\)");
     private static final HttpClient HTTP = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(1)).build();
 
@@ -192,6 +194,7 @@ class CloudExternalConfigStartupIT {
         first.awaitReady();
         assertVersion(first);
         awaitStatusReport(0, first);
+        var registered = assertBundledConnectors(first);
         Document storedWitness;
         String keyring;
         SourceResource witness = new SourceResource("restart_witness",
@@ -203,7 +206,7 @@ class CloudExternalConfigStartupIT {
             assertThat(selectedDb.listCollectionNames().into(new ArrayList<>()))
                     .contains(SystemCollections.SOURCES.collectionName());
             assertDefaultSource(selectedDb, StorageBinding.Mode.CLOUD);
-            assertConnectors(raw.getDatabase(storage.cacheDatabase()), CONNECTORS);
+            assertNoBundledConnectorCopies(raw.getDatabase(storage.cacheDatabase()));
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
             try (var connection = metadataConnection(selected)) {
                 assertThat(connection.artifacts().create(witness)).isEqualTo(ArtifactMutation.CREATED);
@@ -219,6 +222,7 @@ class CloudExternalConfigStartupIT {
         Running restarted = start(carrier, values, MONGO.getReplicaSetUrl(ignored), seed);
         restarted.awaitReady();
         assertVersion(restarted);
+        assertThat(assertBundledConnectors(restarted)).isEqualTo(registered);
         try (var raw = MongoClients.create(MONGO.getReplicaSetUrl())) {
             assertThat(raw.getDatabase(selected).getCollection(SystemCollections.SOURCES.collectionName())
                     .find(new Document("_id", witness.id())).first()).isEqualTo(storedWitness);
@@ -230,7 +234,7 @@ class CloudExternalConfigStartupIT {
                             StorageBinding.defaultSourceId(StorageBinding.Mode.CLOUD), witness.id());
             assertThat(keyringFingerprint(raw.getDatabase(selected))).isEqualTo(keyring);
             assertThat(raw.getDatabase(ignored).listCollectionNames().into(new ArrayList<>())).isEmpty();
-            assertConnectors(raw.getDatabase(storage.cacheDatabase()), CONNECTORS);
+            assertNoBundledConnectorCopies(raw.getDatabase(storage.cacheDatabase()));
         }
         try (var connection = metadataConnection(selected)) {
             assertThat(connection.artifacts().get(witness.id()))
@@ -312,8 +316,13 @@ class CloudExternalConfigStartupIT {
                 try (var raw = MongoClients.create(MONGO.getReplicaSetUrl(database))) {
                     assertThat(raw.getDatabase(database).listCollectionNames().into(new ArrayList<>()))
                             .contains(SystemCollections.SOURCES.collectionName());
-                    assertConnectors(raw.getDatabase(storage.cacheDatabase()),
-                            distribution == Distribution.CLOUD ? CONNECTORS : Set.of());
+                    var cache = raw.getDatabase(storage.cacheDatabase());
+                    if (distribution == Distribution.CLOUD) {
+                        assertBundledConnectors(running);
+                        assertNoBundledConnectorCopies(cache);
+                    } else {
+                        assertConnectors(cache, Set.of());
+                    }
                     assertDefaultSource(raw.getDatabase(database), distribution == Distribution.CLOUD
                             ? StorageBinding.Mode.CLOUD : StorageBinding.Mode.OP);
                 }
@@ -565,7 +574,8 @@ class CloudExternalConfigStartupIT {
     }
 
     private void awaitStatusReport(int previousCount, Running running) throws IOException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+        // If storage is briefly unavailable on Ready, the next real heartbeat runs after 30 seconds.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(45);
         while (statusReports.size() <= previousCount && running.process().isAlive() && System.nanoTime() < deadline) {
             LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
         }
@@ -616,6 +626,19 @@ class CloudExternalConfigStartupIT {
         String token = JSON.readTree(response.body()).path("token").asText();
         assertThat(token).isNotBlank();
         running.awaitBusiness(token);
+    }
+
+    private static Map<String, String> assertBundledConnectors(Running running) throws IOException {
+        // The seed runner emits these outcomes only after checking each exact registration in the runtime registry.
+        var registrations = BUNDLED_REGISTRATION.matcher(running.safeOutput()).results().collect(
+                java.util.stream.Collectors.toMap(match -> match.group(1), match -> match.group(2)));
+        assertThat(registrations.keySet()).containsExactlyInAnyOrderElementsOf(CONNECTORS);
+        return registrations;
+    }
+
+    private static void assertNoBundledConnectorCopies(com.mongodb.client.MongoDatabase database) {
+        assertConnectors(database, Set.of());
+        assertThat(SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(database).countDocuments()).isZero();
     }
 
     private static void assertConnectors(com.mongodb.client.MongoDatabase database, Set<String> expected) {

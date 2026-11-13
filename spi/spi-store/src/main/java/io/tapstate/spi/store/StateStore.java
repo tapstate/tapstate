@@ -55,6 +55,12 @@ public interface StateStore {
         throw new UnsupportedOperationException("atomic workload-fenced checkpoint transitions are not implemented");
     }
 
+    /** Records one bounded recovery attempt under the original live checkpoint fence. */
+    default CasOutcome recordLeaseRecovery(String pipelineId, CheckpointDoc expected,
+            CheckpointDoc.LeaseRecovery recovery, Instant at) {
+        throw new UnsupportedOperationException("lease recovery requires a scoped state store");
+    }
+
     /**
      * Removes a pipeline's checkpoint, discarding its fencing epoch along with it. That discard is the
      * point rather than a side effect: an id whose pipeline is gone must not hand a later pipeline of the

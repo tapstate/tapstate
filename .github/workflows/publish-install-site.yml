@@ -34,10 +34,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: publish-install-site
-  cancel-in-progress: false
-
 env:
   SITE_DOMAIN: install.tapstate.dev
   # Pinned: @latest lets a third party change what runs against the publishing credentials on any
@@ -46,6 +42,10 @@ env:
 
 jobs:
   publish:
+    if: github.event_name != 'release' || !startsWith(github.event.release.tag_name, 'toolchain-')
+    concurrency:
+      group: publish-install-site
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

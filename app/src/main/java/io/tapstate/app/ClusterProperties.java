@@ -17,11 +17,13 @@ class ClusterProperties {
     private String id;
     private String nodeId;
     private Profile profile = Profile.SINGLE;
+    private boolean profileConfigured;
     private int bootstrapMinMembers = 3;
     private Duration nodeSessionTtl = Duration.ofSeconds(30);
     private Duration nodeSessionRenewInterval = Duration.ofSeconds(10);
     private Duration workloadClaimTtl = Duration.ofSeconds(30);
     private Duration workloadClaimRenewInterval = Duration.ofSeconds(10);
+    private boolean workloadClaimTimingConfigured;
     private Duration membershipReconcileInterval = Duration.ofSeconds(1);
 
     String getId() {
@@ -46,7 +48,10 @@ class ClusterProperties {
 
     void setProfile(Profile profile) {
         this.profile = profile;
+        profileConfigured = true;
     }
+
+    boolean explicitSingle() { return profileConfigured && profile == Profile.SINGLE; }
 
     int getBootstrapMinMembers() {
         return bootstrapMinMembers;
@@ -78,6 +83,7 @@ class ClusterProperties {
 
     void setWorkloadClaimTtl(Duration workloadClaimTtl) {
         this.workloadClaimTtl = workloadClaimTtl;
+        workloadClaimTimingConfigured = true;
     }
 
     Duration getWorkloadClaimRenewInterval() {
@@ -86,6 +92,15 @@ class ClusterProperties {
 
     void setWorkloadClaimRenewInterval(Duration workloadClaimRenewInterval) {
         this.workloadClaimRenewInterval = workloadClaimRenewInterval;
+        workloadClaimTimingConfigured = true;
+    }
+
+    Duration pipelineClaimTtl(boolean cloud) {
+        return cloud && !workloadClaimTimingConfigured ? Duration.ofSeconds(60) : workloadClaimTtl;
+    }
+
+    Duration pipelineClaimRenewInterval(boolean cloud) {
+        return cloud && !workloadClaimTimingConfigured ? Duration.ofSeconds(15) : workloadClaimRenewInterval;
     }
 
     Duration getMembershipReconcileInterval() {

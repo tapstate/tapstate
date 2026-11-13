@@ -65,7 +65,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline);
+        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline, true);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
@@ -166,9 +166,32 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         expanded.sourceIds().forEach(id -> sources.put(id, StoredArtifacts.requireSource(snapshot, id)));
         var models = SourceModelSnapshot.capture(scope.pipelineId(), sources.values(), port.schemas());
         var inputs = models.preparationInputs(scope, authored, expanded, sources);
+        preparePipeline(scope, inputs);
+    }
+
+    private void preparePipeline(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        original.requireBusiness();
         context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
+        return modelCommand(pipeline, ownership, false);
+    }
+
+    private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership,
+            boolean publication) {
+        if (publication) {
+            memberStorage.requireNode();
+            var captured = port.draftAuthoringScope(pipeline);
+            if (captured.isPresent()) {
+                var scope = captured.orElseThrow();
+                var models = configuration.publicationAuthoringModels(scope);
+                var node = context.getBean(NodeSessionLease.class).currentFence().orElseThrow(ThreeLayerStorePort::refused);
+                var command = ownership.unpreparedControl(scope);
+                Runnable guard = () -> { memberStorage.requireNode(); command.requireActive(); };
+                try { return new StoreBackedDerivedSchemas.Command(port.forUnpreparedControl(models, node, guard), command::close); }
+                catch (RuntimeException | Error failed) { command.close(); throw failed; }
+            }
+        }
         var live = new LivePipelines(port.desired(), port.state());
         Runnable resting = () -> {
             memberStorage.requireNode();
@@ -293,10 +316,17 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     static class Wiring {
         @Bean StoreBackedDerivedSchemas nativeDerivedSchemas(NativeBusinessContext owner, AuditGate audit,
                 PipelineActuationOwnership ownership) {
-            return new StoreBackedDerivedSchemas(owner.port, audit, pipeline -> owner.modelCommand(pipeline, ownership));
+            return new StoreBackedDerivedSchemas(owner.port, audit, new StoreBackedDerivedSchemas.Commands() {
+                @Override public StoreBackedDerivedSchemas.Command bind(String pipeline) {
+                    return owner.modelCommand(pipeline, ownership);
+                }
+                @Override public StoreBackedDerivedSchemas.Command bindPublication(String pipeline) {
+                    return owner.modelCommand(pipeline, ownership, true);
+                }
+            });
         }
         @Bean SrsStores nativeSrsStores(NativeBusinessContext owner) {
-            return owner.original.cache().srs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
+            return owner.original.cache().runtimeSrs(owner.original.preparation().businessScope(), owner.original::requireBusiness);
         }
         @Bean SrsLogStore srsLogStore(SrsStores stores) { return stores.log(); }
         @Bean WorkloadClaimStore workloadClaimStore(NativeBusinessContext owner) {
@@ -353,8 +383,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new io.tapstate.control.core.ValidationReportService(owner.configuration.validationReports(owner.memberStorage::requireNode),budget);
         }
         @Bean(destroyMethod="close") @Lazy NativeValidationStartCoordinator nativeValidationStartCoordinator(NativeBusinessContext owner,HazelcastInstance member,
-                ValidationOwnerRouter router,ValidationMemberResources.Member resources,ValidationMemberResources process,Clock clock){
-            return new NativeValidationStartCoordinator(member,owner.configuration,router,resources,process,owner.memberStorage::requireNode,Duration.ofSeconds(12),clock);
+                ValidationOwnerRouter router,ValidationMemberResources.Member resources,ValidationMemberResources process,Clock clock,
+                NativeValidationOwnerReservations owners){
+            return new NativeValidationStartCoordinator(member,owner.configuration,router,resources,process,
+                    owner.memberStorage::requireNode,Duration.ofSeconds(12),clock,owners::observeOwner);
         }
         @Bean(destroyMethod="close") @Lazy NativeValidationScheduler nativeValidationScheduler(NativeBusinessContext owner,
                 ValidationMemberResources.Member resources,ValidationMemberResources process,org.springframework.beans.factory.ObjectProvider<NativeValidationStartCoordinator> coordinators,
@@ -412,14 +444,22 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return new ValidationPipelineInitials(member, owner.original.preparation().businessScope(), owner.memberStorage::requireNode, authorization);
         }
         @Bean PipelineActuationOwnership pipelineActuationOwnership(HazelcastInstance member,
-                NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
+                NativeBusinessContext owner, ClusterProperties cluster, ClusterMembershipGate membership, ClusterWorkloadClaims claims,
+                CloudRuntimeSettings cloud) {
             Object held = member.getUserContext().get(HazelcastConfiguration.NODE_SESSION_CONTEXT_KEY);
             if (!(held instanceof WorkloadClaim node)) throw ThreeLayerStorePort.refused();
+            if (cluster.explicitSingle()) {
+                return PipelineActuationOwnership.nodeBacked(owner.original.preparation().businessScope(),
+                        WorkloadClaimFence.from(node), membership, claims, cluster.pipelineClaimTtl(cloud.cloud()),
+                        cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
+            }
             return PipelineActuationOwnership.scoped(owner.original.preparation().businessScope(), node.owner(), membership, claims,
-                    cluster.getWorkloadClaimTtl(), cluster.getWorkloadClaimRenewInterval(), System::nanoTime);
+                    cluster.pipelineClaimTtl(cloud.cloud()), cluster.pipelineClaimRenewInterval(cloud.cloud()), System::nanoTime);
         }
-        @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster) {
-            return new ActuationClaimRenewer(ownership, cluster.getWorkloadClaimRenewInterval());
+        @Bean(destroyMethod = "close") ActuationClaimRenewer actuationClaimRenewer(PipelineActuationOwnership ownership, ClusterProperties cluster,
+                CloudRuntimeSettings cloud) {
+            return cluster.explicitSingle() ? ActuationClaimRenewer.inactive()
+                    : new ActuationClaimRenewer(ownership, cluster.pipelineClaimRenewInterval(cloud.cloud()));
         }
         @Bean CaptureOwnership captureOwnership(HazelcastInstance member, ClusterProperties cluster,
                 ClusterMembershipGate membership, ClusterWorkloadClaims claims) {
@@ -431,7 +471,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 ClusterProperties cluster, Clock clock) {
             var scope = owner.original.preparation().businessScope();
             return new PipelineFirstStatePreparer(scope, owner.configuration.preparations(),
-                    owner.original.cache().pipelinePreparations(scope, owner.memberStorage::requireNode), node::currentFence,
+                    owner.original.cache().admittedPipelinePreparations(scope, owner.memberStorage::requireNode), node::currentFence,
                     owner.memberStorage::requireNode, clock, cluster.getWorkloadClaimTtl());
         }
         @Bean(destroyMethod = "close") ValidationCaptureObservations validationCaptureObservations(
@@ -649,6 +689,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             var operators = new HazelcastOperatorReadiness(member, Duration.ofSeconds(60));
             var scope = owner.original.preparation().businessScope();
             var changes = owner.configuration.rebuilds();
+            if (!(captures instanceof ScopedPipelineCaptureCoordinator scopedCaptures)) throw ThreeLayerStorePort.refused();
             var rebuilds = new PipelineRebuildCoordinator(new PipelineRebuildCoordinator.Stores(owner.port.artifacts(), owner.port.schemas(),
                     owner.original.cache(), owner.context.getBean(SrsStores.class).consumers(), changes,
                     owner.original.cache().pipelineRebuilds(scope, owner.memberStorage::requireNode)),
@@ -660,7 +701,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                         if (job.isPresent() && (job.orElseThrow().isCarryingAJob()
                                 || manifest.isEmpty() || !job.orElseThrow().operatorManifest().equals(manifest.orElseThrow()))) throw ThreeLayerStorePort.refused();
                         if (manifest.isPresent() && manifest.orElseThrow().executionIdentity() instanceof ExecutionFence original
-                                && captures.forRun(request.originalScope(), request.originalClaim(), original).isCapturing(request.originalScope().pipelineId())) throw ThreeLayerStorePort.refused();
+                                && scopedCaptures.hasCaptureForRetirement(request.originalScope(), request.originalClaim(), original)) throw ThreeLayerStorePort.refused();
                     }, cluster.getWorkloadClaimTtl(), clock);
             var ports = new ScopedEngineLifecycleActuator.Ports(operators::prepare, operators::releaseHot,
                     rebuilds::rebuild, (original, command) -> plans.forRun(original, () -> {
@@ -669,7 +710,17 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return ConvergenceDriver.scoped(converger, observations, samples, export,
                     () -> owner.active.get() && node.active() && (cluster.getProfile() == ClusterProperties.Profile.SINGLE || membership.businessEligible()),
                     ownership, new ConvergenceDriver.ScopedPorts(owner.configuration.intents(), owner.original.cache(),
-                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain, alerts));
+                            owner.memberStorage::requireNode, pass -> actuator.forPass(pass, ports), pass -> admission, admission::retain,
+                            alerts, owner.context.getBean(PipelineFirstStatePreparer.class)::prepareDeferred,
+                            pipelineId -> owner.configuration.intents().load(pipelineId)
+                                    .filter(intent -> !intent.deleted() && PipelineRebuildCoordinator.clearsPrivateCapture(intent.desired()))
+                                    .ifPresent(intent -> {
+                                        // The rebuild store verifies the frozen claim and checkpoint.
+                                        // Taking a fresh actuation claim here could invalidate them after restart.
+                                        try (var ignored = ownership.enterPass(intent.scope())) {
+                                            rebuilds.resume(intent.scope(), engine.captureRun(pipelineId).map(Engine.Run::operatorManifest));
+                                        }
+                                    })));
         }
         @Bean PipelineStatusDiagnostics nativePipelineStatusDiagnostics(NativeBusinessContext owner, Engine engine,
                 PipelineActuationOwnership ownership) {

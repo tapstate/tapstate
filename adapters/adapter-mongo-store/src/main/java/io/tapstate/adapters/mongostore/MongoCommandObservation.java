@@ -10,8 +10,9 @@ final class MongoCommandObservation {
     static final ThreadLocal<java.util.function.LongConsumer> BYTES=new ThreadLocal<>();
     private static void size(org.bson.BsonDocument value){var observer=BYTES.get();if(observer!=null)observer.accept(new org.bson.RawBsonDocument(value,new org.bson.codecs.BsonDocumentCodec()).getByteBuffer().remaining());}
     static final CommandListener LISTENER=new CommandListener(){
-        @Override public void commandStarted(CommandStartedEvent event){var observer=CURRENT.get();if(observer!=null)observer.accept(event.getCommandName());size(event.getCommand());var collections=COLLECTIONS.get();if(collections!=null){var target=event.getCommand().get(event.getCommandName());collections.accept(event.getCommandName(),target!=null&&target.isString()?target.asString().getValue():"");}}
-        @Override public void commandSucceeded(CommandSucceededEvent event){size(event.getResponse());}
+        @Override public void commandStarted(CommandStartedEvent event){MongoHttpDiagnosticsScope.started(event);var observer=CURRENT.get();if(observer!=null)observer.accept(event.getCommandName());size(event.getCommand());var collections=COLLECTIONS.get();if(collections!=null){var target=event.getCommand().get(event.getCommandName());collections.accept(event.getCommandName(),target!=null&&target.isString()?target.asString().getValue():"");}}
+        @Override public void commandSucceeded(CommandSucceededEvent event){MongoHttpDiagnosticsScope.finished(event.getRequestId(),event.getElapsedTime(java.util.concurrent.TimeUnit.NANOSECONDS),false);size(event.getResponse());}
+        @Override public void commandFailed(CommandFailedEvent event){MongoHttpDiagnosticsScope.finished(event.getRequestId(),event.getElapsedTime(java.util.concurrent.TimeUnit.NANOSECONDS),true);}
     };
     private MongoCommandObservation() { }
 }

@@ -19,6 +19,7 @@ import io.tapstate.spi.store.FirstPipelineCreationResult;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelinePreparation;
+import io.tapstate.spi.store.PipelinePreparationInputs;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.StorageSetupScope;
 import io.tapstate.spi.store.WorkloadClaimFence;
@@ -147,6 +148,86 @@ class PipelineFirstStatePreparerIT {
             assertThat(f.preparer(f.configuration, f.cache).prepare(f.scope)).isEqualTo(complete);
             assertCode(() -> f.cache.workloadClaims(f.business()).acquirePipeline(f.scope, OWNER, 1, TTL), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.snapshot()).isEqualTo(missing);
+        });
+    }
+
+    @Test void aDeferredStartResumesAfterIssuanceWithoutAnInMemoryGrant() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            assertThat(intents.loadForActuation("flow")).isEmpty();
+            var abandoned = ((FirstPipelineCreationResult.Issued) f.configuration.preparations().issueDeferred(pending, f.node)).creation().preparation();
+            assertThat(f.claim()).isNull();
+            assertThat(f.state()).isNull();
+
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a")) {
+                var other = new WorkloadOwner("node-b", "boot-b");
+                var lease = f.cache.workloadClaims(f.business()).acquire(
+                        new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, other.nodeId()), other, 1, TTL).claim();
+                var preparer = new PipelineFirstStatePreparer(f.business(), reopened.preparations(),
+                        f.cache.admittedPipelinePreparations(f.business(), ACTIVE),
+                        () -> Optional.of(WorkloadClaimFence.from(lease)), ACTIVE, CLOCK, TTL);
+                var recovered = reopened.intents().pendingStart("flow").orElseThrow();
+                preparer.prepareDeferred(recovered);
+                assertThat(reopened.preparations().read("flow").orElseThrow().preparationId()).isEqualTo(abandoned.preparationId());
+                assertThat(reopened.intents().loadForActuation("flow")).contains(recovered.intent());
+                assertThat(f.state()).isNotNull();
+            }
+        });
+    }
+
+    @Test void aSupersededDeferredIntentCannotIssueOrReportAgainstItsReplacement() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            assertThat(intents.compareAndSet(f.scope, pending.intent().intentRevision(),
+                    new DesiredState("flow", PipelineState.STOPPED, inputs.pipelineHash()))).isTrue();
+            assertCode(() -> f.configuration.preparations().issueDeferred(pending, f.node), IoError.PIPELINE_INTENT_FENCED);
+            intents.failStart(pending, IoError.DOCUMENT_UNREADABLE);
+            assertThat(intents.pendingStart("flow")).isEmpty();
+            assertThat(intents.loadForActuation("flow")).isEmpty();
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure()).isEmpty();
+            assertThat(f.claim()).isNull();
+        });
+    }
+
+    @Test void aCancelledDeferredStartCannotSeedItsAlreadyReservedCheckpoint() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            var config = f.configuration.preparations();
+            var cache = f.cache.admittedPipelinePreparations(f.business(), ACTIVE);
+            var issued = (FirstPipelineCreationResult.Issued) config.issueDeferred(pending, f.node);
+            var reservation = cache.reserveFirst(issued.creation(), TTL);
+            assertThat(intents.compareAndSet(f.scope, pending.intent().intentRevision(),
+                    new DesiredState("flow", PipelineState.STOPPED, inputs.pipelineHash()))).isTrue();
+            assertCode(() -> cache.seedDeferred(reservation, config, pending, CLOCK.instant()), IoError.PIPELINE_INTENT_FENCED);
+            assertThat(f.state()).isNull();
+            assertThat(intents.loadForActuation("flow")).isEmpty();
+        });
+    }
+
+    @Test void aFailedDeferredStartIsVisibleAndCannotBeActuated() {
+        withFixture(f -> {
+            var intents = f.configuration.intents();
+            var original = intents.load("flow").orElseThrow();
+            var inputs = new PipelinePreparationInputs(original.desired().revision(), Map.of(), Map.of(), List.of());
+            assertThat(intents.compareAndSetStart(f.scope, original.intentRevision(), original.desired(), inputs)).isTrue();
+            var pending = intents.pendingStart("flow").orElseThrow();
+            intents.failStart(pending, IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.configuration.pipelineDisplayHeaders(List.of("flow"), true).get("flow").startFailure())
+                    .contains(IoError.DOCUMENT_UNREADABLE);
+            assertThat(intents.pendingStart("flow")).isEmpty();
+            assertThat(intents.loadForActuation("flow")).isEmpty();
         });
     }
 

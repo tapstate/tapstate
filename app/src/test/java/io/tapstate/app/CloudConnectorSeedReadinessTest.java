@@ -27,7 +27,6 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.io.PrintWriter;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
@@ -68,7 +67,6 @@ class CloudConnectorSeedReadinessTest {
     private final List<String> loaded = new ArrayList<>();
     private RuntimeException loadFailure;
     private byte[] specOverride;
-    private String eraseAfterLoad;
     private CloudConnectorSeedReadiness.DirectoryEntries directoryEntries = Files::list;
     private Set<String> functions = Set.of("batch_read_function", "stream_read_function");
     private Set<String> selection = Set.copyOf(IDS);
@@ -76,21 +74,19 @@ class CloudConnectorSeedReadinessTest {
     @Test
     void localStorageAcceptanceReadsAndLoadsOnlyItsLockedMongoArtifact() throws Exception {
         selection = CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), true, true);
-        String atlasHash = (String) entry("mongodb-atlas").get("sha256");
-        stores.artifacts.keySet().retainAll(Set.of(atlasHash));
+        stores.registrations.keySet().retainAll(Set.of("mongodb-atlas"));
         var gate = gate();
         assertThat(gate.selectedFileNames()).containsExactly("mongodb-atlas-connector.jar");
         gate.verifyRegistrations(outcomes.stream().filter(outcome ->
                 outcome.artifact().getFileName().toString().equals("mongodb-atlas-connector.jar")).toList());
         assertThat(loaded).containsExactly("mongodb-atlas");
-        assertThat(stores.streamHashes).containsOnly(atlasHash);
     }
 
     @Test
-    void localStorageAcceptanceStillRejectsMissingSelectedRemoteBytes() throws Exception {
+    void localStorageAcceptanceStillRejectsMissingSelectedRegistration() throws Exception {
         selection = CloudConnectorSeedReadiness.localSelection(lockBytes(), selectionReceipt("mongodb-atlas"), true, true);
         var gate = gate();
-        stores.artifacts.remove(entry("mongodb-atlas").get("sha256"));
+        stores.registrations.remove("mongodb-atlas");
         refused(() -> gate.verifyRegistrations(outcomes.stream().filter(outcome ->
                 outcome.artifact().getFileName().toString().equals("mongodb-atlas-connector.jar")).toList()), "registered-artifact-unavailable");
     }
@@ -129,13 +125,6 @@ class CloudConnectorSeedReadinessTest {
                 .run(new org.springframework.boot.DefaultApplicationArguments()), "registration-incomplete");
     }
 
-    @Test
-    void verifiesStoredReleaseBytesThroughTheStreamingPort() throws Exception {
-        stores.streamOnly = true;
-        gate().verifyRegistrations(outcomes);
-        assertThat(stores.streamReads).isGreaterThanOrEqualTo(IDS.size());
-    }
-
     @BeforeEach
     void prepareIndependentRelease() throws Exception {
         seeds = Files.createDirectories(directory.resolve("connectors"));
@@ -150,8 +139,10 @@ class CloudConnectorSeedReadinessTest {
             entries.add(entry);
             writeJar(id, id, VERSION, id.equals("sqlserver") ? "mssql-connector" : id + "-connector");
             byte[] bytes = Files.readAllBytes(seeds.resolve(id + "-connector.jar"));
-            RegistrationOutcome registered = stores.register(id, VERSION, RegistrationSource.SEED, bytes);
-            outcomes.add(new SeedOutcome.Seeded(seeds.resolve(id + "-connector.jar"), registered));
+            var registration = new ConnectorRegistration(id, ContentHash.of(bytes), VERSION, RegistrationSource.SEED);
+            stores.registrations.put(id, registration);
+            outcomes.add(new SeedOutcome.Seeded(seeds.resolve(id + "-connector.jar"),
+                    new RegistrationOutcome(registration, true)));
             byte[] spec = spec(id);
             String specHash = ContentHash.of(spec);
             stores.specs.put(specHash, spec);
@@ -263,18 +254,10 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
-    void preexistingStoredArtifactBytesMustMatchTheirLockedContentAddress() throws Exception {
-        String hash = (String) entry("mongodb-atlas").get("sha256");
-        stores.artifacts.put(hash, stores.artifacts.get(entry("mysql").get("sha256")));
-        refused(this::gate, "stored-artifact-mismatched");
-        assertThat(loaded).isEmpty();
-    }
-
-    @Test
-    void persistentArtifactLossDuringLoadingCannotBeHiddenByAValidCache() throws Exception {
+    void aMissingLocalArtifactAfterPreflightCannotBecomeReady() throws Exception {
         var gate = gate();
-        eraseAfterLoad = "mongodb-atlas";
-        refused(() -> gate.verifyRegistrations(outcomes), "stored-artifact-unavailable");
+        Files.delete(seeds.resolve("mongodb-atlas-connector.jar"));
+        refused(() -> gate.verifyRegistrations(outcomes), "registered-artifact-unavailable");
     }
 
     @Test
@@ -385,9 +368,9 @@ class CloudConnectorSeedReadinessTest {
     }
 
     @Test
-    void missingStoredBytesCannotBeHiddenByASuccessfulSweepOutcome() throws Exception {
+    void missingRegistrationCannotBeHiddenByASuccessfulSweepOutcome() throws Exception {
         var gate = gate();
-        stores.artifacts.remove(entry("mongodb-atlas").get("sha256"));
+        stores.registrations.remove("mongodb-atlas");
         refused(() -> gate.verifyRegistrations(outcomes), "registered-artifact-unavailable");
     }
 
@@ -431,17 +414,10 @@ class CloudConnectorSeedReadinessTest {
         CapabilityDeriver deriver = id -> {
             loaded.add(id);
             if (loadFailure != null) { throw loadFailure; }
-            try {
-                Path plugins = Files.createDirectories(directory.resolve("plugins"));
-                String hash = (String) entry(id).get("sha256");
-                Files.write(plugins.resolve(hash + ".jar"), stores.artifacts.get(hash));
-                if (id.equals(eraseAfterLoad)) { stores.artifacts.remove(hash); }
-            } catch (java.io.IOException failure) {
-                throw new UncheckedIOException(failure);
-            }
+            if (!Files.isRegularFile(seeds.resolve(id + "-connector.jar"))) throw unsafeFailure();
             return new ConnectorCapabilities(functions);
         };
-        return new CloudConnectorSeedReadiness(seeds, directory.resolve("plugins"), trusted,
+        return new CloudConnectorSeedReadiness(seeds, trusted,
                 stores, stores.catalog(), stores.specStore(), deriver, directoryEntries, selection);
     }
 
@@ -509,34 +485,18 @@ class CloudConnectorSeedReadinessTest {
 
     private static final class Stores implements ConnectorRegistry {
         final Map<String, ConnectorRegistration> registrations = new HashMap<>();
-        final Map<String, byte[]> artifacts = new HashMap<>();
         final Map<String, ConnectorCatalogEntry> rows = new HashMap<>();
         final Map<String, byte[]> specs = new HashMap<>();
-        boolean streamOnly;
-        int streamReads;
-        final List<String> streamHashes = new ArrayList<>();
-
         @Override public RegistrationOutcome register(String id, String version, RegistrationSource source, byte[] artifact) {
-            String hash = ContentHash.of(artifact);
-            var registration = new ConnectorRegistration(id, hash, version, source);
-            registrations.put(id, registration);
-            artifacts.put(hash, artifact);
-            return new RegistrationOutcome(registration, true);
+            throw new AssertionError("Readiness must not upload connector JARs");
         }
         @Override public List<ConnectorRegistration> list() { return List.copyOf(registrations.values()); }
         @Override public Optional<byte[]> artifact(String hash) {
-            if (streamOnly) throw new AssertionError("Release readiness must not materialize whole artifacts");
-            return Optional.ofNullable(artifacts.get(hash));
+            throw new AssertionError("Readiness must not download connector JARs");
         }
-        @Override public boolean copyArtifactTo(String hash, OutputStream target) throws IOException {
-            streamReads++;
-            streamHashes.add(hash);
-            byte[] bytes = artifacts.get(hash);
-            if (bytes == null) return false;
-            target.write(bytes);
-            return true;
+        @Override public boolean hasArtifact(String hash) {
+            throw new AssertionError("Readiness must resolve the local image JAR");
         }
-        @Override public boolean hasArtifact(String hash) { return artifacts.containsKey(hash); }
         ConnectorCatalogStore catalog() {
             return new ConnectorCatalogStore() {
                 @Override public void upsert(ConnectorCatalogEntry row) { rows.put(row.id(), row); }

@@ -21,6 +21,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapdata.entity.codec.FromTapValueCodec;
 import io.tapdata.entity.codec.TapCodecsRegistry;
 import io.tapdata.entity.codec.ToTapValueCodec;
+import io.tapdata.entity.schema.TapField;
 import io.tapdata.entity.schema.value.ByteData;
 import io.tapdata.entity.schema.value.DateTime;
 import io.tapdata.entity.schema.value.TapBinaryValue;
@@ -544,16 +545,20 @@ public final class TapEventCodec {
     }
 
     static TapEvent encode(Envelope env, PdkValueConversions conversions) {
+        return encode(env, conversions, Map.of());
+    }
+
+    static TapEvent encode(Envelope env, PdkValueConversions conversions, Map<String, TapField> targetFields) {
         return switch (env.op()) {
             case INSERT, READ -> TapInsertRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions))
+                    .table(env.src()).referenceTime(env.ts()).after(mutable(env.after(), conversions, targetFields))
                     .removedFields(dropped(env));
             case UPDATE -> TapUpdateRecordEvent.create()
                     .table(env.src()).referenceTime(env.ts())
-                    .before(mutable(env.before(), conversions)).after(mutable(env.after(), conversions))
+                    .before(mutable(env.before(), conversions, targetFields)).after(mutable(env.after(), conversions, targetFields))
                     .removedFields(dropped(env));
             case DELETE -> TapDeleteRecordEvent.create()
-                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions));
+                    .table(env.src()).referenceTime(env.ts()).before(mutable(env.before(), conversions, targetFields));
             case DDL -> encodeDdl(env);
         };
     }
@@ -562,8 +567,9 @@ public final class TapEventCodec {
      * A fresh mutable copy PDK can write through in place, or {@code null} when the map is absent, with
      * every carried value put back the way the target wants it.
      */
-    private static Map<String, Object> mutable(Map<String, Object> map, PdkValueConversions conversions) {
-        return conversions.write(map, carrier -> restored(carrier, conversions.codecs())).orElse(null);
+    private static Map<String, Object> mutable(Map<String, Object> map, PdkValueConversions conversions,
+            Map<String, TapField> targetFields) {
+        return conversions.write(map, targetFields, carrier -> restored(carrier, conversions.codecs())).orElse(null);
     }
 
     /**

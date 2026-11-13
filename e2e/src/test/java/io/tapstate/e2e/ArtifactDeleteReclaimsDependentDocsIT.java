@@ -58,12 +58,13 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                 var states = SystemCollections.CACHE_PIPELINE_STATE.on(cache);
                 var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(cache);
                 var id = new Document("_id", pipelineId);
+                var observationId = new Document("pipelineId", pipelineId);
 
                 Await.until("all original bookkeeping to exist before deletion",
                         () -> configuration.intents().load(pipelineId).filter(intent -> !intent.deleted()).isPresent()
-                                && states.find(id).first() != null && observations.find(id).first() != null,
+                                && states.find(id).first() != null && observations.find(observationId).first() != null,
                         () -> "intent=" + configuration.intents().load(pipelineId)
-                                + " state=" + states.find(id).first() + " observation=" + observations.find(id).first());
+                                + " state=" + states.find(id).first() + " observation=" + observations.find(observationId).first());
                 assertThat(configuration.intents().pipelineIds()).contains(pipelineId);
 
                 var initialScope = states.find(id).first().get("scope", Document.class);
@@ -121,7 +122,9 @@ class ArtifactDeleteReclaimsDependentDocsIT {
                 assertThat(retained.getLong("epoch")).isEqualTo(retired.epoch()).isGreaterThan(checkpoint.getLong("epoch"));
                 assertThat(retained.getLong("runtimeWriteFence")).isEqualTo(retired.writeFence())
                         .isGreaterThan(checkpoint.getLong("runtimeWriteFence"));
-                assertThat(observations.find(id).first()).as("the obsolete published observation is removed").isNull();
+                Await.until("obsolete Pipeline observations to be reaped",
+                        () -> observations.find(observationId).first() == null,
+                        () -> String.valueOf(observations.find(observationId).first()));
                 assertThat(control.stateExpectingRefusal(pipelineId).code()).isEqualTo("lifecycle.unknown-pipeline");
             } finally {
                 if (server instanceof RealProcessServer process)

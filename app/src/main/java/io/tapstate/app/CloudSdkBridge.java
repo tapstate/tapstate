@@ -1,5 +1,7 @@
 package io.tapstate.app;
 
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope;
+
 import io.tapstate.cloud.sdk.ApiClient;
 import io.tapstate.cloud.sdk.ApiException;
 import io.tapstate.cloud.sdk.api.C2StatusReportApi;
@@ -66,10 +68,11 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             logValidationFailure("code-exchange", "configured-cluster-mismatch");
             throw CloudAuthenticationService.unavailable();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE)) {
             ExchangeResult result = sdk.exchange(exchangeCode);
             return new CloudCodeExchangeResult(result.jwt(), result.context());
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EXCHANGE);
             throw CloudAuthenticationService.unavailable();
         }
     }
@@ -85,7 +88,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             logValidationFailure("claims-validation", "missing-request-audience");
             return Optional.empty();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_VERIFY)) {
             VerifiedClaims claims = sdk.verify(rawJwt);
             String rejected = !text(claims.userId()) ? "missing-user-id"
                     : !text(claims.organizationId()) ? "missing-org-id"
@@ -107,6 +110,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                     expectedDeployment, claims.userId(), claims.organizationId(), claims.clusterId(),
                     claims.jwtId(), scope, claims.expiresAt(), claims.userEmail()));
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_VERIFY);
             return Optional.empty();
         } catch (IllegalArgumentException invalid) {
             logValidationFailure("claims-validation", "invalid-verified-claims");
@@ -122,9 +126,10 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
                 || !settings.clusterId().equals(clusterId)) {
             return false;
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CALLBACK)) {
             return sdk.verifyCallback(method, timestamp, nonce, data, signature);
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CALLBACK);
             return false;
         }
     }
@@ -134,9 +139,10 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         if (!settings.clusterId().equals(clusterId)) {
             throw statusUnavailable();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_STATUS)) {
             sdk.report(clusterId, nonce, status, settings.token());
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_STATUS);
             throw statusUnavailable();
         }
     }
@@ -146,7 +152,7 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
         if (!settings.clusterId().equals(clusterId)) {
             return Optional.empty();
         }
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS)) {
             ClusterEgressAddress current = sdk.currentEgressAddress();
             if (!organizationId.equals(current.organizationId()) || !clusterId.equals(current.clusterId())) {
                 return Optional.empty();
@@ -154,18 +160,22 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
             return Optional.of(new CloudClusterEgressAddress(current.organizationId(), current.clusterId(),
                     optionalText(current.ec2PublicIp()), optionalText(current.egressAddressStatus())));
         } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS);
             return Optional.empty();
         }
     }
 
     /** Machine-token-authenticated Cluster context, independent of every user session and display label. */
     Optional<io.tapstate.core.alerting.AlarmKey.Scope> alertScope() {
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS)) {
             ClusterEgressAddress original = sdk.currentEgressAddress();
             if (original == null || !settings.clusterId().equals(original.clusterId())
                     || !text(original.organizationId()) || DEPLOYMENT_ORGANIZATION.equals(original.organizationId())) return Optional.empty();
             return Optional.of(new io.tapstate.core.alerting.AlarmKey.Scope(original.organizationId(), original.clusterId()));
-        } catch (ProviderFailure unavailable) { return Optional.empty(); }
+        } catch (ProviderFailure unavailable) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_EGRESS);
+            return Optional.empty();
+        }
     }
 
     private boolean deploymentMatches(CloudSessionIdentity deployment) {
@@ -241,19 +251,25 @@ final class CloudSdkBridge implements CloudCodeExchanger, CloudJwtValidator,
     }
 
     ConfigurationInitialization claimConfiguration(String bootId, String hash) {
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_CLAIM)) {
             var result = sdk.claimConfiguration(bootId, hash);
             if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())) throw new ProviderFailure();
             return result;
-        } catch (ProviderFailure failure) { throw CloudAuthenticationService.unavailable(); }
+        } catch (ProviderFailure failure) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_CLAIM);
+            throw CloudAuthenticationService.unavailable();
+        }
     }
 
     void completeConfiguration(String operationId, String hash) {
-        try {
+        try (var sdkStage = MongoHttpDiagnosticsScope.phase(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_COMPLETE)) {
             var result = sdk.completeConfiguration(operationId, hash);
             if (!settings.clusterId().equals(result.clusterId()) || !hash.equals(result.configurationHash())
                     || !operationId.equals(result.operationId()) || !"COMPLETE".equals(result.phase()) || result.creationGranted()) throw new ProviderFailure();
-        } catch (ProviderFailure failure) { throw CloudAuthenticationService.unavailable(); }
+        } catch (ProviderFailure failure) {
+            MongoHttpDiagnosticsScope.providerFailure(MongoHttpDiagnosticsScope.Phase.SDK_CONFIG_COMPLETE);
+            throw CloudAuthenticationService.unavailable();
+        }
     }
 
     record ConfigurationInitialization(String clusterId, String operationId, String phase, String configurationHash, boolean creationGranted) {

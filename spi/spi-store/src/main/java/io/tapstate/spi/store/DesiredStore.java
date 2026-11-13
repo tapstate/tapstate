@@ -1,6 +1,7 @@
 package io.tapstate.spi.store;
 
 import io.tapstate.core.lifecycle.DesiredState;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import java.util.List;
 import java.util.Optional;
 
@@ -24,6 +25,28 @@ public interface DesiredStore {
 
     /** Returns the current desired intent for a pipeline, or empty if none is set. */
     Optional<DesiredState> read(String pipelineId);
+
+    record StartIntent(Optional<DesiredState> desired, Optional<PipelineIntentScope> scope, long revision) {}
+    record StartPreparation(PipelineIntentScope scope, PipelinePreparationInputs inputs) {}
+
+    record StartEntry(io.tapstate.core.model.PipelineResource pipeline, StartIntent intent, Optional<CheckpointDoc> checkpoint) {}
+
+    default Optional<StartEntry> startEntry(String pipelineId) { return Optional.empty(); }
+
+    /** A deferred native start validates this captured definition before background preparation. */
+    default boolean defersStart(DesiredState desired, StartIntent original, Optional<StartPreparation> preparation) { return false; }
+
+    default StartIntent readForStart(String pipelineId) {
+        return new StartIntent(read(pipelineId), Optional.empty(), 0);
+    }
+
+    default void saveStart(DesiredState desired, StartIntent original) {
+        save(desired);
+    }
+
+    default void saveStart(DesiredState desired, StartIntent original, Optional<StartPreparation> preparation) {
+        saveStart(desired, original);
+    }
 
     /**
      * Lists the id of every pipeline that has a stored desired intent — the set the converge side

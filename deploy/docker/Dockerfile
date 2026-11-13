@@ -121,6 +121,8 @@ LABEL org.opencontainers.image.title="Tapstate Cloud cluster" \
 COPY --from=cloud_connectors /connectors/ /opt/tapstate/connectors/
 COPY --from=cloud_connectors /release/ /opt/tapstate/release/
 ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
+# This diagnostic Cloud image opts in without requiring deployment configuration changes.
+ENV LOGGING_LEVEL_IO_TAPSTATE_DIAGNOSTICS_HTTP=DEBUG
 RUN set -eu; \
     cd /opt/tapstate/connectors; \
     sha256sum -c /opt/tapstate/release/connectors.sha256; \

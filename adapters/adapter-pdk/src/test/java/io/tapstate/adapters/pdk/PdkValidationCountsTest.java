@@ -97,12 +97,12 @@ class PdkValidationCountsTest {
         artifact = new ConnectorRef(List.of(jar), "synthetic.NativeCount", "2.0.8", null);
     }
     static Map<String,Object> settings(String mode) {
-        return Map.of("mode", mode,"database","db","counts",new AtomicInteger(),"metadata",new AtomicInteger(),
+        return Map.of("mode", mode,"counts",new AtomicInteger(),"metadata",new AtomicInteger(),
                 "inits",new AtomicInteger(),"stops",new AtomicInteger(),"entered",new CountDownLatch(1),"release",new CountDownLatch(1));
     }
-    static PdkValidationCounts read(Map<String,Object> settings, PdkValidationCounts.Operation operation) {
+    static PdkValidationCounts read(Map<String,Object> settings) {
         return new PdkValidationCounts(new ConnectionConfig("source","fixture",settings), artifact,
-                new PdkValidationCounts.Request("records", "db", operation), () -> {});
+                new PdkValidationCounts.Request("records"), () -> {});
     }
     @Test void metadataInspectionRejectsMissingNativeMethodsWithoutTryingStatistics(){
         var jar=SyntheticJar.compileToJar(directory,"synthetic.NoNativeCount","""
@@ -129,108 +129,103 @@ class PdkValidationCountsTest {
             }
             """);
         var noCount=new ConnectorRef(List.of(jar),"synthetic.NoNativeCount","2.0.8",null);
-        for(var operation:PdkValidationCounts.Operation.values()){
-            try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",Map.of("database","db")),noCount,
-                    new PdkValidationCounts.Request("records","db",operation),()->{})){
-                assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
-                        failed->assertThat(failed.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
-                assertThat(reader.drained()).isTrue();assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
-            }
+        try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",Map.of()),noCount,
+                new PdkValidationCounts.Request("records"),()->{})){
+            assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
+                    failed->assertThat(failed.code()).isEqualTo(ConnectorError.CAPABILITY_MISSING));
+            assertThat(reader.drained()).isTrue();assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
         }
     }
 
     @Test void metadataInspectionNeverCountsOrDiscoversValueModelsAndRetainsOneOriginalAttempt(){
-        for(var operation:PdkValidationCounts.Operation.values()){
-            var values=settings("fail");
-            try(var reader=read(values,operation)){
-                assertThat(reader.inspect()).isEqualTo(operation==PdkValidationCounts.Operation.NATIVE_PROTOCOL
-                        ?PdkValidationCounts.Operation.PARTITION_FILTER:operation);
-                assertThat((AtomicInteger)values.get("counts")).hasValue(0);assertThat((AtomicInteger)values.get("metadata")).hasValue(1);
-                assertThat((AtomicInteger)values.get("inits")).hasValue(1);assertThat(reader.drained()).isTrue();
-                assertThat(reader.callExited().toCompletableFuture()).isCompleted();
-                assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
-                assertThatThrownBy(reader::inspect).isInstanceOf(TapstateException.class);
-            }
+        var values=settings("fail");
+        try(var reader=read(values)){
+            assertThat(reader.inspect()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+            assertThat((AtomicInteger)values.get("counts")).hasValue(0);assertThat((AtomicInteger)values.get("metadata")).hasValue(1);
+            assertThat((AtomicInteger)values.get("inits")).hasValue(1);assertThat(reader.drained()).isTrue();
+            assertThat(reader.callExited().toCompletableFuture()).isCompleted();
+            assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(reader::inspect).isInstanceOf(TapstateException.class);
         }
         var missing=settings("missing");
-        try(var reader=read(missing,PdkValidationCounts.Operation.NATIVE_PROTOCOL)){
+        try(var reader=read(missing)){
             assertThatThrownBy(reader::inspect).isInstanceOfSatisfying(TapstateException.class,
                     failed->assertThat(failed.code()).isEqualTo(ValidationError.READ_PROTOCOL_VIOLATION));
             assertThat((AtomicInteger)missing.get("counts")).hasValue(0);assertThat(reader.drained()).isTrue();
         }
     }
 
-    @Test void exactNativeScalarHasNoBusinessRowsDiscoveryOrEstimateFallback() {
-        for (var operation : PdkValidationCounts.Operation.values()) {
-            var settings = settings("large");
-            try (var reader = read(settings, operation)) {
-                assertThat(reader.count()).isEqualTo(9007199254740993L);
-                assertThat(reader.drained()).isTrue();
-                assertThat(reader.callExited().toCompletableFuture()).isCompleted();
-                assertThat((AtomicInteger)settings.get("counts")).hasValue(1);
-                assertThat((AtomicInteger)settings.get("metadata")).hasValue(2);
-                assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
-            }
+    @Test void registeredPdkCountNeedsNoDatabaseSettingOrBusinessRowsDiscovery() {
+        var settings = settings("large");
+        try (var reader = read(settings)) {
+            assertThat(reader.count()).isEqualTo(9007199254740993L);
+            assertThat(reader.drained()).isTrue();
+            assertThat(reader.callExited().toCompletableFuture()).isCompleted();
+            assertThat((AtomicInteger)settings.get("counts")).hasValue(1);
+            assertThat((AtomicInteger)settings.get("metadata")).hasValue(0);
+            assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
         }
-        try (var reader=read(settings("zero"),PdkValidationCounts.Operation.PARTITION_FILTER)) { assertThat(reader.count()).isZero(); }
+        try (var reader=read(settings("zero"))) { assertThat(reader.count()).isZero(); }
     }
     @Test void missingNamespaceAndNativeFailureCannotBecomeZero() {
         for (var mode : List.of("missing","fail")) {
             var settings = settings(mode);
-            try (var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER)) {
+            try (var reader=read(settings)) {
                 assertThatThrownBy(reader::count).isInstanceOfSatisfying(TapstateException.class,
-                        failed -> assertThat(failed.code()).isEqualTo(mode.equals("missing")?ValidationError.READ_PROTOCOL_VIOLATION:ValidationError.READ_FAILED));
+                        failed -> assertThat(failed.code()).isEqualTo(ValidationError.READ_FAILED));
                 assertThat(reader.drained()).isTrue();
                 assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
             }
         }
         var settings=settings("missing");
-        try(var reader=read(settings,PdkValidationCounts.Operation.DOCUMENT_COUNT)) {
+        try(var reader=read(settings)) {
             assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
-            assertThat((AtomicInteger)settings.get("counts")).hasValue(0);
+            assertThat((AtomicInteger)settings.get("counts")).hasValue(1);
+            assertThat((AtomicInteger)settings.get("metadata")).hasValue(0);
         }
     }
     @Test void aLogicalConnectorNameDoesNotGrantOrSelectANativeCapability(){
         var values=settings("protocol");
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","mongodb",values),artifact,
-                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{})){
+                new PdkValidationCounts.Request("records"),()->{})){
             assertThat(reader.count()).isEqualTo(9007199254740993L);
             assertThat((AtomicInteger)values.get("counts")).hasValue(1);
         }
     }
-    @Test void sourceSelectionConsumesOnlyAVerifiedNativeNamespaceBeforeCounting(){
+    @Test void explicitInspectionUsesNativeNamespaceAdmissionWithoutCounting(){
         var values=settings("large");var admissions=new AtomicInteger();
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
-                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},actual->{
+                new PdkValidationCounts.Request("records"),()->{},actual->{
                     assertThat(actual).isEqualTo("records");
                     assertThat((AtomicInteger)values.get("counts")).hasValue(admissions.getAndIncrement());
                 })){
-            assertThat(reader.count()).isEqualTo(9007199254740993L);assertThat(admissions).hasValue(2);
+            assertThat(reader.inspect()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+            assertThat(admissions).hasValue(1);
         }
         var refused=settings("large");var denied=new TapstateException(ValidationError.INVALID_CONTRACT,Map.of("field","source-scope"),null);
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",refused),artifact,
-                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},actual->{throw denied;})){
-            assertThatThrownBy(reader::count).isSameAs(denied);
+                new PdkValidationCounts.Request("records"),()->{},actual->{throw denied;})){
+            assertThatThrownBy(reader::inspect).isSameAs(denied);
             assertThat((AtomicInteger)refused.get("counts")).hasValue(0);assertThat(reader.drained()).isTrue();
         }
     }
-    @Test void scopeAdmissionCanSeeOtherNativeTablesBeforeTheScalarRead(){
+    @Test void explicitInspectionCanSeeOtherNativeTables(){
         var values=settings("catalog");var seen=new java.util.ArrayList<String>();
         try(var reader=new PdkValidationCounts(new ConnectionConfig("source","fixture",values),artifact,
-                new PdkValidationCounts.Request("records","db",PdkValidationCounts.Operation.NATIVE_PROTOCOL),()->{},seen::add)){
-            assertThat(reader.count()).isEqualTo(9007199254740993L);
-            assertThat(seen).containsExactly("records","other_records","records","other_records");
+                new PdkValidationCounts.Request("records"),()->{},seen::add)){
+            assertThat(reader.inspect()).isEqualTo(PdkValidationCounts.Operation.PARTITION_FILTER);
+            assertThat(seen).containsExactly("records","other_records");
         }
     }
     @Test void cancellationBeforeDispatchOpensNothing() {
-        var settings=settings("large");var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
+        var settings=settings("large");var reader=read(settings);
         reader.close();assertThat(reader.drained()).isTrue();
         assertThatThrownBy(reader::count).isInstanceOfSatisfying(TapstateException.class,
                 failed->assertThat(failed.code()).isEqualTo(ValidationError.READ_CANCELLED));
         assertThat((AtomicInteger)settings.get("inits")).hasValue(0);
     }
     @Test void preDispatchCloseDeliversExitCallbacksOutsideLifecycleLocks() {
-        var reader=read(settings("large"),PdkValidationCounts.Operation.PARTITION_FILTER);
+        var reader=read(settings("large"));
         try(var observer=Executors.newSingleThreadExecutor()) {
             var callback=reader.callExited().thenRun(()->{
                 try { assertThat(observer.submit(reader::drained).get(250,TimeUnit.MILLISECONDS)).isTrue(); }
@@ -241,7 +236,7 @@ class PdkValidationCountsTest {
         }
     }
     @Test void cancellationDuringInitializationWaitsForActualReturnAndStopsLateResources()throws Exception {
-        var settings=settings("blocked");var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
+        var settings=settings("blocked");var reader=read(settings);
         var entered=(CountDownLatch)settings.get("entered");var release=(CountDownLatch)settings.get("release");
         try(var io=Executors.newSingleThreadExecutor()) {
             var result=io.submit(reader::count);
@@ -257,7 +252,7 @@ class PdkValidationCountsTest {
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings={"fatal-cleanup","fatal-body"})
     void fatalFailureDominatesTheOtherPhaseWithoutLosingCleanupOwnership(String mode){
-        var settings=settings(mode);var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
+        var settings=settings(mode);var reader=read(settings);
         try{
             var failure=catchThrowable(reader::count);
             assertThat(failure).isInstanceOf(AssertionError.class).hasMessage(mode.equals("fatal-cleanup")?"fatal cleanup failed":"fatal count failed");
@@ -270,7 +265,7 @@ class PdkValidationCountsTest {
         }finally{reader.close();}
     }
     @Test void failedCleanupKeepsTheOriginalHandleForRetry() {
-        var settings=settings("cleanup");var reader=read(settings,PdkValidationCounts.Operation.PARTITION_FILTER);
+        var settings=settings("cleanup");var reader=read(settings);
         assertThatThrownBy(reader::count).isInstanceOf(TapstateException.class);
         assertThat(reader.callExited().toCompletableFuture()).isCompletedExceptionally();
         assertThat(reader.drained()).isFalse();reader.close();assertThat(reader.drained()).isTrue();

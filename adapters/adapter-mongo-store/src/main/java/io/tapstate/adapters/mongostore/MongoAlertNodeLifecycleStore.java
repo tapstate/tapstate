@@ -30,12 +30,16 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
     }
     private <T>T tx(Function<ClientSession,T> action) {
         active.run();
-        if(domain.alertSchemaVersion()!=MongoAlertStorageSchema.VERSION)throw unreadable("schema-capability");
+        var verifiedSchema=domain.currentAlertSchema();
         return domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
-            active.run();currentHost(session);T result=action.apply(session);active.run();return result;
+            active.run();currentHost(session,true);T result=action.apply(session);
+            domain.requireVerifiedAlertSchema(verifiedSchema);active.run();return result;
         });
     }
     private CacheAuthScope currentHost(ClientSession session) {
+        return currentHost(session,false);
+    }
+    private CacheAuthScope currentHost(ClientSession session, boolean verifySchema) {
         var row=SystemCollections.STORAGE_SETUP.on(db).find(session,new Document("_id","cluster")).first();
         var binding=bindings.loadForTransaction(session).orElseThrow(()->unreadable("binding"));
         if(!MongoAlertHostIdentity.current(row,setup,binding))throw unreadable("host-installation");
@@ -43,7 +47,8 @@ final class MongoAlertNodeLifecycleStore implements AlertNodeLifecycleStore {
         var prepared=bindings.cachePreparationForTransaction(session).orElseThrow(()->unreadable("cache-preparation"));
         var schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
-        MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
+        var marker=MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
+        if(verifySchema)domain.requireVerifiedAlertSchema(marker);
         return prepared.authScope();
     }
     private void writeFence(ClientSession session) {

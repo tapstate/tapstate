@@ -61,6 +61,40 @@ class ValidationOwnerRouterTest {
             assertThat(f.calls.get(f.ranked(request).getLast())).hasValue(0);
         }
     }
+    @Test void aSingleLocalOwnerReservesAfterSlowStoragePreparation() {
+        var nanos = new AtomicLong();
+        try (var f = new Fixture(Duration.ofSeconds(5), 2, nanos::get)) {
+            f.install(2, Set.of("a"));
+            f.ownerReads.set(pipeline -> {
+                nanos.set(Duration.ofSeconds(29).toNanos());
+                return Optional.empty();
+            });
+            var attempt = f.left.reserveAttempt(request());
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.ACCEPTED);
+            assertThat(attempt.dispatched()).isTrue();
+            assertThat(attempt.receiver().identity().node()).isEqualTo("a");
+            assertThat(f.calls.get("a")).hasValue(1);
+            assertThat(f.calls.get("b")).hasValue(0);
+        }
+    }
+
+    @Test void localReservationFailureKeepsTheDispatchedReceiverForReceipt() {
+        try (var f = new Fixture(Duration.ofSeconds(5))) {
+            f.install(2, Set.of("a"));
+            var request = request();
+            f.behaviors.put("a", reserved -> {
+                f.ga.observeNodeSession(() -> { throw new CancellationException("local roster unavailable"); });
+                return accepted("a", reserved);
+            });
+            f.receipts.put("a", ignored -> new LocalReceipt(new Result(Outcome.REJECTED, null, null), true));
+            var attempt = f.left.reserveAttempt(request);
+            assertThat(attempt.reply().outcome()).isEqualTo(Outcome.UNKNOWN);
+            assertThat(attempt.dispatched()).isTrue();
+            f.ga.observeNodeSession(f.live.get("a")::get);
+            assertThat(f.left.receipt(request, attempt.receiver()).disposed()).isTrue();
+        }
+    }
+
     @Test void aDeadlineAfterCapacityKeepsTheOriginalDispatchedReceipt() {
         deadlineAfterCapacity(0);
     }

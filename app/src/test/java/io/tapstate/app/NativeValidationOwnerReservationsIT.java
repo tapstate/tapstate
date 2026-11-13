@@ -113,7 +113,7 @@ class NativeValidationOwnerReservationsIT {
 
     @Test void preparedOwnerObservationDoesNotPrepareOrWriteEitherStorageDomain() {
         try(var f=new Fixture()){
-            f.owners.readOwner("flow");
+            f.configuration.prepareValidationAccess("flow", f.scope, f.cache, WorkloadClaimFence.from(f.node), () -> {});
             var before=storedRows(f);
             assertThat(f.owners.readPreparedOwner("flow")).isPresent();
             assertThat(storedRows(f)).isEqualTo(before);
@@ -183,6 +183,14 @@ class NativeValidationOwnerReservationsIT {
     }
 
     @Test void aReplacementContextEndsOldMetadataUnderANewTenureWithoutResumingItsRun() {
+        replacementClosesOriginalRun(false);
+    }
+
+    @Test void manualCountReplacementClosesAnOldOpenReportAndRunningSlot() {
+        replacementClosesOriginalRun(true);
+    }
+
+    private void replacementClosesOriginalRun(boolean manualCount) {
         try (var f = new Fixture(Duration.ofSeconds(2))) {
             var request = f.request("FULL", 1); var accepted = f.owners.reserve(request);
             assertThat(accepted.outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
@@ -201,8 +209,13 @@ class NativeValidationOwnerReservationsIT {
                 var reserved=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
                 try(var router=new ValidationOwnerRouter(f.member,f.gate,()->WorkloadClaimFence.from(f.node),replacement::readOwner,
                         new ValidationOwnerRouter.Local(){
-                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next){
-                                var result=replacement.reserve(next);reserved.set(result);return result;
+                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next) {
+                                return reserve(next, false);
+                            }
+                            @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request next, boolean manualFull) {
+                                var result = replacement.reserve(next, manualCount && manualFull);
+                                reserved.set(result);
+                                return result;
                             }
                             @Override public ValidationOwnerRouter.LocalReceipt receipt(ValidationOwnerRouter.Request next){return replacement.receipt(next);}
                         },command->ValidationOwnerRouter.commandUnavailable(command,ValidationOwnerRouter.Outcome.UNKNOWN,null),()->{},Duration.ofSeconds(5),System::nanoTime,replacement::readPreparedOwner);
@@ -227,6 +240,36 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
+    @Test void manualCountHintCannotGrantANonCountTask() {
+        try (var f = new Fixture()) {
+            assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task, 1, f.comparison,
+                    ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN, 1000), UUID.randomUUID())))
+                    .isEqualTo(ValidationTaskStore.Write.APPLIED);
+            var request = new ValidationOwnerRouter.Request("flow", f.task.taskId(), f.task.generation(), 2, 1, "FULL",
+                    UUID.randomUUID(), UUID.randomUUID().toString());
+            assertThat(f.owners.reserve(request, true).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.REJECTED);
+            var mapping = f.raw.getDatabase(f.configName).getCollection("operator_generations").find(new Document("_id", "flow")).first();
+            assertThat(mapping.get("validationPreparation", Document.class)).containsEntry("phase", "UNASSIGNED");
+        }
+    }
+
+    @Test void countExecutionAcquisitionCannotTakeALiveForeignLeaseOrReuseAGeneration() {
+        try (var f = new Fixture()) {
+            var access = f.configuration.prepareValidationAccess("flow", f.scope, f.cache,
+                    WorkloadClaimFence.from(f.node), () -> {});
+            var claims = access.claims();
+            var key = ValidationClaims.key("cluster", "flow");
+            var original = claims.acquireValidationExecution(key, f.node.owner(), 1, Duration.ofSeconds(30)).orElseThrow();
+            assertThat(claims.acquireValidationExecution(key, new WorkloadOwner("other", "other-boot"), 1,
+                    Duration.ofSeconds(30))).isEmpty();
+            var successor = claims.acquireValidationExecution(key, f.node.owner(), 1, Duration.ofSeconds(30)).orElseThrow();
+            assertThat(successor.claimGeneration()).isEqualTo(original.claimGeneration() + 1);
+            assertThat(successor.executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+            assertThat(claims.release(original)).isFalse();
+            assertThat(claims.read(key)).hasValueSatisfying(value -> assertThat(value.claim()).isEqualTo(successor));
+        }
+    }
+
     @Test void aProvenNewPipelineLifetimeUsesNewPreparationWithoutRestartingTheMemberContext() {
         try (var f = new Fixture()) {
             var oldRequest = f.request("FULL", 1); var old = f.owners.reserve(oldRequest);
@@ -241,6 +284,11 @@ class NativeValidationOwnerReservationsIT {
                 assertThat(notes.origin()).isEmpty(); notes.completeAfterVerifiedRelease();
             }
             retirements.complete(receipt); f.configuration.artifacts().create(definition);
+            var mappings = f.raw.getDatabase(f.configName).getCollection("operator_generations");
+            var flow = new Document("_id", "flow");
+            var unassigned = mappings.find(flow).first();
+            assertThat(f.owners.reserve(oldRequest).outcome()).isNotEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            assertThat(mappings.find(flow).first()).isEqualTo(unassigned);
             var task = new ValidationReportAdmission.Task("cluster", "flow", "replacement-task", UUID.randomUUID());
             assertThat(f.tasks.create(new ValidationTaskStore.Create(task, f.comparison, ValidationTaskStore.Settings.defaults(ValidationMethod.COUNT, 1000), UUID.randomUUID())))
                     .isEqualTo(ValidationTaskStore.Write.APPLIED);
@@ -311,8 +359,27 @@ class NativeValidationOwnerReservationsIT {
             for (String pipeline : List.of("flow", "second", "third")) {
                 if (!pipeline.equals("flow")) f.configuration.artifacts().create(new PipelineResource(pipeline, null, List.of(SourceRef.spec("input", false)), null, null,
                         new ServeBlock.Inline("serving", FromRef.literal("orders"), List.of(new SyncElement("out", "views", null, null, null)), null, null), null, null));
-                assertThat(f.owners.readOwner(pipeline).orElseThrow().leased()).isFalse();
+                assertThat(f.owners.readOwner(pipeline)).isEmpty();
             }
+        }
+    }
+
+    @Test void aSlowPreparationKeepsTheFullHandoffWindowAfterAcceptance() {
+        var now = new AtomicLong(System.nanoTime());
+        try (var f = new Fixture(64, 2, now::get)) {
+            var request = f.request("FULL", 1);
+            f.startup = (saved, spec) -> {
+                now.addAndGet(Duration.ofSeconds(31).toNanos());
+                f.owners.expire();
+                return NativeValidationOwnerReservations.StartupGate.ready();
+            };
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            now.addAndGet(Duration.ofSeconds(29).toNanos());
+            f.owners.expire();
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+            now.addAndGet(Duration.ofSeconds(2).toNanos());
+            f.owners.expire();
+            assertThat(f.owners.reserve(request).outcome()).isEqualTo(ValidationOwnerRouter.Outcome.REJECTED);
         }
     }
 

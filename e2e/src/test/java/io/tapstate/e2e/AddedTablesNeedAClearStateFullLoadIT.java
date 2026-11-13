@@ -198,9 +198,8 @@ class AddedTablesNeedAClearStateFullLoadIT {
                 var cache = MongoClients.create(storage.cacheUri())) {
             var checkpoints = SystemCollections.CACHE_PIPELINE_STATE.on(cache.getDatabase(storage.cacheDatabase()));
             Await.until(PIPELINE + " clear to complete in successor generation " + successor.stateGeneration(), BOUND, () -> {
-                boolean stopped = control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent();
-                // Release storage after the old observation, independently of completion or the START response.
-                if (interleaving != null) interleaving.observed(stopped);
+                // Release storage after witnessing the retained observation and pending clear.
+                if (interleaving != null) interleaving.observed(control);
                 var before = ClearConfiguration.read(configuration);
                 before.requireOriginalBusinessAndSingleSuccessor(original);
                 last.set("configuration=" + before);

@@ -15,5 +15,5 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { failure_code: dsl.unwind-column-already-exists }
+  - await: { failure_code: dsl.unwind-column-already-exists }
   - assert: { count: { tgt_file.orders: 0 } }

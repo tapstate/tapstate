@@ -19,8 +19,11 @@ final class BootstrapCloudSessions implements CloudSessionStore, AutoCloseable {
     BootstrapCloudSessions(CloudSessionIdentity identity, Runnable requireSetup) {
         this.identity = Objects.requireNonNull(identity); this.requireSetup = Objects.requireNonNull(requireSetup);
     }
-    private void active() {
+    synchronized void requireLocallyActive() {
         if (closed) throw new TapstateException(ControlError.UNAUTHENTICATED, Map.of(), null);
+    }
+    private void active() {
+        requireLocallyActive();
         requireSetup.run();
     }
     @Override public synchronized boolean create(CloudSessionRecord record) {

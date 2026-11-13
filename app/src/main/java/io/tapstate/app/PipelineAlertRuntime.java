@@ -77,6 +77,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicLong lastLogged = new AtomicLong(Long.MIN_VALUE);
     private static final class ResourceSlot {
         final ArrayDeque<Work> pending=new ArrayDeque<>();
+        final EnumMap<OperationalEvidence.Capability,Work> pendingHealthyCache=new EnumMap<>(OperationalEvidence.Capability.class);
+        final EnumSet<OperationalEvidence.Capability> recoveringCache=EnumSet.noneOf(OperationalEvidence.Capability.class);
         final ConcurrentMap<AlarmKey,AlertEvaluationHost.Binding> bindings=new ConcurrentHashMap<>();
         final AtomicBoolean tickQueued=new AtomicBoolean();
         boolean scheduled;
@@ -318,14 +320,20 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             Runnable originalGuard,AlertInput input) {
         resourceInput(resource,typeId,sourceRevision,producer,originalGuard,active,input,()->{},true);
     }
+    void cacheInput(AlarmKey.Resource resource, String producer, Runnable guard, AlertInput.Operational input) {
+        if(!inputAdmission.enter())return;
+        try {
+            resourceInputAdmitted(resource,"cluster.storage-unavailable",0,producer,guard,active,input,()->{},false,input);
+        } finally {inputAdmission.leave();}
+    }
     private void resourceInput(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
             Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared) {
         if(!inputAdmission.enter()){settled.run();return;}
-        try {resourceInputAdmitted(resource,typeId,sourceRevision,producer,originalGuard,localProof,input,settled,shared);}
+        try {resourceInputAdmitted(resource,typeId,sourceRevision,producer,originalGuard,localProof,input,settled,shared,null);}
         finally{inputAdmission.leave();}
     }
     private void resourceInputAdmitted(AlarmKey.Resource resource,String typeId,long sourceRevision,String producer,
-            Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared) {
+            Runnable originalGuard,Runnable localProof,AlertInput input,Runnable settled,boolean shared,AlertInput.Operational cacheSample) {
         if(closed.get()){settled.run();return;}
         ResourceSlot slot;
         synchronized(objectAdmission){
@@ -335,7 +343,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var captured=rules.get();
         int inputSize=512+(input instanceof AlertInput.Operational op&&op.trace()!=null
                 ?op.trace().text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length:0);
-        submitResource(slot,inputSize,()->{try{
+        submitResourceAdmitted(slot,inputSize,()->{try{
             if(resourceSlots.get(resource)!=slot)throw refused("retired-resource");
             active.run();originalGuard.run();var resolved=services.get();
             if(resolved==null)throw refused("storage-not-ready");
@@ -369,9 +377,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                 &&head.episode().diagnostics().status()!=AlertStateRecord.DiagnosticStatus.NOT_APPLICABLE)
                             &&op.observedAt().isBefore(head.snapshot().lastObservedAt().plus(healthyCoalescingWindow(head.snapshot()))))continue;
                 }
-                accept(binding,next,input,shared);
+                accept(binding, next, input, shared, cacheSample != null, before);
             }
-        }finally{settled.run();}},settled);
+        }finally{settled.run();}},settled,cacheSample);
     }
     private static Duration healthyCoalescingWindow(AlertSnapshot snapshot) {
         // Leave room for the producer's sampling cadence inside the original continuity bound.
@@ -381,14 +389,47 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private void submitResource(ResourceSlot slot,int bytes,Runnable action){submitResource(slot,bytes,action,()->{});}
     private void submitResource(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
         if(!inputAdmission.enter()){refused.run();return;}
-        try {submitResourceAdmitted(slot,bytes,action,refused);}finally{inputAdmission.leave();}
+        try {submitResourceAdmitted(slot,bytes,action,refused,null);}finally{inputAdmission.leave();}
     }
-    private void submitResourceAdmitted(ResourceSlot slot,int bytes,Runnable action,Runnable refused){
+    private void submitResourceAdmitted(ResourceSlot slot,int bytes,Runnable action,Runnable refused,AlertInput.Operational cacheSample){
         if(closed.get()){refused.run();return;}
-        if(queuedTasks.incrementAndGet()>QUEUE_SIZE){queuedTasks.decrementAndGet();reject(null,"queue-capacity");refused.run();return;}
-        if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);reject(null,"queue-byte-budget");refused.run();return;}
-        var work=new Work(null,bytes,action,refused);boolean start;
-        synchronized(slot.pending){slot.pending.addLast(work);start=!slot.scheduled;slot.scheduled=true;}
+        boolean start=false;
+        String refusal=null;
+        synchronized(slot.pending){
+            boolean coalesce=false;
+            if(cacheSample!=null){
+                var capability=cacheSample.capability();
+                if(!cacheSample.succeeded()){
+                    // No healthy sample may move past a failure, even across capabilities.
+                    slot.pendingHealthyCache.clear();
+                    slot.recoveringCache.add(capability);
+                }else if(slot.recoveringCache.contains(capability)){
+                    slot.pendingHealthyCache.clear();
+                }else{
+                    coalesce=true;
+                    var previous=slot.pendingHealthyCache.get(capability);
+                    if(previous!=null){
+                        // The resource's durable sequence is shared by read and write.
+                        previous.action=action;
+                        inputTimes.put(previous,clock.instant());
+                        slot.pending.remove(previous);
+                        slot.pending.addLast(previous);
+                        return;
+                    }
+                }
+            }
+            if(queuedTasks.incrementAndGet()>QUEUE_SIZE){
+                queuedTasks.decrementAndGet();refusal="queue-capacity";
+            }else if(queuedBytes.addAndGet(bytes)>MAX_QUEUED_BYTES){
+                queuedTasks.decrementAndGet();queuedBytes.addAndGet(-bytes);refusal="queue-byte-budget";
+            }else{
+                var work=new Work(null,bytes,action,refused);
+                if(coalesce)slot.pendingHealthyCache.put(cacheSample.capability(),work);
+                if(cacheSample!=null&&cacheSample.succeeded())slot.recoveringCache.remove(cacheSample.capability());
+                slot.pending.addLast(work);start=!slot.scheduled;slot.scheduled=true;
+            }
+        }
+        if(refusal!=null){reject(null,refusal);refused.run();return;}
         if(start)dispatchResource(slot);
     }
     private void dispatchResource(ResourceSlot slot){
@@ -396,11 +437,14 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     }
     private final class ResourceDispatcher implements Runnable {
         final ResourceSlot slot;ResourceDispatcher(ResourceSlot slot){this.slot=slot;}
-        public void run(){Work work;synchronized(slot.pending){work=slot.pending.pollFirst();}
+        public void run(){Work work;synchronized(slot.pending){
+                work=slot.pending.pollFirst();
+                slot.pendingHealthyCache.values().remove(work);
+            }
             try{if(work!=null)work.run();}finally{boolean more;synchronized(slot.pending){more=!slot.pending.isEmpty();if(!more)slot.scheduled=false;}if(more)dispatchResource(slot);}
         }
     }
-    private void cancelResource(ResourceSlot slot){List<Work> pending;synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.scheduled=false;}ShutdownAwait.all(pending.stream().<Runnable>map(work->work::cancel).toList());}
+    private void cancelResource(ResourceSlot slot){List<Work> pending;synchronized(slot.pending){pending=List.copyOf(slot.pending);slot.pending.clear();slot.pendingHealthyCache.clear();slot.scheduled=false;}ShutdownAwait.all(pending.stream().<Runnable>map(work->work::cancel).toList());}
     void collectionUnavailable(String reason){reject(null,reason);}
 
     private List<AlertConfiguration.Rule> matching(Slot slot, List<AlertConfiguration.Rule> snapshot) {
@@ -442,10 +486,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
     }
     private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input) {
-        accept(binding,sequence,input,false);
+        accept(binding, sequence, input, false, false, Optional.empty());
     }
-    private void accept(AlertEvaluationHost.Binding binding,long sequence,AlertInput input,boolean shared) {
-        var outcome = services.get().evaluator().accept(binding, sequence, input);
+    private void accept(AlertEvaluationHost.Binding binding, long sequence, AlertInput input, boolean shared,
+            boolean stateLoaded, Optional<AlertStore.Stored<AlertStateRecord.Head>> cachedState) {
+        var outcome = services.get().evaluator().accept(binding, sequence, input, stateLoaded, cachedState);
         String deferral = outcome==AlertEvaluationHost.Result.BUSY ? (shared ? null : cacheHeartbeatDeferralRefusal(binding,input)) : "not-busy";
         if(outcome==AlertEvaluationHost.Result.BUSY && deferral==null)return;
         if (outcome == AlertEvaluationHost.Result.CONFLICT || outcome == AlertEvaluationHost.Result.BUSY) {
@@ -511,7 +556,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }
     }
     private final class Work implements Runnable {
-        final Slot slot; final int bytes; final Runnable action, refused; final AtomicInteger state = new AtomicInteger();
+        final Slot slot; final int bytes; Runnable action; final Runnable refused; final AtomicInteger state = new AtomicInteger();
         Work(Slot slot, int bytes, Runnable action, Runnable refused) { this.slot=slot;this.bytes=bytes;this.action=action;this.refused=refused; inputTimes.put(this,clock.instant()); }
         public void run() {
             if(!state.compareAndSet(0,1))return;

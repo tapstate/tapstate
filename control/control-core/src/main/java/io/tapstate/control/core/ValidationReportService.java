@@ -19,9 +19,10 @@ public final class ValidationReportService {
     public record Mapping(String id,String outputKind,String output,Table source,Table target,Keys keys) {}
     public record Boundary(String readId,String contractVersion,String startedAt,String finishedAt) {}
     public record Count(String mapping,String output,String source,String target,String difference,Boundary sourceRead,Boundary targetRead) {}
+    public record TableFailure(String mapping,String side,Failure failure) {}
     public record Report(Reference reference,String method,String mappingRevision,String rulesVersion,String fingerprint,List<Mapping> mappings,
             boolean closed,String terminal,String terminalKnownAt,String endedAt,Window window,Failure failure,String rootCount,String retainedBytes,
-            List<Count> counts,String result,String premise,boolean premiseVerifiedBySystem,String conclusionScope,String physicalDrain) {}
+            List<Count> counts,List<TableFailure> tableFailures,String result,String premise,boolean premiseVerifiedBySystem,String conclusionScope,String physicalDrain) {}
     public record RootSummary(String id,ValidationWireValues.Root root,ValidationWireValues.Value summary) {}
     public record RootDetail(String id,String revision,ValidationWireValues.Root root,ValidationWireValues.Value observation) {}
     public static final class Response<T> implements AutoCloseable {
@@ -47,10 +48,14 @@ public final class ValidationReportService {
                     Long.toString(count.difference()),boundary(count.sourceRead()),boundary(count.targetRead()))).toList();
             boolean complete=value.terminal()==ValidationRunState.COMPLETED;
             boolean issues=value.rootCount()!=0||value.counts().stream().anyMatch(count->!count.sameCount());
-            String result=complete?(issues?"COMPLETE_WITH_OBSERVATIONS":"COMPLETE_NO_ISSUES_OBSERVED"):(value.closed()?"INCOMPLETE":"IN_PROGRESS");
+            var tableFailures=value.tableFailures().stream().map(ValidationReportService::tableFailure).toList();
+            String result;
+            if (!complete) result=value.closed()?"INCOMPLETE":"IN_PROGRESS";
+            else if (!tableFailures.isEmpty()) result="COMPLETE_WITH_FAILURES";
+            else result=issues?"COMPLETE_WITH_OBSERVATIONS":"COMPLETE_NO_ISSUES_OBSERVED";
             return new Report(reference(value.reference()),spec.method().name(),Long.toString(comparison.mappingRevision()),comparison.comparisonRulesVersion(),spec.fingerprint(),
                     comparison.mappings().stream().map(ValidationReportService::mapping).toList(),value.closed(),state(value.terminal()),instant(value.terminalKnownAt()),instant(value.endedAt()),
-                    window(value.window()),failure(value.failure()),Long.toString(value.rootCount()),Long.toString(value.retainedBytes()),counts,result,
+                    window(value.window()),failure(value.failure()),Long.toString(value.rootCount()),Long.toString(value.retainedBytes()),counts,tableFailures,result,
                     "INITIAL_SYNC_FINISHED_AND_BOTH_SIDES_STABLE",false,"READ_OBSERVATIONS_NO_COMMON_TIME_SNAPSHOT","UNKNOWN");
         }).orElse(null));
     }
@@ -77,11 +82,24 @@ public final class ValidationReportService {
         try{return new Response<>(allocation,owner,query.get());}catch(RuntimeException|Error failed){allocation.close();throw failed;}
     }
     private static Mapping mapping(ValidationTaskSpec.Mapping value){
-        var keys=value.keys();return new Mapping(value.mappingId(),value.outputKind().name(),value.outputId(),table(value.source()),table(value.target()),keys==null?null:
-                new Keys(keys.confirmationId(),keys.source().stream().map(ValidationReportService::component).toList(),keys.target().stream().map(ValidationReportService::component).toList()));
+        var keys=value.keys();
+        Keys projected=null;
+        if (keys!=null) {
+            projected=keys.deferred()
+                    ?new Keys(keys.confirmationId(),keys.sourcePaths().stream().map(ValidationReportService::deferredComponent).toList(),
+                            keys.targetPaths().stream().map(ValidationReportService::deferredComponent).toList())
+                    :new Keys(keys.confirmationId(),keys.source().stream().map(ValidationReportService::component).toList(),
+                            keys.target().stream().map(ValidationReportService::component).toList());
+        }
+        return new Mapping(value.mappingId(),value.outputKind().name(),value.outputId(),table(value.source()),table(value.target()),projected);
     }
     private static Table table(ValidationTaskSpec.Table value){return new Table(value.nodeId(),value.sourceId(),value.database(),value.schema(),value.table(),value.modelVersion(),value.codecBinding());}
     private static Component component(ValidationKeyBinding.Component value){return new Component(value.path(),value.domain().name(),value.logicalTypes().stream().sorted().toList(),value.numericPolicy().name());}
+    private static Component deferredComponent(List<String> path){return new Component(path,null,List.of(),null);}
+    private static TableFailure tableFailure(ValidationTableFailure value){
+        return new TableFailure(value.mappingId(),value.side().name(),
+                new Failure(value.code(),Map.of(),"TableValidationFailure",value.message(),null,false));
+    }
     private static Boundary boundary(ValidationCheckEvent.ReadBoundary value){return new Boundary(value.readId(),value.contractVersion(),value.startedAt().toString(),value.finishedAt().toString());}
     private static Failure failure(ValidationReportMetadata.Failure value){return value==null?null:new Failure(value.code(),value.params(),value.exceptionType(),value.message(),value.technical(),value.fatal());}
     private static Window window(ValidationReportMetadata.Window value){return value==null?null:new Window(value.startedAt().toString(),instant(value.finishedAt()));}

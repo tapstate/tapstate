@@ -11,14 +11,22 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
     private final RequiredNoteStore guardedStore;
     private final Function<String, RequiredNoteScope> opener;
     private final Runnable active;
+    private final boolean batchSharedStartup;
 
     BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active) {
+        this(store, opener, active, false);
+    }
+
+    BoundConnectorNoteScopes(RequiredNoteStore store, Function<String, RequiredNoteScope> opener, Runnable active,
+            boolean batchSharedStartup) {
+        this.batchSharedStartup = batchSharedStartup;
         this.originalStore = Objects.requireNonNull(store, "store");
         this.opener = Objects.requireNonNull(opener, "opener");
         this.active = Objects.requireNonNull(active, "active");
         this.guardedStore = store.guardedBy(active);
     }
 
+    @Override public boolean batchSharedStartup() { return batchSharedStartup; }
     @Override public RequiredNoteStore store() { return guardedStore; }
     @Override public void requireActive() { active.run(); }
     @Override public RequiredNoteScope open(String namespace) {
@@ -33,7 +41,7 @@ final class BoundConnectorNoteScopes implements ConnectorNoteScopes {
         Objects.requireNonNull(additionalGuard, "additionalGuard");
         return new BoundConnectorNoteScopes(originalStore, opener, () -> {
             active.run(); additionalGuard.run();
-        });
+        }, batchSharedStartup);
     }
 
     /** A release must retain the exact primary scope captured with its connector origin. */

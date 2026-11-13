@@ -1,8 +1,10 @@
 package io.tapstate.archtests;
 
 import com.tngtech.archunit.base.DescribedPredicate;
+import com.tngtech.archunit.core.domain.Dependency;
 import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
+import com.tngtech.archunit.core.domain.JavaFieldAccess;
 import com.tngtech.archunit.core.domain.JavaModifier;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
@@ -19,6 +21,7 @@ import static com.tngtech.archunit.core.domain.JavaClass.Predicates.assignableTo
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.equivalentTo;
 import static com.tngtech.archunit.core.domain.JavaClass.Predicates.resideInAPackage;
 import static com.tngtech.archunit.core.domain.properties.HasName.Predicates.name;
+import static com.tngtech.archunit.lang.conditions.ArchConditions.onlyHaveDependenciesWhere;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.classes;
 import static com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -393,11 +396,26 @@ class RingDependencyRulesTest {
                                 type -> type.getName().startsWith(PipelineDraft.class.getName() + "$")))
                         .or(equivalentTo(PipelineDraftMutation.class));
         classes().that().resideInAPackage("io.tapstate.control.restapi..")
-                .should().onlyDependOnClassesThat(allowedRestApiDependencies)
+                .should(onlyHaveDependenciesWhere(DescribedPredicate.describe(
+                        "allowed HTTP adapter dependencies and the checkpoint error code",
+                        dependency -> allowedRestApiDependencies.test(dependency.getTargetClass())
+                                || isPipelineStatusCheckpointError(dependency))))
                 .allowEmptyShould(true)
                 .because("the HTTP presentation adapter sits on control-core, the kernel, the shared "
                         + "message catalog and the servlet substrate; it does not reach the ports directly")
                 .check(tapstateClasses);
+    }
+
+    /** One error-code field read in the catalog status mapper. It grants no storage port access. */
+    private static boolean isPipelineStatusCheckpointError(Dependency dependency) {
+        return dependency.convertTo(JavaFieldAccess.class).stream().anyMatch(access ->
+                access.getOriginOwner().getName().equals("io.tapstate.control.restapi.PipelineStatusResponse")
+                        && access.getOrigin().getName().equals("of")
+                        && access.getOrigin().getRawParameterTypes().stream().map(JavaClass::getName).toList()
+                                .equals(List.of("io.tapstate.control.core.PipelineCatalogItem",
+                                        "io.tapstate.messages.MessageCatalog", "java.time.Clock"))
+                        && access.getAccessType() == JavaFieldAccess.AccessType.GET
+                        && access.getTarget().getFullName().equals("io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE"));
     }
 
     @Test

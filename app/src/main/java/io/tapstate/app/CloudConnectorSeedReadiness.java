@@ -15,11 +15,11 @@ import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.ConnectorSpecStore;
 import io.tapstate.spi.store.ContentHash;
+import io.tapstate.spi.store.RegistrationSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -59,7 +59,6 @@ final class CloudConnectorSeedReadiness {
             .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).build();
 
     private final Path seedDir;
-    private final Path pluginsDir;
     private final ConnectorRegistry registry;
     private final ConnectorCatalogStore catalog;
     private final ConnectorSpecStore specs;
@@ -69,13 +68,7 @@ final class CloudConnectorSeedReadiness {
     private final Map<String, String> specHashes = new HashMap<>();
 
     static CloudConnectorSeedReadiness checkedRelease(
-            Path seedDir, Path pluginsDir, ConnectorRegistry registry, ConnectorCatalogStore catalog,
-            ConnectorSpecStore specs, CapabilityDeriver deriver) {
-        return checkedRelease(seedDir, pluginsDir, registry, catalog, specs, deriver, false);
-    }
-
-    static CloudConnectorSeedReadiness checkedRelease(
-            Path seedDir, Path pluginsDir, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            Path seedDir, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver, boolean confirmedDevelopment) {
         try (InputStream input = CloudConnectorSeedReadiness.class.getResourceAsStream(LOCK_RESOURCE)) {
             if (input == null) {
@@ -84,7 +77,7 @@ final class CloudConnectorSeedReadiness {
             byte[] trusted = boundedBytes(input, MAX_LOCK_BYTES);
             Set<String> selected = bundledSelection(trusted, confirmedDevelopment);
             if (selected.size() != IDS.size()) LOG.info("Local storage acceptance selects {} from the locked release; full connector coverage is not asserted.", selected);
-            return new CloudConnectorSeedReadiness(seedDir, pluginsDir, trusted, registry, catalog, specs, deriver,
+            return new CloudConnectorSeedReadiness(seedDir, trusted, registry, catalog, specs, deriver,
                     Files::list, selected);
         } catch (IOException failure) {
             throw invalid("release", "embedded-lock-unreadable");
@@ -152,22 +145,21 @@ final class CloudConnectorSeedReadiness {
 
     /** The explicit trusted bytes are a package-local seam for isolated release-shape tests. */
     CloudConnectorSeedReadiness(
-            Path seedDir, Path pluginsDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            Path seedDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver) {
-        this(seedDir, pluginsDir, trustedLock, registry, catalog, specs, deriver, Files::list);
+        this(seedDir, trustedLock, registry, catalog, specs, deriver, Files::list);
     }
 
     CloudConnectorSeedReadiness(
-            Path seedDir, Path pluginsDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            Path seedDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver, DirectoryEntries directoryEntries) {
-        this(seedDir, pluginsDir, trustedLock, registry, catalog, specs, deriver, directoryEntries, Set.copyOf(IDS));
+        this(seedDir, trustedLock, registry, catalog, specs, deriver, directoryEntries, Set.copyOf(IDS));
     }
 
     CloudConnectorSeedReadiness(
-            Path seedDir, Path pluginsDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
+            Path seedDir, byte[] trustedLock, ConnectorRegistry registry, ConnectorCatalogStore catalog,
             ConnectorSpecStore specs, CapabilityDeriver deriver, DirectoryEntries directoryEntries, Set<String> selectedIds) {
         this.seedDir = seedDir.toAbsolutePath().normalize();
-        this.pluginsDir = pluginsDir.toAbsolutePath().normalize();
         this.registry = registry;
         this.catalog = catalog;
         this.specs = specs;
@@ -195,10 +187,6 @@ final class CloudConnectorSeedReadiness {
                 Path jar = this.seedDir.resolve(artifact.id() + "-connector.jar");
                 verifyBytes(jar, artifact.bytes(), artifact.sha256(), artifact.id());
                 specHashes.put(artifact.id(), verifyJar(jar, artifact));
-                if (selectedIds.contains(artifact.id())) {
-                    verifyStoredArtifact(artifact, false);
-                    verifyCache(artifact, false);
-                }
             }
             verifyLicenses(lock.path("licenseFiles"), release.resolve("licenses"));
         } catch (IOException | UncheckedIOException failure) {
@@ -224,27 +212,18 @@ final class CloudConnectorSeedReadiness {
             if (!(outcome instanceof SeedOutcome.Seeded seeded)
                     || !seeded.outcome().registration().connectorId().equals(id)
                     || !seeded.outcome().registration().contentHash().equals(artifact.sha256())
-                    || !artifact.pdkApiVersion().equals(seeded.outcome().registration().pdkApiVersion())) {
+                    || !artifact.pdkApiVersion().equals(seeded.outcome().registration().pdkApiVersion())
+                    || seeded.outcome().registration().source() != RegistrationSource.SEED) {
                 // Do not log the failed outcome's cause: file paths and connector diagnostics may
                 // carry arbitrary input. Only a release-owned id and fixed reason cross this gate.
                 throw invalid(id, "registration-failed");
             }
             var registrations = readPort(id, () -> registry.findAll(id));
-            if (registrations.size() != 1
-                    || !registrations.getFirst().contentHash().equals(artifact.sha256())
-                    || !artifact.pdkApiVersion().equals(registrations.getFirst().pdkApiVersion())
-                    || !readPort(id, () -> registry.hasArtifact(artifact.sha256()))) {
+            if (registrations.size() != 1 || !registrations.getFirst().equals(seeded.outcome().registration())) {
                 throw invalid(id, "registered-artifact-unavailable");
             }
-            // A prior registration can have a catalog row while this server can no longer load its
-            // PDK artifact. Re-probe rather than trusting a row cached by an earlier boot.
+            // Re-probe the exact local image file through the runtime loader on every startup.
             var capabilities = readPort(id, () -> deriver.derive(id));
-            try {
-                verifyStoredArtifact(artifact, true);
-                verifyCache(artifact, true);
-            } catch (IOException failure) {
-                throw invalid(id, "seed-input-unreadable");
-            }
             if (!capabilities.capabilityIds().containsAll(Set.of("batch_read_function", "stream_read_function"))) {
                 throw invalid(id, "read-functions-unavailable");
             }
@@ -274,59 +253,6 @@ final class CloudConnectorSeedReadiness {
         }
         if (!actual.equals(expected)) {
             throw invalid("release", "seed-set-mismatched");
-        }
-    }
-
-    private void verifyStoredArtifact(Artifact artifact, boolean required) {
-        var check = new StoredArtifactCheck(artifact);
-        boolean present;
-        try {
-            present = registry.copyArtifactTo(artifact.sha256(), check);
-        } catch (IOException | UncheckedIOException | TapstateException failure) {
-            preserveQuota(failure);
-            LOG.warn("Stored connector verification failed [connector={}, error_code={}, exception_type={}].", artifact.id(),
-                    failure instanceof TapstateException coded ? coded.code().code() : BootError.CLOUD_CONNECTORS_INVALID.code(),
-                    failure.getClass().getSimpleName());
-            throw invalid(artifact.id(), check.overflow ? "stored-artifact-mismatched" : "registered-artifact-unavailable");
-        }
-        if (required && !present) {
-            throw invalid(artifact.id(), "stored-artifact-unavailable");
-        }
-        if (present && !check.matches()) {
-            throw invalid(artifact.id(), "stored-artifact-mismatched");
-        }
-    }
-
-    /** Checks the locked release independently of the store, retaining no artifact bytes. */
-    private static final class StoredArtifactCheck extends OutputStream {
-        private final Artifact artifact;
-        private final MessageDigest digest;
-        private long count;
-        private boolean overflow;
-
-        private StoredArtifactCheck(Artifact artifact) {
-            this.artifact = artifact;
-            try { digest = MessageDigest.getInstance("SHA-256"); }
-            catch (NoSuchAlgorithmException invariant) { throw new IllegalStateException("The JVM does not provide SHA-256", invariant); }
-        }
-        @Override public void write(int value) throws IOException { write(new byte[]{(byte) value}, 0, 1); }
-        @Override public void write(byte[] bytes, int offset, int length) throws IOException {
-            java.util.Objects.checkFromIndexSize(offset, length, bytes.length);
-            if (length > artifact.bytes() - count) {
-                overflow = true;
-                throw new IOException("Artifact length exceeds the release lock");
-            }
-            digest.update(bytes, offset, length); count += length;
-        }
-        private boolean matches() {
-            return count == artifact.bytes() && HexFormat.of().formatHex(digest.digest()).equals(artifact.sha256());
-        }
-    }
-
-    private void verifyCache(Artifact artifact, boolean required) throws IOException {
-        Path cached = pluginsDir.resolve(artifact.sha256() + ".jar");
-        if (required || Files.exists(cached, LinkOption.NOFOLLOW_LINKS)) {
-            verifyBytes(cached, artifact.bytes(), artifact.sha256(), artifact.id(), "cache-artifact-mismatched");
         }
     }
 
@@ -379,12 +305,8 @@ final class CloudConnectorSeedReadiness {
     }
 
     private static void verifyBytes(Path path, long size, String hash, String id) throws IOException {
-        verifyBytes(path, size, hash, id, "artifact-missing-or-mismatched");
-    }
-
-    private static void verifyBytes(Path path, long size, String hash, String id, String reason) throws IOException {
         if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) || Files.size(path) != size) {
-            throw invalid(id, reason);
+            throw invalid(id, "artifact-missing-or-mismatched");
         }
         MessageDigest digest;
         try {
@@ -399,12 +321,12 @@ final class CloudConnectorSeedReadiness {
             while ((read = input.read(block)) != -1) {
                 count += read;
                 if (count > size) {
-                    throw invalid(id, reason);
+                    throw invalid(id, "artifact-missing-or-mismatched");
                 }
                 digest.update(block, 0, read);
             }
             if (count != size || !HexFormat.of().formatHex(digest.digest()).equals(hash)) {
-                throw invalid(id, reason);
+                throw invalid(id, "artifact-missing-or-mismatched");
             }
         }
     }

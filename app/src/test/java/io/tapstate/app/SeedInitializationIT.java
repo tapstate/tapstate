@@ -35,7 +35,7 @@ class SeedInitializationIT {
     @TempDir Path work;
 
     @Test
-    void localOpStorageRetainsBothIntegrityGatesWhileAvoidingStagingDownloads() throws Exception {
+    void localOpSeedStagingUsesRegistryOnlyWhenNoSeedCopyIsAvailable() throws Exception {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         byte[] lock = java.nio.file.Files.readAllBytes(seeds.resolveSibling("release").resolve("connectors.lock.json"));
         long bytes = 443_262_490L;
@@ -63,7 +63,7 @@ class SeedInitializationIT {
                         var registrar = new ConnectorArtifactRegistrar(registry, introspector, deriver, catalog, specs);
                         registry.reset();
                         long start = System.nanoTime();
-                        var gate = new CloudConnectorSeedReadiness(seeds, plugins, lock, registry, catalog, specs, deriver);
+                        var gate = new CloudConnectorSeedReadiness(seeds, lock, registry, catalog, specs, deriver);
                         long checked = System.nanoTime();
                         var outcomes = new SeedConnectorSweep(registrar, reuseSeed ? cpu : 1).sweep(seeds);
                         long registered = System.nanoTime();
@@ -71,11 +71,7 @@ class SeedInitializationIT {
                         long ready = System.nanoTime();
                         assertThat(outcomes).hasSize(9).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
                         assertThat(registry.list()).hasSize(9);
-                        long expectedRead = switch (state) {
-                            case "cold" -> bytes * (reuseSeed ? 1 : 2);
-                            case "warm" -> bytes * 2;
-                            default -> bytes * (reuseSeed ? 2 : 3);
-                        };
+                        long expectedRead = !reuseSeed && !state.equals("warm") ? bytes : 0;
                         assertThat(registry.readBytes.get()).as(mode + "/" + state).isEqualTo(expectedRead);
                         assertThat(registry.uploadBytes.get()).isEqualTo(state.equals("cold") ? bytes : 0);
                         System.out.printf("SEED_MEASUREMENT mode=%s trial=%d state=%s workers=%d preflight_ms=%d registration_ms=%d final_ms=%d total_ms=%d upload_ms=%d readback_ms=%d upload_bytes=%d readback_bytes=%d%n",

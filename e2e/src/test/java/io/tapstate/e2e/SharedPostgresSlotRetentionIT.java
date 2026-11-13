@@ -17,31 +17,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * Clearing the state of the last pipeline reading a PostgreSQL source through its chain drops the replication
- * slot the connector created there; nothing short of that does.
- *
- * <p>A slot is held on the user's own server and keeps every write-ahead log segment its reader has not
- * confirmed. Once nothing reads through it any more nobody confirms it again, so a slot left behind after a
- * clearing pins the source's log for good. But the slot belongs to the chain, not to any one pipeline on it:
- * letting go of it while another pipeline still reads through it would hand that pipeline a fresh slot at its
- * next start, beginning where the source is then, with every change in between gone.
- *
- * <p>The segments run in order over one database, each starting from what the one before left:
- * <ul>
- *   <li><b>A stop that keeps the state</b> leaves the slot, under the same name, and the next start reads
- *       through it again.</li>
- *   <li><b>Two pipelines on the chain</b>: clearing one leaves the slot -- and the other's next start still
- *       finds it, which is what tells a release that dropped the chain's notes while the slot was busy from
- *       one that left them alone. Clearing the second drops the slot.</li>
- *   <li><b>Clearing and starting again</b> -- what {@code restart --rerun} sends: the old slot is gone and
- *       exactly one new one serves the new run.</li>
- *   <li><b>Clearing a pipeline alone on its chain</b> drops the slot.</li>
- * </ul>
- *
- * <p>A slot is dropped only while no reader holds it, so every segment that expects one gone waits for it
- * rather than reading once: the stream stops on its own schedule. Slots are read for this database alone.
+ * A PostgreSQL slot used by SRS belongs to the shared capture chain. Stopping a pipeline with retained
+ * state preserves its read position. Clearing a pipeline detaches it without retiring the shared chain,
+ * even when it was the last consumer. A later start on the same chain reads through the retained slot.
+ * The witness reads the source database's actual slots and checks that CDC still reaches the target.
  */
-class PurgeReleasesTheSlotIT {
+class SharedPostgresSlotRetentionIT {
 
     private static final Duration BOUND = Duration.ofSeconds(180);
 
@@ -58,7 +39,7 @@ class PurgeReleasesTheSlotIT {
 
     @ParameterizedTest
     @EnumSource(Tiers.class)
-    void onlyClearingTheLastPipelineOnTheChainDropsItsSlot(Tiers tier) throws Exception {
+    void clearingPipelinesKeepsTheSharedSlot(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> source = SharedPostgres.settings("purge_slot_" + suffix);
         createTables(source);
@@ -112,24 +93,23 @@ class PurgeReleasesTheSlotIT {
 
             control.stop(q, true);
             awaitState(control, q, PipelineState.STOPPED);
-            awaitNoSlot(source, "clearing the last pipeline on the chain to drop its slot");
+            awaitInactiveSlot(source, first);
 
             // ---- clearing and starting again, as restart --rerun does -------------------------------
             startKeepingTarget(control, p);
             carry(source, target, ORDERS, 3);
-            String before = PostgresSlots.only(source).name();
+            assertThat(PostgresSlots.names(source)).containsExactly(first);
             control.stop(p, true);
             awaitState(control, p, PipelineState.STOPPED);
             startKeepingTarget(control, p);
             carry(source, target, ORDERS, 4);
-            List<String> after = PostgresSlots.names(source);
-            assertThat(after).as("the rerun reads through exactly one slot").hasSize(1);
-            assertThat(after).as("and not the one the cleared run held").doesNotContain(before);
+            assertThat(PostgresSlots.names(source)).as("the rerun reads through the original shared slot")
+                    .containsExactly(first);
 
             // ---- clearing a pipeline alone on its chain --------------------------------------------
             control.stop(p, true);
             awaitState(control, p, PipelineState.STOPPED);
-            awaitNoSlot(source, "clearing the only pipeline on the chain to drop its slot");
+            awaitInactiveSlot(source, first);
         }
     }
 
@@ -167,9 +147,11 @@ class PurgeReleasesTheSlotIT {
                 () -> target.holds(table, 100 + id), () -> String.valueOf(target.ids(table)));
     }
 
-    private static void awaitNoSlot(Map<String, Object> source, String what) {
-        Await.until(what, BOUND, () -> PostgresSlots.of(source).isEmpty(),
+    private static void awaitInactiveSlot(Map<String, Object> source, String name) {
+        Await.until("the original shared slot to remain without an active reader", BOUND,
+                () -> PostgresSlots.of(source).stream().anyMatch(slot -> slot.name().equals(name) && !slot.active()),
                 () -> String.valueOf(PostgresSlots.of(source)));
+        assertThat(PostgresSlots.names(source)).containsExactly(name);
     }
 
     private static void awaitState(ControlPlane control, String pipeline, PipelineState state) {

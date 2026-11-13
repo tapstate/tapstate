@@ -118,8 +118,8 @@ final class BuiltinResourceSignals {
             // Keep periodic health without letting ordinary claim traffic consume the alert queue.
             if(failure==null&&previous!=null&&!now.isBefore(previous)&&now.isBefore(previous.plusSeconds(1)))return;
             String binding=digest(cache.clusterId(),cache.cacheIncarnation(),Long.toString(cache.bindingVersion()),Long.toString(cache.authGeneration()));
-            runtime.get().resourceInput(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),
-                    "cluster.storage-unavailable",0,binding,active,new AlertInput.Operational(now,binding,
+            runtime.get().cacheInput(new AlarmKey.Resource("cluster-storage","cache",cache.cacheIncarnation()+":"+cache.bindingVersion()),
+                    binding,active,new AlertInput.Operational(now,binding,
                             write?OperationalEvidence.Capability.CACHE_WRITE:OperationalEvidence.Capability.CACHE_READ,failure==null,null,
                             failure==null?null:diagnostics.pipeline(failure,null).orElse(null)));
             // This records attempted publication only; all failures and the next success remain immediate.

@@ -452,12 +452,12 @@ class IndependentCdcRecoveryIT {
                         && tableSequence(consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE), "perTableRingDone", ROOT) < highSequence
                         && tableSequence(consumer(fixture, database, MAIL_PIPELINE, MAIL_SOURCE), "perTableRingDone", secondTable) >= 0,
                 () -> consumersText(fixture, database));
-        Document source = SystemCollections.SRS_CHAINS.on(database)
-                .find(new Document("_id", consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId"))).first();
-        assertThat(source.get("checkpoint", Document.class)).isNotNull();
-        assertThat(sourceSequence(source.get("checkpoint", Document.class)))
-                .as("the shared source checkpoint names the complete durable batch, despite root High pending")
-                .isEqualTo(5L);
+        String chain = consumer(fixture, database, ROOT_PIPELINE, ROOT_SOURCE).getString("miningChainId");
+        Await.answered("the shared source checkpoint names the complete durable batch, despite root High pending",
+                TIMEOUT, () -> java.util.Optional.ofNullable(SystemCollections.SRS_CHAINS.on(database)
+                        .find(new Document("_id", chain)).first())
+                        .map(source -> source.get("checkpoint", Document.class))
+                        .filter(checkpoint -> sourceSequence(checkpoint) == 5L));
         return high;
     }
 

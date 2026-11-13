@@ -32,20 +32,19 @@ pipeline. The history and explanation responses, including coded errors, carry
 | Why does the latest observation look this way? | `GET /api/pipelines/{id}/explain` | `explain <id>` or `status <id>` | `pipeline_explain` |
 | How wide does each node of the current run run, and why? | `plan` in `GET /api/pipelines/{id}/status` or `.../explain` | `explain <id>` or `status <id>` | `pipeline_status` or `pipeline_explain` |
 
-The status response keeps `state` tied to runtime observation. Before the first observation, a known
-pipeline returns `state: "NEW"` and omits `observedState`, `observedAt`, and `observedAgeMillis`;
-`desiredState` carries the requested lifecycle target and `displayState` carries the authoring-facing
-lifecycle projection. An applied artifact that has never been started reports `displayState: "NOT_STARTED"`;
-when a start or resume is in progress, it can report `STARTING` or `RESUMING`. When an observation exists,
-`state`, `observedState`, and `observedAt` come from the same observation, and `observedAgeMillis` is
-calculated from that observation time. A saved draft reports `displayState: "DRAFT"` and `hasArtifact: false`.
+The status response uses `state` for runtime lifecycle state, `desiredState` for the requested target,
+and `displayState` for the authoring-facing lifecycle projection. An applied artifact that has never been
+started reports `displayState: "NOT_STARTED"`. An accepted start can report `desiredState: "RUNNING"`
+and `displayState: "STARTING"` while the runtime checkpoint and observation are still absent. In that
+window the response omits `state`, `observedState`, `observedAt`, and `observedAgeMillis`. A saved draft
+reports `state: "NEW"`, `displayState: "DRAFT"`, and `hasArtifact: false`. The observation fields describe
+the last runtime observation, and `observedAgeMillis` is calculated from its timestamp.
 
-A failure to read the desired lifecycle document is returned separately as `intentReadFailure`, with a coded
-`code`, named `params`, and rendered `message`. Any runtime observation already read remains available in
-`state`, `observedState`, and `observedAt`. If neither desired intent nor an observation can be read, the
-response omits `displayState`; clients should keep this read failure separate from the lifecycle label and
-should not infer a fallback state. A status read for a leftover runtime observation without a current draft or
-artifact reports `hasArtifact: false` and omits `displayState`.
+When runtime state is available but desired intent cannot be read, the response preserves the runtime
+state and includes an `intentReadFailure` object with `code`, `params`, and `message`. If an applied
+Pipeline has no usable runtime state or known transition, the endpoint returns HTTP 500 with
+`io.document-unreadable` and `params.field: "checkpoint"`. A status read for a leftover runtime
+observation without a current draft or artifact reports `hasArtifact: false` and omits `displayState`.
 
 The status watch sends observed state changes only. It stays open without frames while a known pipeline or
 saved draft has no observation, and closes an id that is not known with `lifecycle.unknown-pipeline`. Reads
@@ -85,9 +84,30 @@ within an operation; later visits count again. The flat view spells these instru
 deltas. Older observations without both instruments have no measured cold share. Existing callback
 timings and counters keep their units; callbacks are not physical database command counts.
 
-The cold-layer alert still requires at least 100 logical accesses and a cold share of at least 50%.
-Small samples accumulate, missing key measurements do not establish recovery, and notifications describe
-pressure and recovery transitions.
+The cold-layer alert requires a cold share of at least 50% over at least 100 accesses. It applies that
+floor in keys when split read/write instrumentation is available and in logical accesses for older
+reporters with aggregate key counters. Small samples accumulate and missing measurements do not establish
+recovery. An active alert clears after two measured windows below 40%.
+
+## Nest state metrics
+
+Read the `facts` array of `GET /api/pipelines/{id}/metrics`. Use `tapstate.nest.namespace` to
+join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its step, path and map.
+
+| Metric | Type | What it measures |
+|---|---|---|
+| `tapstate.pipeline.nest.roots.rendered` | Counter | Whole root documents handed to the downstream outbox |
+| `tapstate.pipeline.state.commit.groups` | Counter | Successful state-store write calls |
+| `tapstate.pipeline.state.commit.keys` | Histogram | Keys per successful write call |
+| `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
+| `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
+| `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+
+The root counter measures output from the operator. Target acknowledgement and table loading are
+shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
+within the same execution and counting lifetime. An acknowledged store call may contain multiple
+database transactions. Command counts cover the synchronous Mongo adapter; commands on other
+threads are outside the measurement.
 
 ## Current-run initial-load display
 

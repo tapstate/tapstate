@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import com.hazelcast.config.*;
 import com.hazelcast.core.*;
+import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.model.*;
@@ -87,6 +88,46 @@ class ValidationPipelineInitialsTest {
             }
         } finally { if (writer != null) writer.shutdown(); owner.shutdown(); }
     }
+    @Test @Timeout(20) void decoratedScopedSrsAckBatchesChangesAndReportsTheInitialLoad() throws Exception {
+        var member = Hazelcast.newHazelcastInstance(config("initial-deferred-" + UUID.randomUUID(), "owner", null));
+        var execution = fence();
+        var auth = org.mockito.Mockito.mock(ExecutionAuthorization.class);
+        org.mockito.Mockito.when(auth.require(execution)).thenReturn(claim());
+        member.getUserContext().put(ExecutionAuthorization.USER_CONTEXT_KEY, auth);
+        var stored = new ArrayList<String>();
+        var scoped = org.mockito.Mockito.mock(ScopedSrsSinkAckFactory.class);
+        org.mockito.Mockito.when(scoped.resolve(member)).thenReturn(new SinkAck() {
+            @Override public void advance(String stream, ChainPosition position) {
+                stored.add(position.token());
+            }
+            @Override public void bounded(String stream, SourceOrder through) {
+                stored.add("bound:" + through.seq());
+            }
+        });
+        try (var service = new ValidationPipelineInitials(member, new CacheBusinessScope("cluster", 1, "cache"),
+                () -> {}, value -> {}, value -> {}, value -> Optional.of(new ValidationPipelineInitials.Attempt(17, 21)))) {
+            var factory = FencedSinkAckFactory.heldTo(service.decorate(execution, scoped), execution);
+            var roster = new SinkAckFactory.RunWriters(Map.of("orders", List.of("serve.out#0")),
+                    Map.of("serve.out", Map.of("orders", List.of("serve.out#0"))));
+            factory.beginRun(member, new SinkAckFactory.ExecutionWriters(17, 21, roster));
+            service.started(member, execution, 17, 21, "orders", 0, "SNAPSHOT", 7);
+            var writer = factory.resolve(member).forWriter("serve.out#0");
+            writer.started(17, 21);
+            writer.advance("orders", new ChainPosition(new SourceOrder(7, 1), "first"));
+            writer.advance("orders", new ChainPosition(new SourceOrder(7, 2), "latest"));
+            assertThat(stored).isEmpty();
+
+            writer.bounded("orders", SourceOrder.snapshotRow(7));
+            assertThat(stored).containsExactly("bound:" + SourceOrder.SNAPSHOT_SEQ);
+            await(() -> service.status(execution, Set.of("serve.out")).state() == ValidationInitialLoadState.State.READY);
+
+            writer.flush(true);
+            assertThat(stored).containsExactly("bound:" + SourceOrder.SNAPSHOT_SEQ, "latest");
+        } finally {
+            member.shutdown();
+        }
+    }
+
     @Test @Timeout(35) void aNewCurrentAttemptNeverFallsBackToThePreviouslyCompletedReadyAttempt() throws Exception {
         var member=Hazelcast.newHazelcastInstance(config("initial-current-"+UUID.randomUUID(),"owner",null));
         var current=new AtomicReference<>(new ValidationPipelineInitials.Attempt(17,21)); var scope=new CacheBusinessScope("cluster",1,"cache");var fence=fence();

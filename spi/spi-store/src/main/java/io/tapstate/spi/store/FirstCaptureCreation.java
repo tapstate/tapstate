@@ -5,6 +5,8 @@ public interface FirstCaptureCreation {
     CapturePreparation preparation();
     CapturePreparationRequest request();
     String retention();
+    /** This CONFIG commit proved that the new shared capture has no earlier incarnation. */
+    default boolean newSharedHistory() { return false; }
     void consume();
     void requireActive();
 }

@@ -26,6 +26,7 @@ final class PdkValidationModelVersion {
     private static final String PROFILE="pdk-validation-model-v1";
     private static final String DOCUMENT_PROFILE="pdk-validation-document-model-v1";
     private static final String DOCUMENT_SCOPE_PROFILE="pdk-validation-document-scope-v1";
+    static final String STRUCTURAL_SCOPE_PROFILE="pdk-validation-structural-scope-v1";
     private static final String CODEC_PROFILE="pdk-validation-codecs-v2";
     private static final Set<String> DOCUMENT_STATISTICS=Set.of("size","storageSize","avgObjSize","indexSize");
     private static final long MAX_BYTES=1024L*1024;
@@ -72,16 +73,27 @@ final class PdkValidationModelVersion {
         return DOCUMENT_SCOPE_PROFILE+":"+CanonicalHash.ofText(JsonWriter.write(scope));
     }
 
+    static String structuralScopeVersion(TapTable model, ConnectorRef artifact) {
+        // Collections with sampled fields already have a stable namespace scope.
+        if (documentFields(artifact)) return scopeVersion(model, artifact);
+        requireFields(model);
+        var scope = List.of(STRUCTURAL_SCOPE_PROFILE, new Walker(false, false, true).value(model, 0));
+        return STRUCTURAL_SCOPE_PROFILE + ":" + CanonicalHash.ofText(JsonWriter.write(scope));
+    }
+
     /** Internal bounded representation, also used to verify complete schema-property differences. */
     static Object canonicalModel(TapTable model,ConnectorRef artifact){return canonicalModel(model,documentFields(artifact));}
 
     private static Object canonicalModel(TapTable model){return canonicalModel(model,false);}
     private static Object canonicalModel(TapTable model,boolean documentFields){
+        requireFields(model);
+        return new Walker(documentFields).value(model,0);
+    }
+    private static void requireFields(TapTable model) {
         Objects.requireNonNull(model,"independent model");
         if(model.getNameFieldMap()==null||model.getNameFieldMap().size()>4096)throw invalid("fields");
         for(var entry:model.getNameFieldMap().entrySet())
             if(entry.getKey()==null||entry.getValue()==null||!entry.getKey().equals(entry.getValue().getName()))throw invalid("fieldNames");
-        return new Walker(documentFields).value(model,0);
     }
     private static boolean documentFields(ConnectorRef artifact){
         return Objects.requireNonNull(artifact).className().equals("io.tapdata.mongodb.MongodbConnector");
@@ -102,14 +114,22 @@ final class PdkValidationModelVersion {
         private enum Slot { VALUE, NAMED_FIELDS, NAMED_FIELD, TABLE_ATTRIBUTES }
         private long bytes;
         private int nodes;
-        private final boolean documentFields,documentScope;
+        private final boolean documentFields,documentScope,structuralScope;
         private final IdentityHashMap<Object,Boolean> active=new IdentityHashMap<>();
         Walker(boolean documentFields){this(documentFields,false);}
-        Walker(boolean documentFields,boolean documentScope){this.documentFields=documentFields;this.documentScope=documentScope;}
+        Walker(boolean documentFields,boolean documentScope){this(documentFields,documentScope,false);}
+        Walker(boolean documentFields, boolean documentScope, boolean structuralScope) {
+            this.documentFields = documentFields;
+            this.documentScope = documentScope;
+            this.structuralScope = structuralScope;
+        }
         Object value(Object value,int depth){return value(value,depth,Slot.VALUE);}
         private Object value(Object value,int depth,Slot slot){
             if(depth>MAX_DEPTH||++nodes>MAX_NODES)throw limit();
             charge(64);
+            if (value == null && structuralScope && slot == Slot.TABLE_ATTRIBUTES) {
+                return List.of("map", Map.of());
+            }
             if(value==null)return List.of("null");
             if(value instanceof String text){text(text);return List.of("string",text);}
             if(value instanceof Boolean)return List.of("boolean",value);
@@ -144,8 +164,15 @@ final class PdkValidationModelVersion {
                             if(entry.getValue()!=null&&!(entry.getValue() instanceof Number))throw invalid("documentStatistic");
                             value(entry.getValue(),depth+1);continue;
                         }
-                        charge(64L);text(key);sorted.put(key,value(entry.getValue(),depth+1,
-                                slot==Slot.NAMED_FIELDS?Slot.NAMED_FIELD:Slot.VALUE));
+                        charge(64L);
+                        text(key);
+                        Object attribute = entry.getValue();
+                        var property = value(attribute,depth+1,slot==Slot.NAMED_FIELDS?Slot.NAMED_FIELD:Slot.VALUE);
+                        // Numeric storage size is a live observation. Other extension properties
+                        // can describe table structure and remain part of the saved binding.
+                        if (structuralScope && slot == Slot.TABLE_ATTRIBUTES && key.equals("storageSize")
+                                && (attribute == null || attribute instanceof Number)) continue;
+                        sorted.put(key, property);
                     }
                     return List.of("map",sorted);
                 }
