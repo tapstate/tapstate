@@ -74,8 +74,12 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
      */
     public record Sweep(int rows, long pageMillis, long passMillis) implements java.io.Serializable {
 
-        /** A page of rows a second, and a pass over them a minute after the last. */
-        public static final Sweep DEFAULT = new Sweep(200, 1_000, 60_000);
+        /**
+         * Four pages of a thousand rows a second, and a pass a minute after the last. A pass also counts
+         * what the step holds, and at a page of two hundred a second a state of a few million entries was
+         * never counted once: a pass took hours and starts over whenever the step does.
+         */
+        public static final Sweep DEFAULT = new Sweep(1_000, 250, 60_000);
 
         public Sweep {
             if (rows < 1 || pageMillis < 0 || passMillis < 0) {

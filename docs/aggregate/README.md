@@ -150,7 +150,8 @@ For each input row it keeps:
   `count_distinct`. A retracted maximum cannot be undone from a total.
 
 That is **2 + m entries per input row**, where m is the number of such fields, plus one entry per group.
-The example above keeps 4 per row.
+The example above keeps 4 per row. A row that fails `where:` is in no group but is still remembered, with
+one entry, so that the step knows it has seen it.
 
 **The state holds the input's values**: the group names, the summed amounts, the values ordered for
 `max` and `last`. Treat the state store as you treat the source data.
@@ -163,7 +164,8 @@ change that removed it a second time, and is then forgotten.
 - Applying a pipeline states the cost before anything runs: `aggregate.state-estimate` gives the entries
   per row and the total for the rows the inputs were discovered to hold. When an input reports no row
   count, `aggregate.state-estimate-unsized` gives the cost per row and no total.
-- `explain <pipeline>` shows the same estimate beside what the running step last counted.
+- `explain <pipeline>` shows the same estimate beside what the running step last counted. It answers
+  once the pipeline is running.
 - All changes to one group are applied by one worker, in order. Many changes to the same group in a
   short time are folded into one write, but a step with very few groups (or none) cannot spread its work.
 
@@ -185,9 +187,10 @@ Per step, in the pipeline's status and metrics. Nothing is reported per group.
 | `aggregateStateWrites.<step>` | `tapstate.pipeline.aggregate.state.writes` | commits to state since the step started |
 | `aggregateOrderConflicts.<step>` | `tapstate.pipeline.aggregate.order_conflicts` | input events not applied since the step started |
 
-The first six are counted by a pass over the step's state and are as of the last pass that finished. On
-a large state a pass takes a while, and until the first one finishes they are absent. Absent means not
-measured yet, not zero. `aggregateOrderConflicts` is absent until there is one.
+The first six are counted by a pass over the step's state and are as of the last pass that finished. A
+pass reads about 4,000 entries a second, so a state of five million entries is counted in about twenty
+minutes, and a pass starts over when the step restarts. Until the first one finishes they are absent.
+Absent means not measured yet, not zero. `aggregateOrderConflicts` is absent until there is one.
 
 Inputs divided by state writes says how many changes one write absorbs. A number of tombstones that only
 grows says the source's replay position is not advancing.
@@ -203,7 +206,9 @@ aggregate <pipeline-id> <step> --group region=EU,day=2026-03-01 check one group
 aggregate <pipeline-id> <step> --group region=EU,day=2026-03-01 --repair
 ```
 
-`--group` names every `groupBy` field; a name with no `=value` is the null of that column. Over HTTP the
+`--group` names every `groupBy` field; a name with no `=value` is the null of that column. A date is
+written as `2026-03-01`. When the step holds no group of that name the answer says so, and a repair of
+it writes and sends nothing. Over HTTP the
 same two actions are `POST /api/pipelines/{id}/aggregates/{step}:check` and `:repair`, with an optional
 body `{ "group": { "<name>": "<value>" }, "after": "<cursor>" }`.
 
