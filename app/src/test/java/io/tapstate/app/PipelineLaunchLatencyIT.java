@@ -143,6 +143,8 @@ class PipelineLaunchLatencyIT {
                                         assertThat(row.getList("lines",org.bson.Document.class)).hasSize(1)
                                                 .allSatisfy(line -> assertThat(line).containsEntry("parent_id",1L));
                                     });
+                                    assertThat(barrier.blocked.get()).isTrue();
+                                    assertThat(barrier.prematureExit.get()).isFalse();
                                     System.out.println("INDEPENDENT_TARGET_ROW_VISIBLE_MS "
                                             + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
                                 }
@@ -158,6 +160,8 @@ class PipelineLaunchLatencyIT {
     private static final class PositionReadBarrier implements AutoCloseable {
         final CountDownLatch entered = new CountDownLatch(1);
         final CountDownLatch release = new CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicBoolean blocked = new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.concurrent.atomic.AtomicBoolean prematureExit = new java.util.concurrent.atomic.AtomicBoolean();
         final java.lang.reflect.Field field;
         final io.tapstate.runtime.scheduler.ObservationPublisher publisher;
         final Object original;
@@ -169,10 +173,10 @@ class PipelineLaunchLatencyIT {
             var delegate=(java.util.function.Function<String,Map<String,String>>)original;
             field.set(publisher,(java.util.function.Function<String,Map<String,String>>) id -> {
                 if(id.equals(pipeline)) {
-                    entered.countDown();
-                    try {
-                        if(!release.await(100,TimeUnit.SECONDS))throw new AssertionError("position barrier was not released");
-                    } catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
+                    blocked.set(true);entered.countDown();
+                    try { release.await(); }
+                    catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
+                    finally {if(release.getCount()!=0)prematureExit.set(true);blocked.set(false);}
                 }
                 return delegate.apply(id);
             });

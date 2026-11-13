@@ -27,7 +27,7 @@ final class InProcessServer implements ServerHandle {
      * The scheduled pass that republishes every pipeline's observation, as the scheduler renders it:
      * a scheduled method's string form is its declaring class and method name.
      */
-    private static final String PUBLISHING_PASS = "io.tapstate.app.ConvergenceDriver.reconcile";
+    private static final String PUBLISHING_PASS = "io.tapstate.app.ConvergenceDriver.schedule";
 
     private final ConfigurableApplicationContext context;
     private final URI baseUrl;
@@ -187,7 +187,11 @@ final class InProcessServer implements ServerHandle {
                 for (ScheduledTask task : holder.getScheduledTasks()) {
                     // The runnable is wrapped by the scheduler; its rendering names the scheduled method.
                     if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable()))) {
-                        stoppedPublishers.add(task.getTask().getRunnable());task.cancel();
+                        Runnable scheduled = task.getTask().getRunnable();
+                        Object driver = owner.getBean("convergenceDriver");
+                        stoppedPublishers.add(synchronousPublishingPass(driver));
+                        task.cancel();
+                        awaitPublishingIdle(driver);
                         cancelled++;
                     }
                 }
@@ -198,18 +202,68 @@ final class InProcessServer implements ServerHandle {
 
     /** The real scheduled pass, for a case that controls its storage interleaving. */
     Runnable publishingObservations() {
-        var passes = new java.util.ArrayList<Runnable>();
+        var passes = new java.util.ArrayList<Object>();
         for (var owner : refreshedContexts) {
             if (!owner.isActive() || !belongsToThisServer(owner)) continue;
             for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values()) {
                 for (ScheduledTask task : holder.getScheduledTasks()) {
                     if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
-                        passes.add(task.getTask().getRunnable());
+                        passes.add(owner.getBean("convergenceDriver"));
                 }
             }
         }
         if (passes.size() != 1) throw new AssertionError("expected one native convergence pass: " + passes.size());
-        return passes.getFirst();
+        return synchronousPublishingPass(passes.getFirst());
+    }
+
+    /** The real publisher in this server's scheduled business context, for a scoped read barrier. */
+    Object observationPublisher() {
+        var publishers = new java.util.ArrayList<Object>();
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values())
+                for (ScheduledTask task : holder.getScheduledTasks())
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        publishers.add(owner.getBean("observationPublisher"));
+        }
+        if (publishers.size() != 1) throw new AssertionError("expected one native publisher: " + publishers.size());
+        return publishers.getFirst();
+    }
+
+    /** Test-only mutation access; no production setting admits a serial worker pool. */
+    java.util.concurrent.ThreadPoolExecutor convergenceWorkers() {
+        for (var owner : refreshedContexts) {
+            if (!owner.isActive() || !belongsToThisServer(owner)) continue;
+            for (ScheduledTaskHolder holder : owner.getBeansOfType(ScheduledTaskHolder.class).values())
+                for (ScheduledTask task : holder.getScheduledTasks())
+                    if (PUBLISHING_PASS.equals(String.valueOf(task.getTask().getRunnable())))
+                        return (java.util.concurrent.ThreadPoolExecutor) field(field(owner.getBean("convergenceDriver"),"passes"),"workers");
+        }
+        throw new AssertionError("no convergence worker pool belongs to this server");
+    }
+
+    private static Runnable synchronousPublishingPass(Object driver) {
+        var method = org.springframework.util.ReflectionUtils.findMethod(driver.getClass(),"reconcile");
+        if (method == null) throw new AssertionError("the native synchronous pass is missing");
+        org.springframework.util.ReflectionUtils.makeAccessible(method);
+        return () -> {
+            awaitPublishingIdle(driver);
+            org.springframework.util.ReflectionUtils.invokeMethod(method,driver);
+        };
+    }
+
+    private static void awaitPublishingIdle(Object driver) {
+        var scanning = (java.util.concurrent.atomic.AtomicBoolean) field(driver,"scanning");
+        var active = (java.util.Set<?>) field(field(driver,"passes"),"active");
+        Await.until("all cancelled publishing work to finish",java.time.Duration.ofSeconds(30),
+                () -> !scanning.get() && active.isEmpty(),() -> "active Pipeline passes=" + active);
+    }
+
+    private static Object field(Object owner,String name) {
+        var field = org.springframework.util.ReflectionUtils.findField(owner.getClass(),name);
+        if (field == null) throw new AssertionError("missing native field " + name);
+        org.springframework.util.ReflectionUtils.makeAccessible(field);
+        return org.springframework.util.ReflectionUtils.getField(field,owner);
     }
 
     private boolean belongsToThisServer(ConfigurableApplicationContext candidate) {

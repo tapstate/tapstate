@@ -49,10 +49,10 @@ import org.springframework.context.event.EventListener;
  * shorter than the lease, so the window closes before the lease it was cut from could expire. The
  * interval is measured on the monotonic clock, so moving the node's wall clock cannot widen it.
  *
- * <p>Two threads use the claims. The convergence pass acquires them, advances them for each run and judges
- * the runs under them; {@link #renewDue()}, on a renewer of its own, keeps every held claim's lease running.
- * The pass is one thread over every pipeline this member drives, and a single start can hold it for longer
- * than a lease: renewed only from the pass, every claim the member held ran out behind one slow start and
+ * <p>Convergence workers acquire claims, advance them for each run and judge the runs under them;
+ * {@link #renewDue()}, on a renewer of its own, keeps every held claim's lease running. Each pipeline has
+ * one pass at a time while independent pipelines may progress concurrently. A single start can outlast
+ * a lease: renewed only from the pass, every claim the member held ran out behind one slow start and
  * was taken over from a member that was still there. Everything here synchronizes on this object, so a
  * renewal always carries the claim the pass last moved -- the store matches a renewal on the claim's exact
  * generations, and one sent with a claim the pass has just advanced past would read as the claim lost. The
