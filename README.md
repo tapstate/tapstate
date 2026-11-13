@@ -108,6 +108,13 @@ transforms:
         - { from: shipment, on: { order_id: id }, as: array, path: shipments, arrayKey: [ id ] }
 ```
 
+Two settings matter when you nest your own tables. A PostgreSQL table
+you embed needs `REPLICA IDENTITY FULL`, or a deleted row stays in the
+document ([why](docs/quickstart-online.md#5-author-the-resources)). And
+if a row can move to another parent (a shipment's `order_id` is edited,
+say), switch on `trackKeyChanges`, which is off by default; see
+[Structural key changes](docs/nest/structural-key-changes.md).
+
 A nest emits a final-state changelog: a target upserted by key always
 converges to the current document, but not every intermediate version
 is guaranteed to be visible. Before sizing a large or fan-out-heavy
