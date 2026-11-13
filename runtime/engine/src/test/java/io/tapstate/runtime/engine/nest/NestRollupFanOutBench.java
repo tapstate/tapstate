@@ -80,6 +80,76 @@ class NestRollupFanOutBench {
         System.out.println(String.join(System.lineSeparator(), lines));
     }
 
+    /**
+     * State bytes per element at the row widths real profile and wallet documents carry, and so how many elements
+     * a document holds before it meets the per-document element limit (20,000 by default) and before its stored
+     * state outgrows one MongoDB document (16 MB). Synthetic rows shaped like a contact address (about thirty
+     * columns), a play session (a dozen, with times and decimal wins) and a points movement (a dozen integers).
+     */
+    @Test
+    void stateBytesPerElementAtRealisticRowWidths() throws IOException {
+        int n = 1_000;
+        System.out.println(String.format("%-16s %8s %12s %18s %18s", "row", "columns", "bytes/elem",
+                "elements to 16 MB", "render 1 field ms"));
+        for (String shape : List.of("address", "session", "points")) {
+            NestTopology topology = topology("rollup-1");
+            List<String> path = List.of(topology.slots().getFirst().stateField());
+            RootAssembly root = new RootAssembly();
+            root.applyRoot(Map.of("id", 1L), at(1));
+            long empty = bytes(root);
+            for (long i = 0; i < n; i++) {
+                Map<String, Object> row = realistic(shape, i);
+                root.applyElement(new ElementRef(path, null, List.of(i), i), row, at(2 + i), noPositions());
+            }
+            double perElement = (bytes(root) - empty) / (double) n;
+            double[] render = time(() -> root.render(topology.slots(), Map.of(), "1"));
+            System.out.println(String.format("%-16s %8d %12.0f %18.0f %18.3f", shape, realistic(shape, 0).size(),
+                    perElement, 16_000_000 / perElement, render[0]));
+        }
+    }
+
+    private static Map<String, Object> realistic(String shape, long i) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("id", i);
+        row.put("root_id", 1L);
+        row.put("amount", i % 97);
+        row.put("kind", i % 3 == 0 ? "reward" : "cash");
+        row.put("ts", 1_700_000_000L + i);
+        java.time.LocalDateTime when = java.time.LocalDateTime.of(2026, 3, 1, 10, 0).plusMinutes(i);
+        switch (shape) {
+            case "address" -> {
+                for (String f : List.of("Line1", "Line2", "Suburb", "City", "State", "ZipCode", "ZipPlus",
+                        "Description", "XRef", "Abrv2", "Abrv3", "CountryDescription", "GovtIDFormat", "PhoneFormat",
+                        "ZipFormat", "Mailing", "Verified", "Credit", "Bad", "Validate", "DisplayDefault", "Status")) {
+                    row.put(f, f.length() > 6 ? "Synthetic " + f + " value " + i : "Y");
+                }
+                row.put("CountryID", 36L);
+                row.put("TypeID", 1L);
+                row.put("AddressVersionID", 8L);
+                row.put("XLastUpdated", when);
+            }
+            case "session" -> {
+                row.put("site_id", 1L);
+                row.put("game_id", 1000L + i % 50);
+                row.put("area", "Slots - Zone " + i % 7);
+                row.put("started_at", when);
+                row.put("ended_at", when.plusMinutes(45));
+                row.put("theo_win", new java.math.BigDecimal("825.93"));
+                row.put("actual_win", new java.math.BigDecimal("6.6666"));
+                row.put("coin_in", new java.math.BigDecimal("1250.00"));
+                row.put("status", "A");
+            }
+            default -> {
+                for (String f : List.of("bucket_group", "game_pts", "base_pts", "bonus_pts", "adj_cr", "adj_dr",
+                        "redeem_pts", "expire_pts", "site_id", "tran_code")) {
+                    row.put(f, i % 500);
+                }
+                row.put("post_dtm", when);
+            }
+        }
+        return row;
+    }
+
     private static Map<String, Object> item(long id, long amount) {
         Map<String, Object> row = new LinkedHashMap<>();
         row.put("id", id);
