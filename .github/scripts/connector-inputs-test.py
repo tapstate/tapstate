@@ -36,7 +36,7 @@ class ConnectorInputsTest(unittest.TestCase):
 
     def downloaded(self, command, **options):
         patterns = [command[i + 1] for i, argument in enumerate(command[:-1]) if argument == '--pattern']
-        expected = {name + '-connector.jar' for name in INPUTS.IDS} | {entry['name'] for entry in self.fixture.license_files}
+        expected = {path.name for path in self.jars.glob('*.jar')} | {entry['name'] for entry in self.fixture.license_files}
         self.assertEqual(set(patterns), expected)
         self.assertEqual(command[:4], ['gh', 'release', 'download', 'connectors-preview'])
         destination = Path(command[command.index('--dir') + 1])
@@ -74,14 +74,29 @@ class ConnectorInputsTest(unittest.TestCase):
             INPUTS.prepare_release(output, self.lock, self.sha)
 
     def test_exact_shipping_set_passes_without_weakening_cloud_bundle(self):
-        self.assertEqual(len(INPUTS.verify(self.manifest, self.jars, self.lock, self.sha, 'release')['connectors']), 7)
+        verified = INPUTS.verify(self.manifest, self.jars, self.lock, self.sha, 'release')
+        ids = {entry['id'] for entry in verified['connectors']}
+        self.assertEqual(len(ids), 8)
+        self.assertIn('dummy', ids)
+        self.assertNotIn('db2', ids)
         with self.assertRaises(FIXTURES.MODULE.StageError):
             FIXTURES.MODULE.stage(self.lock, self.jars, self.fixture.staged)
 
+    def test_upstream_keeps_the_existing_seven_inputs(self):
+        with self.assertRaisesRegex(ValueError, 'unclassified connector jar: dummy-connector.jar'):
+            INPUTS.record(self.jars, 'upstream', self.lock, self.sha)
+        (self.jars / 'dummy-connector.jar').unlink()
+        value = INPUTS.record(self.jars, 'upstream', self.lock, self.sha)
+        self.assertEqual({entry['id'] for entry in value['connectors']},
+                         {'mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver', 'mongodb-atlas', 'aws-rds-mysql'})
+        INPUTS.validate_identity(value, self.lock, self.sha, 'upstream')
+        with self.assertRaisesRegex(ValueError, 'connector input set differs'):
+            INPUTS.record(self.jars, 'release', self.lock, self.sha)
+
     def test_mutated_release_asset_fails_instead_of_becoming_an_upstream_input(self):
-        with (self.jars / 'mysql-connector.jar').open('ab') as stream:
+        with (self.jars / 'dummy-connector.jar').open('ab') as stream:
             stream.write(b'changed asset under the same tag')
-        with self.assertRaisesRegex(INPUTS.stage.StageError, 'bytes differ'):
+        with self.assertRaisesRegex(INPUTS.stage.StageError, 'dummy: JAR bytes differ'):
             INPUTS.verify(self.manifest, self.jars, self.lock, self.sha, 'release')
 
     def test_missing_asset_and_duplicate_variants_fail(self):

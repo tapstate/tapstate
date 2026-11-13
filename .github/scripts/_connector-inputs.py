@@ -12,7 +12,8 @@ import tempfile
 import zipfile
 
 sys.dont_write_bytecode = True
-IDS = frozenset({'mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver', 'mongodb-atlas', 'aws-rds-mysql'})
+UPSTREAM_IDS = frozenset({'mysql', 'mongodb', 'postgres', 'oracle', 'sqlserver', 'mongodb-atlas', 'aws-rds-mysql'})
+RELEASE_IDS = UPSTREAM_IDS | {'dummy'}
 RELEASE = 'connectors-preview'
 ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('stage', ROOT / 'deploy/cloud/stage-connectors.py')
@@ -31,13 +32,14 @@ def digest(path):
 
 
 def identify(directory, mode, lock):
+    ids = RELEASE_IDS if mode == 'release' else UPSTREAM_IDS
     entries, licenses = stage.read_lock(lock)
-    expected = {entry['id']: entry for entry in entries if entry['id'] in IDS}
-    require(set(expected) == IDS, 'release lock does not cover the seven witness connectors')
+    expected = {entry['id']: entry for entry in entries if entry['id'] in ids}
+    require(set(expected) == ids, 'release lock does not cover the selected connectors')
     files = sorted(directory.glob('*.jar'))
     selected = {}
     for path in files:
-        candidates = [name for name in IDS if path.name == name + '-connector.jar'
+        candidates = [name for name in ids if path.name == name + '-connector.jar'
                       or path.name.startswith(name + '-connector-')]
         require(len(candidates) == 1, 'unclassified connector jar: ' + path.name)
         name = candidates[0]
@@ -52,7 +54,7 @@ def identify(directory, mode, lock):
         selected[name] = dict(id=name, file=path.name, bytes=size, sha256=sha,
                               pdkApiVersion=headers.get('PDK-API-Version'),
                               upstreamRevision=headers.get('Git-Commit-Id'))
-    require(set(selected) == IDS, 'connector input set differs from the seven witness connectors')
+    require(set(selected) == ids, 'connector input set differs from the selected connectors')
     if mode == 'release':
         for entry in licenses:
             stage.verify_companion_license(directory / entry['name'], entry)
@@ -74,15 +76,16 @@ def validate_identity(value, lock, source_sha, mode):
     require(type(value['schema']) is int and value['schema'] == 1 and value['mode'] == mode and value['source_sha'] == source_sha,
             'connector input selection or host revision differs')
     require(mode in {'upstream', 'release'}, 'unknown input mode')
+    ids = RELEASE_IDS if mode == 'release' else UPSTREAM_IDS
     entries, _ = stage.read_lock(lock)
     locked = {entry['id']: entry for entry in entries}
-    require(isinstance(value['connectors'], list) and len(value['connectors']) == len(IDS), 'incomplete connector identity')
+    require(isinstance(value['connectors'], list) and len(value['connectors']) == len(ids), 'incomplete connector identity')
     seen = set()
     for entry in value['connectors']:
         require(isinstance(entry, dict) and set(entry) == {'id', 'file', 'bytes', 'sha256', 'pdkApiVersion', 'upstreamRevision'},
                 'invalid connector identity entry')
         name = entry['id']
-        require(name in IDS and name not in seen, 'duplicate or unknown connector identity')
+        require(name in ids and name not in seen, 'duplicate or unknown connector identity')
         seen.add(name)
         require(Path(entry['file']).name == entry['file'] and entry['file'].endswith('.jar'), 'invalid connector file name')
         require(type(entry['bytes']) is int and entry['bytes'] > 0, 'invalid connector byte length')
@@ -112,7 +115,7 @@ def prepare_release(directory, lock, source_sha):
         downloaded = Path(temporary)
         command = ['gh', 'release', 'download', RELEASE, '--repo', 'tapstate/tapstate', '--dir', str(downloaded)]
         for entry in entries:
-            if entry['id'] in IDS:
+            if entry['id'] in RELEASE_IDS:
                 command += ['--pattern', entry['id'] + '-connector.jar']
         for entry in licenses:
             command += ['--pattern', entry['name']]

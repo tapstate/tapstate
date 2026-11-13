@@ -42,8 +42,8 @@ and not a bar applied to you.)
 
 The Real connectors workflow runs the same ten witness shards with two input policies:
 
-- **Fixed shipping inputs:** manually dispatch with `connector-inputs=release`. It downloads the seven
-  connector witness assets from `connectors-preview`, verifies their size, SHA-256, manifest and
+- **Fixed shipping inputs:** manually dispatch with `connector-inputs=release`. It downloads eight
+  connector assets, including Dummy, from `connectors-preview`, verifies their size, SHA-256, manifest and
   specification against `deploy/cloud/connectors.lock.json`, and reports `real-connectors-release`.
   Every shard and the aggregate must agree on the actual input identities. A missing or changed
   asset fails; the workflow does not substitute an upstream build. The Cloud image staging path
