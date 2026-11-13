@@ -49,9 +49,23 @@ def require_completeness_before_dev(workflow):
     assert holder in ancestors(jobs, "cloud-dev"), (
         f"distribution-completeness gate ({holder}) must succeed before Cloud dev publication"
     )
-    # With default success conditions, a failed or skipped prerequisite blocks its descendants.
+    # The v0.8.0 exception only admits an intentionally skipped gates job.
+    draft_condition = re.search(r"(?m)^    if: >-\n((?:^      .+\n)+)", jobs["draft"] + "\n")
+    assert draft_condition is not None
+    assert " ".join(draft_condition.group(1).split()) == (
+        "${{ !cancelled() && needs.version.result == 'success' "
+        "&& needs.cli-native.result == 'success' && needs.server-image.result == 'success' "
+        "&& (needs.gates.result == 'success' || (needs.version.outputs.skip_cloud_image_and_gates == 'true' "
+        "&& needs.gates.result == 'skipped')) }}"
+    ), "only the v0.8.0 gates skip may bypass default prerequisite blocking"
+    assert re.search(
+        r"^        if: steps.next.outputs.tag == 'v0\.8\.0' && inputs.commit == '' "
+        r"&& github.ref == format\('refs/heads/\{0\}', github.event.repository.default_branch\)$",
+        jobs["version"], re.MULTILINE,
+    ), "the exception must be scoped to the v0.8.0 default-branch dispatch"
     for name in ancestors(jobs, "publish") | {"publish"}:
-        assert not re.search(r"^    (?:if|continue-on-error):", jobs[name], re.MULTILINE), (
+        condition = r"^    continue-on-error:" if name == "draft" else r"^    (?:if|continue-on-error):"
+        assert not re.search(condition, jobs[name], re.MULTILINE), (
             f"{name} must not override failed-prerequisite blocking"
         )
     assert "cloud-dev" in ancestors(jobs, "approve")
