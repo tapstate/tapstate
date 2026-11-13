@@ -6,6 +6,7 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "release.yml"
+CLI_WORKFLOW = WORKFLOW.with_name("cli-native.yml")
 
 
 def jobs_of(workflow):
@@ -49,27 +50,20 @@ def require_completeness_before_dev(workflow):
     assert holder in ancestors(jobs, "cloud-dev"), (
         f"distribution-completeness gate ({holder}) must succeed before Cloud dev publication"
     )
-    # The v0.8.0 exception only admits an intentionally skipped gates job.
-    draft_condition = re.search(r"(?m)^    if: >-\n((?:^      .+\n)+)", jobs["draft"] + "\n")
-    assert draft_condition is not None
-    assert " ".join(draft_condition.group(1).split()) == (
-        "${{ !cancelled() && needs.version.result == 'success' "
-        "&& needs.cli-native.result == 'success' && needs.server-image.result == 'success' "
-        "&& (needs.gates.result == 'success' || (needs.version.outputs.skip_cloud_image_and_gates == 'true' "
-        "&& needs.gates.result == 'skipped')) }}"
-    ), "only the v0.8.0 gates skip may bypass default prerequisite blocking"
-    assert re.search(
-        r"^        if: steps.next.outputs.tag == 'v0\.8\.0' && inputs.commit == '' "
-        r"&& github.ref == format\('refs/heads/\{0\}', github.event.repository.default_branch\)$",
-        jobs["version"], re.MULTILINE,
-    ), "the exception must be scoped to the v0.8.0 default-branch dispatch"
-    for name in ancestors(jobs, "publish") | {"publish"}:
-        condition = r"^    continue-on-error:" if name == "draft" else r"^    (?:if|continue-on-error):"
-        assert not re.search(condition, jobs[name], re.MULTILINE), (
+    for name in ancestors(jobs, "cloud-ghcr") | {"cloud-ghcr"}:
+        assert not re.search(r"^    (?:if|continue-on-error):", jobs[name], re.MULTILINE), (
             f"{name} must not override failed-prerequisite blocking"
         )
+    assert {"cloud-image", "gates"} <= ancestors(jobs, "draft")
     assert "cloud-dev" in ancestors(jobs, "approve")
-    assert "approve" in ancestors(jobs, "publish")
+    assert {"approve", "publish"} <= ancestors(jobs, "cloud-ghcr")
+
+
+def steps_guarded_by(job, condition):
+    return {
+        name for name, guard in re.findall(r"^      - name: (.+)\n        if: (.+)$", job, re.MULTILINE)
+        if guard == condition
+    }
 
 
 class CloudDevReleaseGatesTest(unittest.TestCase):
@@ -78,6 +72,41 @@ class CloudDevReleaseGatesTest(unittest.TestCase):
 
     def test_a_failed_distribution_check_blocks_dev_and_approval(self):
         require_completeness_before_dev(self.workflow)
+
+    def test_v080_exception_guards_only_release_test_steps(self):
+        jobs = jobs_of(self.workflow)
+        self.assertIn(
+            "        if: steps.next.outputs.tag == 'v0.8.0' && inputs.commit == '' "
+            "&& github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+            jobs["version"],
+        )
+        self.assertIn("      skip_release_tests: ${{ steps.v080-exception.outputs.enabled }}", jobs["version"])
+        guarded = {
+            job: steps_guarded_by(body, "needs.version.outputs.skip_release_tests != 'true'")
+            for job, body in jobs.items()
+        }
+        self.assertEqual({job: steps for job, steps in guarded.items() if steps}, {
+            "cloud-image": {
+                "install the local OCI archive importer",
+                "run both checked images with their real Boot entrypoints",
+            },
+            "connectors": {"start the real-connector lane on the commit being released"},
+            "join-perf": {"start the join performance lane on the commit being released"},
+            "gates": {
+                "The gates still decide the way they are supposed to",
+                "6. the real-connector lane is green on this commit",
+                "8. the join performance lane is green on this commit",
+            },
+        })
+        self.assertIn("      skip-release-tests: ${{ needs.version.outputs.skip_release_tests == 'true' }}",
+                      jobs["cli-native"])
+        cli = CLI_WORKFLOW.read_text()
+        self.assertIn("      skip-release-tests:\n        type: boolean\n        default: false\n", cli)
+        self.assertEqual(
+            steps_guarded_by(jobs_of(cli)["cli-native"], "github.event_name == 'pull_request' || !inputs.skip-release-tests"),
+            {"native smoke (black-box against the produced binary, offline + online)",
+             "MCP stdio smoke (Boot JAR sidecar)"},
+        )
 
     def test_removing_the_completeness_dependency_is_detected(self):
         mutated = re.sub(r"(  cloud-dev:\n.*?^    needs:) [^\n]+", r"\1 [version, gates]",
