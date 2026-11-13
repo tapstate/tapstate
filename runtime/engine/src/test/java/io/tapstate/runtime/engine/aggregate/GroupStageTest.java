@@ -318,6 +318,23 @@ class GroupStageTest {
     }
 
     @Test
+    void aGroupTheStepDoesNotHoldIsAbsentAndARepairOfItWritesAndSendsNothing() {
+        CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
+        GroupStage stage = new GroupStage(SPEC, store);
+        stage.apply(threeOrders());
+        int commits = store.commits;
+
+        assertThat(stage.holds(List.of("EU"))).isTrue();
+        assertThat(stage.holds(List.of("XX"))).isFalse();
+        assertThat(stage.check(List.of("XX"), 1000).verdict()).isEqualTo(GroupStage.Verdict.ABSENT);
+        GroupStage.Audit repair = stage.repair(List.of("XX"), 1000);
+
+        assertThat(repair.verdict()).isEqualTo(GroupStage.Verdict.ABSENT);
+        assertThat(repair.outcome()).as("nothing to send: a delete here would remove a target row on a name alone").isNull();
+        assertThat(store.commits).isEqualTo(commits);
+    }
+
+    @Test
     void aGroupTooLargeToHoldIsInconclusiveAndNothingIsWritten() {
         CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
         GroupStage stage = new GroupStage(SPEC, store);

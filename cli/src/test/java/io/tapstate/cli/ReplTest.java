@@ -5471,6 +5471,23 @@ class ReplTest {
     }
 
     @Test
+    void aGroupTheStepDoesNotHoldIsSaidToBeAbsentAndNotCompared() {
+        // Printed as "1 group compared, 0 differ", a name the step does not hold read as a clean group.
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, String> group = new java.util.LinkedHashMap<>();
+        group.put("region", "XX");
+        client.aggregateOutcomes.add(new AggregateCheckOutcome.Found(1,
+                List.of(new AggregateCheckOutcome.Finding(group, "absent", List.of(), null, null)), null, 0, 0));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("aggregate pl1 by_region --group region=XX --repair")).isTrue();
+
+        assertThat(h.sink().toString().substring(mark)).contains("holds no group region=XX")
+                .contains("nothing was written or sent").doesNotContain("written again").doesNotContain("matches its rows");
+    }
+
+    @Test
     void aggregateRefusesAnArgumentItDoesNotKnow() {
         // A misspelt --repair must not become a check reported as done.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));

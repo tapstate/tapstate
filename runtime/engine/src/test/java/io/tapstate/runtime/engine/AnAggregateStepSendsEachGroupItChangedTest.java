@@ -335,6 +335,13 @@ class AnAggregateStepSendsEachGroupItChangedTest {
             assertThat(repaired.findings()).singleElement()
                     .satisfies(finding -> assertThat(finding.fields()).containsExactly("(rows)", "orders", "revenue"));
 
+            AggregateRequests.Report unknown = ask(AggregateRequests.Request.one(AggregateRequests.Action.REPAIR, Map.of("region", "XX")));
+            assertThat(unknown.findings()).singleElement()
+                    .satisfies(finding -> assertThat(finding.verdict()).isEqualTo("absent"));
+            AggregateRequests.Report settled = ask(AggregateRequests.Request.page(AggregateRequests.Action.CHECK, null, 10));
+            assertThat(settled.groups()).isEqualTo(2);
+            assertThat(lastPerGroup()).as("a repair of a group the step does not hold sends nothing").doesNotContainKey("XX");
+
             AggregateRequests.Report refused = ask(AggregateRequests.Request.one(AggregateRequests.Action.CHECK, Map.of("country", "EU")));
             assertThat(refused.refusal()).isEqualTo("aggregate.group-invalid");
             assertThat(refused.refusalArgs()).containsEntry("step", "by_region");

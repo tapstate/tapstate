@@ -75,8 +75,8 @@ public final class AggregateRequests {
      * One group that was not simply clean.
      *
      * @param group       the group, as the text of each of its key values by name
-     * @param verdict     {@code mismatch} or {@code inconclusive}; {@code clean} only for a group listed
-     *                    because it cannot be given
+     * @param verdict     {@code mismatch}, {@code inconclusive} or {@code absent}; {@code clean} only for a
+     *                    group listed because it cannot be given
      * @param fields      the fields whose derived state differed from the group's rows
      * @param failure     the code under which the group cannot be given exactly now, or null
      * @param failedField the field that code is about, or null

@@ -4537,6 +4537,13 @@ final class Repl {
             List<AggregateCheckOutcome.Finding> findings, long conflicts, long withheld) {
         long differing = findings.stream().filter(finding -> finding.verdict().equals("mismatch")).count();
         long undecided = findings.stream().filter(finding -> finding.verdict().equals("inconclusive")).count();
+        if (groups == 1 && findings.size() == 1 && findings.getFirst().verdict().equals("absent")) {
+            out.println(step + ": the step holds no group " + groupShown(findings.getFirst().group())
+                    + "; nothing was " + (repair ? "written or sent" : "compared"));
+            out.println("A group is named by the values its rows were grouped by. List the groups with a check of every group.");
+            out.flush();
+            return;
+        }
         out.println(step + ": " + groups + (groups == 1 ? " group " : " groups ") + (repair ? "written again from " : "compared with ")
                 + (groups == 1 ? "its" : "their") + " rows, " + differing + (repair ? " had differed" : (differing == 1 ? " differs" : " differ"))
                 + (undecided == 0 ? "" : ", " + undecided + " too large to decide"));
