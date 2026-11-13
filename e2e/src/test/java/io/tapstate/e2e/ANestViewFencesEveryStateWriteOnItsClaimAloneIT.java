@@ -1,26 +1,34 @@
 package io.tapstate.e2e;
 
 import com.mongodb.client.MongoClients;
+import com.mongodb.client.MongoChangeStreamCursor;
+import com.mongodb.client.model.Aggregates;
+import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.testsupport.DockerGate;
+import org.bson.BsonDocument;
+import org.bson.BsonInt64;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.sql.Connection;
 import java.sql.Statement;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * A NEST view keeps applying changes with the same documents while its state store validates once per
  * claim lease: each state write is fenced by its compare-and-set on the pipeline's claim, and no longer
- * also advances the pipeline state's runtime write fence. Under per-write validation every state write
- * advanced both, so the fence would move at least as often as the claim's write counter.
+ * also advances the pipeline state's runtime write fence in the same transaction.
  */
 class ANestViewFencesEveryStateWriteOnItsClaimAloneIT {
     private static final String PARENTS = "orders";
@@ -28,6 +36,7 @@ class ANestViewFencesEveryStateWriteOnItsClaimAloneIT {
     private static final String VIEW = "order_state";
     private static final String PIPELINE = "lease_fenced_orders";
     private static final int CHANGES = 40;
+    private static final String BARRIER = "nest_write_witness_barrier";
 
     @BeforeAll
     static void requireDockerAndRealConnectors() {
@@ -44,39 +53,67 @@ class ANestViewFencesEveryStateWriteOnItsClaimAloneIT {
             start(server, storage, source);
             NestStateOutlivesARunAndIsDiscardedBetweenThemIT.awaitCustomer(
                     () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW), "customer-0", "the initial assembly");
-            long fenceBefore = runtimeWriteFence(storage);
-            long writesBefore = fencedPipelineWrites(storage);
-
-            for (int change = 1; change <= CHANGES; change++) update(source, "customer-" + change);
-            NestStateOutlivesARunAndIsDiscardedBetweenThemIT.awaitCustomer(
-                    () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW), "customer-" + CHANGES,
-                    "every change to reach the document");
-
-            long fenceMoves = runtimeWriteFence(storage) - fenceBefore;
-            long fencedWrites = fencedPipelineWrites(storage) - writesBefore;
-            assertThat(fencedWrites).as("the state writes for %d changes were fenced on the claim", CHANGES).isPositive();
-            assertThat(fenceMoves * 2).as("state writes (%d) no longer advance the runtime write fence (moved %d)",
-                    fencedWrites, fenceMoves).isLessThan(fencedWrites);
+            try (var client = MongoClients.create(storage.cacheUri())) {
+                var cache = client.getDatabase(storage.cacheDatabase());
+                var watched = Aggregates.match(Filters.in("ns.coll", List.of(BARRIER,
+                        SystemCollections.CACHE_NEST_STATE.collectionName(),
+                        SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName(),
+                        SystemCollections.CACHE_PIPELINE_STATE.collectionName())));
+                try (var changes = cache.watch(List.of(watched)).maxAwaitTime(250, TimeUnit.MILLISECONDS).cursor()) {
+                    for (int change = 1; change <= CHANGES; change++) {
+                        String customer = "customer-" + change;
+                        update(source, customer);
+                        // Each change must land before the next one, so the updates cannot be coalesced.
+                        NestStateOutlivesARunAndIsDiscardedBetweenThemIT.awaitCustomer(
+                                () -> mongo.documents(EndpointAddress.uri(storage.masterUri()), VIEW), customer,
+                                "change " + change + " to reach the document");
+                    }
+                    cache.getCollection(BARRIER).insertOne(new Document("_id", PIPELINE));
+                    assertClaimOnlyTransactions(changes);
+                }
+            }
         }
     }
 
-    private static long runtimeWriteFence(PreparedNativeStore storage) {
-        return cache(storage, SystemCollections.CACHE_PIPELINE_STATE, new Document("_id", PIPELINE)).getLong("runtimeWriteFence");
+    private static void assertClaimOnlyTransactions(MongoChangeStreamCursor<ChangeStreamDocument<Document>> changes) {
+        Set<Transaction> state = new HashSet<>();
+        Set<Transaction> claims = new HashSet<>();
+        Set<Transaction> fences = new HashSet<>();
+        Await.until("the CACHE stream to reach the marker after the observed writes", () -> {
+            ChangeStreamDocument<Document> change;
+            while ((change = changes.tryNext()) != null) {
+                String collection = change.getNamespace().getCollectionName();
+                if (collection.equals(BARRIER)) return true;
+                if (collection.equals(SystemCollections.CACHE_NEST_STATE.collectionName())) {
+                    state.add(transaction(change));
+                } else if (collection.equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())
+                        && updated(change, "fencedPipelineWrites")) {
+                    claims.add(transaction(change));
+                } else if (collection.equals(SystemCollections.CACHE_PIPELINE_STATE.collectionName())
+                        && updated(change, "runtimeWriteFence")) {
+                    fences.add(transaction(change));
+                }
+            }
+            return false;
+        }, () -> "state transactions=" + state.size() + ", claim transactions=" + claims.size()
+                + ", fence transactions=" + fences.size());
+        assertThat(state.size()).as("committed Nest writes for the %d changes", CHANGES).isGreaterThanOrEqualTo(CHANGES);
+        assertThat(claims).as("each Nest write transaction proves the pipeline claim").containsAll(state);
+        assertThat(state).as("no Nest write transaction also advances the runtime write fence")
+                .doesNotContainAnyElementsOf(fences);
     }
 
-    private static long fencedPipelineWrites(PreparedNativeStore storage) {
-        Object counter = cache(storage, SystemCollections.CACHE_WORKLOAD_CLAIMS,
-                new Document("_id.resourceType", "PIPELINE_ACTUATION").append("_id.resourceId", PIPELINE)).get("fencedPipelineWrites");
-        return counter == null ? 0L : ((Number) counter).longValue();
+    private static boolean updated(ChangeStreamDocument<Document> change, String field) {
+        return change.getUpdateDescription() != null && change.getUpdateDescription().getUpdatedFields().containsKey(field);
     }
 
-    private static Document cache(PreparedNativeStore storage, SystemCollections table, Document filter) {
-        try (var client = MongoClients.create(storage.cacheUri())) {
-            Document found = table.on(client.getDatabase(storage.cacheDatabase())).find(filter).first();
-            assertThat(found).as("%s row for %s", table.collectionName(), PIPELINE).isNotNull();
-            return found;
-        }
+    private static Transaction transaction(ChangeStreamDocument<Document> change) {
+        assertThat(change.getLsid()).as("session for %s", change.getNamespace()).isNotNull();
+        assertThat(change.getTxnNumber()).as("transaction number for %s", change.getNamespace()).isNotNull();
+        return new Transaction(change.getLsid(), change.getTxnNumber());
     }
+
+    private record Transaction(BsonDocument session, BsonInt64 number) {}
 
     private static void start(ServerHandle server, PreparedNativeStore storage, Map<String, Object> source) {
         ControlPlane control = new ControlPlane(server.baseUrl());

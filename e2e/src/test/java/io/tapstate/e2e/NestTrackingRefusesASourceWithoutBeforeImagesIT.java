@@ -123,6 +123,7 @@ class NestTrackingRefusesASourceWithoutBeforeImagesIT {
                                 + "changes, rather than let the documents diverge.%n  metrics: %s",
                                 control.metrics(pipelineId))
                         .contains(PipelineState.FAILED);
+                await(() -> control.errorCount(pipelineId).filter(count -> count > 0).isPresent());
                 assertThat(control.errorCount(pipelineId))
                         .as("the failure is counted, not only entered")
                         .contains(1L);
