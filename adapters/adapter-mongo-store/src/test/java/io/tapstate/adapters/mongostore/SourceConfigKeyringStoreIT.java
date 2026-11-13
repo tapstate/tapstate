@@ -422,7 +422,7 @@ class SourceConfigKeyringStoreIT {
         keyrings.loadOrCreateCipher();
         SourceConfigKeyringHandle handle = new SourceConfigKeyringHandle(keyrings);
         MongoWorkloadClaimStore claims = new MongoWorkloadClaimStore(SystemCollections.WORKLOAD_CLAIMS.on(database));
-        Duration ttl = Duration.ofMillis(250);
+        Duration ttl = Duration.ofMinutes(1);
         WorkloadClaim crashed = nodeSession(claims, "node-crashed", "boot-crashed", ttl);
         handle.acknowledge(crashed, ttl);
         handle.prepareRotation();
@@ -432,7 +432,17 @@ class SourceConfigKeyringStoreIT {
                         error -> assertThat(error.code())
                                 .isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED));
 
-        Thread.sleep(500);
+        // Advance only this fixture's persisted leases after proving the live-node barrier.
+        var acknowledgements = SystemCollections.SYSTEM_META.on(database);
+        assertThat(acknowledgements.updateOne(new Document("_id", acknowledgement(database, "node-crashed").get("_id")),
+                new Document("$set", new Document("leaseUntil", new Date(0)))).getMatchedCount()).isEqualTo(1);
+        assertThatThrownBy(handle::activatePrepared)
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_ROTATION_BLOCKED));
+        assertThat(SystemCollections.WORKLOAD_CLAIMS.on(database).updateOne(
+                new Document("_id", MongoWorkloadClaimStore.id(crashed.key()))
+                        .append("ownerBootId", crashed.owner().bootId()).append("claimGeneration", crashed.claimGeneration()),
+                new Document("$set", new Document("leaseUntil", new Date(0)))).getMatchedCount()).isEqualTo(1);
         assertThat(handle.activatePrepared()).isEqualTo(3);
     }
 
