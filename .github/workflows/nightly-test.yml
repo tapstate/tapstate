@@ -1,0 +1,169 @@
+name: Nightly Test
+
+on:
+  schedule:
+    # 01:00 Asia/Shanghai on the next calendar day.
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+    inputs:
+      connector-inputs:
+        description: Connector input policy
+        type: choice
+        options: [upstream, release]
+        default: upstream
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      web-sha: ${{ steps.inputs.outputs.web-sha }}
+      version: ${{ steps.inputs.outputs.version }}
+    steps:
+      - name: Require the default branch for the Cloud build environment
+        if: github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
+        run: |
+          echo "::error::Run Nightly Test from the default branch to access the protected Cloud build inputs."
+          exit 1
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pin the build inputs
+        id: inputs
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+        run: |
+          set -euo pipefail
+          web_branch="$(gh api repos/tapstate/tapstate-web --jq .default_branch)"
+          web_sha="$(gh api "repos/tapstate/tapstate-web/git/ref/heads/$web_branch" --jq .object.sha)"
+          [[ "$web_sha" =~ ^[0-9a-f]{40}$ ]]
+          version="$(python3 -c 'import xml.etree.ElementTree as e; print(e.parse("pom.xml").findtext("./{*}properties/{*}revision"))')"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          {
+            echo "web-sha=$web_sha"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+  real-connectors:
+    needs: prepare
+    uses: ./.github/workflows/real-connectors.yml
+    with:
+      source-sha: ${{ github.sha }}
+      connector-inputs: ${{ inputs.connector-inputs || 'upstream' }}
+    secrets:
+      ENTERPRISE_CONNECTORS_READ_TOKEN: ${{ secrets.ENTERPRISE_CONNECTORS_READ_TOKEN }}
+      TAPSTATE_ATLAS_TEST_URI: ${{ secrets.TAPSTATE_ATLAS_TEST_URI }}
+      TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
+
+  join-perf:
+    needs: prepare
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/join-perf.yml
+    with:
+      source-sha: ${{ github.sha }}
+      trend-workflow: nightly-test.yml
+
+  cli-native:
+    needs: prepare
+    uses: ./.github/workflows/cli-native.yml
+    with:
+      source-sha: ${{ github.sha }}
+      release-version: ${{ needs.prepare.outputs.version }}
+
+  release-images:
+    needs: prepare
+    uses: ./.github/workflows/release-images.yml
+    with:
+      source-sha: ${{ github.sha }}
+      web-sha: ${{ needs.prepare.outputs.web-sha }}
+      release-version: ${{ needs.prepare.outputs.version }}
+    secrets:
+      RELEASE_SATELLITE_TOKEN: ${{ secrets.RELEASE_SATELLITE_TOKEN }}
+      CLOUD_ARTIFACT_KEY: ${{ secrets.CLOUD_ARTIFACT_KEY }}
+
+  gate-selftests:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/release-gate-selftests.sh
+
+  distribution:
+    needs: [prepare, cli-native, release-images]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Write the version into the files that pin it
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: .github/scripts/set-version.sh "$VERSION"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tapstate-*.tar.gz
+          path: staging
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: server-image
+          path: image
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-minimum-*
+          path: minimums
+          merge-multiple: true
+      - name: Verify the same distribution that release assembles
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SOURCE_SHA: ${{ github.sha }}
+          WEB_SHA: ${{ needs.release-images.outputs.server_web_revision }}
+          BOOT_SHA256: ${{ needs.release-images.outputs.server_boot_jar_sha256 }}
+        run: |
+          sort minimums/*.minimum > platform-minimums.txt
+          bash .github/scripts/prepare-release-distribution.sh "$VERSION" "$SOURCE_SHA" "$WEB_SHA" "$BOOT_SHA256"
+
+  notify-feishu:
+    if: ${{ !cancelled() && github.event_name == 'schedule' && contains(needs.*.result, 'failure') }}
+    needs: [prepare, real-connectors, join-perf, cli-native, release-images, gate-selftests, distribution]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Notify the Nightly Test group
+        env:
+          WEBHOOK: ${{ secrets.NIGHTLY_FEISHU_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PREPARE: ${{ needs.prepare.result }}
+          REAL_CONNECTORS: ${{ needs.real-connectors.result }}
+          JOIN_PERF: ${{ needs.join-perf.result }}
+          CLI_NATIVE: ${{ needs.cli-native.result }}
+          RELEASE_IMAGES: ${{ needs.release-images.result }}
+          GATE_SELFTESTS: ${{ needs.gate-selftests.result }}
+          DISTRIBUTION: ${{ needs.distribution.result }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$WEBHOOK" ]]; then
+            echo "::error::Configure the NIGHTLY_FEISHU_WEBHOOK repository secret."
+            exit 1
+          fi
+          failed=()
+          [[ "$PREPARE" != failure ]] || failed+=(prepare)
+          [[ "$REAL_CONNECTORS" != failure ]] || failed+=(real-connectors)
+          [[ "$JOIN_PERF" != failure ]] || failed+=(join-perf)
+          [[ "$CLI_NATIVE" != failure ]] || failed+=(cli-native)
+          [[ "$RELEASE_IMAGES" != failure ]] || failed+=(release-images)
+          [[ "$GATE_SELFTESTS" != failure ]] || failed+=(gate-selftests)
+          [[ "$DISTRIBUTION" != failure ]] || failed+=(distribution)
+          message="$(printf 'Nightly Test failed for %s @ %.12s\nFailed jobs: %s\n%s' "$GITHUB_REPOSITORY" "$GITHUB_SHA" "${failed[*]}" "$RUN_URL")"
+          payload="$(jq -cn --arg message "$message" '{msg_type:"text",content:{text:$message}}')"
+          if ! response="$(curl --fail --silent --max-time 20 --header 'Content-Type: application/json' \
+            --data "$payload" "$WEBHOOK")" || ! jq -e '.code == 0' <<< "$response" >/dev/null; then
+            echo "::error::Feishu did not accept the Nightly Test notification."
+            exit 1
+          fi
