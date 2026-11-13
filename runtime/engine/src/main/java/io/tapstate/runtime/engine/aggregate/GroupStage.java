@@ -200,7 +200,9 @@ public final class GroupStage {
         /** Something derived differs from what the rows give; a repair has rewritten it. */
         MISMATCH,
         /** The group holds more than could be read or rewritten in one go; nothing is claimed or changed. */
-        INCONCLUSIVE
+        INCONCLUSIVE,
+        /** The step holds nothing under this key: no row and no totals. Nothing is claimed, changed or sent. */
+        ABSENT
     }
 
     /** The name a difference in how many rows a group counts is reported under. */
@@ -229,6 +231,15 @@ public final class GroupStage {
      * @param next where the next page starts, or null when this page was the last
      */
     public record Groups(List<List<Object>> groups, byte[] next) {
+    }
+
+    /** Whether the store holds anything under {@code group}: its totals, or any entry of its rows. */
+    public boolean holds(List<Object> group) {
+        byte[] key = OrderedBytes.ofKey(group);
+        if (store.loadAll(List.of(totalsKey(key))).getFirst() != null) {
+            return true;
+        }
+        return !store.scan(key(key, ROW), key(key, DISTINCT + 1), null, 1).isEmpty();
     }
 
     /** The groups holding at least one row, in key order, {@code limit} at a time. */
@@ -288,6 +299,9 @@ public final class GroupStage {
         if (rebuilt == null) {
             return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
         }
+        if (rebuilt.nothingHeld()) {
+            return new Audit(group, Verdict.ABSENT, List.of(), null);
+        }
         GroupOutcome now = outcome(rebuilt.totals, false, 0, 0);
         return new Audit(group, rebuilt.differing.isEmpty() ? Verdict.CLEAN : Verdict.MISMATCH, rebuilt.differing, null,
                 now.failure(), now.failedField());
@@ -302,6 +316,11 @@ public final class GroupStage {
         Rebuilt rebuilt = rebuild(group, most);
         if (rebuilt == null) {
             return new Audit(group, Verdict.INCONCLUSIVE, List.of(), null);
+        }
+        if (rebuilt.nothingHeld()) {
+            // A key the step holds nothing under is most often a group named wrongly. Sending it on would
+            // delete whatever the target holds under that key on the word of a name nothing confirmed.
+            return new Audit(group, Verdict.ABSENT, List.of(), null);
         }
         List<Entry> saves = new ArrayList<>();
         List<byte[]> deletes = new ArrayList<>();
@@ -352,7 +371,12 @@ public final class GroupStage {
      * @param wanted  the derived entries its rows give
      */
     private record Rebuilt(Fold fold, Totals totals, byte[] storedTotals, TreeMap<byte[], byte[]> held,
-            TreeMap<byte[], byte[]> wanted, List<String> differing) {
+            TreeMap<byte[], byte[]> wanted, List<String> differing, boolean anyEntry) {
+
+        /** Whether the store holds no entry of any kind under the group's key. */
+        boolean nothingHeld() {
+            return storedTotals == null && !anyEntry;
+        }
     }
 
     private Rebuilt rebuild(List<Object> values, int most) {
@@ -431,7 +455,7 @@ public final class GroupStage {
                 differing.add(fields.get(field).field());
             }
         }
-        return new Rebuilt(fold, totals, storedTotals, held, wanted, List.copyOf(differing));
+        return new Rebuilt(fold, totals, storedTotals, held, wanted, List.copyOf(differing), !all.isEmpty());
     }
 
     private static boolean sameEntries(TreeMap<byte[], byte[]> held, TreeMap<byte[], byte[]> wanted,

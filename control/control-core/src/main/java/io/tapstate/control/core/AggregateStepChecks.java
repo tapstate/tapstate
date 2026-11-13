@@ -39,8 +39,9 @@ public interface AggregateStepChecks {
      * @param group   the group, as the text of each of its key values by name
      * @param verdict {@code mismatch} when something derived differed from the group's rows,
      *                {@code inconclusive} when the group holds more than one request can read or rewrite
-     *                and nothing is claimed about it, {@code clean} for a group listed only because it
-     *                cannot be given exactly now
+     *                and nothing is claimed about it, {@code absent} when the step holds nothing under
+     *                the group that was named and nothing was changed or sent, {@code clean} for a group
+     *                listed only because it cannot be given exactly now
      * @param fields  the output fields whose stored state differed; {@code (rows)} is the count of rows
      * @param code    the error code under which the group cannot be given exactly now, or null
      * @param field   the field that code is about, or null

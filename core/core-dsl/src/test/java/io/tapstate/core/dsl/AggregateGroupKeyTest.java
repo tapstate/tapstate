@@ -57,6 +57,32 @@ class AggregateGroupKeyTest {
     }
 
     @Test
+    @DisplayName("a day is read every way a source hands a date over, so the group the step keyed is among them")
+    void aDayNamesTheGroupHoweverItsSourceCarriedTheDate() {
+        Map<String, ValueType> types = new LinkedHashMap<>();
+        types.put("region", ValueType.of(TapstateType.STRING));
+        types.put("day", ValueType.of(TapstateType.DATE));
+        AggregateStepSpec spec = spec(types);
+        Map<String, String> named = new LinkedHashMap<>();
+        named.put("region", "US");
+        named.put("day", "2026-01-05");
+
+        List<List<Object>> readings = AggregateGroupKey.readings(spec, named);
+
+        assertThat(readings).as("the calendar date first, then the instant and the local time it begins at")
+                .containsExactly(
+                        List.of("US", LocalDate.parse("2026-01-05")),
+                        List.of("US", Instant.parse("2026-01-05T00:00:00Z")),
+                        List.of("US", LocalDateTime.parse("2026-01-05T00:00:00")));
+        assertThat(AggregateGroupKey.parse(spec, named)).isEqualTo(readings.getFirst());
+
+        // A group keyed by the instant is shown as one, and what is shown has to read back as that group.
+        Map<String, String> shown = AggregateGroupKey.shown(spec, List.of("US", Instant.parse("2026-01-05T00:00:00Z")));
+        assertThat(AggregateGroupKey.readings(spec, shown).getFirst())
+                .isEqualTo(List.of("US", Instant.parse("2026-01-05T00:00:00Z")));
+    }
+
+    @Test
     @DisplayName("a name the step does not group by, a missing name and an unreadable value are each refused by reason")
     void whatDoesNotNameAGroupIsRefused() {
         AggregateStepSpec spec = spec(Map.of("tier", ValueType.INT64));

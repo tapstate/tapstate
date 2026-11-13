@@ -242,7 +242,10 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             byte[] next = null;
             if (request.group() != null) {
                 try {
-                    asked = List.of(AggregateGroupKey.parse(spec, request.group()));
+                    // The reading the step holds is the group meant; with none held the most literal one
+                    // is answered for, and comes back as absent.
+                    List<List<Object>> readings = AggregateGroupKey.readings(spec, request.group());
+                    asked = List.of(readings.stream().filter(groups::holds).findFirst().orElse(readings.getFirst()));
                 } catch (TapstateException notAGroup) {
                     Map<String, String> args = new LinkedHashMap<>();
                     notAGroup.args().forEach((name, value) -> args.put(name, String.valueOf(value)));
