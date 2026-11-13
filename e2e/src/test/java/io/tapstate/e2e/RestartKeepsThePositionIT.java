@@ -17,6 +17,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongSupplier;
 
@@ -52,9 +53,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * made to carry a document written after the restart, and beside the claim stands a guard reading the
  * state and the run's own record count. Both have to hold, and the claim is asserted first on purpose --
  * the guard's bound is on volume, so an implementation that read the collection again would trip it on
- * the way past and the reading in question would never be looked at. The case that asserts the whole
- * collection needs no such gate: nought there would mean the run never started, so the count it asserts
- * is its own liveness.
+ * the way past and the reading in question would never be looked at. The rerun case waits for a
+ * replacement execution to enter streaming and publish its snapshot count before asserting how many
+ * documents it read.
  *
  * <p>Gated on Docker and on a directory of real connector jars
  * ({@code -Dtapstate.e2e.connectors-dir}); the real-process tier additionally needs the app module
@@ -162,6 +163,12 @@ class RestartKeepsThePositionIT {
             awaitName(mongo, fixture.target(), CHANGED_ID, BEFORE_RESTART,
                     "the change the first run captured");
 
+            var firstLoad = Await.answered("the original full load", TIMEOUT,
+                    () -> control.initialLoad(fixture.pipelineId())
+                            .filter(load -> "STREAMING".equals(load.get("phase"))));
+            String originalRun = (String) firstLoad.get("runKey");
+            assertThat(originalRun).isNotBlank();
+
             // The pair the terminal composes for the rerun: the stop clears, so there is nothing left
             // to carry on from. Its new full load goes into a target holding the first run's documents,
             // so the start asks first; keeping them is the answer, because what this case reads is how
@@ -169,9 +176,11 @@ class RestartKeepsThePositionIT {
             control.stop(fixture.pipelineId(), true);
             control.startAnswering(fixture.pipelineId(), "target-not-empty", "keep");
 
-            // The count is its own liveness here: nought would mean the run never started, and every
-            // seeded document is the only reading that says it really read the collection again.
-            assertThat(settledRowsRead(control, fixture.pipelineId()))
+            Await.answered("the completed full load of the replacement execution", TIMEOUT,
+                    () -> control.initialLoad(fixture.pipelineId())
+                            .filter(load -> "STREAMING".equals(load.get("phase"))
+                                    && load.get("runKey") instanceof String run && !originalRun.equals(run)));
+            assertThat(control.awaitSnapshotRowsRead(fixture.pipelineId(), Set.of(COLLECTION)).get(COLLECTION))
                     .as("documents the rerun read from %s: it was told to read everything, so it reads "
                             + "every seeded document", COLLECTION)
                     .isEqualTo(SEEDED_ROWS);

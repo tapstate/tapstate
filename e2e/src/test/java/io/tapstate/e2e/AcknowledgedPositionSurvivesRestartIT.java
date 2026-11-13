@@ -11,6 +11,7 @@ import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 import org.junit.jupiter.api.BeforeAll;
@@ -108,7 +109,15 @@ class AcknowledgedPositionSurvivesRestartIT {
             }
             frozenTarget.thaw();
 
-            try (RealProcessServer restarted = (RealProcessServer) Tiers.REAL_PROCESS.launch(storage)) {
+            try (RealProcessServer restarted = Await.answered("the same node to restart after its lease lapses",
+                    BOUND, () -> {
+                        try {
+                            return Optional.of((RealProcessServer) Tiers.REAL_PROCESS.launch(storage));
+                        } catch (AssertionError startup) {
+                            if (!startup.getMessage().contains("[boot.node-id-in-use]")) throw startup;
+                            return Optional.empty();
+                        }
+                    })) {
                 ControlPlane control = new ControlPlane(restarted.baseUrl());
                 storage.loginAndAwaitBusiness(control);
                 control.startUnlessRunning(PIPELINE);
