@@ -136,9 +136,10 @@ narrowed.
 | unknown | refused at apply: `nest.rollup-type-unknown` | refused at apply |
 
 - `avg` is the only rounding, and its scale and rounding mode are part of its type.
-- The types come from discovery. A column nothing typed - an undiscovered source, a schemaless field, the
-  output of a `map` step - cannot be summed or averaged; `count`, `min`, `max`, `first` and `last` still
-  work on it.
+- The types come from discovery. A level read from a `map` or `union` step takes the types those steps
+  work out from their own inputs, so a signed amount computed per source table and merged into one level
+  sums exactly. A column nothing typed - an undiscovered source, a schemaless field, a computed decimal -
+  cannot be summed or averaged; `count`, `min`, `max`, `first` and `last` still work on it.
 - A value whose type differs from its column's declared type (a double in a decimal column) stops the
   document with `nest.rollup-value-type-mismatch` rather than being coerced.
 - Arithmetic on decimals inside an expression is not available yet: `=after.qty * after.unit_price` over
@@ -252,7 +253,7 @@ the target or in a `js` step.
 | Limit | What you run into |
 |---|---|
 | No arithmetic on decimals inside expressions | `=after.qty * after.unit_price` over decimals is refused at apply |
-| `sum` and `avg` need a discovered type | a rollup over a `map` step's output or an undiscovered source can count, but not sum |
+| `sum` and `avg` need a known type | a rollup over an undiscovered source, or over a decimal a `map` computed, can count, but not sum |
 | Recompute on every send | a document with very many elements per rollup level pays a full walk per send; keep it to about 1,000 |
 | Changing a level from `as: array` to `as: rollup` changes its state identity | the level's stored rows are not carried over; plan such a change as a rebuild |
 | No time-driven re-render | a filter that compares with the current time is right only as of the last change to the document |
