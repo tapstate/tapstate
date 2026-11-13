@@ -108,6 +108,19 @@ class SharedSrsObservationRoutingTest {
         assertThat(new StoreBackedPipelineChains(port).progressChainsOf("flow")).containsExactly(channel);
         verifyNoInteractions(captures,consumers,meta);
     }
+    @Test void aSnapshotOnlyPipelineDoesNotRequireASharedConsumerForItsFinalObservation() {
+        var snapshot = new PipelineResource("flow", null, List.of(SourceRef.spec("input", true)),
+                null, null, null, new Settings(null, null, null, null, ReadMode.SNAPSHOT_ONLY, null), null);
+        memory.artifacts().save(snapshot);
+        String channel = SourceCaptureResolution.forPipeline(snapshot, source, model).orElseThrow().chainId().value();
+        doReturn(Optional.empty()).when(meta).read(channel);
+        doThrow(new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", channel), null))
+                .when(port).sinkOffset("flow", "input", channel);
+
+        assertThat(new StoreBackedSinkPositions(port).apply("flow")).isEmpty();
+        verify(port, never()).sinkOffset(anyString(), anyString(), anyString());
+        verifyNoInteractions(captures, consumers, chains);
+    }
     @Test void missingKnownConfigurationControlCannotEraseTheObservedProgress() {
         when(captures.read(BUSINESS,preparation.captureId())).thenReturn(Optional.empty());
         when(claims.read(any())).thenReturn(Optional.of(mock(WorkloadClaimReading.class)));
