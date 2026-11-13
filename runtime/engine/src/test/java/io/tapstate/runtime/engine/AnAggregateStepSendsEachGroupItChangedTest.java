@@ -17,6 +17,7 @@ import io.tapstate.core.dsl.AggregateStepRules;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.dsl.aggregate.ValueType;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.event.SourceOrder;
@@ -132,6 +133,25 @@ class AnAggregateStepSendsEachGroupItChangedTest {
         assertThat(last.get("US").after()).containsEntry("orders", 1L).containsEntry("revenue", new BigDecimal("40.50"))
                 .containsEntry("largest", new BigDecimal("40.50"));
         assertThat(WRITTEN).allSatisfy(written -> assertThat(written.src()).isEqualTo("by_region"));
+    }
+
+    @Test
+    @DisplayName("a value the connector converted groups, sums and is stored as the value inside it")
+    void aConvertedValueIsReadAsTheValueItCarries() {
+        // A source hands a date, a key or a decimal over in a carrier that names its declared type. The
+        // carrier equals nothing but another carrier, so one row carrying it and one that does not must
+        // still be one group, and state has to hold what is inside.
+        Map<String, Object> carried = row(1, "EU", "open", "100.00");
+        carried.put("region", new ConvertedValue("EU", "varchar(8)"));
+        carried.put("amount", new ConvertedValue(new BigDecimal("100.00"), "decimal(10,2)"));
+        run(List.of(
+                Envelope.insert(1, "orders", carried, null).withOrder(new SourceOrder(1, 1)),
+                insert(2, 2, "EU", "open", "40.50")));
+
+        Map<Object, Envelope> last = lastPerGroup();
+        assertThat(last.keySet()).containsExactly("EU");
+        assertThat(last.get("EU").after()).containsEntry("orders", 2L)
+                .containsEntry("revenue", new BigDecimal("140.50")).containsEntry("largest", new BigDecimal("100.00"));
     }
 
     @Test

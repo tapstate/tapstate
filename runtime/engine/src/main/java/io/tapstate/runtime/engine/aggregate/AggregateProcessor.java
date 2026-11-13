@@ -14,6 +14,7 @@ import io.tapstate.core.dsl.aggregate.AggregateStepSpec;
 import io.tapstate.core.dsl.aggregate.Contribution;
 import io.tapstate.core.dsl.aggregate.OrderedBytes;
 import io.tapstate.core.event.ChainPosition;
+import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.lifecycle.Stage;
@@ -452,7 +453,12 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
                     + "' that carries no order on its own chain");
         }
         String chain = event.src();
-        byte[] before = event.before() == null ? null : OrderedBytes.ofKey(AggregateRow.key(spec, event.before()));
+        // The step uses every row value as a value: it keys, compares and stores them. A value the
+        // connector converted travels in a carrier that equals nothing but another carrier and that state
+        // cannot hold, so the row is read through to the values inside before anything looks at it.
+        Map<String, Object> beforeRow = ConvertedValue.unwrapRow(event.before());
+        Map<String, Object> afterRow = ConvertedValue.unwrapRow(event.after());
+        byte[] before = beforeRow == null ? null : OrderedBytes.ofKey(AggregateRow.key(spec, beforeRow));
         if (event.op() == Op.DELETE) {
             if (before == null) {
                 throw new IllegalStateException("aggregate step '" + step + "' was handed a delete of '"
@@ -461,11 +467,11 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             out.add(RowEvent.gone(before, chain, at.order()));
             return;
         }
-        byte[] key = OrderedBytes.ofKey(AggregateRow.key(spec, event.after()));
+        byte[] key = OrderedBytes.ofKey(AggregateRow.key(spec, afterRow));
         if (before != null && !Arrays.equals(before, key)) {
             out.add(RowEvent.gone(before, chain, at.order()));
         }
-        var evaluated = AggregateRow.of(spec, event.after());
+        var evaluated = AggregateRow.of(spec, afterRow);
         if (evaluated.isEmpty()) {
             out.add(RowEvent.gone(key, chain, at.order()));
             return;
