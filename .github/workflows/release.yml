@@ -3,7 +3,6 @@
 # The person says how big the change is (`bump`) and, if it is not the tip of the default branch,
 # which commit ships (`commit`). Everything else is worked out: the version number, every file that
 # pins it, the assets, the checksums, the platform minimums, whether this release is the newest line.
-# The v0.8.0 exception is tied to the computed tag and a default-branch dispatch without a commit override.
 #
 # One dispatch, two halves, with a person in the middle:
 #
@@ -77,8 +76,6 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
-      main_ci: ${{ steps.main-ci.outcome }}
-      skip_release_tests: ${{ steps.v080-exception.outputs.enabled }}
       web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
@@ -111,22 +108,10 @@ jobs:
       - id: next
         run: .github/scripts/next-version.sh "${{ inputs.bump }}" HEAD >> "$GITHUB_OUTPUT"
 
-      # Temporary exception for the v0.8.0 default-branch release.
-      - name: record the v0.8.0 release exception
-        id: v080-exception
-        if: steps.next.outputs.tag == 'v0.8.0' && inputs.commit == '' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-        run: |
-          echo "enabled=true" >> "$GITHUB_OUTPUT"
-          echo "v0.8.0 skips release test suites. OP and Cloud builds, artifact verification, and protected approval still run." >> "$GITHUB_STEP_SUMMARY"
-
-      # The v0.8.0 release can start from the default branch while its CI is running.
-      # Explicit commit releases and all other versions still require the checks.
       # Let the script's own exit code fail the step. It explains its refusal in its own words --
       # including the difference between a check still running and one that has concluded red, which
       # need different answers from a person -- and a wrapper here would restate that less well.
       - name: the required checks are green on that commit
-        id: main-ci
-        if: steps.next.outputs.tag != 'v0.8.0' || inputs.commit != '' || github.ref != format('refs/heads/{0}', github.event.repository.default_branch)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -255,7 +240,6 @@ jobs:
     with:
       source-sha: ${{ needs.version.outputs.sha }}
       release-version: ${{ needs.version.outputs.version }}
-      skip-release-tests: ${{ needs.version.outputs.skip_release_tests == 'true' }}
 
   server-image:
     # A sibling of the CLI matrix again, which it could not be while it pushed: the push is the one act
@@ -609,12 +593,10 @@ jobs:
             --web-revision '${{ needs.version.outputs.web_sha }}' --web-profile onprem \
             --boot-jar-sha256 '${{ needs.server-image.outputs.boot_jar_sha256 }}'
       - name: install the local OCI archive importer
-        if: needs.version.outputs.skip_release_tests != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends skopeo
       - name: run both checked images with their real Boot entrypoints
-        if: needs.version.outputs.skip_release_tests != 'true'
         timeout-minutes: 30
         shell: bash
         run: |
@@ -792,7 +774,6 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
       - name: start the real-connector lane on the commit being released
-        if: needs.version.outputs.skip_release_tests != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -826,7 +807,6 @@ jobs:
         with:
           ref: ${{ needs.version.outputs.sha }}
       - name: start the join performance lane on the commit being released
-        if: needs.version.outputs.skip_release_tests != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -847,7 +827,7 @@ jobs:
     # Two of the eight are not steps here, because they are already the reason this job can run at
     # all, and re-asserting them would be this workflow grading its own dependency graph:
     #
-    #   2. the release smoke tests run in cli-native and cloud-image outside the v0.8.0 exception
+    #   2. the release smoke tests run in cli-native and cloud-image against the built artifacts
     #   3. the distribution is complete        `release-manifest.sh`, in the job below, opening every
     #                                          asset before the draft is assembled
     #
@@ -864,7 +844,6 @@ jobs:
           fetch-depth: 0   # the notes and the docs gate both read the range back to the previous tag
 
       - name: The gates still decide the way they are supposed to
-        if: needs.version.outputs.skip_release_tests != 'true'
         run: |
           shellcheck .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh \
             .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh \
@@ -882,7 +861,6 @@ jobs:
       #    set is read from the branch's rules at this moment rather than copied into this file, and
       #    every name in it has to be present before any conclusion is looked at.
       - name: 1. the required checks are green on this commit
-        if: needs.version.outputs.main_ci != 'skipped'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -896,7 +874,6 @@ jobs:
       #    never started and a lane still running are both refusals, and neither can be read off a
       #    count of failures.
       - name: 6. the real-connector lane is green on this commit
-        if: needs.version.outputs.skip_release_tests != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -920,7 +897,6 @@ jobs:
       #    on one tier, and this is where the rest of the matrix is required to have been green on the
       #    commit going out. A shipped release that got slower is not something a later run can undo.
       - name: 8. the join performance lane is green on this commit
-        if: needs.version.outputs.skip_release_tests != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -961,33 +937,20 @@ jobs:
           .github/scripts/satellites.sh reach
 
       - name: what the gate decided
-        env:
-          MAIN_CI: ${{ needs.version.outputs.main_ci }}
-          SKIP_RELEASE_TESTS: ${{ needs.version.outputs.skip_release_tests }}
         run: |
           {
             echo "### Release gate for ${{ needs.version.outputs.tag }}"
             echo
             echo "| | gate | where it was decided |"
             echo "|---|---|---|"
-            if [ "$MAIN_CI" = skipped ]; then
-              echo "| 1 | required CI on \`${{ needs.version.outputs.sha }}\` | skipped for v0.8.0 |"
-            else
-              echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
-            fi
-            if [ "$SKIP_RELEASE_TESTS" = true ]; then
-              echo "| 2 | release smoke | skipped for v0.8.0 |"
-              echo "| 6 | real-connector tests | skipped for v0.8.0 |"
-              echo "| 8 | join performance tests | skipped for v0.8.0 |"
-            else
-              echo "| 2 | release smoke green | \`cli-native\` and \`cloud-image\` |"
-              echo "| 6 | real-connector lane green on that commit | this job |"
-              echo "| 8 | join performance lane green on that commit | this job |"
-            fi
+            echo "| 1 | required CI green on \`${{ needs.version.outputs.sha }}\` | this job |"
+            echo "| 2 | release smoke green | \`cli-native\` and \`cloud-image\` |"
             echo "| 3 | distribution complete | \`draft\`, before the release is assembled |"
             echo "| 4 | documentation for the range has landed | this job |"
             echo "| 5 | release notes assemble | draft, before the release is assembled |"
+            echo "| 6 | real-connector lane green on that commit | this job |"
             echo "| 7 | satellite token reaches every satellite | this job |"
+            echo "| 8 | join performance lane green on that commit | this job |"
           } >> "$GITHUB_STEP_SUMMARY"
 
   cloud-dev:
