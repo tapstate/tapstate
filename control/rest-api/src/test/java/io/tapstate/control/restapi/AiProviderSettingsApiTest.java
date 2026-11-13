@@ -126,6 +126,12 @@ class AiProviderSettingsApiTest {
                     new AiProviderSettings("openai-compatible", "https://another.example/v1", null, null)))
                     .isInstanceOf(TapstateException.class);
             assertThat(service.require(owner("org-a", "cluster-a")).model()).isEqualTo("model-b");
+            controller.put(workspaceA, new AiProviderSettings("openai-responses", null, "model-b", null));
+            assertThat(controller.get(workspaceA).getBody()).containsEntry("providerId", "openai-responses").doesNotContainKey("apiKey");
+            controller.models(workspaceA, new AiProviderSettings("openai-responses", null, null, null));
+            assertThat(checked.get().providerId()).isEqualTo("openai-responses");
+            assertThat(checked.get().apiKey()).isEqualTo("sk-new-key");
+
 
             assertThat(service.require(owner("org-a", "cluster-a")).apiKey()).isEqualTo("sk-new-key");
 
