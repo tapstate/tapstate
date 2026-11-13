@@ -171,6 +171,50 @@ class AiProviderProtocolTest {
         } finally { server.stop(0); }
     }
 
+    @Test void preservesRelayPrefixesThroughTheProductionEndpointPolicyForBothProtocols() throws Exception {
+        record Route(String provider, String base, String request, String models) { }
+        List<String> paths = new java.util.concurrent.CopyOnWriteArrayList<>();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/", exchange -> {
+            paths.add(exchange.getRequestURI().getPath());
+            String raw = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+            Map<?, ?> body = raw.isEmpty() ? Map.of() : (Map<?, ?>) JsonReader.parse(raw);
+            boolean tool = body.containsKey("tools");
+            Object payload;
+            if (exchange.getRequestMethod().equals("GET")) payload = Map.of("data", List.of(Map.of("id", "model")));
+            else if (body.containsKey("input")) payload = Map.of("status", "completed", "output", List.of(tool
+                    ? Map.of("type", "function_call", "name", "connection_check", "arguments", "{\"ok\":true}")
+                    : Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "OK")))));
+            else payload = Map.of("choices", List.of(Map.of("message", tool
+                    ? Map.of("tool_calls", List.of(Map.of("function", Map.of("name", "connection_check", "arguments", "{\"ok\":true}"))))
+                    : Map.of("content", "OK"))));
+            byte[] bytes = JsonWriter.write(payload).getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            var client = new OpenAiCompatibleClient(base -> {
+                URI validated = OpenAiCompatibleEndpointPolicy.requestUri(base,
+                        host -> new java.net.InetAddress[]{java.net.InetAddress.getByAddress(new byte[]{8, 8, 8, 8})});
+                return URI.create("http://127.0.0.1:" + server.getAddress().getPort() + validated.getRawPath());
+            });
+            for (var route : List.of(
+                    new Route("openai-compatible", "/responses", "/responses/chat/completions", "/responses/models"),
+                    new Route("openai-compatible", "/relay/v1", "/relay/v1/chat/completions", "/relay/v1/models"),
+                    new Route("openai-compatible", "/relay/v1/chat/completions", "/relay/v1/chat/completions", "/relay/v1/models"),
+                    new Route("openai-responses", "/relay/v1", "/relay/v1/responses", "/relay/v1/models"),
+                    new Route("openai-responses", "/relay/v1/responses", "/relay/v1/responses", "/relay/v1/models"),
+                    new Route("openai-responses", "/relay/v1/chat/completions", "/relay/v1/responses", "/relay/v1/models"))) {
+                paths.clear();
+                var settings = new AiProviderSettings(route.provider(), "https://relay.example" + route.base(), "model", "key");
+                client.check(settings);
+                assertThat(client.models(settings)).containsExactly("model");
+                assertThat(paths).as(route.provider() + " " + route.base()).containsExactly(route.request(), route.request(), route.models());
+            }
+        } finally { server.stop(0); }
+    }
+
     private static String event(Map<String, Object> value) { return "data: " + JsonWriter.write(value) + "\n\n"; }
 
     private static void withEndpoint(String path, String response,

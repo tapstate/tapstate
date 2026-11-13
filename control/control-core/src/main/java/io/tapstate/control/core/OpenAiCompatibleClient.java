@@ -578,11 +578,11 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
     private URI endpoint(AiProviderSettings settings, String suffix) {
         String validated = requestUriFactory.apply(settings.baseUrl()).toString();
-        for (String ending : List.of("/chat/completions", "/responses")) {
-            if (validated.endsWith(ending)) {
-                validated = validated.substring(0, validated.length() - ending.length());
-                break;
-            }
+        if (validated.endsWith("/chat/completions")) {
+            validated = validated.substring(0, validated.length() - "/chat/completions".length());
+        }
+        if (responses(settings) && validated.endsWith("/responses")) {
+            validated = validated.substring(0, validated.length() - "/responses".length());
         }
         return URI.create(validated + suffix);
     }

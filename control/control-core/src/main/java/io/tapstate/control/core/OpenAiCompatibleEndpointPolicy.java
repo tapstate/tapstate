@@ -72,7 +72,7 @@ final class OpenAiCompatibleEndpointPolicy {
             throw providerUnavailable();
         }
         String path = base.getRawPath();
-        if (path != null && (path.endsWith("/chat/completions") || path.endsWith("/responses"))) {
+        if (path != null && path.endsWith("/chat/completions")) {
             return URI.create(normalized);
         }
         return URI.create(normalized + "/chat/completions");
