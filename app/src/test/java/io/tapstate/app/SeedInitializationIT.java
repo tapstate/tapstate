@@ -26,6 +26,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
+import tools.jackson.databind.json.JsonMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Paired local replica-set measurements over the actual immutable connector release. */
@@ -38,7 +39,10 @@ class SeedInitializationIT {
     void localOpSeedStagingUsesRegistryOnlyWhenNoSeedCopyIsAvailable() throws Exception {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         byte[] lock = java.nio.file.Files.readAllBytes(seeds.resolveSibling("release").resolve("connectors.lock.json"));
-        long bytes = 443_262_490L;
+        long bytes = 0;
+        for (var connector : new JsonMapper().readTree(lock).path("connectors")) {
+            bytes += connector.path("bytes").longValue();
+        }
         int cpu = Math.max(1, Runtime.getRuntime().availableProcessors());
         // Timing is a retained observation, never a machine-speed pass/fail threshold.
         int trials = Math.max(1, Integer.getInteger("tapstate.test.seed-trials", 1));
