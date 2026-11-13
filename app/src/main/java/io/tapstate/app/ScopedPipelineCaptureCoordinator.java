@@ -1381,7 +1381,12 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private record DemandCheck(Owner owner, long revision) {}
 
     private void maintenanceTick() {
-        maintain();
+        // Retention uses the owner's fixed capture fence. Its store reads must not hold the
+        // coordinator monitor needed to plan and attach an unrelated Pipeline.
+        for (Owner owner : maintain()) {
+            try { retain(owner); }
+            catch (RuntimeException | Error failure) { failedRetention(owner, failure); }
+        }
         List<DemandCheck> due = new ArrayList<>();
         synchronized (this) {
             if (closed.get()) return;
@@ -1408,8 +1413,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
     }
 
-    private synchronized void maintain() {
-        if(closed.get())return;
+    private synchronized List<Owner> maintain() {
+        var retention = new ArrayList<Owner>();
+        if(closed.get())return retention;
         for (var owner : List.copyOf(owners.values())) {
             if (owner.prepared.mode() != CapturePreparation.Mode.SHARED_SRS) continue;
             if (owner.ended.get()) {
@@ -1431,7 +1437,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
                 var failure=owner.physical==null?Optional.<Throwable>empty():owner.physical.tail.health().failure();
-                if (failure.isPresent() && duringHandoff(owner, failure.orElseThrow())) return;
+                if (failure.isPresent() && duringHandoff(owner, failure.orElseThrow())) return retention;
                 if(failure.isPresent()){
                     for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source->source.owner==owner))session.failure.compareAndSet(null,failure.orElseThrow());
                     owner.reportDrainStarted=reportClock.getAsLong();
@@ -1440,11 +1446,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if(needed(owner))continue;
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
-                ensureTail(owner);retain(owner);
+                ensureTail(owner);retention.add(owner);
             }
             catch(RuntimeException|Error failure) {
                 // The loss callback is waiting for this monitor to detach the old shared owner.
-                if (duringHandoff(owner, failure)) return;
+                if (duringHandoff(owner, failure)) return retention;
                 for(var session:sessions.values())if(session.sources.values().stream().anyMatch(source -> source.owner==owner))session.failure.compareAndSet(null,failure);
                 owner.ended.set(true);try {owner.release();owners.remove(owner.prepared.captureId(),owner);}
                 catch(RuntimeException|Error ending){if(ending!=failure)failure.addSuppressed(ending);}
@@ -1458,6 +1464,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner);}
             }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
         }
+        return retention;
+    }
+
+    private synchronized void failedRetention(Owner owner, Throwable failure) {
+        if (owners.get(owner.prepared.captureId()) != owner || owner.ended.get()
+                || duringHandoff(owner, failure)) return;
+        for (var session : sessions.values())
+            if (session.sources.values().stream().anyMatch(source -> source.owner == owner))
+                session.failure.compareAndSet(null, failure);
+        owner.ended.set(true);
+        try { owner.release(); owners.remove(owner.prepared.captureId(), owner); }
+        catch (RuntimeException | Error ending) { if (ending != failure) failure.addSuppressed(ending); }
     }
     private void retain(Owner owner) {
         try { runtime.retain(stores.scope(),owner.prepared.chainId(),owner.fence,owner::require); }

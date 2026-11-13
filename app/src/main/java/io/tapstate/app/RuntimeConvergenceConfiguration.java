@@ -154,7 +154,7 @@ class RuntimeConvergenceConfiguration {
         return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,

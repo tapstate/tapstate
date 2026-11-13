@@ -61,6 +61,26 @@ class SharedSrsObservationRoutingTest {
         assertThat(chains.progressChainsOf("flow")).containsExactly(physical);
         verify(meta,never()).read(canonical);verify(captures,never()).issueFirstCreate(any());
     }
+    @Test void observingOnePipelineDoesNotReadASiblingConsumersSnapshot() {
+        var target = topology(2).consumers().getFirst();
+        var siblingContext = new SrsConsumerContext(new SrsConsumerKey(physical,"sibling","input"),1);
+        var sibling = new SrsConsumerMembership(siblingContext,1,false,Set.of("orders"),
+                new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"sibling"),
+                        new WorkloadOwner("node","boot"),1,1,1));
+        when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,2,List.of(target,sibling)));
+        var offset = meta.read(physical).orElseThrow().consumerOffset(SrsConsumerId.of("flow","input").value()).orElseThrow();
+        when(consumers.cursor(target.context())).thenReturn(Optional.of(offset));
+        when(consumers.cursor(siblingContext)).thenReturn(Optional.of(new ConsumerOffset(
+                siblingContext.key().consumerId(),Map.of(),null,List.of(),null,0L)));
+        when(chains.load(physical)).thenReturn(Optional.of(new SrsChainState(physical,preparation.captureId(),null,2,
+                Set.of("orders"),Set.of("orders"),0,null,null,2,2)));
+        doCallRealMethod().when(port).meta();
+
+        assertThat(new StoreBackedSinkPositions(port).apply("flow"))
+                .containsOnly(entry("orders","new-physical-confirmation"));
+        verify(consumers).cursor(target.context());
+        verify(consumers,never()).cursor(siblingContext);
+    }
     @Test void aStoppedOldScopeWithoutAnAttachmentDoesNotInheritTheNewScopesConfirmation() {
         when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,0,List.of()));
         assertThat(new StoreBackedSinkPositions(port).apply("flow")).isEmpty();

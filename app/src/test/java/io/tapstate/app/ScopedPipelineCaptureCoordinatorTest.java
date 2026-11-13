@@ -460,6 +460,42 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void slowRetentionDoesNotHoldTheMonitorNeededByStartPlanning() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var retaining = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var planned = new CountDownLatch(1);
+            doAnswer(call -> {
+                retaining.countDown();
+                if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("retention was not released");
+                return null;
+            }).when(f.runtime).retain(any(), anyString(), any(), any());
+            var preparations = mock(SinkPreparationStore.class);
+            when(preparations.hasPreparedModels()).thenReturn(true);
+            when(f.pipelines.sinkPreparations(any(),any(),any())).thenReturn(preparations);
+            var pass = mock(PipelineConvergencePass.class);
+            when(pass.scope()).thenReturn(SCOPE);
+            try (var worker = Executors.newSingleThreadExecutor()) {
+                java.util.concurrent.Future<?> planning = null;
+                try {
+                    assertThat(retaining.await(3, TimeUnit.SECONDS)).isTrue();
+                    planning = worker.submit(() -> {
+                        f.coordinator.retainedPlanningModels(pass,f.snapshot(),f.models());
+                        planned.countDown();
+                    });
+                    assertThat(planned.await(1, TimeUnit.SECONDS))
+                            .as("start planning must not wait for unrelated SRS retention I/O")
+                            .isTrue();
+                } finally {
+                    release.countDown();
+                    if (planning != null) planning.get(3, TimeUnit.SECONDS);
+                }
+            }
+            assertThat(held.run().captureFailure("flow")).isEmpty();
+        }
+    }
+
     @Test void unavailableRetentionRetriesWithoutEndingTheOriginalCapture() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var held = ownedShared(f);

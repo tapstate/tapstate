@@ -278,10 +278,13 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     }
     private void closeOwned(long deadline) {
         active.set(false); handlers = List.of();
+        Object driver=context==null?null:context.getBeanFactory().getSingleton("convergenceDriver");
+        if(driver instanceof ConvergenceDriver convergence)convergence.stopForShutdown();
         Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
         var alerts = alertRuntime.get();
         if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
+        if(driver instanceof ConvergenceDriver convergence)convergence.awaitStopped(deadline);
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.awaitStopped(deadline);
         var initial = initialTestCaller.get(); if (initial != null) initial.interrupt();
         Object member = context == null ? null : context.getBeanFactory().getSingleton("hazelcastMember");
@@ -681,7 +684,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 }, runtime::health, scope, deployment, clock, audit).dispatch(operation, caller, input);
             };
         }
-        @Bean ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
+        @Bean(destroyMethod = "close") ConvergenceDriver convergenceDriver(NativeBusinessContext owner, PipelineConverger converger,
                 ObservationPublisher observations, RateSampler samples, MetricsExport export, NodeSessionLease node,
                 ClusterMembershipGate membership, PipelineActuationOwnership ownership, EngineLifecycleActuator actuator,
                 HazelcastInstance member, HazelcastExecutionPlans plans, RebuildAdmission admission, Clock clock, ClusterProperties cluster,

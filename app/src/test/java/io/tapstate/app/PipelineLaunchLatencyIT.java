@@ -29,7 +29,11 @@ class PipelineLaunchLatencyIT {
     private static final Map<String, CompletableFuture<Map<String, Object>>> TRACES = new ConcurrentHashMap<>();
     @TempDir Path work;
 
-    @Test void nativeLaunchStagesKeepTheirRequestCostsVisible() throws Exception {
+    @Test void nativeLaunchStagesKeepTheirRequestCostsVisible() throws Exception { measure(false); }
+
+    @Test void anIndependentNativeStartRunsWhileAnotherPipelinesPositionReadIsHeld() throws Exception { measure(true); }
+
+    private void measure(boolean blockPriorObservation) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -75,13 +79,22 @@ class PipelineLaunchLatencyIT {
                             .append("mode", "alwaysOn").append("data", new org.bson.Document("failCommands", List.of("find", "aggregate", "getMore"))
                                     .append("blockConnection", true).append("blockTimeMS", delay)));
                 }
+                int cacheDelay = Integer.getInteger("launch.cache-delay-ms", 0);
+                if (cacheDelay > 0) {
+                    try (var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                        raw.getDatabase("admin").runCommand(new org.bson.Document("configureFailPoint", "failCommand")
+                                .append("mode", "alwaysOn").append("data", new org.bson.Document("failCommands", List.of("find", "aggregate", "getMore"))
+                                        .append("blockConnection", true).append("blockTimeMS", cacheDelay)));
+                    }
+                }
                 String origin = "http://localhost:" + ((WebServerApplicationContext) application).getWebServer().getPort();
                 try (var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
                     var login = http.send(HttpRequest.newBuilder(URI.create(origin + "/auth/exchange?code=browser-code"))
                             .GET().build(), HttpResponse.BodyHandlers.ofString());
                     assertThat(login.statusCode()).isEqualTo(302);
                     String cookie = login.headers().firstValue("set-cookie").orElseThrow().split(";", 2)[0];
-                    for (int sample = 0; sample < Integer.getInteger("launch.samples", 2); sample++) {
+                    int samples = blockPriorObservation ? 2 : Integer.getInteger("launch.samples", 2);
+                    for (int sample = 0; sample < samples; sample++) {
                         String id = "launch-" + sample;
                         request(http, origin, cookie, "POST", "/api/pipelines/" + id + "/draft", draft(id), 201);
                         request(http, origin, cookie, "POST", "/api/pipelines/" + id + "/draft:preview", Map.of("revision", 1), 200);
@@ -90,28 +103,81 @@ class PipelineLaunchLatencyIT {
                         request(http, origin, cookie, "GET", "/api/pipelines/" + id + "/draft", null, 200);
                         request(http, origin, cookie, "GET", "/api/pipelines/" + id + "/status", null, 200);
                     }
-                    String running = "launch-" + (Integer.getInteger("launch.samples", 2) - 1);
-                    try (var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                    String running = "launch-" + (samples - 1);
+                    var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
+                    if (blockPriorObservation) {
+                        request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
+                                .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
+                    }
+                    var publisher = NativeAppStorage.business(application).getBean(io.tapstate.runtime.scheduler.ObservationPublisher.class);
+                    try (var barrier = blockPriorObservation ? new PositionReadBarrier(publisher,"launch-0") : null;
+                         var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                        if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
+                                .as("the prior Pipeline must reach its actual observation position reader").isTrue();
                         var admin = raw.getDatabase("admin");
-                        admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                        if (!blockPriorObservation) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
                                 .append("data", new org.bson.Document("failCommands", List.of("update"))
                                         .append("namespace", storage.cacheDatabase() + "." + io.tapstate.adapters.mongostore.SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName())
                                         .append("blockConnection", true).append("blockTimeMS", 5000)));
                         try {
                             long requested = System.nanoTime();
                             request(http, origin, cookie, "POST", "/api/pipelines/" + running + ":start", Map.of(), 200);
-                            var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
                             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun(running)
                                     .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
-                            System.out.println("ENGINE_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
+                            long readyMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested);
+                            System.out.println((blockPriorObservation ? "INDEPENDENT_ENGINE_READY_MS " : "ENGINE_READY_MS ") + readyMillis);
+                            if (barrier != null) assertThat(barrier.release.getCount())
+                                    .as("the new real engine must run before the unrelated position reader is released").isEqualTo(1);
                             var state = request(http, origin, cookie, "GET", "/api/pipelines/" + running + "/status", null, 200);
                             assertThat(state).containsEntry("state", "RUNNING").containsEntry("displayState", "RUNNING");
-                            assertThat(state).doesNotContainKeys("observedAt", "observedState");
+                            if (!blockPriorObservation) assertThat(state).doesNotContainKeys("observedAt", "observedState");
+                            if (barrier != null) {
+                                try (var target = com.mongodb.client.MongoClients.create(storage.masterUri())) {
+                                    var rows = target.getDatabase(storage.masterDatabase())
+                                            .getCollection("order_views_" + running.replace('-','_'));
+                                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                                        var row = rows.find(new org.bson.Document("parent_id",1L)).first();
+                                        assertThat(row).as("the independent Pipeline must deliver its root document").isNotNull();
+                                        assertThat(row.get("customer",org.bson.Document.class)).containsEntry("parent_id",1L);
+                                        assertThat(row.getList("lines",org.bson.Document.class)).hasSize(1)
+                                                .allSatisfy(line -> assertThat(line).containsEntry("parent_id",1L));
+                                    });
+                                    System.out.println("INDEPENDENT_TARGET_ROW_VISIBLE_MS "
+                                            + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
+                                }
+                            }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
                     }
                 }
             }
         }
+    }
+
+    /** Holds one real position supplier; all engine, capture and store work still follows production wiring. */
+    private static final class PositionReadBarrier implements AutoCloseable {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final java.lang.reflect.Field field;
+        final io.tapstate.runtime.scheduler.ObservationPublisher publisher;
+        final Object original;
+        @SuppressWarnings("unchecked")
+        PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
+            this.publisher=publisher;
+            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("positions");
+            field.setAccessible(true);original=field.get(publisher);
+            var delegate=(java.util.function.Function<String,Map<String,String>>)original;
+            field.set(publisher,(java.util.function.Function<String,Map<String,String>>) id -> {
+                if(id.equals(pipeline)) {
+                    entered.countDown();
+                    try {
+                        if(!release.await(100,TimeUnit.SECONDS))throw new AssertionError("position barrier was not released");
+                    } catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
+                }
+                return delegate.apply(id);
+            });
+        }
+        @Override public void close() throws Exception {release.countDown();field.set(publisher,original);}
     }
 
     private static Map<String, Object> publish(HttpClient http, String origin, String cookie, String id,
@@ -148,7 +214,7 @@ class PipelineLaunchLatencyIT {
                 "root", Map.of("id", "root", "sourceId", "launch-input", "table", "orders", "key", List.of("_id"), "preTransforms", List.of()),
                 "related", List.of(related("customer", "customers", "object"), related("lines", "lines", "array")),
                 "transforms", List.of(), "output", Map.of("kind", "source", "config", Map.of(
-                        "sourceId", "atlas-store", "table", "order_views", "writeMode", "upsert", "onFullLoad", "append"))));
+                        "sourceId", "atlas-store", "table", "order_views_" + id.replace('-','_'), "writeMode", "upsert", "onFullLoad", "append"))));
     }
 
     private static Map<String, Object> related(String id, String table, String shape) {
