@@ -64,6 +64,20 @@ class PipelineLogAppenderTest {
         assertThat(sink.tail("orders_sync")).isEmpty();
     }
 
+    @Test void profilingDoesNotDisplaceTheOperatorsPipelineLogTail() {
+        RingBufferLogSink sink = new RingBufferLogSink(8, 1);
+        withAppender(sink, "test.logs.operator", logger -> {
+            MDC.put(MDC_KEY, "orders_sync");
+            logger.info("operator-visible progress");
+        });
+        withAppender(sink, PipelineDiagnostics.LOGGER_NAME, logger -> {
+            MDC.put(MDC_KEY, "orders_sync");
+            logger.info("profiling-only sentinel");
+        });
+        assertThat(sink.tail("orders_sync")).extracting(LogLine::message)
+                .containsExactly("operator-visible progress");
+    }
+
     @Test
     void ignoresALineWithABlankPipelineAttribution() {
         RingBufferLogSink sink = new RingBufferLogSink(8, 8);

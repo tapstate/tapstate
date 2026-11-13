@@ -24,12 +24,15 @@ final class PipelinePassExecutor implements AutoCloseable {
     }
 
     boolean submit(String pipeline, Runnable pass) {
-        if (!reserve(pipeline)) return false;
+        var timing = PipelineDiagnostics.attempt(pipeline);
+        if (!reserve(pipeline)) { timing.admission(stopped.get() ? "stopped" : "in_flight", active); return false; }
         try {
-            workers.execute(() -> runReserved(pipeline, pass));
+            workers.execute(() -> runReserved(pipeline, () -> timing.run(pass)));
+            timing.admission("accepted", active);
             return true;
         } catch (RejectedExecutionException saturated) {
             active.remove(pipeline);
+            timing.admission(stopped.get() ? "stopped" : "saturated", active);
             return false;
         } catch (RuntimeException | Error failure) {
             active.remove(pipeline);
@@ -38,7 +41,9 @@ final class PipelinePassExecutor implements AutoCloseable {
     }
 
     void runInline(String pipeline, Runnable pass) {
-        if (reserve(pipeline)) runReserved(pipeline, pass);
+        var timing = PipelineDiagnostics.attempt(pipeline);
+        if (reserve(pipeline)) { timing.admission("inline", active); runReserved(pipeline, () -> timing.run(pass)); }
+        else timing.admission(stopped.get() ? "stopped" : "in_flight", active);
     }
 
     private boolean reserve(String pipeline) {

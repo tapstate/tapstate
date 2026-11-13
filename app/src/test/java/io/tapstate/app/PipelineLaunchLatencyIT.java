@@ -44,6 +44,7 @@ class PipelineLaunchLatencyIT {
                     .environment(CloudFixtureEnvironment.isolated()).run(
                             "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
                             "--logging.level.io.tapstate.app.StorageRoot=WARN",
+                            "--logging.level.io.tapstate.diagnostics.pipeline=DEBUG",
                             "--tapstate.store.mongo.uri=" + storage.configurationUri(),
                             "--tapstate.cloud.atlas-uri=" + storage.configurationUri(),
                             "--tapstate.cloud.base-url=" + NativeCloudAlertManagementIT.CLOUD,
@@ -52,7 +53,8 @@ class PipelineLaunchLatencyIT {
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                             "--SDK_STATUS_SENDER_ENABLED=false",
                             "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
-                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"))) {
+                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+                    var diagnostics = new DiagnosticRecording()) {
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                         assertThat(application.getBean(StorageRoot.class).runtime().business())
                                 .as("phase=" + application.getBean(StorageRoot.class).phase()).isPresent());
@@ -151,9 +153,45 @@ class PipelineLaunchLatencyIT {
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
                     }
+                    if (!blockPriorObservation) {
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
+                                .until(() -> diagnostics.slowPublication().isPresent());
+                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION "
+                                + JsonWriter.write(diagnostics.slowPublication().orElseThrow()));
+                    }
                 }
             }
         }
+    }
+
+    private static final class DiagnosticRecording implements AutoCloseable {
+        final ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(PipelineDiagnostics.LOGGER_NAME);
+        final Queue<Map<?, ?>> completed = new ConcurrentLinkedQueue<>();
+        final ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.AppenderBase<>() {
+                    @Override protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
+                        var record = (Map<?, ?>) JsonReader.parse(event.getFormattedMessage());
+                        if ("PIPELINE_PASS".equals(record.get("phase")) && "end".equals(record.get("edge")))
+                            completed.add(record);
+                    }
+                };
+        DiagnosticRecording() { appender.setContext(logger.getLoggerContext()); appender.start(); logger.addAppender(appender); }
+        Optional<Map<String, Object>> slowPublication() {
+            for (var record : completed) {
+                var mongo = (Map<?, ?>) ((Map<?, ?>) record.get("mongo_by_phase")).get("pipeline_publish");
+                var phase = (Map<?, ?>) ((Map<?, ?>) record.get("phases")).get("pipeline_publish");
+                if (mongo != null && phase != null && Boolean.TRUE.equals(record.get("complete"))
+                        && ((Number) mongo.get("max_driver_ms")).doubleValue() >= 4500
+                        && ((Number) phase.get("inclusive_ms")).doubleValue() >= 4500) {
+                    return Optional.of(Map.of("pass_id", record.get("pass_id"), "pipeline_id", record.get("pipeline_id"),
+                            "phase", "PIPELINE_PUBLISH", "inclusive_ms", phase.get("inclusive_ms"),
+                            "max_driver_ms", mongo.get("max_driver_ms"), "command_count", mongo.get("started")));
+                }
+            }
+            return Optional.empty();
+        }
+        @Override public void close() { logger.detachAppender(appender); appender.stop(); }
     }
 
     /** Holds one real position supplier; all engine, capture and store work still follows production wiring. */

@@ -27,6 +27,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.scheduling.annotation.Scheduled;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 
 /**
  * Periodically reconciles every pipeline's actual state toward its desired intent, then publishes each
@@ -148,9 +149,21 @@ final class ConvergenceDriver implements AutoCloseable {
     void reconcile() { scan(false); }
 
     private void scan(boolean asynchronous) {
-        if (!reconcileEligible.getAsBoolean() || !scanning.compareAndSet(false, true)) return;
+        boolean eligible = PipelineDiagnostics.measure(null, Phase.PIPELINE_ELIGIBILITY, () -> {
+            boolean allowed = reconcileEligible.getAsBoolean();
+            PipelineDiagnostics.event(allowed ? "member_eligible" : "member_not_eligible");
+            return allowed;
+        });
+        if (!eligible) return;
+        if (!scanning.compareAndSet(false, true)) {
+            PipelineDiagnostics.measure(null, Phase.PIPELINE_SCAN, () -> {
+                PipelineDiagnostics.event("scan_already_in_flight"); return null;
+            });
+            return;
+        }
         try {
-            List<String> pipelineIds = scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds();
+            List<String> pipelineIds = PipelineDiagnostics.measure(null, Phase.PIPELINE_SCAN,
+                    () -> scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds());
             int size = pipelineIds.size();
             int start = size == 0 ? 0 : Math.floorMod(nextPipeline, size);
             for (int offset = 0; offset < size; offset++) {
@@ -163,7 +176,7 @@ final class ConvergenceDriver implements AutoCloseable {
             retained.addAll(passes.activePipelines());
             // No other scan admits work until this snapshot has been pruned. Workers may only
             // remove their own completed reservation, so an active claim cannot be pruned away.
-            retain(retained);
+            PipelineDiagnostics.measure(null, Phase.PIPELINE_RETAIN, () -> { retain(retained); return null; });
         } finally { scanning.set(false); }
     }
 
@@ -176,32 +189,42 @@ final class ConvergenceDriver implements AutoCloseable {
         try {
             PipelineActuationOwnership.Permit permit;
             if (scoped == null) {
-                permit = actuation.permit(pipelineId);
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CLAIM)) { permit = actuation.permit(pipelineId); }
             } else {
-                var snapshot = scoped.intents().loadForActuation(pipelineId);
+                var snapshot = PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_INTENT,
+                        () -> scoped.intents().loadForActuation(pipelineId));
                 if (snapshot.isEmpty()) {
                     var pendingStart = scoped.prepareStart() == null
                             ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
-                    if (pendingStart.isPresent()) prepareStart(pendingStart.orElseThrow());
+                    if (pendingStart.isPresent()) {
+                        PipelineDiagnostics.intent(pendingStart.orElseThrow().intent());
+                        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PREPARATION)) {
+                            prepareStart(pendingStart.orElseThrow());
+                        }
+                    }
                     else if (scoped.resumeRebuild() != null) {
                         scoped.resumeRebuild().accept(pipelineId);
                     }
                     return;
                 }
+                PipelineDiagnostics.intent(snapshot.orElseThrow());
                 if (snapshot.get().deleted()) return;
                 if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
                     throw new TapstateException(
                             IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
                 }
-                permit = actuation.permit(snapshot.get().scope());
-                if (permit.granted()) {
-                    localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
-                    pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
-                            scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
-                    actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CLAIM)) {
+                    permit = actuation.permit(snapshot.get().scope());
+                    if (permit.granted()) {
+                        localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
+                        pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
+                                scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
+                        actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
+                    }
                 }
             }
             if (!permit.granted()) {
+                PipelineDiagnostics.event("owner_not_granted");
                 // Another member drives this pipeline. Observe desired and actual; drive neither. Both
                 // halves matter: converging here would call the same lifecycle verb a second time --
                 // this member is carrying no job, which is exactly the condition the converge side
@@ -211,11 +234,15 @@ final class ConvergenceDriver implements AutoCloseable {
             }
             PipelineConvergencePass originalPass = pass;
             if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
-            ConvergeResult result = scoped == null ? converger.converge(pipelineId)
+            ConvergeResult result;
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CONVERGE)) {
+                result = scoped == null ? converger.converge(pipelineId)
                     : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
-                            scoped.rebuilds().apply(pass), ignored -> publisher.publishScoped(originalPass.scope(),
-                                    originalPass.state(), originalPass.observationSample(), null),
+                            scoped.rebuilds().apply(pass), ignored -> PipelineDiagnostics.measure(pipelineId, Phase.PIPELINE_PUBLISH,
+                                    () -> publisher.publishScoped(originalPass.scope(),
+                                            originalPass.state(), originalPass.observationSample(), null)),
                             () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
+            }
             if (result.status() == ConvergeStatus.RECOVERING) return;
             ObservationFailure failure = null;
             if (result.status() == ConvergeStatus.FAILED) {
@@ -228,17 +255,22 @@ final class ConvergenceDriver implements AutoCloseable {
                 LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                         failure.code(), result.failure().orElse(null));
             }
-            var projection = scoped == null ? publisher.publish(pipelineId, failure)
+            java.util.Optional<io.tapstate.core.lifecycle.Observation> projection;
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PUBLISH)) {
+                projection = scoped == null ? publisher.publish(pipelineId, failure)
                     : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+            }
             PipelineConvergencePass sampledPass = pass;
             projection.ifPresent(published -> {
+                PipelineDiagnostics.event("observation_" + published.state().name());
                 if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
-                sample(published, sampledPass);
-                export(published);
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_SAMPLE)) { sample(published, sampledPass); }
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_EXPORT)) { export(published); }
             });
             // A clean pass ends the failure streak; the next throw starts counting from one again.
             reconcileFailures.remove(pipelineId);
         } catch (RuntimeException e) {
+            PipelineDiagnostics.failed(e);
             PipelineConvergencePass failedPass = pass;
             if (scoped != null) alert(() -> scoped.alerts().unavailable(failedPass));
             // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
@@ -306,7 +338,7 @@ final class ConvergenceDriver implements AutoCloseable {
     }
 
     private void alert(Runnable action) {
-        try { action.run(); }
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_ALERTS)) { action.run(); }
         catch (RuntimeException unavailable) { LOG.warn("Alert collection is degraded for this convergence pass"); }
     }
 

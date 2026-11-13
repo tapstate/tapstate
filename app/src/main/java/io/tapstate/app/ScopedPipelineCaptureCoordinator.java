@@ -15,6 +15,7 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.*;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 
 /** Native source owners retain the original Pipeline, capture and physical handoff identities. */
 final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinator,AutoCloseable {
@@ -337,10 +338,18 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 return held.sources.values().stream().filter(source -> source.run!=null).map(source -> source.run.failure()).flatMap(Optional::stream).findFirst();
             }
         }
-        @Override public boolean loadDelivered(String pipeline) { requireId(pipeline); var held=current(); if(held==null || !held.snapshot || held.sources.isEmpty())return true;
-            requireSession(held);if(held.bounded)return stores.boundedLoads().complete(original);
-            return held.sources.values().stream().allMatch(source ->
-                    streamingCursor(held,source).snapshotCompletedTables().containsAll(source.selected.tables())); }
+        @Override public boolean loadDelivered(String pipeline) {
+            requireId(pipeline); var held=current();
+            if(held==null || !held.snapshot || held.sources.isEmpty())return true;
+            return PipelineDiagnostics.measure(pipeline, Phase.PIPELINE_TARGET_CONFIRM, () -> {
+                requireSession(held);
+                boolean delivered = held.bounded ? stores.boundedLoads().complete(original)
+                        : held.sources.values().stream().allMatch(source ->
+                                streamingCursor(held,source).snapshotCompletedTables().containsAll(source.selected.tables()));
+                if (delivered) PipelineDiagnostics.event("initial_snapshot_delivery_observed");
+                return delivered;
+            });
+        }
         @Override public SnapshotReading snapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:snapshotReading(held); }
         @Override public SnapshotReading runSnapshotProgress(String pipeline) { requireId(pipeline); var held=current(); return held==null?SnapshotReading.NONE:runSnapshotReading(held); }
         @Override public InitialLoad initialLoad(String pipeline, ExecutionPlan plan, Instant at) {
@@ -631,7 +640,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var logged = new LinkedHashMap<String, PipelineCaptureBindings.LoggedSource>();
         for (var source : session.sources.values()) {
             if (source.shared)
-                prepareLoggedSource(session, source, pipeline, node, artifacts, authored)
+                PipelineDiagnostics.measure(session.original.pipelineId(), Phase.CAPTURE_SOURCE_PREPARE, () -> {
+                    PipelineDiagnostics.source(source.id);
+                    return prepareLoggedSource(session, source, pipeline, node, artifacts, authored);
+                })
                         .ifPresent(binding -> logged.put(source.id, binding));
         }
         // The preparation mode belongs to the state generation; its READY receipt suppresses
@@ -878,6 +890,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     }
 
     private void startSource(
+            Session session, Source source, SnapshotStateStore state, long epoch,
+            Map<String, PipelineCaptureBindings.LoggedSource> logged, Map<String, DirectSourceRun> direct) {
+        PipelineDiagnostics.measure(session.original.pipelineId(), Phase.CAPTURE_SOURCE_START, () -> {
+            PipelineDiagnostics.source(source.id);
+            startSourceOwned(session, source, state, epoch, logged, direct);
+            return null;
+        });
+    }
+
+    private void startSourceOwned(
             Session session,
             Source source,
             SnapshotStateStore state,
@@ -1383,8 +1405,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void maintenanceTick() {
         // Retention uses the owner's fixed capture fence. Its store reads must not hold the
         // coordinator monitor needed to plan and attach an unrelated Pipeline.
-        for (Owner owner : maintain()) {
-            try { retain(owner); }
+        for (Owner owner : PipelineDiagnostics.measure(null, Phase.CAPTURE_MAINTENANCE, this::maintain)) {
+            try { PipelineDiagnostics.retention(owner.prepared.captureId(), () -> retain(owner)); }
             catch (RuntimeException | Error failure) { failedRetention(owner, failure); }
         }
         List<DemandCheck> due = new ArrayList<>();
