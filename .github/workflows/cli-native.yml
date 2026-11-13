@@ -9,9 +9,6 @@ on:
       release-version:
         required: true
         type: string
-      skip-release-tests:
-        type: boolean
-        default: false
   pull_request:
     branches: [main]
     paths:
@@ -78,10 +75,8 @@ jobs:
       - name: build the native CLI, MCP Boot JAR, and bundle assembly
         run: mvn -B -Pnative -pl cli,control/mcp-server,distribution/cli-bundle -am -DskipTests package
       - name: native smoke (black-box against the produced binary, offline + online)
-        if: github.event_name == 'pull_request' || !inputs.skip-release-tests
         run: bash cli/native-smoke.sh cli/target/tapstate
       - name: MCP stdio smoke (Boot JAR sidecar)
-        if: github.event_name == 'pull_request' || !inputs.skip-release-tests
         shell: bash
         run: |
           jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"

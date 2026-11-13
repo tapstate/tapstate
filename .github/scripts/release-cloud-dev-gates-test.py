@@ -59,13 +59,6 @@ def require_completeness_before_dev(workflow):
     assert {"approve", "publish"} <= ancestors(jobs, "cloud-ghcr")
 
 
-def steps_guarded_by(job, condition):
-    return {
-        name for name, guard in re.findall(r"^      - name: (.+)\n        if: (.+)$", job, re.MULTILINE)
-        if guard == condition
-    }
-
-
 class CloudDevReleaseGatesTest(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text()
@@ -73,40 +66,11 @@ class CloudDevReleaseGatesTest(unittest.TestCase):
     def test_a_failed_distribution_check_blocks_dev_and_approval(self):
         require_completeness_before_dev(self.workflow)
 
-    def test_v080_exception_guards_only_release_test_steps(self):
-        jobs = jobs_of(self.workflow)
-        self.assertIn(
-            "        if: steps.next.outputs.tag == 'v0.8.0' && inputs.commit == '' "
-            "&& github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
-            jobs["version"],
-        )
-        self.assertIn("      skip_release_tests: ${{ steps.v080-exception.outputs.enabled }}", jobs["version"])
-        guarded = {
-            job: steps_guarded_by(body, "needs.version.outputs.skip_release_tests != 'true'")
-            for job, body in jobs.items()
-        }
-        self.assertEqual({job: steps for job, steps in guarded.items() if steps}, {
-            "cloud-image": {
-                "install the local OCI archive importer",
-                "run both checked images with their real Boot entrypoints",
-            },
-            "connectors": {"start the real-connector lane on the commit being released"},
-            "join-perf": {"start the join performance lane on the commit being released"},
-            "gates": {
-                "The gates still decide the way they are supposed to",
-                "6. the real-connector lane is green on this commit",
-                "8. the join performance lane is green on this commit",
-            },
-        })
-        self.assertIn("      skip-release-tests: ${{ needs.version.outputs.skip_release_tests == 'true' }}",
-                      jobs["cli-native"])
+    def test_release_checks_have_no_temporary_exception(self):
         cli = CLI_WORKFLOW.read_text()
-        self.assertIn("      skip-release-tests:\n        type: boolean\n        default: false\n", cli)
-        self.assertEqual(
-            steps_guarded_by(jobs_of(cli)["cli-native"], "github.event_name == 'pull_request' || !inputs.skip-release-tests"),
-            {"native smoke (black-box against the produced binary, offline + online)",
-             "MCP stdio smoke (Boot JAR sidecar)"},
-        )
+        for marker in ("v080-exception", "skip_release_tests", "skip-release-tests"):
+            self.assertNotIn(marker, self.workflow)
+            self.assertNotIn(marker, cli)
 
     def test_removing_the_completeness_dependency_is_detected(self):
         mutated = re.sub(r"(  cloud-dev:\n.*?^    needs:) [^\n]+", r"\1 [version, gates]",
