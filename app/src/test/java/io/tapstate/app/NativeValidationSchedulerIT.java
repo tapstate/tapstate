@@ -134,6 +134,11 @@ class NativeValidationSchedulerIT {
                 }finally{peerResources.close();}
             }finally{
                 if(peerLease!=null){var stopped=peer;peerLease.stopAndClose(()->{if(stopped!=null)stopped.shutdown();});}else if(peer!=null)peer.shutdown();
+                // A peer's shutdown return does not publish its departure on this member. Let the
+                // surviving view settle before its own graceful Jet shutdown broadcasts to members.
+                var local = f.member.getCluster().getLocalMember().getUuid();
+                await(() -> f.member.getCluster().getMembers().size() == 1
+                        && f.member.getCluster().getMembers().iterator().next().getUuid().equals(local));
                 f.raw.getDatabase(source).drop();f.raw.getDatabase(target).drop();
             }
         }
