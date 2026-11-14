@@ -1436,3 +1436,10 @@ io.store-quota-exceeded:
   solution: "Ask the storage administrator to restore capacity, then query the original operation. Do not delete initialized storage or repeat setup."
 control.storage-quota-exceeded:
   message: "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again."
+
+control.ai-provider-request-rejected:
+  message: "The AI provider rejected the model or request protocol."
+  solution: "Check the model ID and API protocol. For current OpenAI models, select Responses API."
+control.ai-provider-rate-limited:
+  message: "The AI provider rate or quota limit was reached."
+  solution: "Check the provider quota and billing, or retry later."

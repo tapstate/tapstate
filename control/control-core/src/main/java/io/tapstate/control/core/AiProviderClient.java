@@ -9,6 +9,10 @@ import java.util.function.Consumer;
 public interface AiProviderClient {
     void check(AiProviderSettings settings);
 
+    default List<String> models(AiProviderSettings settings) {
+        throw AiProviderService.error(ControlError.AI_PROVIDER_FAILED);
+    }
+
     Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, Consumer<String> text);
 }
