@@ -92,7 +92,8 @@ done
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/deploy/cloud/image-runtime-metadata.py" \
   --cloud-jar "$WORK/cloud.jar" --onprem-jar "$WORK/onprem.jar" \
   --cloud-image "$WORK/cloud-image.json" --onprem-image "$WORK/onprem-image.json" \
-  --lock "$ROOT/deploy/cloud/connectors.lock.json" --output "$WORK"
+  --lock "$ROOT/deploy/cloud/connectors.lock.json" \
+  --onprem-lock "$ROOT/deploy/docker/connectors.lock.json" --output "$WORK"
 VERSION="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$WORK/cloud.json")"
 
 docker network create "${LABELS[@]}" "$NETWORK" >/dev/null
@@ -213,11 +214,8 @@ fi
 curl --noproxy '*' -fsS --max-time 10 "$FIXTURE_URL/proof" >"$WORK/proof-after-cloud.json"
 
 onprem_lifecycle() {
-  mkdir -p "$WORK/op-input/connectors" "$WORK/op-input/release" || return 1
-  docker cp "$SERVER:/opt/tapstate/connectors/mongodb-connector.jar" "$WORK/op-input/connectors/" || return 1
-  cp "$ROOT/deploy/cloud/connectors.lock.json" "$WORK/op-input/release/" || return 1
   new_volume onprem || return 1
-  python3 "$ROOT/deploy/docker/native-install-smoke.py" prepare --image "$ONPREM" --volume "$VOLUME" --release "$WORK/op-input" || return 1
+  python3 "$ROOT/deploy/docker/native-install-smoke.py" initialize --image "$ONPREM" --volume "$VOLUME" || return 1
   new_container onprem || return 1
   OP_SERVER="$CURRENT" || return 1
   docker run -d --name "$OP_SERVER" "${LABELS[@]}" --network "$NETWORK" \
@@ -225,7 +223,6 @@ onprem_lifecycle() {
     "$ONPREM" "${BASE_ARGS[@]}" --tapstate.installation.directory=/var/lib/tapstate/installation >/dev/null || return 1
   ready "$OP_SERVER" || return 1
   [[ "$(docker exec "$OP_SERVER" id -u)" = 10001 ]] || return 1
-  docker exec "$OP_SERVER" sh -ec 'test ! -e /opt/tapstate/connectors; test -z "${TAPSTATE_CONNECTORS_SEED_DIR:-}"' || return 1
   python3 "$ROOT/deploy/docker/native-install-smoke.py" install --server "$OP_SERVER" \
     --mongo 'mongodb://fixture:fixture-mongo-password@mongo:27017/{database}?replicaSet=rs0&authSource=admin' \
     --username image-runtime-admin --password image-runtime-onprem-password-sentinel || return 1

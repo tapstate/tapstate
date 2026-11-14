@@ -23,6 +23,12 @@ def command(*args, body=None, timeout=180, label="command"):
     return result.stdout
 
 
+def initialize(args):
+    mount = f"type=volume,src={args.volume},dst=/var/lib/tapstate"
+    owned_container("--mount", mount, "-e", "JAVA_TOOL_OPTIONS=-Xmx768m -XX:ActiveProcessorCount=2", args.image,
+            "installation", "--initialize", f"--tapstate.installation.directory={DIRECTORY}")
+
+
 def prepare(args):
     release = Path(args.release)
     lock = json.loads((release / "release/connectors.lock.json").read_text())
@@ -31,9 +37,8 @@ def prepare(args):
     content = seed.read_bytes()
     if len(content) != expected["bytes"] or hashlib.sha256(content).hexdigest() != expected["sha256"]:
         raise RuntimeError("the Mongo connector seed does not match its retained release lock")
+    initialize(args)
     mount = f"type=volume,src={args.volume},dst=/var/lib/tapstate"
-    owned_container("--mount", mount, "-e", "JAVA_TOOL_OPTIONS=-Xmx768m -XX:ActiveProcessorCount=2", args.image,
-            "installation", "--initialize", f"--tapstate.installation.directory={DIRECTORY}")
     owned_container("-i", "--mount", mount, "--entrypoint", "sh", args.image,
             "-ec", "cat > /var/lib/tapstate/connectors/mongodb-connector.jar", body=content)
     print("Prepared owner-only installation files and the verified Mongo test seed")
@@ -163,11 +168,17 @@ def install(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
+    initialized = commands.add_parser("initialize")
+    initialized.add_argument("--image", required=True)
+    initialized.add_argument("--volume", required=True)
+    initialized.set_defaults(run=initialize)
     setup = commands.add_parser("prepare")
     setup.add_argument("--image", required=True)
     setup.add_argument("--volume", required=True)
     setup.add_argument("--release", default=os.environ.get("TAPSTATE_TEST_CLOUD_RELEASE_DIR"))
+    setup.set_defaults(run=prepare)
     configured = commands.add_parser("install")
+    configured.set_defaults(run=install)
     configured.add_argument("--server", required=True)
     configured.add_argument("--mongo", required=True)
     configured.add_argument("--username", required=True)
@@ -176,7 +187,7 @@ def main():
     if args.action == "prepare" and not args.release:
         parser.error("set TAPSTATE_TEST_CLOUD_RELEASE_DIR to verified public test inputs")
     try:
-        (prepare if args.action == "prepare" else install)(args)
+        args.run(args)
     except (RuntimeError, OSError, ValueError, KeyError, StopIteration, subprocess.TimeoutExpired) as failure:
         detail = str(failure) if isinstance(failure, RuntimeError) else type(failure).__name__
         print(f"Native installation smoke failed: {detail}")
