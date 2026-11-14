@@ -27,6 +27,21 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
     }
 
+    /** Legacy facets compose their reads; native stores override this with one validated snapshot. */
+    default AttachedChain attachedWithChain(String chain, SrsChainStore chains) {
+        var topology = attached(chain);
+        var state = chains.load(chain).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null));
+        return new AttachedChain(topology, state);
+    }
+
+    /** Retention diagnoses a missing checkpoint before inspecting its consumer relations. */
+    default AttachedChain retentionSnapshot(String chain, SrsChainStore chains) {
+        var state = chains.load(chain).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null));
+        return new AttachedChain(attached(chain), state);
+    }
+
     record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
 
     /** Reads original progress and the boundaries for its missing rings from one snapshot. */

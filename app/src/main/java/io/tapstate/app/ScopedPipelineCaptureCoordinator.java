@@ -1439,11 +1439,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             try {
                 owner.require();
                 var current = stores.sources().srs(stores.scope(), owner::require);
+                var attached = current.consumers().attachedWithChain(owner.prepared.chainId(), current.chains());
                 var requested = new TreeSet<String>();
-                current.consumers().attached(owner.prepared.chainId()).consumers()
+                attached.topology().consumers()
                         .forEach(member -> requested.addAll(member.tables()));
-                covered = requested.isEmpty() || current.chains().load(owner.prepared.chainId())
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused).servingTables().containsAll(requested);
+                covered = requested.isEmpty() || attached.chain().servingTables().containsAll(requested);
                 owner.require();
             } catch (RuntimeException | Error failed) { failure = failed; }
             checked.put(owner, new TailCheck(owner, original.revision(), original.physical(), covered, failure));

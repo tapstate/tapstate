@@ -79,6 +79,24 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThat(underMonitor).as("a healthy remote fence read must not block unrelated start planning").isFalse();
         }
     }
+    @Test void healthyMaintenanceReusesTheChainValidatedWithAttachedConsumers() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var topology = stores.consumers().attached(held.chain());
+            var chain = stores.chains().load(held.chain()).orElseThrow();
+            when(stores.consumers().attachedWithChain(eq(held.chain()), any(SrsChainStore.class)))
+                    .thenReturn(new SrsConsumerStore.AttachedChain(topology, chain));
+            clearInvocations(stores.chains(), stores.consumers());
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            verify(stores.chains(), never()).load(held.chain());
+            verify(stores.consumers()).attachedWithChain(eq(held.chain()), any(SrsChainStore.class));
+        }
+    }
+
     @Test void onePublicationSharesOneOriginalCursorAcrossAllCaptureProjections() {
         try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
             var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
@@ -831,6 +849,12 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    private static SrsConsumerStore consumerStore() {
+        var consumers = mock(SrsConsumerStore.class);
+        when(consumers.attachedWithChain(anyString(), any(SrsChainStore.class))).thenCallRealMethod();
+        return consumers;
+    }
+
     private static OwnedShared ownedShared(Fixture f) {
         return ownedShared(f,false);
     }
@@ -842,7 +866,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         var capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,captureId),OWNER,4,2,1,Instant.now().plusSeconds(60));
         var context=new SrsConsumerContext(new SrsConsumerKey(physical,"flow","input"),7);
         var membership=new SrsConsumerMembership(context,1,false,Set.of("orders"),PIPELINE);
-        var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=mock(SrsConsumerStore.class);
+        var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=consumerStore();
         var chain=new AtomicReference<>(new SrsChainState(physical,captureId,"1h",0,Set.of("orders"),Set.of(),0,null,null,1,1));
         var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
         var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
@@ -887,7 +911,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,captureId),OWNER,4,2,1,Instant.now().plusSeconds(60));
             var context=new SrsConsumerContext(new SrsConsumerKey(physical,"flow","input"),7);
             var membership=new SrsConsumerMembership(context,1,false,Set.of("orders"),PIPELINE);
-            var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=mock(SrsConsumerStore.class);
+            var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=consumerStore();
             var chain=new AtomicReference<>(new SrsChainState(physical,captureId,"1h",0,Set.of("orders"),Set.of(),0,null,null,1,1));
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
@@ -945,7 +969,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var openedChain=new SrsChainState(physical,captureId,"1h",2,Set.of("orders"),Set.of("orders"),1,checkpoint,Instant.EPOCH,1,1);
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",13L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var retained=new SrsConsumerProgress(context,1,1,cursor,null);
-            var consumers=mock(SrsConsumerStore.class);var chains=mock(SrsChainStore.class);
+            var consumers=consumerStore();var chains=mock(SrsChainStore.class);
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
             when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(originalChain)));
@@ -1180,7 +1204,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
-            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));
+            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),consumerStore()),mock(HazelcastInstance.class)));
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),
@@ -1208,7 +1232,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         private void streaming() {
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
             when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
-            var consumers = mock(SrsConsumerStore.class);
+            var consumers = consumerStore();
             when(consumers.attached(any(),anyString())).thenAnswer(call->{var run=call.getArgument(0,SrsConsumerRun.class);var member=consumers.find(run.context().key()).orElse(null);return member!=null&&!member.detached()&&member.context().equals(run.context())&&member.revision()==run.membershipRevision()&&member.commandFence().equals(run.originalClaim())&&member.tables().contains(call.getArgument(1,String.class));});
             streamingProgress.set(progress(false, 1, 1));
             when(consumers.find(streamingContext.key())).thenReturn(Optional.of(

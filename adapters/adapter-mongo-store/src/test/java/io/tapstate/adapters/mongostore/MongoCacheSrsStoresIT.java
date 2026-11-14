@@ -30,6 +30,48 @@ class MongoCacheSrsStoresIT {
             SystemCollections.SRS_MODEL_CONTEXTS,SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,
             SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_WORKLOAD_CLAIMS);
 
+    @Test void coherentRetentionUsesOneNativeTransactionAndKeepsItsCallerGuard() {
+        withFixture(f -> {
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var active = new AtomicBoolean(true);
+            var consumers = stores.consumers().guardedBy(() -> {
+                if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            });
+            var fallback = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
+                    new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> { throw new AssertionError("native retention must not reopen its chain"); });
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                var read = consumers.retentionSnapshot(CHAIN, fallback);
+                assertThat(read.chain().miningChainId()).isEqualTo(CHAIN);
+                assertThat(read.topology().scope()).isEqualTo(f.scope);
+                assertThat(commands.stream().filter(("find:" + SystemCollections.SRS_CHAINS.collectionName())::equals)).hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:"))).hasSize(1);
+                int before = commands.size();
+                active.set(false);
+                code(() -> consumers.retentionSnapshot(CHAIN, fallback), IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(commands).hasSize(before);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @Test void coherentRetentionKeepsItsMissingRootDiagnosis() {
+        withFixture(f -> {
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var root = SystemCollections.SRS_CHAINS.on(f.database).find(new Document("_id", CHAIN)).first();
+            assertThat(root).isNotNull();
+            SystemCollections.SRS_CHAINS.on(f.database).deleteOne(new Document("_id", CHAIN));
+            code(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()), IoError.SRS_CHECKPOINT_UNPROVEN);
+            SystemCollections.SRS_CHAINS.on(f.database).insertOne(root);
+            SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+            var original = catchThrowable(() -> stores.consumers().attached(CHAIN));
+            assertThat(original).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) original).code()).isNotEqualTo(IoError.SRS_CHECKPOINT_UNPROVEN);
+            assertThatThrownBy(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(((TapstateException) original).code()));
+        });
+    }
+
     @Test void actualModelPublicationAndLogReadsSurviveReopeningOnlyTheCacheOwner() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope,ACTIVE); var model = f.model();

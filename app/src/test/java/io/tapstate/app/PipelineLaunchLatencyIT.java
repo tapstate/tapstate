@@ -307,7 +307,19 @@ class PipelineLaunchLatencyIT {
                                     try { return method.invoke(ports.chains(), arguments); }
                                     catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
                                 });
-                        return new SrsStores(chains, ports.models(), ports.log(), ports.consumers());
+                        var consumers = (SrsConsumerStore) java.lang.reflect.Proxy.newProxyInstance(SrsConsumerStore.class.getClassLoader(),
+                                new Class<?>[]{SrsConsumerStore.class}, (proxy, method, arguments) -> {
+                                    if (method.getName().equals("attachedWithChain")
+                                            && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                        blocked.set(true); entered.countDown();
+                                        try { release.await(); }
+                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                                    }
+                                    try { return method.invoke(ports.consumers(), arguments); }
+                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                });
+                        return new SrsStores(chains, ports.models(), ports.log(), consumers);
                     }
                     public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
                     public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {
