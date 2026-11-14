@@ -152,6 +152,66 @@ class MongoConfigurationDraftStoreIT {
     }
 
     @Test
+    void concurrentAlertActivityDoesNotReplayPublicationDependencyReads() {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "secret"); domain.artifacts().create(source);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var publication = publication("orders", 1, null, Map.of("src", CanonicalHash.of(source)));
+            long before = revision(database);
+            var dependencyReads = new java.util.concurrent.atomic.AtomicInteger();
+            var triggered = new java.util.concurrent.atomic.AtomicBoolean();
+            var competing = new java.util.concurrent.atomic.AtomicReference<java.util.concurrent.Future<?>>();
+            try (var writer = Executors.newSingleThreadExecutor()) {
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                    if (!command.equals("aggregate") || !collection.equals("sources")) return;
+                    dependencyReads.incrementAndGet();
+                    if (!triggered.compareAndSet(false, true)) return;
+                    competing.set(writer.submit(() -> SystemCollections.CONFIGURATION_VERSION.on(database)
+                            .updateOne(new Document("_id", "configuration"),
+                                    new Document("$inc", new Document("alertWriteFence", 1L)))));
+                    try { competing.get().get(100, TimeUnit.MILLISECONDS); }
+                    catch (java.util.concurrent.TimeoutException orderingHeld) {
+                        // A publication that already owns the ordering document completes before this writer.
+                    } catch (Exception failed) { throw new AssertionError(failed); }
+                });
+                try { assertThat(domain.drafts().publish(publication)).isEqualTo(PipelineDraftMutation.PUBLISHED); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                competing.get().get(5, TimeUnit.SECONDS);
+            }
+            assertThat(triggered).isTrue();
+            assertThat(dependencyReads).as("an unrelated alert write must not replay the dependency snapshot").hasValue(1);
+            assertThat(revision(database)).isEqualTo(before + 1);
+            assertThat(domain.artifacts().get("orders")).contains(publication.artifact());
+            assertThat(domain.drafts().get("orders").orElseThrow().publishedArtifactHash()).isEqualTo(publication.publishedArtifactHash());
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "wrong-type", "array", "exhausted", "invalid-schema"})
+    void earlyPublicationOrderingCannotCommitAcrossInvalidConfiguration(String damage) {
+        withConfiguration((domain, database) -> {
+            var source = source("src", "secret"); domain.artifacts().create(source);
+            domain.drafts().create(draft("orders", 1, PipelineDraft.Mode.DAG, null, null, null));
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(database);
+            if (damage.equals("missing")) versions.deleteOne(new Document("_id", "configuration"));
+            else if (damage.equals("invalid-schema")) SystemCollections.SCHEMA_MIGRATIONS.on(database)
+                    .updateOne(new Document("_id", "config"), new Document("$set", new Document("validation", new Document("phase", "PREPARING"))));
+            else versions.updateOne(new Document("_id", "configuration"), new Document("$set",
+                    new Document("revision", damage.equals("wrong-type") ? "invalid" : damage.equals("array") ? List.of(1L) : Long.MAX_VALUE - 1)));
+            var before = versions.find().first();
+            var saved = domain.drafts().get("orders");
+            assertThatThrownBy(() -> domain.drafts().publish(publication("orders", 1, null, Map.of("src", CanonicalHash.of(source)))))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> {
+                        if (!damage.equals("invalid-schema")) assertThat(failure.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    });
+            assertThat(versions.find().first()).isEqualTo(before);
+            assertThat(domain.artifacts().get("orders")).isEmpty();
+            assertThat(domain.drafts().get("orders")).isEqualTo(saved);
+            assertThat(SystemCollections.OPERATOR_GENERATIONS.on(database).find(new Document("_id", "orders")).first()).isNull();
+        });
+    }
+
+    @Test
     void failedFinalDraftWriteRollsBackArtifactScopeMappingVersionAndKeyFence() {
         withConfiguration((domain, database) -> {
             domain.artifacts().create(source("src", "secret"));

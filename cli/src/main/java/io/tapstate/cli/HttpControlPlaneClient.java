@@ -1749,7 +1749,13 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
      * when that field is absent. A malformed failure block is a contract error, not a healthy pipeline.
      */
     private static StatusOutcome statusFound(String body) {
-        if (JsonReader.parse(body) instanceof Map<?, ?> m
+        Object parsed = JsonReader.parse(body);
+        if (parsed instanceof Map<?, ?> pending && pending.get("pipelineId") instanceof String
+                && pending.get("state") == null && pending.get("observedState") == null
+                && (pending.containsKey("displayState") || pending.containsKey("desiredState"))) {
+            return new StatusOutcome.NoObservation();
+        }
+        if (parsed instanceof Map<?, ?> m
                 && m.get("pipelineId") instanceof String id
                 && m.get("state") instanceof String state) {
             boolean aggregate = m.containsKey("observedState")

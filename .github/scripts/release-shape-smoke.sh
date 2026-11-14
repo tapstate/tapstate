@@ -19,6 +19,7 @@ set -uo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 workflow="$here/../workflows/release.yml"
+images="$here/../workflows/release-images.yml"
 passed=0
 failed=0
 
@@ -31,11 +32,15 @@ failed=0
 # which fails in both directions: a rule that was removed while its comment stayed reads as present,
 # and a rule that is present reads as broken because something described it.
 job() {
+  local file="$workflow"
+  case "$1" in
+    server-image|cloud-server-jar|cloud-image) file="$images" ;;
+  esac
   awk -v want="  $1:" '
     $0 == want { inside = 1; next }
     /^  [a-z][a-z0-9_-]*:[ \t]*$/ { inside = 0 }
     inside && $0 !~ /^[ \t]*#/ { print }
-  ' "$workflow"
+  ' "$file"
 }
 
 jobs_list="$(awk '/^  [a-z][a-z0-9_-]*:[ \t]*$/ { gsub(/[ :]/, ""); print }' "$workflow")"
@@ -50,7 +55,7 @@ hasnt()  { if grep -qE -- "$3" <<<"$(job "$2")"; then bad "$1" "job '$2' still m
 has "the publish job waits on the approval" publish 'needs:.*approve'
 has "the approval waits for the Cloud dev candidate" approve 'needs:.*cloud-dev'
 has "the approval uses the protected release environment" approve '^    environment: release$'
-has "Cloud dev starts only after the release gates" cloud-dev 'needs:.*gates'
+has "Cloud dev starts only after the draft checks" cloud-dev 'needs:.*draft'
 has "Cloud dev reuses its existing workflow" cloud-dev 'uses: [.]\/[.]github/workflows/cloud-cluster-dev[.]yml'
 has "Cloud dev consumes the selected release version" cloud-dev 'version:.*needs[.]version[.]outputs[.]version'
 has "Cloud dev consumes the frozen Tapstate commit" cloud-dev 'source-sha:.*needs[.]version[.]outputs[.]sha'
@@ -87,7 +92,7 @@ hasnt "the publish path retires no branches of its own" satellites 'unbranch'
 # Anything that pushes an image, publishes a release, or moves the floating pointer, in a job that
 # does not need the approval, is the failure this file exists for. Checked over every job there is,
 # so a new one is covered without this list being edited.
-for j in $jobs_list; do
+for j in $jobs_list server-image cloud-server-jar cloud-image; do
   case "$j" in publish|satellites|cloud-ghcr) continue ;; esac
   body="$(job "$j")"
   if grep -qE 'imagetools create|docker push|ghcr-publish[.]sh publish|push: true|draft=false|--latest=|make_latest|satellites[.]sh release|docs-release[.]sh settle' <<<"$body"; then
@@ -112,8 +117,8 @@ has   "Cloud builds its own Web-bearing Boot JAR"         cloud-server-jar 'name
 has   "Cloud builds through the same attested producer" cloud-server-jar 'build-web-assets[.]sh'
 has   "Cloud explicitly requests the Cloud Web profile" cloud-server-jar '\-\-web-profile cloud'
 has   "the freeze records the immutable Web commit" version 'web_sha:.*steps[.]web-pin[.]outputs[.]sha'
-has   "OP consumes the frozen Web commit" server-image 'ref:.*needs[.]version[.]outputs[.]web_sha'
-has   "Cloud consumes that same frozen Web commit" cloud-server-jar 'ref:.*needs[.]version[.]outputs[.]web_sha'
+has   "OP consumes the frozen Web commit" server-image 'ref:.*inputs[.]web-sha'
+has   "Cloud consumes that same frozen Web commit" cloud-server-jar 'ref:.*inputs[.]web-sha'
 has   "Cloud staging consumes an explicit Console URL" cloud-server-jar '\-\-cloud-console-url'
 has   "Cloud retains the producer normalized Console URL" cloud-server-jar 'cloud_console_url:.*steps[.]web-provenance[.]outputs[.]cloud-console-url'
 has   "OP labels its independent Web profile" server-image 'TAPSTATE_WEB_PROFILE=onprem'
@@ -122,7 +127,8 @@ has   "Cloud receives the producer Console URL without shell interpolation" clou
 # shellcheck disable=SC2016
 has   "Cloud labels the producer Console URL" cloud-image 'TAPSTATE_WEB_CLOUD_CONSOLE_URL=\$CLOUD_CONSOLE_URL'
 has   "Cloud checks the producer Boot byte digest" cloud-image '\-\-boot-jar-sha256.*needs[.]cloud-server-jar[.]outputs[.]boot_jar_sha256'
-has   "OP provenance checks the producer Boot byte digest" draft '\-\-boot-jar-sha256.*needs[.]server-image[.]outputs[.]boot_jar_sha256'
+has   "OP provenance receives the producer Boot byte digest" draft 'BOOT_SHA256:.*needs[.]release-images[.]outputs[.]server_boot_jar_sha256'
+has   "the draft checks distribution with the pinned workflow tooling" draft 'run: bash release-tooling/.*prepare-release-distribution[.]sh'
 has   "Cloud compiles an explicit Console return URL"     cloud-server-jar 'VITE_CLOUD_CONSOLE_URL:'
 has   "Cloud reads release Web configuration from its environment" cloud-server-jar 'environment: cloud-ghcr-release'
 has   "Cloud waits for its profile-specific Boot JAR"     cloud-image 'needs:.*cloud-server-jar'
@@ -134,7 +140,7 @@ has   "Cloud verifies its Boot JAR and seed bytes"  cloud-image 'verify-image[.]
 has   "Cloud compares the server Boot JAR"           cloud-image '\-\-boot-jar'
 has   "Cloud checks Web files and revision"         cloud-image 'web-provenance[.]py create'
 has   "Cloud retains the checked archive"           cloud-image 'name: cloud-image-sealed'
-has   "a failed Cloud image blocks approval"         gates       'needs:.*cloud-image'
+has   "a failed Cloud image blocks approval"         gates       'needs:.*release-images'
 hasnt "Cloud does not rebuild Web"                   cloud-image 'pnpm build|prepare-web-assets[.]sh|mvn .*package'
 has   "Cloud runtime proof waits for the paired OP image" cloud-image 'needs:.*server-image'
 has   "Cloud runtime proof downloads the already-built OP archive" cloud-image 'name: server-image'
@@ -181,14 +187,14 @@ has   "Cloud publication supplies the existing workflow token fallback" cloud-gh
 
 has   "Cloud GHCR uses the checked digest publisher" cloud-ghcr 'ghcr-publish[.]sh publish'
 has   "Cloud and OP use the same release version" cloud-ghcr 'needs[.]version[.]outputs[.]version'
-has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]digest'
+has   "Cloud GHCR publishes the verified archive digest" cloud-ghcr 'needs[.]release-images[.]outputs[.]cloud_digest'
 has   "Cloud registers the published version with the control plane" cloud-ghcr 'node cloud-release-tooling/scripts/notify-cloud-release[.]mjs'
 has   "Cloud notification tooling follows the workflow revision" cloud-ghcr 'ref:.*github[.]workflow_sha'
 has   "Cloud notification tooling is checked out separately" cloud-ghcr 'path: cloud-release-tooling'
 has   "Cloud notification checkout selects only its helper" cloud-ghcr 'sparse-checkout: scripts/notify-cloud-release[.]mjs'
 has   "Cloud registration excludes older release lines" cloud-ghcr "if: needs.version.outputs.is_latest == 'true'"
 has   "Cloud registration sends the publisher's immutable image" cloud-ghcr 'CLOUD_IMAGE:.*steps[.]image[.]outputs[.]image'
-has   "Cloud registration sends the checked image digest" cloud-ghcr 'CLOUD_IMAGE_DIGEST:.*needs[.]cloud-image[.]outputs[.]digest'
+has   "Cloud registration sends the checked image digest" cloud-ghcr 'CLOUD_IMAGE_DIGEST:.*needs[.]release-images[.]outputs[.]cloud_digest'
 has   "Cloud publication and registration serialize across versions" cloud-ghcr '^      group: tapstate-cloud-release-publication$'
 has   "queued Cloud publications do not replace one another" cloud-ghcr '^      queue: max$'
 cloud_publish_at="$(job cloud-ghcr | grep -n 'ghcr-publish[.]sh publish' | head -1 | cut -d: -f1)"
@@ -205,7 +211,7 @@ has   "cleanup waits for final Cloud publication" cleanup 'needs:.*cloud-ghcr'
 has   "Cloud Boot JAR is sealed before public artifact storage" cloud-server-jar 'seal-cloud-artifact[.]mjs seal'
 has   "Cloud OCI is sealed before public artifact storage" cloud-image 'seal-cloud-artifact[.]mjs seal'
 has   "Cloud Boot JAR opens only with its producing attempt context" cloud-image 'needs[.]cloud-server-jar[.]outputs[.]sealed_context'
-has   "Cloud OCI opens only with its producing attempt context" cloud-ghcr 'needs[.]cloud-image[.]outputs[.]sealed_context'
+has   "Cloud OCI opens only with its producing attempt context" cloud-ghcr 'needs[.]release-images[.]outputs[.]cloud_sealed_context'
 hasnt "the public artifact path cannot contain a plaintext Boot JAR" cloud-server-jar 'path: app/target/app-.*boot[.]jar'
 hasnt "the public artifact path cannot contain a plaintext Cloud OCI" cloud-image 'path:.*cloud-image[.]tar'
 hasnt "Cloud GHCR never receives AWS credentials" cloud-ghcr 'AWS_|ECR_|configure-aws-credentials'
@@ -345,7 +351,7 @@ else
   bad "the connector lane starts as early as it can" \
       "wanted exactly 'needs: version', got: $(job connectors | grep -E '^    needs:' | head -1)"
 fi
-has  "the draft body comes from the gate"     draft  'body_path'
+has  "the draft uses the release notes it assembles" draft 'body_path: release-notes[.]md'
 has  "and GitHub appends its own list"        draft  'generate_release_notes: true'
 
 # The draft is a draft, and creates no tag until somebody publishes it.
@@ -368,22 +374,20 @@ has "and it writes the board only once the release is out" roadmap 'needs: \[ver
 # other case here passing, and the failure arriving as a version number nobody can explain.
 has "the write-back only opens for the newest line" write-back "if: needs.version.outputs.is_latest == 'true'"
 
-# --- the connector lane is judged the same way as every other required check --------------------
-# It is the sixth gate, and the only one that judges a lane no merge gate covers, so the shape it is
-# read with is the whole of it. Reading it any other way -- a count of failures, `gh pr checks`, a
-# grep of the run list -- puts back exactly what the shared reader exists to refuse: a lane that never
-# started on this commit produces no check-run at all, and every way of counting failures reports that
-# as nothing wrong.
-has "the connector lane is judged by the same reader as every other check" \
-    gates 'checks-on-commit\.sh --sha .* --required real-connectors'
-
-# --- and so is the performance lane -------------------------------------------------------------
-# The same shape for the same reason. This one is the easier of the two to lose: the ordinary build
-# runs part of it, so a reader can talk themselves into "the merge gate covers it" - and what the
-# merge gate covers is three scenarios on one tier out of eleven on three. A lane that never started
-# on the release commit leaves no check-run, which every way of counting failures reports as fine.
-has "the performance lane is judged by the same reader as every other check" \
-    gates 'checks-on-commit\.sh --sha .* --required join-perf'
+for j in release-images connectors join-perf; do
+  has "$j receives the exact release commit" "$j" 'source-sha:.*needs[.]version[.]outputs[.]sha'
+  hasnt "$j cannot ignore a failed run" "$j" '^    (if:|continue-on-error:)'
+done
+has "release calls the shared image workflow" release-images 'uses: .*release-images[.]yml'
+has "the shared image workflow receives the frozen Web commit" release-images 'web-sha:.*needs[.]version[.]outputs[.]web_sha'
+has "the shared image workflow receives the release version" release-images 'release-version:.*needs[.]version[.]outputs[.]version'
+has "release calls the shared connector workflow" connectors 'uses: .*real-connectors[.]yml'
+has "release calls the full join performance workflow" join-perf 'uses: .*join-perf[.]yml'
+hasnt "the release gate cannot ignore failed prerequisites" gates '^    (if:|continue-on-error:)'
+for j in server-image cloud-server-jar cloud-image; do
+  has "$j checks out the caller's immutable source" "$j" 'ref:.*inputs[.]source-sha'
+  hasnt "$j cannot ignore a failed build or smoke" "$j" '^    (if:|continue-on-error:)'
+done
 
 # --- everything is built from the commit the version job resolved -------------------------------
 # The `commit` input is what makes a release from an older line possible at all, and it defaults to
@@ -391,7 +395,7 @@ has "the performance lane is judged by the same reader as every other check" \
 # from a correct one on every dispatch from `main`: same tree, same artifacts, same green run. It
 # diverges only on the case the input exists for, and there it builds the wrong line's code under the
 # right line's version number and publishes it -- with nothing red anywhere.
-for j in server-image cloud-server-jar cloud-image connectors join-perf gates draft publish; do
+for j in gates draft publish; do
   has "$j builds the commit the version job resolved" "$j" 'ref: \$\{\{ needs\.version\.outputs\.sha \}\}'
 done
 # And the release that comes out says so, which is the half a reader can check afterwards.
@@ -408,18 +412,71 @@ while IFS= read -r ref; do
   [ -n "$ref" ] || continue
   from="$(printf '%s' "$ref" | cut -d. -f2)"
   what="$(printf '%s' "$ref" | cut -d. -f4)"
-  job "$from" | awk '/^    outputs:$/ { inside = 1; next } /^    [a-z]/ { inside = 0 } inside' \
-    > /tmp/rss-outputs.$$
-  grep -qE "^      ${what}:" /tmp/rss-outputs.$$ || missing="${missing} ${ref}"
-  rm -f /tmp/rss-outputs.$$
+  if [ "$from" = release-images ]; then
+    outputs="$(sed -n '/^    outputs:$/,/^permissions:$/p' "$images")"
+  else
+    outputs="$(job "$from" | awk '/^    outputs:$/ { inside = 1; next } /^    [a-z]/ { inside = 0 } inside')"
+  fi
+  grep -qE "^      ${what}:" <<<"$outputs" || missing="${missing} ${ref}"
 done <<EOF
-$(grep -oE 'needs\.[a-z][a-z0-9_-]*\.outputs\.[a-z_][a-z0-9_]*' "$workflow" | sort -u)
+$(grep -hoE 'needs\.[a-z][a-z0-9_-]*\.outputs\.[a-z_][a-z0-9_]*' "$workflow" "$images" | sort -u)
 EOF
 if [ -z "$missing" ]; then
   ok "every output read from another job is one that job declares"
 else
   bad "every output read from another job is one that job declares" "undeclared:${missing}"
 fi
+
+# Verify the public Nightly entry point and the shared workflows that it actually calls.
+nightly="$here/../workflows/nightly-test.yml"
+triggers() {
+  awk '/^on:$/ { inside = 1; next } /^[^ ]/ { inside = 0 }
+       inside && /^  [a-z_]+:/ { sub(/:.*/, ""); sub(/^  /, ""); print }' "$1" | sort
+}
+if [ "$(triggers "$nightly")" = $'schedule\nworkflow_dispatch' ] &&
+   grep -qF -- '- cron: "0 17 * * *"' "$nightly"; then
+  ok "Nightly runs only at 01:00 Shanghai time or when manually dispatched"
+else
+  bad "Nightly runs only at 01:00 Shanghai time or when manually dispatched" "unexpected Nightly triggers"
+fi
+for helper in release-images real-connectors; do
+  if [ "$(triggers "$here/../workflows/$helper.yml")" = workflow_call ]; then
+    ok "$helper only runs inside a caller"
+  else
+    bad "$helper only runs inside a caller" "the helper still has an independent trigger"
+  fi
+done
+if [ "$(triggers "$here/../workflows/join-perf.yml")" = $'pull_request\nworkflow_call' ]; then
+  ok "Join retains its path-filtered PR validation and runs on a call"
+else
+  bad "Join retains its path-filtered PR validation and runs on a call" "unexpected Join triggers"
+fi
+release_workflow="$workflow"
+workflow="$nightly"
+for j in real-connectors join-perf cli-native release-images; do
+  has "Nightly calls the shared $j workflow" "$j" "uses: .*${j}[.]yml"
+  has "Nightly pins $j to the event commit" "$j" 'source-sha:.*github[.]sha'
+  has "the failure alert observes $j" notify-feishu "needs:.*$j"
+done
+for j in prepare gate-selftests distribution; do
+  has "the failure alert observes $j" notify-feishu "needs:.*$j"
+done
+has "Nightly runs the release script self-tests" gate-selftests 'run:.*release-gate-selftests[.]sh'
+has "Nightly checks the complete assembled distribution" distribution 'bash .*prepare-release-distribution[.]sh'
+has "Nightly verifies both CLI and image artifacts" distribution 'needs:.*cli-native.*release-images'
+has "Nightly only sends Feishu alerts for scheduled failures" notify-feishu     "if:.*github[.]event_name == 'schedule'.*contains[(]needs[.][*][.]result, 'failure'[)]"
+if grep -qE 'contents: write|packages: write|gh release create|docker push|softprops/action-gh-release' "$nightly"; then
+  bad "Nightly does not publish or register a release" "Nightly contains a publish operation"
+else
+  ok "Nightly does not publish or register a release"
+fi
+workflow="$here/../workflows/join-perf.yml"
+has "the shared Join workflow checks out the requested commit" join-perf 'ref:.*inputs[.]source-sha'
+has "the shared Join workflow runs all eleven scenarios" join-perf 'joinperf.scenarios=F1,F2,I1,I2,I3,I4,R1,R2,R3,R4,R5'
+has "the shared Join workflow runs all three tiers" join-perf 'joinperf.tiers=hot,mixed,cold'
+has "the shared Join workflow requires the complete result" join-perf 'rows.*-lt 34'
+hasnt "the shared Join workflow cannot ignore a failing suite" join-perf 'continue-on-error:'
+workflow="$release_workflow"
 
 if python3 "$here/release-cloud-dev-gates-test.py"; then
   ok "the actual distribution-completeness check blocks Cloud dev publication"

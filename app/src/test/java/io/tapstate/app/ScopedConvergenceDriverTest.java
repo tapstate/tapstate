@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.CasOutcome;
 import io.tapstate.core.lifecycle.CheckpointDoc;
@@ -25,6 +26,7 @@ import io.tapstate.spi.store.WorkloadClaimType;
 import io.tapstate.spi.store.WorkloadOwner;
 import org.junit.jupiter.api.Test;
 
+import java.net.InetSocketAddress;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -35,6 +37,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -207,10 +211,30 @@ class ScopedConvergenceDriverTest {
             assertThat(captured.getLast().state()).isEqualTo(PipelineState.RUNNING);
         }
     }
-    @Test void unreachableExportCannotPreventEvaluationOrTheIndependentFreshnessClock() throws Exception {
-        int unusedPort;
-        try(var socket=new java.net.ServerSocket(0,1,java.net.InetAddress.getLoopbackAddress())){unusedPort=socket.getLocalPort();}
-        var settings=io.tapstate.adapters.otel.ExportSettings.otlpTo("http://127.0.0.1:"+unusedPort+"/v1/metrics",
+    @Test void rejectedExportCannotPreventEvaluationOrTheIndependentFreshnessClock() throws Exception {
+        var collector = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var response = new CompletableFuture<OtlpRejection>();
+        collector.createContext("/v1/metrics", exchange -> {
+            try (exchange) {
+                int size = exchange.getRequestBody().readAllBytes().length;
+                exchange.sendResponseHeaders(400, -1);
+                response.complete(new OtlpRejection(exchange.getRequestMethod(),
+                        exchange.getRequestHeaders().getFirst("Content-Type"), size, exchange.getResponseCode()));
+            }
+        });
+        collector.start();
+        try {
+            verifyAlertFreshnessWithRejectingCollector(collector.getAddress().getPort(), response);
+        } finally {
+            collector.stop(0);
+        }
+    }
+
+    private record OtlpRejection(String method, String contentType, int size, int status) {}
+
+    private void verifyAlertFreshnessWithRejectingCollector(int port,
+            CompletableFuture<OtlpRejection> response) throws Exception {
+        var settings=io.tapstate.adapters.otel.ExportSettings.otlpTo("http://127.0.0.1:"+port+"/v1/metrics",
                 io.tapstate.adapters.otel.ExportSettings.Protocol.HTTP_PROTOBUF,Duration.ofHours(1));
         var harness=new PipelineAlertRuntimeTest();var rule=AlertEvaluationHostTest.definition("pipeline.observation-stale");
         org.mockito.Mockito.when(harness.fixture.store.evaluationRules(org.mockito.ArgumentMatchers.any(),org.mockito.ArgumentMatchers.anyInt()))
@@ -225,7 +249,13 @@ class ScopedConvergenceDriverTest {
             var initial=harness.rows.values().iterator().next().value().snapshot();
             assertThat(initial.status()).isEqualTo(io.tapstate.core.alerting.AlertSnapshot.Status.CLEAR);
             var original=views.observations(FIRST).read("orders").orElseThrow();
-            assertThat(exporter.flush(Duration.ofSeconds(2))).isFalse();
+            // Flush completion is not the collector's verdict. Require an actual rejected export.
+            exporter.flush(Duration.ofSeconds(5));
+            var rejected = response.get(5, TimeUnit.SECONDS);
+            assertThat(rejected.method()).isEqualTo("POST");
+            assertThat(rejected.contentType()).isEqualTo("application/x-protobuf");
+            assertThat(rejected.size()).isPositive();
+            assertThat(rejected.status()).isEqualTo(400);
             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).until(()->runtime.health().queuedInputs()==0);
             harness.fixture.now.set(initial.lastObservedAt().plusSeconds(121));runtime.tick();
             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3)).untilAsserted(()->{

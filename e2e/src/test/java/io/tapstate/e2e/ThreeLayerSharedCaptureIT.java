@@ -368,7 +368,9 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                         .containsEntry("phase","RETIRED").containsEntry("operationId",operation).containsEntry("replacementChain",replacement);
                 for(String id:List.of("reader_a","reader_b")) {
-                    assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                    var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
+                            () -> control.state(id));
+                    assertThat(observed).isEqualTo(PipelineState.STOPPED);
                     assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
                     var refusal=control.startExpectingRefusal(id);assertThat(refusal.status()).isEqualTo(409);
                     assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
@@ -435,21 +437,35 @@ class ThreeLayerSharedCaptureIT {
         if(response.statusCode()==200) {
             assertThat(result.get("phase")).isEqualTo("PLANNED");return result;
         }
-        assertThat(response.statusCode()).isEqualTo(500);
-        assertThat(result.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
-        assertThat(((Map<?,?>)result.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
+        assertSharedPreflightFence(response.statusCode(), result);
         var operation=control.storageStatus().get("operationId");assertThat(operation).isInstanceOf(String.class);
         var original=storage(control,"status",Map.of("operationId",operation));
         assertThat(original.get("phase")).isEqualTo("PLANNED");assertThat(original.get("preflightCurrent")).isEqualTo(false);
         assertThat(original.get("canonicalChain")).isEqualTo(canonical);assertThat(original.get("physicalChain")).isEqualTo(canonical);
         // A separate explicit preflight uses the saved operation; it neither confirms nor replaces it.
         var recheck=new LinkedHashMap<>(request);recheck.put("operationId",operation);
-        var refreshed=storage(control,"plan",recheck);
+        var refreshed=Await.answered("the original shared recovery preflight " + operation, BOUND, () -> {
+            var pending = storage(control, "status", Map.of("operationId", operation));
+            assertThat(pending.get("phase")).isEqualTo("PLANNED");
+            assertThat(pending.get("canonicalChain")).isEqualTo(canonical);
+            assertThat(pending.get("physicalChain")).isEqualTo(canonical);
+            var retry = control.sourceResponse("POST", "/api/storage/recovery/plan", recheck, null);
+            var body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(retry.body());
+            if (retry.statusCode() == 200) return Optional.of(body);
+            assertSharedPreflightFence(retry.statusCode(), body);
+            return Optional.empty();
+        });
         assertThat(refreshed.get("phase")).isEqualTo("PLANNED");
         assertThat(refreshed.get("operationId")).isEqualTo(operation);
         assertThat(((Number)refreshed.get("controlRevision")).longValue()).isGreaterThan(((Number)original.get("controlRevision")).longValue());
         assertThat(refreshed.get("planHash")).isNotEqualTo(original.get("planHash"));
         return refreshed;
+    }
+
+    private static void assertSharedPreflightFence(int status, Map<?, ?> response) {
+        assertThat(status).as("shared recovery preflight: %s", response).isEqualTo(500);
+        assertThat(response.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
+        assertThat(((Map<?, ?>) response.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
     }
     private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {
         var fields=new Document("_id",0);

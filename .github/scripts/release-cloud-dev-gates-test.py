@@ -6,6 +6,9 @@ import unittest
 
 
 WORKFLOW = Path(__file__).resolve().parents[1] / "workflows" / "release.yml"
+CLI_WORKFLOW = WORKFLOW.with_name("cli-native.yml")
+IMAGE_WORKFLOW = WORKFLOW.with_name("release-images.yml")
+DISTRIBUTION = WORKFLOW.parents[1] / "scripts" / "prepare-release-distribution.sh"
 
 
 def jobs_of(workflow):
@@ -34,13 +37,16 @@ def completeness_check(jobs):
     checks = [
         (name, step) for name, body in jobs.items()
         for step in re.split(r"(?m)(?=^      - )", body)
-        if re.search(r"^\s+\.github/scripts/release-manifest\.sh\s", step, re.MULTILINE)
+        if re.search(r"^        run: bash .*prepare-release-distribution\.sh\s", step, re.MULTILINE)
     ]
     assert len(checks) == 1, "expected one executable distribution-completeness check"
     return checks[0]
 
 
-def require_completeness_before_dev(workflow):
+def require_completeness_before_dev(workflow, distribution):
+    assert re.search(r"^\.github/scripts/release-manifest\.sh\s", distribution, re.MULTILINE), (
+        "the distribution script must run the release manifest check"
+    )
     jobs = jobs_of(workflow)
     holder, step = completeness_check(jobs)
     assert not re.search(r"^(?:      - |        )(?:if|continue-on-error):", step, re.MULTILINE), (
@@ -49,38 +55,51 @@ def require_completeness_before_dev(workflow):
     assert holder in ancestors(jobs, "cloud-dev"), (
         f"distribution-completeness gate ({holder}) must succeed before Cloud dev publication"
     )
-    # With default success conditions, a failed or skipped prerequisite blocks its descendants.
-    for name in ancestors(jobs, "publish") | {"publish"}:
+    for name in ancestors(jobs, "cloud-ghcr") | {"cloud-ghcr"}:
         assert not re.search(r"^    (?:if|continue-on-error):", jobs[name], re.MULTILINE), (
             f"{name} must not override failed-prerequisite blocking"
         )
+    assert {"release-images", "gates"} <= ancestors(jobs, "draft")
     assert "cloud-dev" in ancestors(jobs, "approve")
-    assert "approve" in ancestors(jobs, "publish")
+    assert {"approve", "publish"} <= ancestors(jobs, "cloud-ghcr")
 
 
 class CloudDevReleaseGatesTest(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text()
+        self.distribution = DISTRIBUTION.read_text()
 
     def test_a_failed_distribution_check_blocks_dev_and_approval(self):
-        require_completeness_before_dev(self.workflow)
+        require_completeness_before_dev(self.workflow, self.distribution)
+
+    def test_release_checks_have_no_temporary_exception(self):
+        cli = CLI_WORKFLOW.read_text()
+        for marker in ("v080-exception", "skip_release_tests", "skip-release-tests"):
+            self.assertNotIn(marker, self.workflow)
+            self.assertNotIn(marker, cli)
+            self.assertNotIn(marker, IMAGE_WORKFLOW.read_text())
 
     def test_removing_the_completeness_dependency_is_detected(self):
         mutated = re.sub(r"(  cloud-dev:\n.*?^    needs:) [^\n]+", r"\1 [version, gates]",
                          self.workflow, count=1, flags=re.MULTILINE | re.DOTALL)
         with self.assertRaisesRegex(AssertionError, "must succeed before Cloud dev"):
-            require_completeness_before_dev(mutated)
+            require_completeness_before_dev(mutated, self.distribution)
 
     def test_removing_the_executable_check_is_detected(self):
-        mutated = re.sub(r"^\s+\.github/scripts/release-manifest\.sh[^\n]+", "",
+        mutated = re.sub(r"^        run: bash .*prepare-release-distribution\.sh[^\n]+", "",
                          self.workflow, flags=re.MULTILINE)
         with self.assertRaisesRegex(AssertionError, "one executable distribution-completeness check"):
-            require_completeness_before_dev(mutated)
+            require_completeness_before_dev(mutated, self.distribution)
+
+    def test_removing_the_manifest_from_the_distribution_script_is_detected(self):
+        mutated = self.distribution.replace(".github/scripts/release-manifest.sh", "true")
+        with self.assertRaisesRegex(AssertionError, "must run the release manifest check"):
+            require_completeness_before_dev(self.workflow, mutated)
 
     def test_bypassing_failed_prerequisites_is_detected(self):
         mutated = self.workflow.replace("  cloud-dev:\n", "  cloud-dev:\n    if: always()\n", 1)
         with self.assertRaises(AssertionError):
-            require_completeness_before_dev(mutated)
+            require_completeness_before_dev(mutated, self.distribution)
 
     def test_skipping_the_completeness_step_is_detected(self):
         self.require_step_override_rejected("if: false")
@@ -94,7 +113,7 @@ class CloudDevReleaseGatesTest(unittest.TestCase):
         self.assertIn(header, self.workflow)
         mutated = self.workflow.replace(header, header + f"        {override}\n", 1)
         with self.assertRaisesRegex(AssertionError, "step must not skip or tolerate failure"):
-            require_completeness_before_dev(mutated)
+            require_completeness_before_dev(mutated, self.distribution)
 
 
 if __name__ == "__main__":
