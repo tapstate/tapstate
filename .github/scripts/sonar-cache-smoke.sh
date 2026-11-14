@@ -90,10 +90,11 @@ restore = step('Restore Sonar analyzer binaries')
 analyze = step('Analyze admitted coverage')
 assert '        continue-on-error: true' in identify.splitlines()
 assert '        continue-on-error: true' in restore.splitlines()
-assert '        if: steps.guard.outputs.run == \'true\'' in identify.splitlines()
+analysis_guard = "        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (steps.guard.outputs.run == 'true') }}"
+assert analysis_guard in identify.splitlines()
 assert '          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}' in identify.splitlines()
 assert '          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}' in identify.splitlines()
-assert '        if: steps.guard.outputs.run == \'true\'' in analyze.splitlines(), 'a cache hit must never skip analysis'
+assert analysis_guard in analyze.splitlines(), 'a cache hit must never skip full-CI analysis'
 assert '-Dsonar.qualitygate.wait=true' in analyze
 assert re.search(r'^          restore-keys: \|\n\s+sonar-v1-.*outputs.server.*-$', restore, re.M), 'updated plugins should reuse unchanged binaries'
 assert 'bash .github/scripts/sonar-cache-smoke.sh' in workflow

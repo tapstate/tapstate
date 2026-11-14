@@ -85,7 +85,8 @@ for event,ref,expected in [('push','refs/heads/main',True),('pull_request','refs
                            ('workflow_dispatch','refs/heads/ws/example',True),
                            ('push','refs/heads/ws/example',False),('push','refs/tags/other',False)]:
     assert subscribed(event,ref)==expected, (event,ref,'workflow trigger changed')
-assert '        if:' not in step(build,'Check secret availability'), 'every subscribed event evaluates secret availability'
+docs_guard = "        if: needs.shard-plan.outputs.docs-only != 'true'"
+assert docs_guard in step(build,'Check secret availability'), 'every full-CI event evaluates secret availability'
 for output, source in [('sonar-enabled','steps.guard.outputs.run'),('sonar-outcome','steps.analyze.outcome')]:
     assert '      '+output+': ${{ '+source+' }}' in build.splitlines(), 'analysis output binding changed: '+output
 for variable, output in [('SONAR_ENABLED','sonar-enabled'),('SONAR_OUTCOME','sonar-outcome')]:
@@ -94,7 +95,7 @@ assert 'needs: build' in reporter and 'always()' in reporter
 assert 'sonarqube-' in text and 'cancel-in-progress: true' not in text
 admit=step(build,'Admit the complete report and coverage set'); analyze=step(build,'Analyze admitted coverage')
 assert 'ci-aggregate.sh verify' in admit and '--artifacts' in admit and '--restore .' in admit
-assert '        if:' not in admit and 'continue-on-error:' not in admit, 'admission must always gate coverage and analysis'
+assert docs_guard in admit and 'continue-on-error:' not in admit, 'admission must gate every full-CI analysis'
 assert len(re.findall(r'ci-aggregate\.sh verify|sonar-inputs\.sh', build))==1, 'artifact admission must execute exactly once'
 assert build.index('Admit the complete report and coverage set') < build.index('Merge coverage from every declared shard') < build.index('Analyze admitted coverage')
 assert 'mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" sonar:sonar' in analyze
@@ -197,11 +198,18 @@ with tempfile.TemporaryDirectory() as tmp:
         ('success','false','skipped',0),
     ]:
         summary=Path(tmp)/'summary'; summary.write_text('')
-        env=dict(os.environ,BUILD_RESULT=build_result,SONAR_ENABLED=enabled,SONAR_OUTCOME=outcome,GITHUB_STEP_SUMMARY=str(summary))
+        env=dict(os.environ,DOCS_ONLY='false',BUILD_RESULT=build_result,SONAR_ENABLED=enabled,SONAR_OUTCOME=outcome,GITHUB_STEP_SUMMARY=str(summary))
         run=subprocess.run(['bash','-e','-c',command],env=env,capture_output=True,text=True)
         assert (run.returncode==0)==(expect==0),run.stdout+run.stderr
         if enabled=='false' and build_result=='success':
             assert 'not evaluated' in summary.read_text(), 'missing-secret success must remain explicit'
+    for build_result in ('success', 'failure', 'cancelled', 'skipped'):
+        summary=Path(tmp)/'summary'; summary.write_text('')
+        env=dict(os.environ,DOCS_ONLY='true',BUILD_RESULT=build_result,SONAR_ENABLED='',SONAR_OUTCOME='',GITHUB_STEP_SUMMARY=str(summary))
+        run=subprocess.run(['bash','-e','-c',command],env=env,capture_output=True,text=True)
+        assert (run.returncode==0)==(build_result=='success'), 'docs route must not mask a failed build gate'
+        if build_result=='success':
+            assert 'not evaluated for documentation-only changes' in summary.read_text()
 guard=script(step(build,'Check secret availability'))
 with tempfile.TemporaryDirectory() as tmp:
     for token, host, fork, expected in [('', '', 'true', 'false'), ('', '', 'false', 'false'), ('token', '', 'false', 'false'), ('token', 'https://example.invalid', 'false', 'true')]:
