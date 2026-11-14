@@ -48,7 +48,7 @@ def check(workflows, contexts, inputs):
     plan = ci.get('shard-plan', '')
     assert 'ci-receipt.sh event-inputs' in plan and '${{ runner.temp }}/ci-event-inputs.json' in plan, \
         'the original event and actual checkout must be retained with the shard plan'
-    assert 'matrix: ${{ steps.plan.outputs.matrix }}' in plan and 'id: plan' in plan, \
+    assert 'matrix: ${{ steps.scope.outputs.matrix || steps.plan.outputs.matrix }}' in plan and 'id: plan' in plan, \
         'the planner must publish its exact matrix output'
     assert 'ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"' in plan, \
         'matrix IDs must come from the actual emitted plan'
@@ -244,7 +244,7 @@ for original, replacement in [
     ('permissions:\n', 'env:\n  MAVEN_ARGS: "-Dapi.version=1.44"\npermissions:\n'),
     ('ci-receipt.sh event-inputs', 'echo event-capture-removed'),
     ('${{ runner.temp }}/ci-event-inputs.json', '${{ runner.temp }}/missing-event.json'),
-    ('matrix: ${{ steps.plan.outputs.matrix }}', 'matrix: wrong-output'),
+    ('matrix: ${{ steps.scope.outputs.matrix || steps.plan.outputs.matrix }}', 'matrix: wrong-output'),
     ('ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json"', 'echo unrelated-matrix'),
     ('matrix: ${{ fromJSON(needs.shard-plan.outputs.matrix) }}', 'matrix: {shard: [rest]}'),
     ('name: test-shards (${{ matrix.shard }})', 'name: unrelated-worker'),
