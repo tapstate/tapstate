@@ -1,30 +1,26 @@
 # Tapstate
 
-
-
-
-
-
-
- # Tapstate
-
 **From fragmented database changes to one live view of the business.**
 
 Tapstate is an open-source, **operational data engine** that can be used to build a state layer for applications and AI agents. It captures changes from operational databases, incrementally transforms and combines them, and keeps business entities up to date.
 
 **Capture → Transform → Consolidate → Materialize. One deployable.**
 
-## Try Tapstate in minutes
+## Try it in minutes
 
 **Requirements:** Docker with the Compose plugin, and `jq`.
+
+Run this from an empty directory. The installer creates `tapstate-demo/` there and keeps everything inside it:
 
 ```sh
 curl -fsSL https://install.tapstate.dev/demo | sh
 ```
 
-The installer prompts for admin credentials and starts a local playground with MySQL, PostgreSQL, MongoDB, and Tapstate. No existing database or Atlas account is needed.
+It starts a local playground with MySQL, PostgreSQL, MongoDB, and Tapstate. No existing database or Atlas account is needed.
 
-Open **http://127.0.0.1:8080**, sign in, and explore the running pipeline. Everything is created under `tapstate-demo/`.
+**Administrator credentials.** Nothing is preset: the installer asks you to *choose* a username (Enter accepts `admin`) and a password for the playground's first administrator, then signs in with them. Keep them. You use them to sign in to the web UI, and a re-run in the same directory asks for the same ones. To skip the prompt, set `TAPSTATE_ADMIN_USER` and `TAPSTATE_ADMIN_PASSWORD`. If you lose them, run `docker compose down -v` in `tapstate-demo/`, remove the directory, and start again.
+
+Open **http://127.0.0.1:8080**, sign in, and explore the running pipeline. The installer also writes `tapstate-demo/tapstate-mcp.json`, an MCP configuration you can hand to an AI agent so it can manage the playground's pipelines.
 
 **What you'll see:** MySQL orders and PostgreSQL shipments continuously assembled into live order documents in MongoDB. Change a source record and watch the consolidated state update—without re-running a join or batch job.
 
