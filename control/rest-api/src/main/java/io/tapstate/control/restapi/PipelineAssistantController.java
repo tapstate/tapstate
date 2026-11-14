@@ -2,6 +2,7 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AiProviderClient;
+import io.tapstate.control.core.AiProviderSettings;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.PipelineDraftError;
 import io.tapstate.control.core.PipelineDraftService;
@@ -119,39 +120,11 @@ class PipelineAssistantController {
                 if (!focus.isEmpty()) context.put("focus", focus);
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
-                java.util.Optional<Map<String, Object>> candidate;
-                try (var text = new GuardedAssistantText(workspace.requireActive(), delta ->
-                        streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta)))) {
-                    try { candidate = client.propose(settings, messages, context, text); }
-                    catch (RuntimeException | Error failed) { text.throwIfFailed(); throw failed; }
-                    text.finish();
-                }
+                Optional<Map<String, Object>> candidate = propose(settings, messages, context,
+                        workspace.requireActive(), streamEvents, textId);
                 workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
-                if (candidate.isEmpty()) {
-                    streamEvents.status("complete");
-                    streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
-                    streamEvents.done();
-                    return;
-                }
-                streamEvents.status("validating");
-                Map<String, Object> validated = validate(base, id, revision, candidate.orElseThrow(), context);
-                workspace.requireActive().run();
-                if (!Boolean.TRUE.equals(validated.get(VALID))) {
-                    List<Map<String, Object>> diagnostics = diagnostics(validated);
-                    String code = diagnostics.isEmpty()
-                            ? ControlError.AI_INVALID_PROPOSAL.code()
-                            : AssistantWizardJson.text(diagnostics.getFirst().get("code"));
-                    streamEvents.needsInput(code, diagnostics);
-                    return;
-                }
-                Map<String, Object> proposal = new LinkedHashMap<>(validated);
-                proposal.put("baseRevision", revision);
-                workspace.requireActive().run();
-                streamEvents.event(Map.of("type", "data-proposal", "data", proposal));
-                streamEvents.status("ready");
-                streamEvents.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
-                streamEvents.done();
+                completeCandidate(base, id, candidate, context, workspace.requireActive(), streamEvents);
             } catch (UncheckedIOException disconnected) {
                 // Client cancellation closes the provider body through the streaming consumer.
             } catch (TapstateException failure) {
@@ -161,6 +134,49 @@ class PipelineAssistantController {
         return ResponseEntity.ok().cacheControl(CacheControl.noStore())
                 .header("x-vercel-ai-ui-message-stream", "v1").header("X-Accel-Buffering", "no")
                 .contentType(MediaType.TEXT_EVENT_STREAM).body(stream);
+    }
+
+    private Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context, Runnable guard, AssistantStream events, String textId) {
+        try (var text = new GuardedAssistantText(guard, delta ->
+                events.event(Map.of("type", "text-delta", "id", textId, "delta", delta)))) {
+            Optional<Map<String, Object>> candidate = invokeProvider(settings, messages, context, text);
+            text.finish();
+            return candidate;
+        }
+    }
+
+    private Optional<Map<String, Object>> invokeProvider(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context, GuardedAssistantText text) {
+        try { return client.propose(settings, messages, context, text); }
+        catch (RuntimeException failed) { text.throwIfFailed(); throw failed; }
+    }
+
+    private void completeCandidate(PipelineDraft base, String id,
+            Optional<Map<String, Object>> candidate, Map<String, Object> context, Runnable guard,
+            AssistantStream events) {
+        if (candidate.isEmpty()) {
+            events.status("complete");
+        } else {
+            events.status("validating");
+            Map<String, Object> validated = validate(base, id, base.revision(), candidate.orElseThrow(), context);
+            guard.run();
+            if (!Boolean.TRUE.equals(validated.get(VALID))) {
+                List<Map<String, Object>> diagnostics = diagnostics(validated);
+                String code = diagnostics.isEmpty()
+                        ? ControlError.AI_INVALID_PROPOSAL.code()
+                        : AssistantWizardJson.text(diagnostics.getFirst().get("code"));
+                events.needsInput(code, diagnostics);
+                return;
+            }
+            Map<String, Object> proposal = new LinkedHashMap<>(validated);
+            proposal.put("baseRevision", base.revision());
+            guard.run();
+            events.event(Map.of("type", "data-proposal", "data", proposal));
+            events.status("ready");
+        }
+        events.event(Map.of("type", FINISH, FINISH_REASON, "stop"));
+        events.done();
     }
     @Verb("pipeline-draft.assistant-validate")
     @PostMapping("/pipelines/{id}/draft:assistant-validate")

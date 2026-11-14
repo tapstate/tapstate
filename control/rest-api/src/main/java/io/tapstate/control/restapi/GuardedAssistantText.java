@@ -4,6 +4,7 @@ import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.ControlError;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.Condition;
 import java.util.function.Consumer;
@@ -20,7 +21,7 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
     private final Object failureLock = new Object();
     private final Thread worker;
-    private volatile Throwable failure;
+    private final AtomicReference<Throwable> failure = new AtomicReference<>();
     private boolean interruptedProducer;
     private boolean finished;
     private volatile boolean closed;
@@ -28,7 +29,8 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
     GuardedAssistantText(Runnable guard, Consumer<String> output) {
         this.guard = guard;
         this.output = output;
-        worker = Thread.ofVirtual().name("pipeline-assistant-text").start(this::publish);
+        worker = Thread.ofVirtual().name("pipeline-assistant-text")
+                .uncaughtExceptionHandler((thread, failed) -> fail(failed)).start(this::publish);
     }
 
     @Override public void accept(String text) {
@@ -36,12 +38,13 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
         if (text.length() > MAX_PENDING_CHARS) throw AiProviderService.error(ControlError.AI_PROVIDER_FAILED);
         acquire();
         try {
-            while (!closed && failure == null && pending.length() + text.length() > MAX_PENDING_CHARS) awaitPending();
+            while (!closed && failure.get() == null && pending.length() + text.length() > MAX_PENDING_CHARS) changed.await();
             throwIfFailed();
             if (closed || finished) throw new IllegalStateException("assistant text stream is closed");
             pending.append(text);
             changed.signalAll();
-        } finally { lock.unlock(); }
+        } catch (InterruptedException interrupted) { throw interrupted(); }
+        finally { lock.unlock(); }
     }
 
     void finish() {
@@ -55,39 +58,48 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
 
     void throwIfFailed() {
         synchronized (failureLock) {
-            if (failure != null && interruptedProducer && Thread.currentThread() == producer) {
+            Throwable failed = failure.get();
+            if (failed != null && interruptedProducer && Thread.currentThread() == producer) {
                 Thread.interrupted();
                 interruptedProducer = false;
             }
-            if (failure instanceof RuntimeException runtime) throw runtime;
-            if (failure instanceof Error error) throw error;
+            if (failed instanceof RuntimeException runtime) throw runtime;
+            if (failed instanceof Error error) throw error;
         }
     }
 
     private void publish() {
         try {
-            while (true) {
-                lock.lockInterruptibly();
-                try {
-                    while (pending.isEmpty() && !finished && !closed) changed.await();
-                    if (closed || pending.isEmpty() && finished) break;
-                } finally { lock.unlock(); }
+            while (awaitText()) {
                 // Keep the original workspace fence immediately before each released batch.
                 guard.run();
-                lock.lockInterruptibly();
-                try {
-                    if (closed) break;
-                    String batch = pending.toString();
-                    pending.setLength(0);
-                    changed.signalAll();
-                    output.accept(batch);
-                } finally { lock.unlock(); }
+                if (!publishBatch()) break;
             }
             drained.complete(null);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             fail(AiProviderService.error(ControlError.AI_PROVIDER_FAILED));
-        } catch (RuntimeException | Error failed) { fail(failed); }
+        } catch (RuntimeException failed) { fail(failed); }
+    }
+
+    private boolean awaitText() throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            while (pending.isEmpty() && !finished && !closed) changed.await();
+            return !closed && (!pending.isEmpty() || !finished);
+        } finally { lock.unlock(); }
+    }
+
+    private boolean publishBatch() throws InterruptedException {
+        lock.lockInterruptibly();
+        try {
+            if (closed) return false;
+            String batch = pending.toString();
+            pending.setLength(0);
+            changed.signalAll();
+            output.accept(batch);
+            return true;
+        } finally { lock.unlock(); }
     }
 
     private void fail(Throwable failed) {
@@ -95,7 +107,7 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
         try {
             synchronized (failureLock) {
                 if (closed) { drained.complete(null); return; }
-                failure = failed;
+                failure.set(failed);
                 if (!producer.isInterrupted()) {
                     interruptedProducer = true;
                     producer.interrupt();
@@ -104,11 +116,6 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
             }
             changed.signalAll();
         } finally { lock.unlock(); }
-    }
-
-    private void awaitPending() {
-        try { changed.await(); }
-        catch (InterruptedException interrupted) { throw interrupted(); }
     }
 
     private void acquire() {

@@ -26,7 +26,9 @@ class GuardedAssistantTextTest {
                 stream.accept("text");
                 assertThat(failed.await(3, TimeUnit.SECONDS)).isTrue();
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
-                while (worker.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) Thread.sleep(1);
+                while (worker.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(1));
+                }
                 assertThat(worker.getState()).isEqualTo(Thread.State.BLOCKED);
                 stream.close();
             }
@@ -119,6 +121,17 @@ class GuardedAssistantTextTest {
             assertThatThrownBy(stream::finish).isSameAs(refusal);
             assertThat(output).isEmpty();
             assertThat(Thread.currentThread().isInterrupted()).as("the owned wake-up has been consumed").isFalse();
+        }
+    }
+
+    @Test void anUncaughtWorkerErrorReachesTheProducerWithoutPublishingText() {
+        var failure = new AssertionError("publication invariant violated");
+        var output = new ArrayList<String>();
+        try (var stream = new GuardedAssistantText(() -> { throw failure; }, output::add)) {
+            stream.accept("private text");
+            assertThatThrownBy(stream::finish).isSameAs(failure);
+            assertThat(output).isEmpty();
+            assertThat(Thread.currentThread().isInterrupted()).isFalse();
         }
     }
 
