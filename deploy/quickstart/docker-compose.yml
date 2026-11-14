@@ -127,29 +127,10 @@ services:
       mongo:
         condition: service_healthy
     environment:
-      # The set member advertises itself under the address the host reaches it by, which is not
-      # resolvable from inside this network. Addressing the member directly bypasses topology
-      # discovery entirely, so the advertised address is never consulted and the member is reached
-      # under its service name. This is sound only because the set has exactly one member: a direct
-      # connection gives up election and failover awareness, which is why it belongs here in the
-      # single-node stack's configuration and not in the server's own defaults.
-      TAPSTATE_STORE_MONGO_URI: mongodb://mongo:27017/tapstate?directConnection=true
-      # Durable operator state stays separate from control data. A second deployment sharing this
-      # MongoDB service must choose another name to keep equal pipeline namespaces isolated.
-      TAPSTATE_STORE_MONGO_OPERATOR_STATE_DATABASE: tapstate_nest
-      # Pin the connector seed directory to an absolute path. The setting defaults to a path relative to
-      # the image's working directory, so it would shift silently if that directory ever moved; naming it
-      # in full keeps it fixed to the mount target below, whatever the image's working directory is. This
-      # is only a scan location for optional pre-seeding (see the volume) -- a registered connector's
-      # bytes live in the store, in Mongo, not here.
+      TAPSTATE_INSTALLATION_DIRECTORY: /var/lib/tapstate/installation
       TAPSTATE_CONNECTORS_SEED_DIR: /var/lib/tapstate/connectors
     volumes:
-      # Optional bulk pre-seeding, and nothing more. Any *.jar left in ./connectors before the stack
-      # starts is registered once at boot, through the very same register-if-absent path that `tapstate
-      # register` uploads to -- staging a jar here is a convenience, never a precondition for registering
-      # one. Registration needs no mount at all: the CLI uploads the jar's bytes over HTTP and the server
-      # never reads this directory for it. Quickstart stages Dummy here. Read-only,
-      # because the sweep only ever reads it.
+      - tapstate-quickstart-installation:/var/lib/tapstate
       - ./connectors:/var/lib/tapstate/connectors:ro
     ports:
       # Bound to the loopback interface: an unauthenticated first run must not be reachable from
@@ -160,46 +141,8 @@ services:
     # wider than the stop has been observed to need.
     stop_grace_period: 30s
 
-  # Creates the first administrator, then exits. The endpoint that creates it accepts only loopback
-  # callers -- a safeguard against an unauthenticated first run being seized over the network -- and
-  # this container reaches it by sharing the server's network namespace, so its own loopback is the
-  # server's. Sharing the namespace is also why it declares no ports of its own: they would belong to
-  # the server. A throwaway image with nothing but curl keeps this out of the server image, so the
-  # server never has to carry a shell to be bootstrapped.
-  bootstrap:
-    image: curlimages/curl:8.11.1
-    depends_on:
-      server:
-        condition: service_healthy
-    network_mode: "service:server"
-    # One shot: it runs once and is not brought back. Re-running the stack runs it again, and it is
-    # written to succeed the second time (see below), so that is safe.
-    restart: "no"
-    environment:
-      # The demo's first-admin credentials. They fall back to a known default so the stack runs with
-      # no prompting, and read from the environment (an adjacent .env file, or the quickstart script's
-      # generated password) when set. A real deployment must override the default.
-      TAPSTATE_ADMIN_USER: ${TAPSTATE_ADMIN_USER:-admin}
-      TAPSTATE_ADMIN_PASSWORD: ${TAPSTATE_ADMIN_PASSWORD:-admin}
-    entrypoint: ["/bin/sh", "-c"]
-    # The doubled $$ keeps the values out of Compose interpolation so the container's own shell reads
-    # them from its environment. A fresh store answers 204 and a bootstrapped one answers 409; both
-    # mean "an admin now exists", so both exit 0 and re-running the stack never fails here. Any other
-    # status -- including the 403 a non-loopback caller would draw -- is a real failure.
-    command:
-      - |
-        set -eu
-        code=$$(curl -s -o /dev/null -w '%{http_code}' \
-          -X POST http://127.0.0.1:8080/auth/bootstrap \
-          -H 'Content-Type: application/json' \
-          -d "{\"username\":\"$${TAPSTATE_ADMIN_USER}\",\"password\":\"$${TAPSTATE_ADMIN_PASSWORD}\"}")
-        case "$$code" in
-          204) echo "bootstrap: first admin created" ;;
-          409) echo "bootstrap: an admin already exists, nothing to do" ;;
-          *)   echo "bootstrap: failed with HTTP $$code" >&2; exit 1 ;;
-        esac
-
 volumes:
   tapstate-quickstart-mongo:
   tapstate-quickstart-mysql:
   tapstate-quickstart-postgres:
+  tapstate-quickstart-installation:

@@ -135,6 +135,11 @@ have mysql-init/01-orders.sql         "fetches the demo seed SQL"
 have postgres-init/01-shipments.sql   "fetches the second engine's seed SQL"
 have mysql-connector.jar              "fetches the mysql connector jar"
 have mongodb-connector.jar            "fetches the mongodb connector jar"
+if cmp -s "$PREP/mongodb-connector.jar" "$PREP/connectors/mongodb-connector.jar"; then
+  ok "stages the MongoDB connector for storage setup"
+else
+  bad "MongoDB connector is missing from the installation seed directory"
+fi
 if cmp -s "$PREP/connectors/dummy-connector.jar" "$QS_STUB/connectors-preview/dummy-connector.jar"; then
   ok "stages the downloaded Dummy bytes in the connectors/ seed dir"
 else
@@ -167,29 +172,11 @@ fi
 unset PIN_VERSION
 RC="$saved_rc"; OUT="$saved_out"; DEMO="$saved_demo"
 
-# --- .env: a random admin password, saved with tight perms and announced once ------------------------
-# Replaces the shipped admin/admin default so a demo left running is not trivially reachable, and the
-# password lives only in a user-readable-only file plus a single line of output -- never a CLI argument
-# or shell history.
-env_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$PREP/.env" 2>/dev/null || true)"
-if [ -n "$env_pw" ] && [ "$env_pw" != admin ] && [ "${#env_pw}" -ge 16 ]; then
-  ok "generates a random admin password in .env (not the shipped default)"
+if [ ! -e "$PREP/.env" ]; then
+  ok "preparation needs no administrator credentials"
 else
-  bad ".env password weak or absent: '$env_pw'"
+  bad "preparation created an administrator credential file"
 fi
-# ls -l is the portable way to read the mode string here (macOS find has no -printf).
-# shellcheck disable=SC2012
-perms="$(ls -l "$PREP/.env" 2>/dev/null | awk '{print $1}')"
-case "$perms" in
-  -rw-------*) ok "writes .env readable only by the user (600)" ;;
-  *)          bad ".env perms = '$perms', want -rw-------" ;;
-esac
-count="$(printf '%s\n' "$OUT" | grep -Fc "$env_pw" || true)"
-if [ "$count" = 1 ]; then ok "announces the password exactly once"; else bad "password printed $count times (want 1)"; fi
-# two fresh runs get different passwords -- a randomness proxy that a fixed or predictable value fails
-run_prepare Darwin arm64 glibc; pw_a="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
-run_prepare Darwin arm64 glibc; pw_b="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$DEMO/.env" 2>/dev/null || true)"
-if [ -n "$pw_a" ] && [ "$pw_a" != "$pw_b" ]; then ok "each fresh run gets a different password"; else bad "passwords not distinct: '$pw_a' vs '$pw_b'"; fi
 
 # --- the demo workspace is generated, uses in-network addresses, and honours the CEL constraint ------
 WORK="$PREP/work"
@@ -223,15 +210,11 @@ if grep -q 'host: mysql' "$WORK/source/orders_db.tap.yml" 2>/dev/null && ! grep 
 else
   bad "source is not addressed by service name: $(cat "$WORK/source/orders_db.tap.yml" 2>/dev/null)"
 fi
-# The store the server seeds is derived from its own store URI, so that URI has to be reachable from
-# inside the container for the derived one to be too. Checked on the compose file, which is where it is
-# set: loopback here would point the server at itself and the derived views URI would inherit exactly
-# that mistake, one indirection further from anyone looking for it.
-if grep -q 'TAPSTATE_STORE_MONGO_URI:.*mongo:27017' "$PREP/docker-compose.yml" 2>/dev/null \
-   && ! grep -q 'TAPSTATE_STORE_MONGO_URI:.*127.0.0.1' "$PREP/docker-compose.yml" 2>/dev/null; then
-  ok "the server's store URI addresses mongo by its compose service name, not loopback"
+if grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' "$PREP/docker-compose.yml" \
+   && ! grep -q 'TAPSTATE_STORE_MONGO_URI:' "$PREP/docker-compose.yml"; then
+  ok "the server reads its storage configuration from the installation directory"
 else
-  bad "server store URI is not addressed by service name: $(grep TAPSTATE_STORE_MONGO_URI "$PREP/docker-compose.yml" 2>/dev/null)"
+  bad "the server is still configured for legacy storage bootstrap"
 fi
 stale="$(grep -rl 'warehouse' "$WORK" 2>/dev/null || true)"
 if [ -z "$stale" ]; then
@@ -309,18 +292,16 @@ fi
 
 # --- idempotency: a re-run keeps generated state and does not re-download verified assets ------------
 run_prepare Linux x86_64 glibc; RE="$DEMO"
-pw_before="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RE/.env")"
 printf '# user-marker\n' >> "$RE/docker-compose.yml"   # a marker a re-download would erase
 printf 'user-edit\n' > "$RE/work/marker"               # a user edit to the workspace
 run_prepare Linux x86_64 glibc "$RE"                   # re-run over the same dir
-pw_after="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RE/.env")"
 if [ "$RC" -eq 0 ] \
-   && [ -n "$pw_before" ] && [ "$pw_before" = "$pw_after" ] \
+   && [ ! -e "$RE/.env" ] \
    && [ -f "$RE/work/marker" ] \
    && grep -q '# user-marker' "$RE/docker-compose.yml"; then
-  ok "a re-run keeps the password and workspace, and does not re-download assets"
+  ok "a re-run keeps the workspace, and does not re-download assets"
 else
-  bad "re-run not idempotent (rc=$RC, pw_same=$([ "$pw_before" = "$pw_after" ] && echo y || echo n), work_marker=$([ -f "$RE/work/marker" ] && echo y || echo n), compose_marker=$(grep -q '# user-marker' "$RE/docker-compose.yml" && echo y || echo n))"
+  bad "re-run not idempotent (rc=$RC, work_marker=$([ -f "$RE/work/marker" ] && echo y || echo n), compose_marker=$(grep -q '# user-marker' "$RE/docker-compose.yml" && echo y || echo n))"
 fi
 
 # --- macOS quarantine: the strip fires on Darwin, and only there -------------------------------------
@@ -346,7 +327,7 @@ fi
 run_phase_fakes() {
   run_prepare Linux x86_64 glibc "${RUN_REUSE:-}"   # prepare a dir (installs the stub CLI); RUN_REUSE re-runs one
   RUN="$DEMO"
-  RUN_PW="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' "$RUN/.env")"
+  RUN_PW="quickstart-smoke-password"
   cat > "$RUN/tapstate" <<'CLI'
 #!/bin/sh
 printf '%s\n' "$*" >> .cli-argv
@@ -361,6 +342,7 @@ case " $* " in
     exit 0 ;;
   *" ls ") [ "${FAKE_TOKEN_ACCEPTED:-no}" = yes ]; exit $? ;;
 esac
+printf '%s\n' "${TAPSTATE_PASSWORD:-}" >> .login-env
 cat >> .cli-stdin
 # A REPL keeps reading after a refusal but retains its status when the session ends.
 # Keep output and status independent so cases can exercise both non-zero exits and
@@ -383,26 +365,40 @@ JAVA
   cp "$shim/java" "$shim/jdk/bin/java"; chmod +x "$shim/jdk/bin/java"
   cat > "$shim/docker" <<'DOCK'
 #!/bin/sh
-# `compose ps ... server` -> report healthy so the wait loop ends; `compose ps -a ... bootstrap` -> report
-# the one-shot admin-creation container in whatever state the case asked for; `compose exec ... mongosh`
-# (the snapshot count read) -> report the row count the case asked for, so a run that delivers and a run
-# that delivers nothing can both be driven; every other subcommand no-ops.
-#
-# The two `ps` answers are deliberately different shapes. A server reports Health; a one-shot container
-# reports State and ExitCode and never reports Health at all. A script that waited on the wrong one would
-# read a field the other never publishes, which is exactly the confusion these fakes have to be able to
-# expose rather than paper over.
-# A brace inside ${VAR:-default} would close the expansion, so the default is set on its own line.
-bs="${FAKE_BOOTSTRAP_PS:-}"
-[ -n "$bs" ] || bs='{"State":"exited","ExitCode":0}'
-# Which container is being asked about is decided before the subcommand is, because `ps` appears in the
-# bootstrap query too -- answering on the subcommand alone would hand the server's Health line back for
-# every query and quietly make the two indistinguishable.
-# `logs` is answered before the container is looked at, because the bootstrap log query names the
-# container too -- deciding on the container alone would hand a ps line back to a log query.
-case " $* " in *" logs "*) echo "${FAKE_BOOTSTRAP_LOG:-bootstrap: first admin created}"; exit 0 ;; esac
-case " $* " in *" bootstrap "*) echo "$bs"; exit 0 ;; esac
-case "$*" in *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;; esac
+case "$*" in
+  *"/auth/storage-entry"*)
+    entry="${FAKE_INITIAL_ENTRY:-SETUP_REQUIRED}"
+    [ ! -f .storage-committed ] || entry=FIRST_ADMIN_REQUIRED
+    [ ! -f .first-admin-created ] || entry=LOGIN
+    printf '{"entry":"%s"}\n' "$entry"
+    exit 0 ;;
+  *'stage.json'*)
+    printf '%s\n' '{"managementUrl":"http://127.0.0.1:31917"}'
+    exit 0 ;;
+  *"/api/storage/status"*)
+    cat >/dev/null
+    printf '%s\n200' '{"setupPhase":"LOCAL_SETUP","operationId":"test-operation","setupGeneration":1}'
+    exit 0 ;;
+  *"/api/storage/test"*)
+    cat > .storage-test
+    printf '%s\n200' '{"testStamp":"storage-test-proof"}'
+    exit 0 ;;
+  *"/api/storage/setup/commit"*)
+    cat > .storage-commit
+    touch .storage-committed
+    printf '%s\n200' '{"setupPhase":"STORAGE_BOUND"}'
+    exit 0 ;;
+  *"/installation/first-admin"*)
+    cat > .first-admin-request
+    if [ "${FAKE_ADMIN_FAILURE:-no}" = yes ]; then
+        printf '%s\n403' '{"code":"control.bootstrap-forbidden"}'
+    else
+        touch .first-admin-created
+        printf '%s\n200' '{"phase":"COMPLETE"}'
+    fi
+    exit 0 ;;
+  *"{{.Name}}"*) echo "${FAKE_SERVER_NAME:-tapstate-demo-server-1}"; exit 0 ;;
+esac
 # The count is answered per collection rather than once for all of them. That is what lets a case drive
 # "the first engine arrived and the second did not" - the shape a demo wired to only one of its two
 # sources actually produces, and the one a check on a single total cannot tell apart from success.
@@ -423,9 +419,10 @@ DOCK
     TAPSTATE_VERSION="$VERSION" TAPSTATE_BASE_URL="file://$CLI_STUB" \
     TAPSTATE_QUICKSTART_BASE_URL="file://$QS_STUB" TAPSTATE_CONNECTORS_URL="file://$QS_STUB/connectors-preview" \
     FAKE_TARGET_ROWS="${1:-5}" FAKE_SHIPMENT_ROWS="${2:-6}" \
-    FAKE_BOOTSTRAP_PS="${FAKE_BOOTSTRAP_PS:-}" FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
+    TAPSTATE_ADMIN_USER=smoke-owner TAPSTATE_ADMIN_PASSWORD="$RUN_PW" \
+    FAKE_INITIAL_ENTRY="${FAKE_INITIAL_ENTRY:-}" FAKE_ADMIN_FAILURE="${FAKE_ADMIN_FAILURE:-}" \
+    FAKE_CLI_OUT="${FAKE_CLI_OUT:-}" \
     FAKE_CLI_STATUS="${FAKE_CLI_STATUS:-0}" \
-    FAKE_BOOTSTRAP_LOG="${FAKE_BOOTSTRAP_LOG:-}" \
     FAKE_AGENT_TOKEN="${FAKE_AGENT_TOKEN-tsk_fake_agent_token}" FAKE_TOKEN_ACCEPTED="${FAKE_TOKEN_ACCEPTED:-no}" \
     FAKE_JAVA_MAJOR="${FAKE_JAVA_MAJOR:-17}" JAVA_HOME='' \
     TAPSTATE_QUICKSTART_POLL_SECONDS=0 \
@@ -453,17 +450,16 @@ if [ "${1:-}" = --running-rerun ]; then
 fi
 
 run_phase_fakes
-if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-argv" ] && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fq "$RUN_PW" "$RUN/.cli-stdin"; then
-  ok "the admin password reaches the CLI over stdin, never as a command argument"
+if [ "$RUN_RC" -eq 0 ] && grep -Fq -- '-u smoke-owner' "$RUN/.cli-argv" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fqx "$RUN_PW" "$RUN/.login-env" \
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-stdin" && [ ! -e "$RUN/.env" ]; then
+  ok "the supplied administrator credentials reach the CLI without saving or printing the password"
 else
-  bad "password handling (rc=$RUN_RC, argv=$(grep -Fq "$RUN_PW" "$RUN/.cli-argv" 2>/dev/null && echo LEAK || echo ok), stdin=$(grep -Fq "$RUN_PW" "$RUN/.cli-stdin" 2>/dev/null && echo ok || echo MISSING)): $RUN_OUT"
+  bad "the CLI did not receive the administrator credentials as expected"
 fi
-# Failure branches print the driven command stream to say what went wrong -- and that stream contains
-# the admin password by design (the assertion above requires it there). Print it redacted, always.
-redacted_stdin() { sed "s/$RUN_PW/<redacted>/g" "$RUN/.cli-stdin" 2>/dev/null; }
-# The second engine is driven as far as the first is. It no longer has a pipeline of its own -- there
-# is one pipeline over both -- so what is left to check is its connector and its discovery, and the
-# ordering check below then holds it to the same sequence as the first.
+
+redacted_stdin() { cat "$RUN/.cli-stdin"; }
+
 if grep -q 'register \.\./postgres-connector.jar' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'discover-schema fulfillment_db' "$RUN/.cli-stdin" 2>/dev/null \
    && grep -q 'apply source/fulfillment_db.tap.yml' "$RUN/.cli-stdin" 2>/dev/null; then
@@ -645,28 +641,31 @@ else
   bad "the demo does not name the single collection a reader should find: $RUN_OUT"
 fi
 
-# --- the first admin exists before anyone tries to log in ---------------------------------------------
-# The bootstrap sidecar depends_on the server being *healthy*, so it only starts at the moment the server
-# reports healthy. Waiting on server health therefore proves the opposite of what it looks like it proves:
-# it is the moment the admin is guaranteed NOT to exist yet. Observed as a real flake -- two runs of the
-# same commit, one logged in fine and one drew control.auth-failed, after which every following verb
-# reported cli.not-authenticated and the run died on the row count with the real cause scrolled off the top.
-FAKE_BOOTSTRAP_PS='{"State":"running","ExitCode":0}' run_phase_fakes
-unset FAKE_BOOTSTRAP_PS
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -qi 'admin'; then
-  ok "refuses to drive the verbs while the admin has not been created yet, and says so"
+# The three-layer storage setup must finish before first-admin and login.
+run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && jq -e '.layer == "CACHE" and .candidate.configuration.database == "tapstate_config" and .candidate.cache.database == "tapstate_cache" and .candidate.master.database == "views"' "$RUN/.storage-test" >/dev/null \
+   && jq -e '.testStamps.CACHE == "storage-test-proof"' "$RUN/.storage-commit" >/dev/null \
+   && jq -e --arg pw "$RUN_PW" '.username == "smoke-owner" and .password == $pw' "$RUN/.first-admin-request" >/dev/null; then
+  ok "tests the bundled MongoDB, commits storage and creates the requested administrator"
 else
-  bad "raced the bootstrap instead of waiting (rc=$RUN_RC): $RUN_OUT"
+  bad "native setup did not complete as expected (rc=$RUN_RC): $RUN_OUT"
 fi
-# A bootstrap that ran and *failed* is a different condition from one still running, and it must not be
-# waited out until the timeout: the container is gone, so waiting can only end one way.
-FAKE_BOOTSTRAP_PS='{"State":"exited","ExitCode":1}' run_phase_fakes
-unset FAKE_BOOTSTRAP_PS
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'docker compose logs bootstrap'; then
-  ok "a bootstrap that exited non-zero fails the run and points at its log"
+
+FAKE_INITIAL_ENTRY=UNAVAILABLE run_phase_fakes
+if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ]; then
+  ok "does not start the pipeline before installation is ready"
 else
-  bad "a failed bootstrap was not surfaced (rc=$RUN_RC): $RUN_OUT"
+  bad "the pipeline ran while installation was unavailable"
 fi
+
+FAKE_ADMIN_FAILURE=yes run_phase_fakes
+if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
+   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, control.bootstrap-forbidden'; then
+  ok "reports the administrator setup refusal before driving the CLI"
+else
+  bad "the administrator setup refusal was lost (rc=$RUN_RC): $RUN_OUT"
+fi
+
 # An authentication failure must be named where it happens. Without this the run still fails -- but it
 # fails 30 seconds later on "did not reach the target (0 of 5 rows)", which sends the reader to the server
 # log to investigate a pipeline that was never started. The discriminating part is that the run below
@@ -680,28 +679,12 @@ else
   bad "auth failure not named at the point it happened (rc=$RUN_RC): $RUN_OUT"
 fi
 
-# An admin left over from an earlier run is the likely reason a demo whose password is generated cannot
-# log in, and it is the one case the user can act on without reading anything. The bootstrap step reports
-# success either way -- creating the admin and finding one already there are both "an admin exists" -- so
-# a run against a stack whose volume outlived its .env fails at login with both facts true and filed in
-# different places. Reported here as the remedy rather than as a log to go and read.
-FAKE_CLI_OUT='error: control.auth-failed' \
-  FAKE_BOOTSTRAP_LOG='bootstrap: an admin already exists, nothing to do' run_phase_fakes
-unset FAKE_CLI_OUT FAKE_BOOTSTRAP_LOG
-if [ "$RUN_RC" -ne 0 ] && printf '%s' "$RUN_OUT" | grep -q 'down -v'; then
-  ok "an auth failure against a pre-existing admin names the reset that fixes it"
+FAKE_INITIAL_ENTRY=LOGIN run_phase_fakes
+if [ "$RUN_RC" -eq 0 ] && [ -f "$RUN/.cli-stdin" ] && [ ! -e "$RUN/.first-admin-request" ] \
+   && [ ! -e "$RUN/.storage-commit" ]; then
+  ok "a configured stack signs in without recreating storage or an administrator"
 else
-  bad "stale-admin auth failure did not name the remedy (rc=$RUN_RC): $RUN_OUT"
-fi
-# ...and the generic message is kept for an auth failure with no such history, which is a different
-# situation with a different answer: wiping the volume there would destroy data to fix nothing.
-FAKE_CLI_OUT='error: control.auth-failed' \
-  FAKE_BOOTSTRAP_LOG='bootstrap: first admin created' run_phase_fakes
-unset FAKE_CLI_OUT FAKE_BOOTSTRAP_LOG
-if [ "$RUN_RC" -ne 0 ] && ! printf '%s' "$RUN_OUT" | grep -q 'down -v'; then
-  ok "an auth failure with a freshly created admin does not prescribe wiping the volume"
-else
-  bad "the stale-admin remedy leaked into an unrelated auth failure (rc=$RUN_RC): $RUN_OUT"
+  bad "the configured stack did not resume correctly (rc=$RUN_RC): $RUN_OUT"
 fi
 
 # A verb the server refused has to stop the run where it was refused, and the session's exit status is

@@ -1,8 +1,8 @@
 #!/bin/sh
 #
 # tapstate quickstart — brings up the local demo from an empty directory: it downloads the compose stack,
-# the platform's CLI, and the demo connector jars, generates a demo workspace and a .env with a random
-# admin password, then starts the stack and runs a real MySQL -> MongoDB pipeline. Nothing is built.
+# the platform's CLI, and the demo connector jars. It initializes storage, creates an administrator,
+# and runs the demo pipeline.
 #
 # Usage, either form:
 #
@@ -26,6 +26,7 @@
 #   TAPSTATE_BASE_URL             CLI release base, passed through to install.sh.
 #   TAPSTATE_VERSION              pin the CLI version (default: the pinned CLI_VERSION below).
 #   TAPSTATE_CONNECTORS_URL       base URL for the demo connector jars.
+#   TAPSTATE_ADMIN_USER / TAPSTATE_ADMIN_PASSWORD  credentials for non-interactive runs.
 #   TAPSTATE_QUICKSTART_PREPARE_ONLY  stop after preparing the directory, before Docker (used by tests).
 #
 # POSIX sh, no bashisms. All work is inside main().
@@ -266,12 +267,12 @@ write_agent_config() {
     fi
 
     # The password travels in the environment, as everywhere else here, never as an argument.
-    token_json="$(TAPSTATE_PASSWORD="$admin_pw" ./tapstate -c "$server_url" -u admin \
+    token_json="$(TAPSTATE_PASSWORD="$admin_pw" ./tapstate -c "$server_url" -u "$admin_user" \
         token create --scope write -o json 2>/dev/null)" || token_json=""
     agent_token="$(printf '%s' "$token_json" | tr -d '\n' \
         | sed -n 's/.*"token" *: *"\([A-Za-z0-9._~+\/=-]*\)".*/\1/p')"
     if [ -z "$agent_token" ]; then
-        agent_note="no agent token could be created; make one yourself with: TAPSTATE_PASSWORD=<.env password> ./tapstate -c $server_url -u admin token create --scope write"
+        agent_note="no agent token could be created; make one yourself with: ./tapstate -c $server_url -u <username> token create --scope write"
         return 0
     fi
 
@@ -362,10 +363,10 @@ print_next_steps() {
     # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
     # been told, correctly, that everything above was safe to copy.
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, .env, agent configuration)"
+        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, agent configuration)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
-    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ .env docker-compose.yml tapstate-mcp.json"
+    tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ docker-compose.yml tapstate-mcp.json"
     fi
     # The agent block names the file only when there is one; otherwise it says why there is not, so the
     # option is never advertised over a configuration that was never written.
@@ -398,7 +399,7 @@ not a view and not a join. Tapstate keeps it fresh from both sides at once.
 Three ways to use it:
 
   In the browser
-    Open http://127.0.0.1:8080 on this machine and sign in as admin, with the password in .env.
+    Open http://127.0.0.1:8080 on this machine and sign in with the administrator credentials you entered.
     From another computer, keep  ssh -N -L 127.0.0.1:18080:127.0.0.1:8080 <you>@<this host>  open
     and visit http://127.0.0.1:18080 instead.
 
@@ -406,7 +407,7 @@ Three ways to use it:
 $agent_lines
 
   From the CLI -- for scripts, CI, and machines without a browser or an AI assistant
-    ./tapstate -w work        then: connect http://127.0.0.1:8080 ; login admin
+    ./tapstate -w work -c http://127.0.0.1:8080 -u <username>
     then, at the prompt:
       show collections                      three: the two sources, and views.order_state
       views.order_state.find({id:1})         one order, with its shipments inside it
@@ -468,6 +469,84 @@ The pulled images remain; remove them with:  docker image rm <image>
 EOF
 }
 
+read_admin_credentials() {
+    admin_user="${TAPSTATE_ADMIN_USER:-}"
+    admin_pw="${TAPSTATE_ADMIN_PASSWORD:-}"
+    if [ -z "$admin_user" ] || [ -z "$admin_pw" ]; then
+        read_admin_terminal 3<>/dev/tty \
+            || die "enter administrator credentials in a terminal or set TAPSTATE_ADMIN_USER and TAPSTATE_ADMIN_PASSWORD."
+    fi
+    [ -n "$admin_user" ] && [ -n "$admin_pw" ] || die "the administrator username and password are required."
+}
+
+read_admin_terminal() {
+    printf 'Administrator username [admin]: ' >&3
+    IFS= read -r admin_user <&3 || return 1
+    admin_user="${admin_user:-admin}"
+    tty_settings="$(stty -g <&3)" || return 1
+    trap 'stty "$tty_settings" <&3; exit 1' HUP INT TERM
+    password_read=0
+    if stty -echo <&3; then
+        printf 'Administrator password: ' >&3
+        IFS= read -r admin_pw <&3 || password_read=$?
+    else
+        password_read=1
+    fi
+    stty "$tty_settings" <&3 || password_read=1
+    trap 'exit 1' HUP INT TERM
+    printf '\n' >&3
+    return "$password_read"
+}
+
+await_entry() {
+    i=0
+    while [ "$i" -lt 90 ]; do
+        entry="$(docker compose exec -T server curl -fsS --max-time 5 http://127.0.0.1:8080/auth/storage-entry 2>/dev/null \
+            | jq -r '.entry // empty')"
+        for expected in "$@"; do
+            [ "$entry" != "$expected" ] || return 0
+        done
+        i=$((i + 1))
+        sleep "$poll"
+    done
+    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: docker compose logs server"
+}
+
+setup_post() {
+    # The product's installation listener is reachable only inside the server container.
+    response="$(docker compose exec -T server curl -sS --max-time 90 -w '\n%{http_code}' \
+        -H 'Content-Type: application/json' --data-binary @- "$management_url$1")" || return 1
+    status="${response##*
+}"
+    body="${response%
+*}"
+    if [ "$status" != 200 ]; then
+        code="$(printf '%s' "$body" | jq -r '.code // empty' 2>/dev/null || true)"
+        printf 'quickstart: %s failed (HTTP %s%s)\n' "$1" "$status" "${code:+, $code}" >&2
+        return 1
+    fi
+    printf '%s\n' "$body"
+}
+
+configure_storage() {
+    printf 'quickstart: configuring the bundled MongoDB\n'
+    status_json="$(printf '{}' | setup_post /api/storage/status)" || die "could not read installation status"
+    case "$(printf '%s' "$status_json" | jq -r .setupPhase)" in
+        STORAGE_BOUND|COMPLETE) return 0 ;;
+    esac
+    setup="$(printf '%s' "$status_json" | jq -ce '
+        def mongo($db): {kind: "MONGODB", database: $db, uri: ("mongodb://mongo:27017/" + $db + "?directConnection=true")};
+        {operationId, generation: .setupGeneration, candidate: {
+            configuration: mongo("tapstate_config"), cache: mongo("tapstate_cache"), master: mongo("views")
+        }}')" || die "could not read the storage setup scope"
+    test_result="$(printf '%s' "$setup" | jq -c '. + {layer: "CACHE"}' | setup_post /api/storage/test)" \
+        || die "could not test CACHE storage"
+    stamp="$(printf '%s' "$test_result" | jq -er .testStamp)" || die "CACHE storage test returned no proof"
+    printf '%s' "$setup" | jq -c --arg stamp "$stamp" '. + {testStamps: {CACHE: $stamp}}' \
+        | setup_post /api/storage/setup/commit >/dev/null \
+        || die "could not save the storage configuration"
+}
+
 main() {
     # The piped form has no saved file and no stack beside it, so it takes a directory of its own --
     # everything this script adds must stay inside one removable directory. Either marker file says
@@ -489,6 +568,7 @@ main() {
     # downloads later. The prepare-only test seam deliberately skips this: it exists to stop before
     # Docker, so it must not require it. The CLI alone needs neither; say where to get it.
     if [ -z "${TAPSTATE_QUICKSTART_PREPARE_ONLY:-}" ]; then
+        command -v jq >/dev/null 2>&1 || die "jq is required to initialize the demo."
         command -v docker >/dev/null 2>&1 \
             || die "Docker is required to run the stack. Install Docker with the Compose v2 plugin, or install only the offline CLI:  curl -sSL https://install.tapstate.dev/cli | sh"
         docker compose version >/dev/null 2>&1 \
@@ -569,7 +649,7 @@ main() {
         esac
     fi
 
-    # The demo registers three jars explicitly. Dummy is staged for the startup seed sweep.
+    # MongoDB is staged before storage setup. Dummy is staged for startup registration.
     #
     # The postgres one is fetched for the same reason its seed is: the compose file has run a postgres
     # service with a seeded shipments table since the second engine was added, and a demo that fetches
@@ -581,17 +661,8 @@ main() {
     [ -f ./postgres-connector.jar ] || fetch "${cbase}/postgres-connector.jar" ./postgres-connector.jar
     [ -f ./connectors/dummy-connector.jar ] || fetch "${cbase}/dummy-connector.jar" ./connectors/dummy-connector.jar
 
-    # A random admin password replaces the shipped admin/admin default so a stack left running is not
-    # trivially reachable. It is written only to .env (readable by this user alone) and announced once
-    # here -- never passed as a CLI argument, so it stays out of the process table and shell history. A
-    # re-run keeps the existing .env: regenerating it would lock the user out of the admin already
-    # bootstrapped against the old password.
-    if [ ! -f .env ]; then
-        admin_pw="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)"
-        printf 'TAPSTATE_ADMIN_USER=admin\nTAPSTATE_ADMIN_PASSWORD=%s\n' "$admin_pw" > .env
-        chmod 600 .env
-        printf 'quickstart: generated a random admin password, saved to .env: %s\n' "$admin_pw"
-    fi
+    # Storage setup needs the default views connector before a user can log in.
+    [ -f ./connectors/mongodb-connector.jar ] || cp ./mongodb-connector.jar ./connectors/mongodb-connector.jar
 
     # Generate the demo workspace, unless one is already here: a re-run must not clobber edits the user
     # made to their resources.
@@ -603,73 +674,42 @@ main() {
         return
     fi
 
-    # Bring up the stack. The compose file pins the published image, so this pulls rather than builds.
+    grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml \
+        || die "this directory has an older demo Compose file. Run the installer from a new directory."
+
+    read_admin_credentials
+    docker compose run --rm --no-deps -T --entrypoint sh server -ec '
+        dir=$TAPSTATE_INSTALLATION_DIRECTORY
+        if [ ! -d "$dir" ]; then
+            java -jar /opt/tapstate/tapstate.jar installation --initialize "--tapstate.installation.directory=$dir"
+        fi
+    ' || die "could not initialize the local installation directory"
     docker compose up -d
 
-    # Both waits below poll on this interval. It is a knob only so the script's own test suite can drive
-    # the waiting paths without spending a minute on each; a run that does not set it waits the same two
-    # seconds it always has.
     poll="${TAPSTATE_QUICKSTART_POLL_SECONDS:-2}"
+    printf 'quickstart: waiting for the server\n'
+    await_entry SETUP_REQUIRED FIRST_ADMIN_REQUIRED LOGIN
+    if [ "$entry" != LOGIN ]; then
+        management_url="$(docker compose exec -T server sh -ec 'cat "$TAPSTATE_INSTALLATION_DIRECTORY/stage.json"' \
+            | jq -er '.managementUrl | select(test("^http://127[.]0[.]0[.]1:[0-9]+$"))')" \
+            || die "could not read the local installation address"
+    fi
+    if [ "$entry" = SETUP_REQUIRED ]; then
+        configure_storage
+        await_entry FIRST_ADMIN_REQUIRED LOGIN
+    fi
+    if [ "$entry" = FIRST_ADMIN_REQUIRED ]; then
+        # Send the password over stdin and let jq quote both fields.
+        printf '%s' "$admin_pw" | jq -Rs --arg username "$admin_user" '{username: $username, password: .}' \
+            | setup_post /installation/first-admin >/dev/null \
+            || die "could not create the first administrator"
+        await_entry LOGIN
+    fi
 
-    # Wait until the server container reports healthy -- its image carries the /healthz healthcheck -- so
-    # the online verbs are not driven before the server can answer.
-    printf 'quickstart: waiting for the stack to become healthy'
-    i=0
-    while [ "$i" -lt 90 ]; do
-        if docker compose ps --format json server 2>/dev/null | grep -q '"Health":"healthy"'; then
-            break
-        fi
-        i=$((i + 1)); printf '.'; sleep "$poll"
-    done
-    printf '\n'
-    docker compose ps --format json server 2>/dev/null | grep -q '"Health":"healthy"' \
-        || die "the server did not become healthy in time; inspect it with: docker compose logs server"
-
-    # Then wait for the first admin to actually exist. Server health is not that moment -- it is the
-    # moment before it: the bootstrap sidecar declares depends_on the server being healthy, so health is
-    # precisely when that container is cleared to start its one POST. Driving `login` off the health
-    # check alone is a race with a one-request container, and it is a race this has lost in the wild.
-    #
-    # A one-shot container reports State and ExitCode, never Health, so both are checked: `exited` alone
-    # would accept a bootstrap that ran and failed. A non-zero exit is reported immediately rather than
-    # waited out -- the container is gone, so no amount of further waiting changes the answer.
-    printf 'quickstart: waiting for the first admin to be created'
-    i=0
-    while [ "$i" -lt 60 ]; do
-        bootstrap_ps="$(docker compose ps -a --format json bootstrap 2>/dev/null)"
-        if printf '%s' "$bootstrap_ps" | grep -q '"State":"exited"'; then
-            printf '%s' "$bootstrap_ps" | grep -q '"ExitCode":0' \
-                || { printf '\n'; die "the first admin could not be created; inspect it with: docker compose logs bootstrap"; }
-            break
-        fi
-        i=$((i + 1)); printf '.'; sleep "$poll"
-    done
-    printf '\n'
-    printf '%s' "$bootstrap_ps" | grep -q '"State":"exited"' \
-        || die "the first admin was not created in time; inspect it with: docker compose logs bootstrap"
-
-    # Drive the online verbs through the REPL, feeding the password on stdin (the login prompt reads the
-    # next line) so it is never a process argument or a shell-history entry. Workspace paths resolve
-    # against work/, so the jars beside it are ../<jar>.
-    #
-    # Each capture source is applied on its own first, then discovered, then everything is applied. Both
-    # pipelines map a row field, and an expression that reads row fields is refused until the source it
-    # reads has a discovered schema -- while a discovery, in turn, needs the source to exist on the
-    # server. One apply for all of it therefore cannot succeed in either order: the batch is refused
-    # whole, which leaves the sources unapplied and the discoveries with nothing to look at. The second
-    # engine is under the same rule as the first, not exempt from it -- its pipeline maps a row field too.
-    #
-    # Applying the source twice is free; the second apply reports it unchanged.
-    #
-    # The REPL's output is captured so a failed login can be named here, and so a failed verb is seen at
-    # all. Neither can be left to the row count below: that check fires half a minute later and says "the
-    # target is empty", which sends the reader to the server log to investigate a pipeline that was never
-    # started. Authentication is also the one failure that cascades -- every verb after it reports
-    # cli.not-authenticated, so the real cause ends up at the top of a screen of consequences.
-    admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+    # Apply and discover each source before applying the pipeline that reads its schema.
     repl_status=0
-    repl_out="$(printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nregister ../mysql-connector.jar\nregister ../mongodb-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' "$admin_pw" \
-        | ./tapstate -w work 2>&1)" || repl_status=$?
+    repl_out="$(printf 'register ../mysql-connector.jar\nregister ../postgres-connector.jar\napply source/orders_db.tap.yml\napply source/fulfillment_db.tap.yml\ndiscover-schema orders_db\ndiscover-schema fulfillment_db\napply\nstart order_pipeline\nexit\n' \
+        | TAPSTATE_PASSWORD="$admin_pw" ./tapstate -w work -c http://127.0.0.1:8080 -u "$admin_user" 2>&1)" || repl_status=$?
     # The status is taken beside the output rather than being left to `set -e`. As the bare assignment
     # it was, a CLI that exits non-zero ends the script AT this line: the print below never runs, the
     # `case` below it never runs, and everything the CLI said -- a refusal, a stack trace, ten frames of
@@ -678,27 +718,7 @@ main() {
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
-            # Ask the bootstrap what it actually did. "Created it" and "found one already there" are both
-            # successes to that step -- an admin exists either way, which is what makes a re-run safe --
-            # but only the second can explain a password that does not work: the store outlived the .env
-            # the admin was made from. The two failures need different answers, and prescribing a volume
-            # wipe for the wrong one destroys a user's data to fix nothing.
-            bootstrap_said="$(docker compose logs --no-log-prefix --tail 1 bootstrap 2>/dev/null || true)"
-            case "$bootstrap_said" in
-                *"already exists"*)
-                    # The rerun half of this advice has to match how the script was started. The piped
-                    # form saves no copy of itself, so naming quickstart.sh there sends the user to a
-                    # file that is not present -- after the volume wipe has already happened, which is
-                    # the worst possible moment to hand someone a command that cannot work.
-                    if [ -f ./quickstart.sh ]; then
-                        again="sh quickstart.sh"
-                    else
-                        again="curl -sSL https://install.tapstate.dev/demo | sh"
-                    fi
-                    die "the CLI could not log in: this stack already had an admin from an earlier run, and the password in .env is not the one it was created with. Start clean with: docker compose down -v && $again" ;;
-                *)
-                    die "the CLI could not log in, so no verb after it ran; inspect it with: docker compose logs bootstrap" ;;
-            esac ;;
+            die "the CLI could not log in with those administrator credentials" ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the
     # REPL running but makes it exit 1, while older CLIs can still exit zero.
