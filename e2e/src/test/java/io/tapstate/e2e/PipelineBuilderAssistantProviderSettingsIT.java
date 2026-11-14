@@ -23,6 +23,107 @@ class PipelineBuilderAssistantProviderSettingsIT {
     private static final String TEST_KEY = "sk-e2e-provider-key-sentinel";
 
     @Test
+    void anAssistantStreamsBeforeCompletionAndCoalescesTextBehindItsRealAuthorization() throws Exception {
+        var guardEntered = new java.util.concurrent.CountDownLatch(1);
+        var releaseGuard = new java.util.concurrent.CountDownLatch(1);
+        var producerDrained = new java.util.concurrent.CountDownLatch(1);
+        var completeProvider = new java.util.concurrent.CountDownLatch(1);
+        var measurements = new java.util.concurrent.CopyOnWriteArrayList<Map<String, Object>>();
+        var holdFirstPublication = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var producing = new java.util.concurrent.atomic.AtomicBoolean();
+        io.tapstate.control.core.AiProviderClient provider = new io.tapstate.control.core.AiProviderClient() {
+            public void check(io.tapstate.control.core.AiProviderSettings settings) { }
+            public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
+                    java.util.List<Map<String, String>> messages, Map<String, Object> context,
+                    java.util.function.Consumer<String> text) {
+                producing.set(true);
+                text.accept("prefix ");
+                await(guardEntered);
+                for (int i = 0; i < 1000; i++) text.accept(".");
+                producerDrained.countDown();
+                await(completeProvider);
+                return java.util.Optional.empty();
+            }
+        };
+        try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
+                AtlasRuntime runtime = new AtlasRuntime(storage);
+                ServerHandle server = runtime.launch(Tiers.IN_PROCESS, java.util.List.of(), provider);
+                var configuration = io.tapstate.adapters.mongostore.MongoConfigurationDomain.open(
+                        new io.tapstate.adapters.mongostore.MongoConnectionSettings(storage.configurationUri(), null, java.time.Duration.ofSeconds(5)), storage.clusterId());
+                var cache = io.tapstate.adapters.mongostore.MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
+                        java.time.Duration.ofSeconds(5), "assistant-stream-models");
+                var readers = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            ControlPlane control = runtime.control(server, true);
+            seedDraft(configuration.artifacts(), cache.schemas(configuration.bindings().cachePreparation().orElseThrow().businessScope(), () -> {}), control);
+            try (var client = HttpClient.newHttpClient()) {
+                assertThat(providerSettings(client, server, control, "PUT", JsonWriter.write(Map.of(
+                        "providerId", "openai-compatible", "model", "e2e-model", "apiKey", TEST_KEY))).statusCode()).isEqualTo(204);
+                try (var observed = runtime.observeManagedAuthorization(server, thread -> {
+                    if (producing.get() && holdFirstPublication.compareAndSet(true, false)) {
+                        guardEntered.countDown(); await(releaseGuard);
+                    }
+                }, (thread, snapshot) -> {
+                    if (producing.get()) measurements.add(snapshot);
+                })) {
+                    var request = HttpRequest.newBuilder(server.baseUrl().resolve("/api/pipelines/blank_auto/draft:assistant"))
+                            .timeout(java.time.Duration.ofSeconds(30))
+                            .header("Cookie", control.credential()).header("Origin", server.baseUrl().toString())
+                            .header("Content-Type", "application/json")
+                            .POST(HttpRequest.BodyPublishers.ofString(JsonWriter.write(Map.of("revision", 1,
+                                    "messages", java.util.List.of(Map.of("role", "user", "text", "hello")))))).build();
+                    var response = client.sendAsync(request, HttpResponse.BodyHandlers.ofInputStream());
+                    try {
+                        assertThat(guardEntered.await(10, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        assertThat(producerDrained.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                                .as("a remote publication check must not serialize every provider fragment").isTrue();
+                        HttpResponse<java.io.InputStream> received;
+                        try { received = response.get(3, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (java.util.concurrent.TimeoutException buffered) {
+                            throw new AssertionError("SSE headers were buffered while the provider remained active", buffered);
+                        }
+                        assertThat(received.statusCode()).isEqualTo(200);
+                        var lines = new java.io.BufferedReader(new java.io.InputStreamReader(received.body(), StandardCharsets.UTF_8));
+                        var reading = new java.util.concurrent.CountDownLatch(1);
+                        var prefix = readers.submit(() -> {
+                            reading.countDown();
+                            for (String line; (line = lines.readLine()) != null;)
+                                if (line.contains("text-delta")) return line;
+                            throw new AssertionError("no assistant text was received");
+                        });
+                        assertThat(reading.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                        org.assertj.core.api.Assertions.assertThatThrownBy(() -> prefix.get(200, java.util.concurrent.TimeUnit.MILLISECONDS))
+                                .as("the active reader receives no text while authorization is held")
+                                .isInstanceOf(java.util.concurrent.TimeoutException.class);
+                        releaseGuard.countDown();
+                        String firstText = prefix.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        assertThat(firstText).contains("prefix " + ".".repeat(1000)).doesNotContain(TEST_KEY);
+                        assertThat(completeProvider.getCount()).as("provider completion is still unavailable").isEqualTo(1);
+                        assertThat(measurements).hasSize(1);
+                        var mongo = (Map<?, ?>) measurements.getFirst().get("mongo");
+                        assertThat(((Number) mongo.get("started")).intValue()).isBetween(1, 32);
+                        assertThat(measurements.getFirst()).containsEntry("complete", true);
+                        System.out.println("assistant_stream_guard commands=" + mongo.get("started") + " fragments=1001 batches=1");
+                        completeProvider.countDown();
+                        String terminal = readers.submit(() -> lines.lines().reduce("", (a, b) -> a + b))
+                                .get(10, java.util.concurrent.TimeUnit.SECONDS);
+                        assertThat(terminal).contains("text-end", "\"finishReason\":\"stop\"", "[DONE]");
+                        lines.close();
+                    } finally {
+                        releaseGuard.countDown(); completeProvider.countDown();
+                        response.thenAccept(received -> { try { received.body().close(); } catch (java.io.IOException ignored) { } });
+                    }
+                }
+            }
+            runtime.assertAuthenticationBoundary();
+        } finally { releaseGuard.countDown(); completeProvider.countDown(); }
+    }
+
+    private static void await(java.util.concurrent.CountDownLatch latch) {
+        try { latch.await(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw new IllegalStateException(interrupted); }
+    }
+
+    @Test
     void aCloudWorkspaceCanSaveProviderSettingsWithoutReadingBackTheKey() throws Exception {
         try (PreparedNativeStore storage = PreparedNativeStore.createCloud();
                 AtlasRuntime runtime = new AtlasRuntime(storage);
