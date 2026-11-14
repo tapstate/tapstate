@@ -99,6 +99,7 @@ final class MongoPipelineRetirements implements PipelineRetirements {
             MongoValidationPreparations.requireRetired(session,database,cluster,pending.request().scope().pipelineId());
             artifacts.deleteRetiredPipeline(session,pending.request().scope().pipelineId(),pending.request().definitionHash());
             new MongoPipelineIntentStore(client,database,cluster,bindings).retire(session,pending.request().scope());
+            MongoRequiredDeadLetterStore.deleteRetiringGeneration(session, database, pending.request().scope());
             if(SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,new Document("_id",pending.request().scope().pipelineId())
                             .append("stateGeneration",pending.request().scope().stateGeneration()).append("phase","RETIRING")
                             .append("operationId",pending.request().operationId()).append("retirement",MongoPipelineRetirementFacts.encode(pending.fact)).append("noteWriteFence",fence),

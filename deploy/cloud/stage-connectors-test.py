@@ -304,7 +304,7 @@ class StageConnectorsTest(unittest.TestCase):
                     shutil.copyfile(asset, destination / asset.name)
             """), encoding="utf-8")
         gh.chmod(0o755)
-        for name in ("release.yml", "cloud-cluster-dev.yml"):
+        for name in ("release-images.yml", "cloud-cluster-dev.yml"):
             with self.subTest(workflow=name):
                 runtime = self.root / name
                 runtime.mkdir()

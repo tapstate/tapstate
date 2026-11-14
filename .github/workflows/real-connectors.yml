@@ -3,28 +3,36 @@
 name: Real connectors
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
+      source-sha:
+        required: true
+        type: string
       connector-inputs:
-        description: Connector input policy
-        type: choice
-        options: [upstream, release]
-        default: upstream
-  schedule:
-    - cron: "30 19 * * *"
+        required: true
+        type: string
+    secrets:
+      ENTERPRISE_CONNECTORS_READ_TOKEN:
+        required: true
+      TAPSTATE_ATLAS_TEST_URI:
+        required: false
+      TAPSTATE_ATLAS_STANDARD_URI:
+        required: false
 
-concurrency:
-  group: real-connectors-sharded-${{ github.ref }}-${{ inputs.connector-inputs || 'upstream' }}
-  cancel-in-progress: true
+permissions:
+  contents: read
 
 env:
-  CONNECTOR_INPUT_MODE: ${{ inputs.connector-inputs || 'upstream' }}
+  CONNECTOR_INPUT_MODE: ${{ inputs.connector-inputs }}
+  SOURCE_SHA: ${{ inputs.source-sha }}
 
 jobs:
   connector-plan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
       - name: Plan active connector witnesses and record deferred acceptance
         id: plan
         run: |
@@ -53,6 +61,8 @@ jobs:
       CONNECTOR_MODULES: mysql=connectors/mysql-connector,mongodb=connectors/mongodb-connector,postgres=connectors/postgres-connector,oracle=connectors/oracle-connector,sqlserver=connectors/mssql-connector,mongodb-atlas=connectors/mongodb-atlas-connector,aws-rds-mysql=connectors/aws-rds-mysql-connector
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
       - name: Connector JDK compatible with its pinned Lombok
         if: env.CONNECTOR_INPUT_MODE == 'upstream'
         uses: actions/setup-java@v4
@@ -154,12 +164,12 @@ jobs:
         if: env.CONNECTOR_INPUT_MODE == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B .github/scripts/_connector-inputs.py prepare-release --directory "$RUNNER_TEMP/connectors" --source-sha "$GITHUB_SHA"
+        run: python3 -B .github/scripts/_connector-inputs.py prepare-release --directory "$RUNNER_TEMP/connectors" --source-sha "$SOURCE_SHA"
       - name: Record upstream connector inputs
         if: env.CONNECTOR_INPUT_MODE == 'upstream'
-        run: python3 -B .github/scripts/_connector-inputs.py record --directory "$RUNNER_TEMP/connectors" --mode upstream --source-sha "$GITHUB_SHA"
+        run: python3 -B .github/scripts/_connector-inputs.py record --directory "$RUNNER_TEMP/connectors" --mode upstream --source-sha "$SOURCE_SHA"
       - name: Verify selected input identities
-        run: python3 -B .github/scripts/_connector-inputs.py verify --directory "$RUNNER_TEMP/connectors" --mode "$CONNECTOR_INPUT_MODE" --source-sha "$GITHUB_SHA"
+        run: python3 -B .github/scripts/_connector-inputs.py verify --directory "$RUNNER_TEMP/connectors" --mode "$CONNECTOR_INPUT_MODE" --source-sha "$SOURCE_SHA"
       - uses: actions/upload-artifact@v4
         with:
           name: connector-input-identity
@@ -188,6 +198,8 @@ jobs:
       TAPSTATE_ATLAS_STANDARD_URI: ${{ secrets.TAPSTATE_ATLAS_STANDARD_URI }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -247,6 +259,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source-sha }}
       - uses: actions/download-artifact@v4
         with:
           name: connector-input-identity
