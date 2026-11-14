@@ -1166,7 +1166,8 @@ class MongoStorageBindingStoreIT {
             domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", secret));
             return "committed";
         } catch (TapstateException failure) {
-            refused(failure);
+            // Preserve the original sanitized diagnostic and stack for an unexpected race outcome.
+            if (failure.code() != StoreError.INITIALIZATION_REFUSED) throw failure;
             return "refused";
         }
     }

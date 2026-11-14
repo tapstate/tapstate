@@ -77,11 +77,13 @@ class NativeValidationOwnerReservationsIT {
         }
     }
 
-    @Test void aPendingRootStartWaitsForItsOwnForegroundAndMaintenanceBodiesToExit()throws Exception {
+    @Test void aPendingRootStartWaitsForMetadataCapacityWithoutDiscardingItsOriginalResponses()throws Exception {
         var reached=new CountDownLatch(1);var proceed=new CountDownLatch(1);var returned=new CountDownLatch(1);
         var maintenanceEntered=new CountDownLatch(1);var maintenanceExit=new CountDownLatch(1);
+        var prepared=new CountDownLatch(1);
         var result=new java.util.concurrent.atomic.AtomicReference<ValidationOwnerRouter.Result>();
         try(var f=new Fixture()){
+            f.startup=(saved,spec)->{prepared.countDown();return NativeValidationOwnerReservations.StartupGate.ready();};
             assertThat(f.tasks.update(new ValidationTaskStore.Update(f.task,1,f.comparison,ValidationTaskStore.Settings.defaults(ValidationMethod.FULL_COLUMN,1000),UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
             var local=new ValidationOwnerRouter.Local(){
                 @Override public ValidationOwnerRouter.Result reserve(ValidationOwnerRouter.Request request){
@@ -96,16 +98,23 @@ class NativeValidationOwnerReservationsIT {
                 var op=new io.tapstate.runtime.probe.ValidationOperation(coordinator.context(),"flow","task",f.task.generation(),2,1,UUID.randomUUID());
                 try(var response=coordinator.start(op)){assertThat(response.value().outcome()).isEqualTo(io.tapstate.runtime.probe.ValidationOperation.Outcome.PENDING);}
                 assertThat(reached.await(3,TimeUnit.SECONDS)).isTrue();
+                CompletionStage<Void> maintenanceReleased;
                 try(var maintenance=f.resources.admitMaintenanceControl()){
+                    maintenanceReleased=maintenance.released();
                     maintenance.execute(()->{maintenanceEntered.countDown();try{assertThat(maintenanceExit.await(5,TimeUnit.SECONDS)).isTrue();f.tasks.read("flow","task");}
                         catch(InterruptedException interrupted){Thread.currentThread().interrupt();throw new AssertionError(interrupted);}});
                     assertThat(maintenanceEntered.await(2,TimeUnit.SECONDS)).isTrue();
                     try(var progress=coordinator.read(op)){
                         assertThat(progress.value().original()).isEqualTo(op);assertThat(f.resources.snapshot().metadataFrames()).isEqualTo(3);proceed.countDown();
                         assertThat(returned.await(1,TimeUnit.SECONDS)).as("A pending original must not become a disposed metadata refusal before its own paid responses return").isFalse();
+                        assertThat(prepared.getCount()).as("retained startup remains pending while three paid frames are held").isEqualTo(1);
                     }finally{maintenanceExit.countDown();}
                 }
-                assertThat(returned.await(3,TimeUnit.SECONDS)).isTrue();assertThat(result.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
+                // Closing a submitted control is asynchronous. Observe its actual exit and propagate any
+                // body failure before checking admission; a fixed Mongo round-trip budget is not a drain proof.
+                maintenanceReleased.toCompletableFuture().get(30,TimeUnit.SECONDS);
+                assertThat(prepared.await(30,TimeUnit.SECONDS)).as("the original retained bundle starts when sufficient capacity returns").isTrue();
+                assertThat(returned.await(30,TimeUnit.SECONDS)).isTrue();assertThat(result.get().outcome()).isEqualTo(ValidationOwnerRouter.Outcome.ACCEPTED);
                 assertThat(f.tasks.read("flow","task").orElseThrow().full().nextStartSequence()).isEqualTo(1);
             }
         }finally{proceed.countDown();maintenanceExit.countDown();}

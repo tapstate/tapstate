@@ -29,7 +29,15 @@ class PipelineLaunchLatencyIT {
     private static final Map<String, CompletableFuture<Map<String, Object>>> TRACES = new ConcurrentHashMap<>();
     @TempDir Path work;
 
-    @Test void nativeLaunchStagesKeepTheirRequestCostsVisible() throws Exception {
+    @Test void nativeLaunchStagesKeepTheirRequestCostsVisible() throws Exception { measure(false); }
+
+    @Test void anIndependentNativeStartRunsWhileAnotherPipelinesPositionReadIsHeld() throws Exception { measure(true); }
+
+    @Test void anIndependentNativeStartRunsWhileSharedCaptureMaintenanceIsHeld() throws Exception { measure(true, true); }
+
+    private void measure(boolean blockPriorObservation) throws Exception { measure(blockPriorObservation, false); }
+
+    private void measure(boolean blockPriorObservation, boolean blockMaintenance) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -40,6 +48,7 @@ class PipelineLaunchLatencyIT {
                     .environment(CloudFixtureEnvironment.isolated()).run(
                             "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
                             "--logging.level.io.tapstate.app.StorageRoot=WARN",
+                            "--logging.level.io.tapstate.diagnostics.pipeline=DEBUG",
                             "--tapstate.store.mongo.uri=" + storage.configurationUri(),
                             "--tapstate.cloud.atlas-uri=" + storage.configurationUri(),
                             "--tapstate.cloud.base-url=" + NativeCloudAlertManagementIT.CLOUD,
@@ -48,7 +57,8 @@ class PipelineLaunchLatencyIT {
                             "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
                             "--SDK_STATUS_SENDER_ENABLED=false",
                             "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
-                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"))) {
+                            "--tapstate.connectors.plugins-dir=" + work.resolve("plugins"));
+                    var diagnostics = new DiagnosticRecording()) {
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                         assertThat(application.getBean(StorageRoot.class).runtime().business())
                                 .as("phase=" + application.getBean(StorageRoot.class).phase()).isPresent());
@@ -75,13 +85,22 @@ class PipelineLaunchLatencyIT {
                             .append("mode", "alwaysOn").append("data", new org.bson.Document("failCommands", List.of("find", "aggregate", "getMore"))
                                     .append("blockConnection", true).append("blockTimeMS", delay)));
                 }
+                int cacheDelay = Integer.getInteger("launch.cache-delay-ms", 0);
+                if (cacheDelay > 0) {
+                    try (var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                        raw.getDatabase("admin").runCommand(new org.bson.Document("configureFailPoint", "failCommand")
+                                .append("mode", "alwaysOn").append("data", new org.bson.Document("failCommands", List.of("find", "aggregate", "getMore"))
+                                        .append("blockConnection", true).append("blockTimeMS", cacheDelay)));
+                    }
+                }
                 String origin = "http://localhost:" + ((WebServerApplicationContext) application).getWebServer().getPort();
                 try (var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
                     var login = http.send(HttpRequest.newBuilder(URI.create(origin + "/auth/exchange?code=browser-code"))
                             .GET().build(), HttpResponse.BodyHandlers.ofString());
                     assertThat(login.statusCode()).isEqualTo(302);
                     String cookie = login.headers().firstValue("set-cookie").orElseThrow().split(";", 2)[0];
-                    for (int sample = 0; sample < Integer.getInteger("launch.samples", 2); sample++) {
+                    int samples = blockPriorObservation ? 2 : Integer.getInteger("launch.samples", 2);
+                    for (int sample = 0; sample < samples; sample++) {
                         String id = "launch-" + sample;
                         request(http, origin, cookie, "POST", "/api/pipelines/" + id + "/draft", draft(id), 201);
                         request(http, origin, cookie, "POST", "/api/pipelines/" + id + "/draft:preview", Map.of("revision", 1), 200);
@@ -90,28 +109,169 @@ class PipelineLaunchLatencyIT {
                         request(http, origin, cookie, "GET", "/api/pipelines/" + id + "/draft", null, 200);
                         request(http, origin, cookie, "GET", "/api/pipelines/" + id + "/status", null, 200);
                     }
-                    String running = "launch-" + (Integer.getInteger("launch.samples", 2) - 1);
-                    try (var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                    String running = "launch-" + (samples - 1);
+                    var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
+                    if (blockPriorObservation) {
+                        request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
+                                .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
+                    }
+                    var publisher = NativeAppStorage.business(application).getBean(io.tapstate.runtime.scheduler.ObservationPublisher.class);
+                    if (Boolean.getBoolean("launch.mutate.separate-capture-reads")) {
+                        var sample = io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
+                        sample.setAccessible(true);
+                        sample.set(publisher, null);
+                    }
+                    var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
+                            .getBean(PipelineCaptureCoordinator.class);
+                    try (var barrier = blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
+                            : new PositionReadBarrier(publisher,"launch-0") : null;
+                         var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
+                        if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
+                                .as("the prior Pipeline must reach its actual observation position reader").isTrue();
                         var admin = raw.getDatabase("admin");
-                        admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                        if (!blockPriorObservation) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
                                 .append("data", new org.bson.Document("failCommands", List.of("update"))
                                         .append("namespace", storage.cacheDatabase() + "." + io.tapstate.adapters.mongostore.SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName())
                                         .append("blockConnection", true).append("blockTimeMS", 5000)));
                         try {
                             long requested = System.nanoTime();
                             request(http, origin, cookie, "POST", "/api/pipelines/" + running + ":start", Map.of(), 200);
-                            var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
                             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun(running)
                                     .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
-                            System.out.println("ENGINE_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
+                            long readyMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested);
+                            System.out.println((blockPriorObservation ? "INDEPENDENT_ENGINE_READY_MS " : "ENGINE_READY_MS ") + readyMillis);
+                            if (barrier != null) assertThat(barrier.release.getCount())
+                                    .as("the new real engine must run before the unrelated position reader is released").isEqualTo(1);
                             var state = request(http, origin, cookie, "GET", "/api/pipelines/" + running + "/status", null, 200);
                             assertThat(state).containsEntry("state", "RUNNING").containsEntry("displayState", "RUNNING");
-                            assertThat(state).doesNotContainKeys("observedAt", "observedState");
+                            if (!blockPriorObservation) assertThat(state).doesNotContainKeys("observedAt", "observedState");
+                            if (barrier != null) {
+                                try (var target = com.mongodb.client.MongoClients.create(storage.masterUri())) {
+                                    var rows = target.getDatabase(storage.masterDatabase())
+                                            .getCollection("order_views_" + running.replace('-','_'));
+                                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                                        var row = rows.find(new org.bson.Document("parent_id",1L)).first();
+                                        assertThat(row).as("the independent Pipeline must deliver its root document").isNotNull();
+                                        assertThat(row.get("customer",org.bson.Document.class)).containsEntry("parent_id",1L);
+                                        assertThat(row.getList("lines",org.bson.Document.class)).hasSize(1)
+                                                .allSatisfy(line -> assertThat(line).containsEntry("parent_id",1L));
+                                    });
+                                    assertThat(barrier.blocked.get()).isTrue();
+                                    assertThat(barrier.prematureExit.get()).isFalse();
+                                    System.out.println("INDEPENDENT_TARGET_ROW_VISIBLE_MS "
+                                            + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
+                                }
+                            }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
+                    }
+                    if (!blockPriorObservation) {
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
+                                .until(() -> diagnostics.slowPublication().isPresent());
+                        var publication = diagnostics.slowPublication().orElseThrow();
+                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION " + JsonWriter.write(publication));
+                        assertThat(((Number) publication.get("command_count")).intValue())
+                                .as("one source with three tables must reuse its original progress across projections")
+                                .isLessThanOrEqualTo(64);
                     }
                 }
             }
         }
+    }
+
+    private static final class DiagnosticRecording implements AutoCloseable {
+        final ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
+                org.slf4j.LoggerFactory.getLogger(PipelineDiagnostics.LOGGER_NAME);
+        final Queue<Map<?, ?>> completed = new ConcurrentLinkedQueue<>();
+        final ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+                new ch.qos.logback.core.AppenderBase<>() {
+                    @Override protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
+                        var record = (Map<?, ?>) JsonReader.parse(event.getFormattedMessage());
+                        if ("PIPELINE_PASS".equals(record.get("phase")) && "end".equals(record.get("edge")))
+                            completed.add(record);
+                    }
+                };
+        DiagnosticRecording() { appender.setContext(logger.getLoggerContext()); appender.start(); logger.addAppender(appender); }
+        Optional<Map<String, Object>> slowPublication() {
+            for (var record : completed) {
+                var mongo = (Map<?, ?>) ((Map<?, ?>) record.get("mongo_by_phase")).get("pipeline_publish");
+                var phase = (Map<?, ?>) ((Map<?, ?>) record.get("phases")).get("pipeline_publish");
+                if (mongo != null && phase != null && Boolean.TRUE.equals(record.get("complete"))
+                        && ((Number) mongo.get("max_driver_ms")).doubleValue() >= 4500
+                        && ((Number) phase.get("inclusive_ms")).doubleValue() >= 4500) {
+                    return Optional.of(Map.of("pass_id", record.get("pass_id"), "pipeline_id", record.get("pipeline_id"),
+                            "phase", "PIPELINE_PUBLISH", "inclusive_ms", phase.get("inclusive_ms"),
+                            "max_driver_ms", mongo.get("max_driver_ms"), "command_count", mongo.get("started")));
+                }
+            }
+            return Optional.empty();
+        }
+        @Override public void close() { logger.detachAppender(appender); appender.stop(); }
+    }
+
+    /** Holds one real position supplier; all engine, capture and store work still follows production wiring. */
+    private static final class PositionReadBarrier implements AutoCloseable {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch release = new CountDownLatch(1);
+        final java.util.concurrent.atomic.AtomicBoolean blocked = new java.util.concurrent.atomic.AtomicBoolean();
+        final java.util.concurrent.atomic.AtomicBoolean prematureExit = new java.util.concurrent.atomic.AtomicBoolean();
+        final java.lang.reflect.Field field;
+        final Object publisher;
+        final Object original;
+        @SuppressWarnings("unchecked")
+        PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
+            this.publisher=publisher;
+            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
+            field.setAccessible(true);original=field.get(publisher);
+            var delegate=(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>)original;
+            field.set(publisher,(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>) (id, at) -> {
+                if(id.equals(pipeline)) {
+                    blocked.set(true);entered.countDown();
+                    try { release.await(); }
+                    catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
+                    finally {if(release.getCount()!=0)prematureExit.set(true);blocked.set(false);}
+                }
+                return delegate.apply(id, at);
+            });
+        }
+        PositionReadBarrier(ScopedPipelineCaptureCoordinator captures) throws Exception {
+            publisher = captures;
+            field = ScopedPipelineCaptureCoordinator.class.getDeclaredField("stores");
+            field.setAccessible(true);
+            synchronized (captures) {
+                original = field.get(captures);
+                var captured = (ScopedPipelineCaptureCoordinator.Stores) original;
+                var delegate = captured.sources();
+                SrsStoreViews observed = new SrsStoreViews() {
+                    public SrsStores srs(CacheBusinessScope scope, Runnable guard) {
+                        var ports = delegate.srs(scope, guard);
+                        var chains = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
+                                new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> {
+                                    if (method.getName().equals("load") && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                        blocked.set(true); entered.countDown();
+                                        try { release.await(); }
+                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                                    }
+                                    try { return method.invoke(ports.chains(), arguments); }
+                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                });
+                        return new SrsStores(chains, ports.models(), ports.log(), ports.consumers());
+                    }
+                    public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
+                    public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {
+                        return delegate.withCaptureStartup(scope, step);
+                    }
+                    public DirectChannelStore directChannels(CacheBusinessScope scope, Runnable guard) {
+                        return delegate.directChannels(scope, guard);
+                    }
+                };
+                field.set(captures, new ScopedPipelineCaptureCoordinator.Stores(captured.scope(), captured.pipelines(), observed,
+                        captured.configuration(), captured.preparations(), captured.notes(), captured.recoveryPinned(),
+                        captured.boundedLoads(), captured.completedFull()));
+            }
+        }
+        @Override public void close() throws Exception {release.countDown();field.set(publisher,original);}
     }
 
     private static Map<String, Object> publish(HttpClient http, String origin, String cookie, String id,
@@ -148,7 +308,7 @@ class PipelineLaunchLatencyIT {
                 "root", Map.of("id", "root", "sourceId", "launch-input", "table", "orders", "key", List.of("_id"), "preTransforms", List.of()),
                 "related", List.of(related("customer", "customers", "object"), related("lines", "lines", "array")),
                 "transforms", List.of(), "output", Map.of("kind", "source", "config", Map.of(
-                        "sourceId", "atlas-store", "table", "order_views", "writeMode", "upsert", "onFullLoad", "append"))));
+                        "sourceId", "atlas-store", "table", "order_views_" + id.replace('-','_'), "writeMode", "upsert", "onFullLoad", "append"))));
     }
 
     private static Map<String, Object> related(String id, String table, String shape) {

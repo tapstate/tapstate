@@ -413,6 +413,7 @@ public final class ObservationPublisher {
     private final Function<String, SnapshotReading> snapshots;
     private final Function<String, SnapshotReading> runSnapshots;
     private final Function<String, InitialLoad> initialLoads;
+    private final java.util.function.BiFunction<String, Instant, CaptureMeasurements> captureMeasurements;
     private final Function<String, Map<String, Long>> frontierGaps;
     private final Function<String, Map<String, NestStateReading>> nestStateReadings;
     private final Function<String, Map<String, Long>> frontierStalls;
@@ -743,6 +744,30 @@ public final class ObservationPublisher {
             Function<String, SnapshotReading> runSnapshots,
             Function<String, InitialLoad> initialLoads,
             Clock clock) {
+        this(state, observations, recordCounts, positions, snapshots, frontierGaps, nestStateReadings,
+                coldLayer, frontierStalls, frontierStall, nestDeadLetters, joinRecomputeDone,
+                joinRecomputeExpected, captures, deliveries, stages, runSnapshots, initialLoads, null, clock);
+    }
+
+    public ObservationPublisher(StateStore state, ObservationStore observations,
+            Function<String, OptionalLong> recordCounts, Function<String, Map<String, String>> positions,
+            Function<String, SnapshotReading> snapshots,
+            Function<String, Map<String, Long>> frontierGaps,
+            Function<String, Map<String, NestStateReading>> nestStateReadings,
+            NestColdLayerWatch coldLayer,
+            Function<String, Map<String, Long>> frontierStalls,
+            FrontierStallWatch frontierStall,
+            Function<String, Map<String, Long>> nestDeadLetters,
+            Function<String, Map<String, Long>> joinRecomputeDone,
+            Function<String, Map<String, Long>> joinRecomputeExpected,
+            Function<String, CaptureReading> captures,
+            Function<String, DeliveryReading> deliveries,
+            Function<String, StageReading> stages,
+            Function<String, SnapshotReading> runSnapshots,
+            Function<String, InitialLoad> initialLoads,
+            java.util.function.BiFunction<String, Instant, CaptureMeasurements> captureMeasurements,
+            Clock clock) {
+        this.captureMeasurements = captureMeasurements;
         this.initialLoads = Objects.requireNonNull(initialLoads, "initialLoads");
         this.captures = Objects.requireNonNull(captures, "captures");
         this.deliveries = Objects.requireNonNull(deliveries, "deliveries");
@@ -844,14 +869,18 @@ public final class ObservationPublisher {
                 readings = nestStateReadings.apply(pipelineId);
                 gaps = frontierGaps.apply(pipelineId);
                 pinned = frontierStalls.apply(pipelineId);
-                SnapshotReading loaded = snapshots.apply(pipelineId);
-                SnapshotReading readThisRun = runSnapshots.apply(pipelineId);
+                CaptureMeasurements capture = captureMeasurements == null ? null
+                        : Objects.requireNonNull(captureMeasurements.apply(pipelineId, at), "capture measurements");
+                SnapshotReading loaded = capture == null ? snapshots.apply(pipelineId) : capture.snapshot();
+                SnapshotReading readThisRun = capture == null ? runSnapshots.apply(pipelineId) : capture.runSnapshot();
                 List<MetricFact> measured = facts(pipelineId, actual, at, readings, gaps, pinned,
                         nestDeadLetters.apply(pipelineId), joinRecomputeDone.apply(pipelineId),
                         joinRecomputeExpected.apply(pipelineId), loaded, readThisRun);
                 published = new Observation(pipelineId, actual,
                         FlatMetricProjection.of(measured, FLAT_REDUCTIONS).metrics(),
-                        loaded.byTable(), positions.apply(pipelineId), carried, at, measured, initialLoadAt(pipelineId, at));
+                        loaded.byTable(), capture == null ? positions.apply(pipelineId)
+                                : capture.positions().orElseGet(() -> positions.apply(pipelineId)),
+                        carried, at, measured, capture == null ? initialLoadAt(pipelineId, at) : capture.initialLoad());
                 measuredSuccessfully = true;
             } catch (TapstateException unavailable) {
                 if (actual != PipelineState.FAILED) throw unavailable;

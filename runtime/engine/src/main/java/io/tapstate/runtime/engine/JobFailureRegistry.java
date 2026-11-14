@@ -118,7 +118,7 @@ public final class JobFailureRegistry {
         try {
             var current = member.getJet().getJob(pipelineId);
             return current != null && current.getId() == jobId && identity.equals(current.getConfig().getArgument(Engine.RUN_IDENTITY_ARGUMENT));
-        } catch (com.hazelcast.core.HazelcastInstanceNotActiveException stopped) {
+        } catch (com.hazelcast.core.HazelcastInstanceNotActiveException | com.hazelcast.jet.core.JobNotFoundException stopped) {
             // No slot may be adopted through a member that can no longer prove the named job.
             return false;
         }

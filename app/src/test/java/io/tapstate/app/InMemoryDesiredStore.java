@@ -15,7 +15,7 @@ final class InMemoryDesiredStore implements DesiredStore {
     private final Map<String, DesiredState> docs = new LinkedHashMap<>();
 
     @Override
-    public void save(DesiredState desired) {
+    public synchronized void save(DesiredState desired) {
         docs.put(desired.pipelineId(), desired);
     }
 
@@ -24,17 +24,17 @@ final class InMemoryDesiredStore implements DesiredStore {
     }
 
     @Override
-    public void delete(String pipelineId) {
+    public synchronized void delete(String pipelineId) {
         docs.remove(pipelineId);
     }
 
     @Override
-    public Optional<DesiredState> read(String pipelineId) {
+    public synchronized Optional<DesiredState> read(String pipelineId) {
         return Optional.ofNullable(docs.get(pipelineId));
     }
 
     @Override
-    public List<String> pipelineIds() {
+    public synchronized List<String> pipelineIds() {
         return new ArrayList<>(docs.keySet());
     }
 }

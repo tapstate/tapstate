@@ -36,6 +36,34 @@ class RootStateWriteBatchingTest {
 
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void guardedTouchOrderingChangesCallCountsButNotTheKeysReadOrWritten(boolean touchesFirst) throws Exception {
+        Fixture f = new Fixture(NestSendPolicy.everyChange(), 256);
+        TestInbox roots = new TestInbox();
+        TestInbox touches = new TestInbox();
+        for (int id = 0; id < 8; id++) {
+            roots.add(Envelope.insert(id, "order", row("order_id", id, "cust_ref", "C1"), null)
+                    .withOrder(at(id + 1)));
+            touches.add(new NestTouch(List.of(id), id, Map.of(), true, false));
+        }
+        int touchOrdinal = TREE.lookups().getFirst().touchOrdinal();
+        if (touchesFirst) f.assembler.process(touchOrdinal, touches);
+        f.assembler.process(0, roots);
+        if (!touchesFirst) f.assembler.process(touchOrdinal, touches);
+
+        assertThat(roots).isEmpty();
+        assertThat(touches).isEmpty();
+        assertThat(f.roots.singleReads).isEqualTo(touchesFirst ? 0 : 8);
+        assertThat(f.roots.batchReads).isEqualTo(touchesFirst ? 1 : 0);
+        assertThat(f.roots.singleReads + f.roots.batchReadKeys.stream().mapToInt(List::size).sum())
+                .isEqualTo(8);
+        assertThat(f.roots.singleWrites).isEqualTo(8);
+        assertThat(f.roots.batches).isEmpty();
+        assertThat(f.drain()).hasSize(8).extracting(e -> e.after().get("order_id"))
+                .containsExactly(0, 1, 2, 3, 4, 5, 6, 7);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
     void arrayChildrenBeforeRootsUseBoundedReadsAndWrites(boolean folding) throws Exception {
         Fixture f = arrayFixture(new RecordingStore(), folding);
         TestInbox lines = lineRows(32);

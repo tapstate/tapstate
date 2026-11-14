@@ -64,26 +64,38 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         resolutions.forEach((sourceId, resolution) -> {
             boolean singleNode = resolutions.values().stream()
                     .filter(candidate -> candidate.chainId().equals(resolution.chainId())).count() == 1;
-            storePort.meta().read(resolution.chainId().value()).ifPresent(meta -> {
-                ConsumerOffset offset = meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
-                        .orElseGet(() -> singleNode ? meta.consumerOffset(pipelineId).orElse(null) : null);
-                if (offset == null) {
-                    return;
-                }
-                for (String table : resolution.tables()) {
-                    ChainPosition confirmed = offset.sinkAckedByTable().get(table);
-                    if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
-                            || (offset.progressKind() == ConsumerProgressKind.LEGACY
-                                    && resolution.tables().size() == 1 && offset.perTableSeq().size() <= 1))) {
-                        confirmed = offset.sinkAcked();
-                    }
-                    if (confirmed != null && confirmed.token() != null) {
-                        positions.put(table, confirmed.token());
-                    }
-                }
-            });
+            // Bounded snapshots use private capture state even when the source enables SRS.
+            boolean shared = (pipeline.get().settings() == null
+                    || pipeline.get().settings().readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
+                    && pipeline.get().sources().stream().noneMatch(reference -> reference.id().equals(sourceId)
+                    && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs());
+            Optional<ConsumerOffset> own = shared && storePort instanceof ThreeLayerStorePort nativeStore
+                    ? nativeStore.sinkOffset(pipelineId, sourceId, resolution.chainId().value()) : Optional.empty();
+            ConsumerOffset offset = own.orElseGet(() -> storePort.meta().read(resolution.chainId().value())
+                    .flatMap(meta -> meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
+                            .or(() -> singleNode ? meta.consumerOffset(pipelineId) : Optional.empty()))
+                    .orElse(null));
+            if (offset != null) {
+                addConfirmedPositions(positions, resolution.tables(), offset);
+            }
         });
         current.run();return positions;
+    }
+
+    /** The same durable acknowledgement projection serves live samples and stored-position fallbacks. */
+    static void addConfirmedPositions(Map<String, String> positions, java.util.Collection<String> tables,
+            ConsumerOffset offset) {
+        for (String table : tables) {
+            ChainPosition confirmed = offset.sinkAckedByTable().get(table);
+            if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
+                    || (offset.progressKind() == ConsumerProgressKind.LEGACY
+                            && tables.size() == 1 && offset.perTableSeq().size() <= 1))) {
+                confirmed = offset.sinkAcked();
+            }
+            if (confirmed != null && confirmed.token() != null) {
+                positions.put(table, confirmed.token());
+            }
+        }
     }
 
     /** The stored pipeline for the id, or empty when its artifact is absent or names another kind. */

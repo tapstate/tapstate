@@ -134,6 +134,11 @@ class NativeValidationSchedulerIT {
                 }finally{peerResources.close();}
             }finally{
                 if(peerLease!=null){var stopped=peer;peerLease.stopAndClose(()->{if(stopped!=null)stopped.shutdown();});}else if(peer!=null)peer.shutdown();
+                // A peer's shutdown return does not publish its departure on this member. Let the
+                // surviving view settle before its own graceful Jet shutdown broadcasts to members.
+                var local = f.member.getCluster().getLocalMember().getUuid();
+                await(() -> f.member.getCluster().getMembers().size() == 1
+                        && f.member.getCluster().getMembers().iterator().next().getUuid().equals(local));
                 f.raw.getDatabase(source).drop();f.raw.getDatabase(target).drop();
             }
         }
@@ -158,9 +163,11 @@ class NativeValidationSchedulerIT {
                         assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(2);
                         try(var ignored=coordinator.stop(manual)){}
                         await(()->f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                        // Durable closure precedes physical drain; establish an idle run before advancing to another occurrence.
+                        await(()->{try(var stopped=coordinator.read(manual)){return stopped.value().drain()==ValidationOperation.Drain.DRAINED;}});
                         time.now.set(Instant.parse("2026-10-29T00:03:10Z"));await(()->fact(facts,coordinator,task,1).map(value->value.state()==ValidationScheduleObservations.State.SKIPPED_LATE).orElse(false));
                         assertThat(f.member.getJet().getJobs()).isEmpty();ready.set(true);time.now.set(Instant.parse("2026-10-29T00:04:00Z"));
-                        await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));
+                        awaitScheduledCompletion(f,facts,coordinator,task);
                         assertThat(f.member.getJet().getJobs()).hasSize(1);
                         scheduler.close();time.now.set(Instant.parse("2026-10-29T00:10:10Z"));
                         try(var restarted=new NativeValidationScheduler(f.configuration,f.resources,f.process,()->coordinator,facts,time,new ValidationScheduleCalculator(),()->{})){
@@ -194,6 +201,17 @@ class NativeValidationSchedulerIT {
         var operation=new ValidationOperation(coordinator.context(),task.pipelineId(),task.taskId(),task.generation(),revision,fact.sequence(),fact.command());
         try(var response=coordinator.read(operation)){return response.value().toString();}
         catch(RuntimeException refused){return refused.toString();}
+    }
+    private static void awaitScheduledCompletion(NativeValidationOwnerReservationsIT.Fixture f,MemoryValidationSchedules facts,
+            NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task){
+        try{
+            await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10))
+                    .items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));
+        }catch(org.awaitility.core.ConditionTimeoutException timeout){
+            throw new AssertionError("Scheduled COUNT did not complete: schedule="+fact(facts,coordinator,task,1)
+                    +", original="+observed(facts,coordinator,task,1)+", resources="+f.resources.snapshot()
+                    +", jobs="+f.member.getJet().getJobs().stream().map(job->job.getStatus().name()).toList(),timeout);
+        }
     }
     private static Optional<ValidationScheduleObservations.Fact> fact(MemoryValidationSchedules facts,NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task,long revision){
         var origin=coordinator.context();return facts.view(new ValidationScheduleObservations.Origin(origin.node(),origin.boot(),origin.member(),origin.incarnation())).read(task,revision);

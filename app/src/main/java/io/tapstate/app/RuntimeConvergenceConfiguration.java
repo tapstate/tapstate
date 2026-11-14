@@ -125,6 +125,7 @@ class RuntimeConvergenceConfiguration {
                 id -> captureCoordinator.initialLoad(id,
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
+                (id, at) -> captureCoordinator.measurements(id, executionPlans.current(List.of(id)).get(id), at),
                 Clock.systemUTC());
     }
 
@@ -154,7 +155,7 @@ class RuntimeConvergenceConfiguration {
         return new RateSampler(storePort.rateHistory(), history.getSampleInterval());
     }
 
-    @Bean
+    @Bean(destroyMethod = "close")
     ConvergenceDriver convergenceDriver(
             PipelineConverger pipelineConverger, StorePort storePort, ObservationPublisher observationPublisher,
             RateSampler rateSampler, MetricsExport metricsExport,

@@ -84,6 +84,68 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void aBlockedPositionReadDoesNotDelayAnotherPipelinesStart() throws Exception {
+        var reading = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var healthy = new java.util.concurrent.CountDownLatch(1);
+        ObservationPublisher publisher = new ObservationPublisher(state, observations,
+                id -> OptionalLong.empty(), id -> {
+                    if (id.equals("slow")) {
+                        reading.countDown();
+                        try {
+                            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS))
+                                throw new AssertionError("the test did not release its position read");
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new IllegalStateException(interrupted);
+                        }
+                    } else healthy.countDown();
+                    return Map.of();
+                });
+        ConvergenceDriver isolated = new ConvergenceDriver(converger, desired, publisher);
+        desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+        desired.save(new DesiredState("healthy", RUNNING, "rev-1"));
+        try (isolated; var scheduler = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var tick = scheduler.submit(isolated::schedule);
+            try {
+                assertThat(reading.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(healthy.await(1, java.util.concurrent.TimeUnit.SECONDS))
+                        .as("an unrelated start must proceed while the first pipeline waits for SRS positions")
+                        .isTrue();
+            } finally {
+                release.countDown();
+                tick.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void pruningKeepsTheClaimOfARemovedPipelineUntilItsPassEnds() throws Exception {
+        var reading = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var ownership = org.mockito.Mockito.mock(PipelineActuationOwnership.class);
+        org.mockito.Mockito.when(ownership.permit(org.mockito.ArgumentMatchers.anyString()))
+                .thenReturn(PipelineActuationOwnership.Permit.unfenced());
+        var publisher = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> {
+            reading.countDown();
+            try { release.await(); }
+            catch (InterruptedException stopped) { Thread.currentThread().interrupt(); }
+            return Map.of();
+        });
+        try (var isolated = new ConvergenceDriver(converger, desired, publisher, () -> true, ownership)) {
+            desired.save(new DesiredState("slow", RUNNING, "rev-1"));
+            try {
+                isolated.schedule();
+                assertThat(reading.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                org.mockito.Mockito.clearInvocations(ownership);
+                desired.remove("slow");
+                isolated.schedule();
+                org.mockito.Mockito.verify(ownership).retain(org.mockito.ArgumentMatchers.argThat(ids -> ids.contains("slow")));
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test
     void aMemberWithoutCommittedMembershipDoesNotActuateDesiredWork() {
         desired.save(new DesiredState("orders", RUNNING, "rev-1"));
         ConvergenceDriver gated = new ConvergenceDriver(

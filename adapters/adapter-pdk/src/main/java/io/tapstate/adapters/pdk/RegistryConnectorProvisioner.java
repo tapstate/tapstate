@@ -39,6 +39,9 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
     private final Path cacheDir;
     private final Path seedDir;
     private final boolean loadSeedInPlace;
+    private record Inspection(String hash, boolean defaultTest) {}
+    private final Map<Inspection, IntrospectedConnector> inspections = new java.util.LinkedHashMap<>(16, 0.75f, true);
+    private static final int MAX_INSPECTIONS = 32;
 
     public RegistryConnectorProvisioner(
             ConnectorRegistry registry, ConnectorIntrospector introspector, Path cacheDir) {
@@ -112,10 +115,26 @@ public final class RegistryConnectorProvisioner implements ConnectorProvisioner 
             if (current.size() != 1 || !current.getFirst().equals(registration))
                 throw new TapstateException(ConnectorError.LOAD_FAILED, Map.of("connector", connectorId), null);
         }
-        IntrospectedConnector introspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
+        IntrospectedConnector introspected = inspectVerified(registration.contentHash(), staged, defaultTest);
         boolean shareSafe = registry.shareSafeCertification(connectorId, registration.contentHash()).isPresent();
         return new ConnectorRef(List.of(staged), introspected.className(), introspected.pdkApiVersion(), null,
                 introspected.spec(), registration.contentHash(), shareSafe);
+    }
+
+    /** Only immutable byte-derived descriptors are reused. Registration, bytes and certification stay live. */
+    private IntrospectedConnector inspectVerified(String hash, Path staged, boolean defaultTest) {
+        var key = new Inspection(hash, defaultTest);
+        synchronized (inspections) {
+            var known = inspections.get(key);
+            if (known != null) return known;
+        }
+        // Scanning and class loading never hold the cache monitor. Failures are never cached.
+        var inspected = defaultTest ? introspector.introspectDefaultTest(List.of(staged)) : introspector.introspect(List.of(staged));
+        synchronized (inspections) {
+            inspections.put(key, inspected);
+            while (inspections.size() > MAX_INSPECTIONS) inspections.remove(inspections.keySet().iterator().next());
+        }
+        return inspected;
     }
 
     @Override
