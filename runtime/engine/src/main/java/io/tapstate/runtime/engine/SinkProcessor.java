@@ -988,7 +988,12 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
      * once the engine runs it.
      */
     private static SinkWriter openWriter(SupplierEx<? extends SinkWriter> factory,int memberIndex,int localIndex) throws Exception {
-        return factory instanceof IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):factory.get();
+        SinkWriter writer = factory instanceof IndexedSinkWriterFactory indexed?indexed.forWriter(memberIndex,localIndex):factory.get();
+        // Every writer a sink runs is opened here, so this is the one place a row is cleared of product
+        // bookkeeping before it reaches a target. A factory that opts its target out of delivered markers
+        // says so; every other target receives them.
+        boolean deliver = !(factory instanceof StripsInternalFields);
+        return ServedRows.over(writer, deliver);
     }
 
     private static List<Processor> openedTogether(int count, SupplierEx<SinkProcessor> processor) {

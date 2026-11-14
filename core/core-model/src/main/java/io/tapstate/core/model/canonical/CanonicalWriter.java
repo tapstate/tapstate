@@ -33,6 +33,7 @@ import io.tapstate.core.model.ViewBlock;
 import io.tapstate.core.model.ViewResource;
 import io.tapstate.core.model.WriteMode;
 import io.tapstate.core.model.DdlPolicy;
+import io.tapstate.core.model.InternalFields;
 import io.tapstate.core.model.OnFullLoad;
 import io.tapstate.core.model.ErrorPolicy;
 
@@ -537,6 +538,9 @@ public final class CanonicalWriter {
             b.scalar("on_full_load", e.onFullLoad().yaml());
         }
         execution(b, e.execution());
+        if (e.internalFields() != null && e.internalFields() != InternalFields.DELIVER) {
+            b.scalar("internal_fields", e.internalFields().yaml());
+        }
         return b.build();
     }
 

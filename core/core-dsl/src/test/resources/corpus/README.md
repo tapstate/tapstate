@@ -75,6 +75,7 @@ together):
 | `config-type-mismatch` | connector config value whose type differs from the connector's declared field type | C3 |
 | `invalid-config-value` | connector config value outside the connector's declared enum choices | C3 |
 | `unwind-needs-an-element-key` | an unwind naming nothing that varies per element, so every row it expands carries the parent's key | unwind |
+| `reserved-field-declared` | a step output field with the name reserved for product-added row data | map, format |
 | `unwind-needs-an-upsert-target` | an unwind whose rows reach a sync that appends, where a delete is written as another row | unwind |
 | `join-input-not-a-table` | a join's `from:` map names another step of the pipeline rather than a source table | §5 |
 | `join-input-is-a-pattern` | a join's `from:` map binds an alias to a `/…/` pattern rather than one table | §5 |
@@ -113,6 +114,7 @@ Cases (sNN ties the case to the valid/ scenario it mutates; gNN = general gramma
 | `g15-source-without-connector` | missing-field | source with no `connector:`, the field nothing else implies |
 | `g16-read-source-without-mode` | mode-required-for-read | source read by a pipeline with no `mode:`; the write target in the same batch correctly has none |
 | `g17-view-without-primary-key` | missing-field | inline view with no `primary_key:`, the field its sink indexes uniquely |
+| `s12-map-declares-the-reserved-field` | reserved-field-declared | a `map` output field named `__tap` |
 | `g18-unwind-without-an-element-key` | unwind-needs-an-element-key | `type: unwind` with neither `element_key` nor `include_array_index` |
 | `g19-unwind-into-an-append-target` | unwind-needs-an-upsert-target | a keyed `type: unwind` served to a sync with `write_mode: append` |
 

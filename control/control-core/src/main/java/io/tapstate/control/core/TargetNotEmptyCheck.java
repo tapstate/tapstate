@@ -155,7 +155,7 @@ public final class TargetNotEmptyCheck implements StartCheck {
             List<SyncElement> sync = inline.sync().stream()
                     .map(element -> elements.contains(elementId(element))
                             ? new SyncElement(element.id(), element.source(), element.writeMode(), element.rename(),
-                                    element.ddl(), OnFullLoad.CLEAR, element.execution())
+                                    element.ddl(), OnFullLoad.CLEAR, element.execution(), element.internalFields())
                             : element)
                     .toList();
             serve = new ServeBlock.Inline(inline.id(), inline.from(), sync, inline.query(), inline.push());
