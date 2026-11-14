@@ -1086,8 +1086,9 @@ This runtime is a preview. Known constraints in this slice:
   targets whose rows the server can read; for any other target it warns and goes ahead.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
-- **Installation and application commands are separate.** The demo automates storage and administrator setup. A manually started server uses the `installation` owner command and
-  dedicated management channel; the client CLI does not install the server.
+- **Installation and application commands are separate.** The demo automates storage and
+  administrator setup. A manually started server uses the `installation` owner command and
+  dedicated management channel.
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,
   `--connect`, `--token`, and `TAPSTATE_TOKEN` never create or update that cache.

@@ -652,7 +652,7 @@ main() {
     fi
 
     # The demo connector jars. These three are what this release registers, and they are fetched so the
-    # demo runs without the user choosing. They sit outside connectors/ so the seed dir stays empty.
+    # demo runs without the user choosing. MongoDB is staged before storage setup.
     #
     # The postgres one is fetched for the same reason its seed is: the compose file has run a postgres
     # service with a seeded shipments table since the second engine was added, and a demo that fetches
@@ -664,7 +664,7 @@ main() {
     [ -f ./postgres-connector.jar ] || fetch "${cbase}/postgres-connector.jar" ./postgres-connector.jar
 
     # Storage setup needs the default views connector before a user can log in.
-    cp ./mongodb-connector.jar ./connectors/mongodb-connector.jar
+    [ -f ./connectors/mongodb-connector.jar ] || cp ./mongodb-connector.jar ./connectors/mongodb-connector.jar
 
     # Generate the demo workspace, unless one is already here: a re-run must not clobber edits the user
     # made to their resources.
