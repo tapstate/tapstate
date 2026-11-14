@@ -368,7 +368,9 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                         .containsEntry("phase","RETIRED").containsEntry("operationId",operation).containsEntry("replacementChain",replacement);
                 for(String id:List.of("reader_a","reader_b")) {
-                    assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                    var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
+                            () -> control.state(id));
+                    assertThat(observed).isEqualTo(PipelineState.STOPPED);
                     assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
                     var refusal=control.startExpectingRefusal(id);assertThat(refusal.status()).isEqualTo(409);
                     assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
