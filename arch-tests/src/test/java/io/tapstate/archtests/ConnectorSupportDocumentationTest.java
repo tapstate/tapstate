@@ -75,7 +75,7 @@ class ConnectorSupportDocumentationTest {
                             "Applying a cloud pipeline",
                             "whose sync names another connector is refused",
                             "Oracle Free 23", "SQL Server 2022", "DECIMAL(18,4)", "schema rediscovery",
-                            "18 connector ids", "16 across these five database kinds",
+                            "19 connector ids", "16 across these five database kinds",
                             "managed variants", "Except for `mongodb-atlas`",
                             "live-verified individually", "Atlas connector was verified",
                             "`aws-rds-mysql`", "unverified preview",

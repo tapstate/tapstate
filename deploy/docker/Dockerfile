@@ -8,8 +8,8 @@
 #   mvn -pl app -am -DskipTests package
 #   docker build -f deploy/docker/Dockerfile -t tapstate:dev .
 #
-# Connector jars are deliberately NOT baked in. They are registered at runtime by uploading their
-# bytes, which keeps a connector's lifecycle independent of this image's version.
+# The default development target takes connector JARs at runtime. Release targets carry a verified
+# seed independent of the writable installation directory.
 
 # The boot jar is resolved in a throwaway stage rather than copied straight onto its final path.
 # The wildcard tolerates the version in the artifact name without pinning it here, but a glob onto a
@@ -99,10 +99,8 @@ ENTRYPOINT ["java", "-jar", "/opt/tapstate/tapstate.jar"]
 # Overridable: replacing it is how an operator passes a different role or extra Spring arguments.
 CMD ["--role=all"]
 
-# Each profile supplies its own Boot JAR while sharing the runtime layers above. The connector context is
-# supplied only to this target, so ordinary server builds neither fetch nor bundle connector jars.
-# The connector seed has separate distribution terms, so this target does not inherit the server label's
-# Apache-2.0 assertion. Publication still requires a reviewed license inventory and permission.
+# Each release profile supplies its own Boot JAR and verified connector context. Connector seeds have
+# separate distribution terms from the server.
 FROM runtime-base AS cloud
 # Override the standard user: the bundled Db2 runtime registers its installation and client instance
 # on first use. Keep libstdc++6 explicit as a native requirement, even when the base already supplies it.
@@ -128,7 +126,17 @@ RUN set -eu; \
     sha256sum -c /opt/tapstate/release/connectors.sha256; \
     test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 8
 
-# Keep the standard image as the default target and preserve its on-prem connector lifecycle.
-FROM runtime-base AS server
+FROM runtime-base AS onprem-base
 LABEL org.opencontainers.image.source="https://github.com/tapstate/tapstate" \
       io.tapstate.distribution="onprem"
+
+FROM onprem-base AS onprem-release
+LABEL org.opencontainers.image.licenses="NOASSERTION"
+COPY --from=onprem_connectors /connectors/ /opt/tapstate/connectors/
+COPY --from=onprem_connectors /release/ /opt/tapstate/release/
+COPY NOTICE /opt/tapstate/NOTICE
+ENV TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors
+RUN cd /opt/tapstate/connectors && sha256sum -c /opt/tapstate/release/connectors.sha256
+
+# Keep connector-free development builds available without release inputs.
+FROM onprem-base AS server
