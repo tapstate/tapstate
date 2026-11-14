@@ -1401,11 +1401,51 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         return new RingNotOpenYet(new CaptureId(source.prepared.captureId()));
     }
     private record DemandCheck(Owner owner, long revision) {}
+    private record TailCheck(Owner owner, long revision, Physical physical, boolean covered, Throwable failure) {}
+
+    private Map<Owner, TailCheck> checkServingTails() {
+        var selected = new ArrayList<TailCheck>();
+        synchronized (this) {
+            if (closed.get()) return Map.of();
+            for (Owner owner : owners.values()) {
+                if (owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS && !owner.ended.get()
+                        && !owner.drainingReports() && !owner.handingOff && owner.config != null && owner.origin != null
+                        && owner.physical != null && owner.physical.live.get() && owner.physical.tail != null)
+                    selected.add(new TailCheck(owner, owner.demandRevision, owner.physical, false, null));
+            }
+        }
+        var checked = new HashMap<Owner, TailCheck>();
+        for (TailCheck original : selected) {
+            Owner owner = original.owner();
+            boolean covered = false;
+            Throwable failure = null;
+            try {
+                owner.require();
+                var current = stores.sources().srs(stores.scope(), owner::require);
+                var requested = new TreeSet<String>();
+                current.consumers().attached(owner.prepared.chainId()).consumers()
+                        .forEach(member -> requested.addAll(member.tables()));
+                covered = requested.isEmpty() || current.chains().load(owner.prepared.chainId())
+                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused).servingTables().containsAll(requested);
+                owner.require();
+            } catch (RuntimeException | Error failed) { failure = failed; }
+            checked.put(owner, new TailCheck(owner, original.revision(), original.physical(), covered, failure));
+        }
+        return checked;
+    }
+
+    /** Called under the monitor: an old read cannot grant or fail a replacement capture. */
+    private boolean current(TailCheck check) {
+        Owner owner = check.owner();
+        return owners.get(owner.prepared.captureId()) == owner && !owner.ended.get() && !owner.drainingReports()
+                && !owner.handingOff && owner.demandRevision == check.revision()
+                && owner.physical == check.physical() && check.physical().live.get();
+    }
 
     private void maintenanceTick() {
         // Retention uses the owner's fixed capture fence. Its store reads must not hold the
         // coordinator monitor needed to plan and attach an unrelated Pipeline.
-        for (Owner owner : PipelineDiagnostics.measure(null, Phase.CAPTURE_MAINTENANCE, this::maintain)) {
+        for (Owner owner : PipelineDiagnostics.measure(null, Phase.CAPTURE_MAINTENANCE, () -> maintain(checkServingTails()))) {
             try { PipelineDiagnostics.retention(owner.prepared.captureId(), () -> retain(owner)); }
             catch (RuntimeException | Error failure) { failedRetention(owner, failure); }
         }
@@ -1435,7 +1475,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
     }
 
-    private synchronized List<Owner> maintain() {
+    private synchronized List<Owner> maintain(Map<Owner, TailCheck> checked) {
         var retention = new ArrayList<Owner>();
         if(closed.get())return retention;
         for (var owner : List.copyOf(owners.values())) {
@@ -1468,7 +1508,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if(needed(owner))continue;
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
-                ensureTail(owner);retention.add(owner);
+                var check = checked.get(owner);
+                boolean observed = check != null && current(check);
+                if (observed && check.failure() != null) throwFailure(check.failure());
+                if (!observed || !check.covered()) ensureTail(owner);
+                retention.add(owner);
             }
             catch(RuntimeException|Error failure) {
                 // The loss callback is waiting for this monitor to detach the old shared owner.

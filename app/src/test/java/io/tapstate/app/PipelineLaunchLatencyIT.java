@@ -33,7 +33,11 @@ class PipelineLaunchLatencyIT {
 
     @Test void anIndependentNativeStartRunsWhileAnotherPipelinesPositionReadIsHeld() throws Exception { measure(true); }
 
-    private void measure(boolean blockPriorObservation) throws Exception {
+    @Test void anIndependentNativeStartRunsWhileSharedCaptureMaintenanceIsHeld() throws Exception { measure(true, true); }
+
+    private void measure(boolean blockPriorObservation) throws Exception { measure(blockPriorObservation, false); }
+
+    private void measure(boolean blockPriorObservation, boolean blockMaintenance) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -113,7 +117,10 @@ class PipelineLaunchLatencyIT {
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
                     }
                     var publisher = NativeAppStorage.business(application).getBean(io.tapstate.runtime.scheduler.ObservationPublisher.class);
-                    try (var barrier = blockPriorObservation ? new PositionReadBarrier(publisher,"launch-0") : null;
+                    var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
+                            .getBean(PipelineCaptureCoordinator.class);
+                    try (var barrier = blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
+                            : new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must reach its actual observation position reader").isTrue();
@@ -201,7 +208,7 @@ class PipelineLaunchLatencyIT {
         final java.util.concurrent.atomic.AtomicBoolean blocked = new java.util.concurrent.atomic.AtomicBoolean();
         final java.util.concurrent.atomic.AtomicBoolean prematureExit = new java.util.concurrent.atomic.AtomicBoolean();
         final java.lang.reflect.Field field;
-        final io.tapstate.runtime.scheduler.ObservationPublisher publisher;
+        final Object publisher;
         final Object original;
         @SuppressWarnings("unchecked")
         PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
@@ -218,6 +225,43 @@ class PipelineLaunchLatencyIT {
                 }
                 return delegate.apply(id);
             });
+        }
+        PositionReadBarrier(ScopedPipelineCaptureCoordinator captures) throws Exception {
+            publisher = captures;
+            field = ScopedPipelineCaptureCoordinator.class.getDeclaredField("stores");
+            field.setAccessible(true);
+            synchronized (captures) {
+                original = field.get(captures);
+                var captured = (ScopedPipelineCaptureCoordinator.Stores) original;
+                var delegate = captured.sources();
+                SrsStoreViews observed = new SrsStoreViews() {
+                    public SrsStores srs(CacheBusinessScope scope, Runnable guard) {
+                        var ports = delegate.srs(scope, guard);
+                        var chains = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
+                                new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> {
+                                    if (method.getName().equals("load") && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                        blocked.set(true); entered.countDown();
+                                        try { release.await(); }
+                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                                    }
+                                    try { return method.invoke(ports.chains(), arguments); }
+                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                });
+                        return new SrsStores(chains, ports.models(), ports.log(), ports.consumers());
+                    }
+                    public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
+                    public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {
+                        return delegate.withCaptureStartup(scope, step);
+                    }
+                    public DirectChannelStore directChannels(CacheBusinessScope scope, Runnable guard) {
+                        return delegate.directChannels(scope, guard);
+                    }
+                };
+                field.set(captures, new ScopedPipelineCaptureCoordinator.Stores(captured.scope(), captured.pipelines(), observed,
+                        captured.configuration(), captured.preparations(), captured.notes(), captured.recoveryPinned(),
+                        captured.boundedLoads(), captured.completedFull()));
+            }
         }
         @Override public void close() throws Exception {release.countDown();field.set(publisher,original);}
     }

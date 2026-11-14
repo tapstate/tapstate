@@ -376,6 +376,69 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aBlockedMaintenanceChainReadDoesNotDelayCaptureBindings() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100));
+                var callers = Executors.newSingleThreadExecutor()) {
+            var held = ownedShared(f);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            var original = chains.load(held.chain()).orElseThrow();
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            doAnswer(call -> {
+                if (Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                    entered.countDown();
+                    release.await();
+                }
+                return Optional.of(original);
+            }).when(chains).load(held.chain());
+            try {
+                assertThat(entered.await(3, TimeUnit.SECONDS)).as("maintenance reaches the chain read").isTrue();
+                var bindings = callers.submit(held.run()::captureBindings);
+                assertThat(bindings.get(1, TimeUnit.SECONDS)).isNotNull();
+                assertThat(release.getCount()).as("the store read is still withheld").isEqualTo(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadCannotRetireAReplacementOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("old owner read failed") : new IllegalStateException("old owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            held.run().stopCapture("flow", false);
+            var replacement = ownedShared(f);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(replacement.run().isCapturing("flow")).isTrue();
+            assertThat(replacement.run().captureFailure("flow")).isEmpty();
+            verify(replacement.tail(), never()).close();
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadStillFailsItsOriginalOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("original owner read failed") : new IllegalStateException("original owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+        }
+    }
+
     @Test void aBlockedDemandReadDoesNotDelayCaptureRenewal() throws Exception {
         try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
             var entered = new CountDownLatch(1);
