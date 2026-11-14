@@ -46,6 +46,90 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void aPlainMapPublishesItsRenamedPrimaryKeyToTheSyncTarget() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id")));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("ORDER_ID", true)));
+    }
+
+    @Test
+    void aPlainMapCannotPublishOnlyTheSurvivingPartOfACompositeKey() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
+                io.tapstate.core.model.FieldRule.literal(0),
+                io.tapstate.core.model.FieldRule.computed("after.tenant + 1"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            InMemoryStorePort store = seededProjectingPipeline(Map.of("tenant", rule));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("tenant", "INT"),
+                    new SourceField("other", "INT")), List.of("id", "tenant"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+            assertThat(bound).singleElement().satisfies(target -> {
+                assertThat(target.fields()).as("key rule %s", rule).noneMatch(TargetField::primaryKey);
+                assertThat(target.indexes()).as("key rule %s", rule).noneMatch(TargetIndex::unique);
+            });
+        }
+    }
+
+    @Test
+    void aPlainMapCannotPublishARenamedSubsetOfACompositeKey() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
+                io.tapstate.core.model.FieldRule.literal("fixed"),
+                io.tapstate.core.model.FieldRule.computed("after.region + '-copy'"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+            rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id"));
+            rules.put("region", rule);
+            InMemoryStorePort store = seededProjectingPipeline(rules);
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("region", "VARCHAR"),
+                    new SourceField("other", "VARCHAR")), List.of("id", "region"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+            assertThat(bound).singleElement().satisfies(target -> {
+                assertThat(target.fields()).extracting(TargetField::name)
+                        .as("key rule %s", rule).contains("ORDER_ID").doesNotContain("id");
+                assertThat(target.fields()).as("key rule %s", rule).noneMatch(TargetField::primaryKey);
+                assertThat(target.indexes()).as("key rule %s", rule).noneMatch(TargetIndex::unique);
+            });
+        }
+    }
+
+    @Test
+    void aPlainMapPublishesItsCompletelyRenamedCompositeKeyToTheSyncTarget() {
+        Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+        rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id"));
+        rules.put("REGION", io.tapstate.core.model.FieldRule.rename("region"));
+        InMemoryStorePort store = seededProjectingPipeline(rules);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("region", "VARCHAR")),
+                List.of("id", "region"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target -> {
+            assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                    .containsExactly(tuple("ORDER_ID", true), tuple("REGION", true));
+            assertThat(target.indexes()).extracting(TargetIndex::fields, TargetIndex::unique)
+                    .containsExactly(tuple(List.of("ORDER_ID", "REGION"), true));
+        });
+    }
+
+    @Test
     void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
         for (boolean computed : List.of(false, true)) {

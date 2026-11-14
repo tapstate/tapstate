@@ -96,14 +96,71 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void aPlainMapPreservesTheSourcePrimaryKeyUnderItsOutputName() {
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("order_id", FieldRule.rename("o_id"))), one(atTheSource()), null);
+
+        assertThat(renamed.expanded()).isFalse();
+        assertThat(renamed.columns()).containsKey("order_id").doesNotContainKey("o_id");
+        assertThat(renamed.origins()).containsEntry("order_id", "o_id");
+        assertThat(publishedKey(renamed)).containsExactly("order_id");
+    }
+
+    @Test
     void aParentKeyRenamedBeforeExpansionReachesTheTarget() {
         NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(
                 Map.of("order_id", FieldRule.rename("o_id"))), one(atTheSource()), null);
         NodeColumns expanded = NodeColumns.of(unwind(null, "sku"), one(renamed), null);
 
         assertThat(publishedKey(expanded)).containsExactly("order_id", "sku");
-        // Ordinary projections retain their established target-key behavior.
-        assertThat(publishedKey(renamed)).isEmpty();
+        assertThat(publishedKey(renamed)).containsExactly("order_id");
+    }
+
+    @Test
+    void aPlainMapPreservesRenamedCompositeKeys() {
+        TargetTable source = new TargetTable("orders", List.of(
+                new TargetField("o_id", "bigint", true),
+                new TargetField("o_region", "text", true),
+                new TargetField("items", "json", false)));
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("order_id", FieldRule.rename("o_id"));
+        rules.put("region", FieldRule.rename("o_region"));
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(rules), one(atTheSource()), null);
+
+        assertThat(keyOf(StoreBackedDagSource.publishedAs(source, renamed, atTheSource())))
+                .containsExactly("order_id", "region");
+    }
+
+    @Test
+    void aPlainMapDoesNotInheritIdentityForADroppedOrOverwrittenKey() {
+        for (FieldRule rule : List.of(FieldRule.drop(), FieldRule.literal(0),
+                FieldRule.computed("after.o_id + 1"), FieldRule.rename("o_region"))) {
+            NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(Map.of("o_id", rule)),
+                    one(atTheSource()), null);
+
+            assertThat(publishedKey(projected)).as("key rule %s", rule).isEmpty();
+        }
+    }
+
+    @Test
+    void aPlainMapUsesTheLastAliasForSourceIdentity() {
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("first_id", FieldRule.rename("o_id"));
+        rules.put("last_id", FieldRule.rename("o_id"));
+        NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(rules), one(atTheSource()), null);
+
+        assertThat(projected.columns()).containsKeys("first_id", "last_id").doesNotContainKey("o_id");
+        assertThat(publishedKey(projected)).containsExactly("last_id");
+    }
+
+    @Test
+    void aPlainMapKeepsUnchangedKeysIncludingAMissingRenameSource() {
+        for (FieldRule rule : List.of(FieldRule.rename("o_id"), FieldRule.rename("absent"))) {
+            NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(Map.of("o_id", rule)),
+                    one(atTheSource()), null);
+
+            assertThat(publishedKey(projected)).as("key rule %s", rule).containsExactly("o_id");
+        }
     }
 
     @Test

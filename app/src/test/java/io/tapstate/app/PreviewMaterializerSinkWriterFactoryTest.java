@@ -111,6 +111,42 @@ class PreviewMaterializerSinkWriterFactoryTest {
         writer.close();
     }
 
+    @Test
+    void aCompositeKeyOverwriteRefusesUpsertInsteadOfCollapsingDistinctRows() {
+        var source = new io.tapstate.spi.sink.TargetTable("orders", List.of(
+                new io.tapstate.spi.sink.TargetField("id", "INT", true),
+                new io.tapstate.spi.sink.TargetField("tenant", "INT", true)));
+        var columns = NodeColumns.known(Map.of("id", "INT64 NOT NULL", "tenant", "INT64 NOT NULL"));
+        var input = List.of(
+                Envelope.insert(1L, "orders", Map.of("id", 1L, "tenant", 10L), null),
+                Envelope.insert(2L, "orders", Map.of("id", 1L, "tenant", 20L), null));
+        String controlMap = mapName();
+        try (SinkWriter writer = factory(controlMap, Map.of("orders", List.of("id", "tenant")), WriteMode.UPSERT).getEx()) {
+            assertThat(writer.write(input).toCompletableFuture().join().written()).isEqualTo(2);
+            assertThat(member.getMap(controlMap).size()).isEqualTo(2);
+        }
+
+        var projection = new io.tapstate.core.model.TransformBody.MapProjection(
+                Map.of("tenant", io.tapstate.core.model.FieldRule.computed("after.tenant + 1")));
+        var transform = io.tapstate.adapters.transform.StatelessTransforms.map(
+                io.tapstate.adapters.transform.MapSpec.from(projection));
+        var output = input.stream().flatMap(row -> transform.transform(row).stream()).toList();
+        assertThat(output).extracting(Envelope::after).containsExactly(
+                Map.of("id", 1L, "tenant", 11L), Map.of("id", 1L, "tenant", 21L));
+        var produced = NodeColumns.of(projection, Map.of("in", columns), null);
+        var published = StoreBackedDagSource.publishedAs(source, produced, columns);
+        var keys = published.fields().stream().filter(io.tapstate.spi.sink.TargetField::primaryKey)
+                .map(io.tapstate.spi.sink.TargetField::name).toList();
+        String resultMap = mapName();
+        try (SinkWriter writer = factory(resultMap, Map.of("orders", keys), WriteMode.UPSERT).getEx()) {
+            assertThatThrownBy(() -> writer.write(output).toCompletableFuture().join())
+                    .isInstanceOf(CompletionException.class)
+                    .hasCauseInstanceOf(io.tapstate.core.common.TapstateException.class)
+                    .hasRootCauseMessage("actuation.preview-refused {reason=the output identity for stream 'orders' is unresolved}");
+            assertThat(member.getMap(resultMap).size()).isZero();
+        }
+    }
+
     private static PreviewMaterializerSinkWriterFactory factory(
             String mapName, Map<String, List<String>> keys, WriteMode mode) {
         return new PreviewMaterializerSinkWriterFactory(mapName, keys, mode);

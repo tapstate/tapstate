@@ -1897,10 +1897,9 @@ final class StoreBackedDagSource implements DagSource {
      * inherit its old spelling as a fallback when no element type is known.
      *
      *
-     * <p>The key starts as whatever of the table's own key still travels, key columns leading, because
-     * that is the order the sink matches an upsert in. A projection that drops a key column publishes
-     * rows with nothing to match on; that reaches the sink as a key one column short and is reported
-     * there, against the table being written, rather than being invented back here.
+     * <p>The key starts as the table's complete key, key columns leading, because that is the order
+     * the sink matches an upsert in. If a projection drops or replaces any component, output identity
+     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source.
      *
      * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
      * expands a list emits several rows carrying one parent's key, and what tells them apart is a
@@ -1908,12 +1907,10 @@ final class StoreBackedDagSource implements DagSource {
      * table would be published keyed on the parent alone. An upsert target answers that by keeping
      * the last of each parent's expanded rows and losing the rest, filling the table, reporting
      * nothing, and reading exactly like a step that never ran. So the columns each node says it adds
-     * are appended here, after the table's own and in the order the nodes added them. For rows that
-     * passed through an expansion, source origins follow pure renames so the parent identity does
-     * not disappear when its column gets another name. Other streams retain the name-intersection
-     * rule. If a projection copies a source column into several aliases, its last alias identifies
-     * the parent, matching the key passed to the expansion port. A stream that has not passed
-     * through an expansion keeps the rule it has always used.
+     * are appended here, after the table's own and in the order the nodes added them. Source origins
+     * follow pure renames so identity survives a new column name, with or without an expansion.
+     * Replacement values have no source identity. If a projection copies a source column into several
+     * aliases, its last alias identifies the parent, matching the key passed to the expansion port.
      */
     static TargetTable publishedAs(TargetTable base, NodeColumns produced, NodeColumns atTheSource) {
         Map<String, TargetField> declared = new LinkedHashMap<>();
@@ -1925,10 +1922,9 @@ final class StoreBackedDagSource implements DagSource {
         for (String column : produced.columns().keySet()) {
             TargetField carried = declared.get(column);
             fields.add(publishedField(column, carried, produced, atTheSource));
-            TargetField identity = produced.expanded()
-                    ? declared.get(produced.origins().get(column)) : carried;
+            TargetField identity = declared.get(produced.origins().get(column));
             if (identity != null && identity.primaryKey()
-                    && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
+                    && column.equals(parentNames.get(identity.name()))) {
                 key.add(column);
             }
         }
@@ -1939,6 +1935,11 @@ final class StoreBackedDagSource implements DagSource {
             if (!key.contains(added)) {
                 key.add(added);
             }
+        }
+        if (base.fields().stream().filter(TargetField::primaryKey)
+                .anyMatch(field -> !parentNames.containsKey(field.name()))) {
+            // Element locators distinguish siblings only while the complete parent key survives.
+            key.clear();
         }
         return TargetModelResolver.keyedOn(
                 new TargetTable(base.name(), fields, base.indexes().stream()
