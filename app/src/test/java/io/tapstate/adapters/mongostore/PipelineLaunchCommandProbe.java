@@ -5,6 +5,8 @@ import java.util.*;
 /** Test-only synchronous attribution. Never records database payloads or connection settings. */
 public final class PipelineLaunchCommandProbe implements AutoCloseable {
     private final Map<String, Integer> counts = new TreeMap<>();
+    private final Map<String, Integer> attempt = new TreeMap<>();
+    private final Map<String, Integer> maxAttemptCounts = new TreeMap<>();
     private final Map<String, Long> nanos = new TreeMap<>();
     private String stage;
     private long started;
@@ -24,7 +26,10 @@ public final class PipelineLaunchCommandProbe implements AutoCloseable {
                     : "other";
             String caller = frames.stream().filter(value -> value.startsWith("Mongo") && !value.startsWith("MongoCommandObservation"))
                     .findFirst().orElse("none");
-            counts.merge(stage + ":" + command + ":" + caller, 1, Integer::sum);
+            String key = stage + ":" + command + ":" + caller;
+            counts.merge(key, 1, Integer::sum);
+            maxAttemptCounts.merge(key, attempt.merge(key, 1, Integer::sum), Integer::max);
+            if (command.equals("commitTransaction") || command.equals("abortTransaction")) attempt.clear();
         });
         MongoCommandObservation.BYTES.set(bytes -> {
             if (requestBytes) requestBytes = false;
@@ -33,6 +38,7 @@ public final class PipelineLaunchCommandProbe implements AutoCloseable {
     }
 
     public Map<String, Integer> counts() { return Map.copyOf(counts); }
+    public Map<String, Integer> maxAttemptCounts() { return Map.copyOf(maxAttemptCounts); }
     public Map<String, Double> successfulCommandWallMillis() {
         var result = new TreeMap<String, Double>(); nanos.forEach((stage, elapsed) -> result.put(stage, elapsed / 1_000_000.0));
         return Map.copyOf(result);

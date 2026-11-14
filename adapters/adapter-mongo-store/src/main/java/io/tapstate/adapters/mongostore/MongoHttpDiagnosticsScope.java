@@ -22,7 +22,8 @@ public final class MongoHttpDiagnosticsScope implements AutoCloseable {
         PIPELINE_DAG_BUILD, PIPELINE_PLAN_RECORD, PIPELINE_JET_SUBMIT, PIPELINE_PUBLISH, PIPELINE_SAMPLE,
         PIPELINE_ALERTS, PIPELINE_EXPORT, PIPELINE_RETAIN, PIPELINE_LIFECYCLE_READ, PIPELINE_TARGET_CONFIRM,
         CAPTURE_SOURCE_PREPARE, CAPTURE_SOURCE_START,
-        CAPTURE_RETENTION, CAPTURE_MAINTENANCE
+        CAPTURE_RETENTION, CAPTURE_MAINTENANCE,
+        PIPELINE_CLAIM_PROOF, PIPELINE_EVALUATION_PROOF, PIPELINE_REPORTING_PROOF, PIPELINE_OWNERSHIP_WAIT
     }
 
     static final com.mongodb.event.ConnectionPoolListener POOL_LISTENER = new com.mongodb.event.ConnectionPoolListener() {
@@ -39,7 +40,7 @@ public final class MongoHttpDiagnosticsScope implements AutoCloseable {
 
     private static final ThreadLocal<MongoHttpDiagnosticsScope> CURRENT = new ThreadLocal<>();
     private static final Stage NO_STAGE = new Stage(null, null, null, 0);
-    private static final int MAX_GROUPS = 32;
+    private static final int MAX_GROUPS = 128;
     private final MongoHttpDiagnosticsScope previous;
     private final long cpuStarted;
     private final Map<Integer, Pending> pending = new HashMap<>();

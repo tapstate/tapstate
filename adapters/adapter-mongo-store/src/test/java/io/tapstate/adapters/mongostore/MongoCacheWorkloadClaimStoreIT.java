@@ -55,6 +55,50 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @Test void simultaneousDeadlineProofReadsKeepIndependentMongoSessionsAndCallerGuards() {
+        withBusiness(f -> {
+            var expected = WorkloadClaimFence.from(f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim());
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var selected = new AtomicBoolean();
+            var sessions = new java.util.concurrent.ConcurrentHashMap<Long, String>();
+            var guards = new java.util.concurrent.ConcurrentHashMap<Long, AtomicInteger>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getCommandName().equals("aggregate")
+                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())) return;
+                    sessions.put(Thread.currentThread().threadId(), event.getCommand().getDocument("lsid").toJson());
+                    if (selected.compareAndSet(false, true)) { entered.countDown(); await(release); }
+                }
+            };
+            try (var observed = client(listener); var callers = Executors.newFixedThreadPool(2)) {
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                java.util.function.Supplier<WorkloadClaimFence> read = () -> {
+                    var checks = new AtomicInteger();
+                    var ioThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                    return claims.withDeadline(deadline(), () -> {
+                        var thread = Thread.currentThread();
+                        var original = ioThread.get();
+                        if (original == null) ioThread.compareAndSet(null, thread);
+                        assertThat(thread).isSameAs(ioThread.get());
+                        guards.putIfAbsent(thread.threadId(), checks);
+                        checks.incrementAndGet();
+                    }, () -> WorkloadClaimFence.from(claims.readPipeline(PIPELINE).orElseThrow().claim()));
+                };
+                var blocked = callers.submit(read::get);
+                try {
+                    assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                    assertThat(callers.submit(read::get).get(3, TimeUnit.SECONDS)).isEqualTo(expected);
+                    assertThat(release.getCount()).isEqualTo(1);
+                    assertThat(sessions.values()).hasSize(2).doesNotHaveDuplicates();
+                    assertThat(guards.values()).hasSize(2).allSatisfy(value -> assertThat(value.get()).isPositive());
+                } finally { release.countDown(); }
+                assertThat(blocked.get(3, TimeUnit.SECONDS)).isEqualTo(expected);
+                claims.awaitQuiescence(deadline());
+            } finally { release.countDown(); }
+        });
+    }
+
     @Test void validationTenureUsesIndependentNativeClientsWithoutReleasingThePipeline() {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);

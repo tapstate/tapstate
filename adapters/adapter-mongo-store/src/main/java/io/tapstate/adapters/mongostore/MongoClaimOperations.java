@@ -26,6 +26,8 @@ import org.bson.Document;
 
 /** Actual task and session ownership survives a bounded claim caller. */
 final class MongoClaimOperations {
+    private static final org.slf4j.Logger DIAGNOSTICS = org.slf4j.LoggerFactory.getLogger("io.tapstate.diagnostics.pipeline");
+    private static final java.util.concurrent.atomic.AtomicLong NEXT_DIAGNOSTIC = new java.util.concurrent.atomic.AtomicLong();
     private final MongoClient client;
     private final ThreadPoolExecutor workers = new ThreadPoolExecutor(4, 4, 100, TimeUnit.MILLISECONDS,
             new LinkedBlockingQueue<>(), action -> {
@@ -175,6 +177,9 @@ final class MongoClaimOperations {
         private final Runnable guard;
         private final AtomicInteger state = new AtomicInteger();
         private final CompletableFuture<T> result = new CompletableFuture<>();
+        private final long diagnosticId = DIAGNOSTICS.isDebugEnabled() ? NEXT_DIAGNOSTIC.incrementAndGet() : 0;
+        private final long submittedAt = diagnosticId == 0 ? 0 : System.nanoTime();
+        private final long callerThread = diagnosticId == 0 ? 0 : Thread.currentThread().threadId();
 
         private Call(long deadline,Runnable guard, Supplier<T> action) { this.deadline = deadline;this.guard=guard;this.action = action; }
 
@@ -194,14 +199,34 @@ final class MongoClaimOperations {
 
         @Override public void run() {
             if (!state.compareAndSet(0, 1)) return;
+            long startedAt = diagnosticId == 0 ? 0 : System.nanoTime();
+            var diagnostics = diagnosticId == 0 ? null : MongoHttpDiagnosticsScope.open();
+            java.util.Map<String, Object> measured = null;
             T value=null;Throwable failure=null;
             try {
                 current.set(MongoReadBudget.until(deadline));
                 active.set(guard);check();
                 value=action.get();check();
             } catch (Throwable failed) { failure=failed; }
-            finally { current.remove();active.remove(); state.set(2); finished(); }
+            finally {
+                current.remove();active.remove();
+                try { if (diagnostics != null) measured = diagnostics.snapshot(); }
+                finally { if (diagnostics != null) diagnostics.close(); state.set(2); finished(); }
+            }
             if(failure==null)result.complete(value);else result.completeExceptionally(failure);
+            if (measured != null) {
+                var record = new java.util.LinkedHashMap<String, Object>();
+                record.put("event", "mongo_claim_io_diag");
+                record.put("at", java.time.Instant.now().toString());
+                record.put("call_id", diagnosticId);
+                record.put("caller_thread_id", callerThread);
+                record.put("thread_id", Thread.currentThread().threadId());
+                record.put("queue_ms", (startedAt - submittedAt) / 1_000_000.0);
+                record.put("execution_ms", (System.nanoTime() - startedAt) / 1_000_000.0);
+                record.put("outcome", failure == null ? "returned" : "failed");
+                record.putAll(measured);
+                DIAGNOSTICS.debug("{}", io.tapstate.core.common.JsonWriter.write(record));
+            }
         }
     }
 
