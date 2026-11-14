@@ -257,8 +257,9 @@ jobs:
           fi
           cd tapstate-demo
           if grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml; then
-            TAPSTATE_PASSWORD="$TAPSTATE_ADMIN_PASSWORD" ./tapstate -w work -c http://127.0.0.1:8080 \
-              -u "$TAPSTATE_ADMIN_USER" ls > ls.log 2>&1
+            printf 'ls\nexit\n' | TAPSTATE_PASSWORD="$TAPSTATE_ADMIN_PASSWORD" \
+              ./tapstate -w work -c http://127.0.0.1:8080 -u "$TAPSTATE_ADMIN_USER" > ls.log 2>&1 \
+              || { cat ls.log >&2; exit 1; }
           else
             admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
             printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nls\nexit\n' "$admin_pw" \
