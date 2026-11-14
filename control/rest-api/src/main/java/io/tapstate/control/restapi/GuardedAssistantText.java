@@ -1,7 +1,11 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderService;
+import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.ControlError;
+import java.util.ArrayDeque;
+import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
@@ -9,14 +13,17 @@ import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.Condition;
 import java.util.function.Consumer;
 
-/** Coalesces text while a publication check runs, without blocking the provider on each token. */
-final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
+/** Coalesces ordered text and summary parts without blocking the provider on each token. */
+final class GuardedAssistantText implements AiProviderClient.Output, AutoCloseable {
     private static final int MAX_PENDING_CHARS = 524288;
+    private static final int MAX_PENDING_SEGMENTS = 1024;
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
-    private final StringBuilder pending = new StringBuilder();
+    private final ArrayDeque<Segment> pending = new ArrayDeque<>();
+    private int pendingChars;
     private final Runnable guard;
     private final Consumer<String> output;
+    private final Consumer<AiProviderClient.Reasoning> reasoning;
     private final Thread producer = Thread.currentThread();
     private final CompletableFuture<Void> drained = new CompletableFuture<>();
     private final Object failureLock = new Object();
@@ -27,24 +34,56 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
     private volatile boolean closed;
 
     GuardedAssistantText(Runnable guard, Consumer<String> output) {
+        this(guard, output, part -> { });
+    }
+
+    GuardedAssistantText(Runnable guard, Consumer<String> output, Consumer<AiProviderClient.Reasoning> reasoning) {
         this.guard = guard;
         this.output = output;
+        this.reasoning = reasoning;
         worker = Thread.ofVirtual().name("pipeline-assistant-text")
                 .uncaughtExceptionHandler((thread, failed) -> fail(failed)).start(this::publish);
     }
 
     @Override public void accept(String text) {
         if (text.isEmpty()) return;
-        if (text.length() > MAX_PENDING_CHARS) throw AiProviderService.error(ControlError.AI_PROVIDER_FAILED);
+        enqueue(text, null);
+    }
+
+    @Override public void reasoning(AiProviderClient.Reasoning part) { enqueue(part.text(), part); }
+
+    private void enqueue(String text, AiProviderClient.Reasoning part) {
+        int size = text.length() + (part == null ? 0 : part.id().length() + 1);
+        if (size > MAX_PENDING_CHARS) throw AiProviderService.error(ControlError.AI_PROVIDER_FAILED);
         acquire();
         try {
-            while (!closed && failure.get() == null && pending.length() + text.length() > MAX_PENDING_CHARS) changed.await();
+            while (!closed && failure.get() == null && (pendingChars + size > MAX_PENDING_CHARS
+                    || pending.size() >= MAX_PENDING_SEGMENTS && !canAppend(part))) changed.await();
             throwIfFailed();
             if (closed || finished) throw new IllegalStateException("assistant text stream is closed");
-            pending.append(text);
+            if (canAppend(part)) pending.getLast().text.append(text);
+            else pending.addLast(new Segment(part, text));
+            pendingChars += size;
             changed.signalAll();
         } catch (InterruptedException interrupted) { throw interrupted(); }
         finally { lock.unlock(); }
+    }
+
+    private boolean canAppend(AiProviderClient.Reasoning part) {
+        Segment last = pending.peekLast();
+        if (last == null) return false;
+        if (part == null) return last.reasoning == null;
+        return part.phase() == AiProviderClient.Reasoning.Phase.DELTA && last.reasoning != null
+                && last.reasoning.phase() == part.phase() && Objects.equals(last.reasoning.id(), part.id());
+    }
+
+    private static final class Segment {
+        private final AiProviderClient.Reasoning reasoning;
+        private final StringBuilder text;
+        private Segment(AiProviderClient.Reasoning reasoning, String text) {
+            this.reasoning = reasoning;
+            this.text = new StringBuilder(text);
+        }
     }
 
     void finish() {
@@ -94,10 +133,16 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
         lock.lockInterruptibly();
         try {
             if (closed) return false;
-            String batch = pending.toString();
-            pending.setLength(0);
+            List<Segment> batch = List.copyOf(pending);
+            pending.clear();
+            pendingChars = 0;
             changed.signalAll();
-            output.accept(batch);
+            for (Segment segment : batch) {
+                if (closed) return false;
+                if (segment.reasoning == null) output.accept(segment.text.toString());
+                else reasoning.accept(new AiProviderClient.Reasoning(segment.reasoning.id(),
+                        segment.reasoning.phase(), segment.text.toString()));
+            }
             return true;
         } finally { lock.unlock(); }
     }
@@ -134,7 +179,7 @@ final class GuardedAssistantText implements Consumer<String>, AutoCloseable {
         synchronized (failureLock) { closed = true; }
         worker.interrupt();
         if (lock.tryLock()) {
-            try { pending.setLength(0); changed.signalAll(); }
+            try { pending.clear(); pendingChars = 0; changed.signalAll(); }
             finally { lock.unlock(); }
         }
     }

@@ -146,6 +146,11 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
     @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, Consumer<String> text) {
+        return propose(settings, messages, context, (AiProviderClient.Output) text::accept);
+    }
+
+    @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+            Map<String, Object> context, AiProviderClient.Output output) {
         boolean proposalEnabled = !Boolean.FALSE.equals(context.get("proposalEnabled"));
         List<Map<String, String>> prompt = new ArrayList<>();
         String guidance = guidance(proposalEnabled, context);
@@ -163,29 +168,73 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         requestBody.put("messages", prompt);
         requestBody.put("stream", true);
         requestBody.put("max_tokens", 8192);
+        if (responses(settings)) requestBody.put("reasoning", Map.of("summary", "auto"));
         if (proposalEnabled) {
             requestBody.put("tools", List.of(tool));
             if (isConcreteEditRequest(messages) && !Boolean.TRUE.equals(context.get("inputSelectionPending"))) requestBody.put("tool_choice", Map.of(JSON_TYPE, JSON_FUNCTION,
                     JSON_FUNCTION, Map.of("name", "propose_pipeline")));
         }
         Map<String, Object> body = Map.copyOf(requestBody);
-        StringBuilder withheld = new StringBuilder();
-        Consumer<String> safeText = delta -> {
+        var safeOutput = new RedactedOutput(settings.apiKey(), output);
+        Optional<Map<String, Object>> candidate = read(settings, body, safeOutput, proposalEnabled);
+        if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
+        safeOutput.finish();
+        return candidate;
+    }
+
+    private static final class RedactedOutput implements AiProviderClient.Output {
+        private final String secret;
+        private final AiProviderClient.Output output;
+        private final RedactedText text;
+        private final Map<String, RedactedText> summaries = new java.util.LinkedHashMap<>();
+
+        private RedactedOutput(String secret, AiProviderClient.Output output) {
+            this.secret = secret;
+            this.output = output;
+            this.text = new RedactedText(secret, output);
+        }
+
+        @Override public void accept(String delta) { text.accept(delta); }
+
+        @Override public void reasoning(AiProviderClient.Reasoning part) {
+            switch (part.phase()) {
+                case START -> {
+                    summaries.put(part.id(), new RedactedText(secret, delta -> output.reasoning(
+                            new AiProviderClient.Reasoning(part.id(), AiProviderClient.Reasoning.Phase.DELTA, delta))));
+                    output.reasoning(part);
+                }
+                case DELTA -> summaries.get(part.id()).accept(part.text());
+                case END -> {
+                    summaries.remove(part.id()).finish();
+                    output.reasoning(part);
+                }
+            }
+        }
+
+        private void finish() { text.finish(); }
+    }
+
+    private static final class RedactedText implements Consumer<String> {
+        private final String secret;
+        private final Consumer<String> output;
+        private final StringBuilder withheld = new StringBuilder();
+
+        private RedactedText(String secret, Consumer<String> output) { this.secret = secret; this.output = output; }
+
+        @Override public void accept(String delta) {
             withheld.append(delta);
-            String redacted = withheld.toString().replace(settings.apiKey(), "[redacted]");
+            String redacted = withheld.toString().replace(secret, "[redacted]");
             withheld.setLength(0); withheld.append(redacted);
             int hold = 0;
-            int limit = Math.min(withheld.length(), settings.apiKey().length() - 1);
+            int limit = Math.min(withheld.length(), secret.length() - 1);
             for (int length = 1; length <= limit; length++) {
-                if (withheld.substring(withheld.length() - length).equals(settings.apiKey().substring(0, length))) hold = length;
+                if (withheld.substring(withheld.length() - length).equals(secret.substring(0, length))) hold = length;
             }
             int safeLength = withheld.length() - hold;
-            if (safeLength > 0) { text.accept(withheld.substring(0, safeLength)); withheld.delete(0, safeLength); }
-        };
-        Optional<Map<String, Object>> candidate = read(settings, body, safeText, proposalEnabled);
-        if (candidate.stream().anyMatch(value -> containsSecret(value, settings.apiKey()))) throw invalid();
-        if (!withheld.isEmpty()) text.accept(withheld.toString());
-        return candidate;
+            if (safeLength > 0) { output.accept(withheld.substring(0, safeLength)); withheld.delete(0, safeLength); }
+        }
+
+        private void finish() { if (!withheld.isEmpty()) output.accept(withheld.toString()); }
     }
 
     private static String guidance(boolean proposalEnabled, Map<String, Object> context) {
@@ -326,7 +375,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     }
 
     @SuppressWarnings("unchecked")
-    private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, Consumer<String> text,
+    private Optional<Map<String, Object>> read(AiProviderSettings settings, Map<String, Object> body, AiProviderClient.Output text,
             boolean proposalEnabled) {
         for (int attempt = 0; attempt < STREAM_ATTEMPTS; attempt++) {
             long deadline = System.nanoTime() + responseTimeout.toNanos();
@@ -338,7 +387,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                         LOG.log(System.Logger.Level.WARNING, "AI provider stream returned HTTP {0}", response.statusCode());
                     }
                     requireSuccessfulResponse(response.statusCode());
-                    Consumer<String> emit = delta -> { emitted[0] = true; text.accept(delta); };
+                    AiProviderClient.Output emit = new AiProviderClient.Output() {
+                        public void accept(String delta) { emitted[0] = true; text.accept(delta); }
+                        public void reasoning(AiProviderClient.Reasoning part) { emitted[0] = true; text.reasoning(part); }
+                    };
                     return responses(settings) ? readResponses(input, emit, proposalEnabled)
                             : readEvents(input, emit, proposalEnabled);
                 }
@@ -586,7 +638,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
         return URI.create(validated + suffix);
     }
-    private static Optional<Map<String, Object>> readResponses(InputStream input, Consumer<String> text,
+    private static Optional<Map<String, Object>> readResponses(InputStream input, AiProviderClient.Output text,
             boolean proposalEnabled) throws java.io.IOException {
         var stream = new OpenAiResponsesProtocol.Stream(text, proposalEnabled);
         BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8));

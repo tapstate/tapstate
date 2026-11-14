@@ -6,7 +6,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.function.Consumer;
 
 /** Stateless Responses wire translation; only completed output can become a Builder proposal. */
 final class OpenAiResponsesProtocol {
@@ -17,6 +16,7 @@ final class OpenAiResponsesProtocol {
         result.put("model", chat.get("model"));
         result.put("input", chat.get("messages"));
         result.put("store", false);
+        if (chat.containsKey("reasoning")) result.put("reasoning", chat.get("reasoning"));
         result.put("max_output_tokens", chat.getOrDefault("max_completion_tokens", chat.get("max_tokens")));
         if (chat.containsKey("stream")) result.put("stream", chat.get("stream"));
         if (chat.get("tools") instanceof List<?> tools) {
@@ -42,7 +42,8 @@ final class OpenAiResponsesProtocol {
     }
 
     static final class Stream {
-        private final Consumer<String> text;
+        private final AiProviderClient.Output text;
+        private final ResponsesReasoningSummary reasoning;
         private final boolean proposalEnabled;
         private final ToolExplanationStream explanation = new ToolExplanationStream();
         private final StringBuilder arguments = new StringBuilder();
@@ -52,13 +53,15 @@ final class OpenAiResponsesProtocol {
         private boolean argumentsEmitted;
         private Optional<Map<String, Object>> result = Optional.empty();
 
-        Stream(Consumer<String> text, boolean proposalEnabled) {
+        Stream(AiProviderClient.Output text, boolean proposalEnabled) {
             this.text = text;
+            this.reasoning = new ResponsesReasoningSummary(text::reasoning);
             this.proposalEnabled = proposalEnabled;
         }
 
         boolean accept(Map<String, Object> event) {
             if (!(event.get("type") instanceof String type)) throw invalid();
+            reasoning.accept(event);
             switch (type) {
                 case "error", "response.failed", "response.incomplete" -> throw invalid();
                 case "response.output_item.added" -> {
@@ -84,15 +87,17 @@ final class OpenAiResponsesProtocol {
                     complete(object(event.get("response")));
                     return true;
                 }
-                default -> { /* Lifecycle, reasoning and done events carry no independent proposal authority. */ }
+                default -> { /* Lifecycle and summary events carry no independent proposal authority. */ }
             }
             return false;
         }
 
         private void complete(Map<String, Object> response) {
+            List<?> items = validateCompleted(response);
+            reasoning.complete(items);
             Map<String, Object> call = null;
             StringBuilder completedText = new StringBuilder();
-            for (Object raw : validateCompleted(response)) {
+            for (Object raw : items) {
                 Map<String, Object> item = object(raw);
                 if ("function_call".equals(item.get("type"))) {
                     if (!proposalEnabled || call != null || !"propose_pipeline".equals(item.get("name"))

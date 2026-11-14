@@ -35,6 +35,7 @@ class AiProviderProtocolTest {
             client.check(new AiProviderSettings("openai-compatible", base, "relay-custom-model", "test-key"));
             assertThat(received.get().containsKey("max_tokens")).isTrue();
             assertThat(received.get().containsKey("max_completion_tokens")).isFalse();
+            assertThat(received.get().containsKey("reasoning")).isFalse();
         } finally { server.stop(0); }
     }
     @Test void responsesStreamsACompleteToolProposalUsingTheSelectedProtocol() throws Exception {
@@ -52,6 +53,7 @@ class AiProviderProtocolTest {
             Map<?, ?> body = received.get();
             assertThat(body.get("max_output_tokens")).isEqualTo(8192L);
             assertThat(body.get("store")).isEqualTo(false);
+            assertThat(body.get("reasoning")).isEqualTo(Map.of("summary", "auto"));
             assertThat(body.get("input")).isInstanceOf(List.class);
             assertThat(body.containsKey("messages")).isFalse();
             Map<?, ?> tool = (Map<?, ?>) ((List<?>) body.get("tools")).getFirst();
@@ -59,6 +61,121 @@ class AiProviderProtocolTest {
             assertThat(tool.get("strict")).isEqualTo(false);
             assertThat(body.get("tool_choice")).isEqualTo(Map.of("type", "function", "name", "propose_pipeline"));
         }, received);
+    }
+
+    @Test void responsesPublishesSummaryDeltasBeforeTheResponseCompletes() {
+        var reasoning = new java.util.ArrayList<AiProviderClient.Reasoning>();
+        var text = new StringBuilder();
+        AiProviderClient.Output output = new AiProviderClient.Output() {
+            public void accept(String delta) { text.append(delta); }
+            public void reasoning(AiProviderClient.Reasoning part) { reasoning.add(part); }
+        };
+        var stream = new OpenAiResponsesProtocol.Stream(output, false);
+        stream.accept(Map.of("type", "response.reasoning_summary_part.added", "item_id", "rs-1",
+                "summary_index", 0, "part", Map.of("type", "summary_text", "text", "")));
+        stream.accept(Map.of("type", "response.reasoning_summary_text.delta", "item_id", "rs-1",
+                "summary_index", 0, "delta", "Checking "));
+        assertThat(reasoning).extracting(AiProviderClient.Reasoning::phase)
+                .containsExactly(AiProviderClient.Reasoning.Phase.START, AiProviderClient.Reasoning.Phase.DELTA);
+        assertThat(reasoning.getLast().text()).isEqualTo("Checking ");
+        assertThat(text).isEmpty();
+        assertThat(stream.result()).isEmpty();
+    }
+
+    @Test void responsesSummaryStreamsThroughHttpWithIndependentSecretRedaction() throws Exception {
+        var first = new java.util.concurrent.CountDownLatch(1);
+        var complete = new java.util.concurrent.CountDownLatch(1);
+        var output = new RecordingOutput() {
+            @Override public void reasoning(AiProviderClient.Reasoning part) {
+                super.reasoning(part);
+                if (part.phase() == AiProviderClient.Reasoning.Phase.DELTA) first.countDown();
+            }
+        };
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/responses", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            exchange.sendResponseHeaders(200, 0);
+            try (var response = exchange.getResponseBody()) {
+                response.write(event(summaryEvent("response.reasoning_summary_text.delta", 0, "Checking test-")).getBytes(StandardCharsets.UTF_8));
+                response.flush();
+                try { complete.await(); }
+                catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
+                var message = Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "Answer.")));
+                String rest = event(summaryEvent("response.reasoning_summary_text.delta", 0, "key safely."))
+                        + event(summaryEvent("response.reasoning_summary_text.done", 0, "Checking test-key safely."))
+                        + event(Map.of("type", "response.reasoning_text.delta", "item_id", "test-key", "delta", "PRIVATE RAW CONTENT"))
+                        + event(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output",
+                                List.of(summaryItem("Checking test-key safely."), message))));
+                response.write(rest.getBytes(StandardCharsets.UTF_8));
+            }
+        });
+        server.start();
+        try (var requests = java.util.concurrent.Executors.newSingleThreadExecutor()) {
+            var settings = new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "gpt-6.1-terra", "test-key");
+            var result = requests.submit(() -> new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions"))
+                    .propose(settings, List.of(), Map.of("proposalEnabled", false), output));
+            try {
+                assertThat(first.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(result.isDone()).isFalse();
+                assertThat(output.text).isEmpty();
+                complete.countDown();
+                assertThat(result.get(5, java.util.concurrent.TimeUnit.SECONDS)).isEmpty();
+                assertThat(output.summary()).isEqualTo("Checking [redacted] safely.");
+                assertThat(output.parts).extracting(AiProviderClient.Reasoning::phase).containsExactly(
+                        AiProviderClient.Reasoning.Phase.START, AiProviderClient.Reasoning.Phase.DELTA,
+                        AiProviderClient.Reasoning.Phase.DELTA, AiProviderClient.Reasoning.Phase.END);
+                assertThat(output.parts.toString()).doesNotContain("test-key", "PRIVATE RAW CONTENT");
+                assertThat(output.text.toString()).isEqualTo("Answer.");
+            } finally { complete.countDown(); }
+        } finally { complete.countDown(); server.stop(0); }
+    }
+
+    @Test void summaryCompletionFallbackAndDuplicateReceiptsPreserveSeparateParts() {
+        var output = new RecordingOutput();
+        var stream = new OpenAiResponsesProtocol.Stream(output, false);
+        stream.accept(summaryEvent("response.reasoning_summary_text.delta", 0, "First."));
+        stream.accept(summaryEvent("response.reasoning_summary_text.done", 0, "First."));
+        stream.accept(Map.of("type", "response.reasoning_summary_part.done", "item_id", "test-key", "summary_index", 0,
+                "part", Map.of("type", "summary_text", "text", "First.")));
+        var message = Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "Answer.")));
+        stream.accept(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output",
+                List.of(summaryItem("First.", "Second."), message))));
+        assertThat(output.summary()).isEqualTo("First.Second.");
+        assertThat(output.parts.stream().filter(part -> part.phase() == AiProviderClient.Reasoning.Phase.START))
+                .extracting(AiProviderClient.Reasoning::id).containsExactly("reasoning-0", "reasoning-1");
+        assertThat(output.parts.stream().filter(part -> part.phase() == AiProviderClient.Reasoning.Phase.END)).hasSize(2);
+        assertThat(output.text.toString()).isEqualTo("Answer.");
+    }
+
+    @Test void malformedOrTruncatedSummaryCannotAuthorizeAProposal() {
+        for (Map<String, Object> invalid : List.of(
+                summaryEvent("response.reasoning_summary_text.done", 0, "Different."),
+                Map.<String, Object>of("type", "response.reasoning_summary_text.delta", "item_id", "rs", "summary_index", -1, "delta", "x"),
+                Map.<String, Object>of("type", "response.reasoning_summary_text.delta", "item_id", "rs", "summary_index", 1.5, "delta", "x"),
+                Map.<String, Object>of("type", "response.completed", "response", Map.of("status", "completed", "output", List.of(summaryItem("First.")))))) {
+            var stream = new OpenAiResponsesProtocol.Stream(new RecordingOutput(), true);
+            stream.accept(summaryEvent("response.reasoning_summary_text.delta", 0, "First."));
+            assertThatThrownBy(() -> stream.accept(invalid)).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+            assertThat(stream.result()).isEmpty();
+        }
+    }
+
+    private static Map<String, Object> summaryEvent(String type, int index, String text) {
+        return Map.of("type", type, "item_id", "test-key", "summary_index", index,
+                type.endsWith("delta") ? "delta" : "text", text);
+    }
+
+    private static Map<String, Object> summaryItem(String... parts) {
+        return Map.of("type", "reasoning", "id", "test-key", "summary", java.util.Arrays.stream(parts)
+                .map(text -> Map.of("type", "summary_text", "text", text)).toList());
+    }
+
+    private static class RecordingOutput implements AiProviderClient.Output {
+        final StringBuilder text = new StringBuilder();
+        final java.util.List<AiProviderClient.Reasoning> parts = new java.util.concurrent.CopyOnWriteArrayList<>();
+        public void accept(String delta) { text.append(delta); }
+        public void reasoning(AiProviderClient.Reasoning part) { parts.add(part); }
+        String summary() { return parts.stream().map(AiProviderClient.Reasoning::text).collect(java.util.stream.Collectors.joining()); }
     }
 
     @Test void responsesRejectsIncompleteAndMismatchedToolStreams() throws Exception {

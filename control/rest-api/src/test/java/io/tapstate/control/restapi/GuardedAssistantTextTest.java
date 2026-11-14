@@ -1,6 +1,7 @@
 package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.AiProviderService;
+import io.tapstate.control.core.AiProviderClient;
 import io.tapstate.control.core.ControlError;
 import java.util.ArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -11,6 +12,43 @@ import org.junit.jupiter.api.Test;
 import static org.assertj.core.api.Assertions.*;
 
 class GuardedAssistantTextTest {
+    @Test void summaryAndAnswerShareOneOrderedAuthorizedBatch() throws Exception {
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var checks = new AtomicInteger();
+        var output = new ArrayList<String>();
+        try (var stream = new GuardedAssistantText(() -> {
+            checks.incrementAndGet(); entered.countDown(); await(release);
+        }, text -> output.add("text:" + text), part -> output.add(part.phase() + ":" + part.text()))) {
+            try {
+                stream.reasoning(new AiProviderClient.Reasoning("r", AiProviderClient.Reasoning.Phase.START, ""));
+                assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                for (int index = 0; index < 1000; index++) {
+                    stream.reasoning(new AiProviderClient.Reasoning("r", AiProviderClient.Reasoning.Phase.DELTA, "."));
+                }
+                stream.reasoning(new AiProviderClient.Reasoning("r", AiProviderClient.Reasoning.Phase.END, ""));
+                stream.accept("answer");
+                assertThat(output).isEmpty();
+                release.countDown();
+                stream.finish();
+                assertThat(checks).hasValue(1);
+                assertThat(output).containsExactly("START:", "DELTA:" + ".".repeat(1000), "END:", "text:answer");
+            } finally { release.countDown(); }
+        }
+    }
+
+    @Test void refusedAuthorizationWithholdsSummaryAsWellAsText() {
+        var refusal = AiProviderService.error(ControlError.UNAUTHENTICATED);
+        var output = new ArrayList<String>();
+        try (var stream = new GuardedAssistantText(() -> { throw refusal; }, output::add,
+                part -> output.add(part.text()))) {
+            stream.reasoning(new AiProviderClient.Reasoning("r", AiProviderClient.Reasoning.Phase.DELTA, "private summary"));
+            assertThatThrownBy(stream::finish).isSameAs(refusal);
+            assertThat(output).isEmpty();
+            assertThat(Thread.currentThread().isInterrupted()).isFalse();
+        }
+    }
+
     @Test void aClosedRequestCannotBeInterruptedByALateWorkerFailure() throws Exception {
         var failed = new CountDownLatch(1);
         var stream = new GuardedAssistantText(() -> {
@@ -38,29 +76,33 @@ class GuardedAssistantTextTest {
         } finally { stream.close(); Thread.interrupted(); }
     }
 
-    @Test void aLateAdmittedCallbackCannotWriteAfterTheTerminalFrame() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void aLateAdmittedCallbackCannotWriteAfterTheTerminalFrame(boolean summary) throws Exception {
         var output = new java.io.ByteArrayOutputStream();
         var events = new PipelineAssistantController.AssistantStream(output, output::flush);
         var admitted = new CountDownLatch(1);
         var release = new CountDownLatch(1);
-        var stream = new GuardedAssistantText(() -> {}, batch -> {
+        java.util.function.Consumer<String> late = batch -> {
             admitted.countDown();
             boolean waiting = true;
             while (waiting) {
                 try { release.await(); waiting = false; }
                 catch (InterruptedException ignored) { }
             }
-            events.event(java.util.Map.of("type", "text-delta", "id", "text", "delta", batch));
-        });
+            events.event(java.util.Map.of("type", summary ? "reasoning-delta" : "text-delta", "id", "text", "delta", batch));
+        };
+        var stream = new GuardedAssistantText(() -> {}, late, part -> late.accept(part.text()));
         try {
-            stream.accept("late text");
+            if (summary) stream.reasoning(new AiProviderClient.Reasoning("r", AiProviderClient.Reasoning.Phase.DELTA, "late text"));
+            else stream.accept("late text");
             assertThat(admitted.await(3, TimeUnit.SECONDS)).isTrue();
             stream.close();
             events.failure(ControlError.AI_PROVIDER_FAILED.code());
             release.countDown();
             stream.finish();
             assertThat(output.toString(java.nio.charset.StandardCharsets.UTF_8))
-                    .contains("error", "[DONE]").doesNotContain("late text", "text-delta");
+                    .contains("error", "[DONE]").doesNotContain("late text", "text-delta", "reasoning-delta");
         } finally { release.countDown(); stream.close(); }
     }
 

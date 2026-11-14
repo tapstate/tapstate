@@ -24,6 +24,15 @@ class PipelineBuilderAssistantProviderSettingsIT {
 
     @Test
     void anAssistantStreamsBeforeCompletionAndCoalescesTextBehindItsRealAuthorization() throws Exception {
+        assertAssistantStreams(false);
+    }
+
+    @Test
+    void anAssistantSummaryStreamsBeforeCompletionBehindItsRealAuthorization() throws Exception {
+        assertAssistantStreams(true);
+    }
+
+    private void assertAssistantStreams(boolean summary) throws Exception {
         var guardEntered = new java.util.concurrent.CountDownLatch(1);
         var releaseGuard = new java.util.concurrent.CountDownLatch(1);
         var producerDrained = new java.util.concurrent.CountDownLatch(1);
@@ -36,10 +45,22 @@ class PipelineBuilderAssistantProviderSettingsIT {
             public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
                     java.util.List<Map<String, String>> messages, Map<String, Object> context,
                     java.util.function.Consumer<String> text) {
+                return propose(settings, messages, context, (io.tapstate.control.core.AiProviderClient.Output) text::accept);
+            }
+            public java.util.Optional<Map<String, Object>> propose(io.tapstate.control.core.AiProviderSettings settings,
+                    java.util.List<Map<String, String>> messages, Map<String, Object> context,
+                    io.tapstate.control.core.AiProviderClient.Output output) {
                 producing.set(true);
+                if (summary) output.reasoning(new io.tapstate.control.core.AiProviderClient.Reasoning("r",
+                        io.tapstate.control.core.AiProviderClient.Reasoning.Phase.START, ""));
+                java.util.function.Consumer<String> text = summary ? delta -> output.reasoning(
+                        new io.tapstate.control.core.AiProviderClient.Reasoning("r",
+                                io.tapstate.control.core.AiProviderClient.Reasoning.Phase.DELTA, delta)) : output;
                 text.accept("prefix ");
                 await(guardEntered);
                 for (int i = 0; i < 1000; i++) text.accept(".");
+                if (summary) output.reasoning(new io.tapstate.control.core.AiProviderClient.Reasoning("r",
+                        io.tapstate.control.core.AiProviderClient.Reasoning.Phase.END, ""));
                 producerDrained.countDown();
                 await(completeProvider);
                 return java.util.Optional.empty();
@@ -87,7 +108,7 @@ class PipelineBuilderAssistantProviderSettingsIT {
                         var prefix = readers.submit(() -> {
                             reading.countDown();
                             for (String line; (line = lines.readLine()) != null;)
-                                if (line.contains("text-delta")) return line;
+                                if (line.contains(summary ? "reasoning-delta" : "text-delta")) return line;
                             throw new AssertionError("no assistant text was received");
                         });
                         assertThat(reading.await(3, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
@@ -102,11 +123,13 @@ class PipelineBuilderAssistantProviderSettingsIT {
                         var mongo = (Map<?, ?>) measurements.getFirst().get("mongo");
                         assertThat(((Number) mongo.get("started")).intValue()).isBetween(1, 32);
                         assertThat(measurements.getFirst()).containsEntry("complete", true);
-                        System.out.println("assistant_stream_guard commands=" + mongo.get("started") + " fragments=1001 batches=1");
+                        System.out.println("assistant_stream_guard channel=" + (summary ? "summary" : "text")
+                                + " commands=" + mongo.get("started") + " fragments=1001 batches=1");
                         completeProvider.countDown();
                         String terminal = readers.submit(() -> lines.lines().reduce("", (a, b) -> a + b))
                                 .get(10, java.util.concurrent.TimeUnit.SECONDS);
                         assertThat(terminal).contains("text-end", "\"finishReason\":\"stop\"", "[DONE]");
+                        if (summary) assertThat(terminal).contains("reasoning-end");
                         lines.close();
                     } finally {
                         releaseGuard.countDown(); completeProvider.countDown();

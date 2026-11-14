@@ -139,11 +139,19 @@ class PipelineAssistantController {
     private Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
             Map<String, Object> context, Runnable guard, AssistantStream events, String textId) {
         try (var text = new GuardedAssistantText(guard, delta ->
-                events.event(Map.of("type", "text-delta", "id", textId, "delta", delta)))) {
+                events.event(Map.of("type", "text-delta", "id", textId, "delta", delta)),
+                part -> reasoning(events, part))) {
             Optional<Map<String, Object>> candidate = invokeProvider(settings, messages, context, text);
             text.finish();
             return candidate;
         }
+    }
+
+    private static void reasoning(AssistantStream events, AiProviderClient.Reasoning part) {
+        String type = "reasoning-" + part.phase().name().toLowerCase(java.util.Locale.ROOT);
+        if (part.phase() == AiProviderClient.Reasoning.Phase.DELTA) {
+            events.event(Map.of("type", type, "id", part.id(), "delta", part.text()));
+        } else events.event(Map.of("type", type, "id", part.id()));
     }
 
     private Optional<Map<String, Object>> invokeProvider(AiProviderSettings settings, List<Map<String, String>> messages,
