@@ -49,6 +49,8 @@ concurrency:
 # nothing listens on, the send is refused instantly and the installer swallows it -- the same path a
 # user with no network takes.
 env:
+  TAPSTATE_ADMIN_USER: quickstart-ci
+  TAPSTATE_ADMIN_PASSWORD: quickstart-ci-fixture-password
   TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
   # The independent second half: the line above stops the send, this one makes an install that gets
   # sent anyway arrive marked as ours rather than counted as a person's.
@@ -214,6 +216,9 @@ jobs:
             export TAPSTATE_QUICKSTART_BASE_URL="file://$GITHUB_WORKSPACE"
           fi
           cd "$RUNNER_TEMP"
+          if ! grep -q '^read_admin_credentials()' "$SCRIPT"; then
+            unset TAPSTATE_ADMIN_USER TAPSTATE_ADMIN_PASSWORD
+          fi
           cat "$SCRIPT" | sh 2>&1 | tee run.log
           # The image the stack actually started, held to the one this job prepared. Without this the
           # leg can silently run a different server than the one it built or pulled -- which is the
@@ -251,9 +256,14 @@ jobs:
               || { echo "the demo workspace declares the store; this assertion would prove nothing" >&2; exit 1; }
           fi
           cd tapstate-demo
-          admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
-          printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nls\nexit\n' "$admin_pw" \
-            | ./tapstate -w work > ls.log 2>&1
+          if grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml; then
+            TAPSTATE_PASSWORD="$TAPSTATE_ADMIN_PASSWORD" ./tapstate -w work -c http://127.0.0.1:8080 \
+              -u "$TAPSTATE_ADMIN_USER" ls > ls.log 2>&1
+          else
+            admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+            printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nls\nexit\n' "$admin_pw" \
+              | ./tapstate -w work > ls.log 2>&1
+          fi
           # Listed either way: registered by the deployment on one leg, applied from the workspace on
           # the other. Which route it took is the assertion above; that it is there at all is this one,
           # and a demo whose target is not registered delivers nothing on either leg.
@@ -525,6 +535,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
+          if ! grep -q '^read_admin_credentials()' "$SCRIPT"; then
+            unset TAPSTATE_ADMIN_USER TAPSTATE_ADMIN_PASSWORD
+          fi
           cat "$SCRIPT" | sh 2>&1 | tee run.log
           test -d tapstate-demo || { echo "the piped run did not make its own directory" >&2; exit 1; }
 

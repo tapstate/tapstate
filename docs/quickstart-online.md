@@ -27,8 +27,8 @@ target: https://tapstate.dev/docs/quickstart-online
 > stack is `curl -sSL https://install.tapstate.dev/demo | sh`. This page is the same
 > flow by hand, for when you want to see each verb.
 
-What you'll do: bring up a Docker Compose stack — databases, the server, and the
-first-admin bootstrap all seeded and started together — then drive two sources through
+You will start the databases and server with Docker Compose, choose the first
+administrator credentials, and drive two sources through
 one pipeline from the CLI, so that rows from two different database engines are assembled
 into a single object and kept fresh: snapshot first, then live change-data-capture (CDC).
 
@@ -277,8 +277,8 @@ online verbs the script drives, or to point the pipeline at your own databases.
 ## Prerequisites
 
 - **Docker** with the **Compose v2** plugin (`docker compose version`). The stack is
-  a single-node local demo: databases, server, and first-admin bootstrap come up
-  together, on the loopback interface only.
+  a single-node local demo with the server published on loopback only.
+- **jq**, used by the installer to read setup responses and encode credentials.
 - **The system version named in the release notes** — a macOS version on a Mac, a glibc
   version on Linux. A recommendation, not a gate; see the note at the top of this page.
 - **JDK 21** (`java -version`) — only for the dev overlay below, which builds the
@@ -330,33 +330,17 @@ it again.
 > ```
 > Drop the override once the image is published and this becomes a plain pull.
 
-Start everything:
+Run the Quickstart from this directory to initialize the demo and choose the
+administrator credentials:
 
 ```sh
-docker compose up -d
+TAPSTATE_QUICKSTART_BASE_URL="file://$(cd ../.. && pwd)" sh ./quickstart.sh
 ```
 
-That brings up four services:
-
-- **MongoDB** as a single-member replica set (Tapstate's state store needs one),
-  initiated automatically by its healthcheck.
-- **MySQL** seeded with a demo `orders` table of five rows, with row-based binary
-  logging on so CDC has a binlog to tail.
-- the **server** (`--role=all`), published on **`127.0.0.1:8080`** only — an
-  unauthenticated first run must not be reachable from other machines.
-- a one-shot **bootstrap** that creates the first admin over the server's loopback,
-  then exits.
-
-The first admin defaults to **`admin` / `admin`**, which is fine for this
-loopback-only demo. To set your own password, copy `.env.example` to `.env` and edit
-`TAPSTATE_ADMIN_PASSWORD` before bringing the stack up.
-
-Wait for the server to report healthy (first run also builds the image, so allow up
-to a minute):
-
-```sh
-docker compose ps          # the "server" row should read "healthy"
-```
+The script starts MongoDB, MySQL, PostgreSQL and Tapstate. It configures CONFIG,
+CACHE and views in the bundled MongoDB replica set, then uses the administrator
+credentials to run the demo pipeline. The remaining steps show the CLI commands
+the script runs and can be used to inspect the demo or try it with other sources.
 
 ### The server's address
 
@@ -964,7 +948,7 @@ docker compose down -v     # stops every service and drops the named volumes
 
 `down -v` discards the store, so a re-run re-registers the connectors from scratch.
 The pulled/built images remain — remove them with `docker image rm <image>` if you
-want the machine back exactly as it was. The jars, `work/`, and `.env` you created
+want the machine back exactly as it was. The jars and `work/` you created
 here are just files; delete them as usual.
 
 ## Upgrading to a newer release
@@ -1002,7 +986,7 @@ Upgrades are supported within one MAJOR line — `0.2.1` to `0.3.0` and onward. 
 one you just installed.
 
 The downloaded demo is tied to its pinned release. Do not reuse an older demo's database volumes
-as a three-layer installation or mix its bootstrap procedure with the from-source steps below.
+for a fresh three-layer installation.
 
 ## Alternative: build and run the server from source
 
@@ -1102,8 +1086,7 @@ This runtime is a preview. Known constraints in this slice:
   targets whose rows the server can read; for any other target it warns and goes ahead.
 - **`logs` is thin.** The per-pipeline `logs` face is a node-local operational tail
   and is often sparse; full runtime detail is in the server process log.
-- **Installation and application commands are separate.** The released demo has its own bootstrap
-  setup. A server built from this checkout uses the server's `installation` owner command and
+- **Installation and application commands are separate.** The demo automates storage and administrator setup. A manually started server uses the `installation` owner command and
   dedicated management channel; the client CLI does not install the server.
 - **Temporary connections and machine tokens are process-scoped.** A persistent human
   session is created only by `auth login` against a named context; `connect`,

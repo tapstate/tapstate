@@ -159,19 +159,19 @@ The example nests each order's shipments into a live order object
 assembled from both source databases, and updates it as the underlying
 records change.
 
-You need Docker with the Compose plugin.
+You need Docker with the Compose plugin and `jq`.
 
 ```sh
 curl -fsSL https://install.tapstate.dev/demo | sh
 ```
 
-The script starts the playground and saves its configuration under
-`tapstate-demo/`.
+The script prompts for an administrator username and password, sets up the
+bundled MongoDB, and starts the playground under `tapstate-demo/`.
 
 ### Use it in the browser
 
-Open `http://127.0.0.1:8080` and sign in as `admin` with the password
-saved in `tapstate-demo/.env`.
+Open `http://127.0.0.1:8080` and sign in with the administrator credentials
+you entered.
 
 Inspect the sources and their discovered columns, the pipeline that
 assembles them, and its monitoring and logs—or build a pipeline of
