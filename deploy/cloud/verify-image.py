@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect both Cloud OCI platforms before a release is approved or pushed."""
+"""Inspect both OCI platforms before a release is approved or pushed."""
 
 from __future__ import annotations
 
@@ -111,14 +111,19 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     if not isinstance(image_config, dict):
         raise ImageError(f"{platform} has no valid image config")
     user = image_config.get("User")
-    if not isinstance(user, str) or user not in {"0", "0:0", "root", "root:root"}:
+    if web_profile == "cloud" and user not in ("0", "0:0", "root", "root:root"):
         raise ImageError(f"{platform} Cloud runtime requires an explicit root user for Db2 initialization")
+    if web_profile == "onprem" and user != "tapstate":
+        raise ImageError(f"{platform} on-prem runtime must run as tapstate")
     environment = image_config.get("Env")
     if not isinstance(environment, list) or any(not isinstance(entry, str) for entry in environment):
         raise ImageError(f"{platform} Cloud runtime requires the shared C++ runtime preload")
     preloads = [entry for entry in environment if entry.partition("=")[0] == "LD_PRELOAD"]
-    if preloads != ["LD_PRELOAD=libstdc++.so.6"]:
+    if web_profile == "cloud" and preloads != ["LD_PRELOAD=libstdc++.so.6"]:
         raise ImageError(f"{platform} Cloud runtime requires the shared C++ runtime preload without overrides")
+    seed_dirs = [entry for entry in environment if entry.startswith("TAPSTATE_CONNECTORS_SEED_DIR=")]
+    if web_profile == "onprem" and seed_dirs != ["TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"]:
+        raise ImageError(f"{platform} on-prem runtime must use its packaged connector seed")
     labels = image_config.get("Labels")
     if not isinstance(labels, dict):
         raise ImageError(f"{platform} has no image labels")
@@ -126,7 +131,7 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     for key in ("org.opencontainers.image.version", "org.opencontainers.image.revision",
                 "org.opencontainers.image.licenses", "io.tapstate.web.revision",
                 "io.tapstate.web.files.sha256", "io.tapstate.distribution",
-                "io.tapstate.web.profile", "io.tapstate.web.cloud-console-url"):
+                "io.tapstate.web.profile") + (("io.tapstate.web.cloud-console-url",) if web_profile == "cloud" else ()):
         if not isinstance(labels.get(key), str) or not labels[key]:
             raise ImageError(f"{platform} is missing image label {key}")
         relevant_labels[key] = labels[key]
@@ -137,7 +142,7 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
     expected_jar_paths = {f"opt/tapstate/connectors/{entry['id']}-connector.jar" for entry in entries}
     actual_jar_paths = {path for path in files if path.startswith("opt/tapstate/connectors/")}
     if actual_jar_paths != expected_jar_paths:
-        raise ImageError(f"{platform} connector seed differs from the eight locked IDs")
+        raise ImageError(f"{platform} connector seed differs from the locked IDs")
     expected_release_paths = {
         "opt/tapstate/release/connectors.lock.json",
         "opt/tapstate/release/connectors.sha256",
@@ -173,20 +178,19 @@ def verify_platform(layout: Path, descriptor: dict[str, Any], platform: str,
         PROVENANCE.validate_image_labels(props, labels, platform)
         PROVENANCE.verify_declared_profile(props, web_profile, cloud_console_url)
     except PROVENANCE.ProvenanceError as exc:
-        raise ImageError(f"Cloud Web provenance refused: {exc}") from exc
+        raise ImageError(f"Web provenance refused: {exc}") from exc
     return relevant_labels, boot_jar_sha256
 
 
 def verify(layout: Path, lock_path: Path, boot_jar_path: Path | None = None, *,
-           web_profile: str, cloud_console_url: str) -> str:
+           web_profile: str, cloud_console_url: str | None) -> str:
     try:
         profile, console_url = PROVENANCE.declared_profile(web_profile, cloud_console_url)
     except PROVENANCE.ProvenanceError as exc:
         raise ImageError(str(exc)) from exc
-    if profile != "cloud":
-        raise ImageError("Cloud image verification requires the declared Cloud Web profile")
+    required_ids = STAGING.ONPREM_IDS if profile == "onprem" else STAGING.REQUIRED_IDS
     try:
-        entries, license_files = STAGING.read_lock(lock_path)
+        entries, license_files = STAGING.read_lock(lock_path, required_ids)
         lock_bytes = lock_path.read_bytes()
         root = object_from_bytes((layout / "index.json").read_bytes(), "OCI root index")
     except (OSError, STAGING.StageError) as exc:
@@ -238,16 +242,18 @@ def main() -> int:
     parser.add_argument("--oci-layout", required=True, type=Path)
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--boot-jar", required=True, type=Path)
-    parser.add_argument("--web-profile", choices=("cloud",), required=True)
-    parser.add_argument("--cloud-console-url", required=True)
+    parser.add_argument("--web-profile", choices=("cloud", "onprem"), required=True)
+    parser.add_argument("--cloud-console-url")
     args = parser.parse_args()
+    if args.web_profile == "cloud" and args.cloud_console_url is None:
+        parser.error("--cloud-console-url is required for the Cloud profile")
     try:
         digest = verify(args.oci_layout, args.lock, args.boot_jar,
                         web_profile=args.web_profile, cloud_console_url=args.cloud_console_url)
     except ImageError as exc:
-        print(f"Cloud image verification refused: {exc}", file=sys.stderr)
+        print(f"Image verification refused: {exc}", file=sys.stderr)
         return 1
-    print(f"verified linux/amd64 and linux/arm64 Cloud connector seed: {digest}")
+    print(f"verified linux/amd64 and linux/arm64 {args.web_profile} connector seed: {digest}")
     return 0
 
 

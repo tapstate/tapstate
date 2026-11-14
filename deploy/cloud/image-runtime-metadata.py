@@ -28,7 +28,7 @@ SDK = sdk_entry(SDK_VERSION or "")
 SDK_SHA = "e74bbb9d24dec2a91a8ba6fc23201b0e9cb67c1537e35da5581ecec3b723f255"
 
 
-def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict:
+def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path, seed_lock: Path | None = None) -> dict:
     contents = jar_path.read_bytes()
     props = PROVENANCE.properties_from_jar(contents, profile)
     if props["web.profile"] != profile:
@@ -56,8 +56,8 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict
     if any(key in environment for key in ["TAPSTATE_CLOUD_BASE_URL", "TAPSTATE_CLOUD_TOKEN",
                                          "TAPSTATE_CLOUD_ATLAS_URI", "TAPSTATE_CLOUD_CLUSTER_ID", "CLUSTER_ID"]):
         raise ValueError("deployment configuration must not be baked into the image")
-    if (environment.get("TAPSTATE_CONNECTORS_SEED_DIR") == "/opt/tapstate/connectors") != (profile == "cloud"):
-        raise ValueError("the image connector seed configuration has the wrong profile")
+    if environment.get("TAPSTATE_CONNECTORS_SEED_DIR") != "/opt/tapstate/connectors":
+        raise ValueError("the image must use its packaged connector seed")
     with zipfile.ZipFile(jar_path) as jar:
         if hashlib.sha256(jar.read(SDK)).hexdigest() != SDK_SHA:
             raise ValueError("runtime smoke requires the locked actual SDK bytes")
@@ -71,7 +71,7 @@ def metadata(jar_path: Path, image_path: Path, profile: str, lock: Path) -> dict
             "webProfile": profile, "webFilesSha256": props["files.sha256"],
             "bootJarSha256": props["image.boot-jar.sha256"],
             "cloudConsoleUrl": props.get("cloud.console.url"), "webFiles": web_files,
-            "connectorIds": [row["id"] for row in json.loads(lock.read_text())["connectors"]]}
+            "connectorIds": [row["id"] for row in json.loads((seed_lock or lock).read_text())["connectors"]]}
 
 
 def paired(cloud: dict, onprem: dict) -> None:
@@ -85,11 +85,11 @@ def paired(cloud: dict, onprem: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["cloud-jar", "onprem-jar", "cloud-image", "onprem-image", "lock", "output"]:
+    for name in ["cloud-jar", "onprem-jar", "cloud-image", "onprem-image", "lock", "onprem-lock", "output"]:
         parser.add_argument("--" + name, required=True, type=Path)
     args = parser.parse_args()
     cloud = metadata(args.cloud_jar, args.cloud_image, "cloud", args.lock)
-    onprem = metadata(args.onprem_jar, args.onprem_image, "onprem", args.lock)
+    onprem = metadata(args.onprem_jar, args.onprem_image, "onprem", args.lock, args.onprem_lock)
     paired(cloud, onprem)
     for profile, value in [("cloud", cloud), ("onprem", onprem)]:
         (args.output / f"{profile}.json").write_text(json.dumps(value, sort_keys=True) + "\n")
