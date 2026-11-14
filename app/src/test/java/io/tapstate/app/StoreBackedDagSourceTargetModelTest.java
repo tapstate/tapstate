@@ -46,6 +46,22 @@ import org.junit.jupiter.api.Test;
 class StoreBackedDagSourceTargetModelTest {
 
     @Test
+    void aPlainMapPublishesItsRenamedPrimaryKeyToTheSyncTarget() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id")));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("ORDER_ID", true)));
+    }
+
+    @Test
     void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
         for (boolean computed : List.of(false, true)) {

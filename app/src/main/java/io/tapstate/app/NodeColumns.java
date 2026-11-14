@@ -95,8 +95,8 @@ import java.util.Set;
  * @param unknownBecause why the columns cannot be given, naming the node, or null when they are given
  * @param origins       surviving source identity, output column to its original name; replacement
  *                      values have no origin even if their output name matches a source column
- * @param expanded      whether rows passed through an expansion; only these outputs use source
- *                      identity through renames when publishing their parent key
+ * @param expanded      whether rows passed through an expansion, repeating parent values and
+ *                      invalidating source uniqueness
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
