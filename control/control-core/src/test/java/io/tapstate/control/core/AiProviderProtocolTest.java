@@ -208,6 +208,56 @@ class AiProviderProtocolTest {
                         .isInstanceOf(io.tapstate.core.common.TapstateException.class), new AtomicReference<>());
     }
 
+    @Test void aResponsesModelCanExplicitlyDeclineSummaryWithoutLosingItsAnswer() throws Exception {
+        var requests = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/responses", exchange -> {
+            requests.incrementAndGet();
+            Map<?, ?> body = (Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            boolean summary = body.containsKey("reasoning");
+            String payload = summary ? JsonWriter.write(Map.of("error", Map.of("code", "unsupported_parameter", "param", "reasoning")))
+                    : event(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output",
+                            List.of(Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "Answer without summary.")))))));
+            byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(summary ? 400 : 200, bytes.length);
+            try (var output = exchange.getResponseBody()) { output.write(bytes); }
+        });
+        server.start();
+        try {
+            var settings = new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "a-model-without-summaries", "test-key");
+            var output = new RecordingOutput();
+            assertThat(new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions"))
+                    .propose(settings, List.of(), Map.of("proposalEnabled", false), output)).isEmpty();
+            assertThat(output.text.toString()).isEqualTo("Answer without summary.");
+            assertThat(output.parts).isEmpty();
+            assertThat(requests).hasValue(2);
+        } finally { server.stop(0); }
+    }
+
+    @Test void unrelatedOrUnauthorizedResponsesRejectionsDoNotDisableSummary() throws Exception {
+        record Rejection(int status, String code, String parameter) { }
+        for (var rejection : List.of(new Rejection(400, "unsupported_parameter", "tools"),
+                new Rejection(400, "invalid_request_error", "reasoning.summary"),
+                new Rejection(401, "unsupported_parameter", "reasoning"))) {
+            var requests = new java.util.concurrent.atomic.AtomicInteger();
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/v1/responses", exchange -> {
+                requests.incrementAndGet(); exchange.getRequestBody().readAllBytes();
+                byte[] payload = JsonWriter.write(Map.of("error", Map.of("code", rejection.code(), "param", rejection.parameter()))).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(rejection.status(), payload.length);
+                try (var output = exchange.getResponseBody()) { output.write(payload); }
+            });
+            server.start();
+            try {
+                var settings = new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "gpt-6.1-terra", "test-key");
+                assertThatThrownBy(() -> new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions"))
+                        .propose(settings, List.of(), Map.of("proposalEnabled", false), new RecordingOutput()))
+                        .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                assertThat(requests).hasValue(1);
+            } finally { server.stop(0); }
+        }
+    }
+
     @Test void discoversDeduplicatedModelsWithoutRequiringAModelOrReturningSecrets() throws Exception {
         String body = JsonWriter.write(Map.of("data", List.of(Map.of("id", "z-model"), Map.of("id", "a-model"),
                 Map.of("id", "z-model"), Map.of("id", "test-key"), Map.of("id", ""))));

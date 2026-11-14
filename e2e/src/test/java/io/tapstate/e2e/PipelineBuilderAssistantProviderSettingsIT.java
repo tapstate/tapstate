@@ -116,7 +116,12 @@ class PipelineBuilderAssistantProviderSettingsIT {
                                 .as("the active reader receives no text while authorization is held")
                                 .isInstanceOf(java.util.concurrent.TimeoutException.class);
                         releaseGuard.countDown();
-                        String firstText = prefix.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                        String firstText;
+                        try { firstText = prefix.get(5, java.util.concurrent.TimeUnit.SECONDS); }
+                        catch (java.util.concurrent.TimeoutException missing) {
+                            throw new AssertionError("No assistant " + (summary ? "summary" : "text")
+                                    + " reached the active HTTP reader before provider completion", missing);
+                        }
                         assertThat(firstText).contains("prefix " + ".".repeat(1000)).doesNotContain(TEST_KEY);
                         assertThat(completeProvider.getCount()).as("provider completion is still unavailable").isEqualTo(1);
                         assertThat(measurements).hasSize(1);

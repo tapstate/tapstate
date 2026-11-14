@@ -612,21 +612,32 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     private HttpResponse<InputStream> send(AiProviderSettings settings, Map<String, Object> body)
             throws java.io.IOException, InterruptedException {
         var response = http.send(request(settings, body), HttpResponse.BodyHandlers.ofInputStream());
-        if (responses(settings) || response.statusCode() != 400 || !body.containsKey("max_tokens")) return response;
-        // Retry only an explicit token-parameter rejection, never a generic failure or a partially emitted stream.
+        boolean negotiable = responses(settings) ? body.containsKey("reasoning") : body.containsKey("max_tokens");
+        if (response.statusCode() != 400 || !negotiable) return response;
+        String rejected = rejectedParameter(response);
+        Map<String, Object> compatible = new java.util.LinkedHashMap<>(body);
+        if (responses(settings) && body.containsKey("reasoning")
+                && ("reasoning".equals(rejected) || "reasoning.summary".equals(rejected))) {
+            compatible.remove("reasoning");
+        } else if (!responses(settings) && body.containsKey("max_tokens") && "max_tokens".equals(rejected)) {
+            compatible.put("max_completion_tokens", compatible.remove("max_tokens"));
+        } else return response;
+        // Negotiate only an explicit parameter rejection, before any response content is emitted.
+        return http.send(request(settings, compatible), HttpResponse.BodyHandlers.ofInputStream());
+    }
+
+    private String rejectedParameter(HttpResponse<InputStream> response) throws java.io.IOException {
         long deadline = System.nanoTime() + responseTimeout.toNanos();
         try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
             byte[] bytes = input.readNBytes(MAX_BYTES + 1);
             if (bytes.length > MAX_BYTES) throw failed();
             Object parsed;
             try { parsed = JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)); }
-            catch (IllegalArgumentException malformed) { return response; }
+            catch (IllegalArgumentException malformed) { return null; }
             if (!(parsed instanceof Map<?, ?> envelope) || !(envelope.get("error") instanceof Map<?, ?> error)
-                    || !"unsupported_parameter".equals(error.get("code")) || !"max_tokens".equals(error.get("param"))) return response;
+                    || !"unsupported_parameter".equals(error.get("code")) || !(error.get("param") instanceof String parameter)) return null;
+            return parameter;
         }
-        Map<String, Object> compatible = new java.util.LinkedHashMap<>(body);
-        compatible.put("max_completion_tokens", compatible.remove("max_tokens"));
-        return http.send(request(settings, compatible), HttpResponse.BodyHandlers.ofInputStream());
     }
     private URI endpoint(AiProviderSettings settings, String suffix) {
         String validated = requestUriFactory.apply(settings.baseUrl()).toString();
