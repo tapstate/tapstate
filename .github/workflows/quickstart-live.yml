@@ -13,7 +13,7 @@
 #     warmer runner cannot quietly turn "pulled from GHCR" into "already had it".
 #   * Nothing is built. The server arrives as a published multi-arch image, the CLI as a release tarball,
 #     the connector jars as release assets -- no mvn, no GraalVM. The image is checked to carry a repo
-#     digest, which a locally built image does not have.
+#     digest on published runs. Source runs verify the container uses the image built by that job.
 #   * The pipeline is proved by reading the target, not by trusting the script's own summary.
 #   * Change-data-capture is exercised the way the script's closing instructions tell a user to, with all
 #     three operations, because a pipeline that only ever inserts is not the claim being made.
@@ -49,6 +49,8 @@ concurrency:
 # nothing listens on, the send is refused instantly and the installer swallows it -- the same path a
 # user with no network takes.
 env:
+  TAPSTATE_ADMIN_USER: quickstart-ci
+  TAPSTATE_ADMIN_PASSWORD: quickstart-ci-fixture-password
   TAPSTATE_TELEMETRY_URL: http://127.0.0.1:1/e
   # The independent second half: the line above stops the send, this one makes an install that gets
   # sent anyway arrive marked as ours rather than counted as a person's.
@@ -192,6 +194,7 @@ jobs:
           set -eu
           mvn -q -pl app -am -DskipTests clean package
           docker build -f deploy/docker/Dockerfile -t "${{ steps.leg.outputs.ref }}" .
+          docker image inspect "${{ steps.leg.outputs.ref }}" --format '{{.Id}}' > "$RUNNER_TEMP/quickstart-built-image"
 
       - name: Run the quickstart, piped, and let it make its own directory
         # The one command a user runs. Piped rather than saved on purpose: the pipe is the form on the
@@ -214,6 +217,9 @@ jobs:
             export TAPSTATE_QUICKSTART_BASE_URL="file://$GITHUB_WORKSPACE"
           fi
           cd "$RUNNER_TEMP"
+          if ! grep -q '^read_admin_credentials()' "$SCRIPT"; then
+            unset TAPSTATE_ADMIN_USER TAPSTATE_ADMIN_PASSWORD
+          fi
           cat "$SCRIPT" | sh 2>&1 | tee run.log
           # The image the stack actually started, held to the one this job prepared. Without this the
           # leg can silently run a different server than the one it built or pulled -- which is the
@@ -251,9 +257,15 @@ jobs:
               || { echo "the demo workspace declares the store; this assertion would prove nothing" >&2; exit 1; }
           fi
           cd tapstate-demo
-          admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
-          printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nls\nexit\n' "$admin_pw" \
-            | ./tapstate -w work > ls.log 2>&1
+          if grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml; then
+            printf 'ls\nexit\n' | TAPSTATE_PASSWORD="$TAPSTATE_ADMIN_PASSWORD" \
+              ./tapstate -w work -c http://127.0.0.1:8080 -u "$TAPSTATE_ADMIN_USER" > ls.log 2>&1 \
+              || { cat ls.log >&2; exit 1; }
+          else
+            admin_pw="$(sed -n 's/^TAPSTATE_ADMIN_PASSWORD=//p' .env)"
+            printf 'connect http://127.0.0.1:8080\nlogin admin\n%s\nls\nexit\n' "$admin_pw" \
+              | ./tapstate -w work > ls.log 2>&1
+          fi
           # Listed either way: registered by the deployment on one leg, applied from the workspace on
           # the other. Which route it took is the assertion above; that it is there at all is this one,
           # and a demo whose target is not registered delivers nothing on either leg.
@@ -262,26 +274,27 @@ jobs:
           echo "the store is registered and listed: $STORE_DB"
 
       - name: The server came from where this leg says it did
-        # A registry pull leaves a repo digest; a local build has none. That single fact separates the two
-        # legs after the fact, without watching the run. Asserting it in both directions is what keeps the
-        # matrix honest: without the from-source half, a build step that silently no-opped would leave that
-        # leg pulling the published image and re-running the published leg under a second name -- green,
-        # and proving nothing it was added to prove.
+        # Containerd can attach a repository digest to a local build tagged with a repository name.
+        # Check the running image ID against the build receipt on the source leg.
         run: |
           set -eu
-          digests="$(docker image inspect "${{ steps.leg.outputs.ref }}" --format '{{join .RepoDigests ","}}')"
+          cd "$RUNNER_TEMP/tapstate-demo"
+          container="$(docker compose ps -q server)"
+          actual="$(docker inspect --format '{{.Image}}' "$container")"
           if [ "${{ matrix.server }}" = published ]; then
+            digests="$(docker image inspect "$actual" --format '{{join .RepoDigests ","}}')"
             [ -n "$digests" ] || { echo "the server image carries no repo digest -- it was not pulled" >&2; exit 1; }
             echo "pulled: $digests"
           else
-            [ -z "$digests" ] || { echo "the server image carries a repo digest -- it was pulled, not built here: $digests" >&2; exit 1; }
-            echo "built from this checkout: no repo digest"
+            expected="$(cat "$RUNNER_TEMP/quickstart-built-image")"
+            [ "$actual" = "$expected" ] || { echo "the running image $actual differs from build $expected" >&2; exit 1; }
+            echo "built from this checkout: $actual"
           fi
           # And it is the architecture this leg was added to exercise. Two ways this lane can quietly
           # stop covering arm64 and stay green either way: a runner label that goes away or is edited
           # back to ubuntu-latest, and a manifest that ships without its arm64 half -- both leave three
           # legs passing while two of them run the same amd64 image.
-          arch="$(docker image inspect "${{ steps.leg.outputs.ref }}" --format '{{.Architecture}}')"
+          arch="$(docker image inspect "$actual" --format '{{.Architecture}}')"
           [ "$arch" = "${{ matrix.arch }}" ] || {
             echo "the server image is $arch, but this leg exists to run ${{ matrix.arch }}" >&2
             exit 1
@@ -525,6 +538,9 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
+          if ! grep -q '^read_admin_credentials()' "$SCRIPT"; then
+            unset TAPSTATE_ADMIN_USER TAPSTATE_ADMIN_PASSWORD
+          fi
           cat "$SCRIPT" | sh 2>&1 | tee run.log
           test -d tapstate-demo || { echo "the piped run did not make its own directory" >&2; exit 1; }
 
