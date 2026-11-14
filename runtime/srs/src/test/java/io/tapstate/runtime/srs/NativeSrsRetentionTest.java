@@ -16,6 +16,17 @@ class NativeSrsRetentionTest {
     private static final String CHAIN = "chain";
     private static final WorkloadClaimFence CAPTURE = fence(WorkloadClaimType.CAPTURE, "capture");
 
+    @Test void nativeRetentionReusesTheChainValidatedWithItsTopology() {
+        var f = new Fixture(Set.of("a"));
+        f.combined = true;
+        f.progress(f.attach("pipeline", Set.of("a")), Map.of("a", 7L));
+        try (var unit = f.unit()) { f.retain(unit); }
+        assertThat(f.chainReads).as("the coherent topology already contains its validated chain").isZero();
+        assertThat(f.combinedReads).isEqualTo(1);
+        assertThat(f.trims).containsOnly(entry(f.ring("a"), 7L));
+        assertThat(f.reclaims).isEqualTo(1);
+    }
+
     @Test void aHundredTablesReadEachRelevantConsumerOnlyOncePerPass() {
         var tables = IntStream.range(0, 100).mapToObj(i -> "table-" + i).collect(Collectors.toSet());
         var f = new Fixture(tables);
@@ -97,6 +108,8 @@ class NativeSrsRetentionTest {
         final Map<String, Long> trims = new HashMap<>();
         boolean active = true;
         int reclaims;
+        boolean combined;
+        int chainReads, combinedReads;
         Runnable afterBounds = () -> {};
 
         Fixture(Set<String> tables) { this.tables = tables; }
@@ -116,11 +129,21 @@ class NativeSrsRetentionTest {
         NativeSrsCaptureRunUnit unit() {
             var chains = proxy(SrsChainStore.class, (name, args) -> {
                 if (!name.equals("load")) throw new AssertionError(name);
+                chainReads++;
                 assertThat(args[0]).isEqualTo(CHAIN);
                 return Optional.of(new SrsChainState(CHAIN, "capture", "durable", 1, tables, tables, 0, null, null, members.size(), members.size()));
             });
             var consumers = proxy(SrsConsumerStore.class, (name, args) -> switch (name) {
                 case "attached" -> new SrsConsumerTopology(SCOPE, CHAIN, members.size(), members);
+                case "retentionSnapshot" -> {
+                    if (combined) {
+                        combinedReads++;
+                        yield new SrsConsumerStore.AttachedChain(new SrsConsumerTopology(SCOPE, CHAIN, members.size(), members),
+                                new SrsChainState(CHAIN, "capture", "durable", 1, tables, tables, 0, null, null, members.size(), members.size()));
+                    }
+                    var chain = ((SrsChainStore) args[1]).load(CHAIN).orElseThrow();
+                    yield new SrsConsumerStore.AttachedChain(new SrsConsumerTopology(SCOPE, CHAIN, members.size(), members), chain);
+                }
                 case "progress" -> {
                     var context = (SrsConsumerContext) args[0]; reads.merge(context, 1, Integer::sum);
                     yield Optional.ofNullable(progress.get(context));

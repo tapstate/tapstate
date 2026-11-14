@@ -14,6 +14,7 @@ import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.ConsumerOffset;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsChainState;
+import io.tapstate.spi.store.SrsChainStore;
 import io.tapstate.spi.store.SrsConsumerContext;
 import io.tapstate.spi.store.SrsConsumerProgress;
 import io.tapstate.spi.store.SrsSnapshotPin;
@@ -545,10 +546,22 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return attachedWithChain(chain).topology();
     }
 
+    @Override public AttachedChain attachedWithChain(String chain, SrsChainStore chains) {
+        return attachedWithChain(chain);
+    }
+
+    @Override public AttachedChain retentionSnapshot(String chain, SrsChainStore chains) {
+        return attachedWithChain(chain, IoError.SRS_CHECKPOINT_UNPROVEN);
+    }
+
     @Override public AttachedChain attachedWithChain(String chain) {
+        return attachedWithChain(chain, IoError.SRS_CONSUMER_UNAVAILABLE);
+    }
+
+    private AttachedChain attachedWithChain(String chain, IoError missingRoot) {
         requireChainName(chain);
         return transaction(session -> {
-            var view = view(session, chain);
+            var view = view(session, chain, missingRoot);
             List<SrsConsumerMembership> active = view.members().values().stream().filter(member -> !member.detached())
                     .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
             var topology = new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
@@ -1278,8 +1291,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         Map<String, MongoSrsConsumerRecords.Cursor> cursors, List<Document> membershipRows, List<Document> cursorRows) {}
 
     private View view(ClientSession session, String chain) {
+        return view(session, chain, IoError.SRS_CONSUMER_UNAVAILABLE);
+    }
+
+    private View view(ClientSession session, String chain, IoError missingRoot) {
         Document root = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chain)).first();
-        if (root == null) throw unavailable(chain);
+        if (root == null) throw new TapstateException(missingRoot, Map.of("chain", chain), null);
         SrsChainState state = chains.state(session, root);
         return relations(session,chain,root,state);
     }

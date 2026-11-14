@@ -122,6 +122,27 @@ jobs:
           name: server-boot-jar
           path: app/target/app-*-boot.jar
           if-no-files-found: error
+      # Older release sources retain their own image format.
+      - name: stage the exact on-prem connector and license bytes
+        if: hashFiles('deploy/docker/connectors.lock.json') != ''
+        id: onprem-seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/onprem-jars"
+          assets="$(jq -r '.connectors[].id + "-connector.jar", .licenseFiles[].name' deploy/docker/connectors.lock.json)"
+          patterns=()
+          while IFS= read -r asset; do
+            patterns+=(--pattern "$asset")
+          done <<< "$assets"
+          gh release download connectors-preview --repo tapstate/tapstate \
+            "${patterns[@]}" --dir "$RUNNER_TEMP/onprem-jars"
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/stage-connectors.py \
+            --profile onprem --lock deploy/docker/connectors.lock.json \
+            --jar-dir "$RUNNER_TEMP/onprem-jars" --stage-dir "$RUNNER_TEMP/onprem-stage"
+          echo "build-context=onprem_connectors=$RUNNER_TEMP/onprem-stage" >> "$GITHUB_OUTPUT"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       # Into a local archive, not a registry. The completeness check reads both architectures out of
@@ -131,6 +152,8 @@ jobs:
         with:
           context: .
           file: deploy/docker/Dockerfile
+          target: ${{ steps.onprem-seed.outputs.build-context != '' && 'onprem-release' || 'server' }}
+          build-contexts: ${{ steps.onprem-seed.outputs.build-context }}
           platforms: linux/amd64,linux/arm64
           push: false
           tags: ghcr.io/${{ github.repository }}:${{ inputs.release-version }}
@@ -141,6 +164,16 @@ jobs:
             TAPSTATE_WEB_FILES_SHA256=${{ steps.web-provenance.outputs.files-sha256 }}
             TAPSTATE_WEB_PROFILE=onprem
           outputs: type=oci,dest=${{ runner.temp }}/server-image.tar
+      - name: verify both on-prem OCI platforms carry the locked seed
+        if: steps.onprem-seed.outputs.build-context != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/onprem-built-layout"
+          tar -xf "$RUNNER_TEMP/server-image.tar" -C "$RUNNER_TEMP/onprem-built-layout"
+          PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/verify-image.py \
+            --oci-layout "$RUNNER_TEMP/onprem-built-layout" --lock deploy/docker/connectors.lock.json \
+            --boot-jar app/target/app-*-boot.jar --web-profile onprem
       - uses: actions/upload-artifact@v4
         with:
           name: server-image

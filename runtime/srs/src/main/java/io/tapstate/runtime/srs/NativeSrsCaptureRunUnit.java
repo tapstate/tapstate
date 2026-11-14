@@ -103,8 +103,9 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
     public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
-        var chain=stores.chains().load(chainId).orElseThrow(() -> new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chainId),null));
-        var members=stores.consumers().attached(chainId);
+        var attached=stores.consumers().retentionSnapshot(chainId,stores.chains());
+        var chain=attached.chain();
+        var members=attached.topology();
         var floors=new TreeMap<String,Long>();
         for(var member:members.consumers()) {
             if(Collections.disjoint(member.tables(),chain.servingTables()))continue;

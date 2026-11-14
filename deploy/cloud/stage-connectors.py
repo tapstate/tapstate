@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the complete connector release lock and stage immutable Cloud image inputs.
+"""Verify the complete connector release lock and stage immutable image inputs.
 
 The lock is supplied by the release process after publication and license review.
 This script does not download, approve, or publish connector artifacts.
@@ -24,6 +24,9 @@ from typing import Any
 REQUIRED_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
+ONPREM_IDS = (
+    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
+)
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}
 LICENSE_KEYS = {"name", "bytes", "sha256"}
@@ -46,7 +49,7 @@ def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     try:
         lock = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -56,14 +59,14 @@ def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] != 2:
         raise StageError("connector lock schemaVersion must be 2")
     entries = lock["connectors"]
-    if not isinstance(entries, list) or len(entries) != len(REQUIRED_IDS):
-        raise StageError("connector lock must contain exactly eight entries")
+    if not isinstance(entries, list) or len(entries) != len(required_ids):
+        raise StageError(f"connector lock must contain exactly {len(required_ids)} entries")
     ids = []
     for entry in entries:
         if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
             raise StageError("connector entry has missing or unexpected fields")
         connector_id = entry["id"]
-        if not isinstance(connector_id, str) or connector_id not in REQUIRED_IDS:
+        if not isinstance(connector_id, str) or connector_id not in required_ids:
             raise StageError(f"unexpected connector id: {connector_id!r}")
         # The Db2 artifact includes its native runtime; other connector budgets remain unchanged.
         maximum = 256 * 1024 * 1024 if connector_id == "db2" else 128_000_000
@@ -78,7 +81,7 @@ def read_lock(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         if not isinstance(entry["specPath"], str) or not SPEC_PATH.fullmatch(entry["specPath"]):
             raise StageError(f"{connector_id}: unsafe spec path")
         ids.append(connector_id)
-    if sorted(ids) != sorted(REQUIRED_IDS):
+    if sorted(ids) != sorted(required_ids):
         raise StageError("connector lock has a duplicate or missing id")
     license_files = lock["licenseFiles"]
     if not isinstance(license_files, list) or len(license_files) != len(REQUIRED_LICENSE_FILES):
@@ -184,8 +187,8 @@ def verify_companion_license(path: Path, entry: dict[str, Any]) -> None:
         raise StageError(f"{name}: companion license bytes differ from the release lock")
 
 
-def stage(lock_path: Path, jar_dir: Path, stage_dir: Path) -> None:
-    entries, license_files = read_lock(lock_path)
+def stage(lock_path: Path, jar_dir: Path, stage_dir: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> None:
+    entries, license_files = read_lock(lock_path, required_ids)
     expected_names = {f"{entry['id']}-connector.jar" for entry in entries}
     if not jar_dir.is_dir():
         raise StageError("connector JAR directory is missing")
@@ -234,13 +237,15 @@ def main() -> int:
     parser.add_argument("--lock", required=True, type=Path)
     parser.add_argument("--jar-dir", required=True, type=Path)
     parser.add_argument("--stage-dir", required=True, type=Path)
+    parser.add_argument("--profile", choices=("cloud", "onprem"), default="cloud")
     args = parser.parse_args()
+    required_ids = ONPREM_IDS if args.profile == "onprem" else REQUIRED_IDS
     try:
-        stage(args.lock, args.jar_dir, args.stage_dir)
+        stage(args.lock, args.jar_dir, args.stage_dir, required_ids)
     except StageError as exc:
-        print(f"cloud connector staging refused: {exc}", file=sys.stderr)
+        print(f"connector staging refused: {exc}", file=sys.stderr)
         return 1
-    print(f"staged eight locked connectors in {args.stage_dir}")
+    print(f"staged {len(required_ids)} locked connectors in {args.stage_dir}")
     return 0
 
 

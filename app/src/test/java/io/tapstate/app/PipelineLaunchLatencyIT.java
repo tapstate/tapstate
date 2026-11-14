@@ -35,9 +35,15 @@ class PipelineLaunchLatencyIT {
 
     @Test void anIndependentNativeStartRunsWhileSharedCaptureMaintenanceIsHeld() throws Exception { measure(true, true); }
 
+    @Test void anIndependentNativeStartDeliversWhileAnotherPipelinesAlertProofIsHeld() throws Exception { measure(true, false, true); }
+
     private void measure(boolean blockPriorObservation) throws Exception { measure(blockPriorObservation, false); }
 
     private void measure(boolean blockPriorObservation, boolean blockMaintenance) throws Exception {
+        measure(blockPriorObservation, blockMaintenance, false);
+    }
+
+    private void measure(boolean blockPriorObservation, boolean blockMaintenance, boolean blockProof) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -124,11 +130,13 @@ class PipelineLaunchLatencyIT {
                     }
                     var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
                             .getBean(PipelineCaptureCoordinator.class);
-                    try (var barrier = blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
+                    try (var barrier = blockProof ? new PositionReadBarrier(NativeAppStorage.business(application)
+                            .getBean(PipelineActuationOwnership.class), ((ThreeLayerStorePort) port).scope("launch-0"))
+                            : blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
                             : new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
-                                .as("the prior Pipeline must reach its actual observation position reader").isTrue();
+                                .as("the prior Pipeline must enter the selected observation, maintenance or proof barrier").isTrue();
                         var admin = raw.getDatabase("admin");
                         if (!blockPriorObservation) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
                                 .append("data", new org.bson.Document("failCommands", List.of("update"))
@@ -142,7 +150,7 @@ class PipelineLaunchLatencyIT {
                             long readyMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested);
                             System.out.println((blockPriorObservation ? "INDEPENDENT_ENGINE_READY_MS " : "ENGINE_READY_MS ") + readyMillis);
                             if (barrier != null) assertThat(barrier.release.getCount())
-                                    .as("the new real engine must run before the unrelated position reader is released").isEqualTo(1);
+                                    .as("the new real engine must run before the unrelated dependency is released").isEqualTo(1);
                             var state = request(http, origin, cookie, "GET", "/api/pipelines/" + running + "/status", null, 200);
                             assertThat(state).containsEntry("state", "RUNNING").containsEntry("displayState", "RUNNING");
                             if (!blockPriorObservation) assertThat(state).doesNotContainKeys("observedAt", "observedState");
@@ -165,6 +173,14 @@ class PipelineLaunchLatencyIT {
                             }
                         } finally { admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "off")); }
                     }
+                    if (blockProof) org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                            assertThat(diagnostics.claimIo).anySatisfy(record -> {
+                                assertThat(record.get("complete")).isEqualTo(true);
+                                assertThat(((Number) ((Map<?, ?>) record.get("mongo")).get("started")).longValue()).isPositive();
+                                assertThat(((Number) record.get("queue_ms")).doubleValue()).isNotNegative();
+                                assertThat(((Number) record.get("execution_ms")).doubleValue()).isNotNegative();
+                                assertThat(record.get("caller_thread_id")).isNotEqualTo(record.get("thread_id"));
+                            }));
                     if (!blockPriorObservation) {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
                                 .until(() -> diagnostics.slowPublication().isPresent());
@@ -183,12 +199,14 @@ class PipelineLaunchLatencyIT {
         final ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger)
                 org.slf4j.LoggerFactory.getLogger(PipelineDiagnostics.LOGGER_NAME);
         final Queue<Map<?, ?>> completed = new ConcurrentLinkedQueue<>();
+        final Queue<Map<?, ?>> claimIo = new ConcurrentLinkedQueue<>();
         final ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent> appender =
                 new ch.qos.logback.core.AppenderBase<>() {
                     @Override protected void append(ch.qos.logback.classic.spi.ILoggingEvent event) {
                         var record = (Map<?, ?>) JsonReader.parse(event.getFormattedMessage());
                         if ("PIPELINE_PASS".equals(record.get("phase")) && "end".equals(record.get("edge")))
                             completed.add(record);
+                        if ("mongo_claim_io_diag".equals(record.get("event"))) claimIo.add(record);
                     }
                 };
         DiagnosticRecording() { appender.setContext(logger.getLoggerContext()); appender.start(); logger.addAppender(appender); }
@@ -218,6 +236,39 @@ class PipelineLaunchLatencyIT {
         final java.lang.reflect.Field field;
         final Object publisher;
         final Object original;
+        ExecutorService proofWorker;
+        Future<?> proof;
+
+        PositionReadBarrier(PipelineActuationOwnership ownership, PipelineIntentScope scope) throws Exception {
+            var expected = WorkloadClaimFence.from(ownership.permit(scope).claim());
+            var claims = PipelineActuationOwnership.class.getDeclaredField("claims");
+            claims.setAccessible(true); publisher = claims.get(ownership);
+            field = ClusterWorkloadClaims.class.getDeclaredField("store");
+            field.setAccessible(true); original = field.get(publisher);
+            var selected = new java.util.concurrent.atomic.AtomicReference<Thread>();
+            var proxy = java.lang.reflect.Proxy.newProxyInstance(DeadlineWorkloadClaimStore.class.getClassLoader(),
+                    new Class<?>[]{DeadlineWorkloadClaimStore.class}, (ignored, method, arguments) -> {
+                        if (method.getName().equals("withDeadline") && Thread.currentThread() == selected.get()) {
+                            blocked.set(true); entered.countDown();
+                            try { release.await(); }
+                            finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                        }
+                        try { return method.invoke(original, arguments); }
+                        catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                    });
+            field.set(publisher, proxy);
+            var gate = PipelineActuationOwnership.class.getDeclaredField("ioAdmission");
+            gate.setAccessible(true);
+            var serial = (java.util.concurrent.locks.ReentrantLock) gate.get(ownership);
+            proofWorker = Executors.newSingleThreadExecutor();
+            proof = proofWorker.submit(() -> {
+                selected.set(Thread.currentThread());
+                boolean mutate = Boolean.getBoolean("launch.mutate.serial-proof");
+                if (mutate) serial.lock();
+                try { ownership.evaluationProof(scope, expected); }
+                finally { if (mutate) serial.unlock(); }
+            });
+        }
         @SuppressWarnings("unchecked")
         PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
             this.publisher=publisher;
@@ -256,7 +307,19 @@ class PipelineLaunchLatencyIT {
                                     try { return method.invoke(ports.chains(), arguments); }
                                     catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
                                 });
-                        return new SrsStores(chains, ports.models(), ports.log(), ports.consumers());
+                        var consumers = (SrsConsumerStore) java.lang.reflect.Proxy.newProxyInstance(SrsConsumerStore.class.getClassLoader(),
+                                new Class<?>[]{SrsConsumerStore.class}, (proxy, method, arguments) -> {
+                                    if (method.getName().equals("attachedWithChain")
+                                            && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                        blocked.set(true); entered.countDown();
+                                        try { release.await(); }
+                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                                    }
+                                    try { return method.invoke(ports.consumers(), arguments); }
+                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                });
+                        return new SrsStores(chains, ports.models(), ports.log(), consumers);
                     }
                     public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
                     public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {
@@ -271,7 +334,14 @@ class PipelineLaunchLatencyIT {
                         captured.boundedLoads(), captured.completedFull()));
             }
         }
-        @Override public void close() throws Exception {release.countDown();field.set(publisher,original);}
+        @Override public void close() throws Exception {
+            release.countDown(); field.set(publisher,original);
+            if (proofWorker != null) {
+                proofWorker.shutdown();
+                try { proof.get(10, TimeUnit.SECONDS); }
+                finally { assertThat(proofWorker.awaitTermination(10, TimeUnit.SECONDS)).isTrue(); }
+            }
+        }
     }
 
     private static Map<String, Object> publish(HttpClient http, String origin, String cookie, String id,
@@ -335,9 +405,9 @@ class PipelineLaunchLatencyIT {
                     "elapsedMs", millis, "status", response.statusCode(), "measurement", observation)));
             assertThat(response.statusCode()).as(path + ": " + response.body()).isEqualTo(expected);
             if (path.endsWith("/draft:publish")) {
-                var callers = (Map<String, Integer>) observation.get("callers");
+                var callers = (Map<String, Integer>) observation.get("max_callers_per_transaction_attempt");
                 assertThat(callers.getOrDefault("commit:find:MongoPipelineStateMappings.validationSchema", 0))
-                        .as("one publication transaction validates its mapping schema once").isEqualTo(1);
+                        .as("each publication transaction attempt validates its mapping schema once").isEqualTo(1);
             }
             return (Map<String, Object>) JsonReader.parse(response.body());
         } finally { TRACES.remove(traceId); }
@@ -363,6 +433,7 @@ class PipelineLaunchLatencyIT {
                             var trace = TRACES.get(Objects.toString(request.getHeader("X-Launch-Trace"), ""));
                             if (trace != null) {
                                 var snapshot = new LinkedHashMap<>(scope.snapshot()); snapshot.put("callers", probe.counts());
+                                snapshot.put("max_callers_per_transaction_attempt", probe.maxAttemptCounts());
                                 snapshot.put("successful_command_wall_ms_by_stage", probe.successfulCommandWallMillis());
                                 trace.complete(snapshot);
                             }

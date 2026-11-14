@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 import io.tapstate.spi.store.ClusterMembership;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
@@ -249,13 +250,24 @@ final class PipelineActuationOwnership {
     private final AdmissionDrain admission = new AdmissionDrain();
     private final java.util.concurrent.locks.ReentrantLock ioAdmission = new java.util.concurrent.locks.ReentrantLock(true);
 
+    /** Fresh proof reads share the shutdown deadline, but never serialize unrelated store reads. */
+    private <T>T admittedRead(java.util.function.Supplier<T> action,java.util.function.Supplier<T> refused) {
+        if(!admission.enter())return refused.get();
+        try {
+            if(Thread.currentThread().isInterrupted() || !admission.current())return refused.get();
+            return action.get();
+        }finally {admission.leave();}
+    }
+
     private <T>T admittedCall(java.util.function.Supplier<T> action,java.util.function.Supplier<T> refused) {
         if(!admission.enter())return refused.get();
         boolean locked=false;
         try {
             long remaining=admission.remainingNanos();
             if(remaining<=0)return refused.get();
-            try {locked=ioAdmission.tryLock(remaining,java.util.concurrent.TimeUnit.NANOSECONDS);}
+            try (var wait = PipelineDiagnostics.phase(Phase.PIPELINE_OWNERSHIP_WAIT)) {
+                locked=ioAdmission.tryLock(remaining,java.util.concurrent.TimeUnit.NANOSECONDS);
+            }
             catch(InterruptedException interrupted){Thread.currentThread().interrupt();return refused.get();}
             if(!locked || !admission.current())return refused.get();
             return action.get();
@@ -1010,12 +1022,14 @@ final class PipelineActuationOwnership {
 
     /** Retries only the start's proof read, under the same admission deadline. */
     boolean proveStartClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
-        return admittedCall(() -> proveClaimOwned(scope, expected, true, true), () -> false);
+        return PipelineDiagnostics.measure(scope == null ? null : scope.pipelineId(), Phase.PIPELINE_CLAIM_PROOF,
+                () -> admittedRead(() -> proveClaimOwned(scope, expected, true, true), () -> false));
     }
 
     /** Captures a conservative original lease outside CONFIG; the returned guard performs no IO. */
     Optional<Runnable> evaluationProof(PipelineIntentScope scope, WorkloadClaimFence expected) {
-        return admittedCall(()->evaluationProofOwned(scope,expected),Optional::empty);
+        return PipelineDiagnostics.measure(scope == null ? null : scope.pipelineId(), Phase.PIPELINE_EVALUATION_PROOF,
+                () -> admittedRead(()->evaluationProofOwned(scope,expected),Optional::empty));
     }
     private Optional<Runnable> evaluationProofOwned(PipelineIntentScope scope, WorkloadClaimFence expected) {
         Objects.requireNonNull(scope);Objects.requireNonNull(expected);
@@ -1041,7 +1055,8 @@ final class PipelineActuationOwnership {
     }
 
     private boolean proveClaim(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology) {
-        return admittedCall(()->proveClaimOwned(scope,expected,compareTopology,false),()->false);
+        return PipelineDiagnostics.measure(expected.key().resourceId(), Phase.PIPELINE_CLAIM_PROOF,
+                () -> admittedRead(()->proveClaimOwned(scope,expected,compareTopology,false),()->false));
     }
     private boolean proveClaimOwned(PipelineIntentScope scope, WorkloadClaimFence expected, boolean compareTopology,
             boolean retryTimeout) {
@@ -1165,7 +1180,8 @@ final class PipelineActuationOwnership {
     }
 
     Optional<ReportingExecution> reportingExecution(PipelineIntentScope scope) {
-        return admittedCall(()->reportingExecutionOwned(scope),Optional::empty);
+        return PipelineDiagnostics.measure(scope == null ? null : scope.pipelineId(), Phase.PIPELINE_REPORTING_PROOF,
+                () -> admittedRead(()->reportingExecutionOwned(scope),Optional::empty));
     }
     private Optional<ReportingExecution> reportingExecutionOwned(PipelineIntentScope scope) {
         WorkloadClaim expected;

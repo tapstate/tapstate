@@ -140,11 +140,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     @Override public Optional<WorkloadClaimReading> readPipeline(PipelineIntentScope original) {
         requireScope(original);
         var key = pipelineKey(original);
-        return operations.pipelineRenewal(key, () -> transaction(false, original, (store, session) -> {
-            var retained = storedScope(session, key);
-            if (retained != null && !retained.equals(original)) throw claimFenced();
-            return store.read(key);
-        }));
+        // Admission already validated this exact prepared scope in the callback's snapshot.
+        return operations.pipelineRenewal(key, () -> transaction(false, original, (store, session) -> store.read(key)));
     }
     @Override public Optional<WorkloadClaim> renew(WorkloadClaim expected, Duration ttl) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
@@ -396,7 +393,8 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         if (pipeline != null) {
             var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
             access.verifyStateStructure(budget);
-            var current = access.state(session);
+            // The namespace was checked above in this callback; state still validates the prepared claim.
+            var current = access.state(session, true);
             // A real per-Pipeline write serializes admission with controlled state replacement.
             if (admission) access.updateState(session, current, new Document(), false);
         }
