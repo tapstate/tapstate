@@ -25,7 +25,7 @@ REQUIRED_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 ONPREM_IDS = (
-    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy"
+    "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}

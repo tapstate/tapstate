@@ -23,7 +23,7 @@ class OfficialConnectorsTest {
                 "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
                 "tencent-db-postgres",
                 "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
-                "db2", "db2i", "dummy");
+                "db2", "db2i");
     }
 
     @Test
@@ -65,7 +65,7 @@ class OfficialConnectorsTest {
     void pinsThePreviewIdsAndKeepsThemOutOfEveryVerifiedKind() {
         // A preview is accepted without a verified database behind it. Listed under a kind as well, it
         // would quietly pick up that kind's verification promise, which no release lane keeps for it.
-        assertThat(OfficialConnectors.PREVIEW_IDS).containsExactly("db2", "db2i", "dummy");
+        assertThat(OfficialConnectors.PREVIEW_IDS).containsExactly("db2", "db2i");
         // Flattened and pinned first: over an empty set of kinds, "contains no preview" holds trivially.
         List<String> idsUnderAKind = OfficialConnectors.IDS_BY_DATABASE_KIND.values().stream()
                 .flatMap(List::stream)

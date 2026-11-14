@@ -3,7 +3,6 @@ package io.tapstate.e2e;
 import io.tapstate.testsupport.DockerGate;
 
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -44,19 +43,6 @@ class UnofficialConnectorIsRefusedIT {
     @BeforeAll
     static void requireDocker() {
         DockerGate.require();
-    }
-
-    // The specification vocabulary cannot upload an arbitrary JAR through the registration API.
-    @Test
-    void dummyIsAcceptedByTheDefaultRegistrationPolicy(@TempDir Path directory) throws Exception {
-        byte[] artifact = Files.readAllBytes(E2eConnectorJar.buildInto(directory, "dummy"));
-
-        try (var storage = PreparedNativeStore.create(); ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
-            ControlPlane control = new ControlPlane(server.baseUrl());
-            storage.loginAndAwaitBusiness(control);
-            control.registerConnector("dummy", artifact);
-            assertThat(control.connectorIds()).contains("dummy");
-        }
     }
 
     @ParameterizedTest

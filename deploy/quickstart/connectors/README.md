@@ -81,8 +81,8 @@ Reads are verified on Oracle Free 23 and SQL Server 2022, and across MySQL, Post
 MongoDB, with snapshot and CDC inserts, updates and deletes.
 Decimal validation includes a persisted MySQL DECIMAL(18,4) model, large values,
 negative fractions and CDC updates. This is not an exhaustive cross-version or
-all-data-type matrix. The default accepted set contains 19 connector ids: the Db2,
-Db2 for i, and Dummy previews, and 16 across these five database kinds, including existing managed variants of MySQL,
+all-data-type matrix. The default accepted set contains 18 connector ids: the Db2 and
+Db2 for i previews, and 16 across these five database kinds, including existing managed variants of MySQL,
 PostgreSQL and MongoDB. Except for `mongodb-atlas`, those managed variants have not been
 live-verified individually. The Atlas connector was verified with snapshot and change-stream
 reads, restart continuation, and target writes against a real Atlas deployment in both cloud

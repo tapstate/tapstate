@@ -64,14 +64,6 @@
       "upstreamRevision": "3679968ea0e5ba3e478ff1a8f7fb3fd6440e7846",
       "pdkApiVersion": "2.0.5-SNAPSHOT",
       "specPath": "spec_db2.json"
-    },
-    {
-      "id": "dummy",
-      "bytes": 24121809,
-      "sha256": "fb8bb372cd1fedc0ec43e27dd839b91feee36a70a89adfaae6b6fd788c3352f3",
-      "upstreamRevision": "c132b49ffefa81cb0fb5f2b89eaed0631241ce32",
-      "pdkApiVersion": "2.0.5-SNAPSHOT",
-      "specPath": "spec.json"
     }
   ],
   "licenseFiles": [
