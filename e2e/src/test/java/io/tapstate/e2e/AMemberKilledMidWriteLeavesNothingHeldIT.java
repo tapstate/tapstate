@@ -120,9 +120,24 @@ class AMemberKilledMidWriteLeavesNothingHeldIT {
                                     + "store would have given up on it by itself")
                             .isFalse();
                 }
-                assertThat(survivor.state(PIPELINE)).contains(PipelineState.RUNNING);
+                assertRecoveredRunning(holdStarted + WITHIN_THE_HOLD.toNanos(),
+                        () -> survivor.state(PIPELINE));
             }
         }
+    }
+
+    static void assertRecoveredRunning(long deadline, java.util.function.Supplier<java.util.Optional<PipelineState>> state) {
+        assertRecoveredRunning(deadline, state, System::nanoTime);
+    }
+
+    static void assertRecoveredRunning(long deadline, java.util.function.Supplier<java.util.Optional<PipelineState>> state,
+            java.util.function.LongSupplier now) {
+        Duration remaining = Duration.ofNanos(deadline - now.getAsLong());
+        assertThat(remaining).as("the original hold deadline still bounds recovery").isPositive();
+        Await.until("the recovered RUNNING observation within the original hold deadline", remaining,
+                () -> state.get().filter(PipelineState.RUNNING::equals).isPresent(),
+                () -> String.valueOf(state.get()));
+        assertThat(now.getAsLong() - deadline).as("RUNNING was observed before the original hold deadline").isNegative();
     }
 
     private static Map<String, String> resources(Path source, Path target) {
