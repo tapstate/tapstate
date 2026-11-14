@@ -1897,10 +1897,9 @@ final class StoreBackedDagSource implements DagSource {
      * inherit its old spelling as a fallback when no element type is known.
      *
      *
-     * <p>The key starts as whatever of the table's own key still travels, key columns leading, because
-     * that is the order the sink matches an upsert in. A projection that drops a key column publishes
-     * rows with nothing to match on; that reaches the sink as a key one column short and is reported
-     * there, against the table being written, rather than being invented back here.
+     * <p>The key starts as the table's complete key, key columns leading, because that is the order
+     * the sink matches an upsert in. If a projection drops or replaces any component, output identity
+     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source.
      *
      * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
      * expands a list emits several rows carrying one parent's key, and what tells them apart is a
@@ -1936,6 +1935,11 @@ final class StoreBackedDagSource implements DagSource {
             if (!key.contains(added)) {
                 key.add(added);
             }
+        }
+        if (base.fields().stream().filter(TargetField::primaryKey)
+                .anyMatch(field -> !parentNames.containsKey(field.name()))) {
+            // Element locators distinguish siblings only while the complete parent key survives.
+            key.clear();
         }
         return TargetModelResolver.keyedOn(
                 new TargetTable(base.name(), fields, base.indexes().stream()

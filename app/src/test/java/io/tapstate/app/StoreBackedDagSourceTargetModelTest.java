@@ -62,6 +62,27 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void aPlainMapCannotPublishOnlyTheSurvivingPartOfACompositeKey() {
+        for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
+                io.tapstate.core.model.FieldRule.literal(0),
+                io.tapstate.core.model.FieldRule.computed("after.tenant + 1"),
+                io.tapstate.core.model.FieldRule.rename("other"))) {
+            InMemoryStorePort store = seededProjectingPipeline(Map.of("tenant", rule));
+            store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                    new SourceField("id", "INT"), new SourceField("tenant", "INT"),
+                    new SourceField("other", "INT")), List.of("id", "tenant"), List.of())));
+            List<TargetTable> bound = new ArrayList<>();
+
+            new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+            assertThat(bound).singleElement().satisfies(target -> {
+                assertThat(target.fields()).as("key rule %s", rule).noneMatch(TargetField::primaryKey);
+                assertThat(target.indexes()).as("key rule %s", rule).noneMatch(TargetIndex::unique);
+            });
+        }
+    }
+
+    @Test
     void boundedStringMetadataReachesTheSinkOnlyForDirectSourceValues() {
         var string = new io.tapstate.core.common.StringType(36L, false, true, 255L, 2);
         for (boolean computed : List.of(false, true)) {
