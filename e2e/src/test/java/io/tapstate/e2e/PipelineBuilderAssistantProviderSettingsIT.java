@@ -48,6 +48,11 @@ class PipelineBuilderAssistantProviderSettingsIT {
                     .containsEntry("providerId", "openai-compatible")
                     .containsEntry("model", "e2e-model")
                     .doesNotContainKey("apiKey");
+            String responses = JsonWriter.write(Map.of("providerId", "openai-responses", "model", "gpt-6.1-sol"));
+            assertThat(providerSettings(client, server, control, "PUT", responses).statusCode()).isEqualTo(204);
+            var changed = providerSettings(client, server, control, "GET", null);
+            assertThat(object(changed.body())).containsEntry("providerId", "openai-responses").containsEntry("model", "gpt-6.1-sol");
+            assertThat(changed.body()).doesNotContain(TEST_KEY);
             runtime.assertAuthenticationBoundary();
         }
     }

@@ -142,7 +142,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw invalid("owner"); }
     }
     private static void fields(String provider, String endpoint, String model) {
-        if (!"openai-compatible".equals(provider) || endpoint == null || endpoint.isBlank()
+        if (!("openai-compatible".equals(provider) || "openai-responses".equals(provider)) || endpoint == null || endpoint.isBlank()
                 || endpoint.getBytes(StandardCharsets.UTF_8).length > 4096 || model == null || model.isBlank() || model.length() > 200)
             throw invalid("settings");
     }

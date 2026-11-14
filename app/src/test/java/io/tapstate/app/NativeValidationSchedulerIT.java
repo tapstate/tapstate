@@ -157,10 +157,14 @@ class NativeValidationSchedulerIT {
                         time.now.set(Instant.parse("2026-10-29T00:01:00Z"));await(()->fact(facts,coordinator,task,1).map(value->value.state()==ValidationScheduleObservations.State.SKIPPED_BUSY).orElse(false));
                         assertThat(f.member.getJet().getJobs()).isEmpty();assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(2);
                         try(var ignored=coordinator.stop(manual)){}
-                        await(()->f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED);
+                        // A closed permission is not proof that the stopped actor released its control and report resources.
+                        await(()->f.tasks.read("flow",task.taskId()).orElseThrow().full().permission().phase()==ValidationTaskStore.Phase.CLOSED
+                                &&f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10))
+                                        .items().stream().anyMatch(row->row.reference().sequence()==manual.sequence()&&row.closed()&&row.terminal()==ValidationRunState.STOPPED)
+                                &&f.resources.snapshot().metadataFrames()==0);
                         time.now.set(Instant.parse("2026-10-29T00:03:10Z"));await(()->fact(facts,coordinator,task,1).map(value->value.state()==ValidationScheduleObservations.State.SKIPPED_LATE).orElse(false));
                         assertThat(f.member.getJet().getJobs()).isEmpty();ready.set(true);time.now.set(Instant.parse("2026-10-29T00:04:00Z"));
-                        await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));
+                        awaitScheduledCompletion(f,facts,coordinator,task,Instant.parse("2026-10-29T00:04:00Z"),2,1);
                         assertThat(f.member.getJet().getJobs()).hasSize(1);
                         scheduler.close();time.now.set(Instant.parse("2026-10-29T00:10:10Z"));
                         try(var restarted=new NativeValidationScheduler(f.configuration,f.resources,f.process,()->coordinator,facts,time,new ValidationScheduleCalculator(),()->{})){
@@ -169,7 +173,7 @@ class NativeValidationSchedulerIT {
                             assertThat(f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).total()).isEqualTo(2);
                             assertThat(f.tasks.read("flow",task.taskId()).orElseThrow().full().nextStartSequence()).isEqualTo(3);
                             time.now.set(Instant.parse("2026-10-29T00:11:00Z"));
-                            await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10)).items().stream().filter(row->row.terminal()==ValidationRunState.COMPLETED).count()==2);
+                            awaitScheduledCompletion(f,facts,coordinator,task,Instant.parse("2026-10-29T00:11:00Z"),3,2);
                             assertThat(f.tasks.disableSchedule(new ValidationTaskStore.DisableSchedule(task,1,UUID.randomUUID()))).isEqualTo(ValidationTaskStore.Write.APPLIED);
                             time.now.set(Instant.parse("2026-10-29T00:12:00Z"));
                             await(()->fact(facts,coordinator,task,1).isEmpty());
@@ -178,6 +182,25 @@ class NativeValidationSchedulerIT {
                     }
                 }
             }finally{f.raw.getDatabase(source).drop();f.raw.getDatabase(target).drop();}
+        }
+    }
+    private static void awaitScheduledCompletion(NativeValidationOwnerReservationsIT.Fixture fixture,
+            MemoryValidationSchedules facts,NativeValidationStartCoordinator coordinator,
+            ValidationReportAdmission.Task task,Instant occurrence,long sequence,long completed)throws Exception{
+        try{
+            await(()->fact(facts,coordinator,task,1).map(value->
+                    value.state()==ValidationScheduleObservations.State.START_REQUESTED
+                            &&occurrence.equals(value.lastDue())&&value.sequence()==sequence).orElse(false)
+                    &&fixture.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,
+                            new ValidationReports.Paging(0,10)).items().stream()
+                            .filter(row->row.terminal()==ValidationRunState.COMPLETED).count()==completed);
+        }catch(org.awaitility.core.ConditionTimeoutException failed){
+            throw new AssertionError("scheduled completion: due="+occurrence+"; fact="+fact(facts,coordinator,task,1)
+                    +"; original="+observed(facts,coordinator,task,1)
+                    +"; mode="+fixture.tasks.read("flow",task.taskId()).orElseThrow().full()
+                    +"; resources="+fixture.resources.snapshot()
+                    +"; reports="+fixture.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,
+                            new ValidationReports.Paging(0,10)),failed);
         }
     }
     private static ValidationReportAdmission.Task create(NativeValidationOwnerReservationsIT.Fixture f,Time time,ValidationSchedule schedule,io.tapstate.adapters.pdk.ConnectorRef artifact){
