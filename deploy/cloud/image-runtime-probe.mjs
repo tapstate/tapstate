@@ -317,7 +317,10 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     assert.equal(typeof login.token, 'string');
     const rows = await request(base, '/api/connectors', { headers: { Authorization: `Bearer ${login.token}` } });
     assert.equal(rows.status, 200);
-    assert.deepEqual((await rows.json()).connectors.map((row) => row.id), ['mongodb']);
+    const registered = (await rows.json()).connectors;
+    assert.deepEqual(registered.map((row) => row.id).sort(), [...metadata.connectorIds].sort());
+    assert(registered.every((row) => row.origin === 'registered'));
+    console.log(`PASS: on-prem registered ${registered.length} connectors from its packaged seed`);
     assert.equal((await request(base, '/auth/exchange?code=onprem-refused')).status, 403);
     save(statePath, { token: login.token, issuer: login.issuer });
   } else if (phase === 'onprem-restart') {
@@ -336,7 +339,9 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     assert.equal(login.issuer, saved.issuer);
     const rows = await request(base, '/api/connectors', { headers: { Authorization: `Bearer ${login.token}` } });
     assert.equal(rows.status, 200);
-    assert.deepEqual((await rows.json()).connectors.map((row) => row.id), ['mongodb']);
+    const registered = (await rows.json()).connectors;
+    assert.deepEqual(registered.map((row) => row.id).sort(), [...metadata.connectorIds].sort());
+    assert(registered.every((row) => row.origin === 'registered'));
   } else {
     throw new Error('unknown runtime probe phase');
   }
