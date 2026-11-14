@@ -117,6 +117,11 @@ class PipelineLaunchLatencyIT {
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
                     }
                     var publisher = NativeAppStorage.business(application).getBean(io.tapstate.runtime.scheduler.ObservationPublisher.class);
+                    if (Boolean.getBoolean("launch.mutate.separate-capture-reads")) {
+                        var sample = io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
+                        sample.setAccessible(true);
+                        sample.set(publisher, null);
+                    }
                     var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
                             .getBean(PipelineCaptureCoordinator.class);
                     try (var barrier = blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
@@ -163,8 +168,11 @@ class PipelineLaunchLatencyIT {
                     if (!blockPriorObservation) {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
                                 .until(() -> diagnostics.slowPublication().isPresent());
-                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION "
-                                + JsonWriter.write(diagnostics.slowPublication().orElseThrow()));
+                        var publication = diagnostics.slowPublication().orElseThrow();
+                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION " + JsonWriter.write(publication));
+                        assertThat(((Number) publication.get("command_count")).intValue())
+                                .as("one source with three tables must reuse its original progress across projections")
+                                .isLessThanOrEqualTo(64);
                     }
                 }
             }
@@ -213,17 +221,17 @@ class PipelineLaunchLatencyIT {
         @SuppressWarnings("unchecked")
         PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
             this.publisher=publisher;
-            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("positions");
+            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
             field.setAccessible(true);original=field.get(publisher);
-            var delegate=(java.util.function.Function<String,Map<String,String>>)original;
-            field.set(publisher,(java.util.function.Function<String,Map<String,String>>) id -> {
+            var delegate=(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>)original;
+            field.set(publisher,(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>) (id, at) -> {
                 if(id.equals(pipeline)) {
                     blocked.set(true);entered.countDown();
                     try { release.await(); }
                     catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
                     finally {if(release.getCount()!=0)prematureExit.set(true);blocked.set(false);}
                 }
-                return delegate.apply(id);
+                return delegate.apply(id, at);
             });
         }
         PositionReadBarrier(ScopedPipelineCaptureCoordinator captures) throws Exception {

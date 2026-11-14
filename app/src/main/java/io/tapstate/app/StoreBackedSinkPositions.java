@@ -76,20 +76,26 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                             .or(() -> singleNode ? meta.consumerOffset(pipelineId) : Optional.empty()))
                     .orElse(null));
             if (offset != null) {
-                for (String table : resolution.tables()) {
-                    ChainPosition confirmed = offset.sinkAckedByTable().get(table);
-                    if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
-                            || (offset.progressKind() == ConsumerProgressKind.LEGACY
-                                    && resolution.tables().size() == 1 && offset.perTableSeq().size() <= 1))) {
-                        confirmed = offset.sinkAcked();
-                    }
-                    if (confirmed != null && confirmed.token() != null) {
-                        positions.put(table, confirmed.token());
-                    }
-                }
+                addConfirmedPositions(positions, resolution.tables(), offset);
             }
         });
         current.run();return positions;
+    }
+
+    /** The same durable acknowledgement projection serves live samples and stored-position fallbacks. */
+    static void addConfirmedPositions(Map<String, String> positions, java.util.Collection<String> tables,
+            ConsumerOffset offset) {
+        for (String table : tables) {
+            ChainPosition confirmed = offset.sinkAckedByTable().get(table);
+            if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
+                    || (offset.progressKind() == ConsumerProgressKind.LEGACY
+                            && tables.size() == 1 && offset.perTableSeq().size() <= 1))) {
+                confirmed = offset.sinkAcked();
+            }
+            if (confirmed != null && confirmed.token() != null) {
+                positions.put(table, confirmed.token());
+            }
+        }
     }
 
     /** The stored pipeline for the id, or empty when its artifact is absent or names another kind. */

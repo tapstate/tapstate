@@ -42,12 +42,13 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         // unreadable. The browse projection keeps the good rows available and leaves the bad row for
         // repair/diagnostics; its secrets cannot be inferred safely, so it is skipped here.
         DslParser parser = new DslParser();
+        var startupCatalog = operationCatalog();
         delegate.listStored().stream()
                 .filter(StoredArtifactRecord::readable)
                 .filter(row -> row.canonicalForm() != null)
                 .forEach(row -> {
                     try {
-                        track(parser.parse(row.canonicalForm()));
+                        track(parser.parse(row.canonicalForm()), startupCatalog);
                     } catch (RuntimeException ignored) {
                         // The store already classified this row; tracking is best effort on startup.
                     }
@@ -86,7 +87,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
         ArtifactBatchWrite result = delegate.writeAll(writes);
         if (result.appliedSuccessfully()) {
-            writes.forEach(write -> track(write.resource()));
+            trackAll(writes.stream().map(ArtifactWrite::resource).toList());
         }
         return result;
     }
@@ -94,7 +95,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public synchronized void saveAll(List<Resource> artifacts) {
         delegate.saveAll(artifacts);
-        artifacts.forEach(this::track);
+        trackAll(artifacts);
     }
 
     @Override
@@ -104,7 +105,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         // A refused batch wrote nothing, so nothing it named is in the store to track — tracking it
         // would teach the redactor secrets that were never stored.
         if (conflicted.isEmpty()) {
-            artifacts.forEach(this::track);
+            trackAll(artifacts);
         }
         return conflicted;
     }
@@ -119,7 +120,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
 
     /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
-    synchronized void refreshLoaded(java.util.Set<String> ids) { ids.forEach(this::get); }
+    synchronized void refreshLoaded(java.util.Set<String> ids) {
+        var selected = operationCatalog();
+        ids.forEach(id -> delegate.get(id).ifPresent(resource -> track(resource, selected)));
+    }
 
     /** Registers a store-proven startup winner, never a candidate from a refused write. */
     synchronized void trackLoaded(Resource resource) {
@@ -128,7 +132,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
 
     @Override
     public synchronized List<Resource> list() {
-        var current = delegate.list(); current.forEach(this::track); return current;
+        var current = delegate.list(); trackAll(current); return current;
     }
 
     @Override
@@ -181,6 +185,22 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
             redactor.replace(probe, secretValues(source, () -> captured));
             return () -> redactor.remove(probe);
         };
+    }
+
+    /** One operation's successful catalog reading is shared; no facts survive into the next operation. */
+    private Supplier<TapstateCatalog> operationCatalog() {
+        return new Supplier<>() {
+            private TapstateCatalog captured;
+            @Override public TapstateCatalog get() {
+                if (captured == null) captured = catalog.get();
+                return captured;
+            }
+        };
+    }
+
+    private void trackAll(Collection<Resource> resources) {
+        var selected = operationCatalog();
+        resources.forEach(resource -> track(resource, selected));
     }
 
     private void track(Resource resource) {
