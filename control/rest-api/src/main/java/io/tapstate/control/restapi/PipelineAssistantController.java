@@ -24,6 +24,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
+import jakarta.servlet.http.HttpServletResponse;
 import tools.jackson.databind.ObjectMapper;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -84,7 +85,7 @@ class PipelineAssistantController {
     @Verb("pipeline-draft.assistant")
     @PostMapping(value = "/pipelines/{id}/draft:assistant", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     ResponseEntity<StreamingResponseBody> assistant(@PathVariable("id") String id,
-            @RequestBody Map<String, Object> body, HttpServletRequest request) {
+            @RequestBody Map<String, Object> body, HttpServletRequest request, HttpServletResponse response) {
         var workspace = providers.workspace(request);
         String owner = workspace.owner();
         var settings = providers.service().require(owner);
@@ -93,7 +94,7 @@ class PipelineAssistantController {
         PipelineDraft base = current(id, revision);
         List<Map<String, String>> messages = messages(body.get("messages"));
         StreamingResponseBody stream = output -> {
-            AssistantStream streamEvents = new AssistantStream(output);
+            AssistantStream streamEvents = new AssistantStream(output, response::flushBuffer);
             if (!CAPACITY.tryAcquire()) {
                 streamEvents.event(Map.of("type", ERROR, ERROR_TEXT, ControlError.AI_OVERLOADED.code()));
                 streamEvents.event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR,
@@ -118,10 +119,13 @@ class PipelineAssistantController {
                 if (!focus.isEmpty()) context.put("focus", focus);
                 streamEvents.event(Map.of("type", "text-start", "id", textId));
                 streamEvents.status("streaming");
-                var candidate = client.propose(settings, messages, context, delta -> {
-                    workspace.requireActive().run();
-                    streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta));
-                });
+                java.util.Optional<Map<String, Object>> candidate;
+                try (var text = new GuardedAssistantText(workspace.requireActive(), delta ->
+                        streamEvents.event(Map.of("type", "text-delta", "id", textId, "delta", delta)))) {
+                    try { candidate = client.propose(settings, messages, context, text); }
+                    catch (RuntimeException | Error failed) { text.throwIfFailed(); throw failed; }
+                    text.finish();
+                }
                 workspace.requireActive().run();
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
                 if (candidate.isEmpty()) {
@@ -556,28 +560,41 @@ class PipelineAssistantController {
         catch (ArithmeticException | NumberFormatException error) { throw malformed("revision must be a positive integer"); }
     }
     private static TapstateException malformed(String reason) { return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null); }
-    private static final class AssistantStream {
+    static final class AssistantStream {
         private final OutputStream output;
+        private final EventFlush flush;
         private final Object lock = new Object();
+        private boolean finished;
+        private boolean done;
 
-        private AssistantStream(OutputStream output) {
+        AssistantStream(OutputStream output, EventFlush flush) {
             this.output = output;
+            this.flush = flush;
         }
 
         private void status(String state) {
             event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, state, STATUS, state)));
         }
 
-        private void event(Map<String, Object> value) {
-            write("data: " + JsonWriter.write(value) + "\n\n");
+        void event(Map<String, Object> value) {
+            synchronized (lock) {
+                if (finished) return;
+                write("data: " + JsonWriter.write(value) + "\n\n");
+                if (FINISH.equals(value.get("type"))) finished = true;
+            }
         }
 
         private void done() {
-            write("data: [DONE]\n\n");
+            synchronized (lock) {
+                if (done) return;
+                finished = true;
+                done = true;
+                write("data: [DONE]\n\n");
+            }
         }
 
         private void heartbeat() {
-            write(": heartbeat\n\n");
+            synchronized (lock) { if (!finished) write(": heartbeat\n\n"); }
         }
 
         private void needsInput(String code, List<Map<String, Object>> diagnostics) {
@@ -587,7 +604,8 @@ class PipelineAssistantController {
             done();
         }
 
-        private void failure(String code) {
+        void failure(String code) {
+            synchronized (lock) {
             try {
                 event(Map.of("type", DATA_STATUS, "data", Map.of(STATE, ERROR, STATUS, ERROR, "code", code)));
                 event(Map.of("type", ERROR, ERROR_TEXT, code));
@@ -596,17 +614,19 @@ class PipelineAssistantController {
             } catch (UncheckedIOException disconnected) {
                 // A canceled client needs no further terminal event.
             }
+            }
         }
 
         private void write(String frame) {
             try {
                 synchronized (lock) {
                     output.write(frame.getBytes(StandardCharsets.UTF_8));
-                    output.flush();
+                    flush.flush();
                 }
             } catch (IOException error) {
                 throw new UncheckedIOException(error);
             }
         }
     }
+    @FunctionalInterface interface EventFlush { void flush() throws IOException; }
 }
