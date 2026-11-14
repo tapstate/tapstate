@@ -218,6 +218,33 @@ final class InProcessServer implements ServerHandle {
         return false;
     }
 
+    /** Observe the real selected guard on its executing thread; the original check always runs. */
+    AutoCloseable observeManagedAuthorization(java.util.function.Consumer<String> before,
+            java.util.function.BiConsumer<String, java.util.Map<String, Object>> after) {
+        String name = "managedAuthenticationContexts";
+        var beans = (org.springframework.beans.factory.support.DefaultListableBeanFactory) context.getBeanFactory();
+        var original = beans.getBean(name, io.tapstate.control.core.ManagedAuthenticationContext.Provider.class);
+        io.tapstate.control.core.ManagedAuthenticationContext.Provider observed = () -> {
+            var selected = original.current();
+            if (selected == null) return null;
+            return new io.tapstate.control.core.ManagedAuthenticationContext(selected.service(), () -> {
+                try (var measurement = io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.open()) {
+                    String thread = Thread.currentThread().getName();
+                    before.accept(thread);
+                    selected.requireActive().run();
+                    after.accept(thread, measurement.snapshot());
+                }
+            });
+        };
+        beans.destroySingleton(name);
+        beans.registerSingleton(name, observed);
+        return () -> {
+            if (beans.getSingleton(name) != observed) throw new AssertionError("the observed context provider changed");
+            beans.destroySingleton(name);
+            beans.registerSingleton(name, original);
+        };
+    }
+
     @Override
     public void close() {
         try { context.close(); }

@@ -192,21 +192,29 @@ public final class Engine {
     /** The returned handle never resolves the Pipeline name again, even after another run replaces it. */
     public Optional<Run> findRun(String pipelineId, java.io.Serializable originalIdentity) {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
-        Job job = jobNamed(pipelineId);
-        if (job == null) return Optional.empty();
-        JobConfig config = job.getConfig();
-        if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
-        OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
-                ? null : requireOperatorManifest(job, config);
-        return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+        try {
+            Job job = jobNamed(pipelineId);
+            if (job == null) return Optional.empty();
+            JobConfig config = job.getConfig();
+            if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))) return Optional.empty();
+            OperatorRunManifest manifest = config.getArgument(OPERATOR_MANIFEST_ARGUMENT) == null
+                    ? null : requireOperatorManifest(job, config);
+            return Optional.of(new Run(pipelineId, originalIdentity, job, manifest));
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            return Optional.empty();
+        }
     }
 
     /** Captures one marked job and its original placements; later operations never resolve its name again. */
     public Optional<Run> captureRun(String pipelineId) {
-        Job job = jobNamed(pipelineId);
-        if (job == null) return Optional.empty();
-        OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
-        return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
+        try {
+            Job job = jobNamed(pipelineId);
+            if (job == null) return Optional.empty();
+            OperatorRunManifest original = requireOperatorManifest(job, job.getConfig());
+            return Optional.of(new Run(pipelineId, original.executionIdentity(), job, original));
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            return Optional.empty();
+        }
     }
 
     /** A local, non-serializable handle for the one concrete job whose configuration was verified. */

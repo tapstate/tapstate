@@ -165,6 +165,8 @@ class ApiExceptionHandler {
             Map.entry("store.tls-trust-invalid", HttpStatus.BAD_REQUEST),
             Map.entry("control.ai-not-configured", HttpStatus.CONFLICT),
             Map.entry("control.ai-provider-auth-failed", HttpStatus.UNPROCESSABLE_CONTENT),
+            Map.entry("control.ai-provider-request-rejected", HttpStatus.BAD_GATEWAY),
+            Map.entry("control.ai-provider-rate-limited", HttpStatus.TOO_MANY_REQUESTS),
             Map.entry("control.ai-provider-failed", HttpStatus.BAD_GATEWAY),
             Map.entry("control.ai-invalid-proposal", HttpStatus.UNPROCESSABLE_CONTENT),
             Map.entry("control.ai-overloaded", HttpStatus.TOO_MANY_REQUESTS),

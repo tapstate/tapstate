@@ -63,6 +63,7 @@ class AiProviderSettingsApiTest {
         AtomicReference<AiProviderSettings> checked = new AtomicReference<>();
         AiProviderClient fake = new AiProviderClient() {
             @Override public void check(AiProviderSettings value) { checked.set(value); }
+            @Override public List<String> models(AiProviderSettings value) { checked.set(value); return List.of("model-a", "model-b"); }
             @Override public Optional<Map<String, Object>> propose(AiProviderSettings ignored, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
                 throw new AssertionError("provider settings test must not request a proposal");
@@ -117,6 +118,21 @@ class AiProviderSettingsApiTest {
             }
             controller.check(workspaceA, new AiProviderSettings("openai-compatible", null, "model-b", null));
             assertThat(checked.get().apiKey()).isEqualTo("sk-new-key");
+            var discovered = controller.models(workspaceA, new AiProviderSettings("openai-compatible", null, null, null));
+            assertThat(discovered.getBody()).containsEntry("models", List.of("model-a", "model-b")).doesNotContainKey("apiKey");
+            assertThat(discovered.getHeaders().getCacheControl()).isEqualTo("no-store");
+            assertThat(checked.get().apiKey()).isEqualTo("sk-new-key");
+            assertThatThrownBy(() -> controller.models(workspaceA,
+                    new AiProviderSettings("openai-compatible", "https://another.example/v1", null, null)))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(service.require(owner("org-a", "cluster-a")).model()).isEqualTo("model-b");
+            controller.put(workspaceA, new AiProviderSettings("openai-responses", null, "model-b", null));
+            assertThat(controller.get(workspaceA).getBody()).containsEntry("providerId", "openai-responses").doesNotContainKey("apiKey");
+            controller.models(workspaceA, new AiProviderSettings("openai-responses", null, null, null));
+            assertThat(checked.get().providerId()).isEqualTo("openai-responses");
+            assertThat(checked.get().apiKey()).isEqualTo("sk-new-key");
+
+
             assertThat(service.require(owner("org-a", "cluster-a")).apiKey()).isEqualTo("sk-new-key");
 
             assertThatThrownBy(() -> controller.check(workspaceA,

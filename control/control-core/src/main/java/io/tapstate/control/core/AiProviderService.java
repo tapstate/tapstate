@@ -18,16 +18,21 @@ public final class AiProviderService {
         return validated(get(caller).orElseThrow(() -> error(ControlError.AI_NOT_CONFIGURED)));
     }
     public AiProviderSettings resolve(String scope, AiProviderSettings settings) {
+        return validated(resolveKey(scope, settings));
+    }
+    public AiProviderSettings resolveModels(String scope, AiProviderSettings settings) {
+        return validated(resolveKey(scope, settings), false);
+    }
+    private AiProviderSettings resolveKey(String scope, AiProviderSettings settings) {
         if (settings.apiKey() == null || settings.apiKey().isBlank()) {
             AiProviderSettings saved = require(scope);
-            if (!java.util.Objects.equals(settings.providerId(), saved.providerId())
-                    || !OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl()).equals(saved.baseUrl())) {
+            if (!OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl()).equals(saved.baseUrl())) {
                 throw new TapstateException(ControlError.MALFORMED_REQUEST,
                         Map.of("reason", "a new API key is required when changing the provider endpoint"), null);
             }
-            settings = new AiProviderSettings(settings.providerId(), settings.baseUrl(), settings.model(), saved.apiKey());
+            return new AiProviderSettings(settings.providerId(), settings.baseUrl(), settings.model(), saved.apiKey());
         }
-        return validated(settings);
+        return settings;
     }
     public void put(String caller, String actor, AiProviderSettings settings) {
         AiProviderSettings checked = resolve(caller, settings);
@@ -39,15 +44,19 @@ public final class AiProviderService {
                 () -> { store.delete(caller); return null; });
     }
     public static AiProviderSettings validated(AiProviderSettings settings) {
+        return validated(settings, true);
+    }
+    private static AiProviderSettings validated(AiProviderSettings settings, boolean requireModel) {
         String base = OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl());
-        if (!"openai-compatible".equals(settings.providerId())
-                || settings.model() == null || settings.model().isBlank() || settings.model().length() > 200
+        if (!("openai-compatible".equals(settings.providerId()) || "openai-responses".equals(settings.providerId()))
+                || requireModel && (settings.model() == null || settings.model().isBlank())
+                || settings.model() != null && (settings.model().length() > 200 || settings.model().chars().anyMatch(Character::isISOControl))
                 || settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
                 || settings.apiKey().chars().anyMatch(c -> c < 32 || c == 127)) {
             throw new TapstateException(ControlError.MALFORMED_REQUEST,
                     Map.of("reason", "provider settings require a supported HTTPS API endpoint, model and API key"), null);
         }
-        return new AiProviderSettings("openai-compatible", base, settings.model(), settings.apiKey());
+        return new AiProviderSettings(settings.providerId(), base, settings.model(), settings.apiKey());
     }
     public static TapstateException error(ControlError error) { return new TapstateException(error, Map.of(), null); }
 }
