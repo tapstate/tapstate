@@ -108,7 +108,9 @@ class RealDummyPipelineIT {
                     exit
                     """);
             awaitState(control, failing, PipelineState.FAILED);
-            assertThat(control.failureCode(failing)).contains(ConnectorError.CAPTURE_FAILED.code());
+            String failureCode = Await.answered("the Dummy capture failure code to be published",
+                    Duration.ofSeconds(10), () -> control.failureCode(failing));
+            assertThat(failureCode).isEqualTo(ConnectorError.CAPTURE_FAILED.code());
             assertThat(control.logs(failing)).contains("bad-interval");
             cli(server, storage, "status " + failing + "\nexit\n");
 
