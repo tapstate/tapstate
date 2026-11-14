@@ -36,6 +36,18 @@ import org.junit.jupiter.api.io.TempDir;
  * stand in for real connector dist jars; an in-memory registry stands in for the Mongo/GridFS store.
  */
 class RegistryConnectorProvisionerTest {
+    @Test void repeatedResolutionsInspectVerifiedBytesOnceButStillRejectLaterDamage(@TempDir Path dir) throws IOException {
+        byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));
+        var registry = new InMemoryConnectorRegistry();
+        registry.register("orders", "1.3.5", RegistrationSource.SEED, bytes);
+        var introspector = org.mockito.Mockito.spy(new ConnectorIntrospector());
+        var provisioner = new RegistryConnectorProvisioner(registry, introspector, dir.resolve("plugins"));
+        var first = provisioner.resolveCaptureStartup("orders");
+        assertThat(provisioner.resolveCaptureStartup("orders")).isEqualTo(first);
+        org.mockito.Mockito.verify(introspector, org.mockito.Mockito.times(1)).introspect(org.mockito.ArgumentMatchers.anyList());
+        Files.writeString(first.classpath().getFirst(), "damaged cache");
+        assertSafeLoadFailure(() -> provisioner.resolveCaptureStartup("orders"));
+    }
 
     @Test
     void captureStartupReusesInspectionOnlyForARegisteredAndVerifiedArtifact(@TempDir Path dir) throws IOException {

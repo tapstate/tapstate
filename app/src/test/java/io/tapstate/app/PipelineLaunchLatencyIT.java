@@ -33,7 +33,11 @@ class PipelineLaunchLatencyIT {
 
     @Test void anIndependentNativeStartRunsWhileAnotherPipelinesPositionReadIsHeld() throws Exception { measure(true); }
 
-    private void measure(boolean blockPriorObservation) throws Exception {
+    @Test void anIndependentNativeStartRunsWhileSharedCaptureMaintenanceIsHeld() throws Exception { measure(true, true); }
+
+    private void measure(boolean blockPriorObservation) throws Exception { measure(blockPriorObservation, false); }
+
+    private void measure(boolean blockPriorObservation, boolean blockMaintenance) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -113,7 +117,15 @@ class PipelineLaunchLatencyIT {
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
                     }
                     var publisher = NativeAppStorage.business(application).getBean(io.tapstate.runtime.scheduler.ObservationPublisher.class);
-                    try (var barrier = blockPriorObservation ? new PositionReadBarrier(publisher,"launch-0") : null;
+                    if (Boolean.getBoolean("launch.mutate.separate-capture-reads")) {
+                        var sample = io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
+                        sample.setAccessible(true);
+                        sample.set(publisher, null);
+                    }
+                    var captures = (ScopedPipelineCaptureCoordinator) NativeAppStorage.business(application)
+                            .getBean(PipelineCaptureCoordinator.class);
+                    try (var barrier = blockPriorObservation ? blockMaintenance ? new PositionReadBarrier(captures)
+                            : new PositionReadBarrier(publisher,"launch-0") : null;
                          var raw = com.mongodb.client.MongoClients.create(storage.cacheUri())) {
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must reach its actual observation position reader").isTrue();
@@ -156,8 +168,11 @@ class PipelineLaunchLatencyIT {
                     if (!blockPriorObservation) {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
                                 .until(() -> diagnostics.slowPublication().isPresent());
-                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION "
-                                + JsonWriter.write(diagnostics.slowPublication().orElseThrow()));
+                        var publication = diagnostics.slowPublication().orElseThrow();
+                        System.out.println("PIPELINE_DIAGNOSTIC_CALIBRATION " + JsonWriter.write(publication));
+                        assertThat(((Number) publication.get("command_count")).intValue())
+                                .as("one source with three tables must reuse its original progress across projections")
+                                .isLessThanOrEqualTo(64);
                     }
                 }
             }
@@ -201,23 +216,60 @@ class PipelineLaunchLatencyIT {
         final java.util.concurrent.atomic.AtomicBoolean blocked = new java.util.concurrent.atomic.AtomicBoolean();
         final java.util.concurrent.atomic.AtomicBoolean prematureExit = new java.util.concurrent.atomic.AtomicBoolean();
         final java.lang.reflect.Field field;
-        final io.tapstate.runtime.scheduler.ObservationPublisher publisher;
+        final Object publisher;
         final Object original;
         @SuppressWarnings("unchecked")
         PositionReadBarrier(io.tapstate.runtime.scheduler.ObservationPublisher publisher,String pipeline) throws Exception {
             this.publisher=publisher;
-            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("positions");
+            field=io.tapstate.runtime.scheduler.ObservationPublisher.class.getDeclaredField("captureMeasurements");
             field.setAccessible(true);original=field.get(publisher);
-            var delegate=(java.util.function.Function<String,Map<String,String>>)original;
-            field.set(publisher,(java.util.function.Function<String,Map<String,String>>) id -> {
+            var delegate=(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>)original;
+            field.set(publisher,(java.util.function.BiFunction<String,java.time.Instant,io.tapstate.runtime.scheduler.CaptureMeasurements>) (id, at) -> {
                 if(id.equals(pipeline)) {
                     blocked.set(true);entered.countDown();
                     try { release.await(); }
                     catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
                     finally {if(release.getCount()!=0)prematureExit.set(true);blocked.set(false);}
                 }
-                return delegate.apply(id);
+                return delegate.apply(id, at);
             });
+        }
+        PositionReadBarrier(ScopedPipelineCaptureCoordinator captures) throws Exception {
+            publisher = captures;
+            field = ScopedPipelineCaptureCoordinator.class.getDeclaredField("stores");
+            field.setAccessible(true);
+            synchronized (captures) {
+                original = field.get(captures);
+                var captured = (ScopedPipelineCaptureCoordinator.Stores) original;
+                var delegate = captured.sources();
+                SrsStoreViews observed = new SrsStoreViews() {
+                    public SrsStores srs(CacheBusinessScope scope, Runnable guard) {
+                        var ports = delegate.srs(scope, guard);
+                        var chains = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
+                                new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> {
+                                    if (method.getName().equals("load") && Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                                        blocked.set(true); entered.countDown();
+                                        try { release.await(); }
+                                        catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new IllegalStateException(stopped); }
+                                        finally { if (release.getCount() != 0) prematureExit.set(true); blocked.set(false); }
+                                    }
+                                    try { return method.invoke(ports.chains(), arguments); }
+                                    catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                                });
+                        return new SrsStores(chains, ports.models(), ports.log(), ports.consumers());
+                    }
+                    public boolean supportsAdmittedCaptureStartup() { return delegate.supportsAdmittedCaptureStartup(); }
+                    public <T> T withCaptureStartup(CacheBusinessScope scope, java.util.function.Supplier<T> step) {
+                        return delegate.withCaptureStartup(scope, step);
+                    }
+                    public DirectChannelStore directChannels(CacheBusinessScope scope, Runnable guard) {
+                        return delegate.directChannels(scope, guard);
+                    }
+                };
+                field.set(captures, new ScopedPipelineCaptureCoordinator.Stores(captured.scope(), captured.pipelines(), observed,
+                        captured.configuration(), captured.preparations(), captured.notes(), captured.recoveryPinned(),
+                        captured.boundedLoads(), captured.completedFull()));
+            }
         }
         @Override public void close() throws Exception {release.countDown();field.set(publisher,original);}
     }

@@ -125,6 +125,7 @@ class RuntimeConvergenceConfiguration {
                 id -> captureCoordinator.initialLoad(id,
                         executionPlans.current(List.of(id)).get(id),
                         Instant.now()),
+                (id, at) -> captureCoordinator.measurements(id, executionPlans.current(List.of(id)).get(id), at),
                 Clock.systemUTC());
     }
 

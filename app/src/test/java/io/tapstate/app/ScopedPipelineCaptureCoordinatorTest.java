@@ -21,6 +21,95 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    @Test void combinedBoundedMeasurementsKeepStoredPositionsAndRetainedCountsSeparate() throws Exception {
+        try (var f = new Fixture()) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            verify(f.snapshots, timeout(3000)).recordCount("input", "orders", 1, 1);
+            when(f.snapshots.count("input", "orders", 1)).thenReturn(OptionalLong.of(20));
+            when(f.boundedLoads.complete(ORIGINAL)).thenReturn(true);
+            clearInvocations(f.boundedLoads);
+            var at = Instant.now();
+            var sample = run.measurements("flow", new ExecutionPlan("flow", 2L, 3L, 1L, List.of(), List.of(), at), at);
+            assertThat(sample.positions()).isEmpty();
+            assertThat(sample.snapshot().byTable().get("orders").rowsDone()).isEqualTo(20);
+            assertThat(sample.runSnapshot().byTable().get("orders").rowsDone()).isOne();
+            assertThat(sample.initialLoad().tables().get("orders").rowsRead()).isOne();
+            assertThat(sample.initialLoad().tables().get("orders").stage()).isEqualTo(InitialLoad.Stage.LANDED);
+            verify(f.boundedLoads, times(1)).complete(ORIGINAL);
+        }
+    }
+
+    @Test void combinedCdcOnlyMeasurementsPublishOnlyTheirOwnDurableTargetPositions() {
+        try (var f = new Fixture(ReadMode.CDC_ONLY)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var progress = f.streamingProgress.get();
+            var ack = new ChainPosition(new SourceOrder(1, 3), "cdc-target-confirmed");
+            var cursor = new ConsumerOffset(progress.cursor().pipelineId(), Map.of("orders", 3L), ack,
+                    List.of(), null, 0L, Map.of("orders", ack), ConsumerProgressKind.SRS);
+            f.streamingProgress.set(new SrsConsumerProgress(progress.context(), 1, 1, cursor, null));
+            var at = Instant.now();
+            var sample = run.measurements("flow", new ExecutionPlan("flow", 2L, 3L, 1L, List.of(), List.of(), at), at);
+            assertThat(sample.snapshot()).isEqualTo(SnapshotReading.NONE);
+            assertThat(sample.runSnapshot()).isEqualTo(SnapshotReading.NONE);
+            assertThat(sample.initialLoad().tables()).isEmpty();
+            assertThat(sample.positions()).contains(Map.of("orders", "cdc-target-confirmed"));
+        }
+    }
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void healthyMaintenanceNeverChecksRemoteAuthorizationUnderTheCoordinatorMonitor(boolean localOwner) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            if (localOwner) ownedShared(f);
+            else f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL).startCapture("flow", f.snapshot(), f.models());
+            var underMonitor = new AtomicBoolean();
+            var calls = new AtomicInteger();
+            doAnswer(call -> {
+                calls.incrementAndGet();
+                if (Thread.holdsLock(f.coordinator)) underMonitor.set(true);
+                return call.getArgument(1);
+            }).when(f.authorization).requireCapture(any(), any());
+
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+
+            assertThat(calls).hasPositiveValue();
+            assertThat(underMonitor).as("a healthy remote fence read must not block unrelated start planning").isFalse();
+        }
+    }
+    @Test void onePublicationSharesOneOriginalCursorAcrossAllCaptureProjections() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var progress = f.progress(true, 1, 1);
+            var ack = new ChainPosition(new SourceOrder(1, 3), "target-confirmed");
+            var cursor = new ConsumerOffset(progress.cursor().pipelineId(), Map.of("orders", 3L), ack,
+                    List.of("orders"), "seam", 1L, Map.of("orders", ack), ConsumerProgressKind.SRS);
+            f.streamingProgress.set(new SrsConsumerProgress(progress.context(), 1, 1, cursor, progress.snapshot()));
+            var consumers = f.sources.srs(BUSINESS, () -> {}).consumers();
+            clearInvocations(consumers);
+            var observations = new InMemoryStorePort();
+            observations.state().create("flow", StateJson.of(PipelineState.RUNNING), Instant.now());
+            var plan = new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), Instant.now());
+            var publisher = new RuntimeConvergenceConfiguration().observationPublisher(observations,
+                    mock(io.tapstate.runtime.engine.Engine.class), run, ids -> Map.of("flow", plan));
+
+            var observed = publisher.publish("flow").orElseThrow();
+
+            verify(consumers, times(1)).progress(f.streamingContext);
+            assertThat(observed.positions()).containsOnly(entry("orders", "target-confirmed"));
+            assertThat(observed.snapshot().get("orders").landed()).isTrue();
+            assertThat(observed.initialLoad().tables().get("orders").stage()).isEqualTo(InitialLoad.Stage.LANDED);
+            f.streamingProgress.set(f.progress(false, 1, 1));
+            var next = publisher.publish("flow").orElseThrow();
+            assertThat(next.positions()).isEmpty();
+            assertThat(next.snapshot().get("orders").landed()).isFalse();
+            assertThat(next.initialLoad().tables().get("orders").stage()).isNotEqualTo(InitialLoad.Stage.LANDED);
+            verify(consumers, times(2)).progress(f.streamingContext);
+        }
+    }
     @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
@@ -215,6 +304,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     : f.progress(true, "membership".equals(damage) ? 2 : 1, "snapshot".equals(damage) ? 2 : 1));
             assertThatThrownBy(() -> run.snapshotProgress("flow")).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> run.runSnapshotProgress("flow")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> run.measurements("flow", null, Instant.now())).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> run.initialLoad("flow",
                     new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), Instant.now()), Instant.now()))
                     .isInstanceOf(TapstateException.class);
@@ -373,6 +463,86 @@ class ScopedPipelineCaptureCoordinatorTest {
             } finally {
                 resumeRetention.countDown();
             }
+        }
+    }
+
+    @Test void aBlockedMaintenanceChainReadDoesNotDelayCaptureBindings() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100));
+                var callers = Executors.newSingleThreadExecutor()) {
+            var held = ownedShared(f);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            var original = chains.load(held.chain()).orElseThrow();
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            doAnswer(call -> {
+                if (Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                    entered.countDown();
+                    release.await();
+                }
+                return Optional.of(original);
+            }).when(chains).load(held.chain());
+            try {
+                assertThat(entered.await(3, TimeUnit.SECONDS)).as("maintenance reaches the chain read").isTrue();
+                var bindings = callers.submit(held.run()::captureBindings);
+                assertThat(bindings.get(1, TimeUnit.SECONDS)).isNotNull();
+                assertThat(release.getCount()).as("the store read is still withheld").isEqualTo(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadCannotRetireAReplacementOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("old owner read failed") : new IllegalStateException("old owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            held.run().stopCapture("flow", false);
+            var replacement = ownedShared(f);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(replacement.run().isCapturing("flow")).isTrue();
+            assertThat(replacement.run().captureFailure("flow")).isEmpty();
+            verify(replacement.tail(), never()).close();
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadStillFailsItsOriginalOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("original owner read failed") : new IllegalStateException("original owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+        }
+    }
+
+    @Test void anAlreadyFailedTailIsHandledBeforeAnyServingStateRead() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            var failure = new IllegalStateException("physical tail failed");
+            held.tail().health().recording(mock(CaptureListener.class)).onError(failure);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            clearInvocations(chains);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+            verify(chains, never()).load(anyString());
         }
     }
 

@@ -162,6 +162,8 @@ class NativeValidationSchedulerIT {
                                 &&f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10))
                                         .items().stream().anyMatch(row->row.reference().sequence()==manual.sequence()&&row.closed()&&row.terminal()==ValidationRunState.STOPPED)
                                 &&f.resources.snapshot().metadataFrames()==0);
+                        // Permission/report closure precedes physical drain; the next occurrence starts only after both.
+                        await(()->{try(var stopped=coordinator.read(manual)){return stopped.value().drain()==ValidationOperation.Drain.DRAINED;}});
                         time.now.set(Instant.parse("2026-10-29T00:03:10Z"));await(()->fact(facts,coordinator,task,1).map(value->value.state()==ValidationScheduleObservations.State.SKIPPED_LATE).orElse(false));
                         assertThat(f.member.getJet().getJobs()).isEmpty();ready.set(true);time.now.set(Instant.parse("2026-10-29T00:04:00Z"));
                         awaitScheduledCompletion(f,facts,coordinator,task,Instant.parse("2026-10-29T00:04:00Z"),2,1);
@@ -217,6 +219,17 @@ class NativeValidationSchedulerIT {
         var operation=new ValidationOperation(coordinator.context(),task.pipelineId(),task.taskId(),task.generation(),revision,fact.sequence(),fact.command());
         try(var response=coordinator.read(operation)){return response.value().toString();}
         catch(RuntimeException refused){return refused.toString();}
+    }
+    private static void awaitScheduledCompletion(NativeValidationOwnerReservationsIT.Fixture f,MemoryValidationSchedules facts,
+            NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task){
+        try{
+            await(()->f.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,new ValidationReports.Paging(0,10))
+                    .items().stream().anyMatch(row->row.terminal()==ValidationRunState.COMPLETED));
+        }catch(org.awaitility.core.ConditionTimeoutException timeout){
+            throw new AssertionError("Scheduled COUNT did not complete: schedule="+fact(facts,coordinator,task,1)
+                    +", original="+observed(facts,coordinator,task,1)+", resources="+f.resources.snapshot()
+                    +", jobs="+f.member.getJet().getJobs().stream().map(job->job.getStatus().name()).toList(),timeout);
+        }
     }
     private static Optional<ValidationScheduleObservations.Fact> fact(MemoryValidationSchedules facts,NativeValidationStartCoordinator coordinator,ValidationReportAdmission.Task task,long revision){
         var origin=coordinator.context();return facts.view(new ValidationScheduleObservations.Origin(origin.node(),origin.boot(),origin.member(),origin.incarnation())).read(task,revision);

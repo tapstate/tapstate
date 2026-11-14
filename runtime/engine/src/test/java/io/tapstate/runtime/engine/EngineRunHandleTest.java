@@ -18,9 +18,45 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EngineRunHandleTest {
+    @Test void aJobThatVanishesAfterNameLookupIsAbsentWithoutAdoptingItsReplacement() {
+        var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
+        var second = new FakeJob(2, "run-b", JobStatus.RUNNING);
+        var fixture = new Fixture(first);
+        first.onConfig = () -> { throw new com.hazelcast.jet.core.JobNotFoundException(1); };
+        fixture.onJobLookup = () -> fixture.named.set(second);
+        assertThat(fixture.engine.captureRun("p")).isEmpty();
+        fixture.named.set(first);
+        assertThat(fixture.engine.findRun("p", "run-a")).isEmpty();
+        assertThat(second.configReads.get()).isZero();
+        assertThat(first.cancels.get()).isZero(); assertThat(second.cancels.get()).isZero();
+    }
+
+    @Test void configurationFailuresOtherThanAJobVanishingRemainVisible() {
+        var job = new FakeJob(1, "run-a", JobStatus.RUNNING); var fixture = new Fixture(job);
+        var failure = new IllegalStateException("job metadata invariant failed");
+        job.onConfig = () -> { throw failure; };
+        assertThatThrownBy(() -> fixture.engine.captureRun("p")).isSameAs(failure);
+        assertThatThrownBy(() -> fixture.engine.findRun("p", "run-a")).isSameAs(failure);
+    }
+
+    @Test void aVanishedCancellationProofCannotRetireAnotherJobsFailureSlot() {
+        var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
+        var fixture = new Fixture(first);
+        var registry = JobFailureRegistry.of(fixture.member);
+        registry.attach("p", 1, "run-a");
+        var failure = new IllegalArgumentException("original failure");
+        registry.existing("p", 1, "run-a").record(failure);
+        var replacement = new FakeJob(2, "run-b", JobStatus.RUNNING);
+        replacement.onConfig = () -> { throw new com.hazelcast.jet.core.JobNotFoundException(2); };
+        fixture.named.set(replacement);
+        assertThatCode(() -> registry.retireRun("p", 2, "run-b")).doesNotThrowAnyException();
+        assertThat(registry.retainedRunFailure("p", "run-a").orElseThrow().cause()).isSameAs(failure);
+        assertThat(registry.retainedRunFailure("p", "run-b")).isEmpty();
+    }
     @Test void retainedFailureReadsNeedAnActuallyAttachedExactUnretiredJob() {
         var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
         var fixture = new Fixture(first);
@@ -168,13 +204,14 @@ class EngineRunHandleTest {
     static final class FakeJob {
         final AtomicReference<JobStatus> status; final CompletableFuture<Void> future = new CompletableFuture<>();
         final AtomicInteger suspends = new AtomicInteger(), resumes = new AtomicInteger(), cancels = new AtomicInteger(), futures = new AtomicInteger();
-        final Job job; Runnable onStatus = () -> {};
+        final Job job; Runnable onStatus = () -> {}; Runnable onConfig = () -> {};
+        final AtomicInteger configReads = new AtomicInteger();
         FakeJob(long id, String identity, JobStatus initial) {
             status = new AtomicReference<>(initial); JobConfig config = new JobConfig().setName("p");
             if (identity != null) config.setArgument(Engine.RUN_IDENTITY_ARGUMENT, identity);
             job = proxy(Job.class, (method, args) -> switch (method) {
                 case "getId" -> id;
-                case "getConfig" -> config;
+                case "getConfig" -> { configReads.incrementAndGet(); onConfig.run(); yield config; }
                 case "getDistributedObjects" -> java.util.List.of();
                 case "getName" -> "p";
                 case "getStatus" -> { onStatus.run(); yield status.get(); }

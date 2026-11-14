@@ -112,17 +112,17 @@ class AnIndependentStartDoesNotWaitForAnotherObservationIT {
         @SuppressWarnings("unchecked")
         PositionReadBarrier(Object publisher,String pipeline) throws Exception {
             this.publisher=publisher;
-            field=publisher.getClass().getDeclaredField("positions");field.setAccessible(true);
+            field=publisher.getClass().getDeclaredField("captureMeasurements");field.setAccessible(true);
             original=field.get(publisher);
-            var delegate=(Function<String,Map<String,String>>)original;
-            field.set(publisher,(Function<String,Map<String,String>>)id -> {
+            var delegate=(java.util.function.BiFunction<String,java.time.Instant,Object>)original;
+            field.set(publisher,(java.util.function.BiFunction<String,java.time.Instant,Object>) (id, at) -> {
                 if(id.equals(pipeline)) {
                     blocked.set(true);entered.countDown();
                     try { release.await(); }
                     catch(InterruptedException stopped) {Thread.currentThread().interrupt();throw new IllegalStateException(stopped);}
                     finally {if(release.getCount()!=0)prematureExit.set(true);blocked.set(false);}
                 }
-                return delegate.apply(id);
+                return delegate.apply(id, at);
             });
         }
 

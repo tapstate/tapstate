@@ -15,6 +15,29 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SecretTrackingArtifactStoreTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"startup", "list", "save", "refresh"})
+    void aBatchTracksEverySecretUsingOneFreshCatalog(String operation) {
+        var delegate = new RecordingStore();
+        var sources = List.<Resource>of(source("first", "batch-first-secret"), source("second", "batch-second-secret"));
+        if (operation.equals("startup")) delegate.saveAll(sources);
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var redactor = new SecretRedactor();
+        var decorated = new SecretTrackingArtifactStore(delegate, () -> {
+            reads.incrementAndGet();
+            return TapstateCatalog.load();
+        }, redactor);
+        if (operation.equals("save")) decorated.saveAll(sources);
+        if (operation.equals("list") || operation.equals("refresh")) {
+            delegate.saveAll(sources);
+            if (operation.equals("list")) decorated.list();
+            else decorated.refreshLoaded(java.util.Set.of("first", "second"));
+        }
+        assertThat(reads).as("one operation uses one catalog for all source secrets").hasValue(1);
+        assertThat(redactor.redact("batch-first-secret batch-second-secret")).isEqualTo("******** ********");
+        decorated.list();
+        assertThat(reads).as("a later operation must refresh the catalog").hasValue(2);
+    }
 
     @Test void readableListingForwardsNativeBatchAndSharesOneLiveCatalogWithSourceProjection() {
         var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
