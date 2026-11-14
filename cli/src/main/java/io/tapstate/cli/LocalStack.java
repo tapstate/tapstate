@@ -66,12 +66,10 @@ final class LocalStack {
     private static final String ENV_ADMIN_PASSWORD = "TAPSTATE_ADMIN_PASSWORD";
 
     /**
-     * The connector jars staged for the three-database local demo. The release also carries Oracle and
-     * SQL Server for an explicit {@code register <id>}, but starting the local stack must not download
-     * connectors the demo never uses. Managed variants (aliyun-rds-mysql, mongodb-atlas and the rest)
-     * have no published artifact of their own to fetch.
+     * The connector jars staged for the local demo and internal diagnostics. Other published
+     * connectors can be installed with an explicit {@code register <id>}.
      */
-    static final List<String> CONNECTOR_JARS = List.of("mysql", "mongodb", "postgres");
+    static final List<String> CONNECTOR_JARS = List.of("mysql", "mongodb", "postgres", "dummy");
 
     /** How long the stack is given to answer its health probe: this many polls, this far apart. */
     static final int HEALTH_POLLS = 120;

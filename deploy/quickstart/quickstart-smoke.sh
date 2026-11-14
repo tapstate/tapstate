@@ -57,6 +57,7 @@ cp "$REPO/deploy/quickstart/postgres-init/01-shipments.sql" "$QS_STUB/deploy/qui
 printf 'fake-mysql-connector-jar\n'   > "$QS_STUB/connectors-preview/mysql-connector.jar"
 printf 'fake-mongodb-connector-jar\n' > "$QS_STUB/connectors-preview/mongodb-connector.jar"
 printf 'fake-postgres-connector-jar\n' > "$QS_STUB/connectors-preview/postgres-connector.jar"
+printf 'fake-dummy-connector-jar\n'    > "$QS_STUB/connectors-preview/dummy-connector.jar"
 
 trap 'rm -rf "$CLI_STUB" "$QS_STUB"' EXIT
 
@@ -138,6 +139,11 @@ if cmp -s "$PREP/mongodb-connector.jar" "$PREP/connectors/mongodb-connector.jar"
   ok "stages the MongoDB connector for storage setup"
 else
   bad "MongoDB connector is missing from the installation seed directory"
+fi
+if cmp -s "$PREP/connectors/dummy-connector.jar" "$QS_STUB/connectors-preview/dummy-connector.jar"; then
+  ok "stages the downloaded Dummy bytes in the connectors/ seed dir"
+else
+  bad "connectors/ seed dir is missing the downloaded Dummy bytes"
 fi
 
 # --- the pinned CLI version: it must resolve with TAPSTATE_VERSION unset, and match the build ---------

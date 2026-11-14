@@ -1,0 +1,17 @@
+version: tapstate/v1
+kind: source
+id: src_dummy
+connector: dummy
+mode: cdc
+tables: [dummy_orders]
+config:
+  table_name: dummy_orders
+  table_fields:
+    - {name: id, type: serial, pri: true}
+  initial_totals: 32
+  incremental_interval: 1000
+  incremental_interval_totals: 1
+  incremental_types: [1]
+  write_interval: 1000
+  write_interval_totals: 0
+  write_log: false

@@ -642,8 +642,13 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
                              dict(runner,GITHUB_EVENT_NAME='push',GITHUB_REF='refs/tags/v1.0.0'))
     check(deletion['ref_deleted'] and not deletion['event_payload_complete'] and deletion['checkout_sha']==merge,
           'deleted push keeps checkout identity without treating an absent after commit as the PR source')
-    wrong_payload=copy.deepcopy(payload);wrong_payload['pull_request']['base']['sha']='f'*40
-    rejected(lambda:m.event_snapshot(checkout,wrong_payload,runner),'capture rejects wrong base against real Git commit parents')
+    stale_base=copy.deepcopy(payload);stale_base['pull_request']['base']['sha']='f'*40
+    stale_capture=m.event_snapshot(checkout,stale_base,runner)
+    check(stale_capture['pull_request']['base_sha']=='f'*40 and stale_capture['checkout_parents']==[base,head],
+          'ordinary CI retains the recorded base and actual checkout parents when only the base differs')
+    rejects_identity(stale_capture,run,'original PR input')
+    wrong_head=copy.deepcopy(stale_base);wrong_head['pull_request']['head']['sha']='e'*40
+    rejected(lambda:m.event_snapshot(checkout,wrong_head,runner),'capture rejects wrong head despite base drift')
     for field,wrong in [('sha','f'*40),('tree',{'sha':'f'*40}),('parents',[{'sha':'f'*40},{'sha':head}])]:
         changed=copy.deepcopy(commit);changed[field]=wrong
         rejected(lambda:m.reconcile_pr_identity(run,captured,changed,'example/project',7,head,'ws/fixture'),
@@ -662,6 +667,13 @@ with tempfile.TemporaryDirectory(prefix='ci-receipt-', dir='/var/tmp') as tmp:
     check(result.returncode==0,result.stderr)
     check(json.loads((root/'pr-identity.json').read_text())['event_inputs_sha256']==m.digest(snapshot_file),
           'CLI identity binds the exact archived event bytes')
+    event_file.write_text(json.dumps(stale_base))
+    result=subprocess.run([sys.executable,script,'event-inputs','--root',str(checkout),'--output',str(snapshot_file)],
+                          env=runner,capture_output=True,text=True)
+    check(result.returncode==0 and '::warning title=PR base SHA differs::' in result.stdout
+          and 'f'*40 in result.stdout and base in result.stdout
+          and json.loads(snapshot_file.read_text())==stale_capture,
+          'planner CLI warns with both base SHAs and emits the receipt for the actual checkout')
     # The collector keeps head source and actual merge source distinct.
     archive_bytes=io.BytesIO()
     with zipfile.ZipFile(archive_bytes,'w') as archive:
