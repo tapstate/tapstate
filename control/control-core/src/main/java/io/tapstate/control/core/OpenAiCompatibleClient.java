@@ -168,7 +168,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         requestBody.put("messages", prompt);
         requestBody.put("stream", true);
         requestBody.put("max_tokens", 8192);
-        if (responses(settings)) requestBody.put("reasoning", Map.of("summary", "auto"));
+        if (responses(settings)) requestBody.put("reasoning", Map.of("summary", "concise"));
         if (proposalEnabled) {
             requestBody.put("tools", List.of(tool));
             if (isConcreteEditRequest(messages) && !Boolean.TRUE.equals(context.get("inputSelectionPending"))) requestBody.put("tool_choice", Map.of(JSON_TYPE, JSON_FUNCTION,
@@ -635,8 +635,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             try { parsed = JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)); }
             catch (IllegalArgumentException malformed) { return null; }
             if (!(parsed instanceof Map<?, ?> envelope) || !(envelope.get("error") instanceof Map<?, ?> error)
-                    || !"unsupported_parameter".equals(error.get("code")) || !(error.get("param") instanceof String parameter)) return null;
-            return parameter;
+                    || !(error.get("param") instanceof String parameter)) return null;
+            if ("unsupported_parameter".equals(error.get("code"))
+                    || "unsupported_value".equals(error.get("code")) && "reasoning.summary".equals(parameter)) return parameter;
+            return null;
         }
     }
     private URI endpoint(AiProviderSettings settings, String suffix) {

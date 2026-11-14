@@ -53,7 +53,7 @@ class AiProviderProtocolTest {
             Map<?, ?> body = received.get();
             assertThat(body.get("max_output_tokens")).isEqualTo(8192L);
             assertThat(body.get("store")).isEqualTo(false);
-            assertThat(body.get("reasoning")).isEqualTo(Map.of("summary", "auto"));
+            assertThat(body.get("reasoning")).isEqualTo(Map.of("summary", "concise"));
             assertThat(body.get("input")).isInstanceOf(List.class);
             assertThat(body.containsKey("messages")).isFalse();
             Map<?, ?> tool = (Map<?, ?>) ((List<?>) body.get("tools")).getFirst();
@@ -208,14 +208,17 @@ class AiProviderProtocolTest {
                         .isInstanceOf(io.tapstate.core.common.TapstateException.class), new AtomicReference<>());
     }
 
-    @Test void aResponsesModelCanExplicitlyDeclineSummaryWithoutLosingItsAnswer() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"unsupported_parameter, reasoning",
+            "unsupported_parameter, reasoning.summary", "unsupported_value, reasoning.summary"})
+    void aResponsesModelCanExplicitlyDeclineSummaryWithoutLosingItsAnswer(String code, String parameter) throws Exception {
         var requests = new java.util.concurrent.atomic.AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
         server.createContext("/v1/responses", exchange -> {
             requests.incrementAndGet();
             Map<?, ?> body = (Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             boolean summary = body.containsKey("reasoning");
-            String payload = summary ? JsonWriter.write(Map.of("error", Map.of("code", "unsupported_parameter", "param", "reasoning")))
+            String payload = summary ? JsonWriter.write(Map.of("error", Map.of("code", code, "param", parameter)))
                     : event(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output",
                             List.of(Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "Answer without summary.")))))));
             byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);

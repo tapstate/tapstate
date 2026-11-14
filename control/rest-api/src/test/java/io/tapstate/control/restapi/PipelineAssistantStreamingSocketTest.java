@@ -82,7 +82,7 @@ class PipelineAssistantStreamingSocketTest {
                     assertThat(prefix.get(5, TimeUnit.SECONDS)).contains("Inspecting the selected schema.");
                     assertThat(captured.toString()).contains("reasoning-start").doesNotContain("text-delta", "[DONE]");
                     assertThat(release.getCount()).isEqualTo(1);
-                    assertThat(requested.get().get("reasoning")).isEqualTo(Map.of("summary", "auto"));
+                    assertThat(requested.get().get("reasoning")).isEqualTo(Map.of("summary", "concise"));
                     release.countDown();
                     captured.append(readers.submit(() -> lines.lines().collect(java.util.stream.Collectors.joining("\n"))).get(5, TimeUnit.SECONDS));
                     assertThat(captured.toString()).contains("Checking the output keys.", "reasoning-end", "text-delta", "The schema is ready.", "[DONE]");
