@@ -556,7 +556,7 @@
   ],
   "provenance": {
     "specPath": "connectors/postgres-connector/src/main/resources/spec_postgres.json",
-    "specContentHash": "3c6a264cd984802b",
+    "specContentHash": "90fdcdb004498d09",
     "pdkApiVersion": null,
     "requiredLevel": null,
     "modeSource": {
