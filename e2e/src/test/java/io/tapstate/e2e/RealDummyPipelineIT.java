@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The release-backed process and CLI witnesses require -Dtapstate.dummy.jar.
- * The MongoDB backlog witness also requires -Dtapstate.e2e.connectors-dir.
+ * The MongoDB backlog witness also requires -Dtapstate.e2e.managed-mongo-jar or -Dtapstate.e2e.connectors-dir.
  */
 @RequiresDocker
 class RealDummyPipelineIT {
@@ -172,8 +172,11 @@ class RealDummyPipelineIT {
                     Await.until("the real Dummy stream function to return", Duration.ofSeconds(10),
                             () -> rows(witness, "TAIL_END").size() == 1, () -> control.logs(id));
                     long[] stable = acked(witness);
-                    Thread.sleep(3200);
-                    assertThat(acked(witness)).containsExactly(stable);
+                    long stoppedAt = System.nanoTime();
+                    Await.until("target acknowledgements to stay unchanged after stop", Duration.ofSeconds(10), () -> {
+                        assertThat(acked(witness)).containsExactly(stable);
+                        return System.nanoTime() - stoppedAt >= Duration.ofMillis(3200).toNanos();
+                    }, () -> control.logs(id));
                     System.out.println(first);
                     assertCdc(witness, mode.equals("cdc_only") ? 0 : snapshotRows);
                 }
@@ -482,8 +485,14 @@ class RealDummyPipelineIT {
 
     @Test
     void replaysTheSamePrewrittenMongoBatchThroughRealDummy() throws Exception {
-        RealConnectorGate.require("mongodb");
-        Path mongoJar = ConnectorJars.pathFor("mongodb");
+        String managedMongoJar = System.getProperty("tapstate.e2e.managed-mongo-jar");
+        Path mongoJar;
+        if (managedMongoJar == null || managedMongoJar.isBlank()) {
+            RealConnectorGate.require("mongodb");
+            mongoJar = ConnectorJars.pathFor("mongodb");
+        } else {
+            mongoJar = Path.of(managedMongoJar);
+        }
         System.out.printf("MongoDB source artifact: %s SHA-256 %s%n", mongoJar.getFileName(), digest(mongoJar));
         String database = "dummy_backlog_" + UUID.randomUUID().toString().replace("-", "");
         String uri = SharedMongo.replicaSetUrl(database);
@@ -529,8 +538,8 @@ class RealDummyPipelineIT {
                             change.getOperationType(), change.getDocumentKey(), change.getClusterTime(),
                             change.getResumeToken()));
 
-                    replayMongoBatch(uri, cutoff, 1);
-                    replayMongoBatch(uri, cutoff, 2);
+                    replayMongoBatch(uri, cutoff, 1, mongoJar);
+                    replayMongoBatch(uri, cutoff, 2, mongoJar);
                 }
             } finally {
                 db.drop();
@@ -538,7 +547,7 @@ class RealDummyPipelineIT {
         }
     }
 
-    private void replayMongoBatch(String uri, Instant cutoff, int run) throws Exception {
+    private void replayMongoBatch(String uri, Instant cutoff, int run, Path mongoJar) throws Exception {
         Path seeds = Files.createDirectory(work.resolve("mongo-seed-" + run));
         Path witness = work.resolve("mongo-backlog-" + run + ".tsv");
         Files.write(seeds.resolve("dummy-connector.jar"),
@@ -547,7 +556,7 @@ class RealDummyPipelineIT {
         try (var storage = PreparedNativeStore.create(); var server = start(storage, seeds)) {
             var control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
-            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            control.registerConnector("mongodb", Files.readAllBytes(mongoJar));
             try {
                 // Direct capture positions against MongoDB's history. A fresh shared ring has no history.
                 var source = """
