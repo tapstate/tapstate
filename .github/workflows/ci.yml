@@ -36,18 +36,29 @@ jobs:
   shard-plan:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.plan.outputs.matrix }}
+      docs-only: ${{ steps.scope.outputs.docs-only }}
+      matrix: ${{ steps.scope.outputs.matrix || steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: CI change-scope controls
+        run: python3 .github/scripts/ci-change-scope-smoke.py
+      - name: Classify the original pull request diff
+        id: scope
+        run: python3 .github/scripts/ci-change-scope.py
       - name: Record the original event and actual checkout identities
+        if: steps.scope.outputs.docs-only != 'true'
         run: .github/scripts/ci-receipt.sh event-inputs --root . --output "$RUNNER_TEMP/ci-event-inputs.json"
       - name: Derive every test from the current reactor
+        if: steps.scope.outputs.docs-only != 'true'
         id: plan
         run: |
           .github/scripts/ci-shard.sh plan --root . --durations .github/ci-test-durations.json --output "$RUNNER_TEMP/shards.json"
           matrix_json="$(.github/scripts/ci-shard.sh matrix --root . --plan "$RUNNER_TEMP/shards.json")"
           echo "matrix=$matrix_json" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: steps.scope.outputs.docs-only != 'true'
         with:
           name: ci-shard-plan
           overwrite: true
@@ -57,8 +68,10 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Prepare the verified Mongo dependency for managed-target examples
+        if: steps.scope.outputs.docs-only != 'true'
         run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --output "$RUNNER_TEMP/managed-mongo"
       - uses: actions/upload-artifact@v4
+        if: steps.scope.outputs.docs-only != 'true'
         with:
           name: managed-mongo-test-input
           path: ${{ runner.temp }}/managed-mongo/
@@ -84,37 +97,44 @@ jobs:
       - uses: actions/checkout@v4
       # Receipt hashing uses hashlib.file_digest, available since Python 3.11.
       - uses: actions/setup-python@v6
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           python-version: '3.12'
       - uses: actions/download-artifact@v4
-        if: startsWith(matrix.shard, 'e2e-')
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (startsWith(matrix.shard, 'e2e-')) }}
         with:
           name: managed-mongo-test-input
           path: ${{ runner.temp }}/managed-mongo/
       - uses: actions/setup-java@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
       - name: Verify exact Java build
+        if: needs.shard-plan.outputs.docs-only != 'true'
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - uses: actions/download-artifact@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           name: ci-shard-plan
           path: ${{ runner.temp }}
       # Only third-party dependencies are copied from the shared cache. This job's
       # install outputs live in its temporary repository and never enter that cache.
       - name: Seed an isolated dependency repository
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Build the reactor without running tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/maven-observation"
           .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-prepare.json" --phase prepare -- .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id "${{ matrix.shard }}" -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Prepare pinned public inputs for Cloud startup witnesses
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           SHARD: ${{ matrix.shard }}
           PREPARE_CLOUD_INPUTS: ${{ matrix.prepare_cloud_inputs }}
@@ -146,19 +166,23 @@ jobs:
           fi
       # Only input hashes and tool versions are shared; raw configuration and credentials are excluded.
       - name: Record pre-test build inputs
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json" --shard-id "${{ matrix.shard }}" --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
       - name: Derive complete test identities before selection
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           .github/scripts/ci-evidence.sh inventory --root . --lane ci --published-connectors absent --native-cli-presence absent --output "$RUNNER_TEMP/source-inventory.json"
           .github/scripts/ci-evidence.sh resolve --root . --inventory "$RUNNER_TEMP/source-inventory.json" --inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --repo-local "$RUNNER_TEMP/m2" --output "$RUNNER_TEMP/resolved-inventory.json" --probe-receipt "$RUNNER_TEMP/ci-inputs/provider-probe-receipt.json"
           .github/scripts/ci-evidence.sh export-hashes --input "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/ci-inputs/expected-case-hashes.json"
       - name: Record storage before the test shard
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
           if ! docker system df; then
             echo '::warning::Docker storage could not be observed before the test shard.'
           fi
       - name: Execute exactly this shard
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           # Cloud fixtures share the release-input filesystem for hard links and space.
           MAVEN_ARGS: >-
@@ -186,7 +210,7 @@ jobs:
           fi
           .github/scripts/ci-pr-work.sh --root . --event-inputs "$RUNNER_TEMP/ci-event-inputs.json" --output "$RUNNER_TEMP/ci-inputs/pr-work-verify.json" --phase verify -- .github/scripts/ci-shard.sh run --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2" --case-evidence --build-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --class-gate-dir "$RUNNER_TEMP/ci-inputs/class-gates" --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode"
       - name: Record the observed test identity hashes
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         run: |
           if [ -f "$RUNNER_TEMP/resolved-inventory.json" ] && \
              .github/scripts/ci-evidence.sh reports --root . --lane ci --inventory "$RUNNER_TEMP/resolved-inventory.json" --output "$RUNNER_TEMP/observations.json" --class-gates "$RUNNER_TEMP/ci-inputs/class-gates" --inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --shard-plan "$RUNNER_TEMP/shards.json" --shard "${{ matrix.shard }}"; then
@@ -203,12 +227,13 @@ jobs:
           PY_INCOMPLETE
           fi
       - name: Read back the executed JUnit observer controls
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: python3 .github/scripts/_ci-evidence-regression-smoke.py --junit-shard "$RUNNER_TEMP/shards.json" "${{ matrix.shard }}"
       - name: Record post-test input hashes
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --phase post-test-before-pack --runtime-class-dir "$RUNNER_TEMP/ci-runtime-bytecode" --output "$RUNNER_TEMP/ci-inputs/post-test-inputs.json" --shard-id "${{ matrix.shard }}" --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
       - name: Record storage after the test shard
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         run: |
           df -h "$GITHUB_WORKSPACE" "$RUNNER_TEMP" /tmp
           if ! docker system df; then
@@ -218,13 +243,15 @@ jobs:
             echo '::warning::Some test storage could not be measured.'
           fi
       - name: Preserve downloaded dependencies
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Validate and package this shard's evidence
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           SHARD: ${{ matrix.shard }}
         run: .github/scripts/ci-aggregate.sh pack --plan "$RUNNER_TEMP/shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/ci-artifacts/$SHARD"
       - uses: actions/upload-artifact@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           name: ci-test-results-${{ matrix.shard }}
           overwrite: true
@@ -232,7 +259,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         with:
           name: ci-inputs-${{ matrix.shard }}
           overwrite: true
@@ -240,7 +267,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: The scene where a shard failed
-        if: failure()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (failure()) }}
         uses: actions/upload-artifact@v4
         with:
           name: ci-failure-${{ matrix.shard }}
@@ -262,6 +289,7 @@ jobs:
       cancel-in-progress: false
       queue: max
     outputs:
+      docs-only: ${{ needs.shard-plan.outputs.docs-only }}
       sonar-enabled: ${{ steps.guard.outputs.run }}
       sonar-outcome: ${{ steps.analyze.outcome }}
     needs: [shard-plan, test-shards]
@@ -269,22 +297,37 @@ jobs:
     # Match test-shards so toolchain and ABI evidence remain comparable.
     runs-on: ubuntu-22.04
     steps:
+      - name: Validate CI routing
+        env:
+          PLAN_RESULT: ${{ needs.shard-plan.result }}
+          SHARD_RESULT: ${{ needs.test-shards.result }}
+        run: |
+          test "$PLAN_RESULT" = success
+          test "$SHARD_RESULT" = success
+      - name: Documentation-only CI
+        if: needs.shard-plan.outputs.docs-only == 'true'
+        run: |
+          echo 'Only prose documentation changed. Compilation, integration tests, images and Sonar analysis were not run.' >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - uses: actions/setup-python@v6
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           python-version: '3.12'
       - uses: actions/setup-java@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
       - name: Verify exact Java build
+        if: needs.shard-plan.outputs.docs-only != 'true'
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: Check secret availability
+        if: needs.shard-plan.outputs.docs-only != 'true'
         id: guard
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -326,30 +369,37 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Seed an isolated dependency repository
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - uses: actions/download-artifact@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           name: ci-shard-plan
           path: ${{ runner.temp }}
       - uses: actions/download-artifact@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           pattern: ci-test-results-*
           path: ${{ runner.temp }}/ci-artifacts
           merge-multiple: true
       - name: Prepare local artifacts for report generation
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/maven-observation"
           .github/scripts/ci-build-observation.sh --root . --work-dir "$RUNNER_TEMP/maven-observation" --output "$RUNNER_TEMP/maven-observation/summary.json" --shard-id build -- mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/m2" -DskipTests install
       - name: Record the aggregate build inputs
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-receipt.sh inputs --root . --repo-local "$RUNNER_TEMP/m2" --resolve-classpath --output "$RUNNER_TEMP/ci-inputs/build-inputs.json" --shard-id build --maven-observation "$RUNNER_TEMP/maven-observation/summary.json"
       - uses: actions/download-artifact@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           pattern: ci-inputs-*
           path: ${{ runner.temp }}/ci-shard-inputs
       - name: Admit independent build input hashes
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-receipt.sh compare-inputs --root . --plan "$RUNNER_TEMP/shards.json" --inputs-root "$RUNNER_TEMP/ci-shard-inputs" --aggregate-inputs "$RUNNER_TEMP/ci-inputs/build-inputs.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --output "$RUNNER_TEMP/ci-inputs/build-input-equivalence.json"
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         with:
           name: ci-inputs-build
           overwrite: true
@@ -357,19 +407,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
       - name: Admit the complete report and coverage set
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: .github/scripts/ci-aggregate.sh verify --plan "$RUNNER_TEMP/shards.json" --artifacts "$RUNNER_TEMP/ci-artifacts" --restore .
       - name: Every shard job succeeded
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           SHARD_RESULT: ${{ needs.test-shards.result }}
         run: test "$SHARD_RESULT" = success
       - name: MCP stdio smoke (Boot JAR sidecar)
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           jar="$(find control/mcp-server/target -maxdepth 1 -name 'mcp-server-*-boot.jar' -print -quit)"
           test -n "$jar"
           bash control/mcp-server/mcp-smoke.sh "$jar"
       - name: Identify Sonar cache inputs
         id: sonar-cache-key
-        if: steps.guard.outputs.run == 'true'
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (steps.guard.outputs.run == 'true') }}
         continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -379,7 +432,7 @@ jobs:
       # Older entries can supply unchanged binaries; native hashes select updates.
       - name: Restore Sonar analyzer binaries
         id: sonar-cache
-        if: steps.guard.outputs.run == 'true' && steps.sonar-cache-key.outcome == 'success'
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (steps.guard.outputs.run == 'true' && steps.sonar-cache-key.outcome == 'success') }}
         continue-on-error: true
         uses: actions/cache@v4
         with:
@@ -388,13 +441,14 @@ jobs:
           restore-keys: |
             sonar-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.sonar-cache-key.outputs.server }}-
       - name: Merge coverage from every declared shard
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" -N jacoco:merge@jacoco-merge-reactor
           mvn -B -Dmaven.repo.local="$RUNNER_TEMP/m2" jacoco:report@jacoco-report-reactor
       - name: Analyze admitted coverage
         id: analyze
         continue-on-error: true
-        if: steps.guard.outputs.run == 'true'
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (steps.guard.outputs.run == 'true') }}
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
@@ -435,7 +489,7 @@ jobs:
       # (that is exactly the gate-red case worth commenting on); continue-on-error keeps a comment
       # glitch from ever flipping a green job to red - the analyze step is the sole gate authority.
       - name: Comment quality gate on PR
-        if: always() && steps.guard.outputs.run == 'true' && steps.analyze.outcome != 'skipped' && steps.analyze.outcome != '' && github.event_name == 'pull_request'
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always() && steps.guard.outputs.run == 'true' && steps.analyze.outcome != 'skipped' && steps.analyze.outcome != '' && github.event_name == 'pull_request') }}
         continue-on-error: true
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -520,10 +574,10 @@ jobs:
           echo "Posted quality gate comment (status=${status})."
 
       - name: Preserve downloaded dependencies
-        if: always()
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (always()) }}
         run: .github/scripts/ci-maven-cache.sh collect "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - name: Diff coverage
-        if: github.event_name == 'pull_request'
+        if: ${{ needs.shard-plan.outputs.docs-only != 'true' && (github.event_name == 'pull_request') }}
         continue-on-error: true
         run: |
           base="origin/${{ github.base_ref }}"
@@ -531,6 +585,7 @@ jobs:
             || git fetch --quiet --no-tags origin "${{ github.base_ref }}" || true
           DIFF_RANGE="$base...HEAD" bash .github/scripts/diff-coverage.sh >> "$GITHUB_STEP_SUMMARY"
       - name: Preserve the admitted reports and coverage
+        if: needs.shard-plan.outputs.docs-only != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ci-aggregate
@@ -553,12 +608,17 @@ jobs:
     steps:
       - name: Report analysis outcome
         env:
+          DOCS_ONLY: ${{ needs.build.outputs.docs-only }}
           BUILD_RESULT: ${{ needs.build.result }}
           SONAR_ENABLED: ${{ needs.build.outputs.sonar-enabled }}
           SONAR_OUTCOME: ${{ needs.build.outputs.sonar-outcome }}
         run: |
           set -euo pipefail
           test "$BUILD_RESULT" = success
+          if [ "$DOCS_ONLY" = true ]; then
+            echo 'SonarQube: not evaluated for documentation-only changes.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           if [ "$SONAR_ENABLED" = false ]; then
             echo '::notice title=SonarQube not evaluated::Repository secrets were unavailable. This check is green because analysis was skipped, not because the quality gate passed.'
             printf '## SonarQube: not evaluated\n\nRepository secrets were unavailable (including fork pull requests). This check is green because analysis was skipped, not because the quality gate passed. See the build summary for the reason and diff coverage.\n' >> "$GITHUB_STEP_SUMMARY"
@@ -569,6 +629,7 @@ jobs:
           echo 'SonarQube analysis and quality gate passed.' >> "$GITHUB_STEP_SUMMARY"
 
   installer:
+    needs: shard-plan
     # The install and quickstart scripts are shell, not Java: shellcheck them (ubuntu-latest ships
     # shellcheck) and run their smokes. Both drive platform detection, the unsupported-platform refusals,
     # checksum verification, credential handling and idempotency against local file:// / loopback stubs —
@@ -577,6 +638,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck the shell scripts
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           shellcheck -s sh install/install.sh
           shellcheck install/install-smoke.sh install/_event-sink.sh
@@ -604,52 +666,69 @@ jobs:
           shellcheck -s sh scripts/funnel-report.sh
           shellcheck -s sh scripts/funnel-capture-smoke.sh
       - name: installer smoke
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash install/install-smoke.sh
       - name: installer smoke verdict tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash install/install-smoke-test.sh
       - name: quickstart smoke
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/quickstart/quickstart-smoke.sh
       - name: quickstart smoke verdict tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/quickstart/quickstart-smoke-test.sh
       - name: Dockerfile smoke verdict tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/docker/dockerfile-smoke-test.sh
       - name: Image smoke fixture diagnostics tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           bash deploy/docker/image-smoke-test.sh
           bash deploy/docker/image-smoke-fixture-test.sh
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/docker/native-install-smoke-test.py
       - name: Web asset packaging cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash scripts/prepare-web-assets-smoke.sh
       - name: Web release provenance cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: python3 .github/scripts/web-provenance-smoke.py
       - name: Cloud connector input and test-preparation cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           python3 deploy/cloud/stage-connectors-test.py
           python3 -B .github/scripts/connector-inputs-test.py
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/prepare-test-inputs-test.py
       - name: Cloud image runtime helper cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           node --test deploy/cloud/image-runtime-probe.test.mjs
           PYTHONDONTWRITEBYTECODE=1 python3 deploy/cloud/image-runtime-metadata-test.py
       - name: Public Cloud GHCR publisher cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/cloud/ghcr-publish-smoke.sh
       - name: Authenticated Cloud artifact cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: node --test scripts/seal-cloud-artifact.test.mjs
       - name: Cloud release registration cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: node --test scripts/notify-cloud-release.test.mjs
       - name: Cloud dev version notification cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: node --test scripts/notify-cloud-dev.test.mjs
       - name: install-site verifier smoke
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/install-site/verify-smoke.sh
 
       # A function and the route that reaches it travel separately through the release path, so they
       # can disagree -- and when they do, every downstream signal still looks correct.
       - name: install-site consistency smoke
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: sh deploy/install-site/check-site-smoke.sh
 
       # The receiver decides what is stored, so its rules are tested rather than reviewed. node --test
       # is built in; there is no package.json and no dependency to install.
       - name: install event receiver tests
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: node --test deploy/install-site/api/event.test.js
 
       # The capture/report/publish half of the funnel is where a wrong number is produced silently: a
@@ -657,9 +736,11 @@ jobs:
       # look entirely plausible on the page. Fixtures stand in for the API, so this needs no network
       # and no credentials.
       - name: funnel capture smoke
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: sh scripts/funnel-capture-smoke.sh
 
   catalog-scripts:
+    needs: shard-plan
     # The catalog refresh driver and the connector build it calls are shell, and the driver is a gate:
     # its whole job is turning "this step did not run" into a non-zero exit, because every step of a
     # refresh is a JUnit test that skips - rather than fails - when its inputs are absent. A gate that
@@ -671,6 +752,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: CI evidence and durable receipt controls
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           shellcheck .github/scripts/ci-mechanism-inputs.sh
           python3 -m py_compile .github/scripts/_ci-mechanism-inputs.py .github/scripts/_ci-mechanism-inputs-smoke.py
@@ -702,6 +784,7 @@ jobs:
           bash .github/scripts/ci-pr-instances-smoke.sh
           bash .github/scripts/ci-instance-evidence-smoke.sh
       - name: shellcheck the catalog scripts
+        if: needs.shard-plan.outputs.docs-only != 'true'
         # One invocation over all four rather than a line each: a `run: |` block runs under bash -e,
         # so the first script to report anything aborts the step and the ones after it are never
         # checked - which reads as "the rest were clean". The installer job above lost three scripts
@@ -709,10 +792,13 @@ jobs:
         # is stricter here than a current local build.
         run: shellcheck scripts/refresh-catalog.sh scripts/refresh-catalog-smoke.sh scripts/build-real-connectors.sh scripts/build-real-connectors-smoke.sh .github/scripts/catalog-age-days.sh .github/scripts/catalog-age-days-smoke.sh .github/scripts/diff-coverage.sh .github/scripts/diff-coverage-smoke.sh .github/scripts/translate-intake.sh .github/scripts/translate-intake-smoke.sh .github/scripts/fork-sonar-smoke.sh .github/scripts/issue-templates-smoke.sh .github/scripts/latest-release-tag.sh .github/scripts/latest-release-tag-smoke.sh .github/scripts/set-version.sh .github/scripts/set-version-smoke.sh .github/scripts/next-version.sh .github/scripts/next-version-smoke.sh .github/scripts/release-manifest.sh .github/scripts/release-manifest-smoke.sh .github/scripts/site-from-tag.sh .github/scripts/site-from-tag-smoke.sh .github/scripts/changeset-parity.sh .github/scripts/changeset-parity-smoke.sh .github/scripts/_pr-read.sh .github/scripts/_pr-read-smoke.sh .github/scripts/release-notes-read-failure-smoke.sh .github/scripts/_pr-section.sh .github/scripts/docs-impact.sh .github/scripts/checks-on-commit.sh .github/scripts/checks-on-commit-smoke.sh .github/scripts/docs-gate.sh .github/scripts/docs-gate-smoke.sh .github/scripts/release-notes.sh .github/scripts/release-notes-smoke.sh .github/scripts/release-shape-smoke.sh .github/scripts/quickstart-live-shape-smoke.sh .github/scripts/roadmap-shipped.sh .github/scripts/roadmap-shipped-smoke.sh .github/scripts/satellites.sh .github/scripts/satellites-smoke.sh .github/scripts/docs-release.sh .github/scripts/docs-release-smoke.sh .github/scripts/ci-timing.sh .github/scripts/ci-timing-smoke.sh .github/scripts/ci-shard.sh .github/scripts/ci-shard-smoke.sh .github/scripts/hundred-table-diagnostic.sh .github/scripts/ci-aggregate.sh .github/scripts/ci-aggregate-smoke.sh .github/scripts/ci-shape-smoke.sh .github/scripts/ci-maven-cache.sh .github/scripts/ci-maven-cache-smoke.sh .github/scripts/sonar-inputs.sh .github/scripts/sonar-inputs-smoke.sh .github/scripts/sonar-workflow-smoke.sh .github/scripts/ci-pr-work.sh .github/scripts/connector-witnesses.sh .github/scripts/connector-witnesses-smoke.sh .github/scripts/connector-cache.sh .github/scripts/connector-cache-smoke.sh .github/scripts/connector-workflow-smoke.sh .github/scripts/one-verify.sh .github/scripts/one-verify-smoke.sh .github/scripts/sonar-cache-key.sh .github/scripts/sonar-cache-smoke.sh .github/scripts/nightly-upgrade-expiry-smoke.sh
       - name: One automatic full test suite
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/one-verify.sh
       - name: Full test invocation cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/one-verify-smoke.sh
       - name: CI shard and aggregate cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           python3 .github/scripts/connector-witness-coverage-test.py
           bash .github/scripts/connector-witnesses-smoke.sh
@@ -728,59 +814,75 @@ jobs:
           python3 .github/scripts/sonar-main-gate-timeout-test.py
           bash .github/scripts/sonar-cache-smoke.sh
       - name: CI timing cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/ci-timing-smoke.sh
       - name: refresh driver cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash scripts/refresh-catalog-smoke.sh
       - name: catalog refresh publication credential case
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: python3 .github/scripts/catalog-refresh-push-auth-test.py
       - name: connector build cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash scripts/build-real-connectors-smoke.sh
       - name: catalog age cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/catalog-age-days-smoke.sh
       # Not a catalog script, but this is the job where a shell gate's cases run, and the coverage
       # summary is shell whose failure mode is the one this job exists for: a number that is quietly
       # wrong reads exactly like a number that is right.
       - name: diff coverage cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/diff-coverage-smoke.sh
       # Also not a catalog script. Its own workflow fires on `issues`, so these cases would never
       # run on a pull request if they lived there - and this gate's every failure path is a silent
       # skip, which is precisely the shape that rots unnoticed.
       - name: intake translation cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/translate-intake-smoke.sh
 
       # Also not a catalog script. Three workflows ask it which release is newest, and none of the
       # three is a place its cases could live: two of them only run on a release or a dispatch, and
       # the third would run them once per matrix leg for no gain.
       - name: latest release tag cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/latest-release-tag-smoke.sh
 
       - name: version pin cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/set-version-smoke.sh
 
       - name: next version cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/next-version-smoke.sh
 
       - name: release completeness cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/release-manifest-smoke.sh
 
       # A release tag points at the commit CI validated, which is the tree from *before* the version
       # was written in -- so the two entry points the install site serves have to be pinned on the
       # way out, not read straight from the tag.
       - name: install-site entry point cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/site-from-tag-smoke.sh
 
       # Vacuous against this tree -- no changeset exists yet -- so its cases seed their own. Running
       # it here is what stops it from still being vacuous, and unnoticed, on the day one lands.
       - name: changeset parity cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/changeset-parity-smoke.sh
 
       # The three release gates. They only ever run inside a release, which is the worst possible
       # place to find out one of them is broken -- so their cases run on every push instead.
       - name: The release gate reads the checks on a commit the way it is supposed to
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/checks-on-commit-smoke.sh
       - name: The documentation gate still tells "nobody answered" from "answered none"
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/docs-gate-smoke.sh
       - name: The release notes still assemble the way they are supposed to
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           bash .github/scripts/_pr-read-smoke.sh
           bash .github/scripts/release-notes-smoke.sh
@@ -789,22 +891,26 @@ jobs:
       # here is which of them would be touched and with what ref -- and that is exactly the half whose
       # failure is silent: a satellite dropped from the list is never tagged and nothing reports it.
       - name: Every satellite still gets the branch and the tag it is supposed to
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/satellites-smoke.sh
       # The documentation site is coordinated rather than pinned, and the one thing that must never
       # regress is that it cannot stop a release. Three of these cases read the file rather than run
       # it, because --plan returns 0 down every path and the issue lookup needs somebody else's repo.
       - name: The documentation site still cannot block a release
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/docs-release-smoke.sh
       # The board is a concurrent writer: a project workflow fires when an item is added and lands
       # after the mutation, so a run can report every issue moved, exit 0, and leave the board saying
       # something else. Measured on the first real release -- fifteen reported, seven kept. These
       # cases are the only exercise this script gets outside a published release.
       - name: The roadmap step still reports what the board kept, not what it asked for
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/roadmap-shipped-smoke.sh
       # Not a script's cases -- the release workflow's own shape. The three acts that cannot be
       # taken back are all downstream of the approval, and every one of them is one line from
       # moving; a rejected release is otherwise the only thing that would find out.
       - name: The release workflow still puts every irreversible act after the approval
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/release-shape-smoke.sh
 
       # Same reason, one lane over. The quickstart lanes run nightly against published releases, so
@@ -813,9 +919,11 @@ jobs:
       # release it upgrades to, a `-v` on the stop that turns an upgrade into a fresh install. All
       # three leave the lane green.
       - name: The quickstart lanes still cover arm64, and still upgrade across the volumes
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/quickstart-live-shape-smoke.sh
 
       - name: The upgrade lane no longer uses an expired Git recipe
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/nightly-upgrade-expiry-smoke.sh
 
       # The gate itself, not its cases: six files pin the release version, and rewriting them from
@@ -823,6 +931,7 @@ jobs:
       # time; the MCP server's is read by nothing in the tree, so until this ran, a wrong value there
       # would have shipped without a word.
       - name: the six version pins agree
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: |
           bash .github/scripts/set-version.sh
           git diff --exit-code || {
@@ -834,12 +943,15 @@ jobs:
       # File-level, and that is the point: the property being asserted about the notice workflow is
       # the ABSENCE of a checkout step, which no runtime test can establish.
       - name: fork sonar workflow cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/fork-sonar-smoke.sh
 
       - name: issue template cases
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash .github/scripts/issue-templates-smoke.sh
 
   image-smoke:
+    needs: shard-plan
     # Build the server image for the runner's native architecture and smoke it as a black box: it boots
     # against a throwaway replica set until the image's built-in healthcheck reaches healthy (running as
     # the unprivileged uid), `docker stop` yields an orderly exit 0 (not 137/143), and an unsupported
@@ -858,17 +970,21 @@ jobs:
       # produced. Needs no jar of its own -- it builds the real Dockerfile against a synthetic
       # context -- so it runs first and fails fast.
       - name: dockerfile smoke (the boot-jar glob must not resolve two candidates silently)
+        if: needs.shard-plan.outputs.docs-only != 'true'
         run: bash deploy/docker/dockerfile-smoke.sh
       - uses: actions/setup-java@v4
+        if: needs.shard-plan.outputs.docs-only != 'true'
         with:
           distribution: temurin
           java-version: "21.0.13+9.0.LTS"
           cache: maven
       - name: Verify exact Java build
+        if: needs.shard-plan.outputs.docs-only != 'true'
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
       - name: image smoke (builds the boot jar + image, then runs the black-box checks)
+        if: needs.shard-plan.outputs.docs-only != 'true'
         env:
           TAPSTATE_TEST_CLOUD_RELEASE_DIR: ${{ runner.temp }}/image-test-release
         run: |
