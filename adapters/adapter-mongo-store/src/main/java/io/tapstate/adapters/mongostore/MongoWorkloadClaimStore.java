@@ -242,6 +242,11 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
 
     @Override
     public Optional<WorkloadClaimReading> read(WorkloadClaimKey key) {
+        return Optional.ofNullable(readWithRemainingLease(key)).map(this::reading);
+    }
+
+    /** Keep the stored claim available to a caller that also has to validate its preparation. */
+    Document readWithRemainingLease(WorkloadClaimKey key) {
         Objects.requireNonNull(key, "key");
         // An aggregation rather than a find, for one field: how long this lease still has to run has to be
         // worked out where $$NOW is -- on the server that holds the lease -- so that no clock of ours is
@@ -249,9 +254,8 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         List<Document> pipeline = List.of(
                 new Document("$match", new Document("_id", id(key))),
                 leaseRemaining());
-        Document found = io(() -> (session == null ? collection.aggregate(pipeline)
+        return io(() -> (session == null ? collection.aggregate(pipeline)
                 : collection.aggregate(session, pipeline)).first());
-        return Optional.ofNullable(found).map(this::reading);
     }
 
     /**
@@ -476,7 +480,7 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
         return new WorkloadClaimReading(decodeStrict(document), Duration.ofMillis(number(document, LEASE_REMAINING)));
     }
 
-    private WorkloadClaimReading reading(Document document) {
+    WorkloadClaimReading reading(Document document) {
         if (document == null) throw unreadableClaim();
         if (strict && !(document.get(LEASE_REMAINING) instanceof Long)) throw unreadableClaim();
         if (nodeBacked(document)) {

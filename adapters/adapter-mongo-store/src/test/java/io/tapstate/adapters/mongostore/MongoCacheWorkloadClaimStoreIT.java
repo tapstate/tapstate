@@ -55,7 +55,7 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
-    @Test void aPipelineProofDoesNotRecheckItsPreparedScopeOrNamespaceWithinOneTransaction() {
+    @Test void aPipelineProofReadsThePreparedClaimAndItsServerLeaseTogether() {
         withBusiness(f -> {
             var expected = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
@@ -69,8 +69,8 @@ class MongoCacheWorkloadClaimStoreIT {
                 var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(expected);
                 assertThat(commands).as("one callback retains its verified namespace and exact prepared Pipeline scope")
-                        .hasSize(9);
-                assertThat(commands.stream().filter("find:workload_claims"::equals)).hasSize(1);
+                        .hasSize(8);
+                assertThat(commands.stream().filter("find:workload_claims"::equals)).isEmpty();
                 assertThat(commands.stream().filter("aggregate:workload_claims"::equals)).hasSize(1);
                 assertThat(commands.stream().filter(value -> value.startsWith("listCollections:"))).hasSize(2);
             }
