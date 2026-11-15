@@ -229,18 +229,19 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
         }
         var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-        var current = models.currentReferences(session, root, keys, businessChecked);
+        var facts = writing ? null : new MongoSrsReadFacts(session, database, scope, root, businessChecked);
+        var current = models.currentReferences(session, root, keys, businessChecked, facts);
         var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
                         .collect(java.util.stream.Collectors.toSet()));
         for (var entry : checkpoint.tables().entrySet()) {
             var at = entry.getValue(); var key = at.model();
-            var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key);
+            var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key, facts);
             var range = reference.range(); String ring = reference.model().ringName();
             if ((writing && !fence.equals(reference.fence())) || at.sequence() < range.firstSequence() - 1
                     || (range.nextSequence() != null && at.sequence() >= range.nextSequence())) throw unproven(chain);
             var bounds = boundsByRing.get(ring);
-            if (bounds == null) bounds = log.boundsInSession(session, ring);
+            if (bounds == null) bounds = log.boundsInSession(session, ring, facts);
             if (at.sequence() > bounds.largestSequence()) throw unproven(chain);
             if (at.sequence() >= 0 && at.sequence() > bounds.trimmedThrough()) {
                 var event = log.loadInSession(session, ring, at.sequence()).orElseThrow(() -> unproven(chain));
@@ -267,7 +268,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
         Document row = root(session, chain); if (row == null) throw unproven(chain);
         MongoSrsRecoveryControls.requireOrdinary(row); return row;
     }
-    private boolean hasRetainedFacts(ClientSession session, String chain) {
+    boolean hasRetainedFacts(ClientSession session, String chain) {
         for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
             if (table.on(database).find(session, new Document("_id.chain", chain)).limit(1).first() != null) return true;
         }

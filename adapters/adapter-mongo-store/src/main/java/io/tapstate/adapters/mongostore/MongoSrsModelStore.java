@@ -333,7 +333,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     private SrsModel requireModel(ClientSession session, SrsModelKey key) {
-        var row = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(key))).first();
+        return requireModel(session, key, null);
+    }
+    private SrsModel requireModel(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
+        var row = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODELS, new Document("_id", key(key)));
         if (row == null) throw unavailable(key);
         var model = decode(row);
         if (!key.equals(model.key())) throw unavailable(key);
@@ -427,16 +430,19 @@ public final class MongoSrsModelStore implements SrsModelStore {
         return transaction(session -> loadInSession(session, key));
     }
     private Optional<SrsModel> loadInSession(ClientSession session, SrsModelKey key) {
-            requireBusiness(session);
-            Document chain = requireChain(session, key);
+        return loadInSession(session, key, null);
+    }
+    private Optional<SrsModel> loadInSession(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
+            requireBusiness(session, facts);
+            Document chain = requireChain(session, key, facts);
             Document anchor = contexts.head(chain, key.table());
-            var control = contexts.find(session, key);
-            Document stored = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", key(key))).first();
+            var control = contexts.find(session, key, facts);
+            Document stored = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODELS, new Document("_id", key(key)));
             if (control == null) {
                 if (stored != null || anchor != null) throw unavailable(key);
                 return Optional.empty();
             }
-            contexts.requireAnchor(session, chain, control);
+            contexts.requireAnchor(session, chain, control, facts);
             if (stored == null) {
                 if (key.modelVersion() <= control.publishedVersion()) throw unavailable(key);
                 return Optional.empty();
@@ -447,24 +453,32 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot decoding needs an exact structural reference, without claiming an event-time range. */
     SrsModel requireSnapshotReference(ClientSession session, SrsModelKey key) {
+        return requireSnapshotReference(session,key,null);
+    }
+    private SrsModel requireSnapshotReference(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
         requireScope(key);
-        SrsModel model = loadInSession(session, key).orElseThrow(() -> unavailable(key));
-        requireSnapshotBounds(session, model);
+        SrsModel model = loadInSession(session, key, facts).orElseThrow(() -> unavailable(key));
+        requireSnapshotBounds(session, model, facts);
         return model;
     }
 
     private void requireSnapshotBounds(ClientSession session, SrsModel model) {
-        Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(model.ringName()))).first();
+        requireSnapshotBounds(session,model,null);
+    }
+    private void requireSnapshotBounds(ClientSession session, SrsModel model, MongoSrsReadFacts facts) {
+        Document bounds = MongoSrsReadFacts.find(facts,session,database,SystemCollections.SRS_LOG_BOUNDS,
+                new Document("_id",MongoSrsLogStore.boundsId(model.ringName())));
         if (bounds == null) throw unavailable(model.key());
         requireBounds(bounds);
     }
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
-        if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key); return; }
+        var facts=new MongoSrsReadFacts(session,database,scope,false);
+        if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
         var first = keys.iterator().next();
-        var current = currentReferences(session, requireChain(session, first), keys);
-        if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key); return; }
+        var current = currentReferences(session, requireChain(session, first, facts), keys, false, facts);
+        if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
         var byId = current.orElseThrow().values().stream().collect(java.util.stream.Collectors.toMap(
                 reference -> MongoSrsLogStore.boundsId(reference.model().ringName()), reference -> reference.model().key()));
         var found = new java.util.HashSet<SrsModelKey>();
@@ -482,10 +496,13 @@ public final class MongoSrsModelStore implements SrsModelStore {
     record ModelReference(SrsModel model, WorkloadClaimFence fence, EventModelRange range) {}
 
     ModelReference requireReference(ClientSession session, SrsModelKey key) {
+        return requireReference(session, key, null);
+    }
+    ModelReference requireReference(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
         requireScope(key);
-        SrsModel model = loadInSession(session, key).orElseThrow(() -> unavailable(key));
-        var control = contexts.find(session, key);
-        return new ModelReference(model, control.fence(), range(session, model, control));
+        SrsModel model = loadInSession(session, key, facts).orElseThrow(() -> unavailable(key));
+        var control = contexts.find(session, key, facts);
+        return new ModelReference(model, control.fence(), range(session, model, control, facts));
     }
 
     /** A current, single-context ring can share its exact model and anchor reads within this transaction. */
@@ -495,8 +512,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys,
             boolean businessChecked) {
+        return currentReferences(session, chain, keys, businessChecked, null);
+    }
+    Optional<Map<SrsModelKey, ModelReference>> currentReferences(ClientSession session, Document chain, Set<SrsModelKey> keys,
+            boolean businessChecked, MongoSrsReadFacts facts) {
         if (keys.size() < 2) return Optional.empty();
-        if (!businessChecked) requireBusiness(session);
+        if (!businessChecked) requireBusiness(session, facts);
         for (var key : keys) {
             requireScope(key); requireChain(chain, key);
             var head = contexts.head(chain, key.table());
@@ -507,8 +528,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
         try (var rows = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id", new Document("$in", ids)))
                 .batchSize(64).iterator()) {
             while (rows.hasNext()) {
-                requireActive.run(); var model = decode(rows.next());
+                requireActive.run(); var row = rows.next(); var model = decode(row);
                 if (!keys.contains(model.key()) || selected.put(model.key(), model) != null) throw unreadable();
+                if (facts != null) facts.seed(SystemCollections.SRS_MODELS, row);
             }
         }
         if (selected.size() != keys.size()) return Optional.empty();
@@ -556,7 +578,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 && (model.ddlSequence() != control.publishedSequence() || !control.publishedHash().equals(document(model).get("contentHash")))) throw unreadable();
     }
     private Document requireChain(ClientSession session, SrsModelKey key) {
-        Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", key.miningChainId())).first();
+        return requireChain(session, key, null);
+    }
+    private Document requireChain(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
+        Document chain = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS, new Document("_id", key.miningChainId()));
         return requireChain(chain, key);
     }
     private Document requireChain(Document chain, SrsModelKey key) {
@@ -646,23 +671,26 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** An unseen ring may be inspected only when no published ordering anchor or retained data contradicts it. */
     void checkRing(ClientSession session, String ring) {
-        var control = contexts.firstOnRing(session, ring);
+        checkRing(session, ring, null);
+    }
+    void checkRing(ClientSession session, String ring, MongoSrsReadFacts facts) {
+        var control = contexts.firstOnRing(session, ring, facts);
         Document chain;
         if (control != null) {
-            try { chain = requireChain(session, control.key()); }
+            try { chain = requireChain(session, control.key(), facts); }
             catch (TapstateException missing) {
                 if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
                 throw missing;
             }
         }
         else {
-            chain = SystemCollections.SRS_CHAINS.on(database).find(session,
-                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("modelContextHeads.ringName", ring)).first();
+            chain = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS,
+                    new Document("cacheIncarnation", scope.cacheIncarnation()).append("modelContextHeads.ringName", ring));
             if (chain != null) MongoSrsRecoveryControls.requireOrdinary(chain);
         }
-        Document retained = SystemCollections.SRS_MODELS.on(database).find(session,
-                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).projection(new Document("_id",1)).first();
-        Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
+        Document retained = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODELS,
+                new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring), true);
+        Document bounds = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_LOG_BOUNDS, new Document("_id", MongoSrsLogStore.boundsId(ring)));
         if (control == null) {
             if (chain != null || retained != null || bounds != null
                     || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) {
@@ -670,7 +698,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             }
         } else {
             if (bounds == null || retained == null) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
-            try { contexts.requireAnchor(session, chain, control); }
+            try { contexts.requireAnchor(session, chain, control, facts); }
             catch (TapstateException missing) {
                 if (missing.code() == IoError.SRS_MODEL_UNAVAILABLE) throw eventUnavailable(ring, control.key().captureEpoch(), 0);
                 throw missing;
@@ -743,7 +771,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control) {
-        return range(model, control, key -> requireModel(session, key), id -> contexts.require(session, id));
+        return range(session, model, control, null);
+    }
+    private EventModelRange range(ClientSession session, SrsModel model, MongoSrsModelContexts.Context control, MongoSrsReadFacts facts) {
+        return range(model, control, key -> requireModel(session, key, facts), id -> contexts.require(session, id, facts));
     }
 
     private EventModelRange range(SrsModel model, MongoSrsModelContexts.Context control,
@@ -821,6 +852,10 @@ public final class MongoSrsModelStore implements SrsModelStore {
         catch (IllegalArgumentException invalid) { throw unreadable(); }
     }
     private void requireBusiness(ClientSession session) { new MongoCacheBusinessIdentity(database, scope).requireReady(session); }
+    private void requireBusiness(ClientSession session, MongoSrsReadFacts facts) {
+        if (facts == null) requireBusiness(session);
+        else facts.requireBusiness(session, scope, () -> requireBusiness(session));
+    }
     private Document document(SrsModel model) {
         Document table = MongoSchemaStore.tableDocument(model.table());
         Document row = new Document("_id", key(model.key())).append("formatVersion", 1).append("cacheIncarnation", model.key().cacheIncarnation())

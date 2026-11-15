@@ -528,6 +528,75 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         });
     }
 
+    @Override public Optional<PlanningProgress> planningProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
+        Objects.requireNonNull(original,"original"); requireChainName(chain);
+        var sources = Set.copyOf(Objects.requireNonNull(sourceIds,"sourceIds"));
+        if (!scope.equals(new CacheBusinessScope(original.clusterId(),original.bindingVersion(),original.cacheIncarnation())))
+            throw MongoCacheBusinessIdentity.businessFenced();
+        if (sources.isEmpty() || sources.stream().anyMatch(String::isBlank)) throw new IllegalArgumentException("start planning requires source identities");
+        return transaction(session -> {
+            var root = SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+            if (root == null) {
+                if (chains.hasRetainedFacts(session,chain)) throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chain),null);
+                return Optional.empty();
+            }
+            var state = chains.state(session,root,true);
+            if (!chain.equals(state.miningChainId())) throw unavailable(chain);
+            var members = new HashMap<String,SrsConsumerMembership>();
+            var selected = new HashMap<String,SrsConsumerMembership>();
+            long revisions = 0;
+            try (var rows = SystemCollections.SRS_CONSUMERS.on(database).find(session,records.chain(chain)).batchSize(64).iterator()) {
+                while (rows.hasNext()) {
+                    requireActive.run(); var member = records.membership(rows.next()); var context = member.context();
+                    if (!chain.equals(context.key().miningChainId()) || members.put(context.key().consumerId(),member) != null) throw unavailable(chain);
+                    try { revisions = Math.addExact(revisions,member.revision()); }
+                    catch (ArithmeticException invalid) { throw unavailable(chain); }
+                    if (!context.key().pipelineId().equals(original.pipelineId()) || !sources.contains(context.key().sourceId())) continue;
+                    if (context.stateGeneration() > original.stateGeneration()
+                            || !member.detached() && context.stateGeneration() != original.stateGeneration()) throw unavailable(chain);
+                    if (!member.detached()) selected.put(context.key().consumerId(),member);
+                }
+            }
+            // Control closure needs cursor identities, not another pipeline's private progress payload.
+            var present = new java.util.HashSet<String>();
+            try (var rows = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session,records.chain(chain))
+                    .projection(new Document("_id",1).append("formatVersion",1).append("stateGeneration",1)
+                            .append("membershipRevision",1).append("progressRevision",1)).batchSize(64).iterator()) {
+                while (rows.hasNext()) {
+                    requireActive.run(); var row = rows.next();
+                    if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
+                    var member = members.get(consumer);
+                    if (member == null || member.detached() || !id.equals(records.id(member.context().key())) || !present.add(consumer)) throw unavailable(chain);
+                    if (!row.keySet().equals(Set.of("_id","formatVersion","stateGeneration","membershipRevision","progressRevision"))) throw unavailable(chain);
+                    records.cursorIdentity(member,row);
+                }
+            }
+            long active = members.values().stream().filter(member -> !member.detached()).count();
+            if (active != state.consumerCount() || present.size() != active || revisions != state.consumerRevision()) throw unavailable(chain);
+            var progress = new HashMap<String,SrsConsumerProgress>();
+            if (!selected.isEmpty()) {
+                var ids = selected.values().stream().map(member -> records.id(member.context().key())).toList();
+                try (var rows = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database)
+                        .find(session,new Document("_id",new Document("$in",ids))).batchSize(64).iterator()) {
+                    while (rows.hasNext()) {
+                        requireActive.run(); var row = rows.next();
+                        if (!(row.get("_id") instanceof Document id) || !(id.get("consumer") instanceof String consumer)) throw unavailable(chain);
+                        var member = selected.get(consumer);
+                        if (member == null) throw unavailable(chain);
+                        var cursor = records.cursor(member,row);
+                        validateSnapshot(session,member.context(),cursor.snapshot());
+                        var value = new SrsConsumerProgress(member.context(),member.revision(),cursor.revision(),cursor.value(),
+                                cursor.snapshot(),cursor.writerRun(),cursor.ringDoneThrough());
+                        if (progress.put(consumer,value) != null) throw unavailable(chain);
+                    }
+                }
+            }
+            if (progress.size() != selected.size()) throw unavailable(chain);
+            return Optional.of(new PlanningProgress(state,progress.values().stream()
+                    .sorted(Comparator.comparing(value -> value.context().key().consumerId())).toList()));
+        });
+    }
+
     @Override public Optional<SrsConsumerMembership> find(SrsConsumerKey key) {
         Objects.requireNonNull(key, "key");
         return transaction(session -> Optional.ofNullable(view(session, key.miningChainId()).members().get(key.consumerId())));

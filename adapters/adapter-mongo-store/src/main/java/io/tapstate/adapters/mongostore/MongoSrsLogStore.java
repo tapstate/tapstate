@@ -399,6 +399,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     SrsLogBounds boundsInSession(ClientSession session, String ring) { return splitBounds(session, ring); }
+    SrsLogBounds boundsInSession(ClientSession session, String ring, MongoSrsReadFacts facts) { return splitBounds(session, ring, facts); }
 
     /** Strict retained bounds only; absence is hashed as absence and never converted into an old high-water mark. */
     record RetainedBounds(Map<String,SrsLogBounds> byRing,List<Document> rows) {
@@ -422,8 +423,12 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     private SrsLogBounds splitBounds(ClientSession session, String ring) {
-        if (models != null) models.checkRing(session, ring);
-        Document stored = boundsCollection.find(session, new Document("_id", boundsId(ring))).first();
+        return splitBounds(session, ring, null);
+    }
+    private SrsLogBounds splitBounds(ClientSession session, String ring, MongoSrsReadFacts facts) {
+        if (models != null) models.checkRing(session, ring, facts);
+        Document stored = facts == null ? boundsCollection.find(session, new Document("_id", boundsId(ring))).first()
+                : facts.bounds(session, boundsCollection, new Document("_id", boundsId(ring)));
         if (stored == null) {
             if (collection.find(session, ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null) throw unreadableSplit("bounds");
             return new SrsLogBounds(-1L, -1L);

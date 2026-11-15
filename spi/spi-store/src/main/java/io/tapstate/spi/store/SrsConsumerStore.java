@@ -23,6 +23,33 @@ public interface SrsConsumerStore {
     SrsConsumerTopology attached(String miningChainId);
     record AttachedChain(SrsConsumerTopology topology, SrsChainState chain) {}
 
+    record PlanningProgress(SrsChainState chain, List<SrsConsumerProgress> consumers) {
+        public PlanningProgress { consumers = List.copyOf(consumers); }
+    }
+
+    /**
+     * Predicts a start using only the requested source consumers at the original pipeline generation.
+     * Native stores verify shared control and cursor identities in one snapshot without loading peer
+     * progress payloads. Missing retained history still refuses the read. Legacy facets compose reads.
+     * This result grants no capture, mutation or cleanup authority.
+     */
+    default Optional<PlanningProgress> planningProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
+        var held = attachedWithChain(chain);
+        if (!held.topology().scope().equals(new CacheBusinessScope(original.clusterId(),original.bindingVersion(),original.cacheIncarnation()))
+                || !chain.equals(held.chain().miningChainId()))
+            throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null);
+        var selected = new java.util.ArrayList<SrsConsumerProgress>();
+        for (var member : held.topology().consumers()) {
+            if (!member.context().key().pipelineId().equals(original.pipelineId())
+                    || !sourceIds.contains(member.context().key().sourceId())) continue;
+            if (member.context().stateGeneration() != original.stateGeneration())
+                throw new io.tapstate.core.common.TapstateException(IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+            selected.add(progress(member.context()).orElseThrow(() -> new io.tapstate.core.common.TapstateException(
+                    IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", chain), null)));
+        }
+        return Optional.of(new PlanningProgress(held.chain(), selected));
+    }
+
     default AttachedChain attachedWithChain(String chain) {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
     }
