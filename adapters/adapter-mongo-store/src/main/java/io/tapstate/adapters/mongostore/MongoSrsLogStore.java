@@ -437,7 +437,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
     }
 
     /** The caller has proved each ring's exact retained model, sole context and current anchor in this session. */
-    Map<String, SrsLogBounds> boundsForProvenRings(ClientSession session, java.util.Set<String> rings) {
+    Map<String, SrsLogBounds> boundsForProvenRings(ClientSession session, java.util.Set<String> rings, MongoSrsReadFacts facts) {
         var result = new java.util.HashMap<String, SrsLogBounds>();
         var byId = rings.stream().collect(java.util.stream.Collectors.toMap(MongoSrsLogStore::boundsId, ring -> ring));
         try (var rows = boundsCollection.find(session, new Document("_id", new Document("$in", byId.keySet()))).batchSize(64).iterator()) {
@@ -445,6 +445,7 @@ public final class MongoSrsLogStore implements SrsLogStore {
                 if (models != null) models.checkActive();
                 var row = rows.next(); String ring = byId.get(row.get("_id"));
                 if (ring == null || result.put(ring, decodeSplitBounds(row)) != null) throw unreadableSplit("bounds");
+                if (facts != null) facts.seed(SystemCollections.SRS_LOG_BOUNDS, row);
             }
         }
         return Map.copyOf(result);

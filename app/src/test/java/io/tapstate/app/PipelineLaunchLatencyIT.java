@@ -188,7 +188,7 @@ class PipelineLaunchLatencyIT {
                                 assertThat(record.get("caller_thread_id")).isNotEqualTo(record.get("thread_id"));
                             }));
                     if (restartPlanning) {
-                        assertNativeTarget(storage,running);
+                        assertNativeTarget(storage, running, 1L);
                         request(http,origin,cookie,"POST","/api/pipelines/" + running + ":stop",Map.of("purgeState",false),200);
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() ->
                                 assertThat(request(http,origin,cookie,"GET","/api/pipelines/" + running + "/status",null,200))
@@ -205,8 +205,14 @@ class PipelineLaunchLatencyIT {
                                 .allSatisfy(entry -> assertThat(((Map<?,?>)entry).get("load")).isEqualTo("RESUME"));
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun(running)
                                 .filter(run -> run.status()==com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
-                        assertNativeTarget(storage,running);
-                        System.out.println("NATIVE_RESTART_TARGET_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
+                        System.out.println("NATIVE_RESTART_ENGINE_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
+                        try (var source = com.mongodb.client.MongoClients.create(storage.masterUri())) {
+                            var database = source.getDatabase(storage.masterDatabase());
+                            for (String table : List.of("orders", "customers", "lines"))
+                                database.getCollection(table).insertOne(new org.bson.Document("_id", 2L).append("parent_id", 2L));
+                        }
+                        assertNativeTarget(storage, running, 2L);
+                        System.out.println("NATIVE_RESTART_TARGET_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - requested));
                     }
                     if (!blockPriorObservation && !restartPlanning) {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
@@ -222,15 +228,15 @@ class PipelineLaunchLatencyIT {
         }
     }
 
-    private static void assertNativeTarget(NativeAppStorage storage, String pipeline) throws Exception {
+    private static void assertNativeTarget(NativeAppStorage storage, String pipeline, long parentId) throws Exception {
         try (var client=com.mongodb.client.MongoClients.create(storage.masterUri())) {
             var rows=client.getDatabase(storage.masterDatabase()).getCollection("order_views_" + pipeline.replace('-','_'));
             org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-                var row=rows.find(new org.bson.Document("parent_id",1L)).first();
+                var row=rows.find(new org.bson.Document("parent_id", parentId)).first();
                 assertThat(row).isNotNull();
-                assertThat(row.get("customer",org.bson.Document.class)).containsEntry("parent_id",1L);
+                assertThat(row.get("customer",org.bson.Document.class)).containsEntry("parent_id", parentId);
                 assertThat(row.getList("lines",org.bson.Document.class)).hasSize(1)
-                        .allSatisfy(line -> assertThat(line).containsEntry("parent_id",1L));
+                        .allSatisfy(line -> assertThat(line).containsEntry("parent_id", parentId));
             });
         }
     }

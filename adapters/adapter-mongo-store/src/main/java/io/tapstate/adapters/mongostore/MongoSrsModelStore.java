@@ -35,6 +35,7 @@ import java.util.function.Function;
 public final class MongoSrsModelStore implements SrsModelStore {
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
             .writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
+    private static final int MAX_INITIAL_PUBLICATION_BATCH = 4;
     private static final Document PROVE_CAPTURE = new Document("$inc", new Document("fencedModelWrites", 1L));
     private final MongoClient client;
     private final MongoDatabase database;
@@ -115,15 +116,31 @@ public final class MongoSrsModelStore implements SrsModelStore {
             if (deleted > 0) lease.drop();
             return deleted;
     }
-    private void requireBudget(ClientSession session,SrsModel proposed,Document captured) {
-        long bytes=captured.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-        for(var row:SystemCollections.SRS_MODELS.on(database).find(session,new Document("_id.chain",proposed.key().miningChainId())
-                .append("cacheIncarnation",scope.cacheIncarnation())).batchSize(64)) {
-            bytes+=row.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
-            if(bytes>RETAINED_MODEL_BUDGET_BYTES)break;
+    private long retainedModelBytes(ClientSession session, String chain) {
+        long bytes = 0;
+        try (var rows = SystemCollections.SRS_MODELS.on(database).find(session, new Document("_id.chain", chain)
+                .append("cacheIncarnation", scope.cacheIncarnation())).batchSize(64).iterator()) {
+            while (rows.hasNext()) {
+                requireActive.run();
+                bytes += modelBytes(rows.next());
+                if (bytes > RETAINED_MODEL_BUDGET_BYTES) break;
+            }
         }
-        if(bytes>RETAINED_MODEL_BUDGET_BYTES)throw new TapstateException(IoError.SRS_MODEL_CAPACITY,
-                Map.of("chain",proposed.key().miningChainId(),"bytes",RETAINED_MODEL_BUDGET_BYTES),null);
+        return bytes;
+    }
+
+    private static int modelBytes(Document row) {
+        return row.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    }
+
+    private void requireBudget(ClientSession session, SrsModel proposed, Document captured, Map<String, Long> batchBytes) {
+        String chain = proposed.key().miningChainId();
+        long retained = batchBytes == null ? retainedModelBytes(session, chain)
+                : batchBytes.computeIfAbsent(chain, ignored -> retainedModelBytes(session, chain));
+        long next = retained + modelBytes(captured);
+        if (next > RETAINED_MODEL_BUDGET_BYTES) throw new TapstateException(IoError.SRS_MODEL_CAPACITY,
+                Map.of("chain", chain, "bytes", RETAINED_MODEL_BUDGET_BYTES), null);
+        if (batchBytes != null) batchBytes.put(chain, next);
     }
 
     @Override public SrsModel publishInitial(SrsModelKey key, String ring, SourceTable actual, WorkloadClaimFence fence) {
@@ -135,34 +152,71 @@ public final class MongoSrsModelStore implements SrsModelStore {
         Objects.requireNonNull(comparison, "comparison");
         requireScope(key);
         if (key.modelVersion() != 0) throw new IllegalArgumentException("an initial model has version zero");
-        SourceTable captured = new SourceTable(actual.name(), actual.fields(), actual.primaryKey(), actual.indexes());
-        SrsModel candidate =
-                transaction(
-                        session -> {
-                            requireBusiness(session);
-                            Document chain = requireChain(session, key);
-                            var control = contexts.find(session, key);
-                            SourceTable proposed = captured;
-                            long first;
-                            if (control != null) {
-                                contexts.requireAnchor(session, chain, control);
-                                if (control.publishedVersion() != 0) throw unavailable(key);
-                                var retained =
-                                        loadInSession(session, key)
-                                                .orElseThrow(() -> unavailable(key));
-                                first = retained.ddlSequence();
-                                if (comparison == SourceModelComparison.SAMPLED_DOCUMENT
-                                        && comparison.acceptsObservation(
-                                                retained.table(), captured))
-                                    proposed = retained.table();
-                            } else {
-                                first = initialSequence(session, key, ring);
-                            }
-                            return new SrsModel(key, ring, proposed, first);
-                        });
-        // A fixed proposal is revalidated by publication under the original live claim and current
-        // context/bounds. A racing append or context change refuses it rather than selecting a newer one.
-        return publish(candidate, fence);
+        var proposal = transaction(session -> initialProposal(session, key, ring, actual, comparison, null));
+        // Keep the proposal fixed across publication retries; a changed source context must refuse it.
+        return publish(proposal, fence);
+    }
+
+    private SrsModel initialProposal(ClientSession session, SrsModelKey key, String ring, SourceTable actual,
+            SourceModelComparison comparison, MongoSrsReadFacts facts) {
+        requireBusiness(session, facts);
+        Document chain = requireChain(session, key, facts);
+        var control = contexts.find(session, key, facts);
+        SourceTable proposed = new SourceTable(actual.name(), actual.fields(), actual.primaryKey(), actual.indexes());
+        long first;
+        if (control != null) {
+            contexts.requireAnchor(session, chain, control, facts);
+            if (control.publishedVersion() != 0) throw unavailable(key);
+            var retained = loadInSession(session, key, facts).orElseThrow(() -> unavailable(key));
+            first = retained.ddlSequence();
+            if (comparison == SourceModelComparison.SAMPLED_DOCUMENT
+                    && comparison.acceptsObservation(retained.table(), proposed)) proposed = retained.table();
+        } else first = initialSequence(session, key, ring);
+        return new SrsModel(key, ring, proposed, first);
+    }
+
+    @Override public Map<SrsModelKey, SrsModel> requireAll(Set<SrsModelKey> keys) {
+        var selected = Set.copyOf(keys);
+        selected.forEach(this::requireScope);
+        if (selected.isEmpty()) return Map.of();
+        if (selected.size() > 64) return SrsModelStore.super.requireAll(selected);
+        return transaction(session -> {
+            var facts = new MongoSrsReadFacts(session, database, scope, false);
+            var result = new java.util.LinkedHashMap<SrsModelKey, SrsModel>();
+            for (var key : selected) result.put(key, loadInSession(session, key, facts).orElseThrow(() -> unavailable(key)));
+            return Map.copyOf(result);
+        });
+    }
+
+    @Override public Map<SrsModelKey, SrsModel> publishObservedInitials(Map<SrsModelKey, InitialObservation> observations,
+            WorkloadClaimFence fence, SourceModelComparison comparison) {
+        var selected = Map.copyOf(observations);
+        Objects.requireNonNull(fence, "originalCapture"); Objects.requireNonNull(comparison, "comparison");
+        selected.forEach((key, observation) -> {
+            requireScope(key);
+            if (key.modelVersion() != 0) throw new IllegalArgumentException("an initial model has version zero");
+        });
+        if (selected.isEmpty()) return Map.of();
+        // Keep one exact capture context per batch, and leave renewal boundaries for wide sources.
+        var first = selected.keySet().iterator().next();
+        if (selected.size() > MAX_INITIAL_PUBLICATION_BATCH || selected.keySet().stream().anyMatch(key ->
+                !key.miningChainId().equals(first.miningChainId()) || key.captureEpoch() != first.captureEpoch()))
+            return SrsModelStore.super.publishObservedInitials(selected, fence, comparison);
+        var proposals = transaction(session -> {
+            var facts = new MongoSrsReadFacts(session, database, scope, false);
+            var result = new java.util.LinkedHashMap<SrsModelKey, SrsModel>();
+            selected.forEach((key, observation) -> result.put(key,
+                    initialProposal(session, key, observation.ring(), observation.table(), comparison, facts)));
+            return Map.copyOf(result);
+        });
+        // Proposals are fixed; every retry earns a fresh write proof and capacity budget.
+        return changingTheModels(() -> transaction(session -> {
+            requireBusiness(session);
+            var result = new java.util.LinkedHashMap<SrsModelKey, SrsModel>();
+            var batchBytes = new HashMap<String, Long>();
+            proposals.forEach((key, proposal) -> result.put(key, publishInSession(session, proposal, fence, batchBytes)));
+            return Map.copyOf(result);
+        }));
     }
 
     private long initialSequence(ClientSession session, SrsModelKey key, String ring) {
@@ -185,6 +239,9 @@ public final class MongoSrsModelStore implements SrsModelStore {
         try { return change.get(); } finally { lease.drop(); }
     }
     SrsModel publishInSession(ClientSession session, SrsModel model, WorkloadClaimFence fence) {
+        return publishInSession(session, model, fence, null);
+    }
+    private SrsModel publishInSession(ClientSession session, SrsModel model, WorkloadClaimFence fence, Map<String, Long> batchBytes) {
         lease.drop();
         if (!session.hasActiveTransaction()) throw new IllegalStateException("model publication requires its original CACHE transaction");
         Objects.requireNonNull(model, "model"); Objects.requireNonNull(fence, "captureFence");
@@ -192,7 +249,8 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (fence.key().type() != WorkloadClaimType.CAPTURE || !scope.clusterId().equals(fence.key().clusterId())) throw claimFenced();
         Document captured = document(model);
         if (!decode(captured).equals(model)) throw unavailable(model.key());
-        requireBusiness(session);
+        if (batchBytes == null) requireBusiness(session);
+        else requireActive.run();
         Document chain = requireChain(session, model.key());
         if (!Long.valueOf(model.key().captureEpoch()).equals(chain.get("epoch"))
                 || !fence.key().resourceId().equals(chain.get("captureId"))) throw unavailable(model.key());
@@ -231,7 +289,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
             contexts.insert(session, initial);
             contexts.setHead(session, chain, initial);
         }
-        requireBudget(session,model,captured);
+        requireBudget(session, model, captured, batchBytes);
         models.insertOne(session, captured);
         return model;
     }
@@ -381,6 +439,8 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 throw unavailable(new SrsModelKey(chainId, firstTable, scope.cacheIncarnation(), 1, 0));
             }
             var checkpoint = MongoSrsChainStore.decode(chain, scope, contexts).checkpoint();
+            var facts = new MongoSrsReadFacts(session, database, scope, chain, true);
+            prefetchSnapshotHeads(session, chain, selected, facts);
             var result = new java.util.TreeMap<String, SrsModel>();
             for (var entry : new java.util.TreeMap<>(selected).entrySet()) {
                 String table = entry.getKey(); String ring = entry.getValue();
@@ -404,18 +464,31 @@ public final class MongoSrsModelStore implements SrsModelStore {
                     }
                     continue;
                 }
-                var control = contexts.require(session, anchor.get("contextId", Document.class));
-                contexts.requireAnchor(session, chain, control);
+                var control = contexts.require(session, anchor.get("contextId", Document.class), facts);
+                contexts.requireAnchor(session, chain, control, facts);
                 if (!ring.equals(control.ring()) || control.nextId() != null) throw unavailable(control.key());
-                SrsModel model = requirePublishedHead(session, control);
-                Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
-                        new Document("_id", MongoSrsLogStore.boundsId(ring))).first();
-                if (bounds == null) throw unavailable(model.key());
-                requireBounds(bounds);
+                SrsModel model = requirePublishedHead(session, control, facts);
+                requireSnapshotBounds(session, model, facts);
                 result.put(table, model);
             }
             return result.size() == selected.size() ? Optional.of(Map.copyOf(result)) : Optional.empty();
         });
+    }
+
+    private void prefetchSnapshotHeads(ClientSession session, Document chain, Map<String, String> selected, MongoSrsReadFacts facts) {
+        if (selected.size() < 2 || selected.size() > 64) return;
+        var ids = new java.util.ArrayList<Document>();
+        for (String table : selected.keySet()) {
+            var head = contexts.head(chain, table);
+            if (head == null) return;
+            ids.add(head.get("contextId", Document.class));
+        }
+        if (!facts.prefetchExactIds(SystemCollections.SRS_MODEL_CONTEXTS, ids, requireActive)) return;
+        var models = ids.stream().map(id -> contexts.require(session, id, facts))
+                .map(control -> key(version(control, control.publishedVersion()))).toList();
+        if (!facts.prefetchExactIds(SystemCollections.SRS_MODELS, models, requireActive)) return;
+        facts.prefetchExactIds(SystemCollections.SRS_LOG_BOUNDS,
+                selected.values().stream().map(MongoSrsLogStore::boundsId).toList(), requireActive);
     }
 
     private void requireSnapshotResources() {
@@ -474,13 +547,22 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
-        var facts=new MongoSrsReadFacts(session,database,scope,false);
+        requireSnapshotReferences(session, keys, new MongoSrsReadFacts(session, database, scope, false));
+    }
+
+    void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys, MongoSrsReadFacts facts) {
         if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
         var first = keys.iterator().next();
         var current = currentReferences(session, requireChain(session, first, facts), keys, false, facts);
         if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
-        var byId = current.orElseThrow().values().stream().collect(java.util.stream.Collectors.toMap(
+        var references = current.orElseThrow().values();
+        var byId = references.stream().collect(java.util.stream.Collectors.toMap(
                 reference -> MongoSrsLogStore.boundsId(reference.model().ringName()), reference -> reference.model().key()));
+        if (facts.prefetchExactIds(SystemCollections.SRS_LOG_BOUNDS, byId.keySet(), requireActive)) {
+            for (var reference : references) requireSnapshotBounds(session, reference.model(), facts);
+            return;
+        }
+        // An incomplete batch still distinguishes an absent boundary from a collating invalid row.
         var found = new java.util.HashSet<SrsModelKey>();
         try (var rows = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session,
                 new Document("_id", new Document("$in", byId.keySet()))).batchSize(64).iterator()) {
@@ -490,7 +572,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 requireBounds(row);
             }
         }
-        for (var key : keys) if (!found.contains(key)) throw unavailable(key);
+        for (var key : byId.values()) if (!found.contains(key)) throw unavailable(key);
     }
 
     record ModelReference(SrsModel model, WorkloadClaimFence fence, EventModelRange range) {}
@@ -518,6 +600,12 @@ public final class MongoSrsModelStore implements SrsModelStore {
             boolean businessChecked, MongoSrsReadFacts facts) {
         if (keys.size() < 2) return Optional.empty();
         if (!businessChecked) requireBusiness(session, facts);
+        return facts == null ? loadCurrentReferences(session, chain, keys, null)
+                : facts.currentReferences(session, database, keys, () -> loadCurrentReferences(session, chain, keys, facts));
+    }
+
+    private Optional<Map<SrsModelKey, ModelReference>> loadCurrentReferences(ClientSession session, Document chain,
+            Set<SrsModelKey> keys, MongoSrsReadFacts facts) {
         for (var key : keys) {
             requireScope(key); requireChain(chain, key);
             var head = contexts.head(chain, key.table());
@@ -557,8 +645,11 @@ public final class MongoSrsModelStore implements SrsModelStore {
     }
 
     private SrsModel requirePublishedHead(ClientSession session, MongoSrsModelContexts.Context control) {
-        Document stored = SystemCollections.SRS_MODELS.on(database).find(session,
-                new Document("_id", key(version(control, control.publishedVersion())))).first();
+        return requirePublishedHead(session, control, null);
+    }
+    private SrsModel requirePublishedHead(ClientSession session, MongoSrsModelContexts.Context control, MongoSrsReadFacts facts) {
+        Document stored = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_MODELS,
+                new Document("_id", key(version(control, control.publishedVersion()))));
         if (stored == null) throw unavailable(control.key());
         SrsModel model = decode(stored); requirePublished(control, model);
         if (!control.publishedHash().equals(stored.get("contentHash")) || model.ddlSequence() != control.publishedSequence()) throw unreadable();

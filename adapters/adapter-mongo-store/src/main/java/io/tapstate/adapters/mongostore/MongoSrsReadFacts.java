@@ -4,14 +4,18 @@ import com.mongodb.client.ClientSession;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.spi.store.CacheBusinessScope;
+import io.tapstate.spi.store.SrsModelKey;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
 import org.bson.Document;
 import org.bson.json.JsonMode;
 import org.bson.json.JsonWriterSettings;
 
-/** Dependency reads shared only by one checkpoint proof in its original transaction callback. */
+/** Dependency reads shared only by one read operation in its original transaction callback. */
 final class MongoSrsReadFacts {
     private record Lookup(SystemCollections table, String filter, boolean idOnly) {}
     private static final JsonWriterSettings EXACT_BSON = JsonWriterSettings.builder().outputMode(JsonMode.EXTENDED).build();
@@ -19,6 +23,7 @@ final class MongoSrsReadFacts {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Map<Lookup, Optional<Document>> rows = new HashMap<>();
+    private final Map<Set<SrsModelKey>, Optional<Map<SrsModelKey, MongoSrsModelStore.ModelReference>>> currentReferences = new HashMap<>();
     private boolean businessChecked;
 
     MongoSrsReadFacts(ClientSession session, MongoDatabase database, CacheBusinessScope scope,
@@ -43,8 +48,44 @@ final class MongoSrsReadFacts {
         }
     }
 
+    Optional<Map<SrsModelKey, MongoSrsModelStore.ModelReference>> currentReferences(ClientSession original,
+            MongoDatabase selected, Set<SrsModelKey> keys,
+            Supplier<Optional<Map<SrsModelKey, MongoSrsModelStore.ModelReference>>> read) {
+        requireSession(original, selected);
+        return currentReferences.computeIfAbsent(Set.copyOf(keys), ignored -> read.get());
+    }
+
     void seed(SystemCollections table, Document row) {
         rows.put(lookup(table, new Document("_id", row.get("_id")), false), Optional.of(row));
+    }
+
+    /** Seeds only a complete batch of exact IDs; aliases and missing rows fall back to point proofs. */
+    boolean prefetchExactIds(SystemCollections table, Collection<?> ids, Runnable requireActive) {
+        requireSession(session, database);
+        var remaining = new java.util.LinkedHashMap<Lookup, Object>();
+        for (Object id : ids) {
+            var key = lookup(table, new Document("_id", id), false);
+            var known = rows.get(key);
+            if (known == null) remaining.put(key, id);
+            else if (known.isEmpty() || !key.equals(lookup(table, new Document("_id", known.orElseThrow().get("_id")), false)))
+                return false;
+        }
+        if (remaining.isEmpty()) return true;
+        var requested = java.util.List.copyOf(remaining.values());
+        var found = new HashMap<Lookup, Optional<Document>>();
+        try (var cursor = table.on(database).find(session, new Document("_id", new Document("$in", requested)))
+                .limit(remaining.size() + 1).batchSize(64).iterator()) {
+            while (cursor.hasNext()) {
+                requireActive.run();
+                var row = cursor.next();
+                var key = lookup(table, new Document("_id", row.get("_id")), false);
+                if (remaining.remove(key) == null) return false;
+                found.put(key, Optional.of(row));
+            }
+        }
+        if (!remaining.isEmpty()) return false;
+        rows.putAll(found);
+        return true;
     }
 
     static Document find(MongoSrsReadFacts facts, ClientSession session, MongoDatabase database,

@@ -540,7 +540,8 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 if (chains.hasRetainedFacts(session,chain)) throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chain),null);
                 return Optional.empty();
             }
-            var state = chains.state(session,root,true);
+            var facts = new MongoSrsReadFacts(session, database, scope, root, true);
+            var state = chains.state(session, root, true, facts);
             if (!chain.equals(state.miningChainId())) throw unavailable(chain);
             var members = new HashMap<String,SrsConsumerMembership>();
             var selected = new HashMap<String,SrsConsumerMembership>();
@@ -584,7 +585,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         var member = selected.get(consumer);
                         if (member == null) throw unavailable(chain);
                         var cursor = records.cursor(member,row);
-                        validateSnapshot(session,member.context(),cursor.snapshot());
+                        validateSnapshot(session, member.context(), cursor.snapshot(), facts);
                         var value = new SrsConsumerProgress(member.context(),member.revision(),cursor.revision(),cursor.value(),
                                 cursor.snapshot(),cursor.writerRun(),cursor.ringDoneThrough());
                         if (progress.put(consumer,value) != null) throw unavailable(chain);
@@ -716,9 +717,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) {
         Objects.requireNonNull(context, "context");
         return transaction(session -> {
-            var own = own(session,context);
+            var facts = new MongoSrsReadFacts(session, database, scope, true);
+            var own = own(session, context, true, facts);
             if (own == null || own.member().detached()) return Optional.empty();
-            var held = own.cursor(); validateSnapshot(session, context, held.snapshot());
+            var held = own.cursor(); validateSnapshot(session, context, held.snapshot(), facts);
             return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
         });
     }
@@ -726,10 +728,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     @Override public Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {
         var selected = Map.copyOf(ringsByTable);
         return transaction(session -> {
-            var original = own(session, context, true);
+            var facts = new MongoSrsReadFacts(session, database, scope, true);
+            var original = own(session, context, true, facts);
             if (original == null || original.member().detached()) return Optional.empty();
             var held = original.cursor();
-            validateSnapshot(session, context, held.snapshot());
+            validateSnapshot(session, context, held.snapshot(), facts);
             var progress = new SrsConsumerProgress(context, original.member().revision(), held.revision(),
                     held.value(), held.snapshot(), held.writerRun(), held.ringDoneThrough());
             var missing = new java.util.HashSet<String>();
@@ -1164,6 +1167,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
+        validateSnapshot(session, context, snapshot, new MongoSrsReadFacts(session, database, scope, false));
+    }
+
+    private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot,
+            MongoSrsReadFacts facts) {
         if (snapshot == null) return;
         var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
         for (var key : snapshot.models().values()) {
@@ -1171,7 +1179,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 throw unavailable(context.key().miningChainId());
             }
         }
-        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()));
+        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()), facts);
     }
     @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
@@ -1305,10 +1313,14 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked) {
+        return own(session, context, businessChecked, new MongoSrsReadFacts(session, database, scope, businessChecked));
+    }
+
+    private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked, MongoSrsReadFacts facts) {
         String chain = context.key().miningChainId();
-        var root = SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chain)).first();
+        var root = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS, new Document("_id", chain));
         if (root == null) throw unavailable(chain);
-        var state = chains.state(session, root, businessChecked); var id = new Document("_id",records.id(context.key()));
+        var state = chains.state(session, root, businessChecked, facts); var id = new Document("_id",records.id(context.key()));
         var row = SystemCollections.SRS_CONSUMERS.on(database).find(session,id).first();
         if (row == null) {
             // Prove absence through the complete dependency view before allowing a new caller to prepare.
