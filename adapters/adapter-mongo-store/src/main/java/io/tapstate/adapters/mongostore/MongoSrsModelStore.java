@@ -453,24 +453,32 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot decoding needs an exact structural reference, without claiming an event-time range. */
     SrsModel requireSnapshotReference(ClientSession session, SrsModelKey key) {
+        return requireSnapshotReference(session,key,null);
+    }
+    private SrsModel requireSnapshotReference(ClientSession session, SrsModelKey key, MongoSrsReadFacts facts) {
         requireScope(key);
-        SrsModel model = loadInSession(session, key).orElseThrow(() -> unavailable(key));
-        requireSnapshotBounds(session, model);
+        SrsModel model = loadInSession(session, key, facts).orElseThrow(() -> unavailable(key));
+        requireSnapshotBounds(session, model, facts);
         return model;
     }
 
     private void requireSnapshotBounds(ClientSession session, SrsModel model) {
-        Document bounds = SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(model.ringName()))).first();
+        requireSnapshotBounds(session,model,null);
+    }
+    private void requireSnapshotBounds(ClientSession session, SrsModel model, MongoSrsReadFacts facts) {
+        Document bounds = MongoSrsReadFacts.find(facts,session,database,SystemCollections.SRS_LOG_BOUNDS,
+                new Document("_id",MongoSrsLogStore.boundsId(model.ringName())));
         if (bounds == null) throw unavailable(model.key());
         requireBounds(bounds);
     }
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
-        if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key); return; }
+        var facts=new MongoSrsReadFacts(session,database,scope,false);
+        if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
         var first = keys.iterator().next();
-        var current = currentReferences(session, requireChain(session, first), keys);
-        if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key); return; }
+        var current = currentReferences(session, requireChain(session, first, facts), keys, false, facts);
+        if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key, facts); return; }
         var byId = current.orElseThrow().values().stream().collect(java.util.stream.Collectors.toMap(
                 reference -> MongoSrsLogStore.boundsId(reference.model().ringName()), reference -> reference.model().key()));
         var found = new java.util.HashSet<SrsModelKey>();

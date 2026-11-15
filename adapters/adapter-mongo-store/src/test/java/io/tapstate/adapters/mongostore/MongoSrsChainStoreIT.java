@@ -178,6 +178,37 @@ class MongoSrsChainStoreIT {
     }
 
     @Test
+    void aSnapshotModelProofAlsoReusesItsDependenciesWhenRingsHaveHistory() {
+        withBusiness(f -> {
+            var saved=prepareRetainedEpochs(f,Set.of("one","two","three","four"),3);
+            var keys=saved.checkpoint().tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
+            assertThat(keys).hasSize(4);
+            var reads=new java.util.concurrent.atomic.AtomicInteger();
+            var transactions=new java.util.HashSet<String>();
+            var listener=new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database().getName()) || !event.getCommandName().equals("find")) return;
+                    reads.incrementAndGet();
+                    assertThat(event.getCommand().containsKey("txnNumber")).isTrue();
+                    transactions.add(event.getCommand().get("txnNumber").toString());
+                }
+            };
+            try (var observed=MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build());
+                 var session=observed.startSession()) {
+                var models=new MongoSrsModelStore(observed,observed.getDatabase(f.database().getName()),SCOPE);
+                session.withTransaction(() -> {
+                    models.requireSnapshotReferences(session,keys); return null;
+                },com.mongodb.TransactionOptions.builder().readConcern(com.mongodb.ReadConcern.SNAPSHOT)
+                        .writeConcern(com.mongodb.WriteConcern.MAJORITY).build());
+                assertThat(transactions).hasSize(1);
+                assertThat(reads.get()).isPositive().isLessThanOrEqualTo(16);
+            }
+            assertThat(root(f).get("checkpointRevision")).isEqualTo(saved.checkpointRevision());
+        });
+    }
+
+    @Test
     void aSourceCheckpointKeepsExactModelsForQuietTablesAndSurvivesANewCaptureEpoch() {
         withBusiness(f -> {
             prepare(f, Set.of(ORDERS, QUIET));

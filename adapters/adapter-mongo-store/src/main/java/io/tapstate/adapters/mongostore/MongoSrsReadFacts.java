@@ -23,11 +23,15 @@ final class MongoSrsReadFacts {
 
     MongoSrsReadFacts(ClientSession session, MongoDatabase database, CacheBusinessScope scope,
             Document root, boolean businessChecked) {
+        this(session,database,scope,businessChecked);
+        seed(SystemCollections.SRS_CHAINS, root);
+    }
+
+    MongoSrsReadFacts(ClientSession session, MongoDatabase database, CacheBusinessScope scope, boolean businessChecked) {
         this.session = session;
         this.database = database;
         this.scope = scope;
         this.businessChecked = businessChecked;
-        seed(SystemCollections.SRS_CHAINS, root);
     }
 
     void requireBusiness(ClientSession original, CacheBusinessScope expected, Runnable verify) {

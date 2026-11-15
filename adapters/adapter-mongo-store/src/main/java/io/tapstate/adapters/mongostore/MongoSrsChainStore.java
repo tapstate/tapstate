@@ -268,7 +268,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
         Document row = root(session, chain); if (row == null) throw unproven(chain);
         MongoSrsRecoveryControls.requireOrdinary(row); return row;
     }
-    private boolean hasRetainedFacts(ClientSession session, String chain) {
+    boolean hasRetainedFacts(ClientSession session, String chain) {
         for (var table : List.of(SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)) {
             if (table.on(database).find(session, new Document("_id.chain", chain)).limit(1).first() != null) return true;
         }

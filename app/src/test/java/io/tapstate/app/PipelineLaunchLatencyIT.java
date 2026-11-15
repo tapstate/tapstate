@@ -37,6 +37,8 @@ class PipelineLaunchLatencyIT {
 
     @Test void anIndependentNativeStartDeliversWhileAnotherPipelinesAlertProofIsHeld() throws Exception { measure(true, false, true); }
 
+    @Test void aNativeRestartPlansOneOwnCursorBatchAndDeliversItsTarget() throws Exception { measure(false,false,false,true); }
+
     private void measure(boolean blockPriorObservation) throws Exception { measure(blockPriorObservation, false); }
 
     private void measure(boolean blockPriorObservation, boolean blockMaintenance) throws Exception {
@@ -44,6 +46,10 @@ class PipelineLaunchLatencyIT {
     }
 
     private void measure(boolean blockPriorObservation, boolean blockMaintenance, boolean blockProof) throws Exception {
+        measure(blockPriorObservation,blockMaintenance,blockProof,false);
+    }
+
+    private void measure(boolean blockPriorObservation, boolean blockMaintenance, boolean blockProof, boolean restartPlanning) throws Exception {
         try (var config = mongo(); var cache = mongo()) {
             config.start(); cache.start();
             var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("launch_config"),
@@ -105,7 +111,7 @@ class PipelineLaunchLatencyIT {
                             .GET().build(), HttpResponse.BodyHandlers.ofString());
                     assertThat(login.statusCode()).isEqualTo(302);
                     String cookie = login.headers().firstValue("set-cookie").orElseThrow().split(";", 2)[0];
-                    int samples = blockPriorObservation ? 2 : Integer.getInteger("launch.samples", 2);
+                    int samples = blockPriorObservation || restartPlanning ? 2 : Integer.getInteger("launch.samples", 2);
                     for (int sample = 0; sample < samples; sample++) {
                         String id = "launch-" + sample;
                         request(http, origin, cookie, "POST", "/api/pipelines/" + id + "/draft", draft(id), 201);
@@ -117,7 +123,7 @@ class PipelineLaunchLatencyIT {
                     }
                     String running = "launch-" + (samples - 1);
                     var engine = NativeAppStorage.business(application).getBean(io.tapstate.runtime.engine.Engine.class);
-                    if (blockPriorObservation) {
+                    if (blockPriorObservation || restartPlanning) {
                         request(http, origin, cookie, "POST", "/api/pipelines/launch-0:start", Map.of(), 200);
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun("launch-0")
                                 .filter(run -> run.status() == com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
@@ -138,7 +144,7 @@ class PipelineLaunchLatencyIT {
                         if (barrier != null) assertThat(barrier.entered.await(30,TimeUnit.SECONDS))
                                 .as("the prior Pipeline must enter the selected observation, maintenance or proof barrier").isTrue();
                         var admin = raw.getDatabase("admin");
-                        if (!blockPriorObservation) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
+                        if (!blockPriorObservation && !restartPlanning) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand").append("mode", "alwaysOn")
                                 .append("data", new org.bson.Document("failCommands", List.of("update"))
                                         .append("namespace", storage.cacheDatabase() + "." + io.tapstate.adapters.mongostore.SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName())
                                         .append("blockConnection", true).append("blockTimeMS", 5000)));
@@ -153,7 +159,7 @@ class PipelineLaunchLatencyIT {
                                     .as("the new real engine must run before the unrelated dependency is released").isEqualTo(1);
                             var state = request(http, origin, cookie, "GET", "/api/pipelines/" + running + "/status", null, 200);
                             assertThat(state).containsEntry("state", "RUNNING").containsEntry("displayState", "RUNNING");
-                            if (!blockPriorObservation) assertThat(state).doesNotContainKeys("observedAt", "observedState");
+                            if (!blockPriorObservation && !restartPlanning) assertThat(state).doesNotContainKeys("observedAt", "observedState");
                             if (barrier != null) {
                                 try (var target = com.mongodb.client.MongoClients.create(storage.masterUri())) {
                                     var rows = target.getDatabase(storage.masterDatabase())
@@ -181,7 +187,28 @@ class PipelineLaunchLatencyIT {
                                 assertThat(((Number) record.get("execution_ms")).doubleValue()).isNotNegative();
                                 assertThat(record.get("caller_thread_id")).isNotEqualTo(record.get("thread_id"));
                             }));
-                    if (!blockPriorObservation) {
+                    if (restartPlanning) {
+                        assertNativeTarget(storage,running);
+                        request(http,origin,cookie,"POST","/api/pipelines/" + running + ":stop",Map.of("purgeState",false),200);
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).untilAsserted(() ->
+                                assertThat(request(http,origin,cookie,"GET","/api/pipelines/" + running + "/status",null,200))
+                                        .containsEntry("state","STOPPED"));
+                        long requested=System.nanoTime();
+                        var restarted=request(http,origin,cookie,"POST","/api/pipelines/" + running + ":start",Map.of(),200,observation -> {
+                            assertThat(observation.get("complete")).isEqualTo(true);
+                            var collections=(Map<?,?>)observation.get("collections");
+                            assertThat(((Number)collections.get("find:" + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName())).intValue())
+                                    .as("the real HTTP restart reads cursor headers and one own payload batch").isEqualTo(2);
+                        });
+                        var checks=(Map<?,?>)restarted.get("startChecks");
+                        assertThat((List<?>)checks.get("plan")).isNotEmpty()
+                                .allSatisfy(entry -> assertThat(((Map<?,?>)entry).get("load")).isEqualTo("RESUME"));
+                        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(90)).until(() -> engine.captureRun(running)
+                                .filter(run -> run.status()==com.hazelcast.jet.core.JobStatus.RUNNING).isPresent());
+                        assertNativeTarget(storage,running);
+                        System.out.println("NATIVE_RESTART_TARGET_READY_MS " + TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-requested));
+                    }
+                    if (!blockPriorObservation && !restartPlanning) {
                         org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(15))
                                 .until(() -> diagnostics.slowPublication().isPresent());
                         var publication = diagnostics.slowPublication().orElseThrow();
@@ -192,6 +219,19 @@ class PipelineLaunchLatencyIT {
                     }
                 }
             }
+        }
+    }
+
+    private static void assertNativeTarget(NativeAppStorage storage, String pipeline) throws Exception {
+        try (var client=com.mongodb.client.MongoClients.create(storage.masterUri())) {
+            var rows=client.getDatabase(storage.masterDatabase()).getCollection("order_views_" + pipeline.replace('-','_'));
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                var row=rows.find(new org.bson.Document("parent_id",1L)).first();
+                assertThat(row).isNotNull();
+                assertThat(row.get("customer",org.bson.Document.class)).containsEntry("parent_id",1L);
+                assertThat(row.getList("lines",org.bson.Document.class)).hasSize(1)
+                        .allSatisfy(line -> assertThat(line).containsEntry("parent_id",1L));
+            });
         }
     }
 
@@ -390,6 +430,12 @@ class PipelineLaunchLatencyIT {
     @SuppressWarnings("unchecked")
     private static Map<String, Object> request(HttpClient http, String origin, String cookie, String method,
             String path, Object body, int expected) throws Exception {
+        return request(http,origin,cookie,method,path,body,expected,ignored -> {});
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> request(HttpClient http, String origin, String cookie, String method,
+            String path, Object body, int expected, java.util.function.Consumer<Map<String,Object>> verify) throws Exception {
         String traceId = UUID.randomUUID().toString();
         var trace = new CompletableFuture<Map<String, Object>>(); TRACES.put(traceId, trace);
         try {
@@ -404,6 +450,7 @@ class PipelineLaunchLatencyIT {
             System.out.println("LAUNCH_TRACE " + JsonWriter.write(Map.of("method", method, "path", path,
                     "elapsedMs", millis, "status", response.statusCode(), "measurement", observation)));
             assertThat(response.statusCode()).as(path + ": " + response.body()).isEqualTo(expected);
+            verify.accept(observation);
             if (path.endsWith("/draft:publish")) {
                 var callers = (Map<String, Integer>) observation.get("max_callers_per_transaction_attempt");
                 assertThat(callers.getOrDefault("commit:find:MongoPipelineStateMappings.validationSchema", 0))
@@ -434,6 +481,7 @@ class PipelineLaunchLatencyIT {
                             if (trace != null) {
                                 var snapshot = new LinkedHashMap<>(scope.snapshot()); snapshot.put("callers", probe.counts());
                                 snapshot.put("max_callers_per_transaction_attempt", probe.maxAttemptCounts());
+                                snapshot.put("collections",probe.collectionCounts());
                                 snapshot.put("successful_command_wall_ms_by_stage", probe.successfulCommandWallMillis());
                                 trace.complete(snapshot);
                             }

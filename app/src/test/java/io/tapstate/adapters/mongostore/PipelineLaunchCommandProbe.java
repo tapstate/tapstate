@@ -5,6 +5,7 @@ import java.util.*;
 /** Test-only synchronous attribution. Never records database payloads or connection settings. */
 public final class PipelineLaunchCommandProbe implements AutoCloseable {
     private final Map<String, Integer> counts = new TreeMap<>();
+    private final Map<String, Integer> collections = new TreeMap<>();
     private final Map<String, Integer> attempt = new TreeMap<>();
     private final Map<String, Integer> maxAttemptCounts = new TreeMap<>();
     private final Map<String, Long> nanos = new TreeMap<>();
@@ -13,6 +14,7 @@ public final class PipelineLaunchCommandProbe implements AutoCloseable {
     private boolean requestBytes;
 
     public PipelineLaunchCommandProbe() {
+        MongoCommandObservation.COLLECTIONS.set((command,collection) -> collections.merge(command + ":" + collection,1,Integer::sum));
         MongoCommandObservation.CURRENT.set(command -> {
             started = System.nanoTime(); requestBytes = true;
             var frames = StackWalker.getInstance().walk(stream -> stream
@@ -38,10 +40,11 @@ public final class PipelineLaunchCommandProbe implements AutoCloseable {
     }
 
     public Map<String, Integer> counts() { return Map.copyOf(counts); }
+    public Map<String, Integer> collectionCounts() { return Map.copyOf(collections); }
     public Map<String, Integer> maxAttemptCounts() { return Map.copyOf(maxAttemptCounts); }
     public Map<String, Double> successfulCommandWallMillis() {
         var result = new TreeMap<String, Double>(); nanos.forEach((stage, elapsed) -> result.put(stage, elapsed / 1_000_000.0));
         return Map.copyOf(result);
     }
-    @Override public void close() { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.BYTES.remove(); }
+    @Override public void close() { MongoCommandObservation.CURRENT.remove(); MongoCommandObservation.BYTES.remove(); MongoCommandObservation.COLLECTIONS.remove(); }
 }

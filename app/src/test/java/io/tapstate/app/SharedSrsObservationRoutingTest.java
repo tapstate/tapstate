@@ -8,6 +8,8 @@ import io.tapstate.core.model.canonical.SourceCaptureIdentity;
 import io.tapstate.spi.store.*;
 import java.util.*;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -80,6 +82,127 @@ class SharedSrsObservationRoutingTest {
                 .containsOnly(entry("orders","new-physical-confirmation"));
         verify(consumers).cursor(target.context());
         verify(consumers,never()).cursor(siblingContext);
+    }
+    @ParameterizedTest
+    @ValueSource(ints = {1, 2})
+    void nativeStartPlanningReadsEveryOwnSourceWithoutReadingSiblingCursors(int sourceCount) {
+        var sources = new ArrayList<SourceRef>();
+        var members = new ArrayList<SrsConsumerMembership>();
+        var own = new ArrayList<SrsConsumerContext>();
+        var values = new ArrayList<SrsConsumerProgress>();
+        for (int index = 0; index < sourceCount; index++) {
+            String id = index == 0 ? source.id() : "second-input";
+            var selected = new SourceResource(id,null,source.connector(),source.config(),source.mode(),source.tables(),source.srs(),null);
+            memory.artifacts().save(selected);
+            memory.schemas().save(new DiscoveredSourceModel(id,source.connector(),1,model));
+            sources.add(SourceRef.spec(id,true));
+            var context = new SrsConsumerContext(new SrsConsumerKey(physical,pipeline.id(),id),2);
+            own.add(context);
+            members.add(new SrsConsumerMembership(context,1,false,Set.of("orders"),topology(2).consumers().getFirst().commandFence()));
+            var offset = new ConsumerOffset(context.key().consumerId(),Map.of("orders",2L),null,List.of(),null,0L,Map.of(),ConsumerProgressKind.SRS);
+            when(consumers.cursor(context)).thenReturn(Optional.of(offset));
+            values.add(new SrsConsumerProgress(context,1,0,offset,null,null,Map.of()));
+        }
+        var selectedPipeline = new PipelineResource(pipeline.id(),null,sources,null,null,null,null,null);
+        memory.artifacts().save(selectedPipeline);
+        var sibling = new SrsConsumerContext(new SrsConsumerKey(physical,"sibling",source.id()),1);
+        members.add(new SrsConsumerMembership(sibling,1,false,Set.of("orders"),
+                new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.PIPELINE_ACTUATION,"sibling"),
+                        new WorkloadOwner("node","boot"),1,1,1)));
+        when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,3,members));
+        when(consumers.cursor(sibling)).thenThrow(new AssertionError("start planning must not load another pipeline's private cursor"));
+        var state = new SrsChainState(physical,preparation.captureId(),null,2,
+                Set.of("orders"),Set.of("orders"),0,null,null,members.size(),3);
+        when(chains.load(physical)).thenReturn(Optional.of(state));
+        var scope = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
+        var ids = own.stream().map(context -> context.key().sourceId()).collect(java.util.stream.Collectors.toSet());
+        when(consumers.planningProgress(scope,physical,ids)).thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,values)));
+        when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
+
+        var reads = new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),selectedPipeline,Optional.empty());
+        assertThat(reads.progressChains().get()).containsExactly(physical);
+        var progress = reads.progress().apply(physical).orElseThrow();
+        reads.verify().run();
+        assertThat(progress.consumerOffsets()).extracting(ConsumerOffset::pipelineId)
+                .containsExactlyInAnyOrderElementsOf(own.stream().map(context -> context.key().consumerId()).toList());
+        assertThat(StartLoad.of(null,pipeline.id(),List.of(progress))).isEqualTo(StartLoad.RESUME);
+        verify(consumers,times(1)).planningProgress(scope,physical,ids);
+        verify(consumers,never()).progress(any());
+        verify(consumers,never()).cursor(sibling);
+        verify(consumers,never()).attached(physical);
+    }
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void nativeStartPlanningTreatsOnlyAnOlderDetachedMembershipAsAbsent(boolean detached) {
+        var old = topology(1).consumers().getFirst();
+        var marker = new SrsConsumerMembership(old.context(),old.revision(),detached,
+                detached ? Set.of() : old.tables(),old.commandFence());
+        when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,2,
+                detached ? List.of() : List.of(marker)));
+        var scope = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
+        if (detached) when(consumers.planningProgress(scope,physical,Set.of(source.id())))
+                .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(new SrsChainState(physical,preparation.captureId(),null,2,
+                        Set.of("orders"),Set.of("orders"),0,null,null,0,2),List.of())));
+        else when(consumers.planningProgress(scope,physical,Set.of(source.id())))
+                .thenThrow(new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",physical),null));
+        when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
+        var reads = new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),pipeline,Optional.empty());
+        if (detached) assertThat(reads.progressChains().get()).isEmpty();
+        else assertThatThrownBy(() -> reads.progressChains().get()).isInstanceOf(TapstateException.class);
+    }
+
+    @ParameterizedTest @ValueSource(strings={"snapshot","direct"})
+    void nativePrivateModesUseTheSameOwnOnlyPlanningSnapshot(String mode) {
+        boolean snapshot=mode.equals("snapshot");
+        var selected=new PipelineResource(pipeline.id(),null,List.of(SourceRef.spec(source.id(),snapshot)),null,null,null,
+                snapshot ? new Settings(null,null,null,null,ReadMode.SNAPSHOT_ONLY,null) : null,null);
+        memory.artifacts().save(selected);
+        String chain=SourceCaptureResolution.forPipeline(selected,source,model).orElseThrow().chainId().value();
+        var context=new SrsConsumerContext(new SrsConsumerKey(chain,pipeline.id(),source.id()),2);
+        var offset=new ConsumerOffset(context.key().consumerId(),Map.of("orders",2L),null,List.of(),null,0L,Map.of(),ConsumerProgressKind.SRS);
+        var progress=new SrsConsumerProgress(context,1,0,offset,null);
+        var state=new SrsChainState(chain,"original-capture",null,2,Set.of("orders"),Set.of("orders"),0,null,null,1,1);
+        var scope=new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
+        when(consumers.planningProgress(scope,chain,Set.of(source.id())))
+                .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,List.of(progress))));
+        when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
+        when(consumers.attached(chain)).thenThrow(new AssertionError("private-mode planning must not enumerate peer payloads"));
+        var reads=new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),selected,Optional.empty());
+        assertThat(reads.progressChains().get()).containsExactly(chain);
+        assertThat(StartLoad.of(null,pipeline.id(),List.of(reads.progress().apply(chain).orElseThrow()))).isEqualTo(StartLoad.RESUME);
+        reads.verify().run();
+        verify(consumers,times(1)).planningProgress(scope,chain,Set.of(source.id()));
+        verify(consumers,never()).attached(chain); verifyNoInteractions(captures);
+    }
+
+    @Test void nativeStartPlanningGroupsOnlySourcesOnTheSamePhysicalChain() {
+        var second=new SourceResource("second-input",null,source.connector(),source.config(),source.mode(),source.tables(),
+                new Srs("second",null,null,null,true),null);
+        var selected=new PipelineResource(pipeline.id(),null,List.of(SourceRef.spec(source.id(),true),SourceRef.spec(second.id(),true)),null,null,null,null,null);
+        memory.artifacts().saveAll(List.of(second,selected));
+        memory.schemas().save(new DiscoveredSourceModel(second.id(),second.connector(),1,model));
+        String canonicalSecond=SourceCaptureResolution.forPipeline(selected,second,model).orElseThrow().chainId().value();
+        var preparedSecond=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,"second-physical",
+                SourceCaptureIdentity.sharedCapture(canonicalSecond),SourceCaptureIdentity.physical(second.connector(),second.config()),
+                UUID.randomUUID().toString(),canonicalSecond,UUID.randomUUID().toString());
+        when(captures.read(BUSINESS,preparedSecond.captureId())).thenReturn(Optional.of(preparedSecond));
+        var scope=new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
+        for (var descriptor:List.of(Map.entry(source.id(),physical),Map.entry(second.id(),preparedSecond.chainId()))) {
+            var context=new SrsConsumerContext(new SrsConsumerKey(descriptor.getValue(),pipeline.id(),descriptor.getKey()),2);
+            var offset=new ConsumerOffset(context.key().consumerId(),Map.of("orders",2L),null,List.of(),null,0L,Map.of(),ConsumerProgressKind.SRS);
+            var state=new SrsChainState(descriptor.getValue(),"capture",null,2,Set.of("orders"),Set.of("orders"),0,null,null,1,1);
+            when(consumers.planningProgress(scope,descriptor.getValue(),Set.of(descriptor.getKey())))
+                    .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,List.of(new SrsConsumerProgress(context,1,0,offset,null)))));
+        }
+        when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
+        var reads=new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),selected,Optional.empty());
+        assertThat(reads.progressChains().get()).containsExactly(physical,preparedSecond.chainId());
+        assertThat(reads.progress().apply(physical).orElseThrow().consumerOffsets()).hasSize(1);
+        assertThat(reads.progress().apply(preparedSecond.chainId()).orElseThrow().consumerOffsets()).hasSize(1);
+        reads.verify().run();
+        verify(consumers,times(1)).planningProgress(scope,physical,Set.of(source.id()));
+        verify(consumers,times(1)).planningProgress(scope,preparedSecond.chainId(),Set.of(second.id()));
+        verify(consumers,never()).attached(anyString());
     }
     @Test void aStoppedOldScopeWithoutAnAttachmentDoesNotInheritTheNewScopesConfirmation() {
         when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,0,List.of()));
