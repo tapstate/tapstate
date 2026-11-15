@@ -815,15 +815,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             ArtifactStore artifacts,
             PipelineResource authored) {
         if (source.owner == null) return;
-        if (source.owner.config == null) {
-            source.owner.origin = session.original;
-            source.owner.config =
-                    source.selected
-                            .config()
-                            .at(new PipelineNode(session.original.pipelineId(), source.id))
-                            .sharing(
-                                    new SharedNotes(source.prepared.canonicalChainId(), List.of()));
-        }
+        bindOpener(source.owner, session, source);
         try {
             if (stores.sources().supportsAdmittedCaptureStartup()) {
                 var opened = stores.sources().withCaptureStartup(stores.scope(), () -> ensureTail(source.owner, true));
@@ -934,7 +926,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var fixedConfig = config;
         var notes = source.tailOpening;
         source.tailOpening = null;
-        if (notes == null || !config.equals(source.owner.config)) {
+        if (notes == null || source.owner.opener == null || !config.equals(source.owner.opener.config())) {
             boolean recovery = stores.recoveryPinned().test(session.original.scope());
             notes = source.shared && session.snapshot && stores.sources().supportsAdmittedCaptureStartup() && !recovery
                     ? ConfiguredCaptureRun.prepareStartup(session.original, config, stores.notes(), connectors, guard)
@@ -1132,10 +1124,20 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         owner.lease.whileNeeded(owner.demand::get);
         owner.require(); return owner;
     }
+    /** The physical capture keeps one opener identity for its entire ownership tenure. */
+    private record CaptureOpener(ExecutionFence original, CaptureConfig config) {}
+
+    private void bindOpener(Owner owner, Session session, Source source) {
+        if (owner.opener != null) return;
+        var config = source.selected.config().at(new PipelineNode(session.original.pipelineId(), source.id))
+                .sharing(new SharedNotes(source.prepared.canonicalChainId(), List.of()));
+        owner.opener = new CaptureOpener(session.original, config);
+    }
+
     private final class Owner {
         final CapturePreparation prepared; final WorkloadClaimFence fence; final WorkloadClaim initial;
         final Set<ExecutionFence> sessions=ConcurrentHashMap.newKeySet(); final AtomicBoolean ended=new AtomicBoolean();
-        SourceBindingSnapshot identity;CaptureClaimLease lease;ExecutionFence origin;CaptureConfig config;ConfiguredCaptureRun configured;Physical physical;boolean positionEditsRestricted;
+        SourceBindingSnapshot identity;CaptureClaimLease lease;CaptureOpener opener;ConfiguredCaptureRun configured;Physical physical;boolean positionEditsRestricted;
         final AtomicBoolean demand = new AtomicBoolean(true);
         // Guarded by the coordinator monitor; an attachment invalidates an outstanding demand read.
         long demandRevision;
@@ -1341,7 +1343,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted) {
         if(owner.drainingReports())throw new RingNotOpenYet(new CaptureId(owner.prepared.captureId()));
-        owner.require();if(owner.config==null || owner.origin==null)throw refused();
+        owner.require();if(owner.opener==null)throw refused();
         var current=stores.sources().srs(stores.scope(),owner::require);
         String chainId = owner.prepared.chainId();
         var attached = admitted ? current.consumers().attachedWithChain(chainId) : null;
@@ -1353,10 +1355,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if(owner.physical!=null && before.servingTables().containsAll(requested))return null;
         var configured=owner.configured;
         if (configured == null) {
-            boolean recoveryPinned = stores.recoveryPinned().test(owner.origin.scope());
+            boolean recoveryPinned = stores.recoveryPinned().test(owner.opener.original().scope());
             configured = admitted && !recoveryPinned
-                    ? ConfiguredCaptureRun.prepareStartup(owner.origin, owner.config, stores.notes(), connectors, owner::require)
-                    : ConfiguredCaptureRun.prepare(owner.origin, owner.config, stores.notes(), connectors, owner::require, recoveryPinned);
+                    ? ConfiguredCaptureRun.prepareStartup(owner.opener.original(), owner.opener.config(), stores.notes(), connectors, owner::require)
+                    : ConfiguredCaptureRun.prepare(owner.opener.original(), owner.opener.config(), stores.notes(), connectors, owner::require, recoveryPinned);
         } else {
             stores.notes().guardedBy(owner::require).origin(configured.primary());
             connectors.resolve(configured.connectorId(), configured.artifactHash());
@@ -1390,7 +1392,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
-        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
+        var fixed = owner.opener.config();
+        var config=new CaptureConfig(fixed.connectorId(),fixed.settings(),opened.servingTables().stream().sorted().toList(),fixed.node(),fixed.sharedNotes());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
         java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {
@@ -1425,7 +1428,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             if (closed.get()) return Map.of();
             for (Owner owner : owners.values()) {
                 if (owner.prepared.mode() == CapturePreparation.Mode.SHARED_SRS && !owner.ended.get()
-                        && !owner.drainingReports() && !owner.handingOff && owner.config != null && owner.origin != null
+                        && !owner.drainingReports() && !owner.handingOff && owner.opener != null
                         && owner.physical != null && owner.physical.live.get() && owner.physical.tail != null
                         && owner.physical.tail.health().failure().isEmpty())
                     selected.add(new TailCheck(owner, owner.demandRevision, owner.physical, false, null));
@@ -1585,7 +1588,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                 requireSession(session);
                 if(source.foreign!=null)try {execution.authorization().requireCapture(stores.scope(),source.foreign);continue;}catch(TapstateException expired) { /* Re-read this same prepared capture before any takeover. */ }
                 var prepared=stores.preparations().load(source.prepared);source.owner=owner(session,source,prepared);
-                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;source.owner.origin=session.original;source.owner.config=source.selected.config().at(new PipelineNode(session.original.pipelineId(),source.id)).sharing(new SharedNotes(source.prepared.canonicalChainId(),List.of()));ensureTail(source.owner);}
+                if(source.owner!=null){source.owner.positionEditsRestricted|=source.positionEditsRestricted;bindOpener(source.owner,session,source);ensureTail(source.owner);}
             }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
         }
         return retention;
