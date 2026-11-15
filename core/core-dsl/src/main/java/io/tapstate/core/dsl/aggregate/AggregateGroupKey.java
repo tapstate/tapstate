@@ -31,7 +31,7 @@ public final class AggregateGroupKey {
     /** {@code group}'s values under the names of the step's output key, each as text; a null stays null. */
     public static Map<String, String> shown(AggregateStepSpec spec, List<Object> group) {
         Map<String, String> shown = new LinkedHashMap<>();
-        List<String> names = spec.outputKey();
+        List<String> names = spec.groupNames();
         for (int i = 0; i < names.size(); i++) {
             Object value = group.get(i);
             shown.put(names.get(i), value == null ? null : String.valueOf(value));
@@ -67,7 +67,7 @@ public final class AggregateGroupKey {
      *                           is not part of the key, or a value does not read as its column's type
      */
     public static List<List<Object>> readings(AggregateStepSpec spec, Map<String, String> named) {
-        List<String> names = spec.outputKey();
+        List<String> names = spec.groupNames();
         for (String given : named.keySet()) {
             if (!names.contains(given)) {
                 throw invalid(spec, "`" + given + "` is not one of its group names " + names);

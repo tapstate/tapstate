@@ -1479,8 +1479,8 @@ aggregate.key-required:
   message: "Aggregate step `{step}` reads `{from}`, which has no primary key, and names no `key:`."
   solution: "Add `key: [<columns>]` naming the columns that identify one input row. After a `union` of tables whose keys overlap, include the column that tells the tables apart."
 aggregate.name-conflict:
-  message: "Aggregate step `{step}` uses the name `{name}` for both a group and a field."
-  solution: "The output row holds the group names and the fields side by side. Rename one of them."
+  message: "Aggregate step `{step}` uses the name `{name}` for both a key column and a field."
+  solution: "The output row holds the group names and the fields side by side, and a step with no `groupBy` keys its one row by a column named `aggregate`. Rename the field."
 aggregate.expression-invalid:
   message: "Aggregate step `{step}`, `{field}`: its {part} does not check: {reason}"
   solution: "Expressions read the input row as `after`, and `$column` names one of its columns. Check the names against the discovered model with `tapstate desc`."

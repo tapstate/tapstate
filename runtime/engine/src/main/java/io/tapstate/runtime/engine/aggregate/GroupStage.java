@@ -792,6 +792,16 @@ public final class GroupStage {
                 null, Map.of(), null, conflicts, dropped);
     }
 
+    /** What every field comes to over no rows at all: a count of zero, a default, or null. */
+    public Map<String, Object> emptyValues() {
+        Totals none = new Totals(List.of());
+        Map<String, Object> values = new LinkedHashMap<>();
+        for (int field = 0; field < fields.size(); field++) {
+            values.put(fields.get(field).field(), result(none, field).value);
+        }
+        return java.util.Collections.unmodifiableMap(values);
+    }
+
     /** What one field of a group comes to: its value, or why it cannot be given. */
     private record FieldResult(Object value, RollupError failure, Map<String, Object> args) {
     }

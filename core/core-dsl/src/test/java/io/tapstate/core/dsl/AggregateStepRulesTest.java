@@ -218,13 +218,29 @@ class AggregateStepRulesTest {
     }
 
     @Test
-    @DisplayName("with no group names the output key is empty: one row over every member")
-    void noGroupNamesIsOneGroup() {
+    @DisplayName("with no group names the one row is keyed by a column holding the step's id")
+    void noGroupNamesIsOneGroupKeyedByTheStep() {
         AggregateStepSpec spec = AggregateStepRules.compile("totals",
                 step("    fields: { orders: { count: true } }\n"), ORDERS, true, List.of("id"), "orders");
 
-        assertThat(spec.outputKey()).isEmpty();
-        assertThat(spec.outputColumns()).containsOnlyKeys("orders");
+        assertThat(spec.global()).isTrue();
+        assertThat(spec.groupNames()).isEmpty();
+        assertThat(spec.outputKey()).as("a row with no key column is written as a new row every time")
+                .containsExactly("aggregate");
+        assertThat(spec.outputColumns()).containsExactly(
+                Map.entry("aggregate", ValueType.of(TapstateType.STRING)),
+                Map.entry("orders", ValueType.INT64));
+    }
+
+    @Test
+    @DisplayName("with no group names a field cannot take the name of the column that keys the row")
+    void aFieldNamedAsTheKeyOfTheOneRowIsRefused() {
+        refused(() -> Workspace.of(batch("""
+                  - id: by_region
+                    from: [ orders ]
+                    type: aggregate
+                    fields: { aggregate: { count: true } }
+                """)), AggregateError.NAME_CONFLICT, Map.of("step", "by_region", "name", "aggregate"));
     }
 
     @Test

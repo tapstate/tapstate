@@ -163,7 +163,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         this.definition = Objects.requireNonNull(definition, "definition");
         this.stores = Objects.requireNonNull(stores, "stores");
         this.bounds = bounds;
-        this.groupNames = spec.outputKey();
+        this.groupNames = spec.groupNames();
     }
 
     @Override
@@ -190,6 +190,13 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
             this.requests = AggregateRequests.register(member, pipeline, step);
         }
         this.nextSweepAt = System.currentTimeMillis() + sweep.pageMillis();
+        if (spec.global() && !groups.holds(List.of())) {
+            // The total exists before any row does. Nothing would send it otherwise: an empty input
+            // changes no group, and the target would hold no row where SQL answers with a count of zero.
+            Map<String, Object> row = keyed(List.of());
+            row.putAll(groups.emptyValues());
+            pending.add(Envelope.insert(System.currentTimeMillis(), step, row, null));
+        }
     }
 
     /** {@code store}, with every commit to it counted. */
@@ -490,13 +497,30 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
         out.add(RowEvent.member(key, chain, at.order(), evaluated.get().group(), inputs));
     }
 
+    /**
+     * The key columns of a group's row: its names with their values, or the step's id under the one key
+     * column of a step with no group, without which its row could not be found again to be replaced.
+     */
+    private Map<String, Object> keyed(List<Object> group) {
+        Map<String, Object> row = new LinkedHashMap<>();
+        if (spec.global()) {
+            row.put(AggregateStepSpec.GLOBAL_KEY, step);
+        }
+        for (int i = 0; i < groupNames.size(); i++) {
+            row.put(groupNames.get(i), group.get(i));
+        }
+        return row;
+    }
+
     /** A group as the row it is sent as: an upsert of its names and fields, or a delete once it holds no row. */
     private Envelope row(GroupOutcome outcome, long ts) {
-        Map<String, Object> row = new LinkedHashMap<>();
-        for (int i = 0; i < groupNames.size(); i++) {
-            row.put(groupNames.get(i), outcome.group().get(i));
-        }
+        Map<String, Object> row = keyed(outcome.group());
         if (outcome.members() == 0) {
+            if (spec.global()) {
+                // The total over no rows is still a row, as it is in SQL: a count of zero, never a delete.
+                row.putAll(groups.emptyValues());
+                return Envelope.insert(ts, step, row, null);
+            }
             return Envelope.delete(ts, step, row, null);
         }
         row.putAll(outcome.values());
@@ -510,10 +534,7 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
      * whole, so a reader's rule is one line: a row without it is current.
      */
     private Envelope held(GroupOutcome outcome, long ts) {
-        Map<String, Object> row = new LinkedHashMap<>();
-        for (int i = 0; i < groupNames.size(); i++) {
-            row.put(groupNames.get(i), outcome.group().get(i));
-        }
+        Map<String, Object> row = keyed(outcome.group());
         for (var field : spec.fields()) {
             row.put(field.field(), outcome.lastGood() == null ? null : outcome.lastGood().get(field.field()));
         }
