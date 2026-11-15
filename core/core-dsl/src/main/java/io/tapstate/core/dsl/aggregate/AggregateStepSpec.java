@@ -36,14 +36,34 @@ public record AggregateStepSpec(
         fields = List.copyOf(fields);
     }
 
-    /** The output key: the group names, in declared order. Empty for the one global group. */
-    public List<String> outputKey() {
+    /**
+     * The column that keys the one row of a step with no group: it holds the step's id. A row has to be
+     * found again to be replaced, and a row with no key column is written as a new row every time.
+     */
+    public static final String GLOBAL_KEY = "aggregate";
+
+    /** Whether the step has no group names, so that every member row is in its one group. */
+    public boolean global() {
+        return groupBy.isEmpty();
+    }
+
+    /** The names a group is told apart by, in declared order. Empty for the one global group. */
+    public List<String> groupNames() {
         return List.copyOf(groupBy.keySet());
     }
 
-    /** The output row's columns with their types: the group names, then the fields. */
+    /** The output key: the group names in declared order, or {@link #GLOBAL_KEY} alone when there are none. */
+    public List<String> outputKey() {
+        return global() ? List.of(GLOBAL_KEY) : groupNames();
+    }
+
+    /** The output row's columns with their types: the key columns, then the fields. */
     public Map<String, ValueType> outputColumns() {
-        Map<String, ValueType> columns = new LinkedHashMap<>(groupTypes);
+        Map<String, ValueType> columns = new LinkedHashMap<>();
+        if (global()) {
+            columns.put(GLOBAL_KEY, ValueType.of(io.tapstate.core.common.TapstateType.STRING));
+        }
+        columns.putAll(groupTypes);
         for (RollupSpec field : fields) {
             columns.put(field.field(), field.resultType());
         }

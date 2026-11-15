@@ -154,6 +154,53 @@ class AnAggregateStepSendsEachGroupItChangedTest {
                 .containsEntry("revenue", new BigDecimal("140.50")).containsEntry("largest", new BigDecimal("100.00"));
     }
 
+    private static final String TOTAL = """
+            version: tapstate/v1
+            kind: pipeline
+            id: sales
+            source: src_orders
+            transforms:
+              - id: by_region
+                from: [ orders ]
+                type: aggregate
+                where: "=after.status != 'cancelled'"
+                fields:
+                  orders: { count: true }
+                  revenue: { sum: $amount, default: 0 }
+                  largest: { max: $amount }
+            serve:
+              from: by_region
+              sync: [ { id: dw, source: tgt, write_mode: upsert, on_full_load: clear } ]
+            """;
+
+    @Test
+    @DisplayName("a step with no group writes one row under its own id, from before the first row to after the last")
+    void theTotalIsOneRowThatAlwaysExists() {
+        // Without a key column every write of the total was a new row at the target, and only the newest
+        // was right. The row is keyed by the step's id, exists over no rows, and is never deleted.
+        run(List.of(), TOTAL);
+        assertThat(WRITTEN).as("the total over no rows").singleElement().satisfies(written -> {
+            assertThat(written.op()).isEqualTo(Op.INSERT);
+            assertThat(written.after()).containsEntry("aggregate", "by_region").containsEntry("orders", 0L)
+                    .containsEntry("revenue", new BigDecimal("0.00")).containsEntry("largest", null);
+        });
+        WRITTEN.clear();
+
+        run(List.of(insert(1, 1, "EU", "open", "100.00"), insert(2, 2, "US", "open", "40.50")), TOTAL);
+        assertThat(WRITTEN).isNotEmpty().allSatisfy(written -> {
+            assertThat(written.op()).isEqualTo(Op.INSERT);
+            assertThat(written.after()).containsEntry("aggregate", "by_region");
+        });
+        assertThat(WRITTEN.getLast().after()).containsEntry("orders", 2L)
+                .containsEntry("revenue", new BigDecimal("140.50")).containsEntry("largest", new BigDecimal("100.00"));
+        WRITTEN.clear();
+
+        run(List.of(delete(1, 3, row(1, "EU", "open", "100.00")), delete(2, 4, row(2, "US", "open", "40.50"))), TOTAL);
+        assertThat(WRITTEN.getLast().op()).as("emptied, the total is a row of zero and not a delete").isEqualTo(Op.INSERT);
+        assertThat(WRITTEN.getLast().after()).containsEntry("aggregate", "by_region").containsEntry("orders", 0L)
+                .containsEntry("largest", null);
+    }
+
     @Test
     @DisplayName("a group its last row left is sent as a delete of its key")
     void anEmptiedGroupIsDeleted() {

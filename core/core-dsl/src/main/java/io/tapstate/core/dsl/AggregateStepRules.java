@@ -261,8 +261,10 @@ public final class AggregateStepRules {
     }
 
     private static void refuseNameConflicts(String step, TransformBody.Aggregate aggregate) {
+        boolean global = aggregate.groupBy().isEmpty();
         for (String name : aggregate.fields().keySet()) {
-            if (aggregate.groupBy().containsKey(name)) {
+            // With no group the one row is keyed by a column the step adds, which a field cannot also be.
+            if (aggregate.groupBy().containsKey(name) || (global && name.equals(AggregateStepSpec.GLOBAL_KEY))) {
                 throw new TapstateException(AggregateError.NAME_CONFLICT,
                         Map.of("step", step, "name", name), null);
             }

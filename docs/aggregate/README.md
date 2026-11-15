@@ -52,6 +52,17 @@ Expressions read the input row as `after.<column>`, as every row expression does
 A step with no `groupBy` keeps a single row, the total over the whole input. Every change to the input
 updates that one row, so it is the slowest shape to keep current; see [what it costs](#what-it-costs).
 
+That row is keyed by a column named `aggregate` that holds the step's id, so the target replaces it on
+every write and several totals can share one table:
+
+```json
+{ "aggregate": "total_sales", "order_count": 3, "revenue": 147 }
+```
+
+As in SQL, the total exists over no rows: it is written when the step starts, shows a `count` of 0 and
+null (or `default:`) elsewhere, and is never deleted. A step with no `groupBy` cannot name a field
+`aggregate`; that is refused with `aggregate.name-conflict`.
+
 ### `where:` or a `filter` step upstream
 
 Both keep rows out of a group. They differ in what they need from the source.
@@ -236,7 +247,7 @@ altogether is found only by a check that names it.
 | `aggregate.input-not-supported` | `from` is not a source table or a `filter`, `map` or `union` over source tables |
 | `aggregate.upstream-filter-unsafe` | reads a `filter` step on a source without guaranteed before-images |
 | `aggregate.key-required` | the input has no primary key and the step names no `key:` |
-| `aggregate.name-conflict` | a name is used for both a group and a field |
+| `aggregate.name-conflict` | a name is used for both a group and a field, or a step with no `groupBy` names a field `aggregate` |
 | `aggregate.expression-invalid` | `where`, a `groupBy` expression, an argument, a filter or a default does not check |
 | `aggregate.type-unknown` | `sum` or `avg` over a column whose numeric type nothing resolved |
 | `aggregate.rebuild-needs-clear` | a target reading the step keeps its rows on a full load |
