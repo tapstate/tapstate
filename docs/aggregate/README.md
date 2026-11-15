@@ -191,7 +191,7 @@ Per step, in the pipeline's status and metrics. Nothing is reported per group.
 | `aggregateRows.<step>` | `tapstate.pipeline.aggregate.rows` | input rows that are in a group |
 | `aggregateGroups.<step>` | `tapstate.pipeline.aggregate.groups` | groups |
 | `aggregateStateEntries.<step>` | `tapstate.pipeline.aggregate.state.entries` | every entry the step stores |
-| `aggregateTombstones.<step>` | `tapstate.pipeline.aggregate.tombstones` | records kept only until a second delivery is impossible |
+| `aggregateTombstones.<step>` | `tapstate.pipeline.aggregate.tombstones` | rows remembered while in no group: deleted rows, rows that left a group, and rows that fail `where:`, each kept only until a second delivery is impossible |
 | `aggregateLargestGroupRows.<step>` | `tapstate.pipeline.aggregate.group.rows.largest` | rows in the largest group |
 | `aggregateFailedGroups.<step>` | `tapstate.pipeline.aggregate.groups.failed` | groups held at their last good values |
 | `aggregateInputs.<step>` | `tapstate.pipeline.aggregate.inputs` | input events applied since the step started |
@@ -204,7 +204,8 @@ minutes, and a pass starts over when the step restarts. Until the first one fini
 Absent means not measured yet, not zero. `aggregateOrderConflicts` is absent until there is one.
 
 Inputs divided by state writes says how many changes one write absorbs. A number of tombstones that only
-grows says the source's replay position is not advancing.
+grows says the source's replay position is not advancing. Right after a full load it equals the number
+of rows that fail `where:`.
 
 ## Check and repair
 
