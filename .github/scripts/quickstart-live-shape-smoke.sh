@@ -108,6 +108,13 @@ cli_step="$(step "The CLI the quickstart installed is the release's own")"
 has "the installed CLI is held to the image tag this leg started" "$cli_step" \
   'PREPARED##\*:'
 
+# --- the web UI's own sign-in ----------------------------------------------------------------------
+browser_step="$(step 'The web UI signs in through the published port')"
+has "the browser sign-in endpoint is exercised, not only the CLI's token login" "$browser_step" \
+  '/auth/browser/login'
+has "through the port the user opens, from the host" "$browser_step" 'http://127\.0\.0\.1:8080/auth/browser/login'
+has "and a foreign Origin is held to a refusal" "$browser_step" 'evil\.example'
+
 # --- the connector jars --------------------------------------------------------------------------
 jars_step="$(step 'The connector jars the quickstart fetched are readable jars')"
 has "the fetched jars are opened, not just weighed" "$jars_step" 'zipfile'

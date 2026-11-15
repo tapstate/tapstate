@@ -317,7 +317,11 @@ write_agent_config() {
         agent_args="\"mcp\", \"--server\", \"$server_url\", \"--allow-write\""
     else
         docker_bin="$(command -v docker)"
-        server_container="$(docker compose ps --format '{{.Name}}' server 2>/dev/null | head -n 1)"
+        # The container that owns the server's network namespace: the loopback relay where the compose
+        # file has one (the server runs inside its namespace), the server itself in an older one.
+        server_container="$(docker compose ps --format '{{.Name}}' loopback 2>/dev/null | head -n 1)"
+        [ -n "$server_container" ] \
+            || server_container="$(docker compose ps --format '{{.Name}}' server 2>/dev/null | head -n 1)"
         case "$server_container" in
             ""|*[!A-Za-z0-9_.-]*)
                 agent_note="the server container could not be named, so no agent configuration was written"
@@ -545,9 +549,12 @@ read_hidden() {
     return "$hidden_read"
 }
 
+# $@ = the entries to wait for. TAPSTATE_QUICKSTART_WAIT_POLLS bounds the wait (default 300 polls, ten
+# minutes at the default 2s): storage activation on a first start with cold disks has been measured at
+# several minutes on a small VM, and a wait shorter than that fails a stack that is merely slow.
 await_entry() {
     i=0
-    while [ "$i" -lt 90 ]; do
+    while [ "$i" -lt "${TAPSTATE_QUICKSTART_WAIT_POLLS:-300}" ]; do
         entry="$(docker compose exec -T server curl -fsS --max-time 5 http://127.0.0.1:8080/auth/storage-entry 2>/dev/null \
             | jq -r '.entry // empty')"
         for expected in "$@"; do
@@ -561,7 +568,9 @@ await_entry() {
 
 setup_post() {
     # The product's installation listener is reachable only inside the server container.
-    response="$(docker compose exec -T server curl -sS --max-time 90 -w '\n%{http_code}' \
+    # Ten minutes, not ninety seconds: the storage commit waits on the store, and on a first start the
+    # store is the database initialising its files beside two others doing the same.
+    response="$(docker compose exec -T server curl -sS --max-time 600 -w '\n%{http_code}' \
         -H 'Content-Type: application/json' --data-binary @- "$management_url$1")" || return 1
     status="${response##*
 }"
@@ -637,6 +646,13 @@ main() {
     fetch "${qbase}/install/install.sh" "$work/install.sh"
     if ! platform="$(sh "$work/install.sh" --print-platform)"; then
         exit 1   # install.sh already said why (musl / Windows / unknown), pointing to WSL or source
+    fi
+
+    # Before the downloads, not after them: a run with no terminal and no credentials in the environment
+    # cannot finish, and saying so now costs nothing, where saying so after the CLI, the jars and the
+    # images has cost the user minutes. A prepare-only run stops before anything needs credentials.
+    if [ -z "${TAPSTATE_QUICKSTART_PREPARE_ONLY:-}" ]; then
+        require_admin_credentials_source
     fi
 
     # Fetch the stack into this directory, each asset only if absent, so a re-run neither re-downloads a
@@ -725,8 +741,26 @@ main() {
 
     grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml \
         || die "this directory has an older demo Compose file. Run the installer from a new directory."
+    # A compose file is never rewritten, so a directory set up before the loopback relay existed keeps a
+    # stack whose web UI refuses every sign-in. The CLI still works there; say what the browser needs.
+    if ! grep -q 'TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK' docker-compose.yml; then
+        printf '%s\n' "quickstart: this directory's Compose file predates browser sign-in for the demo; the CLI works," \
+            "            but the web UI will refuse to sign in. For the web UI, run the installer from a new directory." >&2
+    fi
 
-    require_admin_credentials_source
+    # The key the server signs session tokens with. Without one it makes up a new key at every start,
+    # and every browser session ends with each restart. Generated once and kept beside the stack, owner-only
+    # like the agent token; a re-run keeps it.
+    if ! grep -q '^TAPSTATE_JWT_SECRET=' .env 2>/dev/null; then
+        secret="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+        [ "${#secret}" -eq 64 ] || die "could not generate the session signing key"
+        (umask 077 && printf 'TAPSTATE_JWT_SECRET=%s\n' "$secret" >> .env)
+    fi
+
+    # The server runs inside the relay's network namespace, so even this one-off needs the relay up.
+    if grep -q '^  loopback:' docker-compose.yml; then
+        docker compose up -d loopback
+    fi
     docker compose run --rm --no-deps -T --entrypoint sh server -ec '
         dir=$TAPSTATE_INSTALLATION_DIRECTORY
         if [ ! -d "$dir" ]; then

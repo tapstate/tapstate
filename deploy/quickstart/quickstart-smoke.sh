@@ -446,10 +446,17 @@ fi
 run_phase_fakes
 if [ "$RUN_RC" -eq 0 ] && grep -Fq -- '-u smoke-owner' "$RUN/.cli-argv" \
    && ! grep -Fq "$RUN_PW" "$RUN/.cli-argv" && grep -Fqx "$RUN_PW" "$RUN/.login-env" \
-   && ! grep -Fq "$RUN_PW" "$RUN/.cli-stdin" && [ ! -e "$RUN/.env" ]; then
+   && ! grep -Fq "$RUN_PW" "$RUN/.cli-stdin" && ! grep -Fqs "$RUN_PW" "$RUN/.env"; then
   ok "the supplied administrator credentials reach the CLI without saving or printing the password"
 else
   bad "the CLI did not receive the administrator credentials as expected"
+fi
+# .env holds the session signing key and nothing else: one line, 64 hex characters, owner-only.
+if [ "$(grep -c '' "$RUN/.env" 2>/dev/null)" = 1 ] && grep -Eqx 'TAPSTATE_JWT_SECRET=[0-9a-f]{64}' "$RUN/.env" \
+   && [ -n "$(find "$RUN/.env" -perm 600)" ]; then
+  ok "the session signing key is generated once into an owner-only .env"
+else
+  bad "the session signing key was not written as one owner-only line in .env"
 fi
 
 redacted_stdin() { cat "$RUN/.cli-stdin"; }
