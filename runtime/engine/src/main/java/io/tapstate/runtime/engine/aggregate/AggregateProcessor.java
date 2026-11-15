@@ -74,16 +74,21 @@ public final class AggregateProcessor extends AbstractProcessor implements Stage
      */
     public record Sweep(int rows, long pageMillis, long passMillis) implements java.io.Serializable {
 
+        /** The most entries a state store hands over in one page; a larger page is refused by the store. */
+        public static final int MOST_ROWS = 256;
+
         /**
-         * Four pages of a thousand rows a second, and a pass a minute after the last. A pass also counts
-         * what the step holds, and at a page of two hundred a second a state of a few million entries was
-         * never counted once: a pass took hours and starts over whenever the step does.
+         * About four thousand rows a second in the largest pages a store gives, and a pass a minute after
+         * the last. A pass also counts what the step holds, and at two hundred rows a second a state of a
+         * few million entries was never counted once: a pass took hours and starts over whenever the
+         * step does.
          */
-        public static final Sweep DEFAULT = new Sweep(1_000, 250, 60_000);
+        public static final Sweep DEFAULT = new Sweep(MOST_ROWS, 64, 60_000);
 
         public Sweep {
-            if (rows < 1 || pageMillis < 0 || passMillis < 0) {
-                throw new IllegalArgumentException("a sweep reads at least one row and waits no negative time");
+            if (rows < 1 || rows > MOST_ROWS || pageMillis < 0 || passMillis < 0) {
+                throw new IllegalArgumentException(
+                        "a sweep reads 1 to " + MOST_ROWS + " rows in a page and waits no negative time");
             }
         }
     }
