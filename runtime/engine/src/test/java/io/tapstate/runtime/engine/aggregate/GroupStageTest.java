@@ -85,6 +85,10 @@ class GroupStageTest {
 
         @Override
         public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+            // The real store refuses a page outside these bounds, so the stand-in does too.
+            if (limit < 1 || limit > 256) {
+                throw new IllegalArgumentException("a page holds 1 to 256 entries");
+            }
             if (!swept) {
                 throw new UnsupportedOperationException("the data path never scans");
             }
@@ -335,6 +339,14 @@ class GroupStageTest {
     }
 
     @Test
+    void aSweepNeverAsksAStoreForMoreThanOnePageHolds() {
+        // The store refuses a larger page, and that refusal stopped every step a moment after it started.
+        assertThat(AggregateProcessor.Sweep.DEFAULT.rows()).isLessThanOrEqualTo(256);
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> new AggregateProcessor.Sweep(257, 0, 0))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void aGroupTooLargeToHoldIsInconclusiveAndNothingIsWritten() {
         CountingStore store = new CountingStore(new OrderedStateStore.Limit(100, 1 << 20)).swept();
         GroupStage stage = new GroupStage(SPEC, store);
@@ -398,6 +410,10 @@ class GroupStageTest {
 
         @Override
         public List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+            // The real store refuses a page outside these bounds, so the stand-in does too.
+            if (limit < 1 || limit > 256) {
+                throw new IllegalArgumentException("a page holds 1 to 256 entries");
+            }
             return store.scan(from, to, after, limit);
         }
     }

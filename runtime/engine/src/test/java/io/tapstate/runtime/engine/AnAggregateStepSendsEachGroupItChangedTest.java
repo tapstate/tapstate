@@ -549,6 +549,10 @@ class AnAggregateStepSendsEachGroupItChangedTest {
 
         @Override
         public synchronized List<Entry> scan(byte[] from, byte[] to, byte[] after, int limit) {
+            // The real store refuses a page outside these bounds, so the stand-in does too.
+            if (limit < 1 || limit > 256) {
+                throw new IllegalArgumentException("a page holds 1 to 256 entries");
+            }
             List<Entry> page = new ArrayList<>();
             var range = after == null ? entries.subMap(from, true, to, false) : entries.subMap(after, false, to, false);
             for (var entry : range.entrySet()) {
