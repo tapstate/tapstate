@@ -543,6 +543,40 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,1", "true,1", "false,4", "true,4"})
+    void retainedProgressSharesModelProofBetweenCheckpointAndSnapshot(boolean planning, int tables) {
+        withBusiness(f -> {
+            var selected = java.util.stream.IntStream.range(0, tables).mapToObj(i -> "table_" + i)
+                    .collect(java.util.stream.Collectors.toSet());
+            var refs = publishSnapshotModels(f, selected);
+            f.chains().requestTables(CHAIN, selected, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, selected, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "original"),
+                    refs.entrySet().stream().collect(java.util.stream.Collectors.toMap(Map.Entry::getKey,
+                            entry -> new io.tapstate.spi.store.SrsTableCheckpoint(entry.getValue(), -1))), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, selected, f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "original", refs);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            if (tables == 1) {
+                f.chains().openEpoch(CHAIN, 1, f.captureFence()).orElseThrow();
+                String table = selected.iterator().next();
+                var next = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 2, 0);
+                models(f).publishInitial(next, ring(table), new SourceTable(table,
+                        List.of(new SourceField("id", "int")), List.of(), List.of()), f.captureFence());
+            }
+            try (var reads = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database().getName(), "find", "srs_models")) {
+                var consumer = new MongoSrsConsumerStore(reads.client, reads.database, SCOPE);
+                var retained = planning ? consumer.planningProgress(positionScope(A), CHAIN, Set.of(A.key().sourceId()))
+                        .orElseThrow().consumers().getFirst() : consumer.progress(A).orElseThrow();
+                assertThat(retained.snapshot()).isEqualTo(pin);
+                assertThat(reads.confirmedCommands()).as("both proofs share exact model bodies; history requires a distinct ring existence check")
+                        .isEqualTo(tables == 1 ? 2 : 1);
+            }
+        });
+    }
+
     @Test void anAttachedSnapshotKeepsItsClosedModelContextUntilItsOwnDetach() {
         withBusiness(f -> {
             var refs=publishSnapshotModels(f,Set.of("orders"));var first=refs.get("orders");

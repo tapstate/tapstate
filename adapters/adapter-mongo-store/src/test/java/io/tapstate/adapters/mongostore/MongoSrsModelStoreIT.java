@@ -67,6 +67,108 @@ class MongoSrsModelStoreIT {
     private static final String CHAIN = "chain-a";
     private static final String RING = "srs.chain-a.orders";
 
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(ints = {4, 5})
+    void smallModelPublicationBatchesButWideSelectionsRetainPerTableWrites(int count) {
+        withBusiness(f -> {
+            var observations = new java.util.LinkedHashMap<SrsModelKey, io.tapstate.spi.store.SrsModelStore.InitialObservation>();
+            for (int i = 0; i < count; i++) {
+                String name = "table_" + i;
+                var shape = table("id", null);
+                var actual = new SourceTable(name, shape.fields(), shape.primaryKey(), shape.indexes());
+                var key = new SrsModelKey(CHAIN, name, SCOPE.cacheIncarnation(), 7, 0);
+                String ring = "srs.chain-a." + name;
+                f.models().publishInitial(key, ring, actual, f.fence());
+                observations.put(key, new io.tapstate.spi.store.SrsModelStore.InitialObservation(ring, actual));
+            }
+            var commands = new java.util.concurrent.ConcurrentHashMap<String, AtomicInteger>();
+            var audits = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.computeIfAbsent(event.getCommandName(), ignored -> new AtomicInteger()).incrementAndGet();
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var database = observed.getDatabase(f.database().getName());
+                var store = new MongoSrsModelStore(observed, database, SCOPE, () -> {}, () -> {
+                    audits.incrementAndGet();
+                    new MongoCacheMetadataStructure(database, Duration.ofMinutes(1)).verifySrs();
+                });
+                assertThat(store.requireAll(observations.keySet())).hasSize(count);
+                var saved = store.publishObservedInitials(observations, f.fence(), SourceModelComparison.DECLARED_STRUCTURE);
+                assertThat(saved).hasSize(count);
+                saved.forEach((key, model) -> assertThat(model.table()).isEqualTo(observations.get(key).table()));
+                int transactions = count == 4 ? 3 : 1 + 2 * count;
+                assertThat(audits.get()).as("wide publication leaves a renewal boundary between table writes").isEqualTo(transactions);
+                assertThat(commands.getOrDefault("commitTransaction", new AtomicInteger()).get()).isEqualTo(transactions);
+                assertThat(commands.getOrDefault("listCollections", new AtomicInteger()).get()).isEqualTo(transactions);
+                assertThat(commands.getOrDefault("listIndexes", new AtomicInteger()).get()).isEqualTo(8 * transactions);
+            }
+        });
+    }
+
+    @Test void selectedSourcePublicationRollsBackEveryModelWhenOneObservationConflicts() {
+        withBusiness(f -> {
+            var retained = f.models().publishInitial(key(0), RING, table("id", null), f.fence());
+            var nextKey = new SrsModelKey(CHAIN, "customers", SCOPE.cacheIncarnation(), 7, 0);
+            var shape = table("id", null);
+            var next = new SourceTable("customers", shape.fields(), shape.primaryKey(), shape.indexes());
+            var before = snapshotFacts(f.database());
+            var observations = Map.of(key(0), new io.tapstate.spi.store.SrsModelStore.InitialObservation(RING, table("changed", null)),
+                    nextKey, new io.tapstate.spi.store.SrsModelStore.InitialObservation("srs.chain-a.customers", next));
+            assertThatThrownBy(() -> f.models().publishObservedInitials(observations, f.fence(), SourceModelComparison.DECLARED_STRUCTURE))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+            assertThat(f.models().load(key(0))).contains(retained);
+        });
+    }
+
+    @Test void selectedSourcePublicationKeepsCompatibleSampledBodiesAndChecksTheOriginalFence() {
+        withBusiness(f -> {
+            var retained = f.models().publishInitial(key(0), RING, table("id", null), f.fence());
+            var observed = new SourceTable("orders", List.of(), List.of(), List.of());
+            var observations = Map.of(key(0), new io.tapstate.spi.store.SrsModelStore.InitialObservation(RING, observed));
+            assertThat(f.models().publishObservedInitials(observations, f.fence(), SourceModelComparison.SAMPLED_DOCUMENT))
+                    .containsEntry(key(0), retained);
+            var before = snapshotFacts(f.database());
+            var original = f.fence();
+            var stale = new WorkloadClaimFence(original.key(), original.owner(), original.claimGeneration() + 1,
+                    original.executionGeneration(), original.topologyRevision());
+            assertThatThrownBy(() -> f.models().publishObservedInitials(observations, stale, SourceModelComparison.SAMPLED_DOCUMENT))
+                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void selectedSourcePublicationCountsAllNewBodiesAgainstTheRetainedBudget() {
+        withBusiness(f -> {
+            var observations = new java.util.LinkedHashMap<SrsModelKey, io.tapstate.spi.store.SrsModelStore.InitialObservation>();
+            for (String name : List.of("orders", "customers")) {
+                var actual = new SourceTable(name, List.of(new SourceField("id", "x".repeat(550_000))), List.of("id"), List.of());
+                observations.put(new SrsModelKey(CHAIN, name, SCOPE.cacheIncarnation(), 7, 0),
+                        new io.tapstate.spi.store.SrsModelStore.InitialObservation("srs.chain-a." + name, actual));
+            }
+            var before = snapshotFacts(f.database());
+            var budgetScans = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("find") && event.getDatabaseName().equals(f.database().getName())
+                            && event.getCommand().getString("find").getValue().equals("srs_models")
+                            && event.getCommand().getDocument("filter").containsKey("_id.chain")) budgetScans.incrementAndGet();
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var store = new MongoSrsModelStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                assertThatThrownBy(() -> store.publishObservedInitials(observations, f.fence(), SourceModelComparison.DECLARED_STRUCTURE))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.SRS_MODEL_CAPACITY));
+                assertThat(budgetScans).hasValue(1);
+            }
+            assertThat(snapshotFacts(f.database())).isEqualTo(before);
+        });
+    }
+
     @Test void reclamationDoesNotLockTheChainWhileWaitingForTheCaptureClaim() {
         withBusiness(f -> {
             f.models().publishInitial(key(0), RING, table("id", null), f.fence());
@@ -1216,6 +1318,35 @@ class MongoSrsModelStoreIT {
             assertThat(saved).containsExactlyInAnyOrderEntriesOf(Map.of("orders", first, "customers", customers));
             assertThat(f.models().require(saved.get("orders").key())).isEqualTo(first);
             assertThat(f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING, "waiting", "srs.chain-a.waiting"))).isEmpty();
+        });
+    }
+
+    @Test void aCompleteSnapshotSelectionBatchesPublishedHeadsBodiesAndBounds() {
+        withBusiness(f -> {
+            var selection = new java.util.LinkedHashMap<String, String>();
+            var expected = new java.util.LinkedHashMap<String, SrsModel>();
+            for (int i = 0; i < 4; i++) {
+                String table = "table_" + i;
+                String ring = "srs.chain-a." + table;
+                var shape = table("id", null);
+                var key = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 7, 0);
+                expected.put(table, f.models().publishInitial(key, ring,
+                        new SourceTable(table, shape.fields(), shape.primaryKey(), shape.indexes()), f.fence()));
+                selection.put(table, ring);
+            }
+            var reads = new java.util.HashMap<String, Integer>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (event.getCommandName().equals("find") && event.getDatabaseName().equals(f.database().getName()))
+                        reads.merge(event.getCommand().getString("find").getValue(), 1, Integer::sum);
+                }
+            };
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                var store = new MongoSrsModelStore(observed, observed.getDatabase(f.database().getName()), SCOPE);
+                assertThat(store.publishedForNewSnapshot(CHAIN, selection)).hasValue(expected);
+                assertThat(reads).containsEntry("srs_model_contexts", 1).containsEntry("srs_models", 1).containsEntry("srs_log_bounds", 1);
+            }
         });
     }
 

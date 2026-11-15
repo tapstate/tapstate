@@ -81,6 +81,22 @@ class MongoPipelineIntentStoreIT {
     }
 
     @Test
+    void aRetainedStartChecksTheBindingOnceInsideTheIntentWrite() {
+        withConfiguration((domain, database, scope) -> {
+            assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
+            String material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            try (var reads = new MongoCommandWitness(MONGO.getReplicaSetUrl(), database.getName(), "find",
+                    SystemCollections.STORAGE_BINDING.collectionName())) {
+                var observed = new MongoPipelineIntentStore(reads.client, reads.database, "cluster-a",
+                        new MongoStorageBindingStore(reads.client, reads.database, ciphers));
+                assertThat(observed.compareAndSet(scope, 1, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+                assertThat(reads.confirmedCommands()).as("one authoritative binding snapshot for the intent CAS").isOne();
+            }
+        });
+    }
+
+    @Test
     void staleRevisionOrArtifactHashCannotOverwriteTheLatestIntentOrAdvanceVersions() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();

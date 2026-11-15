@@ -222,6 +222,12 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing, boolean businessChecked) {
+        validateCheckpoint(session, root, checkpoint, fence, writing, businessChecked,
+                writing ? null : new MongoSrsReadFacts(session, database, scope, root, businessChecked));
+    }
+
+    private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
+                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked, MongoSrsReadFacts facts) {
         String chain = root.getString("_id");
         for (var at : checkpoint.tables().values()) {
             var key = at.model();
@@ -229,11 +235,10 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
         }
         var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-        var facts = writing ? null : new MongoSrsReadFacts(session, database, scope, root, businessChecked);
         var current = models.currentReferences(session, root, keys, businessChecked, facts);
         var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
-                        .collect(java.util.stream.Collectors.toSet()));
+                        .collect(java.util.stream.Collectors.toSet()), facts);
         for (var entry : checkpoint.tables().entrySet()) {
             var at = entry.getValue(); var key = at.model();
             var reference = current.isPresent() ? current.orElseThrow().get(key) : models.requireReference(session, key, facts);
@@ -255,10 +260,14 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
 
     SrsChainState state(ClientSession session, Document row, boolean businessChecked) {
+        return state(session, row, businessChecked, new MongoSrsReadFacts(session, database, scope, row, businessChecked));
+    }
+
+    SrsChainState state(ClientSession session, Document row, boolean businessChecked, MongoSrsReadFacts facts) {
         SrsChainState state = decode(row);
-        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked);
+        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked, facts);
         if (state.pendingFreshFull() != null)
-            models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
+            models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()), facts);
         return state;
     }
     private Document root(ClientSession session, String chain) {

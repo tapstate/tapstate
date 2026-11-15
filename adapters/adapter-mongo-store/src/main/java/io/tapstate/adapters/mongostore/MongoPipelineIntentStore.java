@@ -232,7 +232,9 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
             PipelineIntentSnapshot held = current == null ? null : pending == null ? decodeCurrent(session, current) : decode(current);
             long revision = held == null ? 0 : held.intentRevision();
             if (revision != expected) return false;
-            Document generation = pending == null ? requireScope(session, scope) : requireAdmittedScope(session, scope);
+            // decodeCurrent already proved the exact cache coordinates in this callback.
+            Document generation = pending == null ? requireScope(session, scope, held != null && held.scope().equals(scope))
+                    : requireAdmittedScope(session, scope);
             MongoPipelineSharedRecoveryFacts.requireIntent(session,database,generation,scope,held,desired);
             var recovery=MongoCacheRecoveryFacts.read(generation);
             if(permission!=null) {
@@ -306,12 +308,12 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
         return next;
     }
 
-    private Document requireScope(ClientSession session, PipelineIntentScope scope) {
+    private Document requireScope(ClientSession session, PipelineIntentScope scope, boolean cacheAlreadyMatched) {
         Document stored = identity.find(session, new Document("_id", "cluster")).first();
         if (stored == null || !MongoConfigurationDomain.LAYOUT.equals(stored.get("layoutId"))
                 || !(stored.get("bindingVersion") instanceof Long binding)) throw unreadable();
         if (!clusterId.equals(scope.clusterId()) || !clusterId.equals(stored.get("clusterId")) || binding != scope.bindingVersion()) throw fenced();
-        if (!matchesCurrentCache(session, scope)) throw fenced();
+        if (!cacheAlreadyMatched && !matchesCurrentCache(session, scope)) throw fenced();
         Document row = mappings.find(session, new Document("_id", scope.pipelineId())).first();
         var state = MongoPipelineStateMappings.decode(scope.pipelineId(), row);
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE || state.stateGeneration() != scope.stateGeneration()) throw fenced();
