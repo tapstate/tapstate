@@ -129,6 +129,54 @@ class MongoSrsChainStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(ints = {1, 3})
+    void aCurrentCheckpointDoesNotRepeatItsDependencyReadsForRetainedCaptureEpochs(int epochs) {
+        withBusiness(f -> {
+            var tables = Set.of("one", "two", "three", "four");
+            var saved = prepareRetainedEpochs(f, tables, epochs);
+            var commands = new java.util.ArrayList<String>();
+            var transactions = new java.util.HashSet<String>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    if (!event.getDatabaseName().equals(f.database().getName()) || !event.getCommandName().equals("find")) return;
+                    commands.add(event.getCommand().getString("find").getValue());
+                    assertThat(event.getCommand().containsKey("txnNumber")).isTrue();
+                    transactions.add(event.getCommand().get("txnNumber").toString());
+                }
+            };
+            try (var observed = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl())).addCommandListener(listener).build())) {
+                assertThat(new MongoSrsChainStore(observed, observed.getDatabase(f.database().getName()), SCOPE).load(CHAIN)).contains(saved);
+                assertThat(transactions).hasSize(1);
+                assertThat(commands).as("retained epochs must not replay the same root, identity, context and bounds reads through each layer")
+                        .hasSizeLessThanOrEqualTo(24);
+            }
+        });
+    }
+
+    @Test
+    void aHistoricalCheckpointStillRequiresTheExactBsonAnchorAfterAnEarlierRead() {
+        withBusiness(f -> {
+            var saved = prepareRetainedEpochs(f, Set.of("one", "two", "three", "four"), 3);
+            assertThat(f.chains().load(CHAIN)).contains(saved);
+            var root = root(f);
+            var head = root.getList("modelContextHeads", Document.class).getFirst();
+            var original = head.get("contextId", Document.class);
+            var reordered = new Document("captureContext", original.get("captureContext"))
+                    .append("table", original.get("table")).append("chain", original.get("chain"));
+            assertThat(reordered).isEqualTo(original);
+            assertThat(reordered.toJson()).isNotEqualTo(original.toJson());
+            head.put("contextId", reordered);
+            SystemCollections.SRS_CHAINS.on(f.database()).replaceOne(new Document("_id", CHAIN), root);
+            var originalClaim = claim(f);
+            assertThatThrownBy(() -> f.chains().load(CHAIN))
+                    .satisfies(failure -> code(failure, IoError.SRS_MODEL_UNAVAILABLE));
+            assertThat(root(f)).isEqualTo(root);
+            assertThat(claim(f)).isEqualTo(originalClaim);
+        });
+    }
+
     @Test
     void aSourceCheckpointKeepsExactModelsForQuietTablesAndSurvivesANewCaptureEpoch() {
         withBusiness(f -> {
@@ -471,6 +519,21 @@ class MongoSrsChainStoreIT {
         var tables = new HashMap<String, SrsTableCheckpoint>();
         frontiers.forEach((table, sequence) -> tables.put(table, new SrsTableCheckpoint(key(table, epoch, 0), sequence)));
         return new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(epoch, order), token), tables);
+    }
+    private static SrsChainState prepareRetainedEpochs(Fixture f, Set<String> tables, int epochs) {
+        prepare(f, tables);
+        SrsChainState saved = null;
+        for (int epoch = 1; epoch <= epochs; epoch++) {
+            if (epoch > 1) {
+                assertThat(f.chains().openEpoch(CHAIN, epoch - 1, f.fence())).hasValue(epoch);
+                for (String table : tables) f.models().publish(model(table, epoch, 0, 0), f.fence());
+                assertThat(f.chains().publishServingTables(CHAIN, epoch, tables, f.fence())).isTrue();
+            }
+            var checkpoint = checkpoint(epoch, SourceOrder.SNAPSHOT_SEQ, "retained-" + epoch,
+                    tables.stream().collect(java.util.stream.Collectors.toMap(table -> table, table -> -1L)));
+            saved = f.chains().checkpoint(CHAIN, epoch - 1, checkpoint, f.fence()).orElseThrow();
+        }
+        return saved;
     }
     private static SrsModelKey key(String table, long epoch, long version) { return new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), epoch, version); }
     private static SrsModel model(String table, long epoch, long version, long first) {
