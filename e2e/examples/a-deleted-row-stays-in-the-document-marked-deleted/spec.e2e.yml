@@ -1,0 +1,62 @@
+# A delete at the source marks the row deleted instead of removing it, both for a child row inside an
+# assembled document and for the document's own root row. Each source table passes through a map naming
+# a soft_delete column, and the nest is fed from those maps.
+#
+# What the assertions have to discriminate:
+#
+# - The control comes first: before any delete, both documents carry the marker as false at the root
+#   and on their one element. A run where the marker never appears cannot pass the later steps by
+#   reading an absent field as anything.
+#
+# - A child delete without soft delete shrinks the array to nothing. Here the array keeps its one
+#   element, and the element is read back whole: the e-mail address is still there beside the marker,
+#   which only an element rebuilt from the deleted row's full image can satisfy. A marker written onto
+#   an element that lost its columns fails on the address.
+#
+# - A root delete without soft delete removes the document, so the count drops to one. Here the count
+#   stays at two and the document reads back with its own column and the marker set, and its child
+#   is still embedded: the root was kept, not re-created empty.
+#
+# - The other document is held to its pre-delete state after each delete, so a marker that reached
+#   across documents shows up there and nowhere else.
+#
+# - The last step inserts the deleted child row again under the same key, and the element reads live
+#   once more: a delete followed by a re-insert must not leave a stale marker behind.
+#
+# Every name here is this example's own, so no other example's rows can surface in this run.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: a-deleted-row-stays-in-the-document-marked-deleted
+setup:
+  databases:
+    src: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  managed_target: views.tap.yml
+  apply: [src_sd_players.tap.yml, src_sd_emails.tap.yml, pipeline.tap.yml]
+  discover: [src_sd_players, src_sd_emails]
+pipeline: pipeline.tap.yml
+seed:
+  src_sd_players.sd_players:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: grace }
+  src_sd_emails.sd_emails:
+    values:
+      - { id: 1, player_id: 1, email: ada@example.com }
+      - { id: 2, player_id: 2, email: grace@example.com }
+steps:
+  - start
+  - await: { count: { views.sd_player_state: 2 } }
+  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - await: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { name: grace, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - cdc: { src_sd_emails.sd_emails: { delete: { where: { id: 1 } } } }
+  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": true, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }
+  - assert: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - cdc: { src_sd_players.sd_players: { delete: { where: { id: 2 } } } }
+  - await: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { name: grace, is_deleted: true, "emails[0].email": grace@example.com }, size: { emails: 1 } } } }
+  - assert: { count: { views.sd_player_state: 2 } }
+  - assert: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { is_deleted: false } } } }
+  - cdc: { src_sd_emails.sd_emails: { insert: { values: [ { id: 1, player_id: 1, email: ada@example.com } ] } } }
+  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { "emails[0].is_deleted": false, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }

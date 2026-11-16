@@ -1,0 +1,26 @@
+version: tapstate/v1
+kind: pipeline
+id: soft_deleted_players
+source: [ src_sd_players, src_sd_emails ]
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: sd_player_rows
+    type: map
+    from: [ sd_players ]
+    soft_delete: is_deleted
+  - id: sd_email_rows
+    type: map
+    from: [ sd_emails ]
+    soft_delete: is_deleted
+  - id: sd_player_doc
+    type: nest
+    from: { p: sd_player_rows, e: sd_email_rows }
+    root:
+      from: p
+      key: [ id ]
+      embed:
+        - { from: e, on: { player_id: id }, as: array, path: emails, arrayKey: [ id ] }
+view:
+  id: sd_player_state
+  from: sd_player_doc
+  primary_key: id

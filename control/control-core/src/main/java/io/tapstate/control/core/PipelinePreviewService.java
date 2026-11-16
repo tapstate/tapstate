@@ -287,7 +287,7 @@ public final class PipelinePreviewService {
         List<String> pointers = new ArrayList<>();
         boolean pointerPatternsComplete = true;
         if (body instanceof TransformBody.MapProjection map) {
-            map.fields().forEach((output, rule) -> {
+            map.outputFields().forEach((output, rule) -> {
                 String pointer = pointerField(output);
                 Map<String, Object> effect = new LinkedHashMap<>();
                 effect.put("pointer", pointer);

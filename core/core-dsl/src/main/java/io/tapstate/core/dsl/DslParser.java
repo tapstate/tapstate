@@ -139,6 +139,7 @@ public final class DslParser {
             "id", SOURCE_TOKEN, "write_mode", "rename", "ddl", "on_full_load", OPTIONS_FIELD, EXECUTION_FIELD);
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
     static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
+    private static final String SOFT_DELETE_TOKEN = "soft_delete";
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
@@ -516,7 +517,7 @@ public final class DslParser {
     private static Set<String> payloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            case "map" -> Set.of("fields", SOFT_DELETE_TOKEN);
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
                     "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
@@ -537,7 +538,8 @@ public final class DslParser {
     static Set<String> requiredPayloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields");
+            // fields, unless soft_delete stands in for it; body() refuses a map carrying neither
+            case "map" -> Set.of();
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path");
             case "nest" -> Set.of("root");
@@ -549,8 +551,7 @@ public final class DslParser {
     private TransformBody body(String type, YamlMap s) {
         return switch (type) {
             case "js" -> new TransformBody.Js(s.requireString("script"));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(s.require("fields", s.mapping("fields"))));
+            case "map" -> mapProjection(s);
             case FILTER_TOKEN -> {
                 String expr = s.requireString("expr");
                 checkPredicate(s, "expr", expr);
@@ -581,6 +582,30 @@ public final class DslParser {
             default -> throw YamlMap.error(DslError.ILLEGAL_VALUE, "type", s.node("type"),
                     Map.of(VALUE_TOKEN, type, EXPECTED_TOKEN, "a known transform type (js, map, filter, unwind, union, nest, join)"));
         };
+    }
+
+    /**
+     * A map's body. {@code fields} may be left out only where {@code soft_delete} is given, since a
+     * step adding the deleted-row column is a whole step on its own. The column may not also be a
+     * declared field: two values for one column, one of them silently losing on every row, is a
+     * mistake the author should hear about where they wrote it.
+     */
+    private TransformBody.MapProjection mapProjection(YamlMap s) {
+        String softDelete = s.string(SOFT_DELETE_TOKEN);
+        YamlMap fields = s.mapping("fields");
+        if (softDelete == null) {
+            s.require("fields", fields);
+        } else if (softDelete.isBlank()) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete, EXPECTED_TOKEN, "a column name"));
+        }
+        Map<String, FieldRule> rules = fields == null ? Map.of() : fieldRules(fields);
+        if (softDelete != null && rules.containsKey(softDelete)) {
+            throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
+                    Map.of(VALUE_TOKEN, softDelete,
+                            EXPECTED_TOKEN, "a column not also declared under fields"));
+        }
+        return new TransformBody.MapProjection(rules, softDelete);
     }
 
     private Map<String, FieldRule> fieldRules(YamlMap fields) {
