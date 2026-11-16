@@ -1,5 +1,5 @@
 version: tapstate/v1
 kind: source
-id: views
+id: tgt_sd_mongo
 connector: mongodb
-config: { uri: "${STORE_URI}" }
+config: { uri: "${TGT_URI}" }
