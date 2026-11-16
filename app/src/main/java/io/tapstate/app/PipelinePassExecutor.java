@@ -56,17 +56,16 @@ final class PipelinePassExecutor implements AutoCloseable {
                 finally { if (lane != null) lane.release(); }
             });
             accepted = true;
-            timing.admission("accepted", active);
-            return true;
-        } catch (RejectedExecutionException saturated) {
-            timing.admission(stopped.get() ? "stopped" : "saturated", active);
-            return false;
+        } catch (RejectedExecutionException rejected) {
+            // Record the rejection after releasing its reservation below.
         } finally {
             if (!accepted) {
                 active.remove(pipeline);
                 if (lane != null) lane.release();
             }
         }
+        timing.admission(accepted ? "accepted" : stopped.get() ? "stopped" : "saturated", active);
+        return accepted;
     }
 
     void runInline(String pipeline, Runnable pass) {
