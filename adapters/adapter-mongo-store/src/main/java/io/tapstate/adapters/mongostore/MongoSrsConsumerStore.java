@@ -714,11 +714,19 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     @Override public Optional<ConsumerOffset> cursor(SrsConsumerContext context) { return progress(context).map(SrsConsumerProgress::cursor); }
+    @Override public Optional<ConsumerOffset> observationCursor(SrsConsumerContext context) {
+        return progress(context, true).map(SrsConsumerProgress::cursor);
+    }
+
     @Override public Optional<SrsConsumerProgress> progress(SrsConsumerContext context) {
+        return progress(context, false);
+    }
+
+    private Optional<SrsConsumerProgress> progress(SrsConsumerContext context, boolean forObservation) {
         Objects.requireNonNull(context, "context");
         return transaction(session -> {
             var facts = new MongoSrsReadFacts(session, database, scope, true);
-            var own = own(session, context, true, facts);
+            var own = own(session, context, true, facts, forObservation);
             if (own == null || own.member().detached()) return Optional.empty();
             var held = own.cursor(); validateSnapshot(session, context, held.snapshot(), facts);
             return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
@@ -1317,6 +1325,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked, MongoSrsReadFacts facts) {
+        return own(session, context, businessChecked, facts, false);
+    }
+
+    private Own own(ClientSession session, SrsConsumerContext context, boolean businessChecked, MongoSrsReadFacts facts,
+            boolean forObservation) {
         String chain = context.key().miningChainId();
         var root = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS, new Document("_id", chain));
         if (root == null) throw unavailable(chain);
@@ -1327,7 +1340,11 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
             view(session,chain); return null;
         }
         var member = records.membership(row);
-        if (!member.context().equals(context) || state.consumerRevision() < member.revision()) throw unavailable(chain);
+        if (!member.context().key().equals(context.key()) || state.consumerRevision() < member.revision()) throw unavailable(chain);
+        if (member.context().stateGeneration() != context.stateGeneration()) {
+            if (forObservation && !member.detached()) throw MongoCachePipelineAccess.claimFenced();
+            if (!forObservation || member.context().stateGeneration() > context.stateGeneration()) throw unavailable(chain);
+        }
         var cursor = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(database).find(session,id).first();
         if (member.detached()) { if (cursor != null) throw unavailable(chain); return new Own(root,member,null); }
         if (state.consumerCount() < 1) throw unavailable(chain);

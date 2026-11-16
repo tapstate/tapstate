@@ -704,6 +704,24 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @Test void aStoppedSuccessorTreatsADetachedPredecessorAsAbsentButRefusesAnOrphanCursor() {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var predecessorCursor = cursor(f, A);
+            var next = new SrsConsumerContext(A.key(), A.stateGeneration() + 1);
+            f.consumers().detach(A, member.revision(), f.fenceA()).orElseThrow();
+            replacePipelineScope(f, next);
+            assertThat(f.consumers().observationCursor(next)).isEmpty();
+            var offsets = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database());
+            offsets.insertOne(predecessorCursor);
+            assertThatThrownBy(() -> f.consumers().observationCursor(next)).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            offsets.deleteOne(id(A));
+            f.consumers().attach(next, member.revision() + 1, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().observationCursor(A))
+                    .satisfies(error -> code(error, IoError.WORKLOAD_CLAIM_FENCED));
+        });
+    }
+
     @Test
     void theOriginalPipelineClaimCannotBeReplacedByCaptureOrAnotherPipelineAuthorization() {
         withBusiness(f -> {

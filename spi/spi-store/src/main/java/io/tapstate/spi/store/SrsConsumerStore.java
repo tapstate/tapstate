@@ -83,6 +83,10 @@ public interface SrsConsumerStore {
     }
 
     Optional<ConsumerOffset> cursor(SrsConsumerContext context);
+
+    /** Reads only this consumer for observation; a detached predecessor supplies no progress. */
+    default Optional<ConsumerOffset> observationCursor(SrsConsumerContext context) { return cursor(context); }
+
     Optional<SrsConsumerProgress> progress(SrsConsumerContext context);
 
     /** An implementation may validate one event's original consumer and model in one guarded read. */

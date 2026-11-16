@@ -48,4 +48,12 @@ public interface PipelineIntentStore {
 
     /** Projects live ids only, without decoding intent bodies. */
     List<String> pipelineIds();
+
+    /** Scheduling hint only. Zero means no new RUNNING intent to prioritize. */
+    record ScanCandidate(String pipelineId, long startRevision) {}
+
+    /** The scheduler must still load and prove the original intent before acting. */
+    default List<ScanCandidate> scanCandidates() {
+        return pipelineIds().stream().map(id -> new ScanCandidate(id, 0)).toList();
+    }
 }

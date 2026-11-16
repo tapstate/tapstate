@@ -127,6 +127,104 @@ class ScopedConvergenceDriverTest {
                 sampler, metricsExport, eligible::get, ownership, bindings);
     }
 
+    @Test void aNewStartPassRunsWhileThreePeriodicPassesAreBlocked() throws Exception {
+        assertStartAdmitted(false);
+    }
+
+    @Test void aRefusedStartPermitDoesNotGiveAwayTheReservedSlotOnRetry() throws Exception {
+        assertStartAdmitted(true);
+    }
+
+    @Test void pendingStartsCannotTakeEverySlotFromPeriodicWork() throws Exception {
+        var outcomes = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var store = mock(PipelineIntentStore.class);
+        when(store.scanCandidates()).thenReturn(java.util.stream.Stream.of("a", "b", "c", "d", "periodic")
+                .map(id -> new PipelineIntentStore.ScanCandidate(id, id.equals("periodic") ? 0 : 1)).toList());
+        when(store.loadForActuation(any())).thenAnswer(call -> {
+            if (call.<String>getArgument(0).equals("periodic")) outcomes.countDown();
+            else {
+                try {
+                    if (!release.await(8, TimeUnit.SECONDS)) throw new AssertionError("start barrier timed out");
+                } catch (InterruptedException stopping) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return Optional.empty();
+        });
+        var port = new ConvergenceDriver.ScopedPorts(store, views, () -> {},
+                pass -> { throw new AssertionError("empty intent cannot actuate"); },
+                pass -> RebuildAdmission.never(), ids -> {});
+        try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null,
+                MetricsExport.none(), () -> true, ownership, port)) {
+            try {
+                driver.schedule();
+                assertThat(outcomes.await(2, TimeUnit.SECONDS))
+                        .as("sustained start probes do not take the last periodic slot").isTrue();
+            } finally { release.countDown(); }
+        }
+    }
+
+    private void assertStartAdmitted(boolean retryPermit) throws Exception {
+        var old = List.of("old-a", "old-b", "old-c", "old-d");
+        var current = new java.util.concurrent.atomic.AtomicReference<>(old);
+        var periodic = new java.util.concurrent.CountDownLatch(3);
+        var fourth = new java.util.concurrent.atomic.AtomicBoolean();
+        var started = new java.util.concurrent.CountDownLatch(1);
+        var denied = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var fresh = new PipelineIntentScope("cluster", 1, "cache", "fresh", 1);
+        var tries = new java.util.concurrent.atomic.AtomicInteger();
+        when(ownership.permit(fresh)).thenAnswer(call -> {
+            if (tries.incrementAndGet() == 1) denied.countDown();
+            else started.countDown();
+            return PipelineActuationOwnership.Permit.denied();
+        });
+        var store = mock(PipelineIntentStore.class);
+        when(store.pipelineIds()).thenAnswer(call -> current.get());
+        when(store.scanCandidates()).thenAnswer(call -> current.get().stream()
+                .map(id -> new PipelineIntentStore.ScanCandidate(id, id.equals("fresh") ? 1L : 0L)).toList());
+        when(store.loadForActuation(any())).thenAnswer(call -> {
+            String id = call.getArgument(0);
+            if (id.equals("fresh")) {
+                if (retryPermit) return Optional.of(new PipelineIntentSnapshot(fresh, 1,
+                        new DesiredState("fresh", PipelineState.RUNNING, "original", false)));
+                started.countDown();
+            } else {
+                if (id.equals("old-d")) fourth.set(true);
+                periodic.countDown();
+                try {
+                    if (!release.await(8, TimeUnit.SECONDS)) throw new AssertionError("periodic barrier timed out");
+                } catch (InterruptedException stopping) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return Optional.empty();
+        });
+        var port = new ConvergenceDriver.ScopedPorts(store, views, () -> {},
+                pass -> { throw new AssertionError("empty intent cannot actuate"); },
+                pass -> RebuildAdmission.never(), ids -> {});
+        try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null,
+                MetricsExport.none(), () -> true, ownership, port)) {
+            try {
+                driver.schedule();
+                assertThat(periodic.await(3, TimeUnit.SECONDS)).isTrue();
+                current.set(List.of("old-a", "old-b", "old-c", "old-d", "fresh"));
+                driver.schedule();
+                if (retryPermit) {
+                    assertThat(denied.await(2, TimeUnit.SECONDS)).isTrue();
+                    org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(() -> {
+                        driver.schedule();
+                        return started.getCount() == 0;
+                    });
+                }
+                assertThat(started.await(2, TimeUnit.SECONDS))
+                        .as("an unchanged periodic pass must not occupy the reserved start slot").isTrue();
+                assertThat(fourth).isFalse();
+            } finally { release.countDown(); }
+        }
+    }
+
     @Test void originalScopedPublicationReachesAlertsBeforeARefusingExporter() {
         sampleMetrics = true;
         var sequence = new ArrayList<String>();

@@ -55,7 +55,7 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
-    @Test void aPipelineProofDoesNotRecheckItsPreparedScopeOrNamespaceWithinOneTransaction() {
+    @Test void aPipelineProofReadsItsDependentFactsInOneSnapshot() {
         withBusiness(f -> {
             var expected = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
@@ -66,13 +66,68 @@ class MongoCacheWorkloadClaimStoreIT {
                 }
             };
             try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
                 var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(expected);
-                assertThat(commands).as("one callback retains its verified namespace and exact prepared Pipeline scope")
-                        .hasSize(9);
-                assertThat(commands.stream().filter("find:workload_claims"::equals)).hasSize(1);
-                assertThat(commands.stream().filter("aggregate:workload_claims"::equals)).hasSize(1);
-                assertThat(commands.stream().filter(value -> value.startsWith("listCollections:"))).hasSize(2);
+                assertThat(commands).as("one bounded data query with all original catalog checks")
+                        .containsExactly("find:cache_identity", "listCollections:-", "listCollections:-", "listIndexes:pipeline_state",
+                                "aggregate:schema_migrations", "commitTransaction:-");
+            }
+        });
+    }
+
+    @Test void anInvalidBusinessIdentityRefusesBeforeReadingTheSchemaView() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("businessPhase", "RETIRED")));
+            String schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName();
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database()).drop();
+            f.database().getCollection("unreadable_schema_fixture").insertOne(new Document("_id", "business"));
+            f.database().createView(schema, "unreadable_schema_fixture", List.of(
+                    new Document("$set", new Document("installedVersion",
+                            new Document("$divide", List.of(1, 0))))));
+            try (var observed = client(new CommandListener() {})) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            }
+        });
+    }
+
+    @Test void oversizedOrCollatedCheckpointsKeepTheCollectionLocalRead() {
+        withBusiness(f -> {
+            var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var joinReads = new AtomicInteger();
+            var scalarReads = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    var name = event.getCommandName();
+                    var command = event.getCommand();
+                    if ("aggregate".equals(name) && "schema_migrations".equals(command.getString(name).getValue()))
+                        joinReads.incrementAndGet();
+                    if ("find".equals(name) && "pipeline_state".equals(command.getString(name).getValue()))
+                        scalarReads.incrementAndGet();
+                }
+            };
+            var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var original = state.find(new Document("_id", "orders")).first();
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                state.updateOne(new Document("_id", "orders"), new Document("$set", new Document("pad", "x".repeat(70 * 1024))));
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
+                assertThat(joinReads).hasValue(1);
+                assertThat(scalarReads).hasValue(1);
+
+                state.drop();
+                f.database().createCollection(state.getNamespace().getCollectionName(),
+                        new com.mongodb.client.model.CreateCollectionOptions().collation(com.mongodb.client.model.Collation.builder()
+                                .locale("en").collationStrength(com.mongodb.client.model.CollationStrength.PRIMARY).build()));
+                state.insertOne(original);
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
+                assertThat(joinReads).hasValue(1);
+                assertThat(scalarReads).hasValue(2);
             }
         });
     }
@@ -88,12 +143,13 @@ class MongoCacheWorkloadClaimStoreIT {
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     if (!event.getCommandName().equals("aggregate")
-                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_WORKLOAD_CLAIMS.collectionName())) return;
+                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())) return;
                     sessions.put(Thread.currentThread().threadId(), event.getCommand().getDocument("lsid").toJson());
                     if (selected.compareAndSet(false, true)) { entered.countDown(); await(release); }
                 }
             };
             try (var observed = client(listener); var callers = Executors.newFixedThreadPool(2)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
                 var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
                 java.util.function.Supplier<WorkloadClaimFence> read = () -> {
                     var checks = new AtomicInteger();

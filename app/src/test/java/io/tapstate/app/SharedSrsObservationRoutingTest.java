@@ -46,6 +46,7 @@ class SharedSrsObservationRoutingTest {
         when(consumers.attached(physical)).thenReturn(topology(2));
         var ack=new ChainPosition(new SourceOrder(2,2),"new-physical-confirmation");
         var offset=new ConsumerOffset(SrsConsumerId.of("flow","input").value(),Map.of("orders",2L),ack,List.of(),null,0L,Map.of("orders",ack),ConsumerProgressKind.SRS);
+        when(consumers.observationCursor(topology(2).consumers().getFirst().context())).thenReturn(Optional.of(offset));
         when(meta.read(physical)).thenReturn(Optional.of(new SrsMeta(physical,ack,List.of(offset),List.of(),null,2,null,true)));
         when(meta.read(canonical)).thenThrow(new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",preparation.captureId()),null));
         port=spy(new ThreeLayerStorePort(configuration,bound,ignored -> {throw new AssertionError("observation cannot prepare state");}));
@@ -71,8 +72,8 @@ class SharedSrsObservationRoutingTest {
                         new WorkloadOwner("node","boot"),1,1,1));
         when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,2,List.of(target,sibling)));
         var offset = meta.read(physical).orElseThrow().consumerOffset(SrsConsumerId.of("flow","input").value()).orElseThrow();
-        when(consumers.cursor(target.context())).thenReturn(Optional.of(offset));
-        when(consumers.cursor(siblingContext)).thenReturn(Optional.of(new ConsumerOffset(
+        when(consumers.observationCursor(target.context())).thenReturn(Optional.of(offset));
+        when(consumers.observationCursor(siblingContext)).thenReturn(Optional.of(new ConsumerOffset(
                 siblingContext.key().consumerId(),Map.of(),null,List.of(),null,0L)));
         when(chains.load(physical)).thenReturn(Optional.of(new SrsChainState(physical,preparation.captureId(),null,2,
                 Set.of("orders"),Set.of("orders"),0,null,null,2,2)));
@@ -80,8 +81,9 @@ class SharedSrsObservationRoutingTest {
 
         assertThat(new StoreBackedSinkPositions(port).apply("flow"))
                 .containsOnly(entry("orders","new-physical-confirmation"));
-        verify(consumers).cursor(target.context());
-        verify(consumers,never()).cursor(siblingContext);
+        verify(consumers).observationCursor(target.context());
+        verify(consumers,never()).attached(anyString());
+        verify(consumers,never()).observationCursor(siblingContext);
     }
     @ParameterizedTest
     @ValueSource(ints = {1, 2})
@@ -206,17 +208,19 @@ class SharedSrsObservationRoutingTest {
     }
     @Test void aStoppedOldScopeWithoutAnAttachmentDoesNotInheritTheNewScopesConfirmation() {
         when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,0,List.of()));
+        when(consumers.observationCursor(topology(2).consumers().getFirst().context())).thenReturn(Optional.empty());
         assertThat(new StoreBackedSinkPositions(port).apply("flow")).isEmpty();
         assertThat(new StoreBackedPipelineChains(port).progressChainsOf("flow")).isEmpty();verifyNoInteractions(meta);
     }
     @Test void aDifferentStateGenerationCannotReadTheReplacementConsumersAcknowledgement() {
-        when(consumers.attached(physical)).thenReturn(topology(1));
+        when(consumers.observationCursor(topology(2).consumers().getFirst().context())).thenThrow(
+                new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null));
         assertThatThrownBy(() -> new StoreBackedSinkPositions(port).apply("flow")).isInstanceOf(TapstateException.class);verifyNoInteractions(meta);
     }
     @Test void aBindingOrScopeChangeDuringTheReadCannotRetargetTheOriginalObservation() {
-        when(consumers.attached(physical)).thenAnswer(call -> {
+        when(consumers.observationCursor(topology(2).consumers().getFirst().context())).thenAnswer(call -> {
             when(mappings.read("flow")).thenReturn(Optional.of(new PipelineStateMapping("flow",3,PipelineStateMapping.Phase.ACTIVE,null)));
-            return topology(2);
+            return Optional.empty();
         });
         assertThatThrownBy(() -> new StoreBackedSinkPositions(port).apply("flow")).isInstanceOf(TapstateException.class);verifyNoInteractions(meta);
     }
@@ -237,11 +241,8 @@ class SharedSrsObservationRoutingTest {
         memory.artifacts().save(snapshot);
         String channel = SourceCaptureResolution.forPipeline(snapshot, source, model).orElseThrow().chainId().value();
         doReturn(Optional.empty()).when(meta).read(channel);
-        doThrow(new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE, Map.of("chain", channel), null))
-                .when(port).sinkOffset("flow", "input", channel);
-
         assertThat(new StoreBackedSinkPositions(port).apply("flow")).isEmpty();
-        verify(port, never()).sinkOffset(anyString(), anyString(), anyString());
+        verify(port, never()).sharedSinkOffset(any(), any(), any());
         verifyNoInteractions(captures, consumers, chains);
     }
     @Test void missingKnownConfigurationControlCannotEraseTheObservedProgress() {
@@ -275,7 +276,12 @@ class SharedSrsObservationRoutingTest {
         verifyNoInteractions(meta);verify(captures,never()).issueFirstCreate(any());
     }
     @Test void aChangeAfterResolutionCannotReturnTheNextGenerationsAck() {
-        changeDuringMeta();
+        var context = topology(2).consumers().getFirst().context();
+        var offset = consumers.observationCursor(context);
+        when(consumers.observationCursor(context)).thenAnswer(call -> {
+            when(mappings.read("flow")).thenReturn(Optional.of(new PipelineStateMapping("flow",3,PipelineStateMapping.Phase.ACTIVE,null)));
+            return offset;
+        });
         assertThatThrownBy(() -> new StoreBackedSinkPositions(port).apply("flow")).isInstanceOf(TapstateException.class);
     }
     @Test void positionAndStartPlanningKeepTheScopeUntilAllProgressReadsFinish() {
