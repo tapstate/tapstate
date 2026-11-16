@@ -92,6 +92,21 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void hidesDriverCredentialsWhenTheOldReportAlreadyHasASafetyMarker() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb-atlas", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "SCRAM rejected MongoCredential{userName='fixture-account', mechanismProperties=<hidden>}",
+                        null, null, null)), 1_700_000_000_000L, true));
+
+        var report = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow();
+
+        assertThat(report.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+        assertThat(report.checks().getFirst().message())
+                .contains("SCRAM rejected", "<redacted>").doesNotContain("fixture-account");
+    }
+
+    @Test
     void aNullConnectionIdIsRejected() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
         assertThatThrownBy(() -> query.find(null)).isInstanceOf(NullPointerException.class);

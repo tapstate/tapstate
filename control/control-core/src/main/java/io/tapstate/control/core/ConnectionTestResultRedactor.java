@@ -33,10 +33,10 @@ final class ConnectionTestResultRedactor {
                 result.testedAt(), true);
     }
 
-    /** Hides legacy diagnostics whose original credential values are no longer available. */
+    /** Rechecks credential structures in stored reports and hides text without a safety marker. */
     static ConnectionTestResult hideUntrustedDiagnostics(ConnectionTestResult result) {
         if (result.diagnosticsRedacted()) {
-            return result;
+            return redact(result, List.of());
         }
         List<ConnectionTestItem> safeItems = new ArrayList<>(result.items().size());
         for (int index = 0; index < result.items().size(); index++) {
@@ -90,6 +90,6 @@ final class ConnectionTestResultRedactor {
     }
 
     private static String redact(String text, List<String> secretValues) {
-        return SecretRedactor.redactValues(text, secretValues, MongoUriUserInfo.REDACTED);
+        return SecretRedactor.redactConnectionDiagnostic(text, secretValues);
     }
 }

@@ -167,6 +167,29 @@ class ConnectionTestServiceTest {
     }
 
     @Test
+    void hidesTheDriverCredentialStructureBeforePublishingTheReport() {
+        var status = ConnectionTestItem.Status.FAILED;
+        var report = new ConnectionTestResult("connection", "mongodb-atlas", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", status,
+                        "Authentication refused: MongoCredential{mechanism=SCRAM-SHA-1, "
+                                + "userName='fixture-account', password=<hidden>, mechanismProperties=<hidden>}",
+                        null, null, null)), 1_700_000_000_000L);
+        var store = new RecordingResultStore();
+        var service = new ConnectionTestService(config -> report, store, gate(new RecordingAuditStore()),
+                null, SourceConnectionResolver.forAdHocConnections());
+
+        var immediate = service.test("connection", "mongodb-atlas",
+                Map.of("uri", "mongodb://fixture-account:fixture-password@localhost"), "alice");
+        var latest = new ConnectionTestResultQueryService(store).find("connection").orElseThrow();
+
+        assertThat(immediate.outcome()).isEqualTo(ConnectionTestReport.Outcome.FAILED);
+        assertThat(immediate.checks().getFirst().message())
+                .contains("Authentication refused", "<redacted>").doesNotContain("fixture-account");
+        assertThat(store.saved.items().getFirst().message()).doesNotContain("fixture-account");
+        assertThat(latest).isEqualTo(immediate);
+    }
+
+    @Test
     void redactsTransportSecretsFromCodedProbeFailures() {
         String tlsKey = "private-key-sentinel";
         String causeSecret = "cause-secret-sentinel";

@@ -65,6 +65,11 @@ public final class SecretRedactor {
         return redact(MongoLogSanitizer.redact(text));
     }
 
+    /** Hides connection credential structures and the admitted operation's known secret values. */
+    public static String redactConnectionDiagnostic(String text, Collection<String> values) {
+        return redactValues(MongoLogSanitizer.redact(text), values, MongoUriUserInfo.REDACTED);
+    }
+
     /** Redacts supplied values using the same matcher as the process-wide log registry. */
     public static String redactValues(String text, Collection<String> values, String replacement) {
         if (text == null) {
