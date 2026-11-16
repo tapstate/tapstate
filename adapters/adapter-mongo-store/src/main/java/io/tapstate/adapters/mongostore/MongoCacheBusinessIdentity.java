@@ -21,11 +21,21 @@ final class MongoCacheBusinessIdentity {
     void requireValidationPreparation(ClientSession session, String operation) { readyIdentity(session, java.util.Objects.requireNonNull(operation)); }
 
     private Document readyIdentity(ClientSession session, String maintenance) {
-        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
-        requireReadyIdentity(identity, scope);
+        Document identity = readReadyIdentity(session);
         Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
         requireReadySchema(identity, schema, scope, maintenance);
         return identity;
+    }
+
+    Document readReadyIdentity(ClientSession session) {
+        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        requireReadyIdentity(identity, scope);
+        return identity;
+    }
+
+    void requireAdmissionState(ClientSession session, Document identity) {
+        var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        requireObservedAdmission(identity, schema, scope);
     }
 
     static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {

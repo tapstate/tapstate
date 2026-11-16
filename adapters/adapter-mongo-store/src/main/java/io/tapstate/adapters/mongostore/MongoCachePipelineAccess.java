@@ -474,11 +474,15 @@ final class MongoCachePipelineAccess {
     void verifyStateStructure() { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE); }
     void verifyStateStructure(MongoReadBudget budget) { verifyStructure(SystemCollections.CACHE_PIPELINE_STATE,budget); }
 
+    boolean verifyStateStructureForProof(MongoReadBudget budget) {
+        return MongoPipelineProofFacts.hasSimpleCollation(verifyStructure(SystemCollections.CACHE_PIPELINE_STATE, budget));
+    }
+
     private void verifyStructure(SystemCollections table) {
         verifyStructure(table,null);
     }
 
-    private void verifyStructure(SystemCollections table,MongoReadBudget budget) {
+    private Document verifyStructure(SystemCollections table,MongoReadBudget budget) {
         var found = (budget==null?database:budget.database(database)).listCollections().filter(new Document("name", table.collectionName())).first();
         if (found == null || !"collection".equals(found.get("type"))) throw unreadable("structure");
         var options = found.get("options", Document.class);
@@ -488,6 +492,7 @@ final class MongoCachePipelineAccess {
         var id = indexes.stream().filter(index -> "_id_".equals(index.get("name"))).findFirst().orElse(null);
         if (id == null || !new Document("_id", 1).equals(id.get("key")) || Boolean.TRUE.equals(id.get("hidden"))
                 || Boolean.TRUE.equals(id.get("sparse")) || id.containsKey("partialFilterExpression")) throw unreadable("index");
+        return found;
     }
 
     static TapstateException fenced() { return MongoCacheBusinessIdentity.businessFenced(); }
