@@ -116,8 +116,9 @@ final class NativeValidationOwnerReservations implements ValidationOwnerRouter.L
         synchronized (pipelines) { pipeline = pipelines.get(original.pipelineId()); }
         var current = pipeline == null ? null : pipeline.owner;
         if (current != null && original.equals(current.lease.owner()) && !current.retired.get()
-                && current.lease.observesLive() && pipeline.owner == current && !current.retired.get()) {
-            return io.tapstate.runtime.probe.ValidationOperation.OwnerLease.LIVE;
+                && current.lease.observesLive() && pipeline.owner == current) {
+            // The owner can retire while its lease is being observed.
+            if (!current.retired.get()) return io.tapstate.runtime.probe.ValidationOperation.OwnerLease.LIVE;
         }
         var reading = configuration.observeValidationClaim(original.pipelineId(), scope, cache, this::requireActive);
         requireActive();

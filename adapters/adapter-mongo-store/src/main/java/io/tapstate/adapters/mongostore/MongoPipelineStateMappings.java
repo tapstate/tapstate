@@ -52,13 +52,18 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
 
     void create(ClientSession session,String pipelineId) { create(session,pipelineId,() -> null); }
     void create(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
+        createRow(session, pipelineId, currentBusiness);
+    }
+
+    /** Returns the exact row validated and written in the caller's current transaction. */
+    Document createRow(ClientSession session,String pipelineId,java.util.function.Supplier<io.tapstate.spi.store.CacheBusinessScope> currentBusiness) {
         var validationSchema = validationSchema(session);
         var prior=mappings.find(session,new Document("_id",pipelineId)).first();
         if(prior==null) {
             var initial = new Document("_id",pipelineId).append("stateGeneration",1L).append("phase","ACTIVE").append("operationId",null)
                     .append("noteWriteFence",0L).append("cachePreparation",new Document("phase","UNASSIGNED"));
             if (validationSchema != null) initial.append("validationPreparation", MongoValidationPreparationFacts.initial());
-            mappings.insertOne(session, initial);return;
+            mappings.insertOne(session, initial);return initial;
         }
         var state=decode(pipelineId,prior);if(state.phase()!=PipelineStateMapping.Phase.RETIRED)throw retirementRequired(pipelineId);
         var result=MongoPipelineRetirementFacts.read(prior).completed();
@@ -81,6 +86,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
         MongoPipelineSharedRecoveryFacts.removeOnVerifiedReplacement(prior,replacement,result.scope());
         if(mappings.replaceOne(session,new Document("_id",pipelineId).append("stateGeneration",state.stateGeneration()).append("phase","RETIRED")
                 .append("noteWriteFence",prior.get("noteWriteFence")).append("retirement",prior.get("retirement")),replacement).getMatchedCount()!=1)throw retirementRequired(pipelineId);
+        return replacement;
     }
 
     void requireNoRetainedIdentity(ClientSession session, String resourceId) {
@@ -97,12 +103,11 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
 
     Document requireActiveRow(ClientSession session, String pipelineId) {
         var schema = validationSchema(session);
+        Document current = mappings.find(session, new Document("_id", pipelineId)).first();
         if (schema != null) {
-            var row = mappings.find(session, new Document("_id", pipelineId)).first();
-            if (row == null || !(row.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
+            if (current == null || !(current.get("validationPreparation") instanceof Document value)) throw MongoValidationSchema.unreadable("pipeline-marker");
             MongoValidationPreparationFacts.decode(value, MongoValidationSchema.scope(schema).clusterId(), pipelineId);
         }
-        Document current = mappings.find(session, new Document("_id", pipelineId)).first();
         PipelineStateMapping state = decode(pipelineId, current);
         if (state.phase() != PipelineStateMapping.Phase.ACTIVE) throw retirementRequired(pipelineId);
         return current;

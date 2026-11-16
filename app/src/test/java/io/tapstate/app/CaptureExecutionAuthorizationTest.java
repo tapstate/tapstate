@@ -6,9 +6,11 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.atomic.*;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+@Timeout(20)
 class CaptureExecutionAuthorizationTest {
     private static final CacheBusinessScope SCOPE = new CacheBusinessScope("cluster",1,"cache");
     private static final PipelineIntentScope PIPELINE = new PipelineIntentScope("cluster",1,"cache","same-id",1);
@@ -65,13 +67,22 @@ class CaptureExecutionAuthorizationTest {
         try (var guard = guard()) { refused(() -> guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE))); }
     }
     @Test void aLegalTopologyChangeOrNewerExecutionRefreshesAPreheatedProofWithoutLettingTheOldFenceFollowIt() {
-        for (var next : List.of(claim(WorkloadClaimType.CAPTURE,OWNER,1,0,0),claim(WorkloadClaimType.CAPTURE,OWNER,1,0,3),claim(WorkloadClaimType.CAPTURE,OWNER,1,1,2))) {
+        // A live fenced Capture acquires its topology from a committed membership,
+        // whose revision is positive and increases within the same CACHE scope.
+        for (var next : List.of(claim(WorkloadClaimType.CAPTURE,OWNER,1,0,3),claim(WorkloadClaimType.CAPTURE,OWNER,1,1,2))) {
             var held = new AtomicReference<>(CAPTURE);
             when(claims.read(CAPTURE.key())).thenAnswer(call -> Optional.of(new WorkloadClaimReading(held.get(),Duration.ofSeconds(5))));
             try (var guard = guard()) {
-                guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE)); held.set(next);
+                clearInvocations(claims);
+                guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE));
+                held.set(next);
                 assertThat(guard.requireCapture(SCOPE,WorkloadClaimFence.from(next))).isEqualTo(WorkloadClaimFence.from(next));
-                refused(() -> guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE)));
+                var uncommitted = WorkloadClaimFence.from(claim(WorkloadClaimType.CAPTURE, OWNER, 1, 0, 0));
+                for (int i = 0; i < 8; i++) {
+                    refused(() -> guard.requireCapture(SCOPE,WorkloadClaimFence.from(CAPTURE)));
+                    refused(() -> guard.requireCapture(SCOPE,uncommitted));
+                }
+                verify(claims,times(2)).read(CAPTURE.key());
             }
         }
     }

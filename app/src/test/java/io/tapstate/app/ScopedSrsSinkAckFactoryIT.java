@@ -105,7 +105,7 @@ class ScopedSrsSinkAckFactoryIT {
                         var admin = observer.getDatabase("admin");
                         long entered = ((Number) admin.runCommand(new org.bson.Document("configureFailPoint", "failCommand")
                                 .append("mode", new org.bson.Document("times", 1)).append("data", new org.bson.Document("failCommands", List.of("update"))
-                                        .append("namespace", cacheName + ".workload_claims").append("appName", "tapstate/" + application)
+                                        .append("namespace", cacheName + ".pipeline_state").append("appName", "tapstate/" + application)
                                         .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
                         try (var executor = java.util.concurrent.Executors.newSingleThreadExecutor()) {
                             try {
@@ -117,7 +117,7 @@ class ScopedSrsSinkAckFactoryIT {
                                         .append("timesEntered", entered + 1).append("maxTimeMS", 5000));
                                 var held = admin.runCommand(new org.bson.Document("currentOp", 1).append("$all", true))
                                         .getList("inprog", org.bson.Document.class).stream().filter(op -> ("tapstate/" + application).equals(op.getString("appName")))
-                                        .filter(op -> op.get("command") instanceof org.bson.Document command && "workload_claims".equals(command.getString("update")))
+                                        .filter(op -> op.get("command") instanceof org.bson.Document command && "pipeline_state".equals(command.getString("update")))
                                         .findFirst().orElseThrow();
                                 assertThat(held.get("command", org.bson.Document.class)).containsEntry("autocommit", false)
                                         .doesNotContainKey("startTransaction");

@@ -101,6 +101,8 @@ final class ExecutionAuthorization implements AutoCloseable {
     private record ProofResult(Entry entry, boolean denied) {}
 
     private static final class ScopedProof {
+        // A single volatile publication carries the immutable result and its original fence.
+        @SuppressWarnings("java:S3077")
         volatile ProofResult result = new ProofResult(null, false);
         volatile String readFailure;
         volatile long lastUsed = System.nanoTime();
@@ -109,6 +111,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         long nextRead;
         long revision;
         boolean reading;
+        boolean lastReadSucceeded;
         boolean superseded;
     }
 
@@ -312,6 +315,25 @@ final class ExecutionAuthorization implements AutoCloseable {
         return authorizedEntry(fence) != null;
     }
 
+    /** Optional display reads must never wait for a missing authorization proof. */
+    boolean observedAuthorization(ExecutionFence fence) {
+        Objects.requireNonNull(fence, "fence");
+        if (!fenced || !accepts(fence) || closed.get() || !nodeActive.getAsBoolean()) return false;
+        ReadKey key = ReadKey.of(fence);
+        if (businessScope == null) {
+            var entry = entries.get(key);
+            return entry != null && nanoTime.getAsLong() - entry.deadlineNanos() < 0 && matches(entry.claim(), fence);
+        }
+        var proof = scopedProofs.computeIfAbsent(key, ignored -> new ScopedProof());
+        proof.lastUsed = System.nanoTime();
+        var result = proof.result;
+        if (!proof.superseded && liveMatch(result, entry -> matches(entry.claim(), fence)) && proof.result == result)
+            return true;
+        boolean olderExecution = result.entry() != null && precedes(result.entry(), fence);
+        synchronized (proof) { requestScopedProof(key, proof, olderExecution); }
+        return false;
+    }
+
     /** Rechecks only an already-published proof and its original deadline, without store IO. */
     WorkloadClaimFence requireLocal(ExecutionFence fence) {
         Objects.requireNonNull(fence,"fence");
@@ -376,7 +398,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 var entry = requireWriterLease(fence, proof);
                 if (nanoTime.getAsLong() - entry.deadlineNanos() < 0) break;
                 proof.lastUsed = System.nanoTime();
-                requestScopedProof(key, proof);
+                requestScopedProof(key, proof, false);
                 try {
                     TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
                 } catch (InterruptedException interrupted) {
@@ -525,11 +547,14 @@ final class ExecutionAuthorization implements AutoCloseable {
                 if (liveMatch(result, matches)) return entry;
                 if (entry != null && !precedes.test(entry)
                         && (result.denied() || !matches.test(entry))) return null;
-                if (entry == null && result.denied() && proof.revision != initialRevision) return null;
+                // A completed read that cannot prove the requested fence is already an answer.
+                if (proof.revision != initialRevision) return null;
+                if (entry == null && result.denied() && proof.readFailure != null
+                        && System.nanoTime() - proof.nextRead < 0) return null;
 
                 long left = 3 * windowNanos - (System.nanoTime() - startedAt);
                 if (left <= 0) throw proofUnavailable(key);
-                requestScopedProof(key, proof);
+                requestScopedProof(key, proof, true);
                 try {
                     TimeUnit.NANOSECONDS.timedWait(proof, Math.min(left, TimeUnit.SECONDS.toNanos(1)));
                 } catch (InterruptedException interrupted) {
@@ -552,6 +577,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                 Map.of("detail", "authorization-proof-unavailable " + key.type().name()), null);
     }
 
+    // Each ScopedProof is private and is the common monitor used by its waiters and publishers.
+    @SuppressWarnings("java:S2445")
     private void refreshScopedProofs() {
         sweepLeases();
         long now = System.nanoTime();
@@ -565,17 +592,19 @@ final class ExecutionAuthorization implements AutoCloseable {
                         proof.notifyAll();
                     }
                 } else {
-                    requestScopedProof(key, proof);
+                    requestScopedProof(key, proof, false);
                 }
             }
         });
     }
 
     /** Caller holds only the proof's monitor, never while doing store I/O. */
-    private void requestScopedProof(ReadKey key, ScopedProof proof) {
+    private void requestScopedProof(ReadKey key, ScopedProof proof, boolean foreground) {
+        boolean refreshNow = foreground && proof.lastReadSucceeded;
         if (closed.get() || proof.superseded || proof.reading || proof.storeReading.get()
-                || proof.nextRead != 0 && System.nanoTime() - proof.nextRead < 0) return;
+                || !refreshNow && proof.nextRead != 0 && System.nanoTime() - proof.nextRead < 0) return;
         proof.reading = true;
+        proof.lastReadSucceeded = false;
         try {
             proofReaders.execute(() -> readScopedProof(key, proof));
         } catch (RejectedExecutionException busy) {
@@ -587,6 +616,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     private void readScopedProof(ReadKey key, ScopedProof proof) {
         long startedAt = nanoTime.getAsLong();
         ProofResult result = null;
+        boolean scopeRead = false;
         try {
             var reading = readExecutionProof(key, proof, startedAt);
             proof.readFailure = null;
@@ -599,6 +629,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 result = new ProofResult(new Entry(WorkloadClaimFence.from(observed.claim()), startedAt + held, startedAt + lease),
                         held <= 0);
             }
+            scopeRead = true;
         } catch (RuntimeException unavailable) {
             dropLeases(key);
             proof.readFailure = unavailable instanceof TapstateException coded ? coded.getMessage() : unavailable.getClass().getSimpleName();
@@ -608,7 +639,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                 LOG.debug("Could not refresh {} authorization for {}", key.type(), key.pipelineId(), unavailable);
             }
         } finally {
-            publishScopedProof(key, proof, result);
+            publishScopedProof(key, proof, result, scopeRead);
         }
     }
 
@@ -619,7 +650,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                 || coded.code() == IoError.PIPELINE_INTENT_FENCED;
     }
 
-    private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result) {
+    @SuppressWarnings("java:S2445")
+    private void publishScopedProof(ReadKey key, ScopedProof proof, ProofResult result, boolean scopeRead) {
         // Publish and retire older scopes in one order. No store calls take either monitor.
         synchronized (scopedProofs) {
             synchronized (proof) {
@@ -634,7 +666,8 @@ final class ExecutionAuthorization implements AutoCloseable {
                             proof.result = new ProofResult(null, true);
                         } else {
                             proof.result = result;
-                            if (result.entry() != null && key.scope() != null && !proof.scopeProved) {
+                            // A successful scoped read confirms the generation even before it has a claim.
+                            if (scopeRead && key.scope() != null && !proof.scopeProved) {
                                 proof.scopeProved = true;
                                 retireOlderScopes(key);
                             }
@@ -645,6 +678,7 @@ final class ExecutionAuthorization implements AutoCloseable {
                     long delay = result == null ? Math.min(refreshIntervalNanos, TimeUnit.SECONDS.toNanos(1))
                             : refreshIntervalNanos;
                     proof.nextRead = System.nanoTime() + delay;
+                    proof.lastReadSucceeded = scopeRead;
                 }
                 proof.notifyAll();
             }
@@ -660,6 +694,7 @@ final class ExecutionAuthorization implements AutoCloseable {
         });
     }
 
+    @SuppressWarnings("java:S2445")
     private void retireOlderScopes(ReadKey newer) {
         scopedProofs.forEach((key, proof) -> {
             if (key.scope() == null || !key.pipelineId().equals(newer.pipelineId())
@@ -773,6 +808,7 @@ final class ExecutionAuthorization implements AutoCloseable {
     }
 
     @Override
+    @SuppressWarnings("java:S2445")
     public void close() {
         closed.set(true); entries.clear(); nextReadNanos.clear();
         leases.keySet().forEach(this::dropLeases);

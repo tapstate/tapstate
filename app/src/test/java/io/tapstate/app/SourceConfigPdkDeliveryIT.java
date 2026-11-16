@@ -221,7 +221,18 @@ class SourceConfigPdkDeliveryIT {
                 "--tapstate.cloud.cluster-id=shared-source-cluster"));
         else args.add("--tapstate.store.mongo.uri=" + uri);
         ConfigurableApplicationContext context = new SpringApplicationBuilder(Assembly.class)
-                .initializers(CloudConnectorTestInputs::reportCapabilityFailures)
+                .initializers(CloudConnectorTestInputs::reportCapabilityFailures, app -> {
+                    if (!cloud) return;
+                    app.addBeanFactoryPostProcessor(factory -> factory.addBeanPostProcessor(
+                            new org.springframework.beans.factory.config.BeanPostProcessor() {
+                                @Override public Object postProcessAfterInitialization(Object bean, String name) {
+                                    if (bean instanceof BundledConnectorRegistry) {
+                                        return factory.getBean(io.tapstate.spi.store.StorePort.class).connectors();
+                                    }
+                                    return bean;
+                                }
+                            }));
+                })
                 .environment(CloudFixtureEnvironment.isolated()).run(args.toArray(String[]::new));
         MongoClient raw = null;
         try {
@@ -268,6 +279,14 @@ class SourceConfigPdkDeliveryIT {
     @ConditionalOnProperty(prefix = "tapstate.test", name = "pdk-memory", havingValue = "true")
     @Import({StoreConfiguration.class, ControlPlaneConfiguration.class})
     static class Assembly {
+        @Bean
+        @ConditionalOnProperty(prefix = "tapstate.cloud", name = "base-url")
+        static org.springframework.beans.factory.config.BeanPostProcessor legacyCloudSeedRunner(
+                org.springframework.beans.factory.ObjectProvider<io.tapstate.adapters.pdk.ConnectorArtifactRegistrar> registrar,
+                org.springframework.beans.factory.ObjectProvider<ConnectorPluginProperties> properties) {
+            return CloudConnectorTestInputs.legacySeedRunner(registrar, properties);
+        }
+
         /** This fixture verifies real PDK config delivery without executing a Pipeline preview. */
         @Bean
         PipelinePreviewProbe unusedPreviewProbe() {

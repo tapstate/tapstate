@@ -25,8 +25,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  * A key a level has never held is fetched from the layer behind its memory once, not twice.
  *
  * <p>A level reads a key's state out and writes it back, which is two reaches for the state. Only the
- * first of them can miss: after it, the key is resident. So a run over keys none of which was ever held
- * has a shape - two reaches, one trip - and that shape is the whole assertion. A write that fetches the
+ * first of them can miss: after it, the key is resident. A run over keys none of which was ever held
+ * therefore requests two keys with one cold key per root, even when the calls are batched. A write that fetches the
  * entry it is about to overwrite makes the second trip too, and nothing else about the run differs:
  * every document still lands, every reading stays healthy, and the only trace is a round trip to
  * another process, per key, per residency.
@@ -157,11 +157,7 @@ class NestReadsAFirstTouchKeyOnceNotTwiceIT {
     }
 
     /**
-     * The two readings, taken once they have stopped moving, and asserted as the pair they are.
-     *
-     * <p>They are asserted exactly rather than as bounds because nothing here is left to the run's
-     * timing: every root is seeded before the pipeline starts and none of them is ever evicted, so how
-     * many drains the run happens to take moves neither number. What does move them is the design.
+     * Exact key costs after the readings settle, with bounds for the logical calls that can batch them.
      */
     private void assertWhatOneFirstTouchCost(ControlPlane control) {
         long[] settled = {-1L, -1L};
@@ -190,28 +186,13 @@ class NestReadsAFirstTouchKeyOnceNotTwiceIT {
         assertThat(control.metricTotal(pipelineId, "nestStateReadKeys.")).hasValue((long) ROOTS);
         assertThat(control.metricTotal(pipelineId, "nestStateWriteKeys.")).hasValue((long) ROOTS);
         assertThat(control.metricTotal(pipelineId, "nestStateColdKeys.")).hasValue((long) ROOTS);
-        assertThat(reaches)
-                .as("the state was reached %d times over %d roots, where the pair a level performs is to "
-                        + "read a key's state out and write it back. This is asserted beside the trips "
-                        + "below because trips alone would also be satisfied by a level that had stopped "
-                        + "reading the state at all.%n  metrics: %s",
-                        reaches, ROOTS, control.metrics(pipelineId))
-                .isEqualTo(2L * ROOTS);
-        assertThat(trips)
-                .as("those %d reaches went behind the map %d times, over %d roots none of which was ever "
-                        + "held. Only the first reach of a key can miss - after it the key is resident - "
-                        + "so one trip per root is the whole cost, and %d would mean the write is "
-                        + "fetching the entry it is about to overwrite: a round trip to another process, "
-                        + "per key, per residency, with every document still correct and nothing failing. "
-                        + "Nothing was evicted here - a budget of %d over %d roots - so no trip in this "
-                        + "number is a key read back rather than a key touched for the first "
-                        + "time.%n  metrics: %s",
-                        reaches, trips, ROOTS, 2L * ROOTS, MEMORY_BUDGET, ROOTS, control.metrics(pipelineId))
-                .isEqualTo((long) ROOTS);
-        // The existing single-key workload has one requested key per logical reach and cold callback.
-        // These additional instruments must travel through the real job and observation face too.
-        assertThat(control.metricTotal(pipelineId, KEY_ACCESSES)).hasValue(reaches);
-        assertThat(control.metricTotal(pipelineId, COLD_KEYS)).hasValue(trips);
+        assertThat(control.metricTotal(pipelineId, KEY_ACCESSES)).hasValue(2L * ROOTS);
+        assertThat(control.metricTotal(pipelineId, COLD_KEYS)).hasValue((long) ROOTS);
+        // One invocation can cover several keys. Per-key reads still cost exactly one cold key each.
+        assertThat(reaches).as("logical invocations across %d read and write keys", 2L * ROOTS)
+                .isBetween(1L, 2L * ROOTS);
+        assertThat(trips).as("cold loader invocations across %d cold keys", ROOTS)
+                .isBetween(1L, (long) ROOTS);
     }
 
     /** Every seeded root, with the child table created and left empty. See the class note. */

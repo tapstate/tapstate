@@ -211,6 +211,8 @@ class AtlasPdkSourcePermissionsIT {
     private static void assertSafeCaptureFailure(ControlPlane control, String pipeline, String sourceUri,
             String expectedDetail) {
         awaitState(control, pipeline, PipelineState.FAILED);
+        Await.until(pipeline + " to publish its connector failure", TIMEOUT,
+                () -> control.failureCode(pipeline).isPresent(), () -> control.logs(pipeline));
         assertThat(control.failureCode(pipeline)).contains(ConnectorError.CAPTURE_FAILED.code());
         String body = control.sourceRequest("GET", "/api/pipelines/" + pipeline + "/status", null, null, 200).body();
         assertThat(body).doesNotContain(PASSWORD, sourceUri);
@@ -235,11 +237,13 @@ class AtlasPdkSourcePermissionsIT {
     }
 
     private static void awaitSnapshotProgress(ControlPlane control, String pipeline) {
-        Await.until("the explicit confirmed two-row snapshot progress", TIMEOUT,
-                () -> control.snapshotTable(pipeline, TABLE)
-                        .filter(progress -> progress.rowsDone() == 2 && Integer.valueOf(100).equals(progress.donePct()))
-                        .isPresent(),
-                () -> "snapshot=" + control.snapshotTable(pipeline, TABLE));
+        var load = Await.answered("the completed snapshot progress", TIMEOUT,
+                () -> control.initialLoad(pipeline).filter(progress -> "COMPLETED".equals(progress.get("phase"))));
+        assertThat(load.get("runKey")).asString().startsWith("execution:" + pipeline + ":");
+        var tables = (Map<?, ?>) load.get("tables");
+        var progress = (Map<?, ?>) tables.get(TABLE);
+        assertThat(progress.get("stage")).isEqualTo("LANDED");
+        assertThat(((Number) progress.get("rowsRead")).longValue()).isEqualTo(2L);
         assertThat(control.state(pipeline)).as("the successful snapshot has a healthy current observation")
                 .hasValueSatisfying(state -> assertThat(state).isNotEqualTo(PipelineState.FAILED));
     }

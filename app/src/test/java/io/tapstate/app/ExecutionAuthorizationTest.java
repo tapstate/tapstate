@@ -67,6 +67,58 @@ class ExecutionAuthorizationTest {
     private final ClusterMembershipGate membership = eligibleGate();
     private final AtomicLong nanos = new AtomicLong();
 
+    @Test void aColdLifecycleReaderNeverWaitsForTheClaimStore() throws Exception {
+        submittedRun();
+        var key = new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders");
+        var reading = claims.read(key).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var entered = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var store = mock(WorkloadClaimStore.class);
+        when(store.readPipeline(scope)).thenAnswer(call -> {
+            assertThat(Thread.currentThread().getName()).isEqualTo("tapstate-scoped-proof-read");
+            entered.countDown();
+            assertThat(release.await(5, TimeUnit.SECONDS)).isTrue();
+            return Optional.of(reading);
+        });
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, WINDOW, nanos::get, () -> true); var caller = Executors.newSingleThreadExecutor()) {
+            try {
+                var response = caller.submit(() -> guard.observedAuthorization(fence));
+                assertThat(entered.await(1, TimeUnit.SECONDS)).isTrue();
+                assertThat(response.get(250, TimeUnit.MILLISECONDS)).isFalse();
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2))
+                    .until(() -> guard.observedAuthorization(fence));
+            nanos.addAndGet(WINDOW.toNanos() + 1);
+            org.mockito.Mockito.doThrow(new TapstateException(IoError.STORE_UNAVAILABLE, Map.of("detail", "offline"), null))
+                    .when(store).readPipeline(scope);
+            org.junit.jupiter.api.Assertions.assertTimeout(Duration.ofMillis(250), () ->
+                    assertThat(guard.observedAuthorization(fence)).isFalse());
+        }
+    }
+
+    @Test void repeatedDisplayPollsRespectTheRefreshIntervalAfterAnAbsentClaim() {
+        submittedRun();
+        var reading = claims.read(new WorkloadClaimKey("cluster-a", WorkloadClaimType.PIPELINE_ACTUATION, "orders")).orElseThrow();
+        var scope = new PipelineIntentScope("cluster-a", 1, "cache", "orders", 1);
+        var fence = new ExecutionFence(scope, WorkloadClaimFence.from(reading.claim()));
+        var reads = new AtomicInteger();
+        var store = mock(WorkloadClaimStore.class);
+        when(store.readPipeline(scope)).thenAnswer(call -> { reads.incrementAndGet(); return Optional.empty(); });
+        try (var guard = ExecutionAuthorization.scoped(new CacheBusinessScope("cluster-a", 1, "cache"),
+                store, Duration.ofMinutes(1), nanos::get, () -> true)) {
+            assertThat(guard.observedAuthorization(fence)).isFalse();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(2)).until(() -> reads.get() == 1);
+            for (int i = 0; i < 30; i++) {
+                assertThat(guard.observedAuthorization(fence)).isFalse();
+                java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(5));
+            }
+            assertThat(reads).as("display polling does not drive successful denied proof refreshes").hasValue(1);
+        }
+    }
+
     @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"driver-timeout", "outer-timeout", "fenced", "outage"})
     void scopedProofWaitsForBackgroundRecoveryButKeepsConfirmedFences(String fault) {

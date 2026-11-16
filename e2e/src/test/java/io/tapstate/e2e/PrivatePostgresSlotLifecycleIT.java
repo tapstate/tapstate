@@ -190,6 +190,29 @@ class PrivatePostgresSlotLifecycleIT {
             row(mongo,boundedTarget,109);row(mongo,targets.get(A),109);
             assertThat(PostgresSlots.names(source)).containsExactlyInAnyOrderElementsOf(beforeBounded);
             facts.put("cdcChangedToBoundedUnderCarriedClearReleasedOriginalSlot",true);save();
+
+            facts.put("stage","delete-retained-private-reader");save();
+            String deletedSlot = PostgresSlots.names(source).stream()
+                    .filter(name -> !name.equals(slots.get(B)) && !name.equals(slots.get(S)))
+                    .findFirst().orElseThrow();
+            control.stop(A, false);
+            state(control, A, PipelineState.STOPPED);
+            Await.until("the private reader to stop while retaining its slot", BOUND,
+                    () -> PostgresSlots.of(source).stream().anyMatch(slot -> slot.name().equals(deletedSlot) && !slot.active()),
+                    () -> PostgresSlots.of(source).toString());
+            String artifactHash = control.contentHash(A);
+            var draft = control.createPipelineDraft(A, Map.of(
+                    "pipelineId", A, "mode", "dag", "name", "Private slot deletion witness",
+                    "baseArtifactHash", artifactHash, "graph", Map.of("nodes", List.of(), "edges", List.of(),
+                            "viewport", Map.of("x", 0.0, "y", 0.0, "zoom", 1.0))));
+            control.deletePipeline(A, artifactHash, ((Number) draft.get("revision")).longValue());
+            assertThat(control.artifact(A)).isEmpty();
+            Await.until("deleting the direct pipeline to remove its own slot", BOUND,
+                    () -> !PostgresSlots.names(source).contains(deletedSlot), () -> PostgresSlots.of(source).toString());
+            assertThat(PostgresSlots.names(source)).containsExactlyInAnyOrder(slots.get(B), slots.get(S));
+            insert(source, 110);
+            row(mongo, targets.get(B), 110);
+            facts.put("deleteRemovedOnlyPrivateSlotAndPeerContinuedCdc",true);save();
         } catch (Throwable failure) {
             facts.put("terminalFailure",failure.toString());throw failure;
         } finally {

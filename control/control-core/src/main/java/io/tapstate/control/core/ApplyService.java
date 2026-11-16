@@ -591,6 +591,10 @@ public final class ApplyService {
     /** Validates and materializes one typed resource against the stored workspace without writing it. */
     public Resource prepareTyped(Resource resource) {
         Objects.requireNonNull(resource, "resource");
+        if (resource instanceof PipelineResource pipeline) {
+            return planResourcesAndWorkspace(List.of(pipeline), Map.of(), ValidationScope.ONLINE_SOURCE,
+                    capturePublicationReads(pipeline)).plan().artifacts().getFirst().resource();
+        }
         return planResources(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE)
                 .artifacts().getFirst().resource();
     }
@@ -617,14 +621,8 @@ public final class ApplyService {
     DraftPublicationPlan captureDraftPublication(String principal, Resource resource) {
         Objects.requireNonNull(principal, "principal");
         Objects.requireNonNull(resource, "resource");
-        var dependencySlice = resource instanceof PipelineResource pipeline
-                ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
-        var inventory = dependencySlice.orElseGet(store::readableInventory);
-        var previous = dependencySlice.isPresent() || inventory.exactLookupIds().contains(resource.id())
-                ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
-                : store.get(resource.id());
-        var reads = new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
-                new LinkedHashMap<>());
+        var reads = capturePublicationReads(resource);
+        var previous = Optional.ofNullable(reads.previous());
         var planned = planResourcesAndWorkspace(List.of(resource), Map.of(), ValidationScope.ONLINE_SOURCE, reads);
         var plan = planned.plan();
         var prepared = plan.artifacts().getFirst();
@@ -643,6 +641,18 @@ public final class ApplyService {
         definitions.put(attributed.id(), attributed);
         return new DraftPublicationPlan(publishedPlan,
                 new SchemaDerivation.PublishedInputs(definitions, reads.models(), reads.managedSource()));
+    }
+
+    /** Preview and publication validate the same captured dependency closure. */
+    private PublicationReads capturePublicationReads(Resource resource) {
+        var dependencySlice = resource instanceof PipelineResource pipeline
+                ? store.draftPublicationInventory(pipeline) : Optional.<ArtifactStore.ReadableInventory>empty();
+        var inventory = dependencySlice.orElseGet(store::readableInventory);
+        var previous = dependencySlice.isPresent() || inventory.exactLookupIds().contains(resource.id())
+                ? inventory.resources().stream().filter(value -> value.id().equals(resource.id())).findFirst()
+                : store.get(resource.id());
+        return new PublicationReads(inventory, previous.orElse(null), store.managedDefaultSourceId(),
+                new LinkedHashMap<>());
     }
 
     /** Re-derives the published pipeline's schema after the artifact transaction has committed. */

@@ -1,5 +1,6 @@
 package io.tapstate.e2e;
 
+import io.tapstate.control.core.MonitorError;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.JsonWriter;
 import io.tapstate.core.lifecycle.LifecycleVerb;
@@ -344,7 +345,7 @@ class PipelineObservabilityLiveIT {
             URI base, String token, java.util.function.Predicate<String> kind, String what) {
         AtomicReference<Map<String, Object>> last = new AtomicReference<>(Map.of());
         Await.until(what, REAL_CONNECTOR_WAIT, () -> {
-            Map<String, Object> value = explanation(base, token);
+            Map<String, Object> value = get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain", true);
             last.set(value);
             return kind.test(String.valueOf(value.get("kind")));
         }, () -> String.valueOf(last.get()));
@@ -361,8 +362,12 @@ class PipelineObservabilityLiveIT {
         return get(base, token, "/api/pipelines/" + PIPELINE_ID + "/explain");
     }
 
-    @SuppressWarnings("unchecked")
     private static Map<String, Object> get(URI base, String token, String path) {
+        return get(base, token, path, false);
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> get(URI base, String token, String path, boolean awaitingObservation) {
         HttpRequest request = HttpRequest.newBuilder(base.resolve(path))
                 .timeout(Duration.ofSeconds(20))
                 .header("Authorization", "Bearer " + token)
@@ -371,6 +376,11 @@ class PipelineObservabilityLiveIT {
         try {
             HttpResponse<String> response = HttpClient.newHttpClient()
                     .send(request, HttpResponse.BodyHandlers.ofString());
+            if (awaitingObservation && response.statusCode() == 404
+                    && JsonReader.parse(response.body()) instanceof Map<?, ?> refusal
+                    && MonitorError.NO_OBSERVATION.code().equals(refusal.get("code"))) {
+                return Map.of();
+            }
             if (response.statusCode() != 200) {
                 throw new AssertionError("GET " + path + " returned " + response.statusCode()
                         + ": " + response.body());

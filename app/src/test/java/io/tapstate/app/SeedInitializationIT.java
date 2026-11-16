@@ -26,9 +26,10 @@ import org.junit.jupiter.api.io.TempDir;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
+import tools.jackson.databind.json.JsonMapper;
 import static org.assertj.core.api.Assertions.assertThat;
 
-/** Paired local replica-set measurements over the actual immutable eight-artifact release. */
+/** Paired local replica-set measurements over the actual immutable connector release. */
 @RequiresDocker
 class SeedInitializationIT {
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -38,7 +39,10 @@ class SeedInitializationIT {
     void localOpSeedStagingUsesRegistryOnlyWhenNoSeedCopyIsAvailable() throws Exception {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         byte[] lock = java.nio.file.Files.readAllBytes(seeds.resolveSibling("release").resolve("connectors.lock.json"));
-        long bytes = 443_262_490L;
+        long bytes = 0;
+        for (var connector : new JsonMapper().readTree(lock).path("connectors")) {
+            bytes += connector.path("bytes").longValue();
+        }
         int cpu = Math.max(1, Runtime.getRuntime().availableProcessors());
         // Timing is a retained observation, never a machine-speed pass/fail threshold.
         int trials = Math.max(1, Integer.getInteger("tapstate.test.seed-trials", 1));
@@ -69,8 +73,8 @@ class SeedInitializationIT {
                         long registered = System.nanoTime();
                         gate.verifyRegistrations(outcomes);
                         long ready = System.nanoTime();
-                        assertThat(outcomes).hasSize(8).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
-                        assertThat(registry.list()).hasSize(8);
+                        assertThat(outcomes).hasSize(9).allSatisfy(outcome -> assertThat(outcome).isInstanceOf(SeedOutcome.Seeded.class));
+                        assertThat(registry.list()).hasSize(9);
                         long expectedRead = !reuseSeed && !state.equals("warm") ? bytes : 0;
                         assertThat(registry.readBytes.get()).as(mode + "/" + state).isEqualTo(expectedRead);
                         assertThat(registry.uploadBytes.get()).isEqualTo(state.equals("cold") ? bytes : 0);

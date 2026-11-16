@@ -69,10 +69,10 @@ class MetadataTest(unittest.TestCase):
                   "io.tapstate.web.files.sha256": props["files.sha256"],
                   "io.tapstate.web.profile": profile, "io.tapstate.distribution": profile}
         env = ["PATH=/opt/java/openjdk/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+        env.append("TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors")
         if profile == "cloud":
             labels["io.tapstate.web.cloud-console-url"] = props["cloud.console.url"]
-            env.extend(["LD_PRELOAD=libstdc++.so.6",
-                        "TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"])
+            env.append("LD_PRELOAD=libstdc++.so.6")
         image = self.root / f"{profile}-image.json"
         image.write_text(json.dumps([{"Id": "sha256:" + ("c" if profile == "cloud" else "d") * 64,
                                      "Config": {"Labels": labels, "Env": env,

@@ -80,8 +80,9 @@ public final class PipelineCatalogService {
                         value.publishedDraftRevision(), value.publishedArtifactHash(), value.createdAt(),
                         value.updatedAt(), value.updatedBy()))
                 .orElse(null);
-        return artifact == null && draft == null ? Optional.empty() : Optional.of(toItem(id, draft, artifact,
-                artifact == null ? null : batch.apply(List.of(id)).get(id)));
+        if (artifact == null && draft == null) return Optional.empty();
+        var states = artifact == null ? Map.<String, PipelineCatalogState>of() : batch.apply(List.of(id));
+        return Optional.of(toItem(id, draft, artifact, states.get(id), currentEngineStates(states).get(id)));
     }
 
     /** Returns only the requested catalog window; per-pipeline status reads happen after this slice. */
@@ -108,9 +109,10 @@ public final class PipelineCatalogService {
         int end = (int) Math.min((long) ids.size(), (long) offset + limit);
         List<String> pageIds = new ArrayList<>(ids).subList(offset, end);
         var states = batch.apply(pageIds.stream().filter(artifactById::containsKey).toList());
+        var engineStates = currentEngineStates(states);
         List<PipelineCatalogItem> items = new ArrayList<>(pageIds.size());
         for (String id : pageIds) {
-            items.add(toItem(id, draftById.get(id), artifactById.get(id), states.get(id)));
+            items.add(toItem(id, draftById.get(id), artifactById.get(id), states.get(id), engineStates.get(id)));
         }
         return List.copyOf(items);
     }
@@ -124,7 +126,18 @@ public final class PipelineCatalogService {
         return hasArtifact || drafts.find(id).isPresent();
     }
 
-    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact, PipelineCatalogState stateFacts) {
+    private Map<String, PipelineState> currentEngineStates(Map<String, PipelineCatalogState> states) {
+        var scopes = new java.util.LinkedHashMap<String, io.tapstate.spi.store.PipelineIntentScope>();
+        states.forEach((id, state) -> {
+            if (state.observation().isEmpty() && state.scope() != null
+                    && (state.checkpoint() == PipelineState.RUNNING || state.checkpoint() == PipelineState.PAUSED))
+                scopes.put(id, state.scope());
+        });
+        return scopes.isEmpty() ? Map.of() : observations.currentEngineStates(scopes);
+    }
+
+    private PipelineCatalogItem toItem(String id, PipelineDraftSummary draft, ArtifactSummary artifact, PipelineCatalogState stateFacts,
+            PipelineState engineState) {
         boolean hasArtifact = artifact != null;
         boolean needsRecovery = stateFacts == null && hasArtifact && recoveryRequired.test(id);
         PipelineStatus observation = stateFacts != null
@@ -133,6 +146,7 @@ public final class PipelineCatalogService {
         PipelineState observed = observation == null ? null : observation.observedState();
         PipelineState effective = observation == null ? null : observation.state();
         PipelineState checkpoint = stateFacts == null ? null : stateFacts.checkpoint();
+        if (engineState != null) effective = engineState;
         if (effective == null && stateFacts != null && stateFacts.runningObservationUnavailable()
                 && checkpoint == PipelineState.RUNNING) effective = checkpoint;
         PipelineState target;
@@ -161,7 +175,12 @@ public final class PipelineCatalogService {
 
         // The current failure and the later intent projection remain separate even if STOP arrived
         // after diagnosis. Converting this item must not infer runtime truth from the UI transition.
-        PipelineCatalogItem.DisplayState runtimeState = observation != null && observed != effective
+        PipelineCatalogItem.DisplayState runtimeState = engineState != null
+                ? PipelineCatalogItem.DisplayState.valueOf(engineState.name())
+                : observation == null && stateFacts != null && stateFacts.scope() != null
+                        && !stateFacts.runningObservationUnavailable()
+                        && (checkpoint == PipelineState.RUNNING || checkpoint == PipelineState.PAUSED) ? state
+                : observation != null && observed != effective
                 ? PipelineCatalogItem.DisplayState.valueOf(observation.state().name())
                 : checkpoint == null ? state : PipelineCatalogItem.DisplayState.valueOf(checkpoint.name());
         return new PipelineCatalogItem(

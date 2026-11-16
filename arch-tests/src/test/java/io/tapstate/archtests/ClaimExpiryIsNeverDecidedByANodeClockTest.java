@@ -9,7 +9,9 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -69,23 +71,32 @@ class ClaimExpiryIsNeverDecidedByANodeClockTest {
     }
 
     @Test
-    @DisplayName("nothing that decides about a workload claim reads the deadline the store wrote")
+    @DisplayName("stored claim deadlines are read only at audited call sites")
     void noClaimDecisionReadsTheStoredDeadline() {
         assertThat(WorkloadClaim.class.getRecordComponents())
                 .as("positive control: the accessor this rule bans still exists under this name")
                 .anySatisfy(component -> assertThat(component.getName()).isEqualTo("leaseUntil"));
 
-        List<String> readers = guardedClasses().stream()
+        // These reads forward or log the stored value, or compare two values from the store clock.
+        // The separate wall-clock rule still applies to every guarded class.
+        String ownership = "io.tapstate.app.PipelineActuationOwnership";
+        String claim = "io.tapstate.spi.store.WorkloadClaim";
+        var auditedReads = Map.of(
+                ownership + ".permit(java.lang.String, " + ownership + "$Held)", 3L,
+                ownership + ".renewScoped(" + ownership + "$Held, long)", 4L,
+                ownership + ".advanceScopedProof(" + ownership + "$Held, " + claim + ")", 2L,
+                "io.tapstate.adapters.mongostore.MongoWorkloadClaimStore.withLease(" + claim
+                        + ", io.tapstate.spi.store.WorkloadClaimReading)", 1L);
+        var reads = guardedClasses().stream()
                 .flatMap(type -> type.getCodeUnitAccessesFromSelf().stream())
                 .filter(call -> call.getTargetOwner().isAssignableTo(WorkloadClaim.class)
                         && call.getName().equals("leaseUntil"))
-                .map(call -> call.getOriginOwner().getName() + " -> " + call.getName())
-                .toList();
+                .collect(Collectors.groupingBy(call -> call.getOrigin().getFullName(), Collectors.counting()));
 
-        assertThat(readers)
-                .as("the deadline in the record was written by the store's clock; the only honest thing "
-                        + "to do with it here is nothing -- how much is left is asked for, not worked out")
-                .isEmpty();
+        var unapprovedReads = reads.entrySet().stream()
+                .filter(entry -> entry.getValue() > auditedReads.getOrDefault(entry.getKey(), 0L))
+                .toList();
+        assertThat(unapprovedReads).as("stored deadline reads beyond audited sites").isEmpty();
     }
 
     /** The guarded classes, asserting each one still exists rather than silently covering fewer of them. */

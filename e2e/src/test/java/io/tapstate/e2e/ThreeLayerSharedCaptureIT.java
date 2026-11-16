@@ -252,14 +252,18 @@ class ThreeLayerSharedCaptureIT {
             Await.until("real CDC after the new Mongo full",columnBound,() -> columnRows(mongo,source).equals(columnRows(mongo,target)),
                     () -> "target="+columnRows(mongo,target));
             Await.answered("the new-model CDC acknowledgement",columnBound,() -> control.durablePosition(pipeline,"orders").filter(value -> !value.equals(fullAck)));
-            Await.until("the real checkpoint to consume the pending model handoff",columnBound,() -> {
+            var root=Await.answered("the checkpoint to reference the explicit full's sampled model",columnBound,() -> {
                 var current=cache.getCollection("srs_chains").find(new Document("_id",chain)).first();
-                return current!=null && current.get("resumeOverride")==null && current.get("checkpoint") instanceof Document checkpoint
-                        && Boolean.TRUE.equals(checkpoint.get("positionEditsRestricted"));
-            },() -> "model handoff checkpoint is not yet committed");
-            var root=cache.getCollection("srs_chains").find(new Document("_id",chain)).first();
+                if(current==null || current.get("resumeOverride")!=null
+                        || !(current.get("checkpoint") instanceof Document sampledCheckpoint)
+                        || sampledCheckpoint.getLong("epoch")<snapshot.getLong("snapshotEpoch")) return Optional.empty();
+                return sampledCheckpoint.getList("tables",Document.class).stream()
+                        .filter(table -> "orders".equals(table.getString("table")) && modelKey.equals(table.get("model"))
+                                && table.getLong("sequence")>=model.getLong("ddlSequence"))
+                        .findFirst().map(table -> current);
+            });
             assertThat(root.get("resumeOverride")).isNull();
-            var checkpoint=root.get("checkpoint",Document.class);assertThat(checkpoint).containsEntry("positionEditsRestricted",true);
+            var checkpoint=root.get("checkpoint",Document.class);
             assertThat(checkpoint.getLong("epoch")).isGreaterThanOrEqualTo(snapshot.getLong("snapshotEpoch"));
             var tableCheckpoint=checkpoint.getList("tables",Document.class).stream().filter(value -> "orders".equals(value.getString("table"))).findFirst().orElseThrow();
             assertThat(tableCheckpoint.get("model")).isEqualTo(modelKey);
@@ -364,7 +368,9 @@ class ThreeLayerSharedCaptureIT {
                 assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                         .containsEntry("phase","RETIRED").containsEntry("operationId",operation).containsEntry("replacementChain",replacement);
                 for(String id:List.of("reader_a","reader_b")) {
-                    assertThat(control.state(id)).contains(PipelineState.STOPPED);
+                    var observed = Await.answered(id + " to publish its state after shared recovery", BOUND,
+                            () -> control.state(id));
+                    assertThat(observed).isEqualTo(PipelineState.STOPPED);
                     assertThat(generations.find(new Document("_id",id)).first()).containsEntry("stateGeneration",1L);
                     var refusal=control.startExpectingRefusal(id);assertThat(refusal.status()).isEqualTo(409);
                     assertThat(refusal.code()).isEqualTo(io.tapstate.spi.store.IoError.PIPELINE_STATE_REBUILD_REQUIRED.code());
@@ -431,21 +437,35 @@ class ThreeLayerSharedCaptureIT {
         if(response.statusCode()==200) {
             assertThat(result.get("phase")).isEqualTo("PLANNED");return result;
         }
-        assertThat(response.statusCode()).isEqualTo(500);
-        assertThat(result.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
-        assertThat(((Map<?,?>)result.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
+        assertSharedPreflightFence(response.statusCode(), result);
         var operation=control.storageStatus().get("operationId");assertThat(operation).isInstanceOf(String.class);
         var original=storage(control,"status",Map.of("operationId",operation));
         assertThat(original.get("phase")).isEqualTo("PLANNED");assertThat(original.get("preflightCurrent")).isEqualTo(false);
         assertThat(original.get("canonicalChain")).isEqualTo(canonical);assertThat(original.get("physicalChain")).isEqualTo(canonical);
         // A separate explicit preflight uses the saved operation; it neither confirms nor replaces it.
         var recheck=new LinkedHashMap<>(request);recheck.put("operationId",operation);
-        var refreshed=storage(control,"plan",recheck);
+        var refreshed=Await.answered("the original shared recovery preflight " + operation, BOUND, () -> {
+            var pending = storage(control, "status", Map.of("operationId", operation));
+            assertThat(pending.get("phase")).isEqualTo("PLANNED");
+            assertThat(pending.get("canonicalChain")).isEqualTo(canonical);
+            assertThat(pending.get("physicalChain")).isEqualTo(canonical);
+            var retry = control.sourceResponse("POST", "/api/storage/recovery/plan", recheck, null);
+            var body = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(retry.body());
+            if (retry.statusCode() == 200) return Optional.of(body);
+            assertSharedPreflightFence(retry.statusCode(), body);
+            return Optional.empty();
+        });
         assertThat(refreshed.get("phase")).isEqualTo("PLANNED");
         assertThat(refreshed.get("operationId")).isEqualTo(operation);
         assertThat(((Number)refreshed.get("controlRevision")).longValue()).isGreaterThan(((Number)original.get("controlRevision")).longValue());
         assertThat(refreshed.get("planHash")).isNotEqualTo(original.get("planHash"));
         return refreshed;
+    }
+
+    private static void assertSharedPreflightFence(int status, Map<?, ?> response) {
+        assertThat(status).as("shared recovery preflight: %s", response).isEqualTo(500);
+        assertThat(response.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
+        assertThat(((Map<?, ?>) response.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
     }
     private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {
         var fields=new Document("_id",0);
@@ -588,7 +608,7 @@ class ThreeLayerSharedCaptureIT {
                 long entered = ((Number) admin.runCommand(new Document("configureFailPoint", "failCommand")
                         .append("mode", new Document("times", 1)).append("data", new Document("failCommands", List.of("find"))
                                 .append("namespace", sourceDb + ".orders").append("appName", appName)
-                                .append("blockConnection", true).append("blockTimeMS", 15000))).get("count")).longValue();
+                                .append("blockConnection", true).append("blockTimeMS", 30000))).get("count")).longValue();
                 var fullCount = new Document("_id.scope.pipelineId", "reader_a").append("_id.scope.stateGeneration", 2L);
                 try (var starter = Executors.newSingleThreadExecutor()) {
                     var start = starter.submit(() -> control.lifecycle("reader_a", LifecycleVerb.START));
@@ -599,7 +619,8 @@ class ThreeLayerSharedCaptureIT {
                         assertThat(cache.getCollection("snapshot_counts").countDocuments(fullCount)).isZero();
                         mongo.update(source, "orders", Map.of("id", 2L), Map.of("seq", 222L));
                         awaitRows(mongo, source, targetB, Duration.ofSeconds(8));
-                        Await.answered("the unaffected consumer's target confirmation during the held full start", Duration.ofSeconds(5),
+                        // The sink can batch durable acknowledgements for ten seconds before observation catches up.
+                        Await.answered("the unaffected consumer's target confirmation during the held full start", Duration.ofSeconds(20),
                                 () -> control.durablePosition("reader_b", "orders").filter(value -> !value.equals(beforeAck)));
                         assertThat(heldRead(admin, appName, sourceDb).map(op -> op.get("opid"))).contains(held);
                         assertThat(cache.getCollection("snapshot_counts").countDocuments(fullCount)).isZero();

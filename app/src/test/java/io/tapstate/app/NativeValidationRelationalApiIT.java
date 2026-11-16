@@ -300,7 +300,13 @@ class NativeValidationRelationalApiIT {
                         finally{locked.close();}
                         var report=result.get(90,java.util.concurrent.TimeUnit.SECONDS);
                         if(smallerCap){
-                            assertThat(report).containsEntry("terminal","FAILED");assertThat(report.get("result").toString()).startsWith("INCOMPLETE");
+                            assertThat(report).containsEntry("terminal","COMPLETED").containsEntry("result","COMPLETE_WITH_FAILURES");
+                            assertThat((List<?>)report.get("tableFailures")).singleElement().satisfies(value->{
+                                var failure=(Map<?,?>)value;
+                                assertThat(failure.get("mapping")).isEqualTo("orders");
+                                assertThat(failure.get("side")).isEqualTo("SOURCE");
+                                assertThat(((Map<?,?>)failure.get("failure")).get("code")).isEqualTo("validation.read-failed");
+                            });
                             assertThat(StoredArtifacts.requireSource(artifacts,"input").config()).isEqualTo(source);
                         }else assertThat(report).containsEntry("result","COMPLETE_NO_ISSUES_OBSERVED").containsEntry("rootCount","0");
                         assertThat((List<?>)report.get("mappings")).hasSize(2);

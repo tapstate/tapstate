@@ -958,11 +958,19 @@ class MongoCacheWorkloadClaimStoreIT {
                     error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
             assertThatThrownBy(() -> claims.renew(held, TTL)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
             assertThatThrownBy(() -> claims.advanceExecution(held, 1, Set.of("node-a"))).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            assertThatThrownBy(() -> claims.release(held)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
             assertThat(snapshot(f.database())).isEqualTo(before);
             assertThat(claimScope(f.database())).isEqualTo(header(PIPELINE));
+
+            // Restore the deliberately split scope before performing the legitimate release and replacement.
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).updateOne(new Document("scope", header(next)),
+                    new Document("$set", new Document("scope", header(PIPELINE))));
             assertThat(claims.release(held)).isTrue();
             replacePreparedScope(f, next);
-            assertThat(claims.acquirePipeline(next, OWNER, 1, TTL).claim().claimGeneration()).isEqualTo(held.claimGeneration() + 1);
+            var successor = claims.acquirePipeline(next, OWNER, 1, TTL).claim();
+            assertThat(successor.claimGeneration()).isEqualTo(held.claimGeneration() + 1);
+            assertThat(claims.release(held)).isFalse();
+            assertThat(claims.readPipeline(next).orElseThrow().claim()).isEqualTo(successor);
         });
     }
 
