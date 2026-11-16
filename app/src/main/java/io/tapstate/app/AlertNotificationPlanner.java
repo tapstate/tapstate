@@ -63,10 +63,14 @@ final class AlertNotificationPlanner {
         }
         var keys=discovered.schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
+        var retained=discovered;
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){
-                var view=store.planning();isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
+                var view=retained==null?store.planning():retained;retained=view;isolated|=view.isolatedRecords();unavailable|=!view.unavailableRules().isEmpty();var row=view.schedules().stream().filter(v->v.value().key().equals(key)).findFirst();if(row.isEmpty()||held(view,row.orElseThrow().value())){done=true;break;}
                 var changes=advance(view,row.get());if(changes.intents().isEmpty()&&changes.schedules().isEmpty()){done=true;break;}
+                // Any commit attempt may advance the version or observe a competing write.
+                // No proposal after it may reuse this tick's earlier snapshot.
+                retained=null;
                 if(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,changes.intents(),changes.schedules(),view.version()))!=AlertStore.Outcome.CONFLICT){done=true;break;}
             }if(!done)throw new TapstateException(AlertError.COMMAND_CONFLICT,Map.of(),null);
         }

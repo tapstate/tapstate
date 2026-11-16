@@ -89,20 +89,24 @@ final class MongoAlertCoordinator implements AlertStore {
         });
     }
     private <T>T tx(Access access,boolean write,boolean authoring,Function<ClientSession,T> action) {
-        return tx(access,write,authoring,false,action);
+        return tx(access,write,authoring,null,action);
     }
-    private <T>T tx(Access access,boolean write,boolean authoring,boolean backgroundCommit,Function<ClientSession,T> action) {
+    private <T>T tx(Access access,boolean write,boolean authoring,PlanVersion planned,Function<ClientSession,T> action) {
         if(access!=null){access.revalidate().run();access.locallyActive().run();}
         host.locallyActive().run(); var verifiedSchema=domain.currentAlertSchema();
         return StoreIo.call(()->domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
-            // Contended background commits must not replay the entire host read before
-            // discovering the conflict. All subsequent refusals roll back this same write.
-            if(backgroundCommit){host.locallyActive().run();keyFence(session);}
-            domain.requireVerifiedAlertSchema(currentHost(session));if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
+            // Reject obsolete background proposals before touching shared write fences.
+            // Callback retries obtain a new preimage; accepted writes keep the original CAS.
+            Document preimage = planned == null ? null : ConfigurationVersion.alertWritePreimage(
+                    session, SystemCollections.CONFIGURATION_VERSION.on(db));
+            if (preimage != null && (!Long.valueOf(planned.configurationRevision()).equals(preimage.get("revision"))
+                    || !Long.valueOf(planned.alertFence()).equals(preimage.get(ConfigurationVersion.ALERT_FENCE)))) throw new Conflict();
+            domain.requireVerifiedAlertSchema(currentHost(session,preimage));if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
             if(write){
-                if(!backgroundCommit)keyFence(session);
+                keyFence(session);
                 if(authoring)ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(db), db);
-                else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
+                else if (preimage == null) ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
+                else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db),preimage);
             }
             T result=action.apply(session);domain.requireVerifiedAlertSchema(verifiedSchema);
             host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;
@@ -119,14 +123,15 @@ final class MongoAlertCoordinator implements AlertStore {
             T result=action.apply(session);host.locallyActive().run();return result;
         }));
     }
-    private Document currentHost(ClientSession session) {
+    private Document currentHost(ClientSession session) { return currentHost(session,null); }
+    private Document currentHost(ClientSession session,Document preimage) {
         host.locallyActive().run();var scope=host.setup();
         Document setup=SystemCollections.STORAGE_SETUP.on(db).find(session,new Document("_id","cluster")).first();
         var binding=bindings.loadForTransaction(session);
         if(!MongoAlertHostIdentity.current(setup,scope,binding.orElse(null)))throw stale("host-installation");
         if(binding.isPresent()&&(binding.get().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
-        Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
+        Document version=preimage==null?SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first():preimage;
         var marker=MongoAlertStorageSchema.verifyAuthorityState(schema,version,scope.clusterId(),keys.currentForWrite().activeKeyId());
         if(marker==null||!Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(marker.get("installedVersion")))throw unreadable("schema-capability");
         return marker;
@@ -298,9 +303,9 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Outcome commit(Commit candidate){return commit(candidate,null);}
     @Override public Outcome commitAsCaller(Commit candidate,Access access){Objects.requireNonNull(access);return commit(candidate,access);}
     private Outcome commit(Commit c,Access access) {
-        try{return tx(access,true,false,access==null,s->{
+        try{return tx(access,true,false,access==null?c.version():null,s->{
             boolean changed=false;
-            if(c.version()!=null){
+            if(c.version()!=null&&access!=null){
                 var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();
                 if(version==null||!Long.valueOf(c.version().configurationRevision()).equals(version.get("revision"))
                         ||!Long.valueOf(Math.incrementExact(c.version().alertFence())).equals(version.get(ConfigurationVersion.ALERT_FENCE)))throw new Conflict();
