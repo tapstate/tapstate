@@ -169,13 +169,15 @@ class LocalStackTest {
                 dir + ": docker compose -p " + LocalStack.projectNameFor(home) + " up -d",
                 dir + ": docker compose -p " + LocalStack.projectNameFor(home) + " wait bootstrap");
         assertThat(Files.readString(dir.resolve("docker-compose.yml"))).isEqualTo(COMPOSE_GOLDEN);
-        // the three engines the release publishes jars for, from the release location, into the seed dir
+        // The three demo engines and Dummy are staged in the seed directory.
         assertThat(downloads.fetched).containsExactly(
                 "https://github.com/tapstate/tapstate/releases/download/connectors-preview/mysql-connector.jar",
                 "https://github.com/tapstate/tapstate/releases/download/connectors-preview/mongodb-connector.jar",
-                "https://github.com/tapstate/tapstate/releases/download/connectors-preview/postgres-connector.jar");
+                "https://github.com/tapstate/tapstate/releases/download/connectors-preview/postgres-connector.jar",
+                "https://github.com/tapstate/tapstate/releases/download/connectors-preview/dummy-connector.jar");
         assertThat(dir.resolve("connectors/mysql-connector.jar")).exists();
         assertThat(dir.resolve("connectors/postgres-connector.jar")).exists();
+        assertThat(dir.resolve("connectors/dummy-connector.jar")).exists();
         // the .env carries the admin the bootstrap service creates, with a password nobody chose
         Map<String, String> env = DotEnv.read(dir.resolve(".env"));
         assertThat(env).containsEntry("TAPSTATE_ADMIN_USER", "admin");
@@ -200,7 +202,7 @@ class LocalStackTest {
         assertThat(again.password()).as("regenerating it would lock out the admin already bootstrapped")
                 .isEqualTo(admin.password());
         assertThat(runner.calls).hasSize(6).filteredOn(call -> call.endsWith(" up -d")).hasSize(2);
-        assertThat(downloads.fetched).as("a jar already staged is not fetched again").hasSize(3);
+        assertThat(downloads.fetched).as("a jar already staged is not fetched again").hasSize(4);
     }
 
     @Test
@@ -235,7 +237,8 @@ class LocalStackTest {
         assertThat(downloads.fetched).containsExactly(
                 "https://mirror/jars/mysql-connector.jar",
                 "https://mirror/jars/mongodb-connector.jar",
-                "https://mirror/jars/postgres-connector.jar");
+                "https://mirror/jars/postgres-connector.jar",
+                "https://mirror/jars/dummy-connector.jar");
     }
 
     @Test
