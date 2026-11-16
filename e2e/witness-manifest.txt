@@ -26,6 +26,8 @@ a-deleted-customer-takes-its-orders-out-of-the-target on IN_PROCESS
 a-deleted-customer-takes-its-orders-out-of-the-target on REAL_PROCESS
 a-dimension-change-reaches-the-orders-already-written on IN_PROCESS
 a-dimension-change-reaches-the-orders-already-written on REAL_PROCESS
+a-document-embeds-its-location-by-code-or-by-hub-id on IN_PROCESS
+a-document-embeds-its-location-by-code-or-by-hub-id on REAL_PROCESS
 a-join-naming-a-column-its-table-lacks-fails-with-a-code on IN_PROCESS
 a-join-naming-a-column-its-table-lacks-fails-with-a-code on REAL_PROCESS
 a-large-recompute-finishes-after-the-input-stops on IN_PROCESS
@@ -60,6 +62,8 @@ a-sync-start-before-source-discovery-is-refused on IN_PROCESS
 a-sync-start-before-source-discovery-is-refused on REAL_PROCESS
 a-tracked-row-moved-under-a-minimal-image-is-refused on IN_PROCESS
 a-tracked-row-moved-under-a-minimal-image-is-refused on REAL_PROCESS
+a-transaction-finds-its-location-by-code-or-by-hub-id on IN_PROCESS
+a-transaction-finds-its-location-by-code-or-by-hub-id on REAL_PROCESS
 a-view-and-a-serve-block-each-receive-the-rows on IN_PROCESS
 a-view-and-a-serve-block-each-receive-the-rows on REAL_PROCESS
 a-view-over-a-literal-table-is-refused-without-discovery on IN_PROCESS
