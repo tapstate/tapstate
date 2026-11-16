@@ -166,4 +166,20 @@ class MapSoftDeleteTest {
 
         assertThat(out.removed()).containsExactly("legacy");
     }
+
+    /**
+     * An earlier step that removed a column of the marker's name said so of its own column. This step
+     * writes the marker on every row, so that removal must not travel on and strip it at the target.
+     */
+    @Test
+    @DisplayName("a removal of the marker's own name is not carried past the step that writes it")
+    void aRemovalOfTheMarkerIsDropped() {
+        TransformPort port = map(Map.of(), MARKER);
+        Envelope insert = Envelope.insert(1L, "emails", row(1, "a@x"), null).withRemoved(Set.of(MARKER, "legacy"));
+        Envelope delete = new Envelope(Op.DELETE, 1L, "emails", row(1, "a@x"), null, null)
+                .withRemoved(Set.of(MARKER, "legacy"));
+
+        assertThat(port.transform(insert).get(0).removed()).containsExactly("legacy");
+        assertThat(port.transform(delete).get(0).removed()).containsExactly("legacy");
+    }
 }

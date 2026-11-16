@@ -144,6 +144,30 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
     }
 
     /**
+     * The same walk, where the map reads the source by its id. A source that selects one table is read
+     * by naming the source, and that name is not a table: the walk has to finish at the table the source
+     * selects, or the target is keyless again and named after the source.
+     */
+    @Test
+    void aRootFedThroughAMapThatNamesItsSourceStillLandsInTheRootsTableByItsKey() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("id");
+    }
+
+    /**
      * The table half of the same claim, over a root that was never discovered. The columns are a
      * discovery's to supply and are absent here; which table the documents land in is the topology's, and
      * is known without one.

@@ -4287,6 +4287,10 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         FromRef table = rowPreservingSource(pipeline, ref);
+        if (table instanceof FromRef.Literal literal && sourceVertices.containsKey(literal.ref())) {
+            // A source selecting one table is read by its id; the table it selects is what the walk ends at.
+            table = FromRef.literal(sourceVertices.get(literal.ref()).table());
+        }
         return table == null || table.equals(ref) ? alias : nestTable(table, sourceTablesByName(sourceVertices));
     }
 
