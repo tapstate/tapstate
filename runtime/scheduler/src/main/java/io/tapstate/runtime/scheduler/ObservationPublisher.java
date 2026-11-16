@@ -439,6 +439,14 @@ public final class ObservationPublisher {
      * tell a restart from a total that went backwards. Carrying totals across restarts and keeping
      * restarts visible cannot both be had, and every counter on this face has already chosen the second.
      */
+    /** Separates a new measurement from a refreshed lifecycle projection. */
+    public record Publication(Observation observation, boolean measured) { }
+
+    private record TerminalMeasurement(PipelineIntentScope scope, long epoch,
+            Observation projection, Instant measuredAt) { }
+    private final Map<String, TerminalMeasurement> terminalMeasurements = new ConcurrentHashMap<>();
+    private static final long TERMINAL_MEASUREMENT_SECONDS = 30;
+
     private final Map<String, Map<String, Long>> failuresByPipelineAndCode = new ConcurrentHashMap<>();
 
     /** When this publisher opened the failure account above; every failure point accumulates from it. */
@@ -811,24 +819,59 @@ public final class ObservationPublisher {
      * the reason its previous run died of the moment it leaves FAILED.
      */
     public Optional<Observation> publish(String pipelineId, ObservationFailure failure) {
-        return publish(pipelineId, failure, state, observations, false);
+        return publish(pipelineId, failure, state, observations, null, false).map(Publication::observation);
     }
 
     /** Projects through the fixed state and original-claim observation views captured by this pass. */
     public Optional<Observation> publishScoped(PipelineIntentScope scope, StateStore scopedState,
             ObservationStore scopedObservations, ObservationFailure failure) {
-        Objects.requireNonNull(scope, "scope");
-        return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
-                Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
+        return publishScopedReading(scope, scopedState, scopedObservations, failure, false)
+                .map(Publication::observation);
     }
 
-    private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
-            ObservationStore observations, boolean requirePreparedState) {
+    /** Reuse is allowed only when no consumer requires a fresh terminal metric sample. */
+    public Optional<Publication> publishScopedReading(PipelineIntentScope scope, StateStore scopedState,
+            ObservationStore scopedObservations, ObservationFailure failure, boolean allowTerminalReuse) {
+        Objects.requireNonNull(scope, "scope");
+        return publish(scope.pipelineId(), failure, Objects.requireNonNull(scopedState, "scopedState"),
+                Objects.requireNonNull(scopedObservations, "scopedObservations"), scope, allowTerminalReuse);
+    }
+
+    private Optional<Publication> publish(String pipelineId, ObservationFailure failure, StateStore state,
+            ObservationStore observations, PipelineIntentScope scope, boolean allowTerminalReuse) {
+        boolean requirePreparedState = scope != null;
         Objects.requireNonNull(pipelineId, "pipelineId");
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
         return current.map(checkpoint -> {
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
+            var priorMeasurement = terminalMeasurements.get(pipelineId);
+            Instant now = observedNow();
+            if (allowTerminalReuse && failure == null && priorMeasurement != null
+                    && priorMeasurement.scope().equals(scope) && priorMeasurement.epoch() == checkpoint.epoch()
+                    && !now.isBefore(priorMeasurement.measuredAt())
+                    && now.isBefore(priorMeasurement.measuredAt().plusSeconds(TERMINAL_MEASUREMENT_SECONDS))
+                    && (actual == PipelineState.FAILED || actual == PipelineState.STOPPED)) {
+                var previous = reusableProjection(observations, pipelineId)
+                        .filter(last -> last.state() == actual && last.equals(priorMeasurement.projection()));
+                if (previous.isPresent()) {
+                    var last = previous.orElseThrow();
+                    // The scoped port selected this checkpoint's final execution sample. Refresh
+                    // lifecycle evidence, not released capture data or its original metric timestamps.
+                    var retainedMetrics = new LinkedHashMap<>(last.metrics());
+                    retainedMetrics.remove(RECONCILE_STREAK_FLAT);
+                    var retained = last.facts().stream()
+                            .filter(fact -> !fact.name().equals(RECONCILE_STREAK_METRIC)).toList();
+                    var terminal = new Observation(pipelineId, actual, retainedMetrics, last.snapshot(),
+                            last.positions(), last.failure(), observedNow(), retained, last.initialLoad());
+                    save(observations, terminal, checkpoint.epoch());
+                    terminalMeasurements.put(pipelineId, new TerminalMeasurement(scope, checkpoint.epoch(),
+                            terminal, priorMeasurement.measuredAt()));
+                    return new Publication(terminal, false);
+                }
+            }
+            // A partial fallback or failed save must never become a reusable successful sample.
+            terminalMeasurements.remove(pipelineId);
             if (actual == PipelineState.COMPLETED) {
                 Optional<Observation> previous = observations.read(pipelineId)
                         .filter(last -> last.state() == PipelineState.COMPLETED && last.observedAt() != null);
@@ -843,7 +886,7 @@ public final class ObservationPublisher {
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
                     save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null);
-                    return terminal;
+                    return new Publication(terminal, true);
                 }
             }
             ObservationFailure carried = failure;
@@ -901,11 +944,23 @@ public final class ObservationPublisher {
             if (measuredSuccessfully) {
                 coldLayer.saw(pipelineId, readings);
                 frontierStall.saw(pipelineId, pinned, gaps);
+                if (requirePreparedState && (actual == PipelineState.FAILED || actual == PipelineState.STOPPED))
+                    terminalMeasurements.put(pipelineId,
+                            new TerminalMeasurement(scope, checkpoint.epoch(), published, at));
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return published;
+            return new Publication(published, true);
         });
+    }
+
+    private static Optional<Observation> reusableProjection(ObservationStore observations, String pipelineId) {
+        try { return observations.read(pipelineId); }
+        catch (TapstateException unavailable) {
+            // Reuse is optional. The ordinary measurement and original fenced save still decide
+            // whether publication is valid; never swallow a refusal from that authoritative path.
+            return Optional.empty();
+        }
     }
 
     private InitialLoad initialLoadAt(String pipelineId, Instant at) {
@@ -1282,6 +1337,7 @@ public final class ObservationPublisher {
     public void forgetPipelinesOutside(Collection<String> live) {
         Objects.requireNonNull(live, "live");
         failuresByPipelineAndCode.keySet().retainAll(Set.copyOf(live));
+        terminalMeasurements.keySet().retainAll(Set.copyOf(live));
     }
 
     /**

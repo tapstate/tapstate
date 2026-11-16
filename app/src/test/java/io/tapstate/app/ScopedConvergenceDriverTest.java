@@ -44,6 +44,8 @@ import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -73,6 +75,8 @@ class ScopedConvergenceDriverTest {
     private Runnable onFinalObservation = () -> {};
     private PipelineAlertFeed alertFeed = PipelineAlertFeed.none();
     private MetricsExport metricsExport = MetricsExport.none();
+    private final java.util.concurrent.atomic.AtomicLong nanoTime = new java.util.concurrent.atomic.AtomicLong();
+    private RebuildAdmission rebuildPolicy = RebuildAdmission.never();
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -103,7 +107,7 @@ class ScopedConvergenceDriverTest {
                     pendingCleanup=false; carrying.set(false);
                 }
             };
-        }, pass -> RebuildAdmission.never(), ids -> retained.add(List.copyOf(ids)), alertFeed);
+        }, pass -> rebuildPolicy, ids -> retained.add(List.copyOf(ids)), alertFeed);
         StateStore poisonState = mock(StateStore.class, call -> { throw new AssertionError("unscoped state accessed"); });
         ObservationStore poisonObservations = mock(ObservationStore.class, call -> { throw new AssertionError("unscoped observation accessed"); });
         var poisonDesired = mock(io.tapstate.spi.store.DesiredStore.class,
@@ -124,7 +128,208 @@ class ScopedConvergenceDriverTest {
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
                             : io.tapstate.core.lifecycle.SnapshotReading.NONE;
                 }),
-                sampler, metricsExport, eligible::get, ownership, bindings);
+                sampler, metricsExport, eligible::get, ownership, bindings, nanoTime::get);
+    }
+
+    @Test void reusedTerminalProjectionFeedsLifecycleAlertsButDoesNotInventMetricHistory() {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        var received = new ArrayList<Observation>();
+        var exported = new java.util.concurrent.atomic.AtomicInteger();
+        sampler = mock(io.tapstate.runtime.scheduler.RateSampler.class);
+        alertFeed = new PipelineAlertFeed() {
+            public boolean needsFreshTerminalMetrics(PipelineIntentScope scope) { return false; }
+            public void expecting(PipelineConvergencePass pass) { }
+            public void published(PipelineConvergencePass pass, Observation value, Throwable failure) { received.add(value); }
+            public void unavailable(PipelineConvergencePass pass) { throw new AssertionError("publication failed"); }
+            public void retain(java.util.Collection<String> ids) { }
+        };
+        metricsExport = new MetricsExport() {
+            public void offer(String id, PipelineState state, Instant at, List<io.tapstate.core.lifecycle.MetricFact> facts) {
+                exported.incrementAndGet();
+            }
+            public void forgetPipelinesOutside(java.util.Collection<String> ids) { }
+        };
+        try (var driver = driver()) {
+            driver.reconcile();
+            driver.reconcile();
+            assertThat(received).hasSize(2);
+            assertThat(received).allMatch(value -> value.state() == PipelineState.STOPPED);
+            assertThat(exported).hasValue(1);
+            verify(sampler, times(1)).offer(any(Observation.class), eq(FIRST), any());
+        }
+    }
+
+    @Test void unchangedStoppedPipelineDoesNotContinuouslyReadAndPublish() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            driver.reconcile();
+            assertThat(views.observations(FIRST).read("orders")).get()
+                    .extracting(Observation::state).isEqualTo(PipelineState.STOPPED);
+            int completedLoads = intents.loads;
+            int completedWrites = views.writes.size();
+            for (int i = 0; i < 5; i++) scheduledPass(driver);
+            assertThat(intents.loads).as("unchanged terminal intent must not repeat full storage admission")
+                    .isEqualTo(completedLoads);
+            assertThat(views.writes).hasSize(completedWrites);
+            intents.snapshot = new PipelineIntentSnapshot(FIRST, 5,
+                    new DesiredState("orders", PipelineState.RUNNING, "original"));
+            scheduledPass(driver);
+            assertThat(carrying).isTrue();
+            assertThat(views.observations(FIRST).read("orders")).get()
+                    .extracting(Observation::state).isEqualTo(PipelineState.RUNNING);
+        }
+    }
+
+    @Test void terminalRecheckExpiresButSynchronousPassesAlwaysExecute() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            driver.reconcile();
+            int reads = intents.loads;
+            nanoTime.set(Duration.ofSeconds(29).toNanos()); scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads);
+            nanoTime.set(Duration.ofSeconds(30).toNanos()); scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+            driver.reconcile();
+            assertThat(intents.loads).isEqualTo(reads + 2);
+            verify(ownership, org.mockito.Mockito.atLeastOnce()).retain(Set.of("orders"));
+        }
+    }
+
+    @Test void aChangedPhysicalScopeCannotReuseTerminalCadence() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            driver.reconcile(); int reads = intents.loads;
+            views.current = scope(2);
+            intents.snapshot = new PipelineIntentSnapshot(scope(2), 4, intents.snapshot.desired());
+            scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+            assertThat(views.observations(scope(2)).read("orders")).get()
+                    .extracting(Observation::state).isEqualTo(PipelineState.STOPPED);
+        }
+    }
+
+    @Test void absentSchedulingHintsNeverSuppressActuationReads() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            driver.reconcile(); int reads = intents.loads;
+            intents.hints = false; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
+    @Test void failedPublicationCannotDeferTheNextPass() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            views.rejectPublication = true; driver.reconcile(); int reads = intents.loads;
+            views.rejectPublication = false; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+            assertThat(views.observations(FIRST).read("orders")).isPresent();
+        }
+    }
+
+    @Test void aStoppedCheckpointWithALocalJobCannotBeDeferred() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        views.state(FIRST).create("orders", StateJson.of(PipelineState.STOPPED), T0);
+        carrying.set(true);
+        try (var driver = driver()) {
+            driver.reconcile(); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
+    @Test void pendingPurgeAndReassemblyRemainOnEveryTick() throws Exception {
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original", true));
+        try (var driver = driver()) {
+            driver.reconcile(); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+            intents.snapshot = new PipelineIntentSnapshot(FIRST, 5,
+                    new DesiredState("orders", PipelineState.STOPPED, "original", false, "original", true));
+            driver.reconcile(); reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
+    @Test void failureThatCannotAutomaticallyRetryIsDeferred() throws Exception {
+        views.state(FIRST).create("orders", StateJson.of(PipelineState.FAILED), T0);
+        try (var driver = driver()) {
+            scheduledPass(driver); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads);
+        }
+    }
+
+    @Test void dynamicRecoveryIsNotDeferredAndCanBecomeAdmissibleWithoutANewIntent() throws Exception {
+        var admitted = new AtomicBoolean(); rebuildPolicy = id -> admitted.get();
+        views.state(FIRST).create("orders", StateJson.of(PipelineState.FAILED), T0);
+        try (var driver = driver()) {
+            scheduledPass(driver); int reads = intents.loads;
+            admitted.set(true); scheduledPass(driver);
+            assertThat(intents.loads).isGreaterThan(reads);
+            assertThat(carrying).isTrue();
+        }
+    }
+
+    @Test void exhaustedRecoveryIsDeferredOnlyForTheMatchingIntent() throws Exception {
+        rebuildPolicy = id -> false;
+        views.state(FIRST).create("orders", StateJson.of(PipelineState.FAILED), T0);
+        views.recovery = new CheckpointDoc.LeaseRecovery(4, 3, 3, T0);
+        try (var driver = driver()) {
+            scheduledPass(driver); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads);
+            intents.snapshot = new PipelineIntentSnapshot(FIRST, 5, intents.snapshot.desired());
+            scheduledPass(driver); reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
+    @Test void activatingAPublicationBasedAlertWakesATerminalPipeline() throws Exception {
+        var frequent = new AtomicBoolean();
+        var delegate = PipelineAlertFeed.none();
+        alertFeed = new PipelineAlertFeed() {
+            public void expecting(PipelineConvergencePass p) { delegate.expecting(p); }
+            public void published(PipelineConvergencePass p, Observation o, Throwable t) { delegate.published(p, o, t); }
+            public void unavailable(PipelineConvergencePass p) { delegate.unavailable(p); }
+            public void retain(java.util.Collection<String> ids) { delegate.retain(ids); }
+            public boolean needsFrequentTerminalSamples(PipelineIntentScope scope) { return frequent.get(); }
+        };
+        views.state(FIRST).create("orders", StateJson.of(PipelineState.FAILED), T0);
+        try (var driver = driver()) {
+            scheduledPass(driver); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads);
+            frequent.set(true); scheduledPass(driver); scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 2);
+        }
+    }
+
+    @Test void optionalTerminalProofFailureDoesNotOverwriteSuccessfulPublication() throws Exception {
+        alertFeed = mock(PipelineAlertFeed.class);
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            views.rejectPostPublicationRead = true; driver.reconcile(); int reads = intents.loads;
+            var published = views.observations(FIRST).read("orders").orElseThrow();
+            assertThat(published.state()).isEqualTo(PipelineState.STOPPED);
+            assertThat(published.metrics()).doesNotContainKey("reconcileFailuresInARow");
+            verify(alertFeed, never()).unavailable(any());
+            views.rejectPostPublicationRead = false; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
+    private static void scheduledPass(ConvergenceDriver driver) throws Exception {
+        driver.schedule();
+        var field = ConvergenceDriver.class.getDeclaredField("passes");
+        field.setAccessible(true);
+        var executor = (PipelinePassExecutor) field.get(driver);
+        org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(3))
+                .until(() -> executor.activePipelines().isEmpty());
     }
 
     @Test void aNewStartPassRunsWhileThreePeriodicPassesAreBlocked() throws Exception {
@@ -587,9 +792,16 @@ class ScopedConvergenceDriverTest {
         private PipelineIntentSnapshot snapshot = snapshot(FIRST);
         private RuntimeException loadFailure;
         private int loads;
+        private boolean hints = true;
         @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }
         @Override public Optional<PipelineIntentSnapshot> loadForActuation(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
         @Override public List<String> pipelineIds() { return List.of("orders"); }
+        @Override public List<ScanCandidate> scanCandidates() {
+            return snapshot == null || !hints ? List.of(new ScanCandidate("orders", 0)) : List.of(
+                    new ScanCandidate("orders", snapshot.desired().targetState() == PipelineState.RUNNING
+                            ? snapshot.intentRevision() : 0, snapshot.scope(), snapshot.intentRevision(),
+                            snapshot.desired().targetState()));
+        }
         @Override public PipelineIntentStore guardedBy(Runnable active) { throw new AssertionError("read-only driver"); }
         @Override public boolean compareAndSet(PipelineIntentScope scope, long revision, DesiredState desired) { throw new AssertionError("read-only driver"); }
         @Override public boolean remove(PipelineIntentScope scope, long revision) { throw new AssertionError("read-only driver"); }
@@ -597,6 +809,9 @@ class ScopedConvergenceDriverTest {
     private record Write(String kind, PipelineIntentScope scope, WorkloadClaimFence claim) {}
     private final class Views implements PipelineStoreViews {
         private PipelineIntentScope current = FIRST;
+        private boolean rejectPublication;
+        private boolean rejectPostPublicationRead;
+        private CheckpointDoc.LeaseRecovery recovery;
         private final Map<PipelineIntentScope, InMemoryStateStore> states = new HashMap<>();
         private final Map<PipelineIntentScope, InMemoryObservationStore> projections = new HashMap<>();
         private final InMemoryRateHistoryStore rates = new InMemoryRateHistoryStore();
@@ -618,10 +833,23 @@ class ScopedConvergenceDriverTest {
             org.mockito.Mockito.doAnswer(call -> { check(scope, original, active); writes.add(new Write("rate", scope, original)); rates.append(call.getArgument(0)); return null; })
                     .when(writer).append(any(io.tapstate.core.lifecycle.RateSample.class)); return writer;
         }
-        @Override public StateStore pipelineStates(PipelineIntentScope scope) { check(scope); return state(scope); }
+        @Override public StateStore pipelineStates(PipelineIntentScope scope) {
+            check(scope);
+            if (rejectPostPublicationRead && !writes.isEmpty()
+                    && writes.getLast().kind().equals("observation")) throw fenced();
+            if (recovery == null) return state(scope);
+            var reader = mock(StateStore.class);
+            when(reader.read(any())).thenAnswer(call -> state(scope).read(call.getArgument(0))
+                    .map(doc -> new CheckpointDoc(doc.pipelineId(), doc.stateJson(), doc.epoch(), doc.touchTime(), recovery)));
+            return reader;
+        }
         @Override public StateStore pipelineStates(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             return new StateStore() {
-                @Override public Optional<CheckpointDoc> read(String id) { check(scope); return state(scope).read(id); }
+                @Override public Optional<CheckpointDoc> read(String id) {
+                    check(scope);
+                    return state(scope).read(id).map(doc -> recovery == null ? doc : new CheckpointDoc(
+                            doc.pipelineId(), doc.stateJson(), doc.epoch(), doc.touchTime(), recovery));
+                }
                 @Override public CasOutcome compareAndSwap(String id, long epoch, String next, Instant at) {
                     check(scope, original, active); writes.add(new Write("state", scope, original));
                     if(next.equals(StateJson.of(PipelineState.COMPLETED)))completionTrace.add("completion-cas");
@@ -636,6 +864,7 @@ class ScopedConvergenceDriverTest {
             return new ObservationStore() {
                 @Override public Optional<Observation> read(String id) { check(scope); return observations(scope).read(id); }
                 @Override public void save(Observation value) {
+                    if (rejectPublication) throw fenced();
                     check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value);
                     if(readyToComplete && !completionObserved && value.state()==PipelineState.RUNNING) {
                         completionObserved=true;completionTrace.add("final-observation");onFinalObservation.run();

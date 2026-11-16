@@ -97,7 +97,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private volatile Instant lastEvaluatedAt;
     private final ConcurrentMap<Work,Instant> inputTimes=new ConcurrentHashMap<>();
     private final AlertDiagnosticMessages diagnostics;
-    private final AtomicReference<List<AlertConfiguration.Rule>> rules = new AtomicReference<>(List.of());
+    private record RuleSnapshot(List<AlertConfiguration.Rule> definitions, boolean complete) {}
+    private final AtomicReference<RuleSnapshot> rules = new AtomicReference<>(new RuleSnapshot(List.of(), false));
     private record Failure(String code,Map<String,Object> parameters){}
     private final AtomicReference<Failure> failure = new AtomicReference<>(new Failure(null,Map.of()));
     private final AtomicReference<AlarmKey> reconciliationCursor=new AtomicReference<>();
@@ -120,6 +121,22 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             return ShutdownAwait.daemon(task, "alert-evaluation-" + serial.incrementAndGet());
         }, new ThreadPoolExecutor.AbortPolicy());
     }
+    @Override public boolean needsFrequentTerminalSamples(PipelineIntentScope scope) {
+        var snapshot = rules.get();
+        if (closed.get() || !snapshot.complete()) return true;
+        var resource = new AlarmKey.Resource("pipeline", scope.pipelineId(), Long.toString(scope.stateGeneration()));
+        return snapshot.definitions().stream().anyMatch(rule -> rule.header().active() && rule.enabled()
+                && rule.resources().matches(resource) && (rule.typeId().equals("pipeline.failed") || rule.metric() != null));
+    }
+
+    @Override public boolean needsFreshTerminalMetrics(PipelineIntentScope scope) {
+        var snapshot = rules.get();
+        if (closed.get() || !snapshot.complete()) return true;
+        var resource = new AlarmKey.Resource("pipeline", scope.pipelineId(), Long.toString(scope.stateGeneration()));
+        return snapshot.definitions().stream().anyMatch(rule -> rule.header().active() && rule.enabled()
+                && rule.resources().matches(resource) && rule.metric() != null);
+    }
+
     @Override public void expecting(PipelineConvergencePass pass) { if (pass != null && !closed.get()) slot(pass); }
     private Slot slot(PipelineConvergencePass pass) {
         var producer = new Producer(pass.scope(), pass.claim(), pass.intent());
@@ -132,6 +149,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }
     }
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause) {
+        published(pass, observation, cause, true);
+    }
+    @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause, boolean measured) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
         long sequence = slot.sequence.getAndIncrement();
@@ -143,7 +163,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 null, observation.observedAt(), observation.facts());
         var trace = (diagnostics == null ? AlarmDiagnosticCapture.capture(cause, List.of(), failure -> failure instanceof TapstateException coded
                 ? Optional.of(coded.code().code()) : Optional.empty()) : diagnostics.pipeline(cause,observation.failure())).orElse(null);
-        var capturedRules = rules.get();
+        var capturedRules = rules.get().definitions();
         submit(slot, bytes + 16 * 1024, () -> {
             requireCurrent(slot);
             long interruption = slot.interruptions.get();
@@ -151,7 +171,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();
             for (var rule : matching(slot, capturedRules)) {
                 var binding = binding(slot, rule);
-                if (rule.typeId().equals("pipeline.observation-stale")) continue;
+                if (rule.typeId().equals("pipeline.observation-stale") || !measured && rule.metric() != null) continue;
                 if (slot.discontinuous()) accept(binding, sequence, new AlertInput.Discontinuity(clock.instant()));
                 AlertInput input = rule.metric() != null ? new AlertInput.Metric(original)
                         : new AlertInput.Conditions(original.observedAt(), slot.producer.intent().desired().targetState() != PipelineState.RUNNING
@@ -191,7 +211,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 if(resourceSlots.get(entry.getKey())!=slot)return;
                 for(var entryBinding:slot.bindings.entrySet()) {
                     var previous=entryBinding.getValue();
-                    var current=rules.get().stream().filter(rule->rule.header().identity().equals(previous.definition().header().identity())
+                    var current=rules.get().definitions().stream().filter(rule->rule.header().identity().equals(previous.definition().header().identity())
                             &&rule.matches(entryBinding.getKey())).findFirst();
                     if(current.isEmpty())continue;
                     var binding=new AlertEvaluationHost.Binding(current.orElseThrow(),previous.resource(),previous.producer(),
@@ -201,7 +221,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 }
             }finally{slot.tickQueued.set(false);}},()->slot.tickQueued.set(false));
         }
-        var capturedRules = rules.get();
+        var capturedRules = rules.get().definitions();
         for (Slot slot : slots.values()) {
             if (!slot.tickQueued.compareAndSet(false, true)) continue;
             long sequence = slot.freshnessSequence.getAndIncrement();
@@ -252,7 +272,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         } while (cursor != null);
         active.run(); synchronized(this){
             if(closed.get()){stop(resolved);return;}
-            if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(List.copyOf(all));
+            if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(new RuleSnapshot(List.copyOf(all), unavailableRules.isEmpty()));
         }
         observerTick.get().run();
         if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
@@ -340,7 +360,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             if(!resourceSlots.containsKey(resource)&&resourceSlots.size()+slots.size()>=MAX_OBJECTS){reject(null,"object-budget");settled.run();return;}
             slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
         }
-        var captured=rules.get();
+        var captured=rules.get().definitions();
         int inputSize=512+(input instanceof AlertInput.Operational op&&op.trace()!=null
                 ?op.trace().text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length:0);
         submitResourceAdmitted(slot,inputSize,()->{try{
@@ -716,7 +736,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 }while((failure=settlementFailures.poll())!=null);
                 ShutdownAwait.all(failures);
             }
-            slots.clear();resourceSlots.clear();retainedResourceBindings.set(0);rules.set(List.of());
+            slots.clear();resourceSlots.clear();retainedResourceBindings.set(0);rules.set(new RuleSnapshot(List.of(), false));
         });
     }
 }

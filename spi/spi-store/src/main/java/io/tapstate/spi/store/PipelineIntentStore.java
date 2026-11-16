@@ -50,7 +50,12 @@ public interface PipelineIntentStore {
     List<String> pipelineIds();
 
     /** Scheduling hint only. Zero means no new RUNNING intent to prioritize. */
-    record ScanCandidate(String pipelineId, long startRevision) {}
+    record ScanCandidate(String pipelineId, long startRevision, PipelineIntentScope scope,
+            long intentRevision, io.tapstate.core.lifecycle.PipelineState targetState) {
+        public ScanCandidate(String pipelineId, long startRevision) {
+            this(pipelineId, startRevision, null, 0, null);
+        }
+    }
 
     /** The scheduler must still load and prove the original intent before acting. */
     default List<ScanCandidate> scanCandidates() {

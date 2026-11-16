@@ -45,6 +45,69 @@ class PipelineAlertRuntimeTest {
         return new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, fixture.host), intentStore,
                 (scope, claim) -> Optional.of(()->{}), () -> { }, fixture.clock);
     }
+    @Test void terminalCadenceTracksTheSameRuleSnapshotAndRetainsFailureTriggerWindows() {
+        var pass = pass("orders");
+        var original = AlertEvaluationHostTest.definition("pipeline.failed");
+        var rule = new AlertConfiguration.Rule(original.header(), original.name(), original.typeId(), 1,
+                new AlertConfiguration.Resources(Set.of("pipeline"), false,
+                        Set.of(new AlarmKey.Resource("pipeline", "orders", "1"))),
+                Map.of("trigger-for", java.math.BigDecimal.valueOf(3)), null, true, null).validated(BuiltinAlarmTypes.catalog());
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(), null));
+        try (var runtime = runtime()) {
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isFalse();
+            assertThat(runtime.needsFrequentTerminalSamples(new PipelineIntentScope("cluster", 1, "cache", "orders", 2))).isFalse();
+            for (int second = 0; second <= 3; second++) {
+                fixture.now.set(T.plusSeconds(second));
+                runtime.published(pass, observation("orders", fixture.now.get(), PipelineState.FAILED), null); drained(runtime);
+            }
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            var disabled = new AlertConfiguration.Rule(rule.header(), rule.name(), rule.typeId(), 1,
+                    rule.resources(), rule.parameters(), rule.severityOverride(), false, rule.metric());
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
+        }
+    }
+
+    @Test void aMetricRuleActivatedAfterReuseAdmissionCannotConsumeTheRetainedSample() {
+        var descriptor = new AlarmTypeCatalog.Type("test.gauge", 1, AlarmTypeCatalog.Kind.STATEFUL, Set.of("pipeline"),
+                "pipeline-observations", "threshold", List.of(), AlarmSeverity.MAJOR, true,
+                "test.condition", "test.recovery", "test.guidance");
+        var catalog = new AlarmTypeCatalog(List.of(descriptor));
+        var original = AlertEvaluationHostTest.definition("pipeline.failed");
+        var metric = new MetricAlertEvaluator.Rule("test.quantity", MetricType.GAUGE, "1", Map.of(),
+                MetricAlertEvaluator.Direction.ABOVE, java.math.BigDecimal.TEN, java.math.BigDecimal.ONE);
+        var rule = new AlertConfiguration.Rule(original.header(), "Gauge", "test.gauge", 1,
+                original.resources(), Map.of(), null, true, metric);
+        var host = new AlertEvaluationHost(fixture.store, catalog, AlertChannelPolicy.Deployment.ON_PREM,
+                fixture.clock, "owner-a", () -> { });
+        when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(), null));
+        try (var runtime = new PipelineAlertRuntime(() -> new PipelineAlertRuntime.Services(fixture.store, host, catalog),
+                intentStore, (scope, claim) -> Optional.of(() -> { }), () -> { }, fixture.clock)) {
+            runtime.tick(); drained(runtime);
+            var pass = pass("orders");
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+            var point = MetricPoint.reading(Map.of(), T, 100);
+            var fact = MetricFact.single("test.quantity", MetricType.GAUGE, "1", point);
+            var observation = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(), null, T, List.of(fact));
+            runtime.published(pass, observation, null, false); drained(runtime);
+            assertThat(rows).isEmpty();
+            runtime.published(pass, observation, null, true); drained(runtime);
+            assertThat(rows).hasSize(1);
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+        }
+    }
+
     @Test void anAuthoritativeFailureSummaryIsCapturedWhenTheThrowableIsNoLongerAvailable() {
         var redactor=new io.tapstate.core.logging.SecretRedactor();redactor.replace("source",List.of("original-source-secret"));
         try(var runtime=new PipelineAlertRuntime(()->new PipelineAlertRuntime.Services(fixture.store,fixture.host),intentStore,

@@ -140,12 +140,24 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
     }
     @Override public List<ScanCandidate> scanCandidates() {
         return transaction(session -> intents.find(session, new Document("deleted", new Document("$ne", true)))
-                .projection(new Document("_id", 1).append("intentRevision", 1).append("targetState", 1).append(FAILURE, 1))
+                .projection(new Document("_id", 1).append("intentRevision", 1).append("targetState", 1).append(FAILURE, 1)
+                        .append("clusterId", 1).append("bindingVersion", 1).append("cacheIncarnation", 1)
+                        .append("stateGeneration", 1))
                 .map(row -> {
                     if (!(row.get("_id") instanceof String id) || id.isBlank()) throw unreadable();
                     long start = PipelineState.RUNNING.name().equals(row.get("targetState")) && !row.containsKey(FAILURE)
                             && row.get("intentRevision") instanceof Long revision && revision > 0 ? revision : 0;
-                    return new ScanCandidate(id, start);
+                    try {
+                        if (!(row.get("intentRevision") instanceof Long revision) || revision < 1 || revision == Long.MAX_VALUE
+                                || !(row.get("bindingVersion") instanceof Long binding)
+                                || !(row.get("stateGeneration") instanceof Long generation)) return new ScanCandidate(id, start);
+                        var scope = new PipelineIntentScope(row.getString("clusterId"), binding,
+                                row.getString("cacheIncarnation"), id, generation);
+                        return new ScanCandidate(id, start, scope, revision, PipelineState.valueOf(row.getString("targetState")));
+                    } catch (IllegalArgumentException | NullPointerException | ClassCastException invalidHint) {
+                        // The full actuation read retains responsibility for diagnosing malformed rows.
+                        return new ScanCandidate(id, start);
+                    }
                 }).into(new ArrayList<>()));
     }
 
