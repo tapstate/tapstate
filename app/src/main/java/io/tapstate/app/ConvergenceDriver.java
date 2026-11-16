@@ -1,6 +1,7 @@
 package io.tapstate.app;
 
 import io.tapstate.core.lifecycle.ObservationFailure;
+import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.runtime.scheduler.ConvergeResult;
@@ -50,6 +51,7 @@ final class ConvergenceDriver implements AutoCloseable {
     private final PipelinePassExecutor passes = new PipelinePassExecutor(4);
     private final java.util.concurrent.atomic.AtomicBoolean scanning = new java.util.concurrent.atomic.AtomicBoolean();
     private int nextPipeline;
+    private final Map<String, Long> attemptedStarts = new java.util.concurrent.ConcurrentHashMap<>();
 
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
@@ -162,15 +164,24 @@ final class ConvergenceDriver implements AutoCloseable {
             return;
         }
         try {
-            List<String> pipelineIds = PipelineDiagnostics.measure(null, Phase.PIPELINE_SCAN,
-                    () -> scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds());
-            int size = pipelineIds.size();
+            boolean prioritizeStarts = asynchronous && scoped != null;
+            List<PipelineIntentStore.ScanCandidate> candidates = PipelineDiagnostics.measure(null, Phase.PIPELINE_SCAN,
+                    () -> prioritizeStarts ? scoped.intents().scanCandidates()
+                            : (scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds()).stream()
+                                    .map(id -> new PipelineIntentStore.ScanCandidate(id, 0)).toList());
+            List<String> pipelineIds = candidates.stream().map(PipelineIntentStore.ScanCandidate::pipelineId).toList();
+            int size = candidates.size();
             int start = size == 0 ? 0 : Math.floorMod(nextPipeline, size);
+            var periodic = new java.util.ArrayList<PipelineIntentStore.ScanCandidate>();
             for (int offset = 0; offset < size; offset++) {
-                String pipelineId = pipelineIds.get((start + offset) % size);
-                if (asynchronous) passes.submit(pipelineId, () -> reconcilePipeline(pipelineId));
-                else passes.runInline(pipelineId, () -> reconcilePipeline(pipelineId));
+                var candidate = candidates.get((start + offset) % size);
+                if (!asynchronous) passes.runInline(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+                else if (!prioritizeStarts) passes.submit(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+                else if (isNewStart(candidate)) passes.submitStart(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+                else periodic.add(candidate);
             }
+            for (var candidate : periodic)
+                passes.submitPeriodic(candidate.pipelineId(), () -> reconcilePipeline(candidate));
             nextPipeline = size == 0 ? 0 : (start + 1) % size;
             var retained = new java.util.HashSet<>(pipelineIds);
             retained.addAll(passes.activePipelines());
@@ -180,7 +191,12 @@ final class ConvergenceDriver implements AutoCloseable {
         } finally { scanning.set(false); }
     }
 
-    private void reconcilePipeline(String pipelineId) {
+    private boolean isNewStart(PipelineIntentStore.ScanCandidate candidate) {
+        return candidate.startRevision() > attemptedStarts.getOrDefault(candidate.pipelineId(), 0L);
+    }
+
+    private void reconcilePipeline(PipelineIntentStore.ScanCandidate candidate) {
+        String pipelineId = candidate.pipelineId();
         // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
         // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
@@ -216,6 +232,11 @@ final class ConvergenceDriver implements AutoCloseable {
                 try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CLAIM)) {
                     permit = actuation.permit(snapshot.get().scope());
                     if (permit.granted()) {
+                        // Only an accepted actuation attempt consumes priority. Deferred
+                        // preparation and a denied permit must still be able to use the slot.
+                        if (candidate.startRevision() != 0 && snapshot.get().intentRevision() == candidate.startRevision()
+                                && snapshot.get().desired().targetState() == PipelineState.RUNNING)
+                            attemptedStarts.merge(pipelineId, candidate.startRevision(), Math::max);
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
                         pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
                                 scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
@@ -307,6 +328,7 @@ final class ConvergenceDriver implements AutoCloseable {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        attemptedStarts.keySet().retainAll(pipelineIds);
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);

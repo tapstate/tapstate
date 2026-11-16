@@ -138,6 +138,17 @@ final class MongoPipelineIntentStore implements PipelineIntentStore {
                     return id;
                 }).into(new ArrayList<>()));
     }
+    @Override public List<ScanCandidate> scanCandidates() {
+        return transaction(session -> intents.find(session, new Document("deleted", new Document("$ne", true)))
+                .projection(new Document("_id", 1).append("intentRevision", 1).append("targetState", 1).append(FAILURE, 1))
+                .map(row -> {
+                    if (!(row.get("_id") instanceof String id) || id.isBlank()) throw unreadable();
+                    long start = PipelineState.RUNNING.name().equals(row.get("targetState")) && !row.containsKey(FAILURE)
+                            && row.get("intentRevision") instanceof Long revision && revision > 0 ? revision : 0;
+                    return new ScanCandidate(id, start);
+                }).into(new ArrayList<>()));
+    }
+
     @Override public boolean compareAndSet(PipelineIntentScope scope, long expected, DesiredState desired) {
         Objects.requireNonNull(desired, "desired");
         if (!scope.pipelineId().equals(desired.pipelineId()) || desired.revision().isBlank()
