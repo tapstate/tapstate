@@ -182,6 +182,18 @@ final class SpecGenerator {
         return value;
     }
 
+    /**
+     * A value a document is held to: the two scalars, or a boolean. Only a doc expectation takes a
+     * boolean, since a flag a pipeline writes is read back from the document while seeds, cdc settings
+     * and locators stay on the two scalars every store spells the same way.
+     */
+    private static Map<String, Object> expectedValue() {
+        Map<String, Object> value = new LinkedHashMap<>();
+        value.put("type", List.of("integer", "string", "boolean"));
+        value.put("description", "An integer, a string or a boolean; wider value types are a widening of the vocabulary.");
+        return value;
+    }
+
     private static Map<String, Object> stepDef() {
         List<Object> forms = new ArrayList<>();
         Map<String, Object> lifecycle = new LinkedHashMap<>();
@@ -364,7 +376,7 @@ final class SpecGenerator {
         expect.put("type", "object");
         expect.put("description", "Scalar values by path: a.b for a field of a field, items[0].sku for a "
                 + "field of a list element.");
-        expect.put("additionalProperties", scalarValue());
+        expect.put("additionalProperties", expectedValue());
 
         Map<String, Object> length = scalar("integer", "How many elements the list at this path holds.");
         length.put("minimum", 0);
