@@ -102,7 +102,7 @@ with tempfile.TemporaryDirectory() as tmp:
     release_lock=json.loads((canonical/'deploy/cloud/connectors.lock.json').read_text())
     put('deploy/cloud/connectors.lock.json',json.dumps(release_lock))
     lock_sha=hashlib.sha256((root/'deploy/cloud/connectors.lock.json').read_bytes()).hexdigest()
-    release_ids={'mysql','mongodb','postgres','oracle','sqlserver','mongodb-atlas','aws-rds-mysql'}
+    release_ids={'mysql','mongodb','postgres','oracle','sqlserver','mongodb-atlas','aws-rds-mysql','dummy'}
     identity=dict(schema=1,mode='release',source_sha=plan['source_sha'],release='connectors-preview',lock_sha256=lock_sha,
                   connectors=[dict(id=e['id'],file=e['id']+'-connector.jar',**{k:e[k] for k in ['bytes','sha256','pdkApiVersion','upstreamRevision']})
                               for e in sorted(release_lock['connectors'],key=lambda e:e['id']) if e['id'] in release_ids])
