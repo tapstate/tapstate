@@ -36,6 +36,30 @@ final class MongoValidationSchema {
         }
     }
 
+    /** Definition operations never inherit a structure proof from an enclosing startup phase. */
+    static <T> T duringDefinitionOperation(java.util.function.Supplier<T> work) {
+        var previous = STARTUP.get();
+        STARTUP.set(new IdentityHashMap<>());
+        try { return work.get(); }
+        finally {
+            if (previous == null) STARTUP.remove();
+            else STARTUP.set(previous);
+        }
+    }
+
+    static void refreshDefinitionStructure(MongoDatabase database) {
+        STARTUP.get().remove(database);
+        requireReady(database, true);
+    }
+
+    static void requireVerifiedDefinitionSchema(MongoDatabase database, Document schema, String cluster) {
+        var proof = STARTUP.get().get(database);
+        if (proof == null || !proof.configuration() || !proof.marker().equals(schema)) throw refused();
+        var marker = requireConfiguration(schema, "READY");
+        if (!cluster.equals(scope(marker).clusterId())) throw unreadable("identity");
+        requireMutationReady(schema);
+    }
+
     static Document marker(String operation, String phase, long initialized, CacheBusinessScope scope) {
         var result = new Document("formatVersion", 1).append("operationId", operation).append("phase", phase).append("initializedPipelines", initialized)
                 .append("scope", MongoValidationControlStore.scope(scope));

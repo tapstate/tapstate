@@ -28,6 +28,8 @@ final class NativeValidationScheduler implements AutoCloseable {
     private final Map<Key,Entry> entries=new LinkedHashMap<>();private final AtomicBoolean discovering=new AtomicBoolean();
     private ScheduledFuture<?> polling;private ValidationMemberResources.Unbound allocation;private ThreadPoolExecutor starts;
     private NativeValidationStartCoordinator coordinator;private MemoryValidationSchedules.Writer writer;private ValidationScheduleObservations.Origin origin;
+    private ValidationTaskStore discoveryTasks;
+    private Long emptyRevision;
     private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private long nextDiscovery;
     NativeValidationScheduler(MongoConfigurationDomain configuration,ValidationMemberResources.Member resources,ValidationMemberResources process,
             Supplier<NativeValidationStartCoordinator> coordinators,MemoryValidationSchedules observations,Clock clock,ValidationSchedule.Calculator calculator,Runnable active){
@@ -49,8 +51,24 @@ final class NativeValidationScheduler implements AutoCloseable {
     }
     /** One identity per pass avoids ambient definition enumeration and starvation behind a damaged task. */
     private void scan(){
-        require();var tasks=configuration.validationTasks(this::require);
-        if(pipeline==null){var found=tasks.pipelines(afterPipeline,1);if(found.isEmpty()){afterPipeline=null;return;}pipeline=found.getFirst();afterTask=null;}
+        require();
+        Long revision = null;
+        if (pipeline == null && afterPipeline == null) {
+            revision = configuration.validationDiscoveryRevision();
+            if (revision.equals(emptyRevision)) return;
+        }
+        if (discoveryTasks == null) discoveryTasks = configuration.validationTasks(this::require);
+        var tasks = discoveryTasks;
+        if(pipeline==null){
+            var found=tasks.pipelines(afterPipeline,1);
+            if(found.isEmpty()){
+                // Only an empty inventory is reusable. Populated sweeps keep their original
+                // admission and retry behavior, including slots freed later in a sweep.
+                if (revision != null && revision == configuration.validationDiscoveryRevision()) emptyRevision = revision;
+                afterPipeline=null;return;
+            }
+            emptyRevision=null;pipeline=found.getFirst();afterTask=null;
+        }
         var current=pipeline;List<String> ids;
         try{ids=tasks.taskIds(current,afterTask,1);}catch(TapstateException failed){afterPipeline=pipeline;pipeline=null;afterTask=null;throw failed;}
         if(ids.isEmpty()){afterPipeline=pipeline;pipeline=null;afterTask=null;return;}

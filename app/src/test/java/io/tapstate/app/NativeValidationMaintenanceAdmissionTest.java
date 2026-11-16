@@ -20,6 +20,45 @@ import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
 class NativeValidationMaintenanceAdmissionTest {
+    @Test void emptyDiscoveryOnlyRepeatsWhenConfigurationChanges() {
+        var configuration = mock(MongoConfigurationDomain.class);
+        var tasks = mock(ValidationTaskStore.class);
+        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.validationDiscoveryRevision()).thenReturn(7L);
+        when(tasks.pipelines(null, 1)).thenReturn(List.of());
+        try (var process = new ValidationMemberResources()) {
+            var member = process.bind("cluster", "node", "boot", 4, () -> {});
+            try (var scheduler = new NativeValidationScheduler(configuration, member, process,
+                    () -> mock(NativeValidationStartCoordinator.class), mock(MemoryValidationSchedules.class),
+                    Clock.systemUTC(), mock(ValidationSchedule.Calculator.class), () -> {})) {
+                for (int i = 0; i < 5; i++) ReflectionTestUtils.invokeMethod(scheduler, "scan");
+                verify(tasks).pipelines(null, 1);
+                verify(configuration).validationTasks(any());
+                when(configuration.validationDiscoveryRevision()).thenReturn(8L);
+                ReflectionTestUtils.invokeMethod(scheduler, "scan");
+                verify(tasks, times(2)).pipelines(null, 1);
+                verify(configuration).validationTasks(any());
+            }
+        }
+    }
+
+    @Test void aConfigurationChangeDuringDiscoveryCannotBeRememberedAsCompleted() {
+        var configuration = mock(MongoConfigurationDomain.class);
+        var tasks = mock(ValidationTaskStore.class);
+        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.validationDiscoveryRevision()).thenReturn(7L, 8L, 8L, 8L, 8L);
+        when(tasks.pipelines(null, 1)).thenReturn(List.of());
+        try (var process = new ValidationMemberResources()) {
+            var member = process.bind("cluster", "node", "boot", 4, () -> {});
+            try (var scheduler = new NativeValidationScheduler(configuration, member, process,
+                    () -> mock(NativeValidationStartCoordinator.class), mock(MemoryValidationSchedules.class),
+                    Clock.systemUTC(), mock(ValidationSchedule.Calculator.class), () -> {})) {
+                for (int i = 0; i < 3; i++) ReflectionTestUtils.invokeMethod(scheduler, "scan");
+                verify(tasks, times(2)).pipelines(null, 1);
+            }
+        }
+    }
+
     @Test void schedulerDiscoveryLeavesTheFinalTwoFramesForForegroundAndRetriesAfterRelease() throws Exception {
         var release = new CountDownLatch(1);
         var reads = new AtomicInteger();
@@ -60,6 +99,28 @@ class NativeValidationMaintenanceAdmissionTest {
             }
         } finally {
             release.countDown();
+        }
+    }
+
+    @Test void historyDoesNotRediscoverAnEmptyTaskSetUntilConfigurationChanges() {
+        var configuration = mock(MongoConfigurationDomain.class);
+        var tasks = mock(ValidationTaskStore.class);
+        when(configuration.validationTasks(any())).thenReturn(tasks);
+        when(configuration.validationDiscoveryRevision()).thenReturn(7L);
+        when(tasks.pipelines(null, 1)).thenReturn(List.of());
+        try (var process = new ValidationMemberResources()) {
+            var member = process.bind("cluster", "node", "boot", 4, () -> {});
+            try (var history = new NativeValidationReportHistory(configuration, mock(MongoCacheDomain.class),
+                    new CacheBusinessScope("cluster", 1, "cache"), () -> null, () -> {}, member, process,
+                    mock(NativeValidationOwnerReservations.class), Clock.systemUTC())) {
+                ((java.util.concurrent.ScheduledFuture<?>) ReflectionTestUtils.getField(history, "polling")).cancel(false);
+                for (int i = 0; i < 5; i++) history.scan();
+                verify(tasks).pipelines(null, 1);
+                when(configuration.validationDiscoveryRevision()).thenReturn(8L);
+                history.scan();
+                verify(tasks, times(2)).pipelines(null, 1);
+                verify(configuration).validationTasks(any());
+            }
         }
     }
 

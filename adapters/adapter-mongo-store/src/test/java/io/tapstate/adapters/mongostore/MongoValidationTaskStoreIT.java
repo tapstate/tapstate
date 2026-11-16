@@ -25,9 +25,65 @@ import static io.tapstate.spi.store.ValidationTaskStore.*;
 /** Real CFG authoring and native control facts; these fixtures do not execute business checks. */
 @RequiresDocker
 class MongoValidationTaskStoreIT {
-    @Container static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
+    @Container static final MongoDBContainer CONFIG = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+            .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     @Container static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     static final Duration TTL = Duration.ofSeconds(30);
+
+    @Test void aRetriedDiscoveryRechecksPhysicalStructureAfterATransientFailure() {
+        try (var f = new Fixture()) {
+            var injected = new java.util.concurrent.atomic.AtomicBoolean();
+            var admin = f.configClient.getDatabase("admin");
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("aggregate") && collection.equals(SystemCollections.VALIDATION_TASKS.collectionName())
+                        && injected.compareAndSet(false, true)) {
+                    SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", new Document("times", 1))
+                            .append("data", new Document("failCommands", List.of("aggregate")).append("errorCode", 112)
+                                    .append("errorLabels", List.of("TransientTransactionError"))));
+                }
+            });
+            try {
+                assertThatThrownBy(() -> f.tasks.pipelines(null, 1)).isInstanceOf(TapstateException.class);
+                assertThat(injected).isTrue();
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+        }
+    }
+
+    @Test void discoveryRevisionUsesTheDefinitionSnapshotConcern() {
+        try (var f = new Fixture()) {
+            f.configDb.runCommand(new Document("profile", 2));
+            long revision = f.configuration.validationDiscoveryRevision();
+            f.configDb.runCommand(new Document("profile", 0));
+            assertThat(revision).isEqualTo(f.configuration.configurationRevision());
+            var read = f.configDb.getCollection("system.profile").find(new Document("command.find",
+                    SystemCollections.CONFIGURATION_VERSION.collectionName())).first();
+            assertThat(read).isNotNull();
+            var command = read.get("command", Document.class);
+            assertThat(command.get("readConcern", Document.class)).containsEntry("level", "snapshot");
+            assertThat(command).containsEntry("startTransaction", true).containsEntry("autocommit", false);
+        }
+    }
+
+    @Test void definitionDiscoveryAuditsEachIndexOncePerOperationAndDetectsLaterDamage() {
+        try (var f = new Fixture()) {
+            var reads = new HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("listIndexes")) reads.merge(collection, 1, Integer::sum);
+            });
+            try {
+                assertThat(f.tasks.pipelines(null, 1)).isEmpty();
+                assertThat(reads.get(SystemCollections.VALIDATION_TASKS.collectionName())).isEqualTo(1);
+                assertThat(reads.get(SystemCollections.VALIDATION_REPORTS.collectionName())).isEqualTo(1);
+                assertThat(reads.get(SystemCollections.VALIDATION_DIFFERENCES.collectionName())).isEqualTo(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
+            assertThatThrownBy(() -> f.tasks.pipelines(null, 1)).isInstanceOf(TapstateException.class);
+        }
+    }
 
     @Test void configurationCreateAndEditRemainConfigOnlyWhenTheCacheIsAbsent() {
         try (var f = new Fixture()) {

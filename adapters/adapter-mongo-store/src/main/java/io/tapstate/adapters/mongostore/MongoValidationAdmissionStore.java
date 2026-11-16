@@ -283,10 +283,16 @@ final class MongoValidationAdmissionStore implements ValidationReportAdmission {
         }
 
         private <T> T call(Function<ClientSession, T> action) {
-            return owner.transaction(() -> MongoValidationSchema.requireReady(owner.database, true), session -> {
-                if (!MongoValidationPreparations.validationEnabled(session, owner.database, owner.clusterId)) throw unreadable("schema");
-                MongoValidationSchema.requireMutationReady(owner.database, session);
-                return action.apply(session);
+            return MongoValidationSchema.duringDefinitionOperation(() -> {
+                var firstAttempt = new boolean[] {true};
+                return owner.transaction(() -> MongoValidationSchema.requireReady(owner.database, true), session -> {
+                    if (!firstAttempt[0]) MongoValidationSchema.refreshDefinitionStructure(owner.database);
+                    firstAttempt[0] = false;
+                    var schema = SystemCollections.SCHEMA_MIGRATIONS.on(owner.database)
+                            .find(session, new Document("_id", "config")).first();
+                    MongoValidationSchema.requireVerifiedDefinitionSchema(owner.database, schema, owner.clusterId);
+                    return action.apply(session);
+                });
             });
         }
         private void scope(Task task) { if (!owner.clusterId.equals(task.clusterId())) throw unreadable("task-cluster"); }

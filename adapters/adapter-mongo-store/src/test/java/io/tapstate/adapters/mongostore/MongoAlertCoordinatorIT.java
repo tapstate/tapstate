@@ -53,11 +53,23 @@ class MongoAlertCoordinatorIT {
             var binding=new AlertIntent.Member(rule,1,secondIdentity,facts.head.binding().sourceBindingRevision());
             var head=new AlertStateRecord.Head(snapshot,POLICY.deployment(),AlertOwnership.unclaimed(),null,false,episode,binding);
             f.store.commit(new Commit(CommitKind.STATE_AND_PLAN,new StateChange(0,null,head,List.of(),null),List.of(),List.of()));
+            var reads = new HashMap<String, Integer>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("find")) reads.merge(collection, 1, Integer::sum);
+            });
+            try {
+                var page = f.store.evaluationStates(null, 10);
+                assertThat(page.rows()).hasSize(2);
+                assertThat(reads.get(SystemCollections.ALERT_INSTANCES.collectionName())).isEqualTo(1);
+                assertThat(reads.get(SystemCollections.ALERT_EPISODES.collectionName())).isEqualTo(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
             var first=f.store.evaluationStates(null,1);assertThat(first.rows()).hasSize(1);assertThat(first.next()).isNotNull();
             var second=f.store.evaluationStates(first.next(),1);assertThat(second.rows()).hasSize(1);assertThat(second.next()).isNull();
             assertThat(first.rows().getFirst().value().snapshot().rule().key()).isNotEqualTo(second.rows().getFirst().value().snapshot().rule().key());
             assertThat(List.of(first.rows().getFirst().value().snapshot().rule().key(),second.rows().getFirst().value().snapshot().rule().key()))
                     .containsExactlyInAnyOrder(original.key(),key);
+            SystemCollections.ALERT_EPISODES.on(f.db).deleteOne(new Document("_id.alarm", MongoAlertStateCodec.key(key)));
+            assertThatThrownBy(() -> f.store.evaluationStates(null, 10)).isInstanceOf(TapstateException.class);
         });
     }
     @Test void recoveryPageDiscoversOriginalResourceRemovalAndRetirementRechecksIt() {

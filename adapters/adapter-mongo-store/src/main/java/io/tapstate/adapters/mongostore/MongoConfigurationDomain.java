@@ -784,6 +784,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override public String toString() { return "AuthoringModels[original]"; }
     }
 
+    /** A discovery hint must not get ahead of the majority snapshot used for task definitions. */
+    public long validationDiscoveryRevision() {
+        requireOpen();
+        return StoreIo.call(() -> {
+            try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> {
+                    requireOpen();
+                    return ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()));
+                }, TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
+                        .writeConcern(WriteConcern.MAJORITY.withJournal(true)).readPreference(ReadPreference.primary()).build());
+            }
+        });
+    }
+
     public long configurationRevision() {
         requireOpen();
         return StoreIo.call(() -> {
