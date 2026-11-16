@@ -9,6 +9,7 @@ import io.tapstate.spi.store.ConnectionTester;
 import io.tapdata.pdk.apis.entity.TestItem;
 import io.tapdata.pdk.apis.exception.TapTestItemException;
 
+import java.sql.SQLException;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
@@ -24,9 +25,9 @@ import java.util.function.Consumer;
  * closing the connector's isolated class loader.
  *
  * <p>A connector that reports a failed check is a normal result whose overall {@link Outcome} is FAILED,
- * not an exception; a warning check never fails the outcome. Only a failure that prevents the test from
- * running — the connector cannot be loaded / level-gated, or throws out of {@code connectionTest} —
- * surfaces as a coded connector-domain exception. A connector's own per-item diagnostic code is carried
+ * and an explicit driver authentication rejection is normalized to the same failed-check contract.
+ * A warning check never fails the outcome. Other connector execution failures surface as coded errors.
+ * A connector's own per-item diagnostic code is carried
  * through verbatim as an opaque display string, taking no part in the first-party error-code system.
  * The PDK types stay inside this class; the port and the result carry none of them.
  */
@@ -107,8 +108,8 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
 
     /**
      * Drives the connector's own connectionTest under its class loader, collecting each streamed item. A
-     * connector that throws out of connectionTest could not complete the test — a coded connector-domain
-     * failure, distinct from a connector that reports a failed check (which is a normal FAILED result).
+     * connection rejection reported by a driver is a failed check. Other throwables still follow the
+     * existing execution failure path.
      */
     private static void drive(PdkConnector connector, Consumer<TestItem> sink, boolean strict) {
         try {
@@ -123,12 +124,38 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
             throw new TapstateException(ConnectorError.TEST_FAILED,
                     Map.of(CONNECTOR_PARAM, connector.connectorId(), "detail", detail(diagnostic)), diagnostic);
         } catch (Throwable t) {
+            SQLException sql = authenticationRejection(t);
+            if (sql != null) {
+                TapTestItemException diagnostic = new TapTestItemException(sql);
+                diagnostic.setMessage(detail(sql));
+                diagnostic.setErrorCode(sql.getSQLState());
+                sink.accept(new TestItem("Connection", diagnostic, TestItem.RESULT_FAILED));
+                return;
+            }
             if (strict && t instanceof RuntimeException runtime) throw runtime;
             if (strict && t instanceof Error error) throw error;
             if (t instanceof InterruptedException) Thread.currentThread().interrupt();
             throw new TapstateException(ConnectorError.TEST_FAILED,
                     Map.of(CONNECTOR_PARAM, connector.connectorId(), "detail", detail(t)), t);
         }
+    }
+
+    private static SQLException authenticationRejection(Throwable failure) {
+        if (Thread.currentThread().isInterrupted() || failure.getSuppressed().length != 0) {
+            return null;
+        }
+        // The version probe can wrap the connector-local JDBC authentication exception.
+        Throwable candidate = failure.getClass() == RuntimeException.class ? failure.getCause() : failure;
+        if (candidate != null
+                && candidate.getClass().getName().equals("io.tapdata.exception.TapPdkUserPwdInvalidEx")
+                && candidate.getSuppressed().length == 0) {
+            candidate = candidate.getCause();
+        }
+        if (!(candidate instanceof SQLException sql) || sql.getSuppressed().length != 0) {
+            return null;
+        }
+        String state = sql.getSQLState();
+        return "28P01".equals(state) || "28000".equals(state) ? sql : null;
     }
 
     private final class DefaultCall implements DefaultSourcePdkTest.Call {

@@ -72,6 +72,15 @@ public final class MessageCatalog {
         return new Rendered(substitute(entry.message(), args), solution);
     }
 
+    /** Resolves an exact PDK test-item resource key, preserving unknown connector text. */
+    public String renderConnectorTestText(String text) {
+        if (text == null) {
+            return null;
+        }
+        Entry entry = entries.get("pdk.testitem." + text.strip());
+        return entry == null ? text : entry.message();
+    }
+
     /** Replaces each {@code {name}} token with its argument; an unbound name is left verbatim. */
     static String substitute(String template, Map<String, Object> args) {
         StringBuilder sb = new StringBuilder(template.length() + 16);

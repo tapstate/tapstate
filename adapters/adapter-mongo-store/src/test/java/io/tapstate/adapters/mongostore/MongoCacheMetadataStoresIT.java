@@ -105,6 +105,57 @@ class MongoCacheMetadataStoresIT {
             assertThat(SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database).countDocuments()).isEqualTo(1);
         });
     }
+
+    @Test void compatibleReaderPreservesLegacyAndVersionOneDiagnosticsWithoutRewriting() {
+        withFixture(f -> {
+            var results = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            var rows = SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database);
+            long now = System.currentTimeMillis();
+            var diagnostic = new Document("code", "driver.denied")
+                    .append("params", new Document("count", 2))
+                    .append("causes", List.of(new Document("message", "driver response"),
+                            new Document("message", "cleanup result")));
+            var extension = new Document("formatVersion", 1).append("projection", diagnostic);
+            var expected = new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                    "Rejected", null, null, null, diagnostic);
+            var legacyItem = new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                    "Rejected", null, null, null);
+            var legacyReport = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED,
+                    List.of(legacyItem), now, true);
+
+            results.save(legacyReport);
+            assertThat(results.find("source-a")).contains(legacyReport);
+            var ordinary = rows.find(new Document("_id", "source-a")).first();
+            ordinary.getList("items", Document.class).getFirst().put("diagnostic", extension);
+            rows.replaceOne(new Document("_id", "source-a"), ordinary);
+            var reopened = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            assertThat(reopened.find("source-a").orElseThrow().items()).containsExactly(expected);
+            assertThat(rows.find(new Document("_id", "source-a")).first()).isEqualTo(ordinary);
+
+            var attempt = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 1, now, now + 60_000,
+                    io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            reopened.beginDefaultAttempt(attempt);
+            var terminal = attempt.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now + 1, legacyReport);
+            assertThat(reopened.finishDefaultAttempt(terminal, false)).isTrue();
+            var managed = rows.find(new Document("_id", "source-a")).first();
+            assertThat(managed.getInteger("formatVersion")).isEqualTo(2);
+            managed.get("report", Document.class).getList("items", Document.class).getFirst().put("diagnostic", extension);
+            rows.replaceOne(new Document("_id", "source-a"), managed);
+            var recovered = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            var read = recovered.findDefaultAttempt("source-a").orElseThrow();
+            assertThat(read.attemptId()).isEqualTo(attempt.attemptId());
+            assertThat(read.report().items()).containsExactly(expected);
+            assertThat(recovered.find("source-a")).contains(read.report());
+            assertThat(recovered.finishDefaultAttempt(terminal, false)).isFalse();
+            assertThat(rows.find(new Document("_id", "source-a")).first()).isEqualTo(managed);
+
+            extension.put("formatVersion", 2);
+            rows.replaceOne(new Document("_id", "source-a"), managed);
+            assertThatThrownBy(() -> recovered.find("source-a")).isInstanceOfSatisfying(TapstateException.class,
+                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+        });
+    }
     @Test void expiredOrdinaryResultsAndOversizedReportsCannotPublishAsSuccessfulDiagnostics() {
         withFixture(f -> {
             var results = f.domain.connectionTestResults(SCOPE, ACTIVE);
@@ -125,6 +176,44 @@ class MongoCacheMetadataStoresIT {
                     .isInstanceOf(TapstateException.class);
             assertThat(results.find("source-a")).isEmpty();
             assertThat(results.findDefaultAttempt("source-a").orElseThrow().state()).isEqualTo(io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING);
+        });
+    }
+
+    @Test void isolatedExtendedWritesFenceLateOwnersAndKeepTheBoundedReportAcrossReopen() {
+        withFixture(f -> {
+            var normal = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            var writer = new MongoCacheConnectionTestResultStore(new MongoCacheMetadataAccess(f.client, f.database,
+                    SCOPE, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, ACTIVE), true);
+            long now = System.currentTimeMillis();
+            normal.save(result(now - 1));
+            var late = writer.beginOrdinaryTest("source-a");
+            var next = writer.beginOrdinaryTest("source-a");
+            var check = new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED, "Rejected", null, null, null,
+                    Map.of("code", "28P01", "message", "rejected", "stackTrace", "\uD83D\uDD0E".repeat(75_000),
+                            "causes", List.of(Map.of("message", "first"), Map.of("message", "second"))));
+            var report = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(check), now, true);
+            var published = next.publish(report);
+            assertThat(published.items().getFirst().diagnostic()).containsEntry("truncated", true)
+                    .containsEntry("code", "28P01").containsKey("causes").doesNotContainKey("stackTrace");
+            assertThat(late.publish(result(now + 1))).isEqualTo(result(now + 1));
+            assertThat(normal.find("source-a")).contains(published);
+
+            var attempt = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 1, now, now + 60_000,
+                    io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            writer.beginDefaultAttempt(attempt);
+            var terminal = attempt.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now + 1, report);
+            assertThat(writer.publishDefaultReport(terminal, false)).contains(published);
+            assertThat(writer.publishDefaultReport(terminal, false)).isEmpty();
+            assertThat(normal.findDefaultAttempt("source-a").orElseThrow().report()).isEqualTo(published);
+            assertThat(SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database).find().first())
+                    .containsEntry("formatVersion", 2);
+
+            try (var recovery = MongoCacheDomain.connect(f.binding, Duration.ofSeconds(5), "metadata-recovery")) {
+                var recovered = recovery.connectionTestResults(SCOPE, ACTIVE);
+                assertThat(recovered.find("source-a")).contains(published);
+                assertThat(recovered.findDefaultAttempt("source-a").orElseThrow().attemptId()).isEqualTo(attempt.attemptId());
+            }
         });
     }
 

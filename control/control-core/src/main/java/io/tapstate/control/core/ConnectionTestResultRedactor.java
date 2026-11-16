@@ -1,6 +1,7 @@
 package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.logging.MongoUriUserInfo;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.spi.store.ConnectionTestItem;
@@ -11,6 +12,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.UnaryOperator;
 
 /** Removes submitted credentials from connector-controlled connection diagnostics. */
 final class ConnectionTestResultRedactor {
@@ -18,15 +20,17 @@ final class ConnectionTestResultRedactor {
     private ConnectionTestResultRedactor() {
     }
 
-    static ConnectionTestResult redact(ConnectionTestResult result, List<String> secretValues) {
+    static ConnectionTestResult redact(
+            ConnectionTestResult result, List<String> secretValues, UnaryOperator<String> testText) {
         List<ConnectionTestItem> items = result.items().stream()
                 .map(item -> new ConnectionTestItem(
                         redact(item.name(), secretValues),
                         item.status(),
-                        redact(item.message(), secretValues),
-                        redact(item.reason(), secretValues),
-                        redact(item.solution(), secretValues),
-                        redact(item.connectorErrorCode(), secretValues)))
+                        redact(testText.apply(item.message()), secretValues),
+                        redact(testText.apply(item.reason()), secretValues),
+                        redact(testText.apply(item.solution()), secretValues),
+                        redact(item.connectorErrorCode(), secretValues),
+                        DiagnosticProjection.read(redactValue(item.diagnostic(), secretValues))))
                 .toList();
         return new ConnectionTestResult(
                 result.connectionId(), result.connectorId(), result.outcome(), items,
@@ -36,7 +40,7 @@ final class ConnectionTestResultRedactor {
     /** Rechecks credential structures in stored reports and hides text without a safety marker. */
     static ConnectionTestResult hideUntrustedDiagnostics(ConnectionTestResult result) {
         if (result.diagnosticsRedacted()) {
-            return redact(result, List.of());
+            return redact(result, List.of(), UnaryOperator.identity());
         }
         List<ConnectionTestItem> safeItems = new ArrayList<>(result.items().size());
         for (int index = 0; index < result.items().size(); index++) {

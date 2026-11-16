@@ -3685,16 +3685,8 @@ final class Repl {
         if (!present(value)) {
             return null;
         }
-        String trimmed = value.trim();
-        String key = PDK_TEST_ITEM_PREFIX + trimmed;
-        String rendered = MessageCatalog.bundled().render(key, Map.of()).message();
-        // The catalog answers an unknown code with the code itself. The original is returned in that
-        // case rather than the lookup's answer, so a value carrying braces cannot come back mangled.
-        return rendered.equals(key) ? trimmed : rendered;
+        return MessageCatalog.bundled().renderConnectorTestText(value.trim());
     }
-
-    /** The reserved catalog namespace the connector API's test-item keys are given wording under. */
-    private static final String PDK_TEST_ITEM_PREFIX = "pdk.testitem.";
 
     /** The report as an ordered tree for the machine surfaces, omitting the optional check fields left null. */
     private static Map<String, Object> reportMap(ConnectionReport report) {

@@ -648,7 +648,8 @@ class ControlPlaneConfiguration {
                 return observer.begin(config);
             }
         };
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections, guarded);
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                guarded, MessageCatalog.bundled()::renderConnectorTestText);
     }
 
     @Bean
