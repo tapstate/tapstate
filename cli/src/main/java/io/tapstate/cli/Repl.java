@@ -3565,12 +3565,47 @@ final class Repl {
             if (solution != null) {
                 out.println("          " + solution);
             }
+            if (!check.diagnostic().isEmpty()) {
+                renderConnectionDiagnostic(out, check.diagnostic(), "          ");
+            }
         }
         if (changeCaptureUnavailable(report)) {
             out.println();
             out.println("  Change capture will not work on this connection until the "
                     + CHANGE_STREAM_CHECK + " check passes.");
             out.println("  A snapshot will; a pipeline reading changes will start and never see any.");
+        }
+    }
+
+    private static void renderConnectionDiagnostic(PrintWriter out, Map<?, ?> node, String indent) {
+        String code = node.get("code") instanceof String text ? text : "";
+        String message = node.get("message") instanceof String text ? text : "";
+        if (!code.isEmpty() || !message.isEmpty()) {
+            out.println(indent + (code + " " + message).strip());
+        }
+        if (node.get("solution") instanceof String solution) {
+            out.println(indent + solution);
+        }
+        if (node.get("references") instanceof List<?> references) {
+            for (Object value : references) {
+                if (value instanceof Map<?, ?> reference) {
+                    String parent = reference.get("pipelineId") instanceof String id ? id + "/" : "";
+                    out.println(indent + reference.get("type") + ": " + parent + reference.get("id"));
+                }
+            }
+        }
+        if (node.get("cause") instanceof Map<?, ?> cause) {
+            renderConnectionDiagnostic(out, cause, indent + "  ");
+        }
+        if (node.get("causes") instanceof List<?> causes) {
+            for (Object value : causes) {
+                if (value instanceof Map<?, ?> cause) {
+                    renderConnectionDiagnostic(out, cause, indent + "  ");
+                }
+            }
+        }
+        if (Boolean.TRUE.equals(node.get("truncated"))) {
+            out.println(indent + "[Diagnostic truncated]");
         }
     }
 
