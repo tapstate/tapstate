@@ -371,6 +371,33 @@ jobs:
             echo "snapshot: $rows rows in the target"
           fi
 
+      - name: The web UI signs in through the published port
+        # The browser's own sign-in, from the host, through the port the user opens -- not the CLI's
+        # token login, which a server refusing every browser can still answer. 0.8.0 shipped exactly
+        # that: the CLI worked and the web UI refused every sign-in, because through Docker's port
+        # mapping the server saw the bridge gateway rather than a loopback peer. The from-source leg
+        # always holds this; the published leg holds it once the release's compose carries the relay.
+        env:
+          LEG: ${{ matrix.server }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/tapstate-demo"
+          if [ "$LEG" != from-source ] && ! grep -q '^  loopback:' docker-compose.yml; then
+            echo "skipped: the published release's compose predates the loopback relay"
+            exit 0
+          fi
+          body="$(jq -nc --arg u "$TAPSTATE_ADMIN_USER" --arg p "$TAPSTATE_ADMIN_PASSWORD" '{username: $u, password: $p}')"
+          sign_in() {
+            curl -sS -o /dev/null -w '%{http_code}' -c "$RUNNER_TEMP/jar" -X POST http://127.0.0.1:8080/auth/browser/login \
+              -H 'Content-Type: application/json' -H "Origin: $1" -H 'X-Tapstate-Browser-Request: 1' --data-binary @-
+          }
+          code="$(printf '%s' "$body" | sign_in http://127.0.0.1:8080)"
+          [ "$code" = 200 ] || { echo "browser sign-in answered HTTP $code, expected 200" >&2; exit 1; }
+          grep -q 'tapstate-op-session' "$RUNNER_TEMP/jar" || { echo "browser sign-in set no session cookie" >&2; exit 1; }
+          code="$(printf '%s' "$body" | sign_in http://evil.example)"
+          [ "$code" = 401 ] || { echo "a foreign Origin was answered HTTP $code, expected 401" >&2; exit 1; }
+          echo "browser sign-in: 200 with a session cookie; a foreign Origin is still refused"
+
       - name: Change-data-capture carries insert, update and delete
         # The operations the script's closing instructions hand the user, in the same order. Each wait is
         # bounded: an unbounded one would spend the job timeout to say nothing, where a bounded one names

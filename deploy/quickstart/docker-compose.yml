@@ -34,6 +34,9 @@ services:
       # A named volume, so registered connectors and applied artifacts outlive `down`. Only `down -v`
       # discards them, which then costs a full re-registration of every connector jar.
       - tapstate-quickstart-mongo:/data/db
+    # A clean stop, not a kill: Docker's default 10s grace is shorter than a database flushing its
+    # files can need, and a database stopped by SIGKILL comes back through crash recovery.
+    stop_grace_period: 30s
 
   mysql:
     # The demo's source database, seeded and ready so the stack has something real to read. It is a
@@ -68,6 +71,9 @@ services:
       # the demo's rows persist across a restart, the same as the store.
       - tapstate-quickstart-mysql:/var/lib/mysql
       - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    # A clean stop, not a kill: Docker's default 10s grace is shorter than a database flushing its
+    # files can need, and a database stopped by SIGKILL comes back through crash recovery.
+    stop_grace_period: 30s
 
   postgres:
     # The demo's second source database, on a different engine from the first. That is the whole point
@@ -115,6 +121,9 @@ services:
       # means it seeds once and the demo's rows survive a restart.
       - tapstate-quickstart-postgres:/var/lib/postgresql/data
       - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    # A clean stop, not a kill: Docker's default 10s grace is shorter than a database flushing its
+    # files can need, and a database stopped by SIGKILL comes back through crash recovery.
+    stop_grace_period: 30s
 
   server:
     # A demo directory is not a checkout, so this stack pulls a published image and never builds: a
@@ -129,17 +138,43 @@ services:
     environment:
       TAPSTATE_INSTALLATION_DIRECTORY: /var/lib/tapstate/installation
       TAPSTATE_CONNECTORS_SEED_DIR: /var/lib/tapstate/connectors
+      # Browser sign-in over plain http is accepted only from a loopback peer, and only with this set.
+      # The loopback service below is what makes the peer loopback; see it for why.
+      TAPSTATE_BROWSER_AUTH_ALLOW_INSECURE_LOOPBACK: "true"
+      # The session signing key, generated once into .env by the quickstart. Unset, the server makes
+      # up a new key at every start and every browser session ends with each restart.
+      TAPSTATE_CONTROL_AUTH_JWTSECRET: ${TAPSTATE_JWT_SECRET:-}
     volumes:
       - tapstate-quickstart-installation:/var/lib/tapstate
       - ./connectors:/var/lib/tapstate/connectors:ro
-    ports:
-      # Bound to the loopback interface: an unauthenticated first run must not be reachable from
-      # other machines on the network.
-      - "127.0.0.1:8080:8080"
+    # The server runs inside the loopback service's network namespace, which publishes its port; see
+    # that service for why. Joining it (rather than the other way round) is what lets the server
+    # restart without taking the published port with it: a namespace belongs to the container that
+    # created it, and the relay never restarts.
+    network_mode: "service:loopback"
+    # A start can be refused while the previous process's node lease is still live (a container
+    # recreated within about a minute of the last one stopping: boot.node-id-in-use). Retrying lets
+    # the lease expire instead of leaving the server down until someone notices.
+    restart: on-failure
     # The orderly stop closes the cluster member and the store client before halting. Docker's
     # default 10s grace can cut that short and turn a clean exit into a kill, so the window is set
     # wider than the stop has been observed to need.
     stop_grace_period: 30s
+
+  loopback:
+    # Owns the network namespace the server runs in, publishes it, and relays the published port to the
+    # server over that namespace's loopback interface. Browser sign-in over plain http is accepted only
+    # from a loopback peer, and through Docker's port mapping the server would see the bridge gateway
+    # instead, so without this relay the web UI refuses every sign-in while the CLI works. The port is
+    # bound to the host's loopback only, so "local" keeps the meaning it has without Docker: a process
+    # on this machine.
+    image: alpine/socat:1.8.0.0@sha256:a6be4c0262b339c53ddad723cdd178a1a13271e1137c65e27f90a08c16de02b8
+    command: ["TCP-LISTEN:8079,fork,reuseaddr", "TCP:127.0.0.1:8080"]
+    ports:
+      # Bound to the loopback interface: an unauthenticated first run must not be reachable from
+      # other machines on the network.
+      - "127.0.0.1:8080:8079"
+    restart: unless-stopped
 
 volumes:
   tapstate-quickstart-mongo:

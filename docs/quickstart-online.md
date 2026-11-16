@@ -353,8 +353,8 @@ export TAPSTATE_URL=http://127.0.0.1:8080
 
 If 8080 is taken on your machine, move it in one place and use your port above:
 
-- **the compose stack** - the published port in `deploy/quickstart/docker-compose.yml`,
-  the left-hand side of `127.0.0.1:8080:8080`.
+- **the compose stack** - the published port in `deploy/quickstart/docker-compose.yml`, on the
+  `loopback` service: the left-hand side of `127.0.0.1:8080:8079`.
 - **a server you run yourself** - the `SERVER_PORT` environment variable, see
   [Alternative: build and run the server from source](#alternative-build-and-run-the-server-from-source).
 
