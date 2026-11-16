@@ -692,35 +692,49 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             WorkloadClaimFence node,
             ArtifactStore artifacts,
             PipelineResource authored) {
-        var before =
-                source.srs
-                        .chains()
-                        .load(source.prepared.chainId())
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        var retained =
-                source.srs
-                        .consumers()
-                        .progress(source.consumer.context())
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        var consumers = source.srs.consumers();
+        var context = source.consumer.context();
+        boolean admitted = stores.sources().supportsAdmittedCaptureStartup();
+        SrsChainState before;
+        SrsConsumerProgress retained;
+        if (admitted) {
+            var sampled = consumers.startupSnapshot(context, Map.of()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            before = sampled.chain();
+            retained = sampled.progress();
+        } else {
+            before = source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            retained = consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+        }
         requireStartWindow(session, source, pipeline, before, retained);
         ensureSharedTail(session, source, before, retained, node, artifacts, authored);
-        var chain =
-                source.srs
-                        .chains()
-                        .load(source.prepared.chainId())
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
         if (source.freshFull != null) {
-            waiting.remove(source.consumer.context().key());
+            source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            waiting.remove(context.key());
             return Optional.empty();
         }
-        requirePublishedTables(source, chain);
-        // Metadata preflight precedes the asynchronous source-start baseline. Keep this original
-        // live tail.
-        // A later owner still requires the existing checkpoint before it can open another capture
-        // epoch.
-        var progress = stores.sources().supportsAdmittedCaptureStartup()
-                ? stores.sources().withCaptureStartup(stores.scope(), () -> prepareInitialArrivals(session, source, pipeline, chain, true))
-                : prepareInitialArrivals(session, source, pipeline, chain, false);
+
+        var rings = new TreeMap<String, String>();
+        source.selected.tables().forEach(table -> rings.put(table, source.selected.ringName(table)));
+        SrsChainState chain;
+        SrsConsumerProgress progress;
+        if (admitted) {
+            // Tail startup can change the epoch or publish new heads. Sample again after it returns.
+            var sampled = consumers.startupSnapshot(context, rings).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            chain = sampled.chain();
+            requirePublishedTables(source, chain, sampled.published());
+            var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
+            var bounds = chain.pendingFreshFull() == null && !(start instanceof StartFrom.At)
+                    ? Optional.of(sampled.bounds()) : Optional.<Map<String, SrsLogBounds>>empty();
+            progress = stores.sources().withCaptureStartup(stores.scope(),
+                    () -> prepareInitialArrivals(session, source, chain, start, sampled.progress(), bounds, true));
+        } else {
+            chain = source.srs.chains().load(source.prepared.chainId()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            if (chain.epoch() == 0 || !chain.servingTables().containsAll(rings.keySet())) throw awaiting(source);
+            requirePublishedTables(source, chain, source.srs.models().publishedForNewSnapshot(source.prepared.chainId(), rings));
+            var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
+            progress = prepareInitialArrivals(session, source, chain, start,
+                    consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused), Optional.empty(), false);
+        }
         waiting.remove(source.consumer.context().key());
         long originalEpoch =
                 progress.snapshot() != null
@@ -736,24 +750,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         source.prepared.canonicalChainId()));
     }
 
-    private SrsConsumerProgress prepareInitialArrivals(Session session, Source source, PipelineResource pipeline,
-            SrsChainState chain, boolean admitted) {
+    private SrsConsumerProgress prepareInitialArrivals(Session session, Source source, SrsChainState chain,
+            StartFrom start, SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds, boolean admitted) {
         var consumers = source.srs.consumers();
         var context = source.consumer.context();
-        var start = session.snapshot ? StartFrom.latest() : readStart(pipeline);
-        SrsConsumerProgress progress;
-        Optional<Map<String, SrsLogBounds>> bounds = Optional.empty();
-        if (admitted && source.selected.tables().size() > 1 && chain.pendingFreshFull() == null && !(start instanceof StartFrom.At)) {
-            var rings = new LinkedHashMap<String, String>();
-            source.selected.tables().forEach(table -> rings.put(table, source.selected.ringName(table)));
-            requireSession(session);
-            var sampled = consumers.startupArrivals(context, rings).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-            requireSession(session);
-            progress = sampled.progress();
-            bounds = sampled.bounds();
-        } else {
-            progress = consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
-        }
+        requireSession(session);
         var arrivals = initialArrivals(session, source, chain, progress, start, bounds);
         if (arrivals.isEmpty()) return progress;
         long memberRevision = source.consumer.membershipRevision();
@@ -766,15 +767,9 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         return consumers.progress(context).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
     }
 
-    private void requirePublishedTables(Source source, SrsChainState chain) {
-        if (chain.epoch() == 0 || !chain.servingTables().containsAll(source.selected.tables()))
-            throw awaiting(source);
-        var rings = new TreeMap<String, String>();
-        source.selected
-                .tables()
-                .forEach(table -> rings.put(table, source.selected.ringName(table)));
-        var published =
-                source.srs.models().publishedForNewSnapshot(source.prepared.chainId(), rings);
+    private void requirePublishedTables(Source source, SrsChainState chain,
+            Optional<Map<String, SrsModel>> published) {
+        if (chain.epoch() == 0 || !chain.servingTables().containsAll(source.selected.tables())) throw awaiting(source);
         if (published.isEmpty()
                 || published.orElseThrow().values().stream()
                         .anyMatch(model -> model.key().captureEpoch() != chain.epoch()))

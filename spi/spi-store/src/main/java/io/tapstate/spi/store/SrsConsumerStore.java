@@ -76,6 +76,22 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("Capture startup sampling is not supported");
     }
 
+    record StartupSnapshot(SrsChainState chain, SrsConsumerProgress progress,
+            Optional<Map<String, SrsModel>> published, Map<String, SrsLogBounds> bounds) {
+        public StartupSnapshot {
+            published = published.map(Map::copyOf);
+            bounds = Map.copyOf(bounds);
+        }
+    }
+
+    /**
+     * Reads the chain and original consumer in one snapshot. A nonempty selection also reads the
+     * published models and the boundaries of their missing arrivals. This grants no write authority.
+     */
+    default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable) {
+        throw new UnsupportedOperationException("Capture startup sampling is not supported");
+    }
+
     /** The exact progress committed by an admitted startup's conditional write. */
     default Optional<SrsConsumerProgress> startReadingAfterAndGet(SrsConsumerContext context, long membershipRevision,
             long expectedProgressRevision, Map<String, Long> sequences, WorkloadClaimFence fence) {

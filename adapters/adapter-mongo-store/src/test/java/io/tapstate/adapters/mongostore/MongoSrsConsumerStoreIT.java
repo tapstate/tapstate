@@ -35,8 +35,10 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -1452,6 +1454,48 @@ class MongoSrsConsumerStoreIT {
             assertThat(f.consumers().startReadingAfter(A,1,0,arrivals,f.fenceA())).isTrue();
             assertThat(f.consumers().progress(A)).contains(progressed);
             assertThat(cursor(f,B)).isEqualTo(other); assertThat(root(f)).isEqualTo(chain);
+        });
+    }
+
+    @Test void singleTableStartupReadsTheOriginalChainProgressModelAndBoundsInFewerCommands() {
+        withBusiness(f -> {
+            preparedTrimLog(f);
+            var tables = Set.of("orders");
+            var selection = Map.of("orders", ring("orders"));
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1,4), "t4"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(key, 4)));
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+
+            var separate = new ArrayList<String>();
+            var combined = new ArrayList<String>();
+            io.tapstate.spi.store.SrsChainState chain;
+            io.tapstate.spi.store.SrsConsumerProgress progress;
+            Optional<Map<String, SrsModel>> published;
+            io.tapstate.spi.store.SrsConsumerStore.StartupSnapshot sample;
+            var before = controlRows(f);
+            try {
+                MongoCommandObservation.CURRENT.set(separate::add);
+                chain = f.chains().load(CHAIN).orElseThrow();
+                progress = f.consumers().progress(A).orElseThrow();
+                published = models(f).publishedForNewSnapshot(CHAIN, selection);
+                MongoCommandObservation.CURRENT.set(combined::add);
+                sample = f.consumers().startupSnapshot(A, selection).orElseThrow();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+
+            assertThat(sample.chain()).isEqualTo(chain);
+            assertThat(sample.progress()).isEqualTo(progress);
+            assertThat(sample.published()).isEqualTo(published).isPresent();
+            assertThat(sample.bounds()).containsOnlyKeys(ring("orders"));
+            assertThat(sample.bounds().get(ring("orders")).largestSequence()).isEqualTo(4);
+            assertThat(combined.stream().filter("commitTransaction"::equals)).hasSize(1);
+            assertThat(combined).hasSizeLessThan(separate.size());
+            assertThat(controlRows(f)).isEqualTo(before);
         });
     }
 

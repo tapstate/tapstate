@@ -68,21 +68,20 @@ final class HazelcastOperatorReadiness {
                 || !fence.pipelineId().equals(original.pipelineId())
                 || original.bindings().stream().anyMatch(binding -> !fence.scope().equals(binding.placement().scope())
                         || !fence.operatorExecutionKey().equals(binding.executionKey()))) throw fenced();
-        requireActive.run();
         try {
             Snapshot before = snapshot(original.pipelineId());
             if (planned.isEmpty() || Set.copyOf(planned).size() != planned.size() || !before.identities().keySet().equals(Set.copyOf(planned)))
                 throw refused(original.pipelineId(),"cluster","membership-changed");
             long deadline = System.nanoTime()+timeout.toNanos();
+            requireActive.run();
             Map<Member,Future<Result>> answers = member.getExecutorService(EXECUTOR).submitToMembers(
                     new Install(original,captured,before.identities()),before.members().values());
             for (var target : before.members().entrySet()) {
-                requireActive.run(); Result result = answer(original.pipelineId(),target.getKey(),answers.get(target.getValue()),deadline);
+                Result result = answer(original.pipelineId(),target.getKey(),answers.get(target.getValue()),deadline);
                 if (result == null || !before.identities().get(target.getKey()).equals(result.identity()))
                     throw refused(original.pipelineId(),target.getKey(),"identity-changed");
                 if (result.refusalCode() != null) throw refused(original.pipelineId(),target.getKey(),result.refusalCode());
             }
-            requireActive.run();
             if (!before.identities().equals(snapshot(original.pipelineId()).identities()))
                 throw refused(original.pipelineId(),"cluster","membership-changed");
             requireActive.run();

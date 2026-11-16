@@ -89,7 +89,7 @@ class ScopedEngineLifecycleActuatorTest {
             events.add("operators"); prepared.add(original); assertThat(members).containsExactly("node");
             onPrepare.run(); guard.run();
         },original -> { onRelease.run(); released.add(original); },(original,manifest) -> rebuilds.add(original),(original,command) -> new ExecutionPlanRecorder() {
-            @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) {}
+            @Override public void record(io.tapstate.core.lifecycle.ExecutionPlan plan) { events.add("record"); }
             @Override public void forget(String pipeline) { assertThat(pipeline).isEqualTo(original.pipelineId()); forgottenPlans.add(original); }
             @Override public void forget(io.tapstate.core.lifecycle.ExecutionPlan expected) {
                 assertThat(expected.pipelineId()).isEqualTo(original.pipelineId()); forgottenPlans.add(original);
@@ -315,6 +315,33 @@ class ScopedEngineLifecycleActuatorTest {
         verify(ownership).beginExecution(SCOPE,claim(1)); verify(ownership,never()).beginExecution(anyString());
         verify(engine).submitRun(eq("p"),any(),anyMap(),any(),eq(manifest(2)));
     }
+    @Test void aStartDoesNotRepeatRemoteProofsForLocalPreparation() {
+        var actor = actuator();
+        clearInvocations(ownership);
+
+        actor.start("p");
+
+        long proofs = mockingDetails(ownership).getInvocations().stream()
+                .filter(call -> Set.of("proveClaim", "proveStartClaim").contains(call.getMethod().getName()))
+                .count();
+        // This fixture retires an old run, installs operators, starts capture and submits Jet.
+        assertThat(proofs).isLessThanOrEqualTo(13);
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), eq(manifest(2)));
+    }
+
+    @Test void ownershipLostDuringDagBuildCannotPublishOrSubmit() {
+        preparation = new DagSource.StartPreparation(preparation.capacity(), Set.of(), preparation.artifactSnapshot(),
+                () -> new DagSource.PlannedTopology(List.of("node"), fence -> {
+                    held.set(claim(3));
+                    return new DagSource.PlannedDag(new DAG(), ExecutionShape.totalOne(), List.of("node"), Map.of(), Map.of());
+                }), Map.of(), preparation.sourceModels(), preparation.operatorPlan());
+
+        assertThatThrownBy(() -> actuator().start("p")).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+        assertThat(events).doesNotContain("record", "submit");
+        verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
     @Test void aCaptureResultFromAnotherExecutionCannotBuildOrSubmitTheNewRun() {
         when(fixedCapture.captureBindings()).thenReturn(new PipelineCaptureBindings(new ExecutionFence(SCOPE,claim(1)),Map.of(),false));
         assertThatThrownBy(() -> actuator().start("p")).isInstanceOfSatisfying(TapstateException.class,

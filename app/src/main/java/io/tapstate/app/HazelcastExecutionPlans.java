@@ -72,7 +72,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                     map.replace(expected.pipelineId(), prior, new ScopedPlan(original, expected, false));
             }
             @Override public ExecutionPlan last(String pipeline) {
-                active.run(); if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
+                if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
                 Object held = member.<String,Object>getMap(LAST_MAP_NAME).get(pipeline); active.run();
                 if (held == null) return null;
                 if (!(held instanceof ScopedPlan prior) || !sameBusiness(prior.original(), original)) throw ThreeLayerStorePort.refused();
@@ -84,7 +84,7 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
     private void publish(String name, ScopedPlan candidate, Runnable active) {
         var map = member.<String,Object>getMap(name); String pipeline = candidate.original().pipelineId();
         for (int attempt = 0; attempt < 32; attempt++) {
-            active.run(); Object held = map.get(pipeline); active.run();
+            Object held = map.get(pipeline); active.run();
             if (held == null) { if (map.putIfAbsent(pipeline, candidate) == null) return; }
             else {
                 if (!(held instanceof ScopedPlan prior) || !sameBusiness(prior.original(), candidate.original())

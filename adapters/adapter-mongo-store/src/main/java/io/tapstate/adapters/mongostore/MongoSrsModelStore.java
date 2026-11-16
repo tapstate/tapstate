@@ -11,6 +11,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerStore.ReadEvent;
+import io.tapstate.spi.store.SrsCaptureCheckpoint;
 import io.tapstate.spi.store.SrsLogBounds;
 import io.tapstate.spi.store.SrsLogRecord;
 import io.tapstate.spi.store.SrsModel;
@@ -428,9 +429,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     @Override public Optional<Map<String, SrsModel>> publishedForNewSnapshot(String chainId, Map<String, String> tableRings) {
         if (chainId == null || chainId.isBlank()) throw new IllegalArgumentException("blank mining chain");
-        Map<String, String> selected = Map.copyOf(Objects.requireNonNull(tableRings, "tableRings"));
-        if (selected.isEmpty() || selected.entrySet().stream().anyMatch(entry -> entry.getKey().isBlank() || entry.getValue().isBlank())
-                || Set.copyOf(selected.values()).size() != selected.size()) throw new IllegalArgumentException("invalid snapshot table rings");
+        var selected = snapshotRings(tableRings);
         return transaction(session -> {
             requireSnapshotResources(); requireBusiness(session);
             String firstTable = selected.keySet().iterator().next();
@@ -438,41 +437,60 @@ public final class MongoSrsModelStore implements SrsModelStore {
             if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))) {
                 throw unavailable(new SrsModelKey(chainId, firstTable, scope.cacheIncarnation(), 1, 0));
             }
-            var checkpoint = MongoSrsChainStore.decode(chain, scope, contexts).checkpoint();
-            var facts = new MongoSrsReadFacts(session, database, scope, chain, true);
-            prefetchSnapshotHeads(session, chain, selected, facts);
-            var result = new java.util.TreeMap<String, SrsModel>();
-            for (var entry : new java.util.TreeMap<>(selected).entrySet()) {
-                String table = entry.getKey(); String ring = entry.getValue();
-                Document anchor = contexts.head(chain, table);
-                if (anchor == null) {
-                    if (checkpoint != null && checkpoint.tables().containsKey(table)) throw unavailable(checkpoint.tables().get(table).model());
-                    Document identity = new Document("_id.chain", chainId).append("_id.table", table)
-                            .append("_id.captureContext.cacheIncarnation", scope.cacheIncarnation());
-                    if (SystemCollections.SRS_MODELS.on(database).find(session, identity).limit(1).first() != null
-                            || SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, identity).limit(1).first() != null) {
-                        throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
-                    }
-                    if (SystemCollections.SRS_MODELS.on(database).find(session,
-                            new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).limit(1).first() != null
-                            || contexts.firstOnRing(session, ring) != null
-                            || SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first() != null
-                            || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null
-                            || SystemCollections.SRS_CHAINS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
-                                    .append("modelContextHeads.ringName", ring)).limit(1).first() != null) {
-                        throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
-                    }
-                    continue;
-                }
-                var control = contexts.require(session, anchor.get("contextId", Document.class), facts);
-                contexts.requireAnchor(session, chain, control, facts);
-                if (!ring.equals(control.ring()) || control.nextId() != null) throw unavailable(control.key());
-                SrsModel model = requirePublishedHead(session, control, facts);
-                requireSnapshotBounds(session, model, facts);
-                result.put(table, model);
-            }
-            return result.size() == selected.size() ? Optional.of(Map.copyOf(result)) : Optional.empty();
+            return publishedForNewSnapshot(session, chain, selected,
+                    MongoSrsChainStore.decode(chain, scope, contexts).checkpoint(),
+                    new MongoSrsReadFacts(session, database, scope, chain, true));
         });
+    }
+
+    Optional<Map<String, SrsModel>> startupModels(ClientSession session, Document chain, Map<String, String> tableRings,
+            SrsCaptureCheckpoint checkpoint, MongoSrsReadFacts facts) {
+        requireSnapshotResources();
+        return publishedForNewSnapshot(session, chain, snapshotRings(tableRings), checkpoint, facts);
+    }
+
+    private static Map<String, String> snapshotRings(Map<String, String> tableRings) {
+        Map<String, String> selected = Map.copyOf(Objects.requireNonNull(tableRings, "tableRings"));
+        if (selected.isEmpty() || selected.entrySet().stream().anyMatch(entry -> entry.getKey().isBlank() || entry.getValue().isBlank())
+                || Set.copyOf(selected.values()).size() != selected.size()) throw new IllegalArgumentException("invalid snapshot table rings");
+        return selected;
+    }
+
+    private Optional<Map<String, SrsModel>> publishedForNewSnapshot(ClientSession session, Document chain,
+            Map<String, String> selected, SrsCaptureCheckpoint checkpoint, MongoSrsReadFacts facts) {
+        String chainId = chain.getString("_id");
+        prefetchSnapshotHeads(session, chain, selected, facts);
+        var result = new java.util.TreeMap<String, SrsModel>();
+        for (var entry : new java.util.TreeMap<>(selected).entrySet()) {
+            String table = entry.getKey(); String ring = entry.getValue();
+            Document anchor = contexts.head(chain, table);
+            if (anchor == null) {
+                if (checkpoint != null && checkpoint.tables().containsKey(table)) throw unavailable(checkpoint.tables().get(table).model());
+                Document identity = new Document("_id.chain", chainId).append("_id.table", table)
+                        .append("_id.captureContext.cacheIncarnation", scope.cacheIncarnation());
+                if (SystemCollections.SRS_MODELS.on(database).find(session, identity).limit(1).first() != null
+                        || SystemCollections.SRS_MODEL_CONTEXTS.on(database).find(session, identity).limit(1).first() != null) {
+                    throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
+                }
+                if (SystemCollections.SRS_MODELS.on(database).find(session,
+                        new Document("cacheIncarnation", scope.cacheIncarnation()).append("ringName", ring)).limit(1).first() != null
+                        || contexts.firstOnRing(session, ring) != null
+                        || SystemCollections.SRS_LOG_BOUNDS.on(database).find(session, new Document("_id", MongoSrsLogStore.boundsId(ring))).first() != null
+                        || SystemCollections.SRS_EVENTS.on(database).find(session, MongoSrsLogStore.ringRange(ring, Long.MAX_VALUE)).limit(1).first() != null
+                        || SystemCollections.SRS_CHAINS.on(database).find(session, new Document("cacheIncarnation", scope.cacheIncarnation())
+                                .append("modelContextHeads.ringName", ring)).limit(1).first() != null) {
+                    throw unavailable(new SrsModelKey(chainId, table, scope.cacheIncarnation(), 1, 0));
+                }
+                continue;
+            }
+            var control = contexts.require(session, anchor.get("contextId", Document.class), facts);
+            contexts.requireAnchor(session, chain, control, facts);
+            if (!ring.equals(control.ring()) || control.nextId() != null) throw unavailable(control.key());
+            SrsModel model = requirePublishedHead(session, control, facts);
+            requireSnapshotBounds(session, model, facts);
+            result.put(table, model);
+        }
+        return result.size() == selected.size() ? Optional.of(Map.copyOf(result)) : Optional.empty();
     }
 
     private void prefetchSnapshotHeads(ClientSession session, Document chain, Map<String, String> selected, MongoSrsReadFacts facts) {
