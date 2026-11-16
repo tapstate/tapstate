@@ -321,29 +321,34 @@ final class PreviewSelectionPlanner {
             if (embed.on().isEmpty()) {
                 refuse("Nest relation '" + embed.from() + "' has no exact join keys");
             }
-            TupleSet tuples = new TupleSet();
-            for (Map<String, Object> row : parentRows) {
-                Map<String, Object> tuple = new LinkedHashMap<>();
-                boolean usable = true;
-                for (Map.Entry<String, String> pair : embed.on().entrySet()) {
-                    String physicalChild = child.physicalByLogical().get(pair.getKey());
-                    if (parent.physicalByLogical().get(pair.getValue()) == null || physicalChild == null) {
-                        refuse("Nest relation keys must resolve through source fields and direct Map renames");
+            // One read per way of matching the child: each alternative names different child columns, so
+            // their tuples cannot share one exact-tuple request. The preview renders from what all of them read.
+            List<Envelope> childRows = new ArrayList<>();
+            for (Map<String, String> alternative : embed.alternatives()) {
+                TupleSet tuples = new TupleSet();
+                for (Map<String, Object> row : parentRows) {
+                    Map<String, Object> tuple = new LinkedHashMap<>();
+                    boolean usable = true;
+                    for (Map.Entry<String, String> pair : alternative.entrySet()) {
+                        String physicalChild = child.physicalByLogical().get(pair.getKey());
+                        if (parent.physicalByLogical().get(pair.getValue()) == null || physicalChild == null) {
+                            refuse("Nest relation keys must resolve through source fields and direct Map renames");
+                        }
+                        Object value = row.get(pair.getValue());
+                        if (value == null) {
+                            usable = false;
+                            break;
+                        }
+                        tuple.put(physicalChild, value);
                     }
-                    Object value = row.get(pair.getValue());
-                    if (value == null) {
-                        usable = false;
-                        break;
+                    if (usable) {
+                        tuples.add(tuple);
                     }
-                    tuple.put(physicalChild, value);
                 }
-                if (usable) {
-                    tuples.add(tuple);
-                }
+                childRows.addAll(read(child.sourceKey(),
+                        new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
+                        Math.max(1, MAX_INPUT_ROWS - rowsRead), false));
             }
-            List<Envelope> childRows = read(child.sourceKey(),
-                    new BoundedSnapshotQueryRequest.ExactTuples(tuples.values()),
-                    Math.max(1, MAX_INPUT_ROWS - rowsRead), false);
             List<Map<String, Object>> logicalChildren = logicalRows(child, childRows);
             for (Embed nested : embed.embed() == null ? List.<Embed>of() : embed.embed()) {
                 loadEmbed(aliases, nested, child, logicalChildren);
