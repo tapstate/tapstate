@@ -90,6 +90,26 @@ class MongoConnectionDiagnosticTest {
     }
 
     @Test
+    void versionsByRecordedNodeSourcesAndKeepsHistoricalReportsUntouched() {
+        var previous = new Document("formatVersion", 1).append("projection",
+                new Document("code", "10002").append("cause", new Document("code", "28P01")));
+        var historical = Map.<String, Object>of("code", "10002", "cause", Map.of("code", "28P01"));
+        assertThat(MongoConnectionDiagnostic.read(previous)).isEqualTo(historical);
+        assertThat(MongoConnectionDiagnostic.document(historical)).isEqualTo(previous);
+
+        var recorded = Map.<String, Object>of("code", "10002", "cause",
+                Map.of("code", "28P01", "codeSource", "jdbc-sqlstate"));
+        var current = MongoConnectionDiagnostic.document(recorded);
+        assertThat(current.getInteger("formatVersion")).isEqualTo(2);
+        assertThat(MongoConnectionDiagnostic.read(current)).isEqualTo(recorded);
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                MongoConnectionDiagnostic.read(new Document(current).append("formatVersion", 1)));
+        assertThatIllegalArgumentException().isThrownBy(() ->
+                MongoConnectionDiagnostic.read(new Document("formatVersion", 2).append("projection",
+                        new Document("code", "10002").append("codeSource", "not-recorded"))));
+    }
+
+    @Test
     void strictCacheReaderRejectsUnsupportedOrNoncanonicalDiagnosticsAndUnredactedRows() {
         var original = report(item("Login", "Rejected", Map.of("message", "Authentication failed")));
         for (var extension : List.of("not BSON",

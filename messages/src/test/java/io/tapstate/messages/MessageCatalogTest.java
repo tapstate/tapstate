@@ -38,12 +38,15 @@ class MessageCatalogTest {
         var simplified = catalog.snapshot(error, Locale.SIMPLIFIED_CHINESE);
         var traditional = catalog.snapshot(error, Locale.TRADITIONAL_CHINESE);
         for (var report : java.util.List.of(english, simplified, traditional)) {
-            assertThat(report).containsEntry("code", "TS0060001").containsEntry("params", params);
+            assertThat(report).containsEntry("code", "TS0060001")
+                    .containsEntry("codeSource", "tapstate-standard").containsEntry("params", params);
             assertThat((String) report.get("message")).contains("fixture", "driver detail").doesNotContain("{detail}");
         }
         assertThat(simplified.get("message")).isNotEqualTo(english.get("message")).isNotEqualTo(traditional.get("message"));
-        assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH)).isEmpty();
-        assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH))
+                .isEqualTo(Map.of("code", "connector.test-failed", "codeSource", "tapstate-legacy"));
+        assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH))
+                .isEqualTo(Map.of("code", DslError.UNKNOWN_FIELD.code(), "codeSource", "tapstate-legacy"));
     }
 
     @Test

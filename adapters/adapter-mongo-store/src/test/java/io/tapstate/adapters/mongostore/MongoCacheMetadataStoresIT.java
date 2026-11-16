@@ -186,8 +186,10 @@ class MongoCacheMetadataStoresIT {
             var rows = SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database);
             var oldKey = new Document("_id", "old-source");
             var driver = Map.of("code", "28P01", "rawMessage", "password authentication failed");
-            var corrected = Map.<String, Object>of("code", "10002", "cause", driver);
-            var earlier = Map.<String, Object>of("code", "28P01", "cause", corrected);
+            var earlier = Map.<String, Object>of("code", "28P01", "cause",
+                    Map.of("code", "10002", "cause", driver));
+            var corrected = Map.<String, Object>of("code", "10002", "codeSource", "pdk", "cause",
+                    Map.of("code", "28P01", "codeSource", "jdbc-sqlstate", "rawMessage", "password authentication failed"));
             long now = System.currentTimeMillis();
             var oldReport = new ConnectionTestResult("old-source", "postgres", ConnectionTestResult.Outcome.FAILED,
                     List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
@@ -216,12 +218,13 @@ class MongoCacheMetadataStoresIT {
             var late = writer.beginOrdinaryTest("source-a");
             var next = writer.beginOrdinaryTest("source-a");
             var check = new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED, "Rejected", null, null, null,
-                    Map.of("code", "28P01", "message", "rejected", "stackTrace", "\uD83D\uDD0E".repeat(75_000),
+                    Map.of("code", "28P01", "codeSource", "jdbc-sqlstate", "message", "rejected", "stackTrace", "\uD83D\uDD0E".repeat(75_000),
                             "causes", List.of(Map.of("message", "first"), Map.of("message", "second"))));
             var report = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(check), now, true);
             var published = next.publish(report);
             assertThat(published.items().getFirst().diagnostic()).containsEntry("truncated", true)
-                    .containsEntry("code", "28P01").containsKey("causes").doesNotContainKey("stackTrace");
+                    .containsEntry("code", "28P01").containsEntry("codeSource", "jdbc-sqlstate")
+                    .containsKey("causes").doesNotContainKey("stackTrace");
             assertThat(late.publish(result(now + 1))).isEqualTo(result(now + 1));
             assertThat(normal.find("source-a")).contains(published);
 

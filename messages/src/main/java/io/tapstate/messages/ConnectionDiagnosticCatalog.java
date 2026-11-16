@@ -1,5 +1,6 @@
 package io.tapstate.messages;
 
+import io.tapstate.core.common.DiagnosticCodeSource;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.DiagnosticDefinitionLookup;
 import io.tapstate.core.common.TapstateException;
@@ -57,10 +58,12 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     public Map<String, Object> snapshot(TapstateException failure, Locale locale) {
-        return resolve(failure.code().code(), failure.args(), List.of(), locale)
+        String legacy = failure.code().code();
+        return resolve(legacy, failure.args(), List.of(), locale)
                 .<Map<String, Object>>map(rendered -> Map.of("code", rendered.code(), "params", failure.args(),
+                        DiagnosticCodeSource.FIELD, DiagnosticCodeSource.TAPSTATE_STANDARD,
                         MESSAGE, rendered.message(), SOLUTION, rendered.solution()))
-                .orElseGet(Map::of);
+                .orElseGet(() -> Map.of("code", legacy, DiagnosticCodeSource.FIELD, DiagnosticCodeSource.TAPSTATE_LEGACY));
     }
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {

@@ -1,5 +1,6 @@
 package io.tapstate.control.core;
 
+import io.tapstate.core.common.DiagnosticCodeSource;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.logging.MongoUriUserInfo;
@@ -89,7 +90,7 @@ final class ConnectionTestResultRedactor {
             String field = (String) key;
             switch (field) {
                 case "message", "solution" -> safe.put(field, redact(testText.apply((String) value), secrets));
-                case "definitionStatus" -> safe.put(field, value);
+                case "definitionStatus", DiagnosticCodeSource.FIELD -> safe.put(field, value);
                 case "cause" -> safe.put(field, redactDiagnostic((Map<?, ?>) value, secrets, testText));
                 case "causes" -> safe.put(field, ((List<?>) value).stream()
                         .map(child -> redactDiagnostic((Map<?, ?>) child, secrets, testText)).toList());

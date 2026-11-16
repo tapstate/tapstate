@@ -1,5 +1,6 @@
 package io.tapstate.adapters.mongostore;
 
+import io.tapstate.core.common.DiagnosticCodeSource;
 import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.ConnectionTestItem;
@@ -21,7 +22,8 @@ import java.util.function.Predicate;
 
 /** Versioned diagnostic subdocuments inside the existing CACHE result layouts. */
 final class MongoConnectionDiagnostic {
-    private static final int VERSION = 1;
+    private static final int ORIGINAL_VERSION = 1;
+    private static final int CODE_SOURCE_VERSION = 2;
     private static final int MAX_BSON_BYTES = 256 * 1024;
     private static final int MAX_REFERENCES = 128;
     private static final int COMPACT_TEXT_LENGTH = 1024;
@@ -30,7 +32,19 @@ final class MongoConnectionDiagnostic {
     }
 
     static Document document(Map<String, Object> diagnostic) {
-        return new Document("formatVersion", VERSION).append("projection", bsonValue(diagnostic));
+        int version = hasCodeSource(diagnostic) ? CODE_SOURCE_VERSION : ORIGINAL_VERSION;
+        return new Document("formatVersion", version).append("projection", bsonValue(diagnostic));
+    }
+
+    private static boolean hasCodeSource(Map<?, ?> node) {
+        if (node.containsKey(DiagnosticCodeSource.FIELD)) return true;
+        if (node.get("cause") instanceof Map<?, ?> cause) return hasCodeSource(cause);
+        if (node.get("causes") instanceof List<?> causes) {
+            for (Object cause : causes) {
+                if (cause instanceof Map<?, ?> child && hasCodeSource(child)) return true;
+            }
+        }
+        return false;
     }
 
     private static Object bsonValue(Object value) {
@@ -44,7 +58,8 @@ final class MongoConnectionDiagnostic {
     }
 
     static Map<String, Object> read(Object stored) {
-        if (!(stored instanceof Document document) || !Integer.valueOf(VERSION).equals(document.get("formatVersion"))) {
+        if (!(stored instanceof Document document) || !(document.get("formatVersion") instanceof Integer version)
+                || (version != ORIGINAL_VERSION && version != CODE_SOURCE_VERSION)) {
             throw new IllegalArgumentException("unsupported connection diagnostic format");
         }
         Map<String, Object> diagnostic = DiagnosticProjection.read(document.get("projection"));

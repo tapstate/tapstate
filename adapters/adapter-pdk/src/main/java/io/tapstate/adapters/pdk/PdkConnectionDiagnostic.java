@@ -4,7 +4,7 @@ import io.tapdata.exception.TapCodeException;
 import io.tapdata.entity.error.CoreException;
 import io.tapdata.pdk.apis.exception.TapTestItemException;
 import io.tapstate.core.common.DiagnosticProjection;
-import io.tapstate.core.common.DiagnosticDefinitionLookup;
+import io.tapstate.core.common.DiagnosticCodeSource;
 
 import java.sql.SQLException;
 import java.util.ArrayList;
@@ -49,7 +49,7 @@ final class PdkConnectionDiagnostic {
                 put(node, RAW_MESSAGE, failure.getMessage());
                 if (failure instanceof TapCodeException coded) arguments(node, coded.getDynamicDescriptionParameters());
             }
-            if (!(failure instanceof SQLException)) resolveDefinition(node, code, catalog, locale);
+            identifyCode(node, failure, catalog, locale);
             stack(node, failure, reportedStack);
             addCause(node, failure, seen, 1, catalog, locale);
             return DiagnosticProjection.read(node);
@@ -110,25 +110,52 @@ final class PdkConnectionDiagnostic {
             put(child, "code", coded.getCode());
             arguments(child, coded.getDynamicDescriptionParameters());
             if (child.containsKey("code")) child.put(DEFINITION_STATUS, UNVERIFIED);
-            resolveDefinition(child, coded.getCode(), catalog, locale);
         } else if (cause instanceof SQLException sql) {
             put(child, "code", sql.getSQLState());
         } else if (cause instanceof CoreException grouped && grouped.getCode() != 0) {
             put(child, "code", Integer.toString(grouped.getCode()));
             child.put(DEFINITION_STATUS, UNVERIFIED);
         }
+        identifyCode(child, cause, catalog, locale);
         put(child, RAW_MESSAGE, cause.getMessage());
         stack(child, cause, null);
         addCause(child, cause, seen, depth + 1, catalog, locale);
         return child;
     }
 
-    private static void resolveDefinition(Map<String, Object> node, String code, DiagnosticDefinitionLookup catalog, Locale locale) {
+    private static void identifyCode(Map<String, Object> node, Throwable failure,
+            PdkDiagnosticCatalog catalog, Locale locale) {
+        if (!(node.get("code") instanceof String code)) return;
+        if (failure instanceof SQLException) {
+            node.put(DiagnosticCodeSource.FIELD, DiagnosticCodeSource.JDBC_SQLSTATE);
+        } else if (isSharedPdkCode(failure)) {
+            node.put(DiagnosticCodeSource.FIELD, DiagnosticCodeSource.PDK);
+        } else if (failure instanceof TapCodeException || failure instanceof TapTestItemException) {
+            resolveDefinition(node, code, catalog, locale);
+        }
+    }
+
+    private static boolean isSharedPdkCode(Throwable failure) {
+        if (!(failure instanceof TapCodeException)) return false;
+        Class<?> concrete = failure.getClass();
+        if (concrete.getClassLoader() != TapCodeException.class.getClassLoader()) return false;
+        // The runtime PDK exceptions are outside the adapter's compile-time API. A plugin can
+        // subclass the shared base with a code of its own, so require the same defining domain.
+        for (Class<?> type = concrete; type != TapCodeException.class; type = type.getSuperclass()) {
+            if (type.getName().equals("io.tapdata.exception.TapPdkBaseException")) {
+                return concrete.getProtectionDomain() == type.getProtectionDomain();
+            }
+        }
+        return false;
+    }
+
+    private static void resolveDefinition(Map<String, Object> node, String code, PdkDiagnosticCatalog catalog, Locale locale) {
         List<String> args = node.get("arguments") instanceof List<?> values
                 ? values.stream().map(String.class::cast).toList() : List.of();
         var definition = catalog.resolve(code, Map.of(), args, locale).orElse(null);
         if (definition == null || definition.code().length() > TEXT_LIMIT) return;
         node.put("code", definition.code());
+        node.put(DiagnosticCodeSource.FIELD, DiagnosticCodeSource.CONNECTOR);
         node.remove(DEFINITION_STATUS);
         put(node, "message", definition.message());
         put(node, "solution", definition.solution());

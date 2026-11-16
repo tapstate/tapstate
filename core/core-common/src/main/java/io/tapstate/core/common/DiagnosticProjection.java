@@ -52,6 +52,10 @@ public final class DiagnosticProjection {
                 result.put(key, value);
             }
         }
+        Object codeSource = source.get(DiagnosticCodeSource.FIELD);
+        if (result.containsKey("code") && DiagnosticCodeSource.isKnown(codeSource)) {
+            result.put(DiagnosticCodeSource.FIELD, codeSource);
+        }
         if (source.containsKey(TRUNCATED)) {
             if (!Boolean.TRUE.equals(source.get(TRUNCATED))) {
                 return false;
