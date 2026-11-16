@@ -158,10 +158,11 @@ For each input row it keeps:
 - one entry recording which group the row is in;
 - one entry on the group's side holding what the row contributes;
 - one more entry for each field that has to keep its inputs: `min`, `max`, `first`, `last` and
-  `count_distinct`. A retracted maximum cannot be undone from a total.
+  `count_distinct`. A retracted maximum cannot be undone from a total. `count_distinct` keeps one entry
+  for each distinct value in a group, not one for each row, so it costs less when values repeat.
 
-That is **2 + m entries per input row**, where m is the number of such fields, plus one entry per group.
-The example above keeps 4 per row. A row that fails `where:` is in no group but is still remembered, with
+That is **at most 2 + m entries per input row**, where m is the number of such fields, plus one entry per
+group. The example above keeps up to 4 per row. A row that fails `where:` is in no group but is still remembered, with
 one entry, so that the step knows it has seen it.
 
 **The state holds the input's values**: the group names, the summed amounts, the values ordered for
@@ -172,8 +173,9 @@ change that removed it a second time, and is then forgotten.
 
 ### What it costs
 
-- Applying a pipeline states the cost before anything runs: `aggregate.state-estimate` gives the entries
-  per row and the total for the rows the inputs were discovered to hold. When an input reports no row
+- Applying a pipeline states the cost before anything runs: `aggregate.state-estimate` gives the most
+  entries a row can take and the total that makes for the rows the inputs were discovered to hold. It is
+  an upper bound: a step with a `count_distinct` over repeating values stores less. When an input reports no row
   count, `aggregate.state-estimate-unsized` gives the cost per row and no total.
 - `explain <pipeline>` shows the same estimate beside what the running step last counted. It answers
   once the pipeline is running.
@@ -201,6 +203,9 @@ Per step, in the pipeline's status and metrics. Nothing is reported per group.
 The first six are counted by a pass over the step's state and are as of the last pass that finished. A
 pass reads about 4,000 entries a second, so a state of five million entries is counted in about twenty
 minutes, and a pass starts over when the step restarts. Until the first one finishes they are absent.
+A pass is not a snapshot: it counts while the step keeps applying changes, so a pass that ran through a
+full load, or through a large burst, can report sizes far from the state at its end. The pass after the
+state settles is exact.
 Absent means not measured yet, not zero. `aggregateOrderConflicts` is absent until there is one.
 
 Inputs divided by state writes says how many changes one write absorbs. A number of tombstones that only
