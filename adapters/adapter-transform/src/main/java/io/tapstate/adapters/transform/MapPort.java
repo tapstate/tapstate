@@ -6,6 +6,7 @@ import io.tapstate.spi.transform.TransformPort;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -70,7 +71,7 @@ final class MapPort implements TransformPort {
                 // arrives still correct. Dropping a field here is a different thing and deliberately
                 // adds nothing: it means the field is not carried onward, never that a target should
                 // delete what it already holds. Rebuilding two rows is two chances to lose it.
-                .withRemoved(event.removed()));
+                .withRemoved(carriedRemovals(event, marker)));
     }
 
     /**
@@ -90,7 +91,21 @@ final class MapPort implements TransformPort {
         Map<String, Object> was = project(reading, event.before());
         return new Envelope(Op.UPDATE, event.ts(), event.src(),
                 marked(was, marker, false), marked(was, marker, true), event.schema())
-                .withRemoved(event.removed());
+                .withRemoved(carriedRemovals(event, marker));
+    }
+
+    /**
+     * The removals an earlier step declared, less the marker column: this step writes the marker on
+     * every row it emits, so a removal of a column of that name upstream no longer applies to it, and
+     * a target applying removals after the row would otherwise strip the marker it was just given.
+     */
+    private static Set<String> carriedRemovals(Envelope event, String marker) {
+        if (marker == null || !event.removed().contains(marker)) {
+            return event.removed();
+        }
+        Set<String> kept = new LinkedHashSet<>(event.removed());
+        kept.remove(marker);
+        return kept;
     }
 
     /** The row with the marker column set last, or the row itself where there is no marker or no row. */
