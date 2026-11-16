@@ -56,8 +56,8 @@ jobs:
             ${{ runner.temp }}/ci-event-inputs.json
           if-no-files-found: error
           retention-days: 7
-      - name: Prepare the verified Mongo dependency for managed-target examples
-        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --output "$RUNNER_TEMP/managed-mongo"
+      - name: Prepare verified MongoDB and Dummy test inputs
+        run: python3 deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/managed-mongo"
       - uses: actions/upload-artifact@v4
         with:
           name: managed-mongo-test-input
@@ -175,6 +175,11 @@ jobs:
           esac
           if [[ "$SHARD" == e2e-* ]]; then
             export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.e2e.managed-mongo-jar=$RUNNER_TEMP/managed-mongo/mongodb-connector.jar"
+            if jq -e --arg shard "$SHARD" '.shards[] | select(.id == $shard) | any(.tests[]; .class == "io.tapstate.e2e.RealDummyPipelineIT")' "$RUNNER_TEMP/shards.json" >/dev/null; then
+              dummy_jar="$RUNNER_TEMP/managed-mongo/dummy-connector.jar"
+              test -f "$dummy_jar"
+              export MAVEN_ARGS="$MAVEN_ARGS -Dtapstate.dummy.jar=$dummy_jar"
+            fi
           fi
           if [[ "$SHARD" == app-* ]]; then
             test -n "${TAPSTATE_TEST_CLOUD_RELEASE_DIR:-}"

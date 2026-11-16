@@ -1,8 +1,10 @@
 package io.tapstate.app;
 
 import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.ConnectorCatalogView;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
 import io.tapstate.spi.store.RegistrationSource;
@@ -34,7 +36,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 @RequiresDocker
 class CloudConnectorSeedReadinessIT {
     private static final Set<String> IDS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
 
     @Container
     private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
@@ -42,7 +44,7 @@ class CloudConnectorSeedReadinessIT {
     @TempDir Path work;
 
     @Test
-    void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() {
+    void allLockedRealArtifactsRegisterBeforeReadyAndRemainIdempotentAcrossRestart() throws IOException {
         Path seeds = CloudConnectorTestInputs.seedDirectory();
         var storage = database("complete",true);
         var ready = new AtomicInteger();
@@ -55,11 +57,13 @@ class CloudConnectorSeedReadinessIT {
                     .containsExactlyInAnyOrderElementsOf(IDS);
             assertThat(business.getBean(ConnectorCatalogView.class).summaries())
                     .extracting(summary -> summary.id()).containsExactlyInAnyOrderElementsOf(IDS);
+            assertDummyResolves(business, seeds);
             hashes = registry.list().stream().map(registration -> registration.contentHash()).sorted().toList();
         }
         assertNoArtifactCopies(storage);
         try (var restarted = builder(ready).run(arguments(storage, true, seeds))) {
             assertThat(ready.get()).isEqualTo(2);
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
             assertThat(NativeAppStorage.business(restarted).getBean(ConnectorRegistry.class).list().stream()
                     .map(registration -> registration.contentHash()).sorted()).containsExactlyElementsOf(hashes);
         }
@@ -73,6 +77,35 @@ class CloudConnectorSeedReadinessIT {
             assertThat(cache.getCollection("connector_artifacts.files").countDocuments()).isZero();
             assertThat(cache.getCollection("connector_artifacts.chunks").countDocuments()).isZero();
         }
+    }
+
+    @Test
+    void onPremSeedsAndResolvesDummyAcrossRestart() throws IOException {
+        Path seeds = Files.createDirectory(work.resolve("op-seed"));
+        Files.copy(CloudConnectorTestInputs.seedDirectory().resolve("dummy-connector.jar"),
+                seeds.resolve("dummy-connector.jar"));
+        var storage = database("onprem_dummy", false);
+        var ready = new AtomicInteger();
+        try (var first = builder(ready).run(arguments(storage, false, seeds))) {
+            assertThat(ready.get()).isEqualTo(1);
+            assertDummyResolves(NativeAppStorage.business(first), seeds);
+        }
+        try (var restarted = builder(ready).run(arguments(storage, false, seeds))) {
+            assertThat(ready.get()).isEqualTo(2);
+            assertDummyResolves(NativeAppStorage.business(restarted), seeds);
+        }
+    }
+
+    private static void assertDummyResolves(org.springframework.context.ApplicationContext business, Path seeds)
+            throws IOException {
+        var registrations = business.getBean(ConnectorRegistry.class).findAll("dummy");
+        assertThat(registrations).hasSize(1);
+        assertThat(registrations.getFirst().source()).isEqualTo(RegistrationSource.SEED);
+        var ref = business.getBean(ConnectorProvisioner.class).resolve("dummy");
+        assertThat(ref.contentHash()).isEqualTo(registrations.getFirst().contentHash());
+        assertThat(Files.mismatch(ref.classpath().getFirst(), seeds.resolve("dummy-connector.jar"))).isEqualTo(-1);
+        assertThat(business.getBean(CapabilityDeriver.class).derive("dummy").capabilityIds())
+                .contains("batch_read_function", "stream_read_function", "write_record_function");
     }
 
     @Test
