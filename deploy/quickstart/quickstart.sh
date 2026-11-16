@@ -469,33 +469,80 @@ The pulled images remain; remove them with:  docker image rm <image>
 EOF
 }
 
+admin_credentials_given() {
+    [ -n "${TAPSTATE_ADMIN_USER:-}" ] && [ -n "${TAPSTATE_ADMIN_PASSWORD:-}" ]
+}
+
+# Fail before Docker starts anything when there is neither a terminal to ask in nor credentials to use.
+# The questions themselves come later, once the server says whether an administrator already exists.
+require_admin_credentials_source() {
+    admin_credentials_given && return 0
+    # In a subshell: a failed redirection on a special builtin such as `:` ends a non-interactive shell
+    # outright, which would exit before die could say why.
+    ( : 3<>/dev/tty ) 2>/dev/null \
+        || die "enter administrator credentials in a terminal or set TAPSTATE_ADMIN_USER and TAPSTATE_ADMIN_PASSWORD."
+}
+
+# $1 = new       no administrator exists yet: the user chooses the credentials and confirms the password.
+#      existing  an earlier run created one: the user enters its credentials, once.
 read_admin_credentials() {
-    admin_user="${TAPSTATE_ADMIN_USER:-}"
-    admin_pw="${TAPSTATE_ADMIN_PASSWORD:-}"
-    if [ -z "$admin_user" ] || [ -z "$admin_pw" ]; then
-        read_admin_terminal 3<>/dev/tty \
-            || die "enter administrator credentials in a terminal or set TAPSTATE_ADMIN_USER and TAPSTATE_ADMIN_PASSWORD."
+    if admin_credentials_given; then
+        admin_user="$TAPSTATE_ADMIN_USER"
+        admin_pw="$TAPSTATE_ADMIN_PASSWORD"
+        return 0
     fi
-    [ -n "$admin_user" ] && [ -n "$admin_pw" ] || die "the administrator username and password are required."
+    read_admin_terminal "$1" 3<>/dev/tty \
+        || die "enter administrator credentials in a terminal or set TAPSTATE_ADMIN_USER and TAPSTATE_ADMIN_PASSWORD."
+    if [ -z "$admin_user" ] || [ -z "$admin_pw" ]; then
+        die "the administrator username and password are required."
+    fi
 }
 
 read_admin_terminal() {
-    printf 'Administrator username [admin]: ' >&3
+    if [ "$1" = new ]; then
+        printf 'Create the administrator for this demo. Nothing is preset: you choose the credentials,\n' >&3
+        printf 'and you sign in to the web UI with them. A re-run in this directory asks for them again.\n' >&3
+        printf 'Choose a username for the new administrator [admin]: ' >&3
+    else
+        printf 'This demo already has an administrator, created by an earlier run in this directory.\n' >&3
+        printf "Enter the existing administrator's username [admin]: " >&3
+    fi
     IFS= read -r admin_user <&3 || return 1
     admin_user="${admin_user:-admin}"
+    if [ "$1" != new ]; then
+        read_hidden "Password: " || return 1
+        admin_pw="$hidden"
+        return 0
+    fi
+    while :; do
+        read_hidden "Choose a password: " || return 1
+        if [ -z "$hidden" ]; then
+            printf 'The password cannot be empty.\n' >&3
+            continue
+        fi
+        admin_pw="$hidden"
+        read_hidden "Confirm the password: " || return 1
+        [ "$hidden" = "$admin_pw" ] && return 0
+        printf 'The passwords do not match. Try again.\n' >&3
+    done
+}
+
+# Read one line from the terminal on fd 3 without echoing it, into $hidden.
+read_hidden() {
+    hidden=
     tty_settings="$(stty -g <&3)" || return 1
     trap 'stty "$tty_settings" <&3; exit 1' HUP INT TERM
-    password_read=0
+    hidden_read=0
     if stty -echo <&3; then
-        printf 'Administrator password: ' >&3
-        IFS= read -r admin_pw <&3 || password_read=$?
+        printf '%s' "$1" >&3
+        IFS= read -r hidden <&3 || hidden_read=$?
     else
-        password_read=1
+        hidden_read=1
     fi
-    stty "$tty_settings" <&3 || password_read=1
+    stty "$tty_settings" <&3 || hidden_read=1
     trap 'exit 1' HUP INT TERM
     printf '\n' >&3
-    return "$password_read"
+    return "$hidden_read"
 }
 
 await_entry() {
@@ -677,7 +724,7 @@ main() {
     grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml \
         || die "this directory has an older demo Compose file. Run the installer from a new directory."
 
-    read_admin_credentials
+    require_admin_credentials_source
     docker compose run --rm --no-deps -T --entrypoint sh server -ec '
         dir=$TAPSTATE_INSTALLATION_DIRECTORY
         if [ ! -d "$dir" ]; then
@@ -689,6 +736,13 @@ main() {
     poll="${TAPSTATE_QUICKSTART_POLL_SECONDS:-2}"
     printf 'quickstart: waiting for the server\n'
     await_entry SETUP_REQUIRED FIRST_ADMIN_REQUIRED LOGIN
+    # Ask only now: the server's state says whether the user is creating an administrator or entering
+    # the one an earlier run created, and the questions differ.
+    if [ "$entry" = LOGIN ]; then
+        read_admin_credentials existing
+    else
+        read_admin_credentials new
+    fi
     if [ "$entry" != LOGIN ]; then
         management_url="$(docker compose exec -T server sh -ec 'cat "$TAPSTATE_INSTALLATION_DIRECTORY/stage.json"' \
             | jq -er '.managementUrl | select(test("^http://127[.]0[.]0[.]1:[0-9]+$"))')" \
@@ -718,7 +772,7 @@ main() {
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
-            die "the CLI could not log in with those administrator credentials" ;;
+            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: docker compose down -v (in this directory; it deletes the demo's data), then run the installer again." ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the
     # REPL running but makes it exit 1, while older CLIs can still exit zero.
