@@ -65,9 +65,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  snapshot-lock:
+    # Resolve mutable dependencies once, before any independent producer starts.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+          cache: maven
+      - name: Verify exact Java build
+        run: java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Resolve the reactor's snapshot inputs
+        run: |
+          .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
+          mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install
+          python3 .github/scripts/ci-snapshot-lock.py capture "$RUNNER_TEMP/snapshot-m2" "$RUNNER_TEMP/ci-snapshot-lock"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-snapshot-lock
+          overwrite: true
+          path: ${{ runner.temp }}/ci-snapshot-lock/
+          if-no-files-found: error
+          retention-days: 7
+
   test-shards:
     name: test-shards (${{ matrix.shard }})
-    needs: shard-plan
+    needs: [shard-plan, snapshot-lock]
     # Queue each PR's corresponding worker. It stops only its own obsolete work;
     # a delayed old arrival must never cancel a newer head's worker.
     concurrency:
@@ -108,6 +136,14 @@ jobs:
       # install outputs live in its temporary repository and never enter that cache.
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock
+      - name: Restore frozen snapshot inputs
+        run: |
+          python3 .github/scripts/ci-snapshot-lock.py restore "$RUNNER_TEMP/ci-snapshot-lock" "$RUNNER_TEMP/m2"
+          echo 'MAVEN_ARGS=-nsu' >> "$GITHUB_ENV"
       - name: Build the reactor without running tests
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,6 +204,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
+          export MAVEN_ARGS="$MAVEN_ARGS -nsu"
           case "$SHARD" in
             app-1|app-2|rest)
               export MAVEN_ARGS="$MAVEN_ARGS -DforkCount=2"
@@ -327,6 +364,14 @@ jobs:
 
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock
+      - name: Restore frozen snapshot inputs
+        run: |
+          python3 .github/scripts/ci-snapshot-lock.py restore "$RUNNER_TEMP/ci-snapshot-lock" "$RUNNER_TEMP/m2"
+          echo 'MAVEN_ARGS=-nsu' >> "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -722,6 +767,7 @@ jobs:
           bash .github/scripts/ci-aggregate-smoke.sh
           bash .github/scripts/ci-shape-smoke.sh
           bash .github/scripts/ci-maven-cache-smoke.sh
+          python3 .github/scripts/ci-snapshot-lock-smoke.py
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
           python3 .github/scripts/_ci-pr-work-smoke.py
