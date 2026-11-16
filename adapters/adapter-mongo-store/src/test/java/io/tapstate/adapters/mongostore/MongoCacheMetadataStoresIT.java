@@ -217,6 +217,32 @@ class MongoCacheMetadataStoresIT {
         });
     }
 
+    @Test void anExactlyFullLegacyManagedRowCanStillPublishItsOutcomeWithTruncation() {
+        withFixture(f -> {
+            var access = new MongoCacheMetadataAccess(f.client, f.database, SCOPE, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, ACTIVE);
+            var writer = new MongoCacheConnectionTestResultStore(access, true);
+            long now = System.currentTimeMillis();
+            var attempt = new io.tapstate.spi.store.DefaultSourceTestAttempt("source-a", "example", "a".repeat(64), UUID.randomUUID().toString(),
+                    new io.tapstate.spi.store.WorkloadOwner("node", "boot"), 1, now, now + 60_000,
+                    io.tapstate.spi.store.DefaultSourceTestAttempt.State.CHECKING, null, null);
+            var empty = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(
+                    new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED, "", null, null, null)), now, true);
+            var legacyRow = access.stamp(MongoCacheConnectionTestResultStore.document(
+                    attempt.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now + 1, empty)));
+            String exactlyFull = "x".repeat(1024 * 1024 - MongoConnectionDiagnostic.bsonSize(legacyRow));
+            var full = new ConnectionTestResult("source-a", "example", ConnectionTestResult.Outcome.FAILED, List.of(
+                    new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED, exactlyFull, null, null, null,
+                            Map.of("message", "Reason"))), now, true);
+            writer.beginDefaultAttempt(attempt);
+            var report = writer.publishDefaultReport(attempt.finish(
+                    io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED, now + 1, full), false).orElseThrow();
+            assertThat(report.outcome()).isEqualTo(ConnectionTestResult.Outcome.FAILED);
+            assertThat(report.items().getFirst().diagnostic()).containsEntry("truncated", true);
+            assertThat(writer.find("source-a")).contains(report);
+            assertThat(writer.findDefaultAttempt("source-a").orElseThrow().attemptId()).isEqualTo(attempt.attemptId());
+        });
+    }
+
     private static ConnectorCatalogEntry declaredDb2Sink() {
         var base = entry("db2");
         return new ConnectorCatalogEntry(base.id(), base.name(), base.displayName(), base.icon(), base.group(), base.modes(), base.discovery(),

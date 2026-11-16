@@ -1,0 +1,194 @@
+package io.tapstate.adapters.pdk;
+
+import io.tapdata.ErrorCodeEntity;
+import io.tapdata.exception.TapExClass;
+import io.tapdata.exception.TapExCode;
+import io.tapdata.pdk.apis.exception.TapTestItemException;
+import io.tapstate.core.common.JsonWriter;
+import io.tapstate.spi.store.ContentHash;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.io.IOException;
+import java.lang.reflect.Modifier;
+import java.net.URLClassLoader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.jar.JarEntry;
+import java.util.jar.JarOutputStream;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/** Build-time export and admission checks. Runtime resolution uses only the resulting data. */
+class PdkDiagnosticCatalogTest {
+    @TapExClass(code = 43, module = "first", prefix = "example")
+    public static class First {
+        @TapExCode(describe = "The operation was refused.", dynamicDescription = "Ordered {} then {}.")
+        public static final String REFUSED = "043001";
+    }
+
+    @TapExClass(code = 43, module = "second", prefix = "EXAMPLE")
+    public static class Second {
+        @TapExCode(describe = "Another operation was refused.")
+        public static final String REFUSED = "043001";
+    }
+
+    @Test
+    void exportChecksCompleteCodesBeforeSerializationAndPreservesTheOriginalWidth() throws Exception {
+        var catalog = PdkDiagnosticCatalog.read("fixture", export("fixture", List.of(First.class)));
+        assertThat(catalog.definition("043001").code()).isEqualTo("EXAMPLE043001");
+        assertThat(catalog.definition("43001")).isNull();
+        assertThatThrownBy(() -> export("fixture", List.of(First.class, Second.class)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("repeated full code");
+
+        var failure = new TapTestItemException();
+        failure.setDynamicDescriptionParameters(new String[]{"alpha", "beta"});
+        var document = PdkConnectionDiagnostic.capture(failure, "Fallback", null, "043001", catalog, Locale.ENGLISH);
+        assertThat(document).containsEntry("code", "EXAMPLE043001").containsEntry("arguments", List.of("alpha", "beta"))
+                .containsEntry("message", "The operation was refused.\nOrdered alpha then beta.")
+                .doesNotContainKey("definitionStatus");
+    }
+
+    @Test
+    void theCatalogFollowsTheSelectedArtifactAndNeverBorrowsAnotherSourcesEntry(@TempDir Path temp) throws Exception {
+        var one = jar(temp.resolve("one.jar"), export("one", List.of(First.class)));
+        var two = jar(temp.resolve("two.jar"), export("two", List.of(Second.class)));
+        var oneCatalog = PdkDiagnosticCatalog.load("one", one);
+        var twoCatalog = PdkDiagnosticCatalog.load("two", two);
+        assertThat(oneCatalog.definition("EXAMPLE043001").text(Locale.ENGLISH).get("message")).startsWith("The operation");
+        assertThat(twoCatalog.definition("EXAMPLE043001").text(Locale.ENGLISH).get("message")).startsWith("Another");
+        assertThat(PdkDiagnosticCatalog.load("two", one).definition("EXAMPLE043001")).isNull();
+        var unverified = new ConnectorRef(one.classpath(), one.className(), null, null);
+        assertThat(PdkDiagnosticCatalog.load("one", unverified).definition("EXAMPLE043001")).isNull();
+    }
+
+    @Test
+    void rejectsRepeatedKeysAndRepeatedFullCodesInSuppliedCatalogs() {
+        String row = "{\"rawCode\":\"0043\",\"code\":\"EXT0043\",\"en\":{\"message\":\"Reason\"}}";
+        String repeatedCode = "{\"formatVersion\":1,\"connectorId\":\"fixture\",\"definitions\":[" + row + "," + row + "]}";
+        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedCode.getBytes(StandardCharsets.UTF_8)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("repeated full");
+        String repeatedKey = "{\"formatVersion\":2,\"formatVersion\":1,\"connectorId\":\"fixture\",\"definitions\":[]}";
+        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedKey.getBytes(StandardCharsets.UTF_8)))
+                .isInstanceOf(IOException.class);
+    }
+
+    @Test
+    void capturesExplicitCommonCausesAndKeepsSuppressedFailuresOutOfTheirArray() throws Exception {
+        var outer = new TapTestItemException();
+        var group = new io.tapdata.entity.error.CoreException("Common failure");
+        group.coreException(new io.tapdata.entity.error.CoreException("First failure"));
+        group.coreException(new io.tapdata.entity.error.CoreException("Second failure"));
+        group.addSuppressed(new IllegalStateException("Cleanup diagnostic"));
+        outer.initCause(group);
+        var catalog = PdkDiagnosticCatalog.read("fixture", export("fixture", List.of(First.class)));
+        var result = PdkConnectionDiagnostic.capture(outer, "Failed", null, null, catalog, Locale.ENGLISH);
+        var captured = (Map<?, ?>) result.get("cause");
+        assertThat(captured.containsKey("cause")).isFalse();
+        assertThat((String) captured.get("stackTrace")).contains("Cleanup diagnostic");
+        assertThat((List<?>) captured.get("causes")).hasSize(2);
+        assertThat(captured.get("causes").toString()).contains("First failure", "Second failure").doesNotContain("Cleanup diagnostic");
+    }
+
+    @Test
+    void aBrokenSecondaryGetterKeepsThePrimaryDiagnostic() throws Exception {
+        var outer = new TapTestItemException() {
+            @Override
+            public String getStack() {
+                throw new IllegalStateException("secondary getter failure");
+            }
+        };
+        var catalog = PdkDiagnosticCatalog.read("fixture", export("fixture", List.of(First.class)));
+
+        var result = PdkConnectionDiagnostic.capture(outer, "Connection refused", null, "driver-state",
+                catalog, Locale.ENGLISH);
+
+        assertThat(result).containsEntry("code", "driver-state").containsEntry("definitionStatus", "unverified")
+                .containsEntry("message", "Connection refused").doesNotContainKey("stackTrace");
+    }
+
+    @Test
+    void exportFromExplicitArtifactWhenRequested() throws Exception {
+        String artifact = System.getProperty("tapstate.diagnostics.export.artifact");
+        String classes = System.getProperty("tapstate.diagnostics.export.classes");
+        String id = System.getProperty("tapstate.diagnostics.export.connector");
+        String output = System.getProperty("tapstate.diagnostics.export.output");
+        if (artifact == null && classes == null && id == null && output == null) return;
+        assertThat(artifact).isNotBlank();
+        assertThat(classes).isNotBlank();
+        assertThat(id).isNotBlank();
+        assertThat(output).isNotBlank();
+        var source = Path.of(artifact).toRealPath().toUri().toURL();
+        try (var loader = new URLClassLoader(new java.net.URL[]{source}, getClass().getClassLoader())) {
+            List<Class<?>> types = new ArrayList<>();
+            for (String name : classes.split(",")) {
+                Class<?> type = Class.forName(name.trim(), false, loader);
+                assertThat(type.getProtectionDomain().getCodeSource().getLocation()).isEqualTo(source);
+                types.add(type);
+            }
+            byte[] result = export(id, types);
+            PdkDiagnosticCatalog.read(id, result);
+            Files.write(Path.of(output), result);
+        }
+    }
+
+    private static byte[] export(String connector, List<Class<?>> types) throws IllegalAccessException {
+        Map<String, Map<String, Object>> entries = new TreeMap<>();
+        for (var type : types) {
+            if (type.getDeclaredAnnotation(TapExClass.class) == null) {
+                throw new IllegalArgumentException("missing explicit PDK diagnostic module");
+            }
+            for (var field : type.getDeclaredFields()) {
+                var annotation = field.getAnnotation(TapExCode.class);
+                if (annotation == null) continue;
+                if (!Modifier.isStatic(field.getModifiers()) || !Modifier.isFinal(field.getModifiers())
+                        || field.getType() != String.class || !field.trySetAccessible()) {
+                    throw new IllegalArgumentException("PDK diagnostic code must be a static final string");
+                }
+                String raw = (String) field.get(null);
+                String code = ErrorCodeEntity.create().code(raw).sourceExClass(type).fullErrorCode();
+                if (code.isBlank()) throw new IllegalArgumentException("PDK diagnostic code is blank");
+                Map<String, Object> entry = new TreeMap<>();
+                entry.put("rawCode", raw);
+                entry.put("code", code);
+                entry.put("en", language(annotation.describe(), annotation.solution(), annotation.dynamicDescription()));
+                var simplified = language(annotation.describeCN(), annotation.solutionCN(), annotation.dynamicDescriptionCN());
+                if (!simplified.isEmpty()) entry.put("zh-CN", simplified);
+                if (entries.putIfAbsent(code, entry) != null) {
+                    throw new IllegalArgumentException("repeated full code " + code);
+                }
+            }
+        }
+        Map<String, Object> result = new TreeMap<>();
+        result.put("formatVersion", 1);
+        result.put("connectorId", connector);
+        result.put("definitions", List.copyOf(entries.values()));
+        return JsonWriter.write(result).getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static Map<String, String> language(String message, String solution, String dynamic) {
+        Map<String, String> text = new TreeMap<>();
+        if (!message.isBlank()) text.put("message", message);
+        if (!solution.isBlank()) text.put("solution", solution);
+        if (!dynamic.isBlank()) text.put("dynamic", dynamic);
+        return text;
+    }
+
+    private static ConnectorRef jar(Path path, byte[] data) throws Exception {
+        try (var jar = new JarOutputStream(Files.newOutputStream(path))) {
+            jar.putNextEntry(new JarEntry(PdkDiagnosticCatalog.RESOURCE));
+            jar.write(data);
+            jar.closeEntry();
+        }
+        try (var input = Files.newInputStream(path)) {
+            return new ConnectorRef(List.of(path), "fixture.Provider", null, null, null, ContentHash.of(input), false);
+        }
+    }
+}

@@ -1,11 +1,13 @@
 package io.tapstate.messages;
 
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.Severity;
 import io.tapstate.core.dsl.DslError;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
@@ -19,6 +21,39 @@ import static org.assertj.core.api.Assertions.assertThat;
 class MessageCatalogTest {
 
     private static final MessageCatalog EN = MessageCatalog.bundled();
+
+    @Test
+    void connectionDefinitionsRenderThreeLanguagesWithTheSameStableIdentity() {
+        var testFailed = new TapstateErrorCode() {
+            @Override public String code() { return "connector.test-failed"; }
+            @Override public Severity severity() { return Severity.ERROR; }
+            @Override public Set<String> placeholders() { return Set.of("connector", "detail"); }
+        };
+        var catalog = ConnectionDiagnosticCatalog.bundled();
+        var params = Map.<String, Object>of("connector", "fixture", "detail", "driver detail");
+        var error = new TapstateException(testFailed, params, null);
+        var english = catalog.snapshot(error, Locale.ENGLISH);
+        var simplified = catalog.snapshot(error, Locale.SIMPLIFIED_CHINESE);
+        var traditional = catalog.snapshot(error, Locale.TRADITIONAL_CHINESE);
+        for (var report : java.util.List.of(english, simplified, traditional)) {
+            assertThat(report).containsEntry("code", "TS0060001").containsEntry("params", params);
+            assertThat((String) report.get("message")).contains("fixture", "driver detail").doesNotContain("{detail}");
+        }
+        assertThat(simplified.get("message")).isNotEqualTo(english.get("message")).isNotEqualTo(traditional.get("message"));
+        assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH)).isEmpty();
+    }
+
+    @Test
+    void connectionKeysUseExactMembershipAndOneReportLanguage() {
+        String key = "pdk.connection.fail";
+        String english = EN.renderConnectorTestText(key, Locale.ENGLISH);
+        String simplified = EN.renderConnectorTestText(key, Locale.SIMPLIFIED_CHINESE);
+        String traditional = EN.renderConnectorTestText(key, Locale.TRADITIONAL_CHINESE);
+        assertThat(english).isEqualTo("The connection could not be established.");
+        assertThat(simplified).isNotEqualTo(key).isNotEqualTo(english).isNotEqualTo(traditional);
+        assertThat(EN.renderConnectorTestText("10.10.0.5", Locale.TRADITIONAL_CHINESE)).isEqualTo("10.10.0.5");
+    }
 
     @Test
     void rendersNamedPlaceholdersFromTheArgs() {

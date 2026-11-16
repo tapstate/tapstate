@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.UnaryOperator;
+import java.util.function.Function;
 
 /**
  * The control plane's connection-test verb: it drives the target connection through the runtime probe —
@@ -52,6 +53,7 @@ public final class ConnectionTestService {
     private final SourceConnectionResolver sourceConnections;
     private final Observer observer;
     private final UnaryOperator<String> testText;
+    private final Function<TapstateException, Map<String, Object>> describeRefusal;
     private record Flight(ConnectionConfig connection, java.util.concurrent.CompletableFuture<ConnectionTestReport> report) {}
     private Flight defaultFlight;
 
@@ -71,6 +73,13 @@ public final class ConnectionTestService {
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer,
             UnaryOperator<String> testText) {
+        this(probe, resultStore, auditGate, configValidator, sourceConnections, observer, testText, ignored -> Map.of());
+    }
+
+    public ConnectionTestService(
+            ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
+            ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections, Observer observer,
+            UnaryOperator<String> testText, Function<TapstateException, Map<String, Object>> describeRefusal) {
         this.probe = Objects.requireNonNull(probe, "probe");
         this.resultStore = Objects.requireNonNull(resultStore, "resultStore");
         this.auditGate = Objects.requireNonNull(auditGate, "auditGate");
@@ -78,6 +87,7 @@ public final class ConnectionTestService {
         this.sourceConnections = Objects.requireNonNull(sourceConnections, "sourceConnections");
         this.observer = Objects.requireNonNull(observer, "observer");
         this.testText = Objects.requireNonNull(testText, "testText");
+        this.describeRefusal = Objects.requireNonNull(describeRefusal, "describeRefusal");
     }
 
     /**
@@ -130,11 +140,14 @@ public final class ConnectionTestService {
                         var deadline = attempt.deadlineNanos();
                         var publication = deadline.isPresent() ? null : resultStore.beginOrdinaryTest(config.id());
                         ConnectionTestResult result = deadline.isPresent() ? probe.probeDefault(config, deadline.getAsLong()) : probe.probe(config);
-                        ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(result, secretValues, testText);
+                        ConnectionTestResult safeResult = ConnectionTestResultRedactor.redact(
+                                result, secretValues, testText, resolved.sourceId());
                         return ConnectionTestReport.from(attempt.publish(safeResult, publication));
                     });
         } catch (TapstateException failure) {
-            throw ConnectionTestResultRedactor.redact(failure, secretValues);
+            TapstateException safe = ConnectionTestResultRedactor.redact(failure, secretValues);
+            var diagnostic = ConnectionTestResultRedactor.withSource(describeRefusal.apply(safe), resolved.sourceId(), secretValues);
+            throw diagnostic.isEmpty() ? safe : new ConnectionTestRefusal(safe, diagnostic);
         }
     }
 }

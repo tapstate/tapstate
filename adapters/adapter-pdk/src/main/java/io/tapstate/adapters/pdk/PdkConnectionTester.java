@@ -8,13 +8,18 @@ import io.tapstate.spi.store.ConnectionTestResult.Outcome;
 import io.tapstate.spi.store.ConnectionTester;
 import io.tapdata.pdk.apis.entity.TestItem;
 import io.tapdata.pdk.apis.exception.TapTestItemException;
+import io.tapdata.exception.TapCodeException;
 
+import java.net.ConnectException;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
+import javax.net.ssl.SSLException;
 
 /**
  * The PDK implementation of the connection-test port: it provisions a connector, refuses it with a code
@@ -25,7 +30,7 @@ import java.util.function.Consumer;
  * closing the connector's isolated class loader.
  *
  * <p>A connector that reports a failed check is a normal result whose overall {@link Outcome} is FAILED,
- * and an explicit driver authentication rejection is normalized to the same failed-check contract.
+ * and an explicit driver connection rejection is normalized to the same failed-check contract.
  * A warning check never fails the outcome. Other connector execution failures surface as coded errors.
  * A connector's own per-item diagnostic code is carried
  * through verbatim as an opaque display string, taking no part in the first-party error-code system.
@@ -42,6 +47,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     private final java.time.Duration defaultBudget;
     private final boolean ownsSlot;
     private final boolean captureDiagnostics;
+    private final Supplier<Locale> diagnosticLocale;
     private volatile boolean closed;
 
     /** One parent node owns this slot across replacement business contexts. It is not persistent work. */
@@ -63,27 +69,28 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     }
     PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock, java.util.function.Predicate<ConnectionConfig> managed,
             java.time.Duration budget, java.time.Duration cleanupBudget) {
-        this(provisioner, clock, managed, new DefaultSourceSlot(clock, budget, cleanupBudget), true, false);
+        this(provisioner, clock, managed, new DefaultSourceSlot(clock, budget, cleanupBudget), true, false, () -> Locale.ENGLISH);
     }
     public PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
             java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot) {
-        this(provisioner, clock, managed, slot, false, false);
+        this(provisioner, clock, managed, slot, false, false, () -> Locale.ENGLISH);
     }
 
     /** Diagnostic capture for an isolated assembly with a compatible result store. */
     public PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
-            java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, boolean captureDiagnostics) {
-        this(provisioner, clock, managed, slot, false, captureDiagnostics);
+            java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, Supplier<Locale> locale) {
+        this(provisioner, clock, managed, slot, false, true, locale);
     }
 
     private PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
             java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, boolean ownsSlot,
-            boolean captureDiagnostics) {
+            boolean captureDiagnostics, Supplier<Locale> diagnosticLocale) {
         this.provisioner = java.util.Objects.requireNonNull(provisioner);
         this.clock = java.util.Objects.requireNonNull(clock);
         this.managed = java.util.Objects.requireNonNull(managed);
         this.defaults = java.util.Objects.requireNonNull(slot).tests;
         this.defaultBudget = slot.budget; this.ownsSlot = ownsSlot; this.captureDiagnostics = captureDiagnostics;
+        this.diagnosticLocale = java.util.Objects.requireNonNull(diagnosticLocale);
     }
 
     @Override
@@ -93,7 +100,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     @Override public ConnectionTestResult testDefault(ConnectionConfig config, long deadlineNanos) {
         if (closed) throw new TapstateException(ConnectorError.INSTANCES_BUSY, Map.of(CONNECTOR_PARAM, config.connectorId(), TIMEOUT_PARAM, "0s"), null);
         if (!managed.test(config)) return testOrdinary(config);
-        return defaults.test(config, new DefaultCall(config, deadlineNanos), deadlineNanos);
+        return defaults.test(config, new DefaultCall(config, deadlineNanos, diagnosticLocale.get()), deadlineNanos);
     }
     public boolean defaultTestAvailable() { return !closed && defaults.available(); }
     @Override public void close() {
@@ -102,12 +109,12 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     }
 
     private ConnectionTestResult testOrdinary(ConnectionConfig config) {
-        PdkConnector connector = PdkConnector.open(
-                config.connectorId(), provisioner.resolve(config.connectorId()), config.settings());
+        var ref = provisioner.resolve(config.connectorId());
+        PdkConnector connector = PdkConnector.open(config.connectorId(), ref, config.settings());
         try {
             List<TestItem> raw = new ArrayList<>();
             drive(connector, raw::add, false);
-            List<ConnectionTestItem> items = translate(raw, captureDiagnostics);
+            List<ConnectionTestItem> items = translate(raw, diagnostics(config.connectorId(), ref), diagnosticLocale.get());
             Outcome outcome = anyFailed(items) ? Outcome.FAILED : Outcome.PASSED;
             return new ConnectionTestResult(config.id(), config.connectorId(), outcome, items, clock.millis());
         } finally {
@@ -133,12 +140,12 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
             throw new TapstateException(ConnectorError.TEST_FAILED,
                     Map.of(CONNECTOR_PARAM, connector.connectorId(), "detail", detail(diagnostic)), diagnostic);
         } catch (Throwable t) {
-            SQLException sql = authenticationRejection(t);
-            if (sql != null) {
+            ConnectionRejection rejection = connectionRejection(t);
+            if (rejection != null) {
                 TapTestItemException diagnostic = new TapTestItemException();
-                diagnostic.initCause(sql);
-                diagnostic.setMessage(detail(sql));
-                diagnostic.setErrorCode(sql.getSQLState());
+                diagnostic.initCause(rejection.cause());
+                diagnostic.setMessage(detail(rejection.detail()));
+                diagnostic.setErrorCode(rejection.code());
                 sink.accept(new TestItem("Connection", diagnostic, TestItem.RESULT_FAILED));
                 return;
             }
@@ -150,22 +157,32 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         }
     }
 
-    private static SQLException authenticationRejection(Throwable failure) {
+    private record ConnectionRejection(Throwable cause, Throwable detail, String code) {}
+
+    private static ConnectionRejection connectionRejection(Throwable failure) {
         if (Thread.currentThread().isInterrupted() || failure.getSuppressed().length != 0) {
             return null;
         }
-        // The version probe can wrap the connector-local JDBC authentication exception.
+        // The JDBC version probe sometimes adds an untyped RuntimeException around a PDK refusal.
         Throwable candidate = failure.getClass() == RuntimeException.class ? failure.getCause() : failure;
-        if (candidate != null
-                && candidate.getClass().getName().equals("io.tapdata.exception.TapPdkUserPwdInvalidEx")
-                && candidate.getSuppressed().length == 0) {
-            candidate = candidate.getCause();
+        if (candidate == null || candidate.getSuppressed().length != 0) return null;
+        String type = candidate.getClass().getName();
+        boolean authentication = type.equals("io.tapdata.exception.TapPdkUserPwdInvalidEx");
+        boolean retryable = type.equals("io.tapdata.exception.TapPdkRetryableEx");
+        Throwable driver = authentication || retryable ? candidate.getCause() : candidate;
+        if (driver == null || driver.getSuppressed().length != 0) return null;
+        if (driver instanceof SQLException sql) {
+            String state = sql.getSQLState();
+            if ("28P01".equals(state) || "28000".equals(state)
+                    || retryable && ("08001".equals(state) || "08004".equals(state))) {
+                return new ConnectionRejection(candidate, driver, state);
+            }
         }
-        if (!(candidate instanceof SQLException sql) || sql.getSuppressed().length != 0) {
-            return null;
+        if (retryable && (driver instanceof ConnectException || driver instanceof SSLException)) {
+            String code = candidate instanceof TapCodeException coded ? coded.getCode() : null;
+            return new ConnectionRejection(candidate, driver, code);
         }
-        String state = sql.getSQLState();
-        return "28P01".equals(state) || "28000".equals(state) ? sql : null;
+        return null;
     }
 
     private final class DefaultCall implements DefaultSourcePdkTest.Call {
@@ -178,7 +195,10 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         // Publishes the original defect before owned cleanup can block.
         private final java.util.concurrent.atomic.AtomicReference<Throwable> observedFailure = new java.util.concurrent.atomic.AtomicReference<>();
         private final long deadlineNanos;
-        DefaultCall(ConnectionConfig config, long deadlineNanos) { this.config = config; this.deadlineNanos = deadlineNanos; }
+        private final Locale locale;
+        DefaultCall(ConnectionConfig config, long deadlineNanos, Locale locale) {
+            this.config = config; this.deadlineNanos = deadlineNanos; this.locale = locale;
+        }
         @Override public ConnectionTestResult run() {
             ConnectionTestResult result = null;
             Throwable failure = null;
@@ -209,7 +229,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
             var raw = new ArrayList<TestItem>();
             long[] diagnosticCharacters = {0};
             drive(owned, item -> collectDiagnostic(raw, diagnosticCharacters, item), true);
-            var items = translate(raw, captureDiagnostics);
+            var items = translate(raw, diagnostics(config.connectorId(), ref), locale);
             if (items.isEmpty()) throw new IllegalStateException("default Source connector returned no connection checks");
             return new ConnectionTestResult(config.id(), config.connectorId(), anyFailed(items) ? Outcome.FAILED : Outcome.PASSED,
                     items, clock.millis());
@@ -301,10 +321,14 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         return settings;
     }
 
-    private static List<ConnectionTestItem> translate(List<TestItem> raw, boolean captureDiagnostics) {
+    private PdkDiagnosticCatalog diagnostics(String connectorId, ConnectorRef ref) {
+        return captureDiagnostics ? PdkDiagnosticCatalog.load(connectorId, ref) : null;
+    }
+
+    private static List<ConnectionTestItem> translate(List<TestItem> raw, PdkDiagnosticCatalog diagnostics, Locale locale) {
         List<ConnectionTestItem> items = new ArrayList<>(raw.size());
         for (TestItem item : raw) {
-            items.add(translate(item, captureDiagnostics));
+            items.add(translate(item, diagnostics, locale));
         }
         return items;
     }
@@ -314,7 +338,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
      * falling back to its free-text information for the message; the exception's own code is passed
      * through as the opaque connector-error-code display string.
      */
-    private static ConnectionTestItem translate(TestItem item, boolean captureDiagnostics) {
+    private static ConnectionTestItem translate(TestItem item, PdkDiagnosticCatalog diagnostics, Locale locale) {
         TapTestItemException ex = item.getTapTestItemException();
         String message = firstNonBlank(
                 firstNonBlank(ex != null ? ex.getMessage() : null, item.getInformation()),
@@ -325,8 +349,8 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         var status = status(item.getResult());
         return new ConnectionTestItem(item.getItem(), status,
                 message, reason, solution, connectorErrorCode,
-                captureDiagnostics && (ex != null || status != ConnectionTestItem.Status.PASSED)
-                        ? PdkConnectionDiagnostic.capture(ex, message, solution, connectorErrorCode) : Map.of());
+                diagnostics != null && (ex != null || status != ConnectionTestItem.Status.PASSED)
+                        ? PdkConnectionDiagnostic.capture(ex, message, solution, connectorErrorCode, diagnostics, locale) : Map.of());
     }
 
     /**

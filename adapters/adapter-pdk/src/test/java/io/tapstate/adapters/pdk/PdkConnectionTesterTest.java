@@ -93,7 +93,7 @@ class PdkConnectionTesterTest {
         var ref = new ConnectorRef(List.of(Synthetic.failingTest(dir)), "synthetic.FailingTest", "2.0.8", null);
         var clock = Clock.fixed(Instant.ofEpochMilli(FIXED_MILLIS), ZoneOffset.UTC);
         try (var slot = new PdkConnectionTester.DefaultSourceSlot(clock);
-             var tester = new PdkConnectionTester(ignored -> ref, clock, ignored -> false, slot, true)) {
+             var tester = new PdkConnectionTester(ignored -> ref, clock, ignored -> false, slot, () -> java.util.Locale.ENGLISH)) {
             var result = tester.test(config());
             assertThat(result.outcome()).isEqualTo(Outcome.FAILED);
             assertThat(result.items().getFirst().diagnostic()).isEmpty();
@@ -103,12 +103,14 @@ class PdkConnectionTesterTest {
     }
 
     @Test
-    void aNestedDriverCauseSurvivesWhileOversizedSensitiveTextIsOmittedBeforeRedaction() {
+    void aNestedDriverCauseSurvivesWhileOversizedSensitiveTextIsOmittedBeforeRedaction() throws Exception {
         var cause = new java.sql.SQLException("driver rejected the account", "28P01");
         var failure = new io.tapdata.pdk.apis.exception.TapTestItemException();
         failure.initCause(cause);
-        var projection = PdkConnectionDiagnostic.capture(
-                failure, "x".repeat(4090) + "sensitive-value", "Review credentials", "28000");
+        var empty = PdkDiagnosticCatalog.read("demo",
+                "{\"formatVersion\":1,\"connectorId\":\"demo\",\"definitions\":[]}".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        var projection = PdkConnectionDiagnostic.capture(failure, "x".repeat(4090) + "sensitive-value",
+                "Review credentials", "28000", empty, java.util.Locale.ENGLISH);
         assertThat(projection).containsEntry("code", "28000").containsEntry("truncated", true)
                 .doesNotContainKey("message");
         assertThat(projection.get("cause").toString()).contains("28P01", "driver rejected the account");

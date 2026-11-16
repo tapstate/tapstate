@@ -41,6 +41,10 @@ public final class DiagnosticProjection {
             }
             result.put("truncated", true);
         }
+        if (source.containsKey("definitionStatus")) {
+            if (!"unverified".equals(source.get("definitionStatus"))) return Map.of();
+            result.put("definitionStatus", "unverified");
+        }
         if (!copyParameters(source, result) || !copyCauses(source, result, depth)
                 || !copyReferences(source, result)) {
             return Map.of();

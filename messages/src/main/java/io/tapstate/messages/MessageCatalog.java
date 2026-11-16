@@ -1,12 +1,14 @@
 package io.tapstate.messages;
 
 import io.tapstate.core.common.TapstateErrorCode;
+import io.tapstate.core.common.JsonReader;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 
 /**
@@ -27,6 +29,7 @@ import java.util.Map;
  * anything else, since a malformed catalog is a build asset defect, not a user input.
  */
 public final class MessageCatalog {
+    private static final String CONNECTOR_TEST_PREFIX = "pdk.testitem.";
 
     /** A rendered diagnostic: the primary user-facing message and an optional next-step hint. */
     public record Rendered(String message, String solution) {
@@ -77,8 +80,39 @@ public final class MessageCatalog {
         if (text == null) {
             return null;
         }
-        Entry entry = entries.get("pdk.testitem." + text.strip());
+        Entry entry = entries.get(CONNECTOR_TEST_PREFIX + text.strip());
         return entry == null ? text : entry.message();
+    }
+
+    /** Resolves the exact connector test key in the report's generation language. */
+    public String renderConnectorTestText(String text, Locale locale) {
+        if (text == null) return null;
+        String language = ConnectionDiagnosticCatalog.language(locale);
+        if (language.equals("en")) return renderConnectorTestText(text);
+        var localized = LocalizedConnectorTestText.ENTRIES.get(language);
+        return localized.getOrDefault(CONNECTOR_TEST_PREFIX + text.strip(), text);
+    }
+
+    private static final class LocalizedConnectorTestText {
+        static final Map<String, Map<String, String>> ENTRIES = Map.of(
+                "zh-CN", translations("zh-CN"), "zh-TW", translations("zh-TW"));
+
+        private static Map<String, String> translations(String locale) {
+            var expected = bundled().entries.keySet().stream().filter(key -> key.startsWith(CONNECTOR_TEST_PREFIX))
+                    .collect(java.util.stream.Collectors.toSet());
+            Object parsed = JsonReader.parse(read("/messages/pdk-testitem-" + locale + ".json"));
+            if (!(parsed instanceof Map<?, ?> values) || !values.keySet().equals(expected)) {
+                throw new IllegalStateException("incomplete connector test text for " + locale);
+            }
+            Map<String, String> localized = new LinkedHashMap<>();
+            values.forEach((key, value) -> {
+                if (!(value instanceof String text) || text.isBlank()) {
+                    throw new IllegalStateException("invalid connector test text for " + locale + "/" + key);
+                }
+                localized.put((String) key, text);
+            });
+            return Map.copyOf(localized);
+        }
     }
 
     /** Replaces each {@code {name}} token with its argument; an unbound name is left verbatim. */
@@ -171,7 +205,7 @@ public final class MessageCatalog {
         return sb.toString();
     }
 
-    private static String read(String resource) {
+    static String read(String resource) {
         try (InputStream in = MessageCatalog.class.getResourceAsStream(resource)) {
             if (in == null) {
                 throw new IllegalStateException("bundled message catalog not found on the classpath: " + resource);

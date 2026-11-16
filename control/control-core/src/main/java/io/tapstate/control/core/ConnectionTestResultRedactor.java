@@ -22,6 +22,11 @@ final class ConnectionTestResultRedactor {
 
     static ConnectionTestResult redact(
             ConnectionTestResult result, List<String> secretValues, UnaryOperator<String> testText) {
+        return redact(result, secretValues, testText, null);
+    }
+
+    static ConnectionTestResult redact(
+            ConnectionTestResult result, List<String> secretValues, UnaryOperator<String> testText, String sourceId) {
         List<ConnectionTestItem> items = result.items().stream()
                 .map(item -> new ConnectionTestItem(
                         redact(item.name(), secretValues),
@@ -30,11 +35,23 @@ final class ConnectionTestResultRedactor {
                         redact(testText.apply(item.reason()), secretValues),
                         redact(testText.apply(item.solution()), secretValues),
                         redact(item.connectorErrorCode(), secretValues),
-                        DiagnosticProjection.read(redactDiagnostic(item.diagnostic(), secretValues, testText))))
+                        DiagnosticProjection.read(withSource(
+                                redactDiagnostic(item.diagnostic(), secretValues, testText), sourceId, secretValues))))
                 .toList();
         return new ConnectionTestResult(
                 result.connectionId(), result.connectorId(), result.outcome(), items,
                 result.testedAt(), true);
+    }
+
+    static Map<String, Object> withSource(Map<String, Object> diagnostic, String id, List<String> secrets) {
+        if (diagnostic.isEmpty() || id == null || !id.equals(redact(id, secrets))) return diagnostic;
+        Map<String, Object> enriched = new LinkedHashMap<>(diagnostic);
+        List<Object> references = new ArrayList<>();
+        if (diagnostic.get("references") instanceof List<?> existing) references.addAll(existing);
+        var reference = Map.of("type", "connection", "id", id);
+        if (!references.contains(reference)) references.add(reference);
+        enriched.put("references", List.copyOf(references));
+        return enriched;
     }
 
     /** Rechecks credential structures in stored reports and hides text without a safety marker. */
@@ -70,6 +87,7 @@ final class ConnectionTestResultRedactor {
             String field = (String) key;
             switch (field) {
                 case "message", "solution" -> safe.put(field, redact(testText.apply((String) value), secrets));
+                case "definitionStatus" -> safe.put(field, value);
                 case "cause" -> safe.put(field, redactDiagnostic((Map<?, ?>) value, secrets, testText));
                 case "causes" -> safe.put(field, ((List<?>) value).stream()
                         .map(child -> redactDiagnostic((Map<?, ?>) child, secrets, testText)).toList());
