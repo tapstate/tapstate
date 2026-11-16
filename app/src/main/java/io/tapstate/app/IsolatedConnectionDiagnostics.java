@@ -15,5 +15,5 @@ public record IsolatedConnectionDiagnostics(String clusterId, String cacheDataba
         return clusterId.equals(binding.setup().clusterId()) && cacheDatabase.equals(binding.cache().database());
     }
 
-    record Active() {}
+    enum Active { INSTANCE }
 }

@@ -73,11 +73,69 @@ class PdkDiagnosticCatalogTest {
     void rejectsRepeatedKeysAndRepeatedFullCodesInSuppliedCatalogs() {
         String row = "{\"rawCode\":\"0043\",\"code\":\"EXT0043\",\"en\":{\"message\":\"Reason\"}}";
         String repeatedCode = "{\"formatVersion\":1,\"connectorId\":\"fixture\",\"definitions\":[" + row + "," + row + "]}";
-        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedCode.getBytes(StandardCharsets.UTF_8)))
+        byte[] repeatedCodeBytes = repeatedCode.getBytes(StandardCharsets.UTF_8);
+        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedCodeBytes))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("repeated full");
         String repeatedKey = "{\"formatVersion\":2,\"formatVersion\":1,\"connectorId\":\"fixture\",\"definitions\":[]}";
-        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedKey.getBytes(StandardCharsets.UTF_8)))
+        byte[] repeatedKeyBytes = repeatedKey.getBytes(StandardCharsets.UTF_8);
+        assertThatThrownBy(() -> PdkDiagnosticCatalog.read("fixture", repeatedKeyBytes))
                 .isInstanceOf(IOException.class);
+    }
+
+    @Test
+    void capsExpansionWithoutRejectingACompressibleCatalog(@TempDir Path temp) throws Exception {
+        String resource = """
+                {"formatVersion":1,"connectorId":"fixture","definitions":[
+                  {"rawCode":"043","code":"EXT043","en":{"message":"Reason"}}
+                ]}
+                """;
+        var bounded = jar(temp.resolve("bounded.jar"), (resource + " ".repeat(128 * 1024)).getBytes(StandardCharsets.UTF_8));
+        var oversized = jar(temp.resolve("oversized.jar"), (resource + " ".repeat(256 * 1024)).getBytes(StandardCharsets.UTF_8));
+
+        assertThat(PdkDiagnosticCatalog.load("fixture", bounded).definition("043")).isNotNull();
+        assertThat(PdkDiagnosticCatalog.load("fixture", oversized).definition("043")).isNull();
+    }
+
+    @Test
+    void resolvesArgumentsAndFallsBackThroughAvailableLocaleMaps() throws Exception {
+        byte[] resource = """
+                {"formatVersion":1,"connectorId":"fixture","definitions":[
+                  {"rawCode":"043","code":"EXT043","en":{"message":"Login failed","dynamic":"Account {} on {}"},
+                   "zh-CN":{"message":"Simplified"},"zh-TW":{}},
+                  {"rawCode":"044","code":"EXT044","en":{"dynamic":"Account {}"}},
+                  {"rawCode":"045","code":"EXT045","en":{"message":"English"},"zh-TW":{"message":"Traditional"}}
+                ]}
+                """.getBytes(StandardCharsets.UTF_8);
+        var catalog = PdkDiagnosticCatalog.read("fixture", resource);
+
+        assertThat(catalog.resolve("043", Map.of(), List.of("user", "server"), Locale.ENGLISH).orElseThrow().message())
+                .isEqualTo("Login failed\nAccount user on server");
+        assertThat(catalog.resolve("EXT043", Map.of(), List.of("user"), Locale.ENGLISH).orElseThrow().message())
+                .isEqualTo("Login failed");
+        assertThat(catalog.resolve("043", Map.of(), List.of("user", "server", "extra"), Locale.ENGLISH).orElseThrow().message())
+                .isEqualTo("Login failed");
+        assertThat(catalog.resolve("043", Map.of("account", "user"), List.of(), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.resolve("043", Map.of(), List.of(), Locale.TAIWAN).orElseThrow().message()).isEqualTo("Simplified");
+        assertThat(catalog.resolve("044", Map.of(), List.of("user"), Locale.CHINA).orElseThrow().message()).isEqualTo("Account user");
+        assertThat(catalog.resolve("045", Map.of(), List.of(), Locale.forLanguageTag("zh-Hant")).orElseThrow().message())
+                .isEqualTo("Traditional");
+    }
+
+    @Test
+    void anAmbiguousRawCodeDoesNotBorrowAnotherDefinition() throws Exception {
+        byte[] resource = """
+                {"formatVersion":1,"connectorId":"fixture","definitions":[
+                  {"rawCode":"043","code":"EXT043","en":{"message":"First"}},
+                  {"rawCode":"043","code":"OTHER043","en":{"message":"Second"}},
+                  {"rawCode":"EXT043","code":"OUTEREXT043","en":{"message":"Third"}}
+                ]}
+                """.getBytes(StandardCharsets.UTF_8);
+        var catalog = PdkDiagnosticCatalog.read("fixture", resource);
+
+        assertThat(catalog.definition("043")).isNull();
+        assertThat(catalog.definition("EXT043")).isNull();
+        assertThat(catalog.definition("OTHER043").text(Locale.ENGLISH)).containsEntry("message", "Second");
+        assertThat(catalog.definition("OUTEREXT043").text(Locale.ENGLISH)).containsEntry("message", "Third");
     }
 
     @Test

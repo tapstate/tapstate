@@ -72,7 +72,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var resultStore = diagnosticCandidate == null ? port.connectionTestResults()
                 : isolatedConnectionTestResults(diagnosticCandidate);
         if (diagnosticCandidate != null) {
-            beans.registerSingleton("activeConnectionDiagnostics", new IsolatedConnectionDiagnostics.Active());
+            beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
         }
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
             original.requireBusiness();

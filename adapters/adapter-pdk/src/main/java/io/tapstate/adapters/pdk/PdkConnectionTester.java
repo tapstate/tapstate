@@ -160,21 +160,20 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     private record ConnectionRejection(Throwable cause, Throwable detail, String code) {}
 
     private static ConnectionRejection connectionRejection(Throwable failure) {
-        if (Thread.currentThread().isInterrupted() || failure.getSuppressed().length != 0) {
+        if (Thread.currentThread().isInterrupted() || !hasNoSuppressed(failure)) {
             return null;
         }
         // The JDBC version probe sometimes adds an untyped RuntimeException around a PDK refusal.
         Throwable candidate = failure.getClass() == RuntimeException.class ? failure.getCause() : failure;
-        if (candidate == null || candidate.getSuppressed().length != 0) return null;
+        if (!hasNoSuppressed(candidate)) return null;
         String type = candidate.getClass().getName();
         boolean authentication = type.equals("io.tapdata.exception.TapPdkUserPwdInvalidEx");
         boolean retryable = type.equals("io.tapdata.exception.TapPdkRetryableEx");
         Throwable driver = authentication || retryable ? candidate.getCause() : candidate;
-        if (driver == null || driver.getSuppressed().length != 0) return null;
+        if (!hasNoSuppressed(driver)) return null;
         if (driver instanceof SQLException sql) {
             String state = sql.getSQLState();
-            if ("28P01".equals(state) || "28000".equals(state)
-                    || retryable && ("08001".equals(state) || "08004".equals(state))) {
+            if (isSqlConnectionRejection(state, retryable)) {
                 return new ConnectionRejection(candidate, driver, state);
             }
         }
@@ -183,6 +182,15 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
             return new ConnectionRejection(candidate, driver, code);
         }
         return null;
+    }
+
+    private static boolean hasNoSuppressed(Throwable failure) {
+        return failure != null && failure.getSuppressed().length == 0;
+    }
+
+    private static boolean isSqlConnectionRejection(String state, boolean retryable) {
+        return "28P01".equals(state) || "28000".equals(state)
+                || retryable && ("08001".equals(state) || "08004".equals(state));
     }
 
     private final class DefaultCall implements DefaultSourcePdkTest.Call {

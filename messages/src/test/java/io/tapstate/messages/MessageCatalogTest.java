@@ -7,11 +7,13 @@ import io.tapstate.core.dsl.DslError;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The error-code message catalog: the presentation-layer renderer that turns a coded exception into
@@ -42,6 +44,36 @@ class MessageCatalogTest {
         assertThat(simplified.get("message")).isNotEqualTo(english.get("message")).isNotEqualTo(traditional.get("message"));
         assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH)).isEmpty();
         assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH)).isEmpty();
+    }
+
+    @Test
+    void connectionCatalogRejectsIncompleteEntriesAndMismatchedPlaceholders() {
+        assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path -> "{}"))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("incomplete");
+        assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path ->
+                """
+                {"TS0060001":{"message":" ","solution":"Check {connector} because {detail}."}}
+                """))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("invalid language entry");
+        assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path ->
+                """
+                {"TS0060001":{"message":"Cannot test {connector}.","solution":"Check {extra}."}}
+                """))
+                .isInstanceOf(IllegalStateException.class).hasMessageContaining("incorrect diagnostic parameters");
+    }
+
+    @Test
+    void connectionCatalogPreservesExplicitLocaleAndParameterContracts() {
+        String code = "connector.test-failed";
+        var catalog = ConnectionDiagnosticCatalog.bundled();
+        var arguments = Map.<String, Object>of("connector", "orders", "detail", "Refused");
+        var traditional = catalog.resolve(code, arguments, List.of(), Locale.TRADITIONAL_CHINESE).orElseThrow();
+        assertThat(catalog.resolve(code, arguments, List.of(), Locale.forLanguageTag("zh-Hant")).orElseThrow())
+                .isEqualTo(traditional);
+        assertThat(catalog.resolve(code, arguments, List.of(), Locale.forLanguageTag("zh-HK")).orElseThrow())
+                .isEqualTo(traditional);
+        assertThat(catalog.resolve(code, arguments, List.of("position"), Locale.ENGLISH)).isEmpty();
+        assertThat(EN.renderConnectorTestText(null, Locale.SIMPLIFIED_CHINESE)).isNull();
     }
 
     @Test

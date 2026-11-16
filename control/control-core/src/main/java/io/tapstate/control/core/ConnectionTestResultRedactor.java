@@ -17,6 +17,8 @@ import java.util.function.UnaryOperator;
 /** Removes submitted credentials from connector-controlled connection diagnostics. */
 final class ConnectionTestResultRedactor {
 
+    private static final String REFERENCES = "references";
+
     private ConnectionTestResultRedactor() {
     }
 
@@ -47,10 +49,10 @@ final class ConnectionTestResultRedactor {
         if (diagnostic.isEmpty() || id == null || !id.equals(redact(id, secrets))) return diagnostic;
         Map<String, Object> enriched = new LinkedHashMap<>(diagnostic);
         List<Object> references = new ArrayList<>();
-        if (diagnostic.get("references") instanceof List<?> existing) references.addAll(existing);
+        if (diagnostic.get(REFERENCES) instanceof List<?> existing) references.addAll(existing);
         var reference = Map.of("type", "connection", "id", id);
         if (!references.contains(reference)) references.add(reference);
-        enriched.put("references", List.copyOf(references));
+        enriched.put(REFERENCES, List.copyOf(references));
         return enriched;
     }
 
@@ -91,7 +93,7 @@ final class ConnectionTestResultRedactor {
                 case "cause" -> safe.put(field, redactDiagnostic((Map<?, ?>) value, secrets, testText));
                 case "causes" -> safe.put(field, ((List<?>) value).stream()
                         .map(child -> redactDiagnostic((Map<?, ?>) child, secrets, testText)).toList());
-                case "references" -> {
+                case REFERENCES -> {
                     var authorized = ((List<?>) value).stream()
                             .filter(reference -> reference.equals(redactValue(reference, secrets))).toList();
                     if (!authorized.isEmpty()) safe.put(field, authorized);

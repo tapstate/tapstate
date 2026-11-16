@@ -103,6 +103,92 @@ class PdkConnectionTesterTest {
     }
 
     @Test
+    void thrownAuthenticationAndRetryableConnectionRefusalsBecomeFailedChecks(@TempDir Path dir) {
+        var jar = rejectionFixture(dir);
+        var ref = new ConnectorRef(List.of(jar), "synthetic.ConnectionRefusal", "2.0.8", null);
+        var clock = Clock.fixed(Instant.ofEpochMilli(FIXED_MILLIS), ZoneOffset.UTC);
+        try (var slot = new PdkConnectionTester.DefaultSourceSlot(clock);
+             var tester = new PdkConnectionTester(ignored -> ref, clock, ignored -> false, slot, () -> java.util.Locale.ENGLISH)) {
+            assertRefusal(tester, "28P01", "28P01");
+            assertRefusal(tester, "28000", "28000");
+            assertRefusal(tester, "08001", "08001");
+            assertRefusal(tester, "08004", "08004");
+            assertRefusal(tester, "network", "10012");
+            assertRefusal(tester, "tls", "10012");
+
+            assertUnexpectedFailure(tester, "08006");
+            assertUnexpectedFailure(tester, "suppressed");
+            assertUnexpectedFailure(tester, "untyped");
+            assertUnexpectedFailure(tester, "missing-driver");
+        }
+    }
+
+    private static void assertRefusal(ConnectionTester tester, String scenario, String code) {
+        var result = tester.test(new ConnectionConfig("conn-1", "demo", Map.of("scenario", scenario)));
+        assertThat(result.outcome()).as(scenario).isEqualTo(Outcome.FAILED);
+        assertThat(result.items()).singleElement().satisfies(item -> {
+            assertThat(item.status()).isEqualTo(Status.FAILED);
+            assertThat(item.connectorErrorCode()).isEqualTo(code);
+            assertThat(item.diagnostic()).containsEntry("message", "driver refusal");
+        });
+    }
+
+    private static void assertUnexpectedFailure(ConnectionTester tester, String scenario) {
+        var config = new ConnectionConfig("conn-1", "demo", Map.of("scenario", scenario));
+        assertThatThrownBy(() -> tester.test(config)).as(scenario).isInstanceOfSatisfying(TapstateException.class,
+                exception -> assertThat(exception.code()).isEqualTo(ConnectorError.TEST_FAILED));
+    }
+
+    private static Path rejectionFixture(Path dir) {
+        return SyntheticJar.compileToJar(dir, "synthetic.ConnectionRefusal", """
+                package synthetic;
+
+                import io.tapdata.entity.codec.TapCodecsRegistry;
+                import io.tapdata.entity.schema.TapTable;
+                import io.tapdata.exception.TapPdkRetryableEx;
+                import io.tapdata.exception.TapPdkUserPwdInvalidEx;
+                import io.tapdata.pdk.apis.TapConnector;
+                import io.tapdata.pdk.apis.context.TapConnectionContext;
+                import io.tapdata.pdk.apis.entity.ConnectionOptions;
+                import io.tapdata.pdk.apis.entity.TestItem;
+                import io.tapdata.pdk.apis.functions.ConnectorFunctions;
+                import java.net.ConnectException;
+                import java.sql.SQLException;
+                import java.util.List;
+                import java.util.function.Consumer;
+                import javax.net.ssl.SSLException;
+
+                public class ConnectionRefusal implements TapConnector {
+                    public void registerCapabilities(ConnectorFunctions functions, TapCodecsRegistry codecs) {}
+                    public void init(TapConnectionContext context) {}
+                    public void stop(TapConnectionContext context) {}
+                    public void discoverSchema(TapConnectionContext c, List<String> tables, int size, Consumer<List<TapTable>> sink) {}
+                    public int tableCount(TapConnectionContext context) { return 0; }
+
+                    public ConnectionOptions connectionTest(TapConnectionContext ctx, Consumer<TestItem> sink) {
+                        String scenario = (String) ctx.getConnectionConfig().get("scenario");
+                        String driverMessage = "driver refusal";
+                        throw switch (scenario) {
+                            case "28P01" -> new RuntimeException(new TapPdkUserPwdInvalidEx("4000", "authentication",
+                                    new SQLException(driverMessage, scenario)));
+                            case "08001", "08004" -> new TapPdkRetryableEx("4001", new SQLException(driverMessage, scenario));
+                            case "network" -> new TapPdkRetryableEx("4001", new ConnectException(driverMessage));
+                            case "tls" -> new TapPdkRetryableEx("4001", new SSLException(driverMessage));
+                            case "suppressed" -> {
+                                var driver = new SQLException(driverMessage, "28P01");
+                                driver.addSuppressed(new IllegalStateException("cleanup failed"));
+                                yield new RuntimeException(driver);
+                            }
+                            case "untyped" -> new RuntimeException("wrapper without a cause");
+                            case "missing-driver" -> new TapPdkRetryableEx("4001", (Throwable) null);
+                            default -> new RuntimeException(new SQLException(driverMessage, scenario));
+                        };
+                    }
+                }
+                """);
+    }
+
+    @Test
     void aNestedDriverCauseSurvivesWhileOversizedSensitiveTextIsOmittedBeforeRedaction() throws Exception {
         var cause = new java.sql.SQLException("driver rejected the account", "28P01");
         var failure = new io.tapdata.pdk.apis.exception.TapTestItemException();

@@ -10,12 +10,15 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 /** Product definitions used by the connection diagnostic projection. */
 public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLookup {
     private static final Pattern PARAMETER = Pattern.compile("\\{([a-z][A-Za-z0-9]*)}");
     private static final String ENGLISH = "en";
+    private static final String MESSAGE = "message";
+    private static final String SOLUTION = "solution";
     private static final List<String> LANGUAGES = List.of(ENGLISH, "zh-CN", "zh-TW");
 
     public enum Definition {
@@ -46,7 +49,7 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     private static final class Bundled {
-        static final ConnectionDiagnosticCatalog INSTANCE = load();
+        static final ConnectionDiagnosticCatalog INSTANCE = load(MessageCatalog::read);
     }
 
     public static ConnectionDiagnosticCatalog bundled() {
@@ -55,8 +58,8 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
 
     public Map<String, Object> snapshot(TapstateException failure, Locale locale) {
         return resolve(failure.code().code(), failure.args(), List.of(), locale)
-                .<Map<String, Object>>map(text -> Map.of("code", text.code(), "params", failure.args(),
-                        "message", text.message(), "solution", text.solution()))
+                .<Map<String, Object>>map(rendered -> Map.of("code", rendered.code(), "params", failure.args(),
+                        MESSAGE, rendered.message(), SOLUTION, rendered.solution()))
                 .orElseGet(Map::of);
     }
 
@@ -74,7 +77,7 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
                 ? "zh-TW" : "zh-CN";
     }
 
-    private static ConnectionDiagnosticCatalog load() {
+    static ConnectionDiagnosticCatalog load(Function<String, String> readResource) {
         Map<String, Definition> byLegacy = new LinkedHashMap<>();
         Map<String, Definition> byCode = new LinkedHashMap<>();
         for (Definition definition : Definition.values()) {
@@ -86,16 +89,16 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
         }
         Map<String, Map<String, MessageCatalog.Rendered>> languages = new LinkedHashMap<>();
         for (String language : LANGUAGES) {
-            Object parsed = JsonReader.parse(MessageCatalog.read("/messages/connection-diagnostic-" + language + ".json"));
+            Object parsed = JsonReader.parse(readResource.apply("/messages/connection-diagnostic-" + language + ".json"));
             if (!(parsed instanceof Map<?, ?> entries) || !entries.keySet().equals(byCode.keySet())) {
                 throw new IllegalStateException("incomplete connection diagnostic catalog " + language);
             }
             Map<String, MessageCatalog.Rendered> templates = new LinkedHashMap<>();
             byCode.forEach((code, definition) -> {
                 if (!(entries.get(code) instanceof Map<?, ?> entry)
-                        || !entry.keySet().equals(Set.of("message", "solution"))
-                        || !(entry.get("message") instanceof String message) || message.isBlank()
-                        || !(entry.get("solution") instanceof String solution) || solution.isBlank()) {
+                        || !entry.keySet().equals(Set.of(MESSAGE, SOLUTION))
+                        || !(entry.get(MESSAGE) instanceof String message) || message.isBlank()
+                        || !(entry.get(SOLUTION) instanceof String solution) || solution.isBlank()) {
                     throw new IllegalStateException("invalid language entry " + language + "/" + code);
                 }
                 Set<String> used = new java.util.HashSet<>();

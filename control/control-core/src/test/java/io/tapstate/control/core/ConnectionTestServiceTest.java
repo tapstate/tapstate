@@ -76,20 +76,6 @@ class ConnectionTestServiceTest {
         savedConfig.put("__TAPDATA", Map.of("sshPassword", sshPassword));
         SourceResource source = new SourceResource(
                 "source-transport", null, "mysql", savedConfig, null, null, null, null);
-        ArtifactStore artifacts = new ArtifactStore() {
-            @Override
-            public void saveAll(List<Resource> resources) { }
-
-            @Override
-            public Optional<Resource> get(String id) {
-                return source.id().equals(id) ? Optional.of(source) : Optional.empty();
-            }
-
-            @Override
-            public List<Resource> list() {
-                return List.of(source);
-            }
-        };
         ConnectionTestResult echoed = new ConnectionTestResult(
                 "source-transport", "mysql", Outcome.FAILED,
                 List.of(new ConnectionTestItem(
@@ -102,7 +88,7 @@ class ConnectionTestServiceTest {
         RecordingResultStore store = new RecordingResultStore();
         ConnectionTestService service = new ConnectionTestService(
                 config -> echoed, store, gate(new RecordingAuditStore()), null,
-                new SourceConnectionResolver(artifacts));
+                resolverFor(source));
 
         ConnectionTestReport immediate = service.test(
                 "source-transport", "mysql", Map.of("host", "preview"), "alice");
@@ -190,6 +176,69 @@ class ConnectionTestServiceTest {
     }
 
     @Test
+    void redactsNestedBranchesAndPreservesOnlySafeLinkedReferences() {
+        String username = "fixture<redacted>-account";
+        String password = "connector-shared-fixture-password";
+        var config = Map.<String, Object>of("uri", "mongodb://fixture%3Credacted%3E-account:" + password + "@localhost");
+        var source = new SourceResource("orders", null, "mongodb", config, null, null, null, null);
+        var parentReference = Map.of("type", "connection", "id", source.id());
+        var diagnostic = Map.<String, Object>of(
+                "definitionStatus", "unverified", "message", "Connection failed for " + username,
+                "solution", "Check " + password,
+                "references", List.of(parentReference, Map.of("type", "connection", "id", username),
+                        Map.of("type", "pipeline-node", "id", "read", "pipelineId", "sync")),
+                "causes", List.of(
+                        Map.of("arguments", List.of(username, "database"), "rawMessage", "Driver refused " + username),
+                        Map.of("cause", Map.of("params", Map.of("login", username, "delay", 1),
+                                "stackTrace", "Stack containing " + password))));
+        var captured = new ConnectionTestResult(source.id(), "mongodb", Outcome.FAILED, List.of(
+                new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED, "Login refused", null, null, null,
+                        diagnostic)), 1_700_000_000_000L);
+        var store = new RecordingResultStore();
+        var service = new ConnectionTestService(configured -> captured, store, gate(new RecordingAuditStore()), null,
+                resolverFor(source));
+
+        var immediate = service.test(source.id(), source.connector(), config, "alice");
+        var latest = new ConnectionTestResultQueryService(store).find(source.id()).orElseThrow();
+        var published = immediate.checks().getFirst().diagnostic();
+
+        assertThat(published).containsEntry("definitionStatus", "unverified")
+                .containsEntry("message", "Connection failed for <redacted>")
+                .containsEntry("solution", "Check <redacted>")
+                .containsEntry("references", List.of(parentReference, Map.of("type", "pipeline-node", "id", "read",
+                        "pipelineId", "sync")));
+        assertThat(published.get("causes")).isEqualTo(List.of(
+                Map.of("arguments", List.of("<redacted>", "database"), "rawMessage", "Driver refused <redacted>"),
+                Map.of("cause", Map.of("params", Map.of("login", "<redacted>", "delay", 1),
+                        "stackTrace", "Stack containing <redacted>"))));
+        assertThat(store.saved.items().getFirst().diagnostic()).isEqualTo(published);
+        assertThat(latest).isEqualTo(immediate);
+    }
+
+    @Test
+    void attachesTheAuthorizedSourceToARefusalWithoutPublishingAReport() {
+        String privateKey = "fixture-private-key";
+        var config = Map.<String, Object>of("host", "localhost", "sslKey", privateKey);
+        var source = new SourceResource("orders", null, "mysql", config, null, null, null, null);
+        var failure = new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", privateKey), null);
+        var store = new RecordingResultStore();
+        var service = new ConnectionTestService(configured -> { throw failure; },
+                store, gate(new RecordingAuditStore()), null, resolverFor(source),
+                ignored -> ConnectionTestService.Attempt.NONE, java.util.function.UnaryOperator.identity(),
+                safeFailure -> Map.of("code", "TS0060001", "message", "Connection refused",
+                        "params", safeFailure.args()));
+
+        assertThatThrownBy(() -> service.test(source.id(), source.connector(), config, "alice"))
+                .isInstanceOfSatisfying(ConnectionTestRefusal.class, refusal -> {
+                    assertThat(refusal.code()).isEqualTo(ControlError.MALFORMED_REQUEST);
+                    assertThat(refusal.getCause()).isNull();
+                    assertThat(refusal.diagnostic()).containsEntry("params", Map.of("reason", "<redacted>"))
+                            .containsEntry("references", List.of(Map.of("type", "connection", "id", source.id())));
+                });
+        assertThat(store.saved).isNull();
+    }
+
+    @Test
     void redactsTransportSecretsFromCodedProbeFailures() {
         String tlsKey = "private-key-sentinel";
         String causeSecret = "cause-secret-sentinel";
@@ -268,6 +317,23 @@ class ConnectionTestServiceTest {
                 .isInstanceOf(NullPointerException.class);
         assertThatThrownBy(() -> new ConnectionTestService(probe, store, auditGate, null, null))
                 .isInstanceOf(NullPointerException.class);
+    }
+
+    private static SourceConnectionResolver resolverFor(SourceResource source) {
+        return new SourceConnectionResolver(new ArtifactStore() {
+            @Override
+            public void saveAll(List<Resource> resources) { }
+
+            @Override
+            public Optional<Resource> get(String id) {
+                return source.id().equals(id) ? Optional.of(source) : Optional.empty();
+            }
+
+            @Override
+            public List<Resource> list() {
+                return List.of(source);
+            }
+        });
     }
 
     private static AuditGate gate(AuditStore auditStore) {

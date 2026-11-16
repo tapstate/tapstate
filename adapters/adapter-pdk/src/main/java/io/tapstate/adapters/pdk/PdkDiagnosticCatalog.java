@@ -23,6 +23,7 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
     static final String RESOURCE = "META-INF/tapstate/connection-diagnostics.json";
     private static final int MAX_BYTES = 256 * 1024;
     private static final int MAX_DEFINITIONS = 1024;
+    private static final String DYNAMIC = "dynamic";
     private static final JsonFactory JSON = JsonFactory.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(12).build()).build();
@@ -52,13 +53,16 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
         }
         try (var jar = new JarFile(ref.classpath().getFirst().toFile(), false)) {
             var entry = jar.getJarEntry(RESOURCE);
-            if (entry == null || entry.isDirectory() || entry.getSize() > MAX_BYTES
+            if (entry == null || entry.isDirectory()) return UNAVAILABLE;
+            long declaredSize = entry.getSize();
+            if (declaredSize < 0 || declaredSize > MAX_BYTES
                     || jar.stream().filter(candidate -> candidate.getName().equals(RESOURCE)).limit(2).count() != 1) {
                 return UNAVAILABLE;
             }
             try (var input = jar.getInputStream(entry)) {
+                // Check actual expanded bytes independently of the archive directory.
                 byte[] data = input.readNBytes(MAX_BYTES + 1);
-                return data.length <= MAX_BYTES ? read(connectorId, data) : UNAVAILABLE;
+                return data.length == declaredSize ? read(connectorId, data) : UNAVAILABLE;
             }
         } catch (IOException | IllegalArgumentException invalid) {
             return UNAVAILABLE;
@@ -100,7 +104,7 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
         if (value == null) return Map.of();
         if (!(value instanceof Map<?, ?> text)) throw new IllegalArgumentException("invalid connector diagnostic text");
         Map<String, String> entries = new HashMap<>();
-        for (String field : List.of("message", "solution", "dynamic")) {
+        for (String field : List.of("message", "solution", DYNAMIC)) {
             if (text.get(field) instanceof String content && !content.isBlank()) entries.put(field, content);
             else if (text.containsKey(field)) throw new IllegalArgumentException("invalid connector diagnostic text");
         }
@@ -112,7 +116,8 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
         if (code == null) return null;
         Definition exact = byFullCode.get(code);
         Definition raw = byRawCode.get(code);
-        return exact != null && raw != null && exact != raw ? null : exact == null ? raw : exact;
+        if (exact == null) return raw;
+        return raw == null || exact == raw ? exact : null;
     }
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
@@ -120,8 +125,9 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
         if (definition == null || !named.isEmpty()) return Optional.empty();
         var text = definition.text(locale);
         String message = text.get("message");
-        if (text.get("dynamic") != null) {
-            String substitution = renderPositional(text.get("dynamic"), positional);
+        String template = text.get(DYNAMIC);
+        if (template != null) {
+            String substitution = renderPositional(template, positional);
             if (substitution != null) message = message == null ? substitution : message + "\n" + substitution;
         }
         return Optional.of(new Resolved(definition.code(), message, text.get("solution")));

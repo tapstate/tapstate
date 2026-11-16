@@ -13,6 +13,15 @@ import java.util.Map;
 public final class DiagnosticProjection {
 
     public static final int MAX_DEPTH = 32;
+    private static final String TRUNCATED = "truncated";
+    private static final String DEFINITION_STATUS = "definitionStatus";
+    private static final String UNVERIFIED = "unverified";
+    private static final String PARAMETERS = "params";
+    private static final String ARGUMENTS = "arguments";
+    private static final String CAUSE = "cause";
+    private static final String CAUSES = "causes";
+    private static final String REFERENCES = "references";
+    private static final String PIPELINE_ID = "pipelineId";
     private static final List<String> TEXT_FIELDS = List.of("code", "message", "solution", "rawMessage", "stackTrace");
 
     private DiagnosticProjection() {
@@ -27,34 +36,38 @@ public final class DiagnosticProjection {
             return Map.of();
         }
         Map<String, Object> result = new LinkedHashMap<>();
-        for (String key : TEXT_FIELDS) {
-            if (source.containsKey(key)) {
-                if (!(source.get(key) instanceof String value) || value.isBlank()) {
-                    return Map.of();
-                }
-                result.put(key, value);
-            }
-        }
-        if (source.containsKey("truncated")) {
-            if (!Boolean.TRUE.equals(source.get("truncated"))) {
-                return Map.of();
-            }
-            result.put("truncated", true);
-        }
-        if (source.containsKey("definitionStatus")) {
-            if (!"unverified".equals(source.get("definitionStatus"))) return Map.of();
-            result.put("definitionStatus", "unverified");
-        }
-        if (!copyParameters(source, result) || !copyCauses(source, result, depth)
+        if (!copyRootFields(source, result) || !copyParameters(source, result) || !copyCauses(source, result, depth)
                 || !copyReferences(source, result)) {
             return Map.of();
         }
         return Collections.unmodifiableMap(result);
     }
 
+    private static boolean copyRootFields(Map<?, ?> source, Map<String, Object> result) {
+        for (String key : TEXT_FIELDS) {
+            if (source.containsKey(key)) {
+                if (!(source.get(key) instanceof String value) || value.isBlank()) {
+                    return false;
+                }
+                result.put(key, value);
+            }
+        }
+        if (source.containsKey(TRUNCATED)) {
+            if (!Boolean.TRUE.equals(source.get(TRUNCATED))) {
+                return false;
+            }
+            result.put(TRUNCATED, true);
+        }
+        if (source.containsKey(DEFINITION_STATUS)) {
+            if (!UNVERIFIED.equals(source.get(DEFINITION_STATUS))) return false;
+            result.put(DEFINITION_STATUS, UNVERIFIED);
+        }
+        return true;
+    }
+
     private static boolean copyParameters(Map<?, ?> source, Map<String, Object> result) {
-        if (source.containsKey("params")) {
-            if (source.containsKey("arguments") || !(source.get("params") instanceof Map<?, ?> raw)) {
+        if (source.containsKey(PARAMETERS)) {
+            if (source.containsKey(ARGUMENTS) || !(source.get(PARAMETERS) instanceof Map<?, ?> raw)) {
                 return false;
             }
             Map<String, Object> params = new LinkedHashMap<>();
@@ -65,14 +78,14 @@ public final class DiagnosticProjection {
                 }
                 params.put(key, value);
             }
-            result.put("params", Collections.unmodifiableMap(params));
+            result.put(PARAMETERS, Collections.unmodifiableMap(params));
         }
-        if (source.containsKey("arguments")) {
-            if (!(source.get("arguments") instanceof List<?> args)
+        if (source.containsKey(ARGUMENTS)) {
+            if (!(source.get(ARGUMENTS) instanceof List<?> args)
                     || !args.stream().allMatch(String.class::isInstance)) {
                 return false;
             }
-            result.put("arguments", List.copyOf(args));
+            result.put(ARGUMENTS, List.copyOf(args));
         }
         return true;
     }
@@ -88,19 +101,19 @@ public final class DiagnosticProjection {
     }
 
     private static boolean copyCauses(Map<?, ?> source, Map<String, Object> result, int depth) {
-        if (source.containsKey("cause")) {
-            if (source.containsKey("causes")) {
+        if (source.containsKey(CAUSE)) {
+            if (source.containsKey(CAUSES)) {
                 return false;
             }
-            Map<String, Object> child = read(source.get("cause"), depth + 1);
+            Map<String, Object> child = read(source.get(CAUSE), depth + 1);
             if (child.isEmpty()) {
                 return false;
             }
-            result.put("cause", child);
+            result.put(CAUSE, child);
         }
-        if (source.containsKey("causes")) {
-            if (!(source.get("causes") instanceof List<?> raw)
-                    || (raw.size() < 2 && !Boolean.TRUE.equals(source.get("truncated")))) {
+        if (source.containsKey(CAUSES)) {
+            if (!(source.get(CAUSES) instanceof List<?> raw)
+                    || (raw.size() < 2 && !Boolean.TRUE.equals(source.get(TRUNCATED)))) {
                 return false;
             }
             List<Map<String, Object>> children = new ArrayList<>();
@@ -111,40 +124,40 @@ public final class DiagnosticProjection {
                 }
                 children.add(child);
             }
-            result.put("causes", List.copyOf(children));
+            result.put(CAUSES, List.copyOf(children));
         }
         return true;
     }
 
     private static boolean copyReferences(Map<?, ?> source, Map<String, Object> result) {
-        if (!source.containsKey("references")) {
+        if (!source.containsKey(REFERENCES)) {
             return true;
         }
-        if (!(source.get("references") instanceof List<?> raw)) {
+        if (!(source.get(REFERENCES) instanceof List<?> raw)) {
             return false;
         }
         List<Map<String, String>> references = new ArrayList<>();
         for (Object entry : raw) {
-            if (!(entry instanceof Map<?, ?> reference)
-                    || !(reference.get("type") instanceof String type) || type.isEmpty()
-                    || !(reference.get("id") instanceof String id) || id.isEmpty()) {
-                return false;
-            }
-            if (reference.containsKey("pipelineId")) {
-                if (!(reference.get("pipelineId") instanceof String pipelineId) || pipelineId.isEmpty()) {
-                    return false;
-                }
-                references.add(Map.of("type", type, "id", id, "pipelineId", pipelineId));
-            } else {
-                if ("pipeline-node".equals(type)) {
-                    return false;
-                }
-                references.add(Map.of("type", type, "id", id));
-            }
+            Map<String, String> reference = readReference(entry);
+            if (reference.isEmpty()) return false;
+            references.add(reference);
         }
         if (!references.isEmpty()) {
-            result.put("references", List.copyOf(references));
+            result.put(REFERENCES, List.copyOf(references));
         }
         return true;
+    }
+
+    private static Map<String, String> readReference(Object entry) {
+        if (!(entry instanceof Map<?, ?> reference)
+                || !(reference.get("type") instanceof String type) || type.isEmpty()
+                || !(reference.get("id") instanceof String id) || id.isEmpty()) {
+            return Map.of();
+        }
+        if (reference.containsKey(PIPELINE_ID)) {
+            return reference.get(PIPELINE_ID) instanceof String pipelineId && !pipelineId.isEmpty()
+                    ? Map.of("type", type, "id", id, PIPELINE_ID, pipelineId) : Map.of();
+        }
+        return "pipeline-node".equals(type) ? Map.of() : Map.of("type", type, "id", id);
     }
 }
