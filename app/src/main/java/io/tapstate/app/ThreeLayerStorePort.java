@@ -169,10 +169,7 @@ final class ThreeLayerStorePort implements StorePort {
         var prepared=sharedCaptureDescriptor(source,canonical);
         if(prepared.isEmpty()) {
             // Start planning can leave the absent-history proof to the transaction that creates capture.
-            if (verifyMissingCapture && (bound.cache().workloadClaims(business())
-                    .read(new WorkloadClaimKey(business().clusterId(), WorkloadClaimType.CAPTURE, capture)).isPresent()
-                    || stores.get().chains().load(canonical.chainId().value()).isPresent()))
-                throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
+            if (verifyMissingCapture) requireNoOrphanedCapture(canonical, capture, stores);
             return requireAttachment?Optional.empty():Optional.of(canonical);
         }
         var fixed=prepared.orElseThrow();
@@ -183,6 +180,13 @@ final class ThreeLayerStorePort implements StorePort {
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
         return Optional.of(canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+    }
+
+    private void requireNoOrphanedCapture(SourceCaptureResolution canonical, String capture, Supplier<SrsStores> stores) {
+        if (bound.cache().workloadClaims(business())
+                .read(new WorkloadClaimKey(business().clusterId(), WorkloadClaimType.CAPTURE, capture)).isPresent()
+                || stores.get().chains().load(canonical.chainId().value()).isPresent())
+            throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
     }
     PipelineIntentScope scope(String pipeline) {
         active();
@@ -525,17 +529,20 @@ final class ThreeLayerStorePort implements StorePort {
         });
     }
     Optional<SrsMeta> unsharedStartProgress(String chain) { return directPosition(chain); }
-    Optional<ConsumerOffset> sinkOffset(String pipeline, String source, String chain) {
-        var original = scope(pipeline);
-        Runnable guard = () -> {
-            active();
-            if (!original.equals(scope(pipeline))) throw refused();
-        };
+    Optional<ConsumerOffset> sharedSinkOffset(PlanningScope reading, io.tapstate.core.model.SourceResource source,
+            SourceCaptureResolution canonical) {
+        var original = reading.scope();
+        var prepared = sharedCaptureDescriptor(source, canonical);
+        if (prepared.isEmpty()) {
+            var capture = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+            requireNoOrphanedCapture(canonical, capture, () -> bound.cache().srs(business(), this::active));
+            return Optional.empty();
+        }
+        // The cursor snapshot proves its own attachment, generation and checkpoint dependencies.
         var context = new io.tapstate.spi.store.SrsConsumerContext(
-                new io.tapstate.spi.store.SrsConsumerKey(chain, pipeline, source), original.stateGeneration());
-        var offset = bound.cache().srs(business(), guard).consumers().cursor(context);
-        guard.run();
-        return offset;
+                new io.tapstate.spi.store.SrsConsumerKey(prepared.orElseThrow().chainId(), original.pipelineId(), source.id()),
+                original.stateGeneration());
+        return bound.cache().srs(business(), this::active).consumers().observationCursor(context);
     }
 
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {
