@@ -94,6 +94,8 @@ class AtlasPdkSourcePermissionsIT {
              var server = runtime.launch(Tiers.IN_PROCESS)) {
             var control = runtime.control(server, true);
             runtime.register(control, CONNECTOR);
+            assertThat(control.testConnection("atlas_valid_user", CONNECTOR, settings(uri("root", "admin")))
+                    .outcome()).isEqualTo("PASSED");
             var immediate = control.sourceRequest("POST", "/api/connections:test",
                     Map.of("id", id, "connectorId", CONNECTOR, "settings", settings(uri(username, "admin"))),
                     null, 200);
@@ -102,9 +104,10 @@ class AtlasPdkSourcePermissionsIT {
 
             assertThat(immediate.body()).doesNotContain(username, PASSWORD);
             assertThat(latest.body()).doesNotContain(username, PASSWORD);
-            var report = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(immediate.body());
+            var report = (Map<?, ?>) JsonReader.parse(immediate.body());
             assertThat(report.get("outcome")).isEqualTo("FAILED");
-            assertThat(io.tapstate.core.common.JsonReader.parse(latest.body())).isEqualTo(report);
+            assertThat(report.get("checks").toString()).contains("Exception authenticating", "MongoCredential<redacted>");
+            assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
             runtime.assertAuthenticationBoundary();
         }
     }

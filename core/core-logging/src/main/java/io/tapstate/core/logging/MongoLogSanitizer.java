@@ -10,7 +10,7 @@ final class MongoLogSanitizer {
         if (text == null) {
             return null;
         }
-        String safe = hideBlock(text, "MongoCredential{", "mechanismProperties=<hidden>}");
+        String safe = redactCredentialDump(text);
         safe = hideBlock(safe, "ProxySettings{", "}");
         StringBuilder result = new StringBuilder();
         int cursor = 0;
@@ -27,6 +27,10 @@ final class MongoLogSanitizer {
         }
         result.append(safe, cursor, safe.length());
         return result.toString();
+    }
+
+    static String redactCredentialDump(String text) {
+        return text == null ? null : hideBlock(text, "MongoCredential{", "mechanismProperties=<hidden>}");
     }
 
     private static int nextUri(String text, int from) {

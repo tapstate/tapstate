@@ -107,6 +107,22 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void leavesEndpointDescriptionsAndContactAddressesIntact() {
+        String message = "No reply from mongodb://db.example:27017 after 3 attempts; contact ops@example.org";
+        String reason = "A proxy was used; server replied {code=18}";
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        message, reason, null, null)), 1_700_000_000_000L, true));
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst();
+
+        assertThat(check.message()).isEqualTo(message);
+        assertThat(check.reason()).isEqualTo(reason);
+    }
+
+    @Test
     void aNullConnectionIdIsRejected() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
         assertThatThrownBy(() -> query.find(null)).isInstanceOf(NullPointerException.class);
