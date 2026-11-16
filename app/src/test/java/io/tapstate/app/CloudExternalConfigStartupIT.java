@@ -66,7 +66,7 @@ class CloudExternalConfigStartupIT {
     private static final String READY = "Tapstate application is ready";
     private static final String PASSWORD = NativeAppStorage.PASSWORD;
     private static final Set<String> CONNECTORS = Set.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern HTTP_PORT = Pattern.compile("Tomcat started on port (\\d+)");
     private static final Pattern BUNDLED_REGISTRATION = Pattern.compile(
