@@ -170,7 +170,7 @@ public final class PipelineRepresentation {
         if (body.containsKey("script")) {
             return "js";
         }
-        if (body.containsKey("fields")) {
+        if (body.containsKey("fields") || body.containsKey("soft_delete") || body.containsKey("softDelete")) {
             return "map";
         }
         if (body.containsKey("expr")) {
@@ -194,8 +194,7 @@ public final class PipelineRepresentation {
     static TransformBody body(String type, Map<String, Object> payload, String path) {
         return switch (type) {
             case "js" -> new TransformBody.Js(requiredText(payload, "script", path));
-            case "map" -> new TransformBody.MapProjection(
-                    fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
+            case "map" -> mapBody(payload, path);
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
             // An expansion's four optional keys are read as absent when absent, never defaulted:
@@ -362,11 +361,31 @@ public final class PipelineRepresentation {
         return number.intValue();
     }
 
+    /** A map's fields may be absent only where soft_delete stands in for them, as in the document form. */
+    private static TransformBody.MapProjection mapBody(Map<String, Object> payload, String path) {
+        String softDelete = textOrNull(value(payload, "soft_delete", "softDelete"), path + ".soft_delete");
+        if (softDelete != null && softDelete.isBlank()) {
+            throw malformed(path + ".soft_delete must name a column");
+        }
+        Map<String, FieldRule> fields = softDelete != null && payload.get("fields") == null
+                ? Map.of()
+                : fieldRules(requiredObject(payload, "fields", path), path + ".fields");
+        if (softDelete != null && fields.containsKey(softDelete)) {
+            throw malformed(path + ".soft_delete names a column also declared under fields");
+        }
+        return new TransformBody.MapProjection(fields, softDelete);
+    }
+
     private static Map<String, Object> bodyValue(TransformBody body) {
         Map<String, Object> value = new LinkedHashMap<>();
         switch (body) {
             case TransformBody.Js js -> value.put("script", js.script());
-            case TransformBody.MapProjection map -> value.put("fields", fieldRuleValues(map.fields()));
+            case TransformBody.MapProjection map -> {
+                value.put("fields", fieldRuleValues(map.fields()));
+                if (map.softDelete() != null) {
+                    value.put("soft_delete", map.softDelete());
+                }
+            }
             case TransformBody.Filter filter -> value.put("expr", filter.expr());
             // Every key, including the ones the author omitted: this face reports what a pipeline
             // is, and a key left out of the answer is indistinguishable from a key this face does

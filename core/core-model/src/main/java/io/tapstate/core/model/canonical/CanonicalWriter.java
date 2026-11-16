@@ -313,7 +313,14 @@ public final class CanonicalWriter {
     private void body(B b, TransformBody body) {
         switch (body) {
             case TransformBody.Js js -> b.literal("script", js.script());
-            case TransformBody.MapProjection mp -> b.put("fields", fieldRules(mp.fields()));
+            // An omitted fields block stays omitted: only a soft-delete map may leave it out, and writing
+            // an empty one would change the identity of an artifact its author never edited.
+            case TransformBody.MapProjection mp -> {
+                if (!mp.fields().isEmpty() || mp.softDelete() == null) {
+                    b.put("fields", fieldRules(mp.fields()));
+                }
+                b.scalar("soft_delete", mp.softDelete());
+            }
             case TransformBody.Filter f -> b.expression("expr", f.expr());
             // Declared order, which is the order the grammar declares them in: the one required key,
             // then the two an author already knows from a document store's own unwind, then the two
