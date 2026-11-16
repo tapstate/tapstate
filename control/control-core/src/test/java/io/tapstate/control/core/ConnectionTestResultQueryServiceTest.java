@@ -123,6 +123,23 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void hidesUserInfoAndProxyCredentialsInPreviouslyStoredReports() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Unable to connect to mongodb://fixture-user:fixture-secret@db.example/data",
+                        "Refused ProxySettings{host=proxy, port=1080, username=fixture-user, password=fixture-secret}",
+                        "Check the server address", null)), 1_700_000_000_000L, true));
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst();
+
+        assertThat(check.message()).isEqualTo("Unable to connect to mongodb://<redacted>@db.example/data");
+        assertThat(check.reason()).isEqualTo("Refused ProxySettings<redacted>");
+        assertThat(check.solution()).isEqualTo("Check the server address");
+    }
+
+    @Test
     void aNullConnectionIdIsRejected() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
         assertThatThrownBy(() -> query.find(null)).isInstanceOf(NullPointerException.class);

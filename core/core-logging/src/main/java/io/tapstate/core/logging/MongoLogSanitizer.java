@@ -1,7 +1,12 @@
 package io.tapstate.core.logging;
 
+import java.util.regex.Pattern;
+
 /** Hides Mongo connection credentials even before any Source secrets have been registered. */
 final class MongoLogSanitizer {
+
+    private static final Pattern REPORT_URI_USERINFO = Pattern.compile(
+            "(mongodb(?:\\+srv)?://)[^\\s/?#]*@", Pattern.UNICODE_CHARACTER_CLASS);
 
     private MongoLogSanitizer() {
     }
@@ -29,7 +34,20 @@ final class MongoLogSanitizer {
         return result.toString();
     }
 
-    static String redactCredentialDump(String text) {
+    static String redactReport(String text) {
+        if (text == null) {
+            return null;
+        }
+        String safe = redactCredentialDump(text);
+        int proxy = safe.indexOf("ProxySettings{");
+        if (proxy >= 0 && (safe.indexOf("username=", proxy) >= 0 || safe.indexOf("password=", proxy) >= 0)) {
+            safe = hideBlock(safe, "ProxySettings{", "}");
+        }
+        // Do not extend a host-only endpoint into prose containing an unrelated at-sign.
+        return REPORT_URI_USERINFO.matcher(safe).replaceAll("$1" + MongoUriUserInfo.REDACTED + "@");
+    }
+
+    private static String redactCredentialDump(String text) {
         return text == null ? null : hideBlock(text, "MongoCredential{", "mechanismProperties=<hidden>}");
     }
 
