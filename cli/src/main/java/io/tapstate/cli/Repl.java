@@ -3656,6 +3656,9 @@ final class Repl {
             putIfPresent(entry, REASON_PARAM, check.reason());
             putIfPresent(entry, "solution", check.solution());
             putIfPresent(entry, "connectorErrorCode", check.connectorErrorCode());
+            if (!check.diagnostic().isEmpty()) {
+                entry.put("diagnostic", check.diagnostic());
+            }
             checks.add(entry);
         }
         map.put("checks", checks);

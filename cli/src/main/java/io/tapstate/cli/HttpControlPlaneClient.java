@@ -1,5 +1,6 @@
 package io.tapstate.cli;
 
+import io.tapstate.core.common.DiagnosticProjection;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.control.client.ControlResponse;
 import io.tapstate.control.client.HttpControlClient;
@@ -1082,7 +1083,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                             && c.get("status") instanceof String status) {
                         checks.add(new ConnectionReport.Check(name, status,
                                 stringOrNull(c.get("message")), stringOrNull(c.get("reason")),
-                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode"))));
+                                stringOrNull(c.get("solution")), stringOrNull(c.get("connectorErrorCode")),
+                                DiagnosticProjection.read(c.get("diagnostic"))));
                     }
                 }
             }
