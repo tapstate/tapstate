@@ -103,20 +103,9 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
     public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
-        var attached=stores.consumers().retentionSnapshot(chainId,stores.chains());
-        var chain=attached.chain();
-        var members=attached.topology();
-        var floors=new TreeMap<String,Long>();
-        for(var member:members.consumers()) {
-            if(Collections.disjoint(member.tables(),chain.servingTables()))continue;
-            var held=stores.consumers().progress(member.context());
-            // Read each original consumer once. A coherent detach or replacement abandons this pass;
-            // CACHE still rechecks current subscribers in each actual trim transaction.
-            if(held.isEmpty())return;
-            var progress=held.orElseThrow();if(progress.membershipRevision()!=member.revision())return;
-            for(String table:member.tables())if(chain.servingTables().contains(table))
-                floors.merge(table,progress.ringDoneThrough().getOrDefault(table,-1L),Math::min);
-        }
+        var confirmed=stores.consumers().retentionFloors(chainId,stores.chains());
+        if(confirmed.isEmpty())return;
+        var floors=new TreeMap<>(confirmed.orElseThrow());
         for(var entry:floors.entrySet())if(entry.getValue()>=0) {
             fixed.run();String ring=SrsRingbuffer.ringName(chainId,entry.getKey());
             long trimmed=stores.log().bounds(ring).trimmedThrough();fixed.run();

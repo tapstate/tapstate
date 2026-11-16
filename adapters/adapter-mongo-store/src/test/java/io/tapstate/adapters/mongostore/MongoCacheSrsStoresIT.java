@@ -55,6 +55,33 @@ class MongoCacheSrsStoresIT {
         });
     }
 
+    @Test void retentionFloorsDoNotReopenAnAuditedTransactionForEachSubscriber() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+            assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+            assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+            var first = new SrsConsumerContext(f.consumer(), 1);
+            var second = new SrsConsumerContext(new SrsConsumerKey(CHAIN, "pipeline", "second"), 1);
+            stores.consumers().attach(first, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            stores.consumers().attach(second, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            assertThat(stores.consumers().startReadingAfter(first, 1, 0, "orders", 12, prepared.fence())).isTrue();
+            assertThat(stores.consumers().startReadingAfter(second, 1, 0, "orders", 4, prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceReadSequence(first, 1, "orders", 99, prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceReadSequence(second, 1, "orders", 100, prepared.fence())).isTrue();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(stores.consumers().retentionFloors(CHAIN, stores.chains())).hasValue(Map.of("orders", 4L));
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
+                        .as("topology and every confirmed floor share the original native snapshot").hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
+                        .as("all eight physical facets are audited once, not once per subscriber").hasSize(8);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
     @Test void coherentRetentionKeepsItsMissingRootDiagnosis() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope, ACTIVE);
@@ -69,6 +96,78 @@ class MongoCacheSrsStoresIT {
             assertThat(((TapstateException) original).code()).isNotEqualTo(IoError.SRS_CHECKPOINT_UNPROVEN);
             assertThatThrownBy(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()))
                     .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(((TapstateException) original).code()));
+        });
+    }
+
+    @Test void admittedObservationChecksOneStructureAndOneTransaction() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
+                        .as("admission and cursor proof belong to one snapshot").hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
+                        .as("the cursor does not reopen the same eight physical facets").hasSize(8);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"admission", "retired", "index", "guard"})
+    void combinedObservationKeepsFreshAdmissionStructureAndCallerChecks(String damage) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var active = new AtomicBoolean(true);
+            Runnable guard = () -> { if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); };
+            assertThat(f.domain.observationCursor(f.scope, context, guard)).isPresent();
+            IoError expected = switch (damage) {
+                case "admission" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$unset", new Document("claimAdmissionFence", "")));
+                    yield IoError.DOCUMENT_UNREADABLE;
+                }
+                case "retired" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("businessPhase", "RETIRED")));
+                    yield IoError.CACHE_BUSINESS_FENCED;
+                }
+                case "index" -> {
+                    SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+                    yield IoError.DOCUMENT_UNREADABLE;
+                }
+                default -> { active.set(false); yield IoError.WORKLOAD_CLAIM_FENCED; }
+            };
+            code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void combinedRetentionRefusesMissingCursorOrPinnedModel(boolean missingModel) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+            assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+            assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+            stores.models().publish(f.model(), f.capture);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            var member = stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            assertThat(stores.consumers().pinSnapshot(context, member.revision(), 0,
+                    new SrsSnapshotPin(1, "seam", Map.of("orders", f.model().key())), prepared.fence())).isTrue();
+            assertThat(stores.consumers().retentionFloors(CHAIN, stores.chains())).hasValue(Map.of("orders", -1L));
+            if (missingModel) SystemCollections.SRS_MODELS.on(f.database).deleteMany(new Document());
+            else SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database).deleteMany(new Document());
+            var before = f.snapshot();
+            assertThatThrownBy(() -> stores.consumers().retentionFloors(CHAIN, stores.chains()))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
         });
     }
 

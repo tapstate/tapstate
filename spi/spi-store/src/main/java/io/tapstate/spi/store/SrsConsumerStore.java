@@ -69,6 +69,21 @@ public interface SrsConsumerStore {
         return new AttachedChain(attached(chain), state);
     }
 
+    /** Native stores return confirmed floors from one snapshot; legacy facets abandon a changed relation. */
+    default Optional<Map<String, Long>> retentionFloors(String chain, SrsChainStore chains) {
+        var attached = retentionSnapshot(chain, chains);
+        var serving = attached.chain().servingTables();
+        var floors = new java.util.TreeMap<String, Long>();
+        for (var member : attached.topology().consumers()) {
+            if (java.util.Collections.disjoint(member.tables(), serving)) continue;
+            var held = progress(member.context());
+            if (held.isEmpty() || held.orElseThrow().membershipRevision() != member.revision()) return Optional.empty();
+            for (String table : member.tables()) if (serving.contains(table))
+                floors.merge(table, held.orElseThrow().ringDoneThrough().getOrDefault(table, -1L), Math::min);
+        }
+        return Optional.of(Map.copyOf(floors));
+    }
+
     record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
 
     /** Reads original progress and the boundaries for its missing rings from one snapshot. */

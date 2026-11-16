@@ -27,6 +27,19 @@ class NativeSrsRetentionTest {
         assertThat(f.reclaims).isEqualTo(1);
     }
 
+    @Test void jointRetentionFloorsDoNotReopenIndividualConsumerReads() {
+        var f = new Fixture(Set.of("a", "b"));
+        f.jointFloors = Map.of("a", 4L, "b", -1L);
+        f.attach("first", Set.of("a", "b"));
+        f.attach("second", Set.of("a"));
+        try (var unit = f.unit()) { f.retain(unit); }
+        assertThat(f.combinedReads).isEqualTo(1);
+        assertThat(f.chainReads).isZero();
+        assertThat(f.reads).isEmpty();
+        assertThat(f.trims).containsOnly(entry(f.ring("a"), 4L));
+        assertThat(f.reclaims).isEqualTo(1);
+    }
+
     @Test void aHundredTablesReadEachRelevantConsumerOnlyOncePerPass() {
         var tables = IntStream.range(0, 100).mapToObj(i -> "table-" + i).collect(Collectors.toSet());
         var f = new Fixture(tables);
@@ -109,6 +122,7 @@ class NativeSrsRetentionTest {
         boolean active = true;
         int reclaims;
         boolean combined;
+        Map<String,Long> jointFloors;
         int chainReads, combinedReads;
         Runnable afterBounds = () -> {};
 
@@ -134,6 +148,11 @@ class NativeSrsRetentionTest {
                 return Optional.of(new SrsChainState(CHAIN, "capture", "durable", 1, tables, tables, 0, null, null, members.size(), members.size()));
             });
             var consumers = proxy(SrsConsumerStore.class, (name, args) -> switch (name) {
+                case "retentionFloors" -> {
+                    if (jointFloors == null) yield null;
+                    combinedReads++;
+                    yield Optional.of(jointFloors);
+                }
                 case "attached" -> new SrsConsumerTopology(SCOPE, CHAIN, members.size(), members);
                 case "retentionSnapshot" -> {
                     if (combined) {
@@ -173,7 +192,10 @@ class NativeSrsRetentionTest {
                 var guard = (Runnable) args[0];
                 return proxy(type, (name, arguments) -> { guard.run(); var result = call.apply(name, arguments); guard.run(); return result; });
             }
-            return call.apply(method.getName(), args);
+            var result = call.apply(method.getName(), args);
+            if (result == null && method.getName().equals("retentionFloors"))
+                return java.lang.reflect.InvocationHandler.invokeDefault(proxy, method, args);
+            return result;
         }));
     }
 }

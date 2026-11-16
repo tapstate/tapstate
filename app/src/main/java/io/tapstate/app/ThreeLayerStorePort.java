@@ -542,7 +542,7 @@ final class ThreeLayerStorePort implements StorePort {
         var context = new io.tapstate.spi.store.SrsConsumerContext(
                 new io.tapstate.spi.store.SrsConsumerKey(prepared.orElseThrow().chainId(), original.pipelineId(), source.id()),
                 original.stateGeneration());
-        return bound.cache().srs(business(), this::active).consumers().observationCursor(context);
+        return bound.cache().observationCursor(business(), context, this::active);
     }
 
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {

@@ -625,6 +625,26 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return attachedWithChain(chain, IoError.SRS_CHECKPOINT_UNPROVEN);
     }
 
+    @Override public Optional<Map<String, Long>> retentionFloors(String chain, SrsChainStore ignored) {
+        requireChainName(chain);
+        return transaction(session -> {
+            var facts = new MongoSrsReadFacts(session, database, scope, true);
+            var root = MongoSrsReadFacts.find(facts, session, database, SystemCollections.SRS_CHAINS, new Document("_id", chain));
+            if (root == null) throw new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null);
+            var state = chains.state(session, root, true, facts);
+            var view = relations(session, chain, root, state);
+            var floors = new java.util.TreeMap<String, Long>();
+            for (var member : view.members().values()) {
+                if (member.detached() || java.util.Collections.disjoint(member.tables(), state.servingTables())) continue;
+                var cursor = view.cursors().get(member.context().key().consumerId());
+                validateSnapshot(session, member.context(), cursor.snapshot(), facts);
+                for (String table : member.tables()) if (state.servingTables().contains(table))
+                    floors.merge(table, cursor.ringDoneThrough().getOrDefault(table, -1L), Math::min);
+            }
+            return Optional.of(Map.copyOf(floors));
+        });
+    }
+
     @Override public AttachedChain attachedWithChain(String chain) {
         return attachedWithChain(chain, IoError.SRS_CONSUMER_UNAVAILABLE);
     }
@@ -725,13 +745,25 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
 
     private Optional<SrsConsumerProgress> progress(SrsConsumerContext context, boolean forObservation) {
         Objects.requireNonNull(context, "context");
-        return transaction(session -> {
-            var facts = new MongoSrsReadFacts(session, database, scope, true);
-            var own = own(session, context, true, facts, forObservation);
-            if (own == null || own.member().detached()) return Optional.empty();
-            var held = own.cursor(); validateSnapshot(session, context, held.snapshot(), facts);
-            return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
+        return transaction(session -> progress(session, context, forObservation));
+    }
+
+    Optional<ConsumerOffset> admittedObservationCursor(SrsConsumerContext context) {
+        Objects.requireNonNull(context, "context");
+        return inTransaction(session -> {
+            new MongoCacheBusinessIdentity(database, scope).requireAdmissionState(session);
+            requireStructure.run();
+            requireActive.run();
+            return progress(session, context, true).map(SrsConsumerProgress::cursor);
         });
+    }
+
+    private Optional<SrsConsumerProgress> progress(ClientSession session, SrsConsumerContext context, boolean forObservation) {
+        var facts = new MongoSrsReadFacts(session, database, scope, true);
+        var own = own(session, context, true, facts, forObservation);
+        if (own == null || own.member().detached()) return Optional.empty();
+        var held = own.cursor(); validateSnapshot(session, context, held.snapshot(), facts);
+        return Optional.of(new SrsConsumerProgress(context,own.member().revision(),held.revision(),held.value(),held.snapshot(),held.writerRun(),held.ringDoneThrough()));
     }
 
     @Override public Optional<StartupArrivals> startupArrivals(SrsConsumerContext context, Map<String, String> ringsByTable) {

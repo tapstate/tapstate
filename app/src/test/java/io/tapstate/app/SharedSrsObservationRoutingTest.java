@@ -42,6 +42,10 @@ class SharedSrsObservationRoutingTest {
         when(bound.preparation()).thenReturn(new CachePreparation("auth",new CacheAuthScope("cluster",1,StorageBinding.Mode.OP,"cache",1)));
         when(bound.cache()).thenReturn(cache);when(cache.schemas(eq(BUSINESS),any())).thenReturn(memory.schemas());
         when(cache.srs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
+        when(cache.observationCursor(eq(BUSINESS),any(),any())).thenAnswer(call -> {
+            call.<Runnable>getArgument(2).run();
+            return consumers.observationCursor(call.getArgument(1));
+        });
         when(cache.workloadClaims(BUSINESS)).thenReturn(claims);
         when(consumers.attached(physical)).thenReturn(topology(2));
         var ack=new ChainPosition(new SourceOrder(2,2),"new-physical-confirmation");

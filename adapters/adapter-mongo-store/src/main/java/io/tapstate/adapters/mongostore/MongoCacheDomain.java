@@ -416,6 +416,16 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return srs(expected, requireActive, false, false);
     }
 
+    /** Reads an original consumer cursor with admission and structure checks in the same operation. */
+    public java.util.Optional<io.tapstate.spi.store.ConsumerOffset> observationCursor(CacheBusinessScope expected,
+            io.tapstate.spi.store.SrsConsumerContext context, Runnable requireActive) {
+        Objects.requireNonNull(requireActive, "requireActive");
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        var structure = new MongoCacheMetadataStructure(database, rateRetention);
+        return new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs)
+                .admittedObservationCursor(context);
+    }
+
     /** One validated view for the synchronous reads of a start plan. */
     public io.tapstate.spi.store.SrsStores startPlanningSrs(CacheBusinessScope expected, Runnable requireActive) {
         return srs(expected, requireActive, true, false);
