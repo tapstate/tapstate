@@ -92,7 +92,9 @@ class PipelineRepresentationSoftDeleteTest {
     @Test
     @DisplayName("a blank soft_delete is refused")
     void blankIsRefused() {
-        assertThatThrownBy(() -> model(mapStep(Map.of("type", "map", "soft_delete", " "))))
+        Map<String, Object> step = mapStep(Map.of("type", "map", "soft_delete", " "));
+
+        assertThatThrownBy(() -> model(step))
                 .isInstanceOf(TapstateException.class)
                 .hasMessageContaining("soft_delete must name a column");
     }
@@ -100,8 +102,10 @@ class PipelineRepresentationSoftDeleteTest {
     @Test
     @DisplayName("a marker also declared under fields is refused")
     void markerAlsoAFieldIsRefused() {
-        assertThatThrownBy(() -> model(mapStep(Map.of(
-                "type", "map", "soft_delete", "is_deleted", "fields", Map.of("is_deleted", false)))))
+        Map<String, Object> step = mapStep(Map.of(
+                "type", "map", "soft_delete", "is_deleted", "fields", Map.of("is_deleted", false)));
+
+        assertThatThrownBy(() -> model(step))
                 .isInstanceOf(TapstateException.class)
                 .hasMessageContaining("also declared under fields");
     }
@@ -109,7 +113,9 @@ class PipelineRepresentationSoftDeleteTest {
     @Test
     @DisplayName("a map with neither fields nor soft_delete is still refused")
     void neitherIsRefused() {
-        assertThatThrownBy(() -> model(mapStep(Map.of("type", "map"))))
+        Map<String, Object> step = mapStep(Map.of("type", "map"));
+
+        assertThatThrownBy(() -> model(step))
                 .isInstanceOf(TapstateException.class);
     }
 }
