@@ -16,7 +16,7 @@ final class MongoCachePipelineStateStore implements StateStore {
 
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return access.transaction(session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session))));
+        return access.readTransaction(false, session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session, true))));
     }
 
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {

@@ -100,6 +100,29 @@ final class MongoCacheMetadataStructure {
 
     void verifySrs() { verify(SRS_TABLES); }
 
+    /** Admitted readers keep namespace checks live; full index audits belong to admission and strict operations. */
+    void verifySrsNamespaces() { verifyNamespaces(SRS_TABLES); }
+
+    void verifyPipelineNamespaces(boolean observation) {
+        verifyNamespaces(observation ? List.of(SystemCollections.CACHE_PIPELINE_STATE,
+                SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_WORKLOAD_CLAIMS)
+                : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS));
+    }
+
+    private void verifyNamespaces(List<SystemCollections> tables) {
+        StoreIo.run(() -> requireNamespaces(names(tables), collections(names(tables))));
+    }
+
+    private static void requireNamespaces(Set<String> required, Map<String, Document> existing) {
+        if (!existing.keySet().equals(required)) throw unreadable("collections");
+        for (var description : existing.values()) {
+            if (!"collection".equals(description.get("type"))) throw unreadable("collection-type");
+            Document options = description.get("options", Document.class);
+            if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries")))
+                throw unreadable("collection-options");
+        }
+    }
+
     void verifySrsRuntime() {
         var tables = new java.util.ArrayList<>(SRS_TABLES);
         tables.add(SystemCollections.CACHE_PIPELINE_STATE);
@@ -116,14 +139,8 @@ final class MongoCacheMetadataStructure {
         StoreIo.run(() -> {
             var required = names(tables);
             var existing = collections(required, remainingMillis);
-            if (!existing.keySet().equals(required)) throw unreadable("collections");
+            requireNamespaces(required, existing);
             for (var table : tables) {
-                for (String name : table.physicalNames()) {
-                    Document description = existing.get(name);
-                    if (!"collection".equals(description.get("type"))) throw unreadable("collection-type");
-                    Document options = description.get("options", Document.class);
-                    if (options != null && (Boolean.TRUE.equals(options.get("capped")) || options.containsKey("timeseries"))) throw unreadable("collection-options");
-                }
                 var rows = readIndexes(table.indexTargetOn(metadataDatabase(remainingMillis)), remainingMillis != null);
                 verifyId(rows);
                 if (table != SystemCollections.CACHE_PIPELINE_RATE_HISTORY && rows.stream().anyMatch(row -> row.containsKey("expireAfterSeconds"))) throw unreadable("ttl-index");

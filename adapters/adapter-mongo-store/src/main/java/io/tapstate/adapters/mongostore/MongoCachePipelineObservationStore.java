@@ -44,6 +44,10 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     static Map<Object, Document> claims(ClientSession session, MongoCachePipelineAccess access, List<Document> ids) {
         MongoCacheWorkloadClaimStore.requireCollection(access.database);
+        return claimsInVerifiedNamespace(session, access, ids);
+    }
+
+    private static Map<Object, Document> claimsInVerifiedNamespace(ClientSession session, MongoCachePipelineAccess access, List<Document> ids) {
         var collection = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(access.database);
         var results = new HashMap<Object, Document>();
         for (var row : collection.aggregate(session, List.of(
@@ -69,11 +73,11 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     @Override public Optional<Observation> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return access.observationTransaction(session -> {
+        return access.readTransaction(true, session -> {
             var state = SystemCollections.CACHE_PIPELINE_STATE.on(access.database)
                     .find(session, new Document("_id", pipelineId)).first();
             var id = claimKey(access);
-            var reading = reading(session, access, state, claims(session, access, List.of(id)).get(id));
+            var reading = reading(session, access, state, claimsInVerifiedNamespace(session, access, List.of(id)).get(id));
             var row = collection().find(session, new Document("_id", reading.key())).first();
             var selected = new HashMap<Object, Document>();
             if (row != null) selected.put(reading.key(), row);
@@ -98,12 +102,12 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         var refreshed = new Observation(expected.pipelineId(), expected.state(), expected.metrics(), expected.snapshot(),
                 expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad());
         var captured = document(refreshed, id);
-        return access.observationTransaction(session -> {
+        return access.readTransaction(true, session -> {
             var state = access.stateRow(session);
             if (!Long.valueOf(checkpointEpoch).equals(state.get("epoch"))
                     || StateJson.parse(state.getString("stateJson")) != expected.state()) return Optional.empty();
             var claimId = claimKey(access);
-            var reading = reading(session, access, state, claims(session, access, List.of(claimId)).get(claimId));
+            var reading = reading(session, access, state, claimsInVerifiedNamespace(session, access, List.of(claimId)).get(claimId));
             // Never borrow terminal details from another execution for this compare-and-refresh.
             if (!id.equals(reading.key())) return Optional.empty();
             var row = collection().find(session, new Document("_id", id)).first();

@@ -31,6 +31,7 @@ final class MongoCachePipelineAccess {
     private final MongoClient client;
     private final WorkloadClaimFence original;
     private final Runnable requireActive;
+    private final java.util.function.BooleanSupplier admittedReads;
     private final boolean unpreparedModels;
     private final WorkloadClaimFence originalNode;
     private final java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor;
@@ -51,12 +52,20 @@ final class MongoCachePipelineAccess {
     MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
-        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, false, null, java.util.Optional.empty(),null);
+        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases, () -> false);
+    }
+    MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
+            WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
+            io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, java.util.function.BooleanSupplier admittedReads) {
+        this(client, database, scope, original, requireActive, rateRetention, operatorDatabases,
+                false, null, java.util.Optional.empty(), null, admittedReads);
     }
     private MongoCachePipelineAccess(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence original, Runnable requireActive, java.time.Duration rateRetention,
             io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases, boolean unpreparedModels, WorkloadClaimFence originalNode,
-            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor,MongoConfigurationDomain.AuthoringModels authoringModels) {
+            java.util.Optional<io.tapstate.spi.store.PipelineRetirementResult> authoringPredecessor,MongoConfigurationDomain.AuthoringModels authoringModels,
+            java.util.function.BooleanSupplier admittedReads) {
+        this.admittedReads = Objects.requireNonNull(admittedReads);
         this.unpreparedModels = unpreparedModels; this.originalNode = originalNode;
         this.authoringModels=authoringModels;
         this.authoringPredecessor = Objects.requireNonNull(authoringPredecessor);
@@ -70,12 +79,12 @@ final class MongoCachePipelineAccess {
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, PipelineIntentScope scope,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
-        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty(),null);
+        return new MongoCachePipelineAccess(client, database, scope, null, active, retention, null, true, node, java.util.Optional.empty(),null, () -> false);
     }
     static MongoCachePipelineAccess unpreparedModels(MongoClient client, MongoDatabase database, MongoConfigurationDomain.AuthoringModels original,
             WorkloadClaimFence node, Runnable active, java.time.Duration retention) {
         return new MongoCachePipelineAccess(client, database, original.scope(), null,
-                active, retention, null, true, node, original.predecessor(),original);
+                active, retention, null, true, node, original.predecessor(),original, () -> false);
     }
     void requireModelPin() { if (unpreparedModels) throw fenced(); }
 
@@ -83,11 +92,20 @@ final class MongoCachePipelineAccess {
 
     <T> T observationTransaction(Function<ClientSession, T> action) { return transaction(true, action); }
 
+    /** Read projections never create namespaces; every attempt still checks identity and live collection descriptions. */
+    <T> T readTransaction(boolean observation, Function<ClientSession, T> action) {
+        return transaction(observation, TRANSACTION, true, action);
+    }
+
     private <T> T transaction(boolean observation, Function<ClientSession, T> action) {
         return transaction(observation, TRANSACTION, action);
     }
 
     private <T> T transaction(boolean observation, TransactionOptions options, Function<ClientSession, T> action) {
+        return transaction(observation, options, false, action);
+    }
+
+    private <T> T transaction(boolean observation, TransactionOptions options, boolean reading, Function<ClientSession, T> action) {
         return StoreIo.call(() -> {
             try {
                 requireActive.run();
@@ -96,7 +114,12 @@ final class MongoCachePipelineAccess {
                         requireActive.run();
                         new MongoCacheBusinessIdentity(database, new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))
                                 .requireAdmissionState(session);
-                        if (observation) verifyStructures(); else verifyStateStructure();
+                        if (reading && admittedReads.getAsBoolean()) {
+                            new MongoCacheMetadataStructure(database, rateRetention).verifyPipelineNamespaces(observation);
+                        } else {
+                            if (observation) verifyStructures(); else verifyStateStructure();
+                            if (reading) MongoCacheWorkloadClaimStore.requireCollection(database);
+                        }
                         T result = action.apply(session);
                         requireActive.run();
                         return result;

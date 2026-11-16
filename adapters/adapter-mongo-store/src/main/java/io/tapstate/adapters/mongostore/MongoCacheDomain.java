@@ -30,6 +30,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private boolean connectionClosed;
+    private volatile CacheBusinessScope readAdmission;
 
     private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
@@ -260,9 +261,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     /** Admission validates retained business structures and configured indexes without repairing them. */
     public void verifyBusinessReady(CacheBusinessScope expected) {
+        readAdmission = null;
         loadBusinessScope(expected);
         new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
         loadBusinessScope(expected);
+        readAdmission = expected;
     }
 
     /** Controlled continuation requires the original operation and already retained authentication facts. */
@@ -422,7 +425,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        return new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs)
+        Runnable verify = () -> {
+            if (expected.equals(readAdmission)) structure.verifySrsNamespaces();
+            else structure.verifySrs();
+        };
+        return new MongoSrsConsumerStore(client, database, expected, active, verify)
                 .admittedObservationCursor(context);
     }
 
@@ -732,7 +739,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        return new MongoCachePipelineAccess(client, database, scope, original, () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
+        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
+        return new MongoCachePipelineAccess(client, database, scope, original,
+                () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases,
+                () -> business.equals(readAdmission));
     }
 
     /**

@@ -30,6 +30,130 @@ class MongoCacheSrsStoresIT {
             SystemCollections.SRS_MODEL_CONTEXTS,SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,
             SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_WORKLOAD_CLAIMS);
 
+    @Test void admittedReadersDoNotRepeatTheBusinessIndexAudit() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            f.domain.verifyBusinessReady(f.scope);
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), ACTIVE);
+            var observations = f.domain.pipelineObservations(prepared.scope(), prepared.fence(), ACTIVE);
+            var at = java.time.Instant.parse("2026-11-16T00:00:00Z");
+            var checkpoint = states.read("pipeline").orElseThrow();
+            assertThat(states.compareAndSwap("pipeline", checkpoint.epoch(), "STOPPED", at))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            var stopped = new io.tapstate.core.lifecycle.Observation("pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED,
+                    Map.of(), Map.of(), Map.of(), null, at, List.of());
+            observations.save(stopped, checkpoint.epoch() + 1);
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(states.read("pipeline")).isPresent();
+                assertReadBudget(commands, 5);
+                commands.clear();
+                assertThat(observations.read("pipeline")).contains(stopped);
+                assertReadBudget(commands, 6);
+                commands.clear();
+                assertThat(observations.refreshTerminal(stopped, checkpoint.epoch() + 1, at.plusSeconds(1))).isPresent();
+                assertReadBudget(commands, 7);
+                commands.clear();
+                assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+                assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
+                assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).hasSize(1);
+                assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    private static void assertReadBudget(List<String> commands, int count) {
+        assertThat(commands).hasSize(count);
+        assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
+        assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).hasSize(1);
+        assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"observation-drop", "state-view", "cursor-drop", "retired", "generation", "claim", "guard"})
+    void admittedReadersKeepNamespaceAndAuthorityChecks(String damage) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var active = new AtomicBoolean(true);
+            Runnable guard = () -> { if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); };
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), guard);
+            var observations = f.domain.pipelineObservations(prepared.scope(), prepared.fence(), guard);
+            f.domain.verifyBusinessReady(f.scope);
+            assertThat(states.read("pipeline")).isPresent();
+            assertThat(f.domain.observationCursor(f.scope, context, guard)).isPresent();
+            Runnable read = () -> states.read("pipeline");
+            IoError expected = IoError.DOCUMENT_UNREADABLE;
+            switch (damage) {
+                case "observation-drop" -> {
+                    SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database).drop();
+                    read = () -> observations.read("pipeline");
+                }
+                case "state-view" -> {
+                    var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database);
+                    f.database.getCollection("state_copy").insertOne(state.find().first());
+                    state.drop();
+                    f.database.createView(SystemCollections.CACHE_PIPELINE_STATE.collectionName(), "state_copy", List.of());
+                }
+                case "cursor-drop" -> {
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database).drop();
+                    read = () -> f.domain.observationCursor(f.scope, context, guard);
+                }
+                case "retired" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("businessPhase", "RETIRED")));
+                    expected = IoError.CACHE_BUSINESS_FENCED;
+                    code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+                }
+                case "generation" -> {
+                    SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id", "pipeline"),
+                            new Document("$set", new Document("scope.stateGeneration", 2L)));
+                    expected = IoError.CACHE_BUSINESS_FENCED;
+                }
+                case "claim" -> {
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).updateOne(
+                            new Document("_id", MongoWorkloadClaimStore.id(prepared.fence().key())),
+                            new Document("$set", new Document("pipelineScope.stateGeneration", 2L)));
+                    expected = IoError.WORKLOAD_CLAIM_FENCED;
+                }
+                default -> {
+                    active.set(false);
+                    expected = IoError.WORKLOAD_CLAIM_FENCED;
+                    code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+                }
+            }
+            code(read::run, expected);
+        });
+    }
+
+    @Test void admittedIndexPolicyNeverRelaxesCheckpointWritesOrTheNextAudit() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            f.domain.verifyBusinessReady(f.scope);
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), ACTIVE);
+            var checkpoint = states.read("pipeline").orElseThrow();
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database).createIndex(new Document("touchMillis", 1),
+                    new IndexOptions().name("unexpected_ttl").expireAfter(10L, java.util.concurrent.TimeUnit.SECONDS));
+            SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+            assertThat(states.read("pipeline")).contains(checkpoint);
+            assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+            code(() -> states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()), IoError.DOCUMENT_UNREADABLE);
+            assertThat(states.read("pipeline")).contains(checkpoint);
+            code(() -> f.domain.verifyBusinessReady(f.scope), IoError.DOCUMENT_UNREADABLE);
+            // A failed re-admission also revokes the optimized mode of already-created views.
+            code(() -> states.read("pipeline"), IoError.DOCUMENT_UNREADABLE);
+            code(() -> f.domain.observationCursor(f.scope, context, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+        });
+    }
+
     @Test void coherentRetentionUsesOneNativeTransactionAndKeepsItsCallerGuard() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope, ACTIVE);
