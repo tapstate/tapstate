@@ -136,7 +136,7 @@ class StageConnectorsTest(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         with patch.object(PREPARE.subprocess, "run", side_effect=response) as downloaded:
             PREPARE.prepare(self.lock, self.staged)
-        self.assertEqual(downloaded.call_count, 10)
+        self.assertEqual(downloaded.call_count, 11)
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
 
     def test_tampered_public_test_input_fails_without_producing_output(self) -> None:
@@ -263,7 +263,7 @@ class StageConnectorsTest(unittest.TestCase):
         )
         self.assertEqual((self.staged / "release/connectors.lock.json").read_bytes(), self.lock.read_bytes())
         lines = (self.staged / "release/connectors.sha256").read_text(encoding="ascii").splitlines()
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(len(lines), 9)
         for entry in self.entries:
             self.assertIn(f"{entry['sha256']}  {entry['id']}-connector.jar", lines)
         for entry in self.license_files:

@@ -48,7 +48,9 @@ final class PublishedConnectorArtifacts {
             "db2", new Artifact(203_082_147,
                     "3c7c34e54e110402dca4699ecafce9aa04f719457fccba14e3b759d8e8fdb500"),
             "db2i", new Artifact(34_343_764,
-                    "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff"));
+                    "510a34799ee3dc8d55a5f8205d1a96209b45679d68eed4f5283b87289e1848ff"),
+            "dummy", new Artifact(24_121_809,
+                    "fb8bb372cd1fedc0ec43e27dd839b91feee36a70a89adfaae6b6fd788c3352f3"));
 
     /** Connector ids pinned to an expected {@code <id>-connector.jar} asset and trusted digest. */
     static final List<String> IDS = List.copyOf(ARTIFACTS.keySet());

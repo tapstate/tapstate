@@ -986,10 +986,12 @@ def event_snapshot(root, payload, environment):
         require(environment['GITHUB_HEAD_REF'] == head['ref'] and environment['GITHUB_BASE_REF'] == base['ref'],
                 'PR event refs differ from runner refs')
         require(value['ref'] == f'refs/pull/{number}/merge', 'PR checkout is not the merge ref')
-        require(parents == [sha(base['sha'], 'PR base'), sha(head['sha'], 'PR head')],
-                'checkout parents differ from original PR base/head')
-        value['pull_request'] = dict(number=number, action=payload['action'], head_sha=head['sha'],
-                                     base_sha=base['sha'], head_ref=head['ref'], base_ref=base['ref'],
+        base_sha = sha(base['sha'], 'PR base')
+        head_sha = sha(head['sha'], 'PR head')
+        require(len(parents) == 2 and parents[1] == head_sha,
+                'checkout is not a two-parent merge with the original PR head')
+        value['pull_request'] = dict(number=number, action=payload['action'], head_sha=head_sha,
+                                     base_sha=base_sha, head_ref=head['ref'], base_ref=base['ref'],
                                      head_repository=head['repo']['full_name'], base_repository=repository,
                                      **event_labels(pr))
     else:
@@ -1006,6 +1008,12 @@ def event_inputs(args):
     path = Path(os.environ['GITHUB_EVENT_PATH'])
     value = event_snapshot(Path(args.root).resolve(), json.loads(path.read_text()), os.environ)
     write(Path(args.output), value)
+    if 'pull_request' in value:
+        event_base = value['pull_request']['base_sha']
+        checkout_base = value['checkout_parents'][0]
+        if event_base != checkout_base:
+            print(f'::warning title=PR base SHA differs::Event base {event_base} differs from checkout base '
+                  f'{checkout_base}. Testing checkout {value["checkout_sha"]}.')
 
 
 def archived_attempt_history(run, files, raw, parse_json):

@@ -1,4 +1,4 @@
-# Connector seed directory (optional)
+# Connector seed directory
 
 This directory is bind-mounted into the server as its connector seed directory. Drop connector
 `*.jar` files here **before** starting the stack and each one is registered once, at server
@@ -148,16 +148,15 @@ Tapstate does not yet reject that configuration before starting.
 
 A refusal is reported for that jar alone and the seed sweep carries on with the rest.
 
-It is **not** how a connector is normally registered, and it is **not** a precondition for
-registration. The usual path is:
+To add a connector to an already initialized deployment, use:
 
 ```
 tapstate register <path-to-jar-or-published-id>
 ```
 
 which uploads the jar's bytes to the running server over HTTP -- no mount, and nothing in this
-directory, is involved. Registering that way works whether or not this directory exists or holds
-anything. **Leaving this directory empty is the expected case.**
+directory, is involved. Quickstart stages the MongoDB connector here before configuring its default
+views target.
 
 Notes:
 
