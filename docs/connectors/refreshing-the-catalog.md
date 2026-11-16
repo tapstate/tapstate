@@ -230,3 +230,8 @@ appearance and fallback independently from the code's business outcome.
 
 The current server assembly keeps the existing response and write formats. Diagnostic snapshots
 and extended writes are exercised in the isolated assembly against a selected CACHE binding.
+
+Before enabling extended writes, retain a packaged reader that accepts the complete stored
+diagnostic shape, including verification status. Compare existing report reads before the new
+writer starts, then repeat the reads after returning to the retained reader on the same CACHE.
+A build that rejects a field in the retained diagnostic requires an earlier rollback boundary.
