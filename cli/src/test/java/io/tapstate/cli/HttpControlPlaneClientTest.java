@@ -1557,6 +1557,29 @@ class HttpControlPlaneClientTest {
                 .isInstanceOf(ConnectionTestResultOutcome.Unreachable.class);
     }
 
+    @Test
+    void preservesTheDiagnosticOfARefusedConnectionRequestInBothPaths() throws Exception {
+        HttpServer server = apiServer("/api/connections", 500, """
+                {"code":"connector.test-failed","message":"Unable to run the test",
+                 "params":{"connector":"postgres"},
+                 "diagnostic":{"causes":[{"code":"DRIVER"}],"truncated":true}}
+                """, new AtomicReference<>());
+        try {
+            var client = new HttpControlPlaneClient();
+            var params = Map.<String, Object>of("connector", "postgres");
+            var diagnostic = Map.<String, Object>of(
+                    "causes", List.of(Map.of("code", "DRIVER")), "truncated", true);
+            assertThat(client.test(baseOf(server), "tok", "orders", "postgres", Map.of()))
+                    .isEqualTo(new ConnectionTestOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+            assertThat(client.testResult(baseOf(server), "tok", "orders"))
+                    .isEqualTo(new ConnectionTestResultOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+        } finally {
+            server.stop(0);
+        }
+    }
+
     // --- schema discovery: POST /api/connections:discover-schema, decodes the discovered model ---------
 
     private static final String SCHEMA_BODY =

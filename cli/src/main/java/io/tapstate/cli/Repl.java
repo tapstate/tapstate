@@ -2469,7 +2469,8 @@ final class Repl {
                 renderReport(tested.report(), chosen);
                 yield reportStatus(tested.report());
             }
-            case ConnectionTestOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ConnectionTestOutcome.Rejected rejected -> renderConnectionRejection(
+                    rejected.code(), rejected.message(), rejected.params(), rejected.diagnostic(), chosen);
             case ConnectionTestOutcome.TimedOut ignored -> reportRequestTimedOut();
             case ConnectionTestOutcome.Unreachable ignored -> reportRequestFailed();
         };
@@ -2660,7 +2661,8 @@ final class Repl {
                 err.flush();
                 yield Cli.EXIT_DIAGNOSTIC;
             }
-            case ConnectionTestResultOutcome.Rejected rejected -> renderRejection(rejected.code(), rejected.message());
+            case ConnectionTestResultOutcome.Rejected rejected -> renderConnectionRejection(
+                    rejected.code(), rejected.message(), rejected.params(), rejected.diagnostic(), parsed.format());
             case ConnectionTestResultOutcome.Unreachable ignored -> reportRequestFailed();
         };
     }
@@ -3607,6 +3609,24 @@ final class Repl {
         if (Boolean.TRUE.equals(node.get("truncated"))) {
             out.println(indent + "[Diagnostic truncated]");
         }
+    }
+
+    private int renderConnectionRejection(
+            String code, String message, Map<String, Object> params, Map<String, Object> diagnostic,
+            OutputFormat format) {
+        if (diagnostic.isEmpty()) {
+            return renderRejection(code, message);
+        }
+        PrintWriter err = commandLine.getErr();
+        if (format == OutputFormat.TEXT) {
+            renderRejection(code, message, params);
+            renderConnectionDiagnostic(err, diagnostic, "  ");
+        } else {
+            var body = Map.of("code", code, "message", message, "params", params, "diagnostic", diagnostic);
+            err.println(format == OutputFormat.JSON ? JsonOut.write(body) : YamlOut.write(body));
+        }
+        err.flush();
+        return Cli.EXIT_DIAGNOSTIC;
     }
 
     /**

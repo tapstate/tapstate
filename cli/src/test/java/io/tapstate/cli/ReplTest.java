@@ -3002,6 +3002,24 @@ class ReplTest {
     }
 
     @Test
+    void aRefusedConnectionTestKeepsTheDiagnosticAndLegacyParametersInJson() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        var diagnostic = Map.<String, Object>of("cause", Map.of("message", "Peer reset"));
+        var params = Map.<String, Object>of("connector", "mongodb");
+        client.testOutcome = new ConnectionTestOutcome.Rejected(
+                "connector.test-failed", "Unable to run the test", params, diagnostic);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("test my-mongo -o json");
+
+        assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
+                .isEqualTo(Map.of("code", "connector.test-failed", "message", "Unable to run the test",
+                        "params", params, "diagnostic", diagnostic));
+    }
+
+    @Test
     void testOfflineReportsThatAConnectionIsRequired() {
         Harness h = harness(Path.of("tap-work"));
 
