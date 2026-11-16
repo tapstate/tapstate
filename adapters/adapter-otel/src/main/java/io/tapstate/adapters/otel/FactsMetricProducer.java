@@ -22,6 +22,7 @@ import io.tapstate.core.lifecycle.MetricType;
 import io.tapstate.core.lifecycle.PipelineState;
 
 import java.time.Instant;
+import java.util.function.BooleanSupplier;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -107,25 +108,35 @@ final class FactsMetricProducer implements MetricProducer {
 
     /** Holds {@code facts} as the latest of {@code pipelineId}, folded to the budget on the way in. */
     void offer(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts) {
+        offerIfCurrent(pipelineId, state, observedAt, facts, () -> true);
+    }
+
+    void offerIfCurrent(String pipelineId, PipelineState state, Instant observedAt, List<MetricFact> facts,
+            BooleanSupplier current) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(facts, "facts");
         List<MetricFact> folded = new ArrayList<>(facts.size());
         // The folder remembers which values it named; one offer at a time keeps that memory whole.
         synchronized (folder) {
+            if (!current.getAsBoolean()) {
+                return;
+            }
             for (MetricFact fact : facts) {
                 folded.add(folder.fold(fact));
             }
+            if (current.getAsBoolean()) {
+                latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
+            }
         }
-        latest.put(pipelineId, new Offered(state, observedAt, List.copyOf(folded)));
     }
 
     /** Drops what is held for every pipeline outside {@code pipelineIds}; their series stop with the next collection. */
     void forgetPipelinesOutside(Collection<String> pipelineIds) {
         Set<String> kept = Set.copyOf(pipelineIds);
-        latest.keySet().retainAll(kept);
         // The per-pipeline fold remembers which values of each open dimension it named, and that memory
         // has the same expiry as the names below: it belongs to a pipeline, and the pipeline is gone.
         synchronized (folder) {
+            latest.keySet().retainAll(kept);
             folder.forgetPipelinesOutside(kept);
         }
         // The names go with the pipelines they were held for. A name is a promise to a chart: this series

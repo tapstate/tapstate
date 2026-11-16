@@ -1008,6 +1008,18 @@ final class PipelineActuationOwnership {
         return proveClaim(scope, expected, true);
     }
 
+    /** Reports against the original claim without holding the serialized actuation IO lock. */
+    boolean proveObservationClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
+        if (!admission.enter()) {
+            return false;
+        }
+        try {
+            return admission.current() && proveClaimOwned(scope, expected, true, false);
+        } finally {
+            admission.leave();
+        }
+    }
+
     /** Retries only the start's proof read, under the same admission deadline. */
     boolean proveStartClaim(PipelineIntentScope scope, WorkloadClaimFence expected) {
         return admittedCall(() -> proveClaimOwned(scope, expected, true, true), () -> false);

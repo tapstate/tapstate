@@ -8,6 +8,7 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.function.BooleanSupplier;
 import java.util.function.*;
 
 /** Bounded production feed. The two evaluation workers own no transport and never run convergence. */
@@ -134,6 +135,19 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void published(PipelineConvergencePass pass, Observation observation, Throwable cause) {
         if (pass == null || closed.get()) return;
         Slot slot = slot(pass); if (slot == null) return;
+        publish(slot, observation, cause, () -> true);
+    }
+
+    @Override public void publishedPeriodic(PipelineConvergencePass pass, Observation observation, BooleanSupplier current) {
+        if (closed.get() || !current.getAsBoolean()) return;
+        Slot slot = slots.get(pass.scope().pipelineId());
+        // Only convergence can install a producer. A delayed worker cannot reinstate its old slot.
+        if (slot != null && slot.producer.equals(new Producer(pass.scope(), pass.claim(), pass.intent()))) {
+            publish(slot, observation, null, current);
+        }
+    }
+
+    private void publish(Slot slot, Observation observation, Throwable cause, BooleanSupplier current) {
         long sequence = slot.sequence.getAndIncrement();
         int bytes = inputBytes(observation);
         if (bytes < 0 || observation.observedAt() == null || observation.observedAt().isAfter(clock.instant())) {
@@ -146,6 +160,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         var capturedRules = rules.get();
         submit(slot, bytes + 16 * 1024, () -> {
             requireCurrent(slot);
+            if (!current.getAsBoolean()) return;
             long interruption = slot.interruptions.get();
             slot.actual = original.state();
             if (slot.publication == null || original.observedAt().isAfter(slot.publication)) slot.publication = original.observedAt();

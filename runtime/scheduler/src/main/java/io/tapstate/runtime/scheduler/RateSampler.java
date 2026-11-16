@@ -15,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -47,6 +48,7 @@ public final class RateSampler {
     private final Duration interval;
     private record Cadence(Object scope, Instant at) {}
     private final Map<String, Cadence> lastSampledAt = new ConcurrentHashMap<>();
+    private final Set<String> appending = ConcurrentHashMap.newKeySet();
 
     public RateSampler(RateHistoryStore history, Duration interval) {
         this.history = Objects.requireNonNull(history, "history");
@@ -80,12 +82,20 @@ public final class RateSampler {
         if (sample == null) {
             return;
         }
-        Cadence last = lastSampledAt.get(observation.pipelineId());
-        if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
+        String pipelineId = observation.pipelineId();
+        if (!appending.add(pipelineId)) {
             return;
         }
-        destination.append(sample);
-        lastSampledAt.put(observation.pipelineId(), new Cadence(key, observation.observedAt()));
+        try {
+            Cadence last = lastSampledAt.get(pipelineId);
+            if (last != null && key.equals(last.scope()) && observation.observedAt().isBefore(last.at().plus(interval))) {
+                return;
+            }
+            destination.append(sample);
+            lastSampledAt.put(pipelineId, new Cadence(key, observation.observedAt()));
+        } finally {
+            appending.remove(pipelineId);
+        }
     }
 
     /** Drops the cadence bookkeeping of every pipeline outside {@code live}, which is the set that still exists. */

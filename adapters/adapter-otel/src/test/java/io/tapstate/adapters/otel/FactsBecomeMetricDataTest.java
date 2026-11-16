@@ -115,6 +115,18 @@ class FactsBecomeMetricDataTest {
     }
 
     @Test
+    void aRevokedPeriodicOfferCannotReplaceTheTerminalExport() {
+        producer.offer("a", PipelineState.STOPPED, AT, List.of());
+        var checks = new java.util.concurrent.atomic.AtomicInteger();
+        producer.offerIfCurrent("a", PipelineState.RUNNING, AT, List.of(Facts.records("a", 1, 1)),
+                () -> checks.getAndIncrement() == 0);
+
+        var state = only(producer.produce(Resource.empty()), FactsMetricProducer.STATE_METRIC)
+                .getLongGaugeData().getPoints();
+        assertThat(with(state, FactsMetricProducer.STATE_ATTRIBUTE, "stopped").getValue()).isEqualTo(1L);
+    }
+
+    @Test
     void aLaterOfferReplacesThePipelinesFactsAndAForgottenPipelinesSeriesStop() {
         producer.offer("a", PipelineState.RUNNING, AT, List.of(Facts.records("a", 1, 1)));
         producer.offer("b", PipelineState.RUNNING, AT, List.of(Facts.records("b", 2, 2)));

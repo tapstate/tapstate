@@ -4,8 +4,10 @@ import io.tapstate.core.lifecycle.NestColdLayerPressure;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.NestStateWindow;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -33,8 +35,7 @@ import java.util.Set;
  * be differenced against each other's counts — and a joined name would answer that with a separator that
  * has to be absent from every pipeline id there will ever be.
  *
- * <p>Not thread-safe, and does not need to be: it is fed from the pass that publishes observations, which
- * is one caller at a time.
+ * <p>Protects the accumulated readings from concurrent publishers. Notifications run outside the lock.
  */
 public final class NestColdLayerWatch {
 
@@ -55,23 +56,30 @@ public final class NestColdLayerWatch {
     public void saw(String pipelineId, Map<String, NestStateReading> readings) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         Objects.requireNonNull(readings, "readings");
-        Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
-        held.keySet().retainAll(readings.keySet());
-        readings.forEach((namespace, reading) -> judge(pipelineId, held, namespace, reading));
-        if (held.isEmpty()) {
-            byPipeline.remove(pipelineId);
+        List<Runnable> notices = new ArrayList<>();
+        synchronized (byPipeline) {
+            Map<String, Seen> held = byPipeline.computeIfAbsent(pipelineId, ignored -> new HashMap<>());
+            held.keySet().retainAll(readings.keySet());
+            readings.forEach((namespace, reading) -> judge(pipelineId, held, namespace, reading, notices));
+            if (held.isEmpty()) {
+                byPipeline.remove(pipelineId);
+            }
         }
+        notices.forEach(Runnable::run);
     }
 
     /** Which namespaces are currently held, as pipeline and namespace together — what a caller asserts on. */
     Set<String> watching() {
         Set<String> held = new HashSet<>();
-        byPipeline.forEach((pipelineId, namespaces) ->
-                namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
+        synchronized (byPipeline) {
+            byPipeline.forEach((pipelineId, namespaces) ->
+                    namespaces.keySet().forEach(namespace -> held.add(pipelineId + "/" + namespace)));
+        }
         return held;
     }
 
-    private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading) {
+    private void judge(String pipelineId, Map<String, Seen> held, String namespace, NestStateReading reading,
+            List<Runnable> notices) {
         Seen before = held.get(namespace);
         boolean wasOver = before != null && before.over();
         if (reading.keyAccess() != null && !reading.keyAccess().available()) {
@@ -109,9 +117,9 @@ public final class NestColdLayerWatch {
         }
         held.put(namespace, new Seen(reading, reading, nowOver, healthy));
         if (nowOver && !wasOver) {
-            alert.crossed(pipelineId, namespace, window);
+            notices.add(() -> alert.crossed(pipelineId, namespace, window));
         } else if (!nowOver && wasOver) {
-            alert.cleared(pipelineId, namespace, window);
+            notices.add(() -> alert.cleared(pipelineId, namespace, window));
         }
     }
 

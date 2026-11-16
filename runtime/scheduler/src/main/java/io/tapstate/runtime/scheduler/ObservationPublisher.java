@@ -4,6 +4,7 @@ import io.tapstate.core.event.Op;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.PipelineIntentScope;
+import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.core.lifecycle.CaptureReading;
 import io.tapstate.core.lifecycle.DeliveryReading;
 import io.tapstate.core.lifecycle.FlatMetricProjection;
@@ -44,6 +45,7 @@ import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -797,12 +799,34 @@ public final class ObservationPublisher {
                 Objects.requireNonNull(scopedObservations, "scopedObservations"), true);
     }
 
+    /**
+     * Publishes a periodic RUNNING reading for the checkpoint and claim captured by convergence.
+     * A stale request never measures the successor by pipeline ID or refreshes its last observation.
+     */
+    public Optional<Observation> publishRunningScoped(PipelineIntentScope scope, CheckpointDoc checkpoint,
+            ObservationStore observations, BooleanSupplier stillCurrent) {
+        if (!scope.pipelineId().equals(checkpoint.pipelineId())
+                || StateJson.parse(checkpoint.stateJson()) != PipelineState.RUNNING) {
+            throw new IllegalArgumentException("periodic observations require the original running checkpoint");
+        }
+        return publishCheckpoint(Optional.of(checkpoint), null, observations, true, stillCurrent);
+    }
+
     private Optional<Observation> publish(String pipelineId, ObservationFailure failure, StateStore state,
             ObservationStore observations, boolean requirePreparedState) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         var current = state.read(pipelineId);
         if (requirePreparedState && current.isEmpty()) throw missingCheckpoint(pipelineId);
-        return current.map(checkpoint -> {
+        return publishCheckpoint(current, failure, observations, requirePreparedState, () -> true);
+    }
+
+    private Optional<Observation> publishCheckpoint(Optional<CheckpointDoc> expected, ObservationFailure failure,
+            ObservationStore observations, boolean requirePreparedState, BooleanSupplier stillCurrent) {
+        return expected.flatMap(checkpoint -> {
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
+            String pipelineId = checkpoint.pipelineId();
             PipelineState actual = StateJson.parse(checkpoint.stateJson());
             if (actual == PipelineState.COMPLETED) {
                 Optional<Observation> previous = observations.read(pipelineId)
@@ -818,7 +842,7 @@ public final class ObservationPublisher {
                             retainedMetrics, last.snapshot(),
                             last.positions(), null, observedNow(), retained, terminalLoad(pipelineId, last));
                     save(observations, terminal, requirePreparedState ? checkpoint.epoch() : null);
-                    return terminal;
+                    return Optional.of(terminal);
                 }
             }
             ObservationFailure carried = failure;
@@ -868,14 +892,20 @@ public final class ObservationPublisher {
             }
             // Both paths use the original observation port. Its scope, checkpoint and claim checks
             // remain authoritative, and a refusal here cannot be mistaken for unreadable telemetry.
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
             save(observations, published, requirePreparedState ? checkpoint.epoch() : null);
+            if (!stillCurrent.getAsBoolean()) {
+                return Optional.empty();
+            }
             if (measuredSuccessfully) {
                 coldLayer.saw(pipelineId, readings);
                 frontierStall.saw(pipelineId, pinned, gaps);
             }
             // Handed back so that whoever runs the pass can take a sample off exactly what was published,
             // at the time it was published, rather than reading it back or measuring it again.
-            return published;
+            return Optional.of(published);
         });
     }
 

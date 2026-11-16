@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -102,6 +103,23 @@ class ObservationPublisherTest {
         public void cleared(String pipelineId, String namespace, NestStateWindow window) {
             cleared.add(namespace);
         }
+    }
+
+    @Test
+    void aPeriodicReadingLosesItsOriginalExecutionWhileCollecting() {
+        state.seed("orders", PipelineState.RUNNING);
+        var previous = publisher.publish("orders").orElseThrow();
+        var checkpoint = state.read("orders").orElseThrow();
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var current = new AtomicBoolean(true);
+        var collecting = withWatch(NestColdLayerAlert.NONE, id -> {
+            current.set(false);
+            return Map.of("nest.orders", new NestStateReading(8, 100, 400, 2_000));
+        });
+
+        assertThat(collecting.publishRunningScoped(scope, checkpoint, observations, current::get)).isEmpty();
+        assertThat(current).isFalse();
+        assertThat(observations.read("orders").orElseThrow()).isSameAs(previous);
     }
 
     @Test
