@@ -219,23 +219,35 @@ level with many elements is rewritten and re-folded on every change to any of th
 
 ### How wide a rollup level can be
 
-Measured on a 2-CPU / 8 GB engine with one shared MongoDB, one level of five-column rows:
+Every change to a document rewrites the document's stored state and refolds its rollup levels, so what a change
+costs grows with how heavy the document is - its elements times how wide each element is - not with the element
+count alone. Measured on a 2-CPU engine with one shared MongoDB:
 
-| Elements per document | Render per send, 1 field / 5 fields | Changes per second one document sustains |
-|---:|---|---|
-| 10 | 0.04 / 0.15 ms | as many as a plain array (the engine's own ceiling) |
-| 100 | 0.09 / 0.33 ms | as many as a plain array |
-| 1,000 | 0.4 / 1.6 ms | as many as a plain array |
-| 10,000 | 4.5 / 17 ms | fewer than 25, where the same level as a plain array sustains 50 |
+| One document holding | State | Changes per second it keeps up with |
+|---|---:|---|
+| 1,000 elements of 5 columns | ~0.3 MB | 50 |
+| 1,000 to 5,000 elements of 30 columns | ~0.9 to 4.3 MB | 25, not 50 |
+| 10,000 elements of 5 columns | ~3 MB | fewer than 25 |
 
-**Keep a rollup level to about 1,000 elements per document.** Up to there rollup fields cost nothing a
-nest's own throughput would notice; at 10,000 the document falls behind at a few dozen changes a second.
-Beyond 1,000 elements, compute the value in the target or wait for the cross-row step.
+**Keep a document with rollup fields under about 1 MB of state.** An element takes about 100 bytes plus 25 per
+column, so that is about 3,300 elements of narrow rows and about 1,100 of 30-column rows. Rendering one
+thousand elements takes about 0.4 ms per field for narrow rows and up to 2 ms for wide ones.
+
+You are told when a level is past that, twice:
+
+- **When the pipeline is applied**, `nest.rollup-level-wide` names each level whose discovered tables average
+  more elements per document than its width allows (its rows over its parent level's rows). An average cannot
+  see one unusually wide document, and a level nobody discovered is not estimated.
+- **While it runs**, the engine logs `nest.rollup-level-wide` once for each document that grows past the
+  boundary of its rollups' width.
+
+Beyond that, compute the value outside the document's render: in the target, or with a cross-row computation
+keyed by the parent once one is available.
 
 Independent of rollups, a nest level also meets these limits as it widens: a snapshot that reads more than
 10,000 children before their parent row stops with `nest.pending-limit-exceeded`; a document holds 20,000
-elements by default (`max_elements_per_document`); and a root's stored state, about 300 bytes per element at
-this row width, must fit one MongoDB document, which it outgrows just under 50,000 elements.
+elements by default (`max_elements_per_document`); and a document's stored state must fit one MongoDB document
+(16 MB) across all its levels together.
 
 ## When to use something else
 
@@ -254,7 +266,7 @@ the target or in a `js` step.
 |---|---|
 | No arithmetic on decimals inside expressions | `=after.qty * after.unit_price` over decimals is refused at apply |
 | `sum` and `avg` need a known type | a rollup over an undiscovered source, or over a decimal a `map` computed, can count, but not sum |
-| Recompute on every send | a document with very many elements per rollup level pays a full walk per send; keep it to about 1,000 |
+| Recompute on every send | a heavy document pays a full rewrite and refold per change; keep it under about 1 MB |
 | Changing a level from `as: array` to `as: rollup` changes its state identity | the level's stored rows are not carried over; plan such a change as a rebuild |
 | No time-driven re-render | a filter that compares with the current time is right only as of the last change to the document |
 | Data validation does not check rollup fields | validating a nest that declares rollup fields is refused rather than compared |

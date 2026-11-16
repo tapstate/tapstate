@@ -367,6 +367,7 @@ nest.resolver-vertex-limit-exceeded
 nest.rollup-evaluation-failed
 nest.rollup-expression-invalid
 nest.rollup-field-conflict
+nest.rollup-level-wide
 nest.rollup-on-reference-embed
 nest.rollup-overflow
 nest.rollup-result-not-convertible

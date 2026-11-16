@@ -20,6 +20,7 @@ import java.util.Set;
  * @param argumentType what the argument was declared to be; the fold refuses a value of another type
  * @param resultType the type of the field's value after any {@code type:} conversion
  * @param references the reference paths the field's expressions read
+ * @param elementBoundary how many elements its level should hold per document, for the level's row width
  */
 public record RollupSpec(
         String field,
@@ -31,7 +32,8 @@ public record RollupSpec(
         ValueType resultType,
         RollupResultType convert,
         Object defaultValue,
-        Set<String> references) implements Serializable {
+        Set<String> references,
+        long elementBoundary) implements Serializable {
 
     private static final long serialVersionUID = 1L;
 

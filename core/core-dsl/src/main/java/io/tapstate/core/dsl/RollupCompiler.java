@@ -5,6 +5,7 @@ import io.tapstate.core.common.TapstateType;
 import io.tapstate.core.dsl.aggregate.AggregateFunction;
 import io.tapstate.core.dsl.aggregate.Aggregates;
 import io.tapstate.core.dsl.aggregate.RollupError;
+import io.tapstate.core.dsl.aggregate.RollupGuidance;
 import io.tapstate.core.dsl.aggregate.RollupScope;
 import io.tapstate.core.dsl.aggregate.RollupSpec;
 import io.tapstate.core.dsl.aggregate.ValueType;
@@ -80,7 +81,8 @@ public final class RollupCompiler {
             throw invalid(name, "default", refused.getMessage());
         }
         return new RollupSpec(name, function, argument, by, filter, argumentType, resultType, field.type(),
-                defaultValue, references);
+                defaultValue, references,
+                RollupGuidance.elementsPerDocument(scope.columnsKnown() ? scope.columns().size() : 0));
     }
 
     private static ValueType typed(String name, String part, String expr, RollupScope scope, boolean predicate,
