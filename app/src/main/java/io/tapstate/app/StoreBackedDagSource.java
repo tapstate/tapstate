@@ -3493,7 +3493,9 @@ final class StoreBackedDagSource implements DagSource {
         }
         Map<String, io.tapstate.core.dsl.aggregate.ValueType> types = new LinkedHashMap<>();
         columns.columns().forEach((name, declared) -> {
-            io.tapstate.core.common.TapstateType type = JoinSchemaDrift.typeOf(declared);
+            // A column whose type nothing declared stays untyped, rather than failing the whole level.
+            io.tapstate.core.common.TapstateType type = declared == null
+                    ? io.tapstate.core.common.TapstateType.UNKNOWN : JoinSchemaDrift.typeOf(declared);
             var numeric = columns.numericTypes().get(name);
             Integer scale = type == io.tapstate.core.common.TapstateType.DECIMAL && numeric != null
                     ? numeric.scale() : null;

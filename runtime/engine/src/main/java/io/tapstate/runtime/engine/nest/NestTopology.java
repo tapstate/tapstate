@@ -657,7 +657,7 @@ public record NestTopology(List<NestVertex> vertices, List<NestStream> streams, 
 
     /**
      * Refuses a rollup field whose name is already taken where it lands: by a column of the parent row, an
-     * embed's path, a flat field, or another rollup field, from this embed or a sibling. The ADR-0115 pass
+     * embed's path, a flat field, or another rollup field, from this embed or a sibling. The existing pass
      * for flat fields, widened to the one namespace every field of a level shares. A model that was not
      * discovered contributes nothing here, and the render checks the actual row the same way.
      */

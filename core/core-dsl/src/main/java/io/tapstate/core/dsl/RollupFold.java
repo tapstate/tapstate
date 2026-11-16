@@ -49,6 +49,12 @@ public final class RollupFold {
      * names the document in a refusal.
      */
     public static Map<String, Object> apply(List<RollupSpec> specs, List<RollupElement> elements, String root) {
+        // A refusal names the document; one nobody named is still refused, under a name that says so.
+        String named = root == null ? "(document)" : root;
+        return fold(specs, elements, named);
+    }
+
+    private static Map<String, Object> fold(List<RollupSpec> specs, List<RollupElement> elements, String root) {
         Map<String, Object> results = new LinkedHashMap<>();
         if (specs.isEmpty()) {
             return results;

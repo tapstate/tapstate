@@ -143,9 +143,9 @@ class RollupFieldsFoldExactlyTest {
     @Test
     void numbersCompareByValueAndStringsByCodePoint() {
         List<RollupElement> elements = List.of(
-                element(1, row("sku", "😀")), element(2, row("sku", "￿")), element(3, row("sku", "Z")));
+                element(1, row("sku", "\uD83D\uDE00")), element(2, row("sku", "\uFFFF")), element(3, row("sku", "Z")));
         assertThat(fold(Map.of("hi", field(RollupFunction.MAX, "$sku")), elements))
-                .containsEntry("hi", "😀");
+                .containsEntry("hi", "\uD83D\uDE00");
         List<RollupElement> prices = List.of(element(1, row("price", new BigDecimal("2.50"))),
                 element(2, row("price", new BigDecimal("2.5"))), element(3, row("price", new BigDecimal("1.25"))));
         assertThat(fold(Map.of("distinct", field(RollupFunction.COUNT_DISTINCT, "$price")), prices))
@@ -325,6 +325,17 @@ class RollupFieldsFoldExactlyTest {
                 RollupField.of(RollupFunction.SUM, "=after.amount * after.prize.valeu", null, null, null), scope))
                 .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(RollupError.EXPRESSION_INVALID))
                 .satisfies(e -> assertThat(((TapstateException) e).args()).containsEntry("part", "argument"));
+    }
+
+    @Test
+    void anExpressionThatFailsOnAnUnnamedDocumentIsStillRefusedWithItsCode() {
+        RollupScope untyped = new RollupScope(Map.of(), false, Map.of(), Map.of(), Map.of());
+        RollupSpec spec = RollupCompiler.compile("n",
+                RollupField.of(RollupFunction.COUNT, true, "=after.qty + 1 > 0", null, null), untyped);
+        assertThatThrownBy(() -> RollupFold.apply(List.of(spec), List.of(element(1, row("qty", "not a number"))), null))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code()).isEqualTo(RollupError.EVALUATION_FAILED))
+                .satisfies(e -> assertThat(((TapstateException) e).args()).containsEntry("root", "(document)"));
     }
 
     // ---- helpers ------------------------------------------------------------------------------------
