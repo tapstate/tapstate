@@ -57,7 +57,7 @@ class OrderedBytesSortAsTheValuesDoTest {
     void textSortsByCodePoint() {
         String astral = new String(Character.toChars(0x1F600));
         inOrder(List.of("", "\u0000", "\u0000a", "\u0001", "A", "Z", "a", "a\u0000", "a\u0000b", "a\u0001", "aa",
-                "b", "é", "߿", "ࠀ", "\ud800", "￿", astral, astral + "a"));
+                "b", "é", "\u07ff", "\u0800", "\ud800", "\uffff", astral, astral + "a"));
         Random random = new Random(12);
         int[] points = {0, 1, 'a', 'b', 0x7f, 0x80, 0x7ff, 0x800, 0xd7ff, 0xd800, 0xdfff, 0xe000, 0xffff, 0x10000, 0x10ffff};
         agrees(random, 4000, r -> {
