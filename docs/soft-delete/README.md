@@ -76,6 +76,10 @@ transforms:
 Here a deleted e-mail stays in `emails` marked deleted, a deleted phone leaves `phones`, and a deleted
 player keeps its document marked deleted.
 
+The documents are still written to the root table's name and upserted by the root's key when the root
+is fed through a map, as here, or a filter. A root fed through any other step (a `js` step, a union)
+loses that: the target is named after the step and has no key to upsert by.
+
 When a source cascades a parent delete to its children, each child delete arrives as its own event, so
 the children are marked too if their stream passes through a soft-delete step. Marking a document's
 children when only the parent row is deleted is not done.

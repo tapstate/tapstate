@@ -20,7 +20,7 @@ transforms:
       key: [ id ]
       embed:
         - { from: e, on: { player_id: id }, as: array, path: emails, arrayKey: [ id ] }
-view:
-  id: sd_player_state
+serve:
   from: sd_player_doc
-  primary_key: id
+  sync:
+    - source: tgt_sd_mongo

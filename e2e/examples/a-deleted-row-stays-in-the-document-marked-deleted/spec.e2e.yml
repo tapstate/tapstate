@@ -17,6 +17,11 @@
 #   stays at two and the document reads back with its own column and the marker set, and its child
 #   is still embedded: the root was kept, not re-created empty.
 #
+# - The documents are written through a serve sync, not a managed view, so nothing outside the
+#   pipeline names the target's key. The target collection takes the root table's name and the
+#   count holds at two across every change: a nest root fed by a step must still upsert by the root
+#   key rather than append a document per change or name the collection after the step.
+#
 # - The other document is held to its pre-delete state after each delete, so a marker that reached
 #   across documents shows up there and nowhere else.
 #
@@ -31,10 +36,9 @@ name: a-deleted-row-stays-in-the-document-marked-deleted
 setup:
   databases:
     src: { kind: mysql }
-    store: { kind: mongo }
+    tgt: { kind: mongo }
   connectors: [mysql, mongodb]
-  managed_target: views.tap.yml
-  apply: [src_sd_players.tap.yml, src_sd_emails.tap.yml, pipeline.tap.yml]
+  apply: [src_sd_players.tap.yml, src_sd_emails.tap.yml, tgt_sd_mongo.tap.yml, pipeline.tap.yml]
   discover: [src_sd_players, src_sd_emails]
 pipeline: pipeline.tap.yml
 seed:
@@ -48,15 +52,16 @@ seed:
       - { id: 2, player_id: 2, email: grace@example.com }
 steps:
   - start
-  - await: { count: { views.sd_player_state: 2 } }
-  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
-  - await: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { name: grace, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - await: { count: { tgt_sd_mongo.sd_players: 2 } }
+  - await: { doc: { tgt_sd_mongo.sd_players: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - await: { doc: { tgt_sd_mongo.sd_players: { where: { id: 2 }, expect: { name: grace, is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
   - cdc: { src_sd_emails.sd_emails: { delete: { where: { id: 1 } } } }
-  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": true, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }
-  - assert: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
+  - await: { doc: { tgt_sd_mongo.sd_players: { where: { id: 1 }, expect: { name: ada, is_deleted: false, "emails[0].is_deleted": true, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }
+  - assert: { doc: { tgt_sd_mongo.sd_players: { where: { id: 2 }, expect: { is_deleted: false, "emails[0].is_deleted": false }, size: { emails: 1 } } } }
   - cdc: { src_sd_players.sd_players: { delete: { where: { id: 2 } } } }
-  - await: { doc: { views.sd_player_state: { where: { id: 2 }, expect: { name: grace, is_deleted: true, "emails[0].email": grace@example.com }, size: { emails: 1 } } } }
-  - assert: { count: { views.sd_player_state: 2 } }
-  - assert: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { is_deleted: false } } } }
+  - await: { doc: { tgt_sd_mongo.sd_players: { where: { id: 2 }, expect: { name: grace, is_deleted: true, "emails[0].email": grace@example.com }, size: { emails: 1 } } } }
+  - assert: { count: { tgt_sd_mongo.sd_players: 2 } }
+  - assert: { doc: { tgt_sd_mongo.sd_players: { where: { id: 1 }, expect: { is_deleted: false } } } }
   - cdc: { src_sd_emails.sd_emails: { insert: { values: [ { id: 1, player_id: 1, email: ada@example.com } ] } } }
-  - await: { doc: { views.sd_player_state: { where: { id: 1 }, expect: { "emails[0].is_deleted": false, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }
+  - await: { doc: { tgt_sd_mongo.sd_players: { where: { id: 1 }, expect: { "emails[0].is_deleted": false, "emails[0].email": ada@example.com }, size: { emails: 1 } } } }
+  - assert: { count: { tgt_sd_mongo.sd_players: 2 } }
