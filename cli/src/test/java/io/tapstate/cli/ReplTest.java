@@ -5665,10 +5665,10 @@ class ReplTest {
     void anAggregateStepsLineSaysWhatIsNotKnownRatherThanLeavingItOut() {
         // A line with no estimate and no count on it would read as a step that costs nothing.
         assertThat(Repl.aggregateLine(new ExplainOutcome.Aggregate("by_region", 3, List.of("most"), 1_000L, 3_000L, 2_400L)))
-                .isEqualTo("  aggregate  by_region: 3 state entries per input row (2, and 1 each for most);"
+                .isEqualTo("  aggregate  by_region: up to 3 state entries per input row (2, and 1 each for most);"
                         + " about 3000 for 1000 input rows; 2400 stored at the last count");
         assertThat(Repl.aggregateLine(new ExplainOutcome.Aggregate("by_region", 2, List.of(), null, null, null)))
-                .isEqualTo("  aggregate  by_region: 2 state entries per input row;"
+                .isEqualTo("  aggregate  by_region: up to 2 state entries per input row;"
                         + " input size unknown, so no estimate; not counted yet");
     }
 

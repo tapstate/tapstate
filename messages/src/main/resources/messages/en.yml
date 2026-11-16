@@ -1500,10 +1500,10 @@ aggregate.result-not-convertible:
   message: "Aggregate step `{step}`, field `{field}` of group {group} is the {from} value that `type: {to}` cannot hold exactly."
   solution: "Drop `type:` to keep the exact value, or convert to a type that holds it (`decimal` holds every integer and decimal). The group keeps its last good values meanwhile."
 aggregate.state-estimate:
-  message: "Aggregate step `{step}` of pipeline {pipeline} keeps {entriesPerRow} state entries per input row: about {estimatedEntries} for the {inputRows} rows its inputs hold."
-  solution: "Nothing to fix. This is what the step stores to keep its totals exact through restarts and replays, and it holds the input's values. A field that keeps its inputs (min, max, first, last, a distinct count) adds one entry per row; `explain` shows the estimate beside what the running step counted."
+  message: "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row: at most about {estimatedEntries} for the {inputRows} rows its inputs hold."
+  solution: "Nothing to fix. This is what the step stores to keep its totals exact through restarts and replays, and it holds the input's values. A field that keeps its inputs (min, max, first, last) adds one entry per row, and a distinct count one per distinct value in a group; `explain` shows the estimate beside what the running step counted."
 aggregate.state-estimate-unsized:
-  message: "Aggregate step `{step}` of pipeline {pipeline} keeps {entriesPerRow} state entries per input row; an input reports no row count, so the total is not estimated."
+  message: "Aggregate step `{step}` of pipeline {pipeline} keeps up to {entriesPerRow} state entries per input row; an input reports no row count, so the total is not estimated."
   solution: "Discover the source the step reads so its tables report row counts, then apply again to have the total estimated."
 aggregate.definition-changed:
   message: "Aggregate step `{step}` holds state built by a different definition: its {changed} changed."

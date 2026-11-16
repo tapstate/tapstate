@@ -5626,7 +5626,7 @@ final class Repl {
      * nobody knows is said to be unknown; left out, the line would read as a step that costs nothing.
      */
     static String aggregateLine(ExplainOutcome.Aggregate aggregate) {
-        StringBuilder line = new StringBuilder("  aggregate  ").append(aggregate.step()).append(": ")
+        StringBuilder line = new StringBuilder("  aggregate  ").append(aggregate.step()).append(": up to ")
                 .append(aggregate.entriesPerRow()).append(" state entries per input row");
         if (!aggregate.keptInputFields().isEmpty()) {
             line.append(" (2, and 1 each for ").append(String.join(", ", aggregate.keptInputFields())).append(')');
