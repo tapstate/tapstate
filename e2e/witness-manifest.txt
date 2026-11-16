@@ -72,6 +72,8 @@ a-view-whose-store-cannot-be-reached-fails-with-a-named-code on IN_PROCESS
 a-view-whose-store-cannot-be-reached-fails-with-a-named-code on REAL_PROCESS
 an-aggregate-view-matches-a-group-by on IN_PROCESS
 an-aggregate-view-matches-a-group-by on REAL_PROCESS
+an-aggregate-view-with-no-groups-is-one-row-that-always-exists on IN_PROCESS
+an-aggregate-view-with-no-groups-is-one-row-that-always-exists on REAL_PROCESS
 an-oracle-table-reaches-the-managed-store on IN_PROCESS
 an-oracle-table-reaches-the-managed-store on REAL_PROCESS
 an-order-row-is-widened-by-its-customer-and-its-payment on IN_PROCESS
