@@ -1644,7 +1644,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
             document.emissionBytes = -1;
             recentReferenceStates.remove(key);
             document.assembly.reconcileMissingObjects(slots);
-            document.assembly.render(slots, resolved, String.valueOf(key)).ifPresentOrElse(
+            document.assembly.render(slots, resolved, String.valueOf(key), store::folded).ifPresentOrElse(
                     rendered -> settleRendered(key, document, rendered, resolved,
                             allowMissingReferences, allowMissingObjects, writes),
                     () -> settleDeleted(key, document));
@@ -1957,7 +1957,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
                 : referencesFor(assembly);
         Optional<Map<String, Object>> rendered = assembly == null
                 ? Optional.empty()
-                : assembly.render(slots, references, String.valueOf(entry.getKey()));
+                : assembly.render(slots, references, String.valueOf(entry.getKey()), store::folded);
         if (rendered.isEmpty()) {
             open.remove();
             return false;

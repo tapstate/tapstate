@@ -107,6 +107,10 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.state.commit.round_trips",
                         "tapstate.pipeline.state.commit.duration",
                         "tapstate.pipeline.state.evictions",
+                        "tapstate.pipeline.state.document.bytes",
+                        "tapstate.pipeline.state.document.bytes.max",
+                        "tapstate.pipeline.state.commit.bytes",
+                        "tapstate.pipeline.nest.rollup.fold.duration",
                         "tapstate.pipeline.join.recompute.rows",
                         "tapstate.pipeline.join.recompute.rows.total",
                         "tapstate.pipeline.records.driven",
@@ -489,6 +493,7 @@ class WhatHappensPastTheCardinalityBudgetTest {
                         "tapstate.pipeline.frontier.gap",
                         "tapstate.pipeline.frontier.stall",
                         "tapstate.pipeline.nest.pending.high_water",
+                        "tapstate.pipeline.state.document.bytes.max",
                         "tapstate.pipeline.nest.namespace.info",
                         "tapstate.pipeline.reconcile.failures.streak");
     }

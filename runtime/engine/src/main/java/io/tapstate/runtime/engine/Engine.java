@@ -949,6 +949,7 @@ public final class Engine {
             if (measured != null) {
                 if (measured.rootsSince() != null) reading = reading.withRootsRendered(measured.rootsRendered(), measured.rootsSince());
                 if (measured.commits() != null) reading = reading.withCommits(measured.commits());
+                if (measured.weight() != null) reading = reading.withWeight(measured.weight());
             }
             readings.put(namespace, reading.withContext(keySamples.get(namespace), originOf(bindings, namespace)));
         });

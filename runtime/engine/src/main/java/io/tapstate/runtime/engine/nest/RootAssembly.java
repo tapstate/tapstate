@@ -658,15 +658,30 @@ public final class RootAssembly implements Serializable {
      */
     public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
             Map<String, Map<Object, Map<String, Object>>> resolved, String root) {
+        return render(slots, resolved, root, null);
+    }
+
+    /** As above, telling {@code foldTimer} how long each level's rollup fields took to fold, in nanoseconds. */
+    public Optional<Map<String, Object>> render(List<EmbedSlot> slots,
+            Map<String, Map<Object, Map<String, Object>>> resolved, String root,
+            java.util.function.LongConsumer foldTimer) {
         Objects.requireNonNull(slots, "slots");
         Objects.requireNonNull(resolved, "resolved");
         if (!rootPresent) {
             return Optional.empty();
         }
         Map<String, Object> document = new LinkedHashMap<>(rootFields);
-        renderInto(document, children, slots, resolved, true, root, RollupLevel.ROOT);
+        this.foldTimer = foldTimer;
+        try {
+            renderInto(document, children, slots, resolved, true, root, RollupLevel.ROOT);
+        } finally {
+            this.foldTimer = null;
+        }
         return Optional.of(document);
     }
+
+    /** Where the render in progress reports its folds; never part of the state. */
+    private transient java.util.function.LongConsumer foldTimer;
 
     /** How a refusal names a document whose key the caller did not pass. */
     private static final String UNNAMED_ROOT = "(document)";
@@ -1346,9 +1361,13 @@ public final class RootAssembly implements Serializable {
      * written is left standing in a keyed target at its last value, which is the one thing an incomplete
      * total must not do.
      */
-    private static void writeRollups(Map<String, Object> document, EmbedSlot slot, List<RollupElement> live,
+    private void writeRollups(Map<String, Object> document, EmbedSlot slot, List<RollupElement> live,
             String root, RollupLevel level, Map<String, String> occupied) {
+        long began = foldTimer == null ? 0L : System.nanoTime();
         Map<String, Object> values = RollupFold.apply(slot.rollups(), live, root);
+        if (foldTimer != null) {
+            foldTimer.accept(System.nanoTime() - began);
+        }
         for (Map.Entry<String, Object> value : values.entrySet()) {
             String field = value.getKey();
             if (document.containsKey(field)) {

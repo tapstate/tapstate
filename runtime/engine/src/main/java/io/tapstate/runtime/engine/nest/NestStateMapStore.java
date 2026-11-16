@@ -77,7 +77,17 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
         }
         this.stats = NestStateStats.of(member);
         NestStateStats counted = this.stats;
-        this.committed = (keys, roundTrips, nanos) -> counted.committed(namespace, keys, roundTrips, nanos);
+        this.committed = new NestStateIo.Committed() {
+            @Override
+            public void group(long keys, long roundTrips, long nanos) {
+                counted.committed(namespace, keys, roundTrips, nanos);
+            }
+
+            @Override
+            public void sizes(java.util.Collection<byte[]> written) {
+                counted.wrote(namespace, written);
+            }
+        };
         this.stateIo = new NestStateIo(store, namespace, bindings == null ? null : () -> bindings.isRootNestState(namespace), committed);
     }
 
@@ -149,7 +159,7 @@ final class NestStateMapStore implements MapStore<Object, Object>, MapLoaderLife
             byte[] originalKey = resolver.releases().isEmpty() ? null : toBytes(key);
             String storedKey = NestStateKeys.nameOf(key);
             byte[] bytes = toBytes(value);
-            NestStateIo.commit(committed, 1, () -> releases.saveWithRelease(namespace, storedKey, bytes, originalKey));
+            NestStateIo.commit(committed, List.of(bytes), () -> releases.saveWithRelease(namespace, storedKey, bytes, originalKey));
         } else stateIo.saveAll(Map.of(NestStateKeys.nameOf(key), toBytes(value)));
     }
 

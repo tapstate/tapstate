@@ -109,12 +109,22 @@ join a measurement to `tapstate.pipeline.nest.namespace.info`, which gives its s
 | `tapstate.pipeline.state.commit.round_trips` | Histogram | Synchronous backend commands per successful write call |
 | `tapstate.pipeline.state.commit.duration` | Histogram | Seconds from store call to acknowledgement |
 | `tapstate.pipeline.state.evictions` | Counter | Local state-map evictions |
+| `tapstate.pipeline.state.document.bytes` | Histogram | Bytes per written key; at a root namespace, the weight of each document as stored |
+| `tapstate.pipeline.state.document.bytes.max` | Gauge | The most bytes one key's state has taken |
+| `tapstate.pipeline.state.commit.bytes` | Histogram | Bytes per successful write call |
+| `tapstate.pipeline.nest.rollup.fold.duration` | Histogram | Seconds to fold one document's rollup fields at a level that declares them |
 
 The root counter measures output from the operator. Target acknowledgement and table loading are
 shown by the existing pipeline metrics and snapshot interfaces. Compare cumulative samples only
 within the same execution and counting lifetime. An acknowledged store call may contain multiple
 database transactions. Command counts cover the synchronous Mongo adapter; commands on other
 threads are outside the measurement.
+
+Every change to a document rewrites its whole stored state, so `state.document.bytes` at a root namespace is
+what one change costs. A document holding about a megabyte or more is past what rollup fields keep up with
+(see [rollup fields](../nest/rollup-fields.md)); `state.document.bytes.max` shows how close the heaviest has
+come to the 16 MB a stored document may hold. `nest.rollup.fold.duration` separates the time spent folding
+rollup fields from the time spent writing state.
 
 ## Current-run initial-load display
 
