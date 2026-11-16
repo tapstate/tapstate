@@ -11,6 +11,10 @@ import java.util.Objects;
  * key used inside a parent's state; {@code path} is the output field for array and object shapes and is
  * absent for flat. Keeping the two separate is what lets a pathless flat embed retain durable identity.
  *
+ * <p>{@code alternatives} are the further places a referenced slot's row may be read from, one per
+ * {@code orOn} alternative of its embed, tried in order after the slot's own reference. The first one whose
+ * row is live is the one rendered. Empty for every slot that declares none.
+ *
  * <p>The shape is a property of the declared tree, not of the data, which is why it is handed to a
  * render rather than remembered per document: an array embed that has never received a row still
  * renders an empty array, and only the declaration says so.
@@ -22,7 +26,23 @@ public record EmbedSlot(
         EmbedAs as,
         List<String> referenceFields,
         String lookupMap,
-        List<EmbedSlot> children) implements Serializable {
+        List<EmbedSlot> children,
+        List<Reference> alternatives) implements Serializable {
+
+    /** One further place a referenced slot's row may be read from: the fields naming it, and its namespace. */
+    public record Reference(List<String> referenceFields, String lookupMap) implements Serializable {
+
+        public Reference {
+            referenceFields = List.copyOf(referenceFields);
+            Objects.requireNonNull(lookupMap, "lookupMap");
+        }
+    }
+
+    /** A slot with no alternatives, which is every slot whose embed declares no {@code orOn}. */
+    public EmbedSlot(String stateField, String path, String diagnosticPath, EmbedAs as,
+            List<String> referenceFields, String lookupMap, List<EmbedSlot> children) {
+        this(stateField, path, diagnosticPath, as, referenceFields, lookupMap, children, List.of());
+    }
 
     /**
      * An embed whose rows are grouped under this level, which is every embed that points at nothing. Its
@@ -30,13 +50,13 @@ public record EmbedSlot(
      * from.
      */
     public EmbedSlot(String path, EmbedAs as, List<EmbedSlot> children) {
-        this(path, path, path, as, null, null, children);
+        this(path, path, path, as, null, null, children, List.of());
     }
 
     /** A referenced object or array embed using its output path as its state identity. */
     public EmbedSlot(String path, EmbedAs as, List<String> referenceFields, String lookupMap,
             List<EmbedSlot> children) {
-        this(path, path, path, as, referenceFields, lookupMap, children);
+        this(path, path, path, as, referenceFields, lookupMap, children, List.of());
     }
 
     public EmbedSlot {
@@ -51,6 +71,10 @@ public record EmbedSlot(
         }
         referenceFields = referenceFields == null ? null : List.copyOf(referenceFields);
         children = List.copyOf(children);
+        alternatives = alternatives == null ? List.of() : List.copyOf(alternatives);
+        if (!alternatives.isEmpty() && lookupMap == null) {
+            throw new IllegalArgumentException("slot " + path + " has alternatives but is not a reference");
+        }
         if (referenceFields == null ^ lookupMap == null) {
             throw new IllegalArgumentException(
                     "slot " + path + " names one half of a reference and not the other");
@@ -64,5 +88,24 @@ public record EmbedSlot(
      */
     public boolean isReference() {
         return lookupMap != null;
+    }
+
+    /** Whether this slot's row is chosen among several places, in order, rather than read from one. */
+    public boolean hasAlternatives() {
+        return !alternatives.isEmpty();
+    }
+
+    /**
+     * Every place this referenced slot's row may be read from, in the order they are tried: its own
+     * reference first, then each alternative.
+     */
+    public List<Reference> references() {
+        if (lookupMap == null) {
+            return List.of();
+        }
+        List<Reference> all = new java.util.ArrayList<>(1 + alternatives.size());
+        all.add(new Reference(referenceFields, lookupMap));
+        all.addAll(alternatives);
+        return List.copyOf(all);
     }
 }
