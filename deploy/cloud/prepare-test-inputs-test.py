@@ -18,12 +18,12 @@ INPUTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INPUTS)
 
 
-def jar_bytes(revision="pinned-revision"):
+def jar_bytes(revision="pinned-revision", connector="mongodb"):
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as jar:
-        jar.writestr("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\nImplementation-Title: mongodb-connector\n"
+        jar.writestr("META-INF/MANIFEST.MF", f"Manifest-Version: 1.0\nImplementation-Title: {connector}-connector\n"
                      f"Git-Commit-Id: {revision}\nPDK-API-Version: test-api\n\n")
-        jar.writestr("mongodb.json", json.dumps({"properties": {"id": "mongodb"}}))
+        jar.writestr(f"{connector}.json", json.dumps({"properties": {"id": connector}}))
     return output.getvalue()
 
 
@@ -48,10 +48,15 @@ class MongoTestInputTests(unittest.TestCase):
         self.downloaded.append((url, maximum))
         destination.write_bytes(self.payloads[destination.name])
 
-    def prepare(self):
-        with patch.object(INPUTS.STAGE, "read_lock", return_value=([self.entry, {"id": "mysql"}], self.licenses)), \
+    def prepare(self, *, with_dummy=False):
+        dummy_jar = jar_bytes(connector="dummy")
+        dummy = self.entry | {"id": "dummy", "specPath": "dummy.json", **digest(dummy_jar)}
+        entries = [self.entry, dummy, {"id": "mysql"}]
+        self.payloads.setdefault("dummy-connector.jar", dummy_jar)
+        with patch.object(INPUTS.STAGE, "read_lock", return_value=(entries, self.licenses)), \
                 patch.object(INPUTS, "download", side_effect=self.download):
-            INPUTS.prepare_mongodb(self.root / "lock.json", self.output, "https://example.invalid/pinned")
+            INPUTS.prepare_mongodb(self.root / "lock.json", self.output, "https://example.invalid/pinned",
+                                   with_dummy=with_dummy)
 
     def test_only_the_requested_connector_and_verified_licenses_are_published(self):
         self.prepare()
@@ -60,6 +65,18 @@ class MongoTestInputTests(unittest.TestCase):
         self.assertEqual(self.downloaded, [
             ("https://example.invalid/pinned/mongodb-connector.jar", len(self.jar)),
             ("https://example.invalid/pinned/NOTICE.txt", len(self.payloads["NOTICE.txt"]))])
+
+    def test_dummy_opt_in_prepares_both_locked_connectors(self):
+        self.prepare(with_dummy=True)
+        self.assertEqual(sorted(path.name for path in self.output.iterdir()),
+                         ["NOTICE.txt", "dummy-connector.jar", "mongodb-connector.jar"])
+        self.assertEqual((self.output / "dummy-connector.jar").read_bytes(), self.payloads["dummy-connector.jar"])
+
+    def test_changed_dummy_jar_prevents_publication(self):
+        self.payloads["dummy-connector.jar"] = b"changed"
+        with self.assertRaisesRegex(INPUTS.STAGE.StageError, "dummy: JAR bytes differ"):
+            self.prepare(with_dummy=True)
+        self.assertFalse(self.output.exists())
 
     def test_changed_jar_bytes_never_publish_an_output(self):
         self.payloads["mongodb-connector.jar"] = self.jar + b"changed"

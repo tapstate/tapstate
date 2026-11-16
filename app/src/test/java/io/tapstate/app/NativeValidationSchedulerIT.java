@@ -166,8 +166,22 @@ class NativeValidationSchedulerIT {
                         // Durable closure precedes physical drain; establish an idle run before advancing to another occurrence.
                         await(()->{try(var stopped=coordinator.read(manual)){return stopped.value().drain()==ValidationOperation.Drain.DRAINED;}});
                         time.now.set(Instant.parse("2026-10-29T00:03:10Z"));await(()->fact(facts,coordinator,task,1).map(value->value.state()==ValidationScheduleObservations.State.SKIPPED_LATE).orElse(false));
-                        assertThat(f.member.getJet().getJobs()).isEmpty();ready.set(true);time.now.set(Instant.parse("2026-10-29T00:04:00Z"));
+                        assertThat(f.member.getJet().getJobs()).isEmpty();
+                        // The CLOSED permission can be visible while the original STOP still owns validation control.
+                        await(() -> {
+                            try (var response = coordinator.read(manual)) {
+                                var status = response.value();
+                                return "STOPPED".equals(status.state()) && status.retired()
+                                        && status.drain() == ValidationOperation.Drain.DRAINED && !status.controlUnknown()
+                                        && f.configuration.validationReports(() -> {}).history("flow", task.taskId(),
+                                                ValidationMode.FULL, new ValidationReports.Paging(0, 10)).items().stream()
+                                                .anyMatch(row -> row.reference().sequence() == manual.sequence()
+                                                        && row.terminal() == ValidationRunState.STOPPED);
+                            }
+                        });
+                        ready.set(true);time.now.set(Instant.parse("2026-10-29T00:04:00Z"));
                         awaitScheduledCompletion(f,facts,coordinator,task);
+
                         assertThat(f.member.getJet().getJobs()).hasSize(1);
                         scheduler.close();time.now.set(Instant.parse("2026-10-29T00:10:10Z"));
                         try(var restarted=new NativeValidationScheduler(f.configuration,f.resources,f.process,()->coordinator,facts,time,new ValidationScheduleCalculator(),()->{})){

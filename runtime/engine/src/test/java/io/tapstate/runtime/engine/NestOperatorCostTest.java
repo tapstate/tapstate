@@ -275,10 +275,12 @@ class NestOperatorCostTest {
         // Out of memory but not out of the store, so the reads that follow are the cold path exactly.
         member.getMap(referenced).evictAll();
         Snapshot before = snapshot(root, referenced, index);
+        var rootKeysBefore = NestStateStats.of(member).keyAccess(root);
 
         feed("orders", rootsPointingAtRows());
         quiesce();
         Report report = report(before, snapshot(root, referenced, index), ROOTS);
+        var rootKeysAfter = NestStateStats.of(member).keyAccess(root);
 
         job.cancel();
         print("N:1 - a document fetching the row it points at", report);
@@ -299,14 +301,18 @@ class NestOperatorCostTest {
         // edge ordering while the number of keys read and written remains exact.
         Counters rootWork = report.namespaces().get(root);
         assertThat(report.emitted()).isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.reads() - rootKeysBefore.reads()).as("root keys read").isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.writes() - rootKeysBefore.writes()).as("root keys written").isEqualTo(ROOTS);
+        assertThat(rootKeysAfter.coldLoads() - rootKeysBefore.coldLoads()).as("root cold keys read").isEqualTo(ROOTS);
         assertThat(rootWork.keyAccesses()).isEqualTo(2L * ROOTS);
         assertThat(rootWork.coldKeys()).isEqualTo(ROOTS);
         assertThat(rootWork.coldSaves()).isEqualTo(ROOTS);
-        assertThat(rootWork.accesses()).isGreaterThan(ROOTS).isLessThanOrEqualTo(2L * ROOTS);
+        assertThat(rootWork.accesses()).isLessThanOrEqualTo(2L * ROOTS);
         assertThat(rootWork.coldLoads()).isPositive().isLessThanOrEqualTo(ROOTS);
         assertThat(rootWork.coldLoads() - rootWork.coldBatches() + rootWork.coldBatchedKeys())
                 .as("scalar reads plus the keys carried by bulk reads")
                 .isEqualTo(ROOTS);
+
         // Every cold key is still fetched exactly once. Concurrent partition loads can now share a
         // backend request, so call count is a ceiling, while the key count below remains exact.
         assertThat(batches.coldLoads())
