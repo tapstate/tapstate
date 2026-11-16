@@ -599,6 +599,23 @@ class EnvelopeParserTest {
         assertThat(doc.size()).containsExactly(java.util.Map.entry("items", 2L));
     }
 
+    /** A flag the pipeline writes is read back as a boolean; seeds and locators stay integer or string. */
+    @Test
+    void aDocMatcherAcceptsABooleanExpectation() {
+        Envelope envelope = EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { is_deleted: true } } } }\n"));
+
+        Matcher.Doc doc = (Matcher.Doc) ((Step.Assertion) envelope.steps().getFirst()).matcher();
+        assertThat(doc.expect()).containsExactly(java.util.Map.entry("is_deleted", true));
+    }
+
+    @Test
+    void aDocMatcherStillRefusesAValueWiderThanABoolean() {
+        assertThatThrownBy(() -> EnvelopeParser.parse(minimal(
+                "steps:\n  - assert: { doc: { a.t: { where: { id: 1 }, expect: { price: 1.5 } } } }\n")))
+                .hasMessageContaining("must be an integer, a string or a boolean");
+    }
+
     /** A doc that expects nothing would hold for any document at all, including the wrong one. */
     @Test
     void aDocMatcherWithoutExpectationsIsRefused() {
