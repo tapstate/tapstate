@@ -127,6 +127,10 @@ on the embed, as for any embed, and a source that supplies before images. See
 - **All elements of one parent are held together.** A merged array is one embed level, so the nest's
   per-document element limit (`max_elements_per_document` on the `nest` step) counts the rows of all
   merged tables together. A parent with many rows across many tables reaches it sooner.
+- **Merge into an embed, not into the root.** Keep the root's `from` a source table, as in the
+  examples above. When the root reads a step's output (a `union`, `map` or `js` step), the assembled
+  documents reach a `serve` target without a key, and the target appends a new document on every
+  change instead of updating the one it has. A `view` that declares `primary_key` is not affected.
 - **Every change rewrites the whole document.** A new session row sends the whole player document
   again, with every movement and session in it. See [Throughput limits](throughput-limits.md) for
   the arithmetic on your own row counts.
