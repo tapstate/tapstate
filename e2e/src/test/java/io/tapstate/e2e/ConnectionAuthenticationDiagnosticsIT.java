@@ -1,9 +1,14 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoClients;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.JsonReader;
 import io.tapstate.testsupport.RequiresDocker;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -14,58 +19,112 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ConnectionAuthenticationDiagnosticsIT {
 
     @Test
-    void mysqlPublishesReadableChecksAndRetainsTheSameReport() {
+    void mysqlPublishesReadableChecksAndRetainsTheSameReport(@TempDir Path home) throws Exception {
         RealConnectorGate.require("mysql");
         var settings = SharedMySql.settings("connection_auth_diagnostic");
 
-        var report = failedAuthentication("mysql", settings);
+        var report = failedAuthentication("mysql", settings, home);
 
         assertThat(report.toString())
                 .contains("The connection could not be established.", "The database could not be reached",
                         "Check the host, port, database and credentials")
                 .doesNotContain("pdk.connection.fail", "pdk.connection.reason", "pdk.connection.solution");
+        assertThat((List<?>) report.get("checks")).anySatisfy(value -> {
+            var check = (Map<?, ?>) value;
+            assertThat(check.get("status")).isEqualTo("FAILED");
+            assertThat(check.get("diagnostic").toString()).contains("The connection could not be established.");
+        });
     }
 
     @Test
-    void postgresPublishesRejectedCredentialsAsAFailedConnectionCheck() {
+    void postgresPublishesRejectedCredentialsAsAFailedConnectionCheck(@TempDir Path home) throws Exception {
         RealConnectorGate.require("postgres");
         var settings = SharedPostgres.settings("connection_auth_diagnostic");
         settings.put("user", settings.remove("username"));
         settings.put("schema", "public");
 
-        var report = failedAuthentication("postgres", settings);
+        var report = failedAuthentication("postgres", settings, home);
 
         assertThat((List<?>) report.get("checks")).anySatisfy(value -> {
             var check = (Map<?, ?>) value;
             assertThat(check.get("status")).isEqualTo("FAILED");
             assertThat(check.get("connectorErrorCode")).isEqualTo("28P01");
             assertThat((String) check.get("message")).contains("password authentication failed");
+            var diagnostic = (Map<?, ?>) check.get("diagnostic");
+            var cause = (Map<?, ?>) diagnostic.get("cause");
+            assertThat(cause.get("code")).isEqualTo("28P01");
+            assertThat((String) cause.get("rawMessage")).contains("password authentication failed");
         });
     }
 
-    private static Map<?, ?> failedAuthentication(String connector, Map<String, Object> settings) {
+    @Test
+    void mongodbDefaultSourceRetainsItsManagedFormatAndTerminalPublication() {
+        RealConnectorGate.require("mongodb");
         try (var store = PreparedNativeStore.create();
-             var server = Tiers.IN_PROCESS.launch(store)) {
+             var server = InProcessServer.startWithConnectionDiagnostics(store);
+             var client = MongoClients.create(store.cacheUri())) {
             var control = new ControlPlane(server.baseUrl());
             store.loginAndAwaitBusiness(control);
-            control.registerConnector(connector, ConnectorJars.bytesFor(connector));
-            assertThat(control.testConnection("valid_" + connector, connector, settings).outcome())
-                    .isEqualTo("PASSED");
-
-            String id = "invalid_" + connector;
-            String badPassword = "wrong-fixture-password";
-            var invalid = new LinkedHashMap<>(settings);
-            invalid.put("password", badPassword);
+            control.registerConnector("mongodb", ConnectorJars.bytesFor("mongodb"));
+            var settings = Map.<String, Object>of("isUri", true, "uri", store.masterUri());
             var immediate = control.sourceRequest("POST", "/api/connections:test",
-                    Map.of("id", id, "connectorId", connector, "settings", invalid), null, 200);
-            var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result", null, null, 200);
+                    Map.of("id", "views", "connectorId", "mongodb", "settings", settings), null, 200);
+            var latest = control.sourceRequest("GET", "/api/connections/views/test-result", null, null, 200);
             var report = (Map<?, ?>) JsonReader.parse(immediate.body());
-            assertThat(report.get("outcome")).isEqualTo("FAILED");
-            assertThat((List<?>) report.get("checks")).isNotEmpty();
+            assertThat(report.get("outcome")).isEqualTo("PASSED");
             assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
-            assertThat(immediate.body()).doesNotContain(badPassword);
-            assertThat(latest.body()).doesNotContain(badPassword);
+            var row = SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(client.getDatabase(store.cacheDatabase()))
+                    .find(new Document("_id", "views")).first();
+            assertThat(row).containsEntry("formatVersion", 2).containsEntry("state", "PASSED")
+                    .containsKeys("cacheScope", "attemptId", "sourceHash", "nodeId", "bootId", "sessionGeneration", "deadlineAt", "report");
+        }
+    }
+
+    private static Map<?, ?> failedAuthentication(String connector, Map<String, Object> settings, Path home) throws Exception {
+        try (var store = PreparedNativeStore.create()) {
+            String valid = "valid_" + connector;
+            Object legacy;
+            try (var server = Tiers.IN_PROCESS.launch(store)) {
+                var control = new ControlPlane(server.baseUrl());
+                store.loginAndAwaitBusiness(control);
+                control.registerConnector(connector, ConnectorJars.bytesFor(connector));
+                assertThat(control.testConnection(valid, connector, settings).outcome()).isEqualTo("PASSED");
+                var earlier = control.sourceRequest("GET", "/api/connections/" + valid + "/test-result", null, null, 200);
+                assertThat(earlier.body()).doesNotContain("\"diagnostic\":");
+                legacy = JsonReader.parse(earlier.body());
+            }
+            Map<?, ?> report;
+            String id = "invalid_" + connector;
+            try (var server = InProcessServer.startWithConnectionDiagnostics(store)) {
+                var control = new ControlPlane(server.baseUrl());
+                store.loginAndAwaitBusiness(control);
+                var earlier = control.sourceRequest("GET", "/api/connections/" + valid + "/test-result", null, null, 200);
+                assertThat(JsonReader.parse(earlier.body())).isEqualTo(legacy);
+
+                String badPassword = "wrong-fixture-password";
+                var invalid = new LinkedHashMap<>(settings);
+                invalid.put("password", badPassword);
+                var immediate = control.sourceRequest("POST", "/api/connections:test",
+                        Map.of("id", id, "connectorId", connector, "settings", invalid), null, 200);
+                var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result", null, null, 200);
+                report = (Map<?, ?>) JsonReader.parse(immediate.body());
+                assertThat(report.get("outcome")).isEqualTo("FAILED");
+                assertThat((List<?>) report.get("checks")).isNotEmpty();
+                assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
+                assertThat(immediate.body()).doesNotContain(badPassword);
+                assertThat(latest.body()).doesNotContain(badPassword);
+                if (connector.equals("postgres")) {
+                    ConnectionDiagnosticProcesses.verify(home, store, server.baseUrl(), control, id, report);
+                }
+            }
+            try (var recovered = Tiers.IN_PROCESS.launch(store)) {
+                var control = new ControlPlane(recovered.baseUrl());
+                store.loginAndAwaitBusiness(control);
+                var latest = control.sourceRequest("GET", "/api/connections/" + id + "/test-result", null, null, 200);
+                assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
+            }
             return report;
         }
     }
+
 }

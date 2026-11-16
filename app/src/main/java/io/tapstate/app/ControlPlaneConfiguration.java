@@ -615,11 +615,15 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock,
             org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification,
-            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots) {
+            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         java.util.function.Predicate<io.tapstate.spi.store.ConnectionConfig> managed = config -> {
             var current = verification.getIfAvailable(); return current != null && current.manages(config);
         };
         var slot = slots.getIfAvailable();
+        if (diagnostics.getIfAvailable() != null) {
+            return new PdkConnectionTester(provisioner, clock, managed, java.util.Objects.requireNonNull(slot), true);
+        }
         return slot == null ? new PdkConnectionTester(provisioner, clock, managed) : new PdkConnectionTester(provisioner, clock, managed, slot);
     }
 

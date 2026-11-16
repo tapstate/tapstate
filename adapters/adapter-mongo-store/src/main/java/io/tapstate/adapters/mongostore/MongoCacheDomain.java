@@ -495,6 +495,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public io.tapstate.spi.store.ConnectionTestResultStore connectionTestResults(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheConnectionTestResultStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, requireActive));
     }
+    /** Used by the isolated compatibility assembly to exercise actual versioned report publication. */
+    public io.tapstate.spi.store.ConnectionTestResultStore isolatedDiagnosticResults(CacheBusinessScope expected, Runnable requireActive) {
+        return new MongoCacheConnectionTestResultStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, requireActive), true);
+    }
     private MongoCacheMetadataAccess metadataAccess(CacheBusinessScope expected, SystemCollections table, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
         var access = new MongoCacheMetadataAccess(client, database, expected, table,

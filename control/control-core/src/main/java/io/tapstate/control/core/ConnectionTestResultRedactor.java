@@ -30,7 +30,7 @@ final class ConnectionTestResultRedactor {
                         redact(testText.apply(item.reason()), secretValues),
                         redact(testText.apply(item.solution()), secretValues),
                         redact(item.connectorErrorCode(), secretValues),
-                        DiagnosticProjection.read(redactValue(item.diagnostic(), secretValues))))
+                        DiagnosticProjection.read(redactDiagnostic(item.diagnostic(), secretValues, testText))))
                 .toList();
         return new ConnectionTestResult(
                 result.connectionId(), result.connectorId(), result.outcome(), items,
@@ -61,6 +61,27 @@ final class ConnectionTestResultRedactor {
             return failure;
         }
         return failure.withoutCause(safeArgs);
+    }
+
+    private static Map<String, Object> redactDiagnostic(
+            Map<?, ?> diagnostic, List<String> secrets, UnaryOperator<String> testText) {
+        Map<String, Object> safe = new LinkedHashMap<>();
+        diagnostic.forEach((key, value) -> {
+            String field = (String) key;
+            switch (field) {
+                case "message", "solution" -> safe.put(field, redact(testText.apply((String) value), secrets));
+                case "cause" -> safe.put(field, redactDiagnostic((Map<?, ?>) value, secrets, testText));
+                case "causes" -> safe.put(field, ((List<?>) value).stream()
+                        .map(child -> redactDiagnostic((Map<?, ?>) child, secrets, testText)).toList());
+                case "references" -> {
+                    var authorized = ((List<?>) value).stream()
+                            .filter(reference -> reference.equals(redactValue(reference, secrets))).toList();
+                    if (!authorized.isEmpty()) safe.put(field, authorized);
+                }
+                default -> safe.put(field, redactValue(value, secrets));
+            }
+        });
+        return safe;
     }
 
     private static Object redactValue(Object value, List<String> secretValues) {

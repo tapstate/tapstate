@@ -41,6 +41,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     private final DefaultSourcePdkTest defaults;
     private final java.time.Duration defaultBudget;
     private final boolean ownsSlot;
+    private final boolean captureDiagnostics;
     private volatile boolean closed;
 
     /** One parent node owns this slot across replacement business contexts. It is not persistent work. */
@@ -62,19 +63,27 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     }
     PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock, java.util.function.Predicate<ConnectionConfig> managed,
             java.time.Duration budget, java.time.Duration cleanupBudget) {
-        this(provisioner, clock, managed, new DefaultSourceSlot(clock, budget, cleanupBudget), true);
+        this(provisioner, clock, managed, new DefaultSourceSlot(clock, budget, cleanupBudget), true, false);
     }
     public PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
             java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot) {
-        this(provisioner, clock, managed, slot, false);
+        this(provisioner, clock, managed, slot, false, false);
     }
+
+    /** Diagnostic capture for an isolated assembly with a compatible result store. */
+    public PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
+            java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, boolean captureDiagnostics) {
+        this(provisioner, clock, managed, slot, false, captureDiagnostics);
+    }
+
     private PdkConnectionTester(ConnectorProvisioner provisioner, Clock clock,
-            java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, boolean ownsSlot) {
+            java.util.function.Predicate<ConnectionConfig> managed, DefaultSourceSlot slot, boolean ownsSlot,
+            boolean captureDiagnostics) {
         this.provisioner = java.util.Objects.requireNonNull(provisioner);
         this.clock = java.util.Objects.requireNonNull(clock);
         this.managed = java.util.Objects.requireNonNull(managed);
         this.defaults = java.util.Objects.requireNonNull(slot).tests;
-        this.defaultBudget = slot.budget; this.ownsSlot = ownsSlot;
+        this.defaultBudget = slot.budget; this.ownsSlot = ownsSlot; this.captureDiagnostics = captureDiagnostics;
     }
 
     @Override
@@ -98,7 +107,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         try {
             List<TestItem> raw = new ArrayList<>();
             drive(connector, raw::add, false);
-            List<ConnectionTestItem> items = translate(raw);
+            List<ConnectionTestItem> items = translate(raw, captureDiagnostics);
             Outcome outcome = anyFailed(items) ? Outcome.FAILED : Outcome.PASSED;
             return new ConnectionTestResult(config.id(), config.connectorId(), outcome, items, clock.millis());
         } finally {
@@ -126,7 +135,8 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         } catch (Throwable t) {
             SQLException sql = authenticationRejection(t);
             if (sql != null) {
-                TapTestItemException diagnostic = new TapTestItemException(sql);
+                TapTestItemException diagnostic = new TapTestItemException();
+                diagnostic.initCause(sql);
                 diagnostic.setMessage(detail(sql));
                 diagnostic.setErrorCode(sql.getSQLState());
                 sink.accept(new TestItem("Connection", diagnostic, TestItem.RESULT_FAILED));
@@ -199,7 +209,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
             var raw = new ArrayList<TestItem>();
             long[] diagnosticCharacters = {0};
             drive(owned, item -> collectDiagnostic(raw, diagnosticCharacters, item), true);
-            var items = translate(raw);
+            var items = translate(raw, captureDiagnostics);
             if (items.isEmpty()) throw new IllegalStateException("default Source connector returned no connection checks");
             return new ConnectionTestResult(config.id(), config.connectorId(), anyFailed(items) ? Outcome.FAILED : Outcome.PASSED,
                     items, clock.millis());
@@ -291,10 +301,10 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         return settings;
     }
 
-    private static List<ConnectionTestItem> translate(List<TestItem> raw) {
+    private static List<ConnectionTestItem> translate(List<TestItem> raw, boolean captureDiagnostics) {
         List<ConnectionTestItem> items = new ArrayList<>(raw.size());
         for (TestItem item : raw) {
-            items.add(translate(item));
+            items.add(translate(item, captureDiagnostics));
         }
         return items;
     }
@@ -304,7 +314,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
      * falling back to its free-text information for the message; the exception's own code is passed
      * through as the opaque connector-error-code display string.
      */
-    private static ConnectionTestItem translate(TestItem item) {
+    private static ConnectionTestItem translate(TestItem item, boolean captureDiagnostics) {
         TapTestItemException ex = item.getTapTestItemException();
         String message = firstNonBlank(
                 firstNonBlank(ex != null ? ex.getMessage() : null, item.getInformation()),
@@ -312,8 +322,11 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         String reason = ex != null ? ex.getReason() : null;
         String solution = ex != null ? ex.getSolution() : null;
         String connectorErrorCode = ex != null ? ex.getErrorCode() : null;
-        return new ConnectionTestItem(item.getItem(), status(item.getResult()),
-                message, reason, solution, connectorErrorCode);
+        var status = status(item.getResult());
+        return new ConnectionTestItem(item.getItem(), status,
+                message, reason, solution, connectorErrorCode,
+                captureDiagnostics && (ex != null || status != ConnectionTestItem.Status.PASSED)
+                        ? PdkConnectionDiagnostic.capture(ex, message, solution, connectorErrorCode) : Map.of());
     }
 
     /**

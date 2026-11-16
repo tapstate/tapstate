@@ -85,6 +85,34 @@ class PdkConnectionTesterTest {
         assertThat(login.reason()).isEqualTo("bad credentials");
         assertThat(login.solution()).isEqualTo("check username/password");
         assertThat(login.connectorErrorCode()).isEqualTo("28000");
+        assertThat(login.diagnostic()).isEmpty();
+    }
+
+    @Test
+    void anIsolatedAssemblyCapturesTheChecksWithoutChangingTheirOutcome(@TempDir Path dir) {
+        var ref = new ConnectorRef(List.of(Synthetic.failingTest(dir)), "synthetic.FailingTest", "2.0.8", null);
+        var clock = Clock.fixed(Instant.ofEpochMilli(FIXED_MILLIS), ZoneOffset.UTC);
+        try (var slot = new PdkConnectionTester.DefaultSourceSlot(clock);
+             var tester = new PdkConnectionTester(ignored -> ref, clock, ignored -> false, slot, true)) {
+            var result = tester.test(config());
+            assertThat(result.outcome()).isEqualTo(Outcome.FAILED);
+            assertThat(result.items().getFirst().diagnostic()).isEmpty();
+            assertThat(result.items().getLast().diagnostic()).containsEntry("code", "28000")
+                    .containsEntry("message", "Login denied").containsEntry("solution", "check username/password");
+        }
+    }
+
+    @Test
+    void aNestedDriverCauseSurvivesWhileOversizedSensitiveTextIsOmittedBeforeRedaction() {
+        var cause = new java.sql.SQLException("driver rejected the account", "28P01");
+        var failure = new io.tapdata.pdk.apis.exception.TapTestItemException();
+        failure.initCause(cause);
+        var projection = PdkConnectionDiagnostic.capture(
+                failure, "x".repeat(4090) + "sensitive-value", "Review credentials", "28000");
+        assertThat(projection).containsEntry("code", "28000").containsEntry("truncated", true)
+                .doesNotContainKey("message");
+        assertThat(projection.get("cause").toString()).contains("28P01", "driver rejected the account");
+        assertThat(projection.toString()).doesNotContain("sensitive-value", "sensit");
     }
 
     /**

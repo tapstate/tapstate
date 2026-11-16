@@ -76,6 +76,17 @@ final class MongoConnectionDiagnostic {
         }
         ConnectionTestResult truncated = withItems(result, minimal);
         if (wholeRowFits.test(truncated)) return truncated;
+        if (marked) {
+            var shortChecks = minimal.stream().map(item -> new ConnectionTestItem(item.name(), item.status(),
+                    compactText(item.message()), compactText(item.reason()), compactText(item.solution()),
+                    item.connectorErrorCode(), item.diagnostic())).toList();
+            var shortReport = withItems(result, shortChecks);
+            if (wholeRowFits.test(shortReport)) return shortReport;
+
+            // An exactly full legacy record can leave no space for an extension marker.
+            var legacy = withItems(result, result.items().stream().map(item -> withDiagnostic(item, Map.of())).toList());
+            if (wholeRowFits.test(legacy)) return legacy;
+        }
         throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", result.connectionId()), null);
     }
 
@@ -93,14 +104,14 @@ final class MongoConnectionDiagnostic {
                 case "cause" -> result.put(field, compactNode((Map<?, ?>) value));
                 case "causes" -> result.put(field, ((List<?>) value).stream()
                         .map(child -> compactNode((Map<?, ?>) child)).toList());
-                case "message", "solution" -> result.put(field, compactText(value));
+                case "message", "solution" -> result.put(field, compactText((String) value));
                 case "params" -> {
                     Map<String, Object> params = new LinkedHashMap<>();
-                    ((Map<?, ?>) value).forEach((name, arg) -> params.put((String) name, compactText(arg)));
+                    ((Map<?, ?>) value).forEach((name, arg) -> params.put((String) name, arg instanceof String text ? compactText(text) : arg));
                     result.put(field, params);
                 }
                 case "arguments" -> result.put(field, ((List<?>) value).stream()
-                        .map(MongoConnectionDiagnostic::compactText).toList());
+                        .map(text -> compactText((String) text)).toList());
                 default -> result.put(field, value);
             }
         }
@@ -108,13 +119,13 @@ final class MongoConnectionDiagnostic {
         return result;
     }
 
-    private static Object compactText(Object value) {
-        if (value instanceof String text && text.length() > COMPACT_TEXT_LENGTH) {
+    private static String compactText(String text) {
+        if (text != null && text.length() > COMPACT_TEXT_LENGTH) {
             int end = Character.isHighSurrogate(text.charAt(COMPACT_TEXT_LENGTH - 1))
                     ? COMPACT_TEXT_LENGTH - 1 : COMPACT_TEXT_LENGTH;
             return text.substring(0, end) + "\u2026";
         }
-        return value;
+        return text;
     }
 
     private static ConnectionTestItem withDiagnostic(ConnectionTestItem item, Map<String, Object> diagnostic) {

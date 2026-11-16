@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.containers.wait.strategy.WaitAllStrategy;
@@ -85,13 +86,14 @@ class AtlasPdkSourcePermissionsIT {
         }
     }
 
-    @Test
-    void rejectedCredentialsAreHiddenInImmediateAndLatestReports() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void rejectedCredentialsAreHiddenInImmediateAndLatestReports(boolean diagnostics) throws Exception {
         String username = "p2-atlas-witness-user";
         String id = "atlas_wrong_user";
         try (var prepared = PreparedNativeStore.create();
              var runtime = new AtlasRuntime(AtlasRuntime.Mode.ON_PREM, prepared);
-             var server = runtime.launch(Tiers.IN_PROCESS)) {
+             var server = diagnostics ? InProcessServer.startWithConnectionDiagnostics(prepared) : runtime.launch(Tiers.IN_PROCESS)) {
             var control = runtime.control(server, true);
             runtime.register(control, CONNECTOR);
             assertThat(control.testConnection("atlas_valid_user", CONNECTOR, settings(uri("root", "admin")))
@@ -107,6 +109,12 @@ class AtlasPdkSourcePermissionsIT {
             var report = (Map<?, ?>) JsonReader.parse(immediate.body());
             assertThat(report.get("outcome")).isEqualTo("FAILED");
             assertThat(report.get("checks").toString()).contains("Exception authenticating", "MongoCredential<redacted>");
+            if (diagnostics) {
+                assertThat((List<?>) report.get("checks")).anySatisfy(value ->
+                        assertThat(((Map<?, ?>) value).get("diagnostic")).isInstanceOf(Map.class));
+            } else {
+                assertThat(immediate.body()).doesNotContain("\"diagnostic\":");
+            }
             assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
             runtime.assertAuthenticationBoundary();
         }

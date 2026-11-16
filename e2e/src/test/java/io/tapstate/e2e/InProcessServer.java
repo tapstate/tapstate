@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.app.Bootstrap;
+import io.tapstate.app.IsolatedConnectionDiagnostics;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.web.server.context.WebServerApplicationContext;
 import org.springframework.context.ConfigurableApplicationContext;
@@ -56,6 +57,15 @@ final class InProcessServer implements ServerHandle {
     }
     static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
             io.tapstate.control.core.AiProviderClient provider) {
+        return startPrepared(storage, additionalArguments, provider, null);
+    }
+
+    static InProcessServer startWithConnectionDiagnostics(PreparedNativeStore storage) {
+        return startPrepared(storage, List.of(), null, new IsolatedConnectionDiagnostics(storage.clusterId(), storage.cacheDatabase()));
+    }
+
+    private static InProcessServer startPrepared(PreparedNativeStore storage, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
         var arguments = new java.util.ArrayList<String>();
         for (String value : List.of("--tapstate.cluster.id=" + storage.clusterId(),
                 "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2")) {
@@ -63,7 +73,7 @@ final class InProcessServer implements ServerHandle {
             if (additionalArguments.stream().noneMatch(argument -> argument.startsWith(key))) arguments.add(value);
         }
         arguments.addAll(additionalArguments);
-        return start(storage.configurationUri(), null, arguments, provider);
+        return start(storage.configurationUri(), null, arguments, provider, diagnostics);
     }
 
     /** Boots the assembly with an explicit operator-state database. */
@@ -78,11 +88,16 @@ final class InProcessServer implements ServerHandle {
 
     static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
             io.tapstate.control.core.AiProviderClient provider) {
+        return start(storeUri, operatorStateDatabase, additionalArguments, provider, null);
+    }
+
+    private static InProcessServer start(String storeUri, String operatorStateDatabase, List<String> additionalArguments,
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
         Path stagingDirectory = ServerHandle.privateStagingDirectory();
         ConfigurableApplicationContext context;
         var refreshed = new java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext>();
         try {
-            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed, provider);
+            context = boot(storeUri, operatorStateDatabase, stagingDirectory, additionalArguments, refreshed, provider, diagnostics);
         } catch (RuntimeException e) {
             // Nothing is handed back to close, so nothing else will ever clear this up. Attached rather
             // than thrown: why the assembly did not boot is the thing a reader needs.
@@ -102,7 +117,7 @@ final class InProcessServer implements ServerHandle {
     private static ConfigurableApplicationContext boot(String storeUri, String operatorStateDatabase,
             Path stagingDirectory, List<String> additionalArguments,
             java.util.concurrent.CopyOnWriteArrayList<ConfigurableApplicationContext> refreshedContexts,
-            io.tapstate.control.core.AiProviderClient provider) {
+            io.tapstate.control.core.AiProviderClient provider, IsolatedConnectionDiagnostics diagnostics) {
         java.util.ArrayList<String> arguments = new java.util.ArrayList<>(List.of(
                 "--server.address=127.0.0.1", "--server.port=0"));
         arguments.addAll(additionalArguments);
@@ -117,6 +132,9 @@ final class InProcessServer implements ServerHandle {
                         ServerHandle.ALSO_ACCEPT_IDS_SETTING + "=" + E2eConnectorJar.CONNECTOR_ID));
         if (operatorStateDatabase != null) defaults.add(ServerHandle.OPERATOR_STATE_DATABASE_SETTING + "=" + operatorStateDatabase);
         var builder = new SpringApplicationBuilder(Bootstrap.class);
+        if (diagnostics != null) {
+            builder.initializers(context -> context.getBeanFactory().registerSingleton("isolatedConnectionDiagnostics", diagnostics));
+        }
         if (provider != null) {
             builder.initializers(context -> context.addBeanFactoryPostProcessor(factory -> {
                 var registry = (org.springframework.beans.factory.support.BeanDefinitionRegistry) factory;
