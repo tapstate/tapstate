@@ -110,8 +110,10 @@ class ConnectionAuthenticationDiagnosticsIT {
         RealConnectorGate.require("mongodb");
         String cluster = "connection-auth-" + java.util.UUID.randomUUID();
         String password = "wrong-default-source-password";
+        String encodedUsername = "fixture-default%3Credacted%3E-source-user";
+        String username = "fixture-default<redacted>-source-user";
         String uri = SharedMongo.replicaSetUrl("default_source_connection_test").replace(
-                "mongodb://", "mongodb://fixture-missing-default-source-user:" + password + "@");
+                "mongodb://", "mongodb://" + encodedUsername + ":" + password + "@");
         var settings = Map.<String, Object>of("isUri", true, "uri", uri);
         var source = new io.tapstate.core.model.SourceResource("views", null, "mongodb", settings, null, null, null, null);
         try (var store = PreparedNativeStore.withBorrowedMaster(cluster, "e2e", "e2e-password", source);
@@ -127,12 +129,12 @@ class ConnectionAuthenticationDiagnosticsIT {
             assertThat(report.get("outcome")).isEqualTo("FAILED");
             assertThat(JsonReader.parse(latest.body())).isEqualTo(report);
             assertThat(latest.body()).contains("diagnostic")
-                    .doesNotContain("fixture-missing-default-source-user", password);
+                    .doesNotContain(username, encodedUsername, password);
             var row = SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(client.getDatabase(store.cacheDatabase()))
                     .find(new Document("_id", "views")).first();
             assertThat(row).containsEntry("formatVersion", 2).containsEntry("state", "FAILED")
                     .containsKeys("attemptId", "cacheScope", "deadlineAt", "report");
-            assertThat(row.toJson()).doesNotContain("fixture-missing-default-source-user", password);
+            assertThat(row.toJson()).doesNotContain(username, encodedUsername, password);
         }
     }
 

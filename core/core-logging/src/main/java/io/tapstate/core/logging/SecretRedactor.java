@@ -99,6 +99,10 @@ public final class SecretRedactor {
     }
 
     private static String replaceOutsideMarkers(String text, String secret, String replacement) {
+        if (!EXISTING_MARKERS.contains(secret) && EXISTING_MARKERS.stream().anyMatch(secret::contains)) {
+            // A complete admitted credential outranks marker-like text contained within it.
+            return text.replace(secret, replacement);
+        }
         StringBuilder result = new StringBuilder(text.length());
         int segmentStart = 0;
         int cursor = 0;
