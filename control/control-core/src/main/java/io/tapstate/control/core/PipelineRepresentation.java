@@ -46,6 +46,9 @@ import java.util.function.Function;
 /** Projects a canonical Pipeline artifact and its resolved Sources into a structured view. */
 public final class PipelineRepresentation {
 
+    private static final String FIELDS_KEY = "fields";
+    private static final String SOFT_DELETE_KEY = "soft_delete";
+
     private final PipelineDagProjection dagProjection = new PipelineDagProjection();
 
     /** Builds a Pipeline view while preserving the declared Source reference order. */
@@ -170,7 +173,7 @@ public final class PipelineRepresentation {
         if (body.containsKey("script")) {
             return "js";
         }
-        if (body.containsKey("fields") || body.containsKey("soft_delete") || body.containsKey("softDelete")) {
+        if (body.containsKey(FIELDS_KEY) || body.containsKey(SOFT_DELETE_KEY) || body.containsKey("softDelete")) {
             return "map";
         }
         if (body.containsKey("expr")) {
@@ -363,13 +366,13 @@ public final class PipelineRepresentation {
 
     /** A map's fields may be absent only where soft_delete stands in for them, as in the document form. */
     private static TransformBody.MapProjection mapBody(Map<String, Object> payload, String path) {
-        String softDelete = textOrNull(value(payload, "soft_delete", "softDelete"), path + ".soft_delete");
+        String softDelete = textOrNull(value(payload, SOFT_DELETE_KEY, "softDelete"), path + "." + SOFT_DELETE_KEY);
         if (softDelete != null && softDelete.isBlank()) {
             throw malformed(path + ".soft_delete must name a column");
         }
-        Map<String, FieldRule> fields = softDelete != null && payload.get("fields") == null
+        Map<String, FieldRule> fields = softDelete != null && payload.get(FIELDS_KEY) == null
                 ? Map.of()
-                : fieldRules(requiredObject(payload, "fields", path), path + ".fields");
+                : fieldRules(requiredObject(payload, FIELDS_KEY, path), path + "." + FIELDS_KEY);
         if (softDelete != null && fields.containsKey(softDelete)) {
             throw malformed(path + ".soft_delete names a column also declared under fields");
         }
@@ -381,9 +384,9 @@ public final class PipelineRepresentation {
         switch (body) {
             case TransformBody.Js js -> value.put("script", js.script());
             case TransformBody.MapProjection map -> {
-                value.put("fields", fieldRuleValues(map.fields()));
+                value.put(FIELDS_KEY, fieldRuleValues(map.fields()));
                 if (map.softDelete() != null) {
-                    value.put("soft_delete", map.softDelete());
+                    value.put(SOFT_DELETE_KEY, map.softDelete());
                 }
             }
             case TransformBody.Filter filter -> value.put("expr", filter.expr());

@@ -140,6 +140,7 @@ public final class DslParser {
     static final Set<String> EXECUTION_KEYS = Set.of("parallelism", "batch");
     static final Set<String> BATCH_KEYS = Set.of("max_records", "max_wait");
     private static final String SOFT_DELETE_TOKEN = "soft_delete";
+    private static final String FIELDS_TOKEN = "fields";
     private static final Set<String> RENAME_KEYS = Set.of("map", "case", "prefix", "suffix");
     private static final Set<String> QUERY_KEYS = Set.of("type", "backend");
     static final Set<String> PUSH_KEYS = Set.of("id", SOURCE_TOKEN, "topic", FORMAT_FIELD, OPTIONS_FIELD);
@@ -517,7 +518,7 @@ public final class DslParser {
     private static Set<String> payloadKeys(String type) {
         return switch (type) {
             case "js" -> Set.of("script");
-            case "map" -> Set.of("fields", SOFT_DELETE_TOKEN);
+            case "map" -> Set.of(FIELDS_TOKEN, SOFT_DELETE_TOKEN);
             case FILTER_TOKEN -> Set.of("expr");
             case "unwind" -> Set.of("path", "include_array_index",
                     "preserve_null_and_empty_arrays", "element_key", "element_type", SOURCE_ID_FIELD_TOKEN);
@@ -592,9 +593,9 @@ public final class DslParser {
      */
     private TransformBody.MapProjection mapProjection(YamlMap s) {
         String softDelete = s.string(SOFT_DELETE_TOKEN);
-        YamlMap fields = s.mapping("fields");
+        YamlMap fields = s.mapping(FIELDS_TOKEN);
         if (softDelete == null) {
-            s.require("fields", fields);
+            s.require(FIELDS_TOKEN, fields);
         } else if (softDelete.isBlank()) {
             throw s.errorAt(SOFT_DELETE_TOKEN, DslError.ILLEGAL_VALUE,
                     Map.of(VALUE_TOKEN, softDelete, EXPECTED_TOKEN, "a column name"));
