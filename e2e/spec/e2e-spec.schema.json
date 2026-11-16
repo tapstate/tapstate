@@ -452,10 +452,9 @@
                     "additionalProperties": {
                       "type": [
                         "integer",
-                        "string",
-                        "boolean"
+                        "string"
                       ],
-                      "description": "An integer, a string or a boolean; wider value types are a widening of the vocabulary."
+                      "description": "An integer or a string; wider value types are a widening of the vocabulary."
                     }
                   },
                   "expect": {
