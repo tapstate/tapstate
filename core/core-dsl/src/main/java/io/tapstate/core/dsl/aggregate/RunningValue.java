@@ -293,6 +293,10 @@ public abstract sealed class RunningValue {
             this.average = average;
         }
 
+        // The total holds each double's exact binary value, so that the result is the
+        // correctly rounded sum of the doubles and a retraction cancels to the last bit.
+        // BigDecimal.valueOf would add the shortest decimal text of the double instead.
+        @SuppressWarnings("java:S2111")
         private void change(Object value, int by) {
             double d = floating(value);
             if (Double.isNaN(d)) {

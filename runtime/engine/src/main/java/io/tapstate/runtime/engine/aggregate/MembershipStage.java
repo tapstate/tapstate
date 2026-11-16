@@ -262,7 +262,7 @@ public final class MembershipStage {
         List<Entry> part = new ArrayList<>();
         long bytes = 0;
         for (Entry save : saves) {
-            long weight = save.key().length + save.state().length;
+            long weight = (long) save.key().length + save.state().length;
             if (!part.isEmpty() && (part.size() == limit.operations() || bytes + weight > limit.bytes())) {
                 store.commit(part, List.of());
                 part = new ArrayList<>();
