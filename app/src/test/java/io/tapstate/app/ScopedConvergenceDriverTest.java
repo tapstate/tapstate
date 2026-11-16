@@ -863,6 +863,16 @@ class ScopedConvergenceDriverTest {
         @Override public ObservationStore pipelineObservations(PipelineIntentScope scope, WorkloadClaimFence original, Runnable active) {
             return new ObservationStore() {
                 @Override public Optional<Observation> read(String id) { check(scope); return observations(scope).read(id); }
+                @Override public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+                    check(scope, original, active);
+                    var checkpoint = state(scope).read(scope.pipelineId()).orElseThrow();
+                    if (checkpoint.epoch() != epoch || StateJson.parse(checkpoint.stateJson()) != expected.state()
+                            || !read(scope.pipelineId()).filter(expected::equals).isPresent()) return Optional.empty();
+                    var refreshed = new Observation(expected.pipelineId(), expected.state(), expected.metrics(), expected.snapshot(),
+                            expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad());
+                    save(refreshed);
+                    return Optional.of(refreshed);
+                }
                 @Override public void save(Observation value) {
                     if (rejectPublication) throw fenced();
                     check(scope, original, active); writes.add(new Write("observation", scope, original)); observations(scope).save(value);

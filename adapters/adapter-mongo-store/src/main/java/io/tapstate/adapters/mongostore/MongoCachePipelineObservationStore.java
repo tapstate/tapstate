@@ -82,6 +82,40 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
         });
     }
 
+    @Override public Optional<Observation> refreshTerminal(Observation expected, long checkpointEpoch, java.time.Instant at) {
+        access.requirePipeline(expected.pipelineId());
+        if (access.originalClaim() == null) throw MongoCachePipelineAccess.fenced();
+        if (expected.state() != PipelineState.FAILED && expected.state() != PipelineState.STOPPED)
+            throw new IllegalArgumentException("terminal refresh requires a failed or stopped projection");
+        if (checkpointEpoch < 0 || expected.observedAt() == null || at == null)
+            throw new IllegalArgumentException("invalid terminal refresh checkpoint or time");
+        if (at.isBefore(expected.observedAt())) return Optional.empty();
+        // A previous claim can still publish the coded failure for this epoch under its own key.
+        // The ordinary reader must get a chance to recover that reason before any reuse.
+        if (expected.state() == PipelineState.FAILED && expected.failure() == null) return Optional.empty();
+        var id = keyOfFence(access, checkpointEpoch, access.originalClaim());
+        var previous = document(expected, id);
+        var refreshed = new Observation(expected.pipelineId(), expected.state(), expected.metrics(), expected.snapshot(),
+                expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad());
+        var captured = document(refreshed, id);
+        return access.observationTransaction(session -> {
+            var state = access.stateRow(session);
+            if (!Long.valueOf(checkpointEpoch).equals(state.get("epoch"))
+                    || StateJson.parse(state.getString("stateJson")) != expected.state()) return Optional.empty();
+            var claimId = claimKey(access);
+            var reading = reading(session, access, state, claims(session, access, List.of(claimId)).get(claimId));
+            // Never borrow terminal details from another execution for this compare-and-refresh.
+            if (!id.equals(reading.key())) return Optional.empty();
+            var row = collection().find(session, new Document("_id", id)).first();
+            if (row == null || !previous.equals(row)) return Optional.empty();
+            // Like ordinary observation saves, a concurrent transition leaves only an old-key
+            // projection; it cannot modify a newer key. No lifecycle or claim authority is advanced.
+            var result = collection().replaceOne(session, new Document("_id", id)
+                    .append("observedAt", previous.get("observedAt")), captured);
+            return result.getMatchedCount() == 1 ? Optional.of(refreshed) : Optional.empty();
+        });
+    }
+
     static Optional<Observation> select(Reading reading, Document row, Document terminal) {
         var actual = reading.actual();
         if (actual == PipelineState.RUNNING && !reading.live()) return Optional.empty();

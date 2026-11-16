@@ -71,6 +71,50 @@ class ObservationPublisherTest {
     }
 
     @Test
+    void coherentTerminalRefreshDoesNotSeparatelyRereadTheCheckpointOrProjection() {
+        state.seed("orders", PipelineState.STOPPED);
+        var first = publisher.publishScopedReading(new PipelineIntentScope("cluster", 1, "cache", "orders", 1),
+                state, observations, null, true).orElseThrow().observation();
+        var scoped = new ObservationStore() {
+            public void save(Observation value) { throw new AssertionError("refresh already saved"); }
+            public Optional<Observation> read(String id) { throw new AssertionError("refresh already read"); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+            public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+                assertThat(expected).isEqualTo(first); assertThat(epoch).isZero();
+                return Optional.of(new Observation(expected.pipelineId(), expected.state(), expected.metrics(),
+                        expected.snapshot(), expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad()));
+            }
+        };
+        var checkpointReads = new StateStore() {
+            public Optional<CheckpointDoc> read(String id) { throw new AssertionError("refresh already read checkpoint"); }
+            public void create(String id, String json, Instant at) { throw new AssertionError("no lifecycle mutation"); }
+            public CasOutcome compareAndSwap(String id, long epoch, String json, Instant at) { throw new AssertionError("no lifecycle mutation"); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+        };
+        var refreshed = publisher.publishScopedReading(new PipelineIntentScope("cluster", 1, "cache", "orders", 1),
+                checkpointReads, scoped, null, true).orElseThrow();
+        assertThat(refreshed.measured()).isFalse();
+        assertThat(refreshed.observation().facts()).isEqualTo(first.facts());
+    }
+
+    @Test
+    void aRefusedCoherentRefreshCannotReuseAnotherExecutionsTerminalDetails() {
+        state.seed("orders", PipelineState.FAILED);
+        var scope = new PipelineIntentScope("cluster", 1, "cache", "orders", 1);
+        var first = publisher.publishScopedReading(scope, state, observations, null, true).orElseThrow().observation();
+        var nextExecution = new ObservationStore() {
+            public void save(Observation value) { observations.save(value); }
+            public Optional<Observation> read(String id) { return Optional.of(first); }
+            public void delete(String id) { throw new AssertionError("no removal"); }
+            public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+                return Optional.empty();
+            }
+        };
+        assertThat(publisher.publishScopedReading(scope, state, nextExecution, null, true)
+                .orElseThrow().measured()).isTrue();
+    }
+
+    @Test
     void anOptionalTerminalReuseReadRefusalFallsBackToOrdinaryMeasurement() {
         state.seed("orders", PipelineState.STOPPED);
         var scoped = new RecordingObservationStore();
@@ -1061,12 +1105,23 @@ class ObservationPublisherTest {
     }
 
     /** In-memory observation store double. */
-    private static final class RecordingObservationStore implements ObservationStore {
+    private final class RecordingObservationStore implements ObservationStore {
         @Override
         public void delete(String pipelineId) {
             throw new UnsupportedOperationException("removal is not exercised by this double");
         }
 
+
+        @Override
+        public Optional<Observation> refreshTerminal(Observation expected, long epoch, Instant at) {
+            var checkpoint = state.read(expected.pipelineId()).orElseThrow();
+            if (checkpoint.epoch() != epoch || StateJson.parse(checkpoint.stateJson()) != expected.state()
+                    || !read(expected.pipelineId()).filter(expected::equals).isPresent()) return Optional.empty();
+            var updated = new Observation(expected.pipelineId(), expected.state(), expected.metrics(), expected.snapshot(),
+                    expected.positions(), expected.failure(), at, expected.facts(), expected.initialLoad());
+            save(updated);
+            return Optional.of(updated);
+        }
 
         private final Map<String, Observation> docs = new HashMap<>();
         private TapstateException nextReadFailure;

@@ -56,6 +56,102 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void terminalRefreshUsesOneCoherentCheckpointAndProjectionRead() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var original = new Observation("orders", PipelineState.FAILED, Map.of("recordCount", 8L), Map.of(),
+                    Map.of("orders", "position"), new io.tapstate.core.lifecycle.ObservationFailure("test.failure", Map.of()),
+                    AT, List.of());
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(original, 1);
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent e) {
+                    if (e.getDatabaseName().equals(f.database().getName()) || e.getCommandName().equals("commitTransaction"))
+                        commands.add(e.getCommandName());
+                }
+            };
+            try (var observed = client(listener)) {
+                var store = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, f.fence(), ACTIVE));
+                var refreshed = store.refreshTerminal(original, 1, AT.plusSeconds(1)).orElseThrow();
+                assertThat(refreshed.observedAt()).isEqualTo(AT.plusSeconds(1));
+                assertThat(refreshed.metrics()).isEqualTo(original.metrics());
+                assertThat(refreshed.positions()).isEqualTo(original.positions());
+                assertThat(refreshed.failure()).isEqualTo(original.failure());
+                assertThat(commands).hasSize(11);
+                assertThat(java.util.Collections.frequency(commands, "commitTransaction")).isEqualTo(1);
+                assertThat(java.util.Collections.frequency(commands, "find")).isEqualTo(2);
+                assertThat(java.util.Collections.frequency(commands, "listIndexes")).isEqualTo(2);
+                assertThat(store.read("orders")).contains(refreshed);
+                assertThat(store.refreshTerminal(original, 1, AT.plusSeconds(2))).isEmpty();
+                assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
+                assertThat(store.refreshTerminal(refreshed, 1, AT.plusSeconds(2))).isEmpty();
+                assertThat(store.read("orders")).isEmpty();
+            }
+        });
+    }
+
+    @Test void terminalRefreshDoesNotHideADelayedFailureFromThePreviousClaim() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var previous = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var next = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
+                    1, Set.of("node-a")).orElseThrow());
+            var replacement = f.domain().pipelineObservations(SCOPE, next, ACTIVE);
+            var noReason = observation(PipelineState.FAILED);
+            replacement.save(noReason, 1);
+            var reason = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("test.failure", Map.of()), AT, List.of());
+            previous.save(reason, 1);
+            assertThat(replacement.read("orders")).contains(reason);
+            assertThat(replacement.refreshTerminal(noReason, 1, AT.plusSeconds(1))).isEmpty();
+            assertThat(replacement.read("orders")).contains(reason);
+        });
+    }
+
+    @Test void terminalRefreshNeverAdoptsAnotherClaimOrOverwritesANewerSample() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var original = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("test.failure", Map.of()), AT, List.of());
+            var observations = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            observations.save(original, 1);
+            var claims = f.domain().workloadClaims(BUSINESS);
+            var next = WorkloadClaimFence.from(claims.advanceExecution(claims.read(KEY).orElseThrow().claim(),
+                    1, Set.of("node-a")).orElseThrow());
+            assertThat(observations.refreshTerminal(original, 1, AT.plusSeconds(1))).isEmpty();
+            var replacement = f.domain().pipelineObservations(SCOPE, next, ACTIVE);
+            assertThat(replacement.refreshTerminal(original, 1, AT.plusSeconds(1))).isEmpty();
+            replacement.save(original, 1);
+            var entered = new CountDownLatch(1); var release = new CountDownLatch(1); var once = new AtomicBoolean();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent e) {
+                    if (isUpdate(e, SystemCollections.CACHE_PIPELINE_OBSERVATION.collectionName()) && once.compareAndSet(false, true)) {
+                        entered.countDown(); await(release);
+                    }
+                }
+            };
+            try (var observed = client(listener); var worker = Executors.newSingleThreadExecutor()) {
+                var store = new MongoCachePipelineObservationStore(new MongoCachePipelineAccess(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, next, ACTIVE));
+                var refresh = worker.submit(() -> store.refreshTerminal(original, 1, AT.plusSeconds(1)));
+                try {
+                    await(entered);
+                    var newer = new Observation("orders", PipelineState.FAILED, Map.of("recordCount", 9L), Map.of(),
+                            Map.of(), original.failure(), AT.plusSeconds(2), List.of());
+                    replacement.save(newer, 1);
+                    release.countDown();
+                    assertThat(refresh.get(10, TimeUnit.SECONDS)).isEmpty();
+                    assertThat(replacement.read("orders")).contains(newer);
+                } finally { release.countDown(); }
+            }
+        });
+    }
+
     @Test void initialLoadDisplayRoundTripsAndNewRunReplacesOnlyItsOwnCurrentFacts() {
         withFixture(f -> {
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
