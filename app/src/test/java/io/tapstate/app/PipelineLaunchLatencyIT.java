@@ -31,6 +31,82 @@ class PipelineLaunchLatencyIT {
 
     @Test void nativeLaunchStagesKeepTheirRequestCostsVisible() throws Exception { measure(false); }
 
+    @Test void artifactListReadsSharedOutputMetadataOncePerHttpPage() throws Exception {
+        try (var config = mongo(); var cache = mongo()) {
+            config.start(); cache.start();
+            var storage = NativeAppStorage.prepare(config.getReplicaSetUrl("artifact_page_config"),
+                    cache.getReplicaSetUrl("artifact_page_cache"), cache.getReplicaSetUrl("artifact_page_master"),
+                    StorageBinding.Mode.CLOUD, NativeCloudAlertManagementIT.CLUSTER);
+            try (var application = new SpringApplicationBuilder(Bootstrap.class,
+                    NativeCloudAlertManagementIT.ControlledSdk.class, Measurements.class)
+                    .environment(CloudFixtureEnvironment.isolated()).run(
+                            "--server.address=127.0.0.1", "--server.port=0", "--logging.level.root=ERROR",
+                            "--tapstate.store.mongo.uri=" + storage.configurationUri(),
+                            "--tapstate.cloud.atlas-uri=" + storage.configurationUri(),
+                            "--tapstate.cloud.base-url=" + NativeCloudAlertManagementIT.CLOUD,
+                            "--tapstate.cloud.token=controlled-cloud-machine-token",
+                            "--tapstate.cloud.cluster-id=" + storage.clusterId(),
+                            "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2",
+                            "--SDK_STATUS_SENDER_ENABLED=false",
+                            "--tapstate.connectors.seed-dir=" + CloudConnectorTestInputs.seedDirectory(),
+                            "--tapstate.connectors.plugins-dir=" + work.resolve("artifact-page-plugins"));
+                 var http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+                org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                        assertThat(application.getBean(StorageRoot.class).runtime().business()).isPresent());
+                NativeAppStorage.awaitBusiness(application);
+                var port = NativeAppStorage.business(application).getBean(StorePort.class);
+                var parser = new io.tapstate.core.dsl.DslParser();
+                port.artifacts().save(new SourceResource("page-input", null, "mongodb",
+                        Map.of("isUri", true, "uri", storage.masterUri()), null,
+                        List.of(io.tapstate.core.model.TableRef.regex("order.*")), null, null));
+                port.schemas().save(new DiscoveredSourceModel("page-input", "mongodb", 0L,
+                        new SourceModel(List.of(new SourceTable("orders",
+                                List.of(new SourceField("_id", "int", TapstateType.INT64)), List.of("_id"), List.of())))));
+                for (int i = 0; i < 8; i++) port.artifacts().save(parser.parse("""
+                        version: tapstate/v1
+                        kind: pipeline
+                        id: page-%d
+                        source: page-input
+                        serve:
+                          from: page-input
+                          sync: [{id: sink, source: atlas-store}]
+                        """.formatted(i)));
+                String origin = "http://localhost:" + ((WebServerApplicationContext) application).getWebServer().getPort();
+                var login = http.send(HttpRequest.newBuilder(URI.create(origin + "/auth/exchange?code=browser-code")).GET().build(),
+                        HttpResponse.BodyHandlers.ofString());
+                assertThat(login.statusCode()).as(login.body()).isEqualTo(302);
+                String cookie = login.headers().firstValue("set-cookie").orElseThrow().split(";", 2)[0];
+                var totals = new ArrayList<Long>();
+                java.util.function.Consumer<Map<String, Object>> budget = reading -> {
+                    var collections = (Map<?, ?>) reading.get("collections");
+                    String modelRead = "find:" + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SOURCE_SCHEMAS.collectionName();
+                    assertThat(collections.get(modelRead)).isInstanceOf(Number.class);
+                    assertThat(((Number) collections.get(modelRead)).intValue())
+                            .as("one discovery header and table batch per distinct source, independently of page size").isEqualTo(2);
+                    totals.add(((Number) ((Map<?, ?>) reading.get("mongo")).get("started")).longValue());
+                };
+                var small = request(http, origin, cookie, "GET", "/api/pipelines:artifacts?limit=1&offset=0", null, 200, budget);
+                assertThat((List<?>) small.get("items")).hasSize(1);
+                var full = request(http, origin, cookie, "GET", "/api/pipelines:artifacts?limit=8&offset=0", null, 200, budget);
+                assertThat((List<?>) full.get("items")).hasSize(8);
+                assertThat(totals.get(1) - totals.getFirst()).as("shared output enrichment does not grow by pipeline count").isLessThanOrEqualTo(8);
+                for (int i = 0; i < 25; i++) port.artifacts().save(new SourceResource("unrelated-" + i, null, "mongodb",
+                        Map.of("isUri", true, "uri", storage.masterUri()), null, null, null, null));
+                request(http, origin, cookie, "GET", "/api/pipelines:artifacts?limit=8&offset=0", null, 200, budget);
+                assertThat(totals.get(2)).as("unrelated artifacts do not add enrichment commands").isLessThanOrEqualTo(totals.get(1) + 4);
+                var shared = (SourceResource) port.artifacts().get("page-input").orElseThrow();
+                port.schemas().save(new DiscoveredSourceModel(shared.id(), shared.connector(), 1L,
+                        new SourceModel(List.of(new SourceTable("orders_new",
+                                List.of(new SourceField("_id", "int", TapstateType.INT64)), List.of("_id"), List.of())))));
+                var changed = request(http, origin, cookie, "GET", "/api/pipelines:artifacts?limit=8&offset=0", null, 200, budget);
+                assertThat(JsonWriter.write(changed)).contains("orders_new");
+                request(http, origin, cookie, "GET", "/api/pipelines:artifacts?limit=8&offset=50", null, 200, reading ->
+                        assertThat(((Map<?, ?>) reading.get("collections")).get("find:"
+                                + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SOURCE_SCHEMAS.collectionName())).isNull());
+            }
+        }
+    }
+
     @Test void anIndependentNativeStartRunsWhileAnotherPipelinesPositionReadIsHeld() throws Exception { measure(true); }
 
     @Test void anIndependentNativeStartRunsWhileSharedCaptureMaintenanceIsHeld() throws Exception { measure(true, true); }

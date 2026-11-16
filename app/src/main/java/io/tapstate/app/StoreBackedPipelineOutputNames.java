@@ -30,6 +30,11 @@ final class StoreBackedPipelineOutputNames implements PipelineOutputNames {
         return source.outputNameResult(pipeline);
     }
 
+    @Override public Function<PipelineResource, Result> forArtifactPage(Function<String, Optional<Resource>> lookup) {
+        var page = source.catalogOutputNames(null, lookup);
+        return pipeline -> page.apply(pipeline).names();
+    }
+
     @Override
     public Description describe(PipelineResource pipeline, Map<String, Resource> resources) {
         return source.outputNameDetails(pipeline, resources);

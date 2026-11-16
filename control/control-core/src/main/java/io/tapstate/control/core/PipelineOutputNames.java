@@ -52,6 +52,11 @@ public interface PipelineOutputNames {
         return pipeline -> describe(pipeline, resources);
     }
 
+    /** One artifact page may share successful reads, including absence, without requesting input lineage. */
+    default Function<PipelineResource, Result> forArtifactPage(Function<String, Optional<Resource>> lookup) {
+        return this::resolve;
+    }
+
     default Result resolve(PipelineResource pipeline) {
         try {
             return new Result(of(pipeline), List.of());
