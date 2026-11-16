@@ -56,8 +56,12 @@ final class AlertNotificationPlanner {
         active.run();
         // Discovery starts from durable state and schedules on every process; no process-local known set is authoritative.
         var initial=store.planning();boolean isolated=initial.isolatedRecords(),unavailable=!initial.unavailableRules().isEmpty();var seed=isolated?new Changes(List.of(),List.of()):seed(initial,null);
-        if(!seed.schedules().isEmpty())require(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(),seed.schedules(),initial.version())));
-        var keys=store.planning().schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
+        var discovered=initial;
+        if(!seed.schedules().isEmpty()){
+            require(store.commit(new AlertStore.Commit(AlertStore.CommitKind.PLAN,null,List.of(),seed.schedules(),initial.version())));
+            discovered=store.planning();
+        }
+        var keys=discovered.schedules().stream().map(v->v.value()).filter(v->v.batch()==null&&v.retiredAt()==null).map(AlertSchedule.Record::key).toList();
         int count=Math.min(32,keys.size());
         for(int index=0;index<count;index++){var key=keys.get(Math.floorMod(offset+index,keys.size()));active.run();
             boolean done=false;for(int retry=0;retry<3;retry++){

@@ -20,6 +20,66 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void backgroundKeyConflictRetriesBeforeRepeatingHostReads() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var keys = SystemCollections.CLUSTER_KEYS.on(f.db);
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = keys.find().first();
+            var beforeVersion = versions.find().first();
+            var commands = new ArrayList<String>();
+            try (var control = MongoClients.create(MONGO.getReplicaSetUrl())) {
+                var admin = control.getDatabase("admin");
+                admin.runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", new Document("times", 1))
+                        .append("data", new Document("failCommands", List.of("update"))
+                                .append("namespace", f.db.getName() + ".cluster_keys")
+                                .append("errorCode", 112).append("errorLabels", List.of("TransientTransactionError"))));
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+                try { assertThat(accept(f, facts)).isEqualTo(Outcome.STAGED); }
+                finally {
+                    MongoCommandObservation.COLLECTIONS.remove();
+                    admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+                }
+            }
+            int aborted = commands.indexOf("abortTransaction:");
+            assertThat(aborted).isPositive();
+            assertThat(commands.subList(0, aborted)).contains("update:cluster_keys")
+                    .doesNotContain("find:storage_setup", "find:schema_migrations", "find:configuration_version", "listIndexes:sources");
+            long committedKeyWrites = commands.subList(aborted + 1, commands.size()).stream()
+                    .filter("update:cluster_keys"::equals).count();
+            assertThat(committedKeyWrites).isPositive();
+            assertThat((long) Collections.frequency(commands, "update:cluster_keys")).isEqualTo(committedKeyWrites + 1);
+            assertThat(keys.find().first().getLong("sourceWriteFence")).isEqualTo(beforeKey.getLong("sourceWriteFence") + committedKeyWrites);
+            assertThat(versions.find().first().getLong(ConfigurationVersion.ALERT_FENCE))
+                    .isEqualTo(beforeVersion.getLong(ConfigurationVersion.ALERT_FENCE) + 1);
+            assertThat(versions.find().first().getLong("revision")).isEqualTo(beforeVersion.getLong("revision"));
+            assertThat(f.store.evaluationStates(null, 10).rows()).hasSize(1);
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).hasSize(1);
+        });
+    }
+
+    @Test void earlyBackgroundKeyFenceRollsBackWhenTheHostIsStale() {
+        withStore(f -> {
+            var facts = businessFacts(f);
+            var keys = SystemCollections.CLUSTER_KEYS.on(f.db);
+            var versions = SystemCollections.CONFIGURATION_VERSION.on(f.db);
+            var beforeKey = keys.find().first();
+            var beforeVersion = versions.find().first();
+            var stale = new Host(SCOPE, new StorageSetupScope(SCOPE.clusterId(), "installation-a", "old-operation", 1),
+                    AlertChannelPolicy.Deployment.ON_PREM, () -> {}).withChannels(Set.of(EMAIL));
+            var store = f.domain.alerts(stale, BuiltinAlarmTypes.catalog(), f.clock);
+            assertThatThrownBy(() -> store.commit(new Commit(CommitKind.STATE_AND_PLAN,
+                    new StateChange(0, null, facts.head, List.of(), null), List.of(new IntentChange(null, facts.intent)),
+                    List.of(new ScheduleChange(null, facts.schedule)))))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(keys.find().first()).isEqualTo(beforeKey);
+            assertThat(versions.find().first()).isEqualTo(beforeVersion);
+            assertThat(f.store.evaluationStates(null, 10).rows()).isEmpty();
+            assertThat(f.store.dueIntents(T.plusSeconds(1), null, 10).rows()).isEmpty();
+        });
+    }
+
     @Test void unsupportedBuiltinFormatThreeCannotBlockCompatibleDeliveryPages(){
         withStore(f->{var facts=businessFacts(f);accept(f,facts);var unknown=MongoAlertDeliveryCodec.write(facts.intent(),1);
             unknown.get("_id",Document.class).put("deliveryId","future-builtin-format-three");unknown.put("formatVersion",3);

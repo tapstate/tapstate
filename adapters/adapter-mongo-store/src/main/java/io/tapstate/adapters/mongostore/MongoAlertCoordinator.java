@@ -89,18 +89,27 @@ final class MongoAlertCoordinator implements AlertStore {
         });
     }
     private <T>T tx(Access access,boolean write,boolean authoring,Function<ClientSession,T> action) {
+        return tx(access,write,authoring,false,action);
+    }
+    private <T>T tx(Access access,boolean write,boolean authoring,boolean backgroundCommit,Function<ClientSession,T> action) {
         if(access!=null){access.revalidate().run();access.locallyActive().run();}
         host.locallyActive().run(); var verifiedSchema=domain.currentAlertSchema();
         return StoreIo.call(()->domain.alertTransaction(new MongoReadBudget(Duration.ofSeconds(10)),session->{
+            // Contended background commits must not replay the entire host read before
+            // discovering the conflict. All subsequent refusals roll back this same write.
+            if(backgroundCommit){host.locallyActive().run();keyFence(session);}
             domain.requireVerifiedAlertSchema(currentHost(session));if(access!=null){currentActor(session,access.actor(),access);if(write&&access.actor()==null&&!Set.of("WRITE","ADMIN").contains(access.cloudGrantedScope()))throw stale("cloud-write-permission");}
             if(write){
-                if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
+                if(!backgroundCommit)keyFence(session);
                 if(authoring)ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(db), db);
                 else ConfigurationVersion.advanceAlert(session,SystemCollections.CONFIGURATION_VERSION.on(db));
             }
             T result=action.apply(session);domain.requireVerifiedAlertSchema(verifiedSchema);
             host.locallyActive().run();if(access!=null)access.locallyActive().run();return result;
         }));
+    }
+    private void keyFence(ClientSession session) {
+        if(!keys.fenceWrite(new SourceConfigWriteScope(session),keys.currentForWrite().activeKeyId()))throw stale("configuration-key");
     }
     private <T>T maintenanceTx(boolean write,Duration remaining,Function<ClientSession,T> action) {
         host.locallyActive().run();return StoreIo.call(()->domain.alertMaintenanceTransaction(new MongoReadBudget(remaining),session->{
@@ -289,7 +298,7 @@ final class MongoAlertCoordinator implements AlertStore {
     @Override public Outcome commit(Commit candidate){return commit(candidate,null);}
     @Override public Outcome commitAsCaller(Commit candidate,Access access){Objects.requireNonNull(access);return commit(candidate,access);}
     private Outcome commit(Commit c,Access access) {
-        try{return tx(access,true,false,s->{
+        try{return tx(access,true,false,access==null,s->{
             boolean changed=false;
             if(c.version()!=null){
                 var version=SystemCollections.CONFIGURATION_VERSION.on(db).find(s,new Document("_id",ConfigurationVersion.ID)).first();

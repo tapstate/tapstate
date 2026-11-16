@@ -25,23 +25,33 @@ final class NativeValidationScheduler implements AutoCloseable {
     private final MongoConfigurationDomain configuration;private final ValidationMemberResources.Member resources;private final ValidationMemberResources process;
     private final Supplier<NativeValidationStartCoordinator> coordinators;private final MemoryValidationSchedules observations;private final Clock clock;
     private final ValidationSchedule.Calculator calculator;private final Runnable active;
+    private final java.util.function.LongSupplier nanoTime;
     private final Map<Key,Entry> entries=new LinkedHashMap<>();private final AtomicBoolean discovering=new AtomicBoolean();
     private ScheduledFuture<?> polling;private ValidationMemberResources.Unbound allocation;private ThreadPoolExecutor starts;
     private NativeValidationStartCoordinator coordinator;private MemoryValidationSchedules.Writer writer;private ValidationScheduleObservations.Origin origin;
     private ValidationTaskStore discoveryTasks;
     private Long emptyRevision;
-    private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private long nextDiscovery;
+    private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private volatile long nextDiscovery;
     NativeValidationScheduler(MongoConfigurationDomain configuration,ValidationMemberResources.Member resources,ValidationMemberResources process,
             Supplier<NativeValidationStartCoordinator> coordinators,MemoryValidationSchedules observations,Clock clock,ValidationSchedule.Calculator calculator,Runnable active){
+        this(configuration,resources,process,coordinators,observations,clock,calculator,active,System::nanoTime);
+    }
+    NativeValidationScheduler(MongoConfigurationDomain configuration,ValidationMemberResources.Member resources,ValidationMemberResources process,
+            Supplier<NativeValidationStartCoordinator> coordinators,MemoryValidationSchedules observations,Clock clock,ValidationSchedule.Calculator calculator,Runnable active,
+            java.util.function.LongSupplier nanoTime){
         this.configuration=Objects.requireNonNull(configuration);this.resources=Objects.requireNonNull(resources);this.process=Objects.requireNonNull(process);
         this.coordinators=Objects.requireNonNull(coordinators);this.observations=Objects.requireNonNull(observations);this.clock=Objects.requireNonNull(clock);
         this.calculator=Objects.requireNonNull(calculator);this.active=Objects.requireNonNull(active);
+        this.nanoTime=Objects.requireNonNull(nanoTime);
     }
     synchronized void start(){if(closed||started)return;started=true;polling=process.controlTicks(this::dispatch);}
     private void dispatch(){
         if(closed)return;
         try{active.run();sendDue();}catch(TapstateException unavailable){return;}
-        long now=System.nanoTime();if(now-nextDiscovery<0||!discovering.compareAndSet(false,true))return;nextDiscovery=now+TimeUnit.MILLISECONDS.toNanos(100);
+        long now=nanoTime.getAsLong();if(now-nextDiscovery<0||!discovering.compareAndSet(false,true))return;
+        now=nanoTime.getAsLong();
+        if(now-nextDiscovery<0){discovering.set(false);return;}
+        nextDiscovery=now+TimeUnit.MILLISECONDS.toNanos(100);
         final ValidationMemberResources.Control work;
         try{work=resources.admitMaintenanceControl();}
         catch(TapstateException unavailable){discovering.set(false);return;}
@@ -55,7 +65,10 @@ final class NativeValidationScheduler implements AutoCloseable {
         Long revision = null;
         if (pipeline == null && afterPipeline == null) {
             revision = configuration.validationDiscoveryRevision();
-            if (revision.equals(emptyRevision)) return;
+            if (revision.equals(emptyRevision)) {
+                waitForEmptyInventoryPoll();
+                return;
+            }
         }
         if (discoveryTasks == null) discoveryTasks = configuration.validationTasks(this::require);
         var tasks = discoveryTasks;
@@ -64,7 +77,10 @@ final class NativeValidationScheduler implements AutoCloseable {
             if(found.isEmpty()){
                 // Only an empty inventory is reusable. Populated sweeps keep their original
                 // admission and retry behavior, including slots freed later in a sweep.
-                if (revision != null && revision == configuration.validationDiscoveryRevision()) emptyRevision = revision;
+                if (revision != null && revision == configuration.validationDiscoveryRevision()) {
+                    emptyRevision = revision;
+                    waitForEmptyInventoryPoll();
+                }
                 afterPipeline=null;return;
             }
             emptyRevision=null;pipeline=found.getFirst();afterTask=null;
@@ -87,6 +103,11 @@ final class NativeValidationScheduler implements AutoCloseable {
             catch(TapstateException invalid){publish(saved.task(),saved.revision(),null,null,ValidationScheduleObservations.State.FAILED,invalid.code().code(),null,null);return;}
             var entry=new Entry(saved,next);entries.put(key,entry);publish(entry.task,entry.revision,next,null,ValidationScheduleObservations.State.WAITING,null,null,null);
         }
+    }
+    private void waitForEmptyInventoryPoll() {
+        // The fast ticks walk populated inventories and dispatch due occurrences. An empty
+        // inventory needs only a bounded change probe, matching report-history discovery.
+        nextDiscovery=nanoTime.getAsLong()+TimeUnit.SECONDS.toNanos(1);
     }
     private void ensureRegistry(){
         if(starts!=null)return;require();var reserved=resources.reserve(new ValidationLocalBudget.Amount(8L*1024*1024,1,0,0),0);
