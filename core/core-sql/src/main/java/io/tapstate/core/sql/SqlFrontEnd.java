@@ -193,6 +193,10 @@ public final class SqlFrontEnd {
         if (inFrom != null) {
             return inFrom;
         }
+        Unsupported orJoined = OrJoins.refused(select);
+        if (orJoined != null) {
+            return orJoined;
+        }
         Unsupported nonRow = firstNonRowCall(select);
         return nonRow != null ? nonRow : firstUnevaluableOperator(select);
     }
@@ -273,7 +277,9 @@ public final class SqlFrontEnd {
             // a cross join and the comma form are the same statement, and the one shape that
             // multiplies every row by every other row
             case NONE -> at("CROSS JOIN", join);
-            case ON -> equalitiesOnly(join.getCondition());
+            case ON -> OrJoins.isDisjunction(join.getCondition())
+                    ? OrJoins.joinShape(join, SqlFrontEnd::equalitiesOnly)
+                    : equalitiesOnly(join.getCondition());
         };
     }
 
@@ -369,10 +375,14 @@ public final class SqlFrontEnd {
                 .parserConfig(PARSER)
                 .build())) {
             SqlNode parsed = planner.parse(sql);
+            // before validation, so that the statement validated - and typed - is the one the plan states
+            SqlNode statement = parsed instanceof SqlOrderBy ordered ? ordered.query : parsed;
+            Map<String, String> alternatives = statement instanceof SqlSelect written && written.getFrom() != null
+                    ? OrJoins.rewrite(written) : Map.of();
             var validated = planner.validateAndGetType(parsed);
             RelDataType row = validated.right;
             SqlSelect select = selectOf(validated.left);
-            JoinTree from = tree(select.getFrom());
+            JoinTree from = tree(select.getFrom(), alternatives);
             List<Expr> computed = projected(select, from, tables);
             if (computed.size() != row.getFieldCount()) {
                 throw new SqlFrontEndException("the select list works out to " + computed.size()
@@ -574,9 +584,16 @@ public final class SqlFrontEnd {
      * validated type of the SQL as written.
      */
     private static JoinTree tree(SqlNode node) {
+        return tree(node, Map.of());
+    }
+
+    /**
+     * @param alternatives the sources {@link OrJoins} added, each mapped to the source it stands in for
+     */
+    private static JoinTree tree(SqlNode node, Map<String, String> alternatives) {
         if (node instanceof SqlJoin join) {
-            JoinTree left = tree(join.getLeft());
-            JoinTree right = tree(join.getRight());
+            JoinTree left = tree(join.getLeft(), alternatives);
+            JoinTree right = tree(join.getRight(), alternatives);
             List<JoinTree.KeyPair> keys = new ArrayList<>();
             boolean captured = switch (join.getConditionType()) {
                 // a natural join matches on columns nobody wrote down, so an empty key list is not
@@ -593,7 +610,8 @@ public final class SqlFrontEnd {
                     kindOf(join.getJoinType()), List.copyOf(keys), !captured);
         }
         if (node instanceof SqlBasicCall call && call.getOperator().getKind() == SqlKind.AS) {
-            return new JoinTree.Source(lastName(call.operand(1)), lastName(call.operand(0)));
+            String name = lastName(call.operand(1));
+            return new JoinTree.Source(name, lastName(call.operand(0)), alternatives.get(name));
         }
         if (node instanceof SqlIdentifier identifier) {
             String name = lastName(identifier);
