@@ -106,7 +106,7 @@ final class PreviewSelectionPlanner {
             String factAlias = entry.getValue().plan().factSource().name();
             roots.add(context.lineage(aliases.aliases().get(factAlias)).sourceKey());
             for (String alias : entry.getValue().plan().from().sources().stream()
-                    .map(JoinTree.Source::name).toList()) {
+                    .map(JoinTree.Source::declared).toList()) {
                 if (!alias.equals(factAlias)) {
                     dimensions.add(context.lineage(aliases.aliases().get(alias)).sourceKey());
                 }
@@ -380,6 +380,12 @@ final class PreviewSelectionPlanner {
             FromClause.Aliases aliases = (FromClause.Aliases) step.from();
             Map<String, Lineage> lineages = new LinkedHashMap<>();
             aliases.aliases().forEach((name, ref) -> lineages.put(name, lineage(ref)));
+            // an OR alternative the front end added samples the rows of the alias it stands in for
+            compiled.plan().from().sources().forEach(source -> {
+                if (!source.declared().equals(source.name()) && lineages.containsKey(source.declared())) {
+                    lineages.put(source.name(), lineages.get(source.declared()));
+                }
+            });
             Map<String, List<Map<String, Object>>> available = new LinkedHashMap<>();
             String fact = compiled.plan().factSource().name();
             available.put(fact, logicalRows(lineages.get(fact)));
