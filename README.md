@@ -6,6 +6,12 @@ Tapstate is an open-source, **operational data engine** that can be used to buil
 
 **Capture → Transform → Consolidate → Materialize. One deployable.**
 
+[**Try Tapstate in minutes ↓**](#try-it-in-minutes)
+
+![Tapstate Operational State Layer: operational systems flow through CDC into Capture, Transform, Consolidate, and Materialize, maintaining live business state for Agentic AI and mission-critical applications.](docs/assets/operational-state-layer.svg)
+
+*Conceptual architecture: the current Alpha materializes state in MongoDB; stable state-consumption APIs and push delivery are not yet available.*
+
 ## Try it in minutes
 
 **Requirements:** Docker with the Compose plugin, and `jq`.
