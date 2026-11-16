@@ -179,6 +179,33 @@ class MongoCacheMetadataStoresIT {
         });
     }
 
+    @Test void connectionCodePriorityChangesDoNotRewriteEarlierDiagnostics() {
+        withFixture(f -> {
+            var writer = new MongoCacheConnectionTestResultStore(new MongoCacheMetadataAccess(f.client, f.database,
+                    SCOPE, SystemCollections.CACHE_CONNECTION_TEST_RESULTS, ACTIVE), true);
+            var rows = SystemCollections.CACHE_CONNECTION_TEST_RESULTS.on(f.database);
+            var oldKey = new Document("_id", "old-source");
+            var driver = Map.of("code", "28P01", "rawMessage", "password authentication failed");
+            var corrected = Map.<String, Object>of("code", "10002", "cause", driver);
+            var earlier = Map.<String, Object>of("code", "28P01", "cause", corrected);
+            long now = System.currentTimeMillis();
+            var oldReport = new ConnectionTestResult("old-source", "postgres", ConnectionTestResult.Outcome.FAILED,
+                    List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                            "Rejected", null, null, "28P01", earlier)), now, true);
+            var newReport = new ConnectionTestResult("new-source", "postgres", ConnectionTestResult.Outcome.FAILED,
+                    List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                            "Rejected", null, null, "10002", corrected)), now + 1, true);
+            writer.beginOrdinaryTest(oldReport.connectionId()).publish(oldReport);
+            var oldDocument = rows.find(oldKey).first();
+            writer.beginOrdinaryTest(newReport.connectionId()).publish(newReport);
+
+            var reader = f.domain.connectionTestResults(SCOPE, ACTIVE);
+            assertThat(reader.find(oldReport.connectionId())).contains(oldReport);
+            assertThat(reader.find(newReport.connectionId())).contains(newReport);
+            assertThat(rows.find(oldKey).first()).isEqualTo(oldDocument);
+        });
+    }
+
     @Test void isolatedExtendedWritesFenceLateOwnersAndKeepTheBoundedReportAcrossReopen() {
         withFixture(f -> {
             var normal = f.domain.connectionTestResults(SCOPE, ACTIVE);

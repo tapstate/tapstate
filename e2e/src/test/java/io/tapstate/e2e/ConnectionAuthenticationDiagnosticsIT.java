@@ -75,10 +75,14 @@ class ConnectionAuthenticationDiagnosticsIT {
         assertThat((List<?>) report.get("checks")).anySatisfy(value -> {
             var check = (Map<?, ?>) value;
             assertThat(check.get("status")).isEqualTo("FAILED");
-            assertThat(check.get("connectorErrorCode")).isEqualTo("28P01");
+            assertThat(check.get("connectorErrorCode")).isEqualTo("10002");
             assertThat((String) check.get("message")).contains("password authentication failed");
             var diagnostic = (Map<?, ?>) check.get("diagnostic");
-            assertThat(diagnostic.get("cause").toString()).contains("28P01", "password authentication failed");
+            assertThat(diagnostic.get("code")).isEqualTo("10002");
+            var cause = (Map<?, ?>) diagnostic.get("cause");
+            assertThat(cause.get("code")).isEqualTo("28P01");
+            assertThat(cause.get("cause")).isNull();
+            assertThat((String) cause.get("rawMessage")).contains("password authentication failed");
         });
     }
 

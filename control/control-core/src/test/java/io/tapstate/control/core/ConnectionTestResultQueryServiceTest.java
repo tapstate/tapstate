@@ -54,6 +54,24 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void rereadingAnEarlierPostgresReportKeepsItsOriginalPrimaryCodeAndCauseChain() {
+        var diagnostic = Map.<String, Object>of("code", "28P01", "cause",
+                Map.of("code", "10002", "cause", Map.of("code", "28P01")));
+        var stored = new ConnectionTestResult("conn-orders", "postgres", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Connection", ConnectionTestItem.Status.FAILED,
+                        "password authentication failed", null, null, "28P01", diagnostic)),
+                1_700_000_000_000L, true);
+        var store = new MapResultStore();
+        store.save(stored);
+
+        var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow().checks().getFirst();
+
+        assertThat(check.connectorErrorCode()).isEqualTo("28P01");
+        assertThat(check.diagnostic()).isEqualTo(diagnostic);
+        assertThat(store.find("conn-orders")).contains(stored);
+    }
+
+    @Test
     void findReturnsEmptyWhenTheConnectionWasNeverTested() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
 

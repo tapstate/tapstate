@@ -37,7 +37,9 @@ final class ConnectionDiagnosticProcesses {
         var text = CliOnce.runNative(Path.of(nativePath), home, storage.password(),
                 "-c", server.toString(), "-u", storage.username(), "test-result", id);
         assertThat(text.exitCode()).isEqualTo(1);
-        assertThat(text.stdout()).contains("FAILED", "28P01", "password authentication failed");
+        assertThat(text.stdout()).contains("FAILED", "[10002]", "password authentication failed")
+                .doesNotContain("[28P01]");
+        assertThat(text.stdout().lines().map(String::strip).filter("28P01"::equals)).hasSize(1);
 
         String java = Path.of(System.getProperty("java.home"), "bin", "java").toString();
         var builder = new ProcessBuilder(java, "-jar", mcpJar, "--server", server.toString());
@@ -64,11 +66,12 @@ final class ConnectionDiagnosticProcesses {
     private static void assertSameDiagnostics(Map<?, ?> expected, Map<?, ?> report) {
         assertThat(report.get("outcome")).isEqualTo(expected.get("outcome"));
         assertThat(report.get("testedAt")).isEqualTo(expected.get("testedAt"));
-        assertThat(checkDiagnostics(report)).isEqualTo(checkDiagnostics(expected));
+        assertThat(checkField(report, "connectorErrorCode")).isEqualTo(checkField(expected, "connectorErrorCode"));
+        assertThat(checkField(report, "diagnostic")).isEqualTo(checkField(expected, "diagnostic"));
     }
 
-    private static List<?> checkDiagnostics(Map<?, ?> report) {
-        return ((List<?>) report.get("checks")).stream().map(item -> ((Map<?, ?>) item).get("diagnostic")).toList();
+    private static List<?> checkField(Map<?, ?> report, String field) {
+        return ((List<?>) report.get("checks")).stream().map(item -> ((Map<?, ?>) item).get(field)).toList();
     }
 
     private static void send(Writer input, Map<String, Object> message) throws IOException {

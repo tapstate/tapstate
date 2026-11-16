@@ -142,11 +142,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         } catch (Throwable t) {
             ConnectionRejection rejection = connectionRejection(t);
             if (rejection != null) {
-                TapTestItemException diagnostic = new TapTestItemException();
-                diagnostic.initCause(rejection.cause());
-                diagnostic.setMessage(detail(rejection.detail()));
-                diagnostic.setErrorCode(rejection.code());
-                sink.accept(new TestItem("Connection", diagnostic, TestItem.RESULT_FAILED));
+                sink.accept(rejection);
                 return;
             }
             if (strict && t instanceof RuntimeException runtime) throw runtime;
@@ -157,7 +153,18 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         }
     }
 
-    private record ConnectionRejection(Throwable cause, Throwable detail, String code) {}
+    private static final class ConnectionRejection extends TestItem {
+        private final Throwable failure;
+
+        ConnectionRejection(Throwable failure, Throwable driver, String code) {
+            super(ITEM_CONNECTION, RESULT_FAILED);
+            this.failure = failure;
+            var diagnostic = new TapTestItemException();
+            diagnostic.setMessage(detail(driver));
+            diagnostic.setErrorCode(code);
+            setTapTestItemException(diagnostic);
+        }
+    }
 
     private static ConnectionRejection connectionRejection(Throwable failure) {
         if (Thread.currentThread().isInterrupted() || !hasNoSuppressed(failure)) {
@@ -174,7 +181,8 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         if (driver instanceof SQLException sql) {
             String state = sql.getSQLState();
             if (isSqlConnectionRejection(state, retryable)) {
-                return new ConnectionRejection(candidate, driver, state);
+                String code = candidate instanceof TapCodeException coded ? coded.getCode() : state;
+                return new ConnectionRejection(candidate, driver, code);
             }
         }
         if (retryable && (driver instanceof ConnectException || driver instanceof SSLException)) {
@@ -355,10 +363,12 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
         String solution = ex != null ? ex.getSolution() : null;
         String connectorErrorCode = ex != null ? ex.getErrorCode() : null;
         var status = status(item.getResult());
+        // A synthesized check reports the original failure at the root, including its own causes.
+        Throwable failure = item instanceof ConnectionRejection rejection ? rejection.failure : ex;
         return new ConnectionTestItem(item.getItem(), status,
                 message, reason, solution, connectorErrorCode,
                 diagnostics != null && (ex != null || status != ConnectionTestItem.Status.PASSED)
-                        ? PdkConnectionDiagnostic.capture(ex, message, solution, connectorErrorCode, diagnostics, locale) : Map.of());
+                        ? PdkConnectionDiagnostic.capture(failure, message, solution, connectorErrorCode, diagnostics, locale) : Map.of());
     }
 
     /**

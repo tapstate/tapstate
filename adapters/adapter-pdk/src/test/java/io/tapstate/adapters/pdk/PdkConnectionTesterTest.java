@@ -109,12 +109,13 @@ class PdkConnectionTesterTest {
         var clock = Clock.fixed(Instant.ofEpochMilli(FIXED_MILLIS), ZoneOffset.UTC);
         try (var slot = new PdkConnectionTester.DefaultSourceSlot(clock);
              var tester = new PdkConnectionTester(ignored -> ref, clock, ignored -> false, slot, () -> java.util.Locale.ENGLISH)) {
-            assertRefusal(tester, "28P01", "28P01");
-            assertRefusal(tester, "28000", "28000");
-            assertRefusal(tester, "08001", "08001");
-            assertRefusal(tester, "08004", "08004");
-            assertRefusal(tester, "network", "10012");
-            assertRefusal(tester, "tls", "10012");
+            assertRefusal(tester, "wrapped-auth", "10002", "28P01");
+            assertRefusal(tester, "28P01", "28P01", null);
+            assertRefusal(tester, "28000", "28000", null);
+            assertRefusal(tester, "08001", "10012", "08001");
+            assertRefusal(tester, "08004", "10012", "08004");
+            assertRefusal(tester, "network", "10012", null);
+            assertRefusal(tester, "tls", "10012", null);
 
             assertUnexpectedFailure(tester, "08006");
             assertUnexpectedFailure(tester, "suppressed");
@@ -123,13 +124,22 @@ class PdkConnectionTesterTest {
         }
     }
 
-    private static void assertRefusal(ConnectionTester tester, String scenario, String code) {
+    private static void assertRefusal(ConnectionTester tester, String scenario, String code, String causeCode) {
         var result = tester.test(new ConnectionConfig("conn-1", "demo", Map.of("scenario", scenario)));
         assertThat(result.outcome()).as(scenario).isEqualTo(Outcome.FAILED);
         assertThat(result.items()).singleElement().satisfies(item -> {
             assertThat(item.status()).isEqualTo(Status.FAILED);
             assertThat(item.connectorErrorCode()).isEqualTo(code);
-            assertThat(item.diagnostic()).containsEntry("message", "driver refusal");
+            var root = item.diagnostic();
+            assertThat(root).containsEntry("code", code).containsEntry("message", "driver refusal");
+            if (root.get("cause") instanceof Map<?, ?> cause) {
+                assertThat(cause.get("code")).as(scenario + " direct cause code").isEqualTo(causeCode);
+                assertThat(cause.containsKey("cause")).isFalse();
+                assertThat(cause.get("rawMessage")).isEqualTo("driver refusal");
+            } else {
+                assertThat(causeCode).as(scenario + " expected cause code").isNull();
+                assertThat(root).containsEntry("rawMessage", "driver refusal");
+            }
         });
     }
 
@@ -169,8 +179,8 @@ class PdkConnectionTesterTest {
                         String scenario = (String) ctx.getConnectionConfig().get("scenario");
                         String driverMessage = "driver refusal";
                         throw switch (scenario) {
-                            case "28P01" -> new RuntimeException(new TapPdkUserPwdInvalidEx("4000", "authentication",
-                                    new SQLException(driverMessage, scenario)));
+                            case "wrapped-auth" -> new RuntimeException(new TapPdkUserPwdInvalidEx("4000", "authentication",
+                                    new SQLException(driverMessage, "28P01")));
                             case "08001", "08004" -> new TapPdkRetryableEx("4001", new SQLException(driverMessage, scenario));
                             case "network" -> new TapPdkRetryableEx("4001", new ConnectException(driverMessage));
                             case "tls" -> new TapPdkRetryableEx("4001", new SSLException(driverMessage));

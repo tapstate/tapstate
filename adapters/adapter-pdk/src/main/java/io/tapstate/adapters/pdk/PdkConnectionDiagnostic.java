@@ -30,20 +30,27 @@ final class PdkConnectionDiagnostic {
     private PdkConnectionDiagnostic() {
     }
 
-    static Map<String, Object> capture(TapTestItemException failure, String message, String solution, String code,
+    static Map<String, Object> capture(Throwable failure, String message, String solution, String code,
             PdkDiagnosticCatalog catalog, Locale locale) {
         var node = new LinkedHashMap<String, Object>();
         put(node, "code", code);
         put(node, "message", message);
         put(node, "solution", solution);
-        if (node.containsKey("code")) node.put(DEFINITION_STATUS, UNVERIFIED);
+        if (node.containsKey("code") && !(failure instanceof SQLException)) node.put(DEFINITION_STATUS, UNVERIFIED);
         if (failure == null) return DiagnosticProjection.read(node);
         try {
             Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
             seen.add(failure);
-            arguments(node, failure.getDynamicDescriptionParameters());
-            resolveDefinition(node, code, catalog, locale);
-            stack(node, failure, failure.getStack());
+            String reportedStack = null;
+            if (failure instanceof TapTestItemException item) {
+                arguments(node, item.getDynamicDescriptionParameters());
+                reportedStack = item.getStack();
+            } else {
+                put(node, RAW_MESSAGE, failure.getMessage());
+                if (failure instanceof TapCodeException coded) arguments(node, coded.getDynamicDescriptionParameters());
+            }
+            if (!(failure instanceof SQLException)) resolveDefinition(node, code, catalog, locale);
+            stack(node, failure, reportedStack);
             addCause(node, failure, seen, 1, catalog, locale);
             return DiagnosticProjection.read(node);
         } catch (RuntimeException | LinkageError unavailable) {
