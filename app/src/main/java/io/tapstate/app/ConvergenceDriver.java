@@ -55,7 +55,8 @@ final class ConvergenceDriver implements AutoCloseable {
     private int nextPipeline;
     private final LongSupplier nanoTime;
     private static final long TERMINAL_RECHECK_NANOS = java.time.Duration.ofSeconds(30).toNanos();
-    private record TerminalPass(PipelineIntentScope scope, long revision, PipelineState target, long completedAt) {}
+    private record TerminalPass(PipelineIntentScope scope, long revision, PipelineState target,
+            PipelineState actual, long completedAt) {}
     private final Map<String, TerminalPass> terminalPasses = new java.util.concurrent.ConcurrentHashMap<>();
     private final Map<String, Long> attemptedStarts = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -223,17 +224,17 @@ final class ConvergenceDriver implements AutoCloseable {
             terminalPasses.remove(candidate.pipelineId(), terminal);
             return true;
         }
-        return scoped.alerts().needsFrequentTerminalSamples(terminal.scope())
+        return scoped.alerts().needsFrequentTerminalSamples(terminal.scope(), terminal.actual())
                 || nanoTime.getAsLong() - terminal.completedAt() >= TERMINAL_RECHECK_NANOS;
     }
 
     private void rememberTerminal(PipelineConvergencePass pass, ConvergeResult result,
             Optional<io.tapstate.core.lifecycle.Observation> projection, LifecycleActuator actuator, RebuildAdmission rebuilds) {
         if (pass == null || result.status() != ConvergeStatus.CONVERGED || projection.isEmpty()
-                || result.checkpoint().isEmpty()
-                || scoped.alerts().needsFrequentTerminalSamples(pass.scope())) return;
+                || result.checkpoint().isEmpty()) return;
         var checkpoint = result.checkpoint().orElseThrow();
         var actual = StateJson.parse(checkpoint.stateJson());
+        if (scoped.alerts().needsFrequentTerminalSamples(pass.scope(), actual)) return;
         var intent = pass.intent();
         var desired = intent.desired();
         if (desired.purgeState() || desired.reassemble() && desired.rebuiltAtStateEpoch() == null
@@ -250,7 +251,7 @@ final class ConvergenceDriver implements AutoCloseable {
             if (actuator.isCarryingAJob(pass.scope().pipelineId())
                     || pass.state().read(pass.scope().pipelineId()).filter(checkpoint::equals).isEmpty()) return;
             terminalPasses.put(pass.scope().pipelineId(), new TerminalPass(pass.scope(), intent.intentRevision(),
-                    desired.targetState(), nanoTime.getAsLong()));
+                    desired.targetState(), actual, nanoTime.getAsLong()));
         } catch (TapstateException unavailableHint) {
             // Publication already succeeded. An optional scheduling proof must not replace it
             // with a reconcile failure; without the hint the next tick performs a full pass.

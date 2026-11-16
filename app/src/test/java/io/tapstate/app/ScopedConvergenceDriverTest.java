@@ -289,6 +289,28 @@ class ScopedConvergenceDriverTest {
         }
     }
 
+    @Test void lifecycleOnlyAlertsDoNotWakeSettledStoppedPipelines() throws Exception {
+        var metric = new AtomicBoolean();
+        alertFeed = new PipelineAlertFeed() {
+            public void expecting(PipelineConvergencePass p) { }
+            public void published(PipelineConvergencePass p, Observation o, Throwable t) { }
+            public void unavailable(PipelineConvergencePass p) { }
+            public void retain(java.util.Collection<String> ids) { }
+            public boolean needsFrequentTerminalSamples(PipelineIntentScope scope) { return true; }
+            public boolean needsFrequentTerminalSamples(PipelineIntentScope scope, PipelineState actual) {
+                return metric.get() || actual != PipelineState.STOPPED;
+            }
+        };
+        intents.snapshot = new PipelineIntentSnapshot(FIRST, 4,
+                new DesiredState("orders", PipelineState.STOPPED, "original"));
+        try (var driver = driver()) {
+            scheduledPass(driver); int reads = intents.loads; scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads);
+            metric.set(true); scheduledPass(driver);
+            assertThat(intents.loads).isEqualTo(reads + 1);
+        }
+    }
+
     @Test void activatingAPublicationBasedAlertWakesATerminalPipeline() throws Exception {
         var frequent = new AtomicBoolean();
         var delegate = PipelineAlertFeed.none();

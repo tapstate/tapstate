@@ -55,12 +55,15 @@ class PipelineAlertRuntimeTest {
         when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(), null));
         try (var runtime = runtime()) {
             assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
             assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
             runtime.tick(); drained(runtime);
             assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
             when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
             runtime.tick(); drained(runtime);
             assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isFalse();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.FAILED)).isTrue();
             assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isFalse();
             assertThat(runtime.needsFrequentTerminalSamples(new PipelineIntentScope("cluster", 1, "cache", "orders", 2))).isFalse();
             for (int second = 0; second <= 3; second++) {
@@ -73,6 +76,46 @@ class PipelineAlertRuntimeTest {
             when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(disabled), null));
             runtime.tick(); drained(runtime);
             assertThat(runtime.needsFrequentTerminalSamples(pass.scope())).isFalse();
+        }
+    }
+
+    @Test void aFailedRuleReloadCannotKeepTheStoppedCadenceHint() {
+        var pass = pass("orders");
+        try (var runtime = runtime()) {
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isFalse();
+            when(fixture.store.evaluationRules(any(), anyInt())).thenThrow(StorageRuntime.unavailable());
+            runtime.tick(); drained(runtime);
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
+            assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+        }
+    }
+
+    @Test void stoppedLifecycleHousekeepingDoesNotInventSamplesOrStaleQuality() {
+        try (var runtime = runtime()) {
+            runtime.tick(); drained(runtime);
+            var running = pass("orders");
+            runtime.published(running, observation("orders", T, PipelineState.FAILED), null); drained(runtime);
+            assertThat(rows.values().iterator().next().value().snapshot().status()).isEqualTo(AlertSnapshot.Status.FIRING);
+            var stopped = new PipelineIntentSnapshot(running.scope(), 2,
+                    new DesiredState("orders", PipelineState.STOPPED, "revision"));
+            intents.put("orders", stopped);
+            var next = mock(PipelineConvergencePass.class);
+            var scope = running.scope(); var claim = running.claim();
+            when(next.scope()).thenReturn(scope); when(next.claim()).thenReturn(claim); when(next.intent()).thenReturn(stopped);
+            fixture.now.set(T.plusSeconds(1));
+            runtime.published(next, observation("orders", fixture.now.get(), PipelineState.STOPPED), null); drained(runtime);
+            var before = rows.values().iterator().next().value().snapshot();
+            assertThat(before.quality()).isEqualTo(AlertSnapshot.Quality.UNKNOWN);
+            for (int second : new int[]{17, 32}) {
+                fixture.now.set(T.plusSeconds(second)); runtime.tick(); drained(runtime);
+                var after = rows.values().iterator().next().value().snapshot();
+                assertThat(after.quality()).isEqualTo(AlertSnapshot.Quality.UNKNOWN);
+                assertThat(after.status()).isEqualTo(AlertSnapshot.Status.FIRING);
+                assertThat(after.episode()).isEqualTo(before.episode());
+                assertThat(after.lastObservedAt()).isEqualTo(before.lastObservedAt());
+                assertThat(after.lastSequence()).isEqualTo(before.lastSequence());
+            }
         }
     }
 
@@ -97,6 +140,7 @@ class PipelineAlertRuntimeTest {
             when(fixture.store.evaluationRules(any(), anyInt())).thenReturn(new AlertStore.DefinitionPage(List.of(rule), null));
             runtime.tick(); drained(runtime);
             assertThat(runtime.needsFreshTerminalMetrics(pass.scope())).isTrue();
+            assertThat(runtime.needsFrequentTerminalSamples(pass.scope(), PipelineState.STOPPED)).isTrue();
             var point = MetricPoint.reading(Map.of(), T, 100);
             var fact = MetricFact.single("test.quantity", MetricType.GAUGE, "1", point);
             var observation = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(), null, T, List.of(fact));

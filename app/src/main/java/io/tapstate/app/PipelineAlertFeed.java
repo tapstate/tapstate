@@ -13,6 +13,8 @@ interface PipelineAlertFeed {
     void retain(Collection<String> pipelineIds);
     /** Unknown consumers retain ordinary publication cadence. This is never an actuation proof. */
     default boolean needsFrequentTerminalSamples(io.tapstate.spi.store.PipelineIntentScope scope) { return true; }
+    default boolean needsFrequentTerminalSamples(io.tapstate.spi.store.PipelineIntentScope scope,
+            io.tapstate.core.lifecycle.PipelineState actual) { return needsFrequentTerminalSamples(scope); }
     /** Unknown consumers require fresh data; lifecycle-only rules may reuse measured terminal data. */
     default boolean needsFreshTerminalMetrics(io.tapstate.spi.store.PipelineIntentScope scope) { return true; }
     static PipelineAlertFeed none() {

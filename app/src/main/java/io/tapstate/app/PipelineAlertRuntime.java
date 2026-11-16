@@ -122,11 +122,16 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         }, new ThreadPoolExecutor.AbortPolicy());
     }
     @Override public boolean needsFrequentTerminalSamples(PipelineIntentScope scope) {
+        return needsFrequentTerminalSamples(scope, null);
+    }
+
+    @Override public boolean needsFrequentTerminalSamples(PipelineIntentScope scope, PipelineState actual) {
         var snapshot = rules.get();
         if (closed.get() || !snapshot.complete()) return true;
         var resource = new AlarmKey.Resource("pipeline", scope.pipelineId(), Long.toString(scope.stateGeneration()));
         return snapshot.definitions().stream().anyMatch(rule -> rule.header().active() && rule.enabled()
-                && rule.resources().matches(resource) && (rule.typeId().equals("pipeline.failed") || rule.metric() != null));
+                && rule.resources().matches(resource) && (rule.metric() != null
+                        || actual != PipelineState.STOPPED && rule.typeId().equals("pipeline.failed")));
     }
 
     @Override public boolean needsFreshTerminalMetrics(PipelineIntentScope scope) {
@@ -201,9 +206,17 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     void tick() {
         if (closed.get()) return;
         if (refreshing.compareAndSet(false, true)) {
+            var previousRules = rules.get();
             submit(null, 0, () -> {
-                try { refresh(); } finally { refreshing.set(false); }
-            }, () -> refreshing.set(false));
+                try { refresh(); }
+                catch (RuntimeException | Error failed) {
+                    rules.compareAndSet(previousRules, new RuleSnapshot(previousRules.definitions(), false));
+                    throw failed;
+                } finally { refreshing.set(false); }
+            }, () -> {
+                rules.compareAndSet(previousRules, new RuleSnapshot(previousRules.definitions(), false));
+                refreshing.set(false);
+            });
         }
         for(var entry:resourceSlots.entrySet()){
             var slot=entry.getValue();if(!slot.tickQueued.compareAndSet(false,true))continue;
@@ -242,7 +255,12 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                                     AlertEvaluationHost.seconds(rule, "startup-grace", 120), AlertEvaluationHost.seconds(rule, "max-age", 120)));
                         } else {
                             if (slot.discontinuous()) accept(binding, slot.sequence.get(), new AlertInput.Discontinuity(clock.instant()));
-                            AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding));
+                            boolean stoppedLifecycle = rule.typeId().equals("pipeline.failed") && rule.metric() == null
+                                    && slot.actual == PipelineState.STOPPED
+                                    && slot.producer.intent().desired().targetState() == PipelineState.STOPPED;
+                            AlertEvaluationHost.requireResult(stoppedLifecycle
+                                    ? services.get().evaluator().tickStoppedPipeline(binding)
+                                    : services.get().evaluator().tick(binding));
                         }
                     }
                     requireCurrent(slot);

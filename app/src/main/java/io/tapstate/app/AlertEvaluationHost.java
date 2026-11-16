@@ -185,6 +185,17 @@ final class AlertEvaluationHost {
     }
 
     Result tick(Binding binding) {
+        return tick(binding, false);
+    }
+
+    /** A freshly confirmed stopped intent makes this lifecycle condition inapplicable, not a new sample. */
+    Result tickStoppedPipeline(Binding binding) {
+        if (!binding.definition().typeId().equals("pipeline.failed") || binding.definition().metric() != null)
+            throw new IllegalArgumentException("stopped housekeeping requires a pipeline failure rule");
+        return tick(binding, true);
+    }
+
+    private Result tick(Binding binding, boolean stopped) {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
             var retained = store.state(binding.key(), read);
@@ -202,7 +213,10 @@ final class AlertEvaluationHost {
                 if(outcome==AlertStore.Outcome.CONFLICT)continue;
                 points.remove(binding.key());return Result.ACCEPTED;
             }
-            var timed=AlertLifecycle.tick(before.snapshot(),now);
+            var snapshot = before.snapshot();
+            var timed = stopped && snapshot.quality() == AlertSnapshot.Quality.UNKNOWN
+                    && snapshot.lastObservedAt() != null && !snapshot.lastObservedAt().isAfter(now)
+                    ? new AlertUpdate(snapshot, List.of(), false) : AlertLifecycle.tick(snapshot, now);
             var episode=timed.snapshot().episode();
             var severity=now.isBefore(binding.definition().header().updatedAt()) || episode!=null&&now.isBefore(episode.firedAt())
                     || timed.snapshot().lastObservedAt()!=null&&timed.snapshot().lastObservedAt().isAfter(now)
