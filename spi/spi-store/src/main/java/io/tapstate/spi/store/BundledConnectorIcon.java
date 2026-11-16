@@ -1,5 +1,6 @@
 package io.tapstate.spi.store;
 
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.Objects;
 
@@ -15,6 +16,22 @@ public record BundledConnectorIcon(String mediaType, byte[] bytes) {
     @Override
     public byte[] bytes() {
         return bytes.clone();
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return this == other || other instanceof BundledConnectorIcon icon
+                && mediaType.equals(icon.mediaType) && Arrays.equals(bytes, icon.bytes);
+    }
+
+    @Override
+    public int hashCode() {
+        return 31 * mediaType.hashCode() + Arrays.hashCode(bytes);
+    }
+
+    @Override
+    public String toString() {
+        return "BundledConnectorIcon[mediaType=" + mediaType + ", bytes=" + bytes.length + "]";
     }
 
     /** The icon media type for its declared JAR entry path. */

@@ -97,7 +97,6 @@ class FixedSleepGateTest {
             entry("test/java/io/tapstate/e2e/NestReparentMovesTheChildIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestResolvesFourLevelDeepIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestRootFanoutLimitFailsTheJobIT.java", 1L),
-            entry("test/java/io/tapstate/e2e/NestSaysWhenItIsServedFromTheColdLayerIT.java", 1L),
             entry("test/java/io/tapstate/e2e/NestTrackingRefusesASourceWithoutBeforeImagesIT.java", 1L),
             // Two polls and one fixed gap that is not one - see the class comment.
             entry("test/java/io/tapstate/e2e/NestThrottleCoalescesHotRootIT.java", 1L),

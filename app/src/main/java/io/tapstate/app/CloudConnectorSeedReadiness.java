@@ -48,7 +48,7 @@ final class CloudConnectorSeedReadiness {
     static final String LOCK_RESOURCE = "/META-INF/tapstate/connectors.lock.json";
     static final String LOCAL_SELECTION_RESOURCE = "/META-INF/tapstate/local-storage-acceptance.json";
     private static final List<String> IDS = List.of(
-            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2");
+            "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2", "dummy");
     private static final Set<String> LICENSES = Set.of("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt");
     private static final Set<String> ARTIFACT_KEYS = Set.of(
             "id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath");

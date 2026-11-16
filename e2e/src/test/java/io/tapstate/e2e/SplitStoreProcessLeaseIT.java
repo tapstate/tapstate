@@ -82,6 +82,9 @@ class SplitStoreProcessLeaseIT {
                     .as("lease renewal during the outage performs no CONFIG write").isEqualTo(keys);
             String oldBoot = original.get(NODES.getFirst()).getString("ownerBootId");
             long generation = ((Number) original.get(NODES.getFirst()).get("claimGeneration")).longValue();
+            var restarting = cluster.member(NODES.getFirst());
+            Await.until("the restarting node to read the alert store again", Duration.ofSeconds(30),
+                    restarting::alertCenterAvailable, () -> "the alert store is unavailable after CONFIG recovered");
             cluster.restart(NODES.getFirst());
             cluster.awaitMembers(NODES.getFirst(), 3);
             var replacement = claims(cacheObserver, cacheDb).get(NODES.getFirst());

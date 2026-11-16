@@ -111,6 +111,20 @@ final class ControlPlane {
         if(!(parsed instanceof Map<?,?> map))throw new AssertionError("alert response is not an object");
         var value=new LinkedHashMap<String,Object>();map.forEach((key,item)->value.put(String.valueOf(key),item));return value;
     }
+    boolean alertCenterAvailable() {
+        var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
+        String code = codeOf(response.body());
+        if ("control.storage-unavailable".equals(code)) return false;
+        if ("io.document-unreadable".equals(code)) {
+            var params = paramsOf(response.body());
+            if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
+                return false;
+            }
+        }
+        expect(response, 200, "read alert center");
+        return true;
+    }
+
     void awaitInitialAlertMaintenance(){
         Await.until("the initial bounded alert cleanup to finish",Duration.ofSeconds(30),()->{
             var value=alert("health",Map.of()).get("maintenance");

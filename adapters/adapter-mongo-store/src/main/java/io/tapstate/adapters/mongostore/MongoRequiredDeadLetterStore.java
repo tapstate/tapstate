@@ -9,6 +9,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoDatabase;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineStateMapping;
 import io.tapstate.spi.store.RequiredDeadLetterContext;
 import io.tapstate.spi.store.RequiredDeadLetterFact;
@@ -115,6 +116,16 @@ final class MongoRequiredDeadLetterStore implements RequiredDeadLetterStore {
             touch(session, context, mapping); rows.deleteMany(session, filter(context)); return null;
         });
     }
+
+    /** The caller has verified the original retirement and owns its final CONFIG transaction. */
+    static void deleteRetiringGeneration(ClientSession session, MongoDatabase database, PipelineIntentScope original) {
+        SystemCollections.CONFIG_NEST_DEAD_LETTERS.on(database).deleteMany(session,
+                new Document("_id.clusterId", original.clusterId())
+                        .append("_id.bindingVersion", original.bindingVersion())
+                        .append("_id.pipelineId", original.pipelineId())
+                        .append("_id.stateGeneration", original.stateGeneration()));
+    }
+
     private Document requireScope(ClientSession session, RequiredDeadLetterContext context) {
         Objects.requireNonNull(context, "context");
         Document identity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();

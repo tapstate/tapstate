@@ -56,7 +56,8 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
 
     static Reading reading(ClientSession session, MongoCachePipelineAccess access, Document state, Document row) {
         access.validateState(state);
-        var claim = row == null ? null : row.get("claim", Document.class);
+        if (row == null) throw MongoCachePipelinePreparations.rebuild(access.scope);
+        var claim = row.get("claim", Document.class);
         access.requirePreparedClaim(session, claim);
         boolean live = Boolean.TRUE.equals(row.get("live"));
         if (MongoWorkloadClaimStore.nodeBacked(claim)) {

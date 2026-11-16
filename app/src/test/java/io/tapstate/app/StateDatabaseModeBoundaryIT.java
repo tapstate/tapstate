@@ -165,7 +165,9 @@ class StateDatabaseModeBoundaryIT {
         var intent = configuration.intents().loadForActuation(OWNER).orElseThrow();
         var ownership = child.getBean(PipelineActuationOwnership.class);
         // Shutdown preserves the old claim history; a replacement must wait for the original lease.
-        var takeoverBudget = child.getBean(ClusterProperties.class).getWorkloadClaimTtl().plusSeconds(15);
+        var cluster = child.getBean(ClusterProperties.class);
+        boolean cloud = root.mode() == StorageBinding.Mode.CLOUD;
+        var takeoverBudget = cluster.pipelineClaimTtl(cloud).plus(cluster.pipelineClaimRenewInterval(cloud)).plusSeconds(5);
         org.awaitility.Awaitility.await().atMost(takeoverBudget).until(() -> ownership.permit(scope).granted());
         var permit = ownership.permit(scope);
         var execution = ownership.beginExecution(scope, WorkloadClaimFence.from(permit.claim()));

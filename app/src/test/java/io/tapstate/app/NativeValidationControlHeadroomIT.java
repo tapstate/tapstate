@@ -73,7 +73,7 @@ class NativeValidationControlHeadroomIT {
                 child.getBean(NativeValidationScheduler.class).close();
                 org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(()->child.getBean(ValidationMemberResources.Member.class).snapshot().metadataFrames()==0);
                 long before=((Number)admin.runCommand(new Document("configureFailPoint","failCommand").append("mode",new Document("times",2))
-                        .append("data",new Document("failCommands",List.of("aggregate")).append("namespace",data+".orders").append("blockConnection",true).append("blockTimeMS",20000))).get("count")).longValue();
+                        .append("data",new Document("failCommands",List.of("count")).append("namespace",data+".orders").append("blockConnection",true).append("blockTimeMS",20000))).get("count")).longValue();
                 try{
                     // Admit the actual production Jobs directly so transient START response frames cannot
                     // decide this control-headroom scenario before both long-lived reads exist.

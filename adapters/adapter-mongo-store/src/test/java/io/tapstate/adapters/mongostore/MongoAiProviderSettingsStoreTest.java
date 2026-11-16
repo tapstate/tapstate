@@ -169,13 +169,17 @@ class MongoAiProviderSettingsStoreTest {
         var clientField = MongoConnection.class.getDeclaredField("client");
         clientField.setAccessible(true);
         clientField.set(connection, fixture.client());
-        var databaseField = MongoConnection.class.getDeclaredField("databaseName");
+        var databaseNameField = MongoConnection.class.getDeclaredField("databaseName");
+        databaseNameField.setAccessible(true);
+        databaseNameField.set(connection, "tapstate");
+        var verifiedDatabase = fixture.database();
+        var databaseField = MongoConnection.class.getDeclaredField("database");
         databaseField.setAccessible(true);
-        databaseField.set(connection, "tapstate");
+        databaseField.set(connection, verifiedDatabase);
         var keyringField = MongoConnection.class.getDeclaredField("sourceConfigKeyring");
         keyringField.setAccessible(true);
         keyringField.set(connection, new SourceConfigKeyringHandle(
-                new SourceConfigKeyringStore(fixture.client(), fixture.database())));
+                new SourceConfigKeyringStore(fixture.client(), verifiedDatabase)));
 
         long verifiedKeyringReads = fixture.findFilters.stream()
                 .filter(filter -> filter.equals(new Document("_id", "source-config-keyring"))).count();

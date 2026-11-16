@@ -45,13 +45,30 @@ The independent entry requires a fresh report with one executed test and zero
 skips. It supplements the normal shard result and does not replace aggregate
 admission.
 
+## Nightly Test
+
+`nightly-test.yml` runs at 01:00 Asia/Shanghai and can be run manually from
+`main`. It checks real connectors, the full Join performance matrix, native
+CLI and MCP bundles for four platforms, the paired Cloud and OP image smoke,
+release-script self-tests, and distribution completeness. Release calls the
+same checks for its own selected source and Web revisions. Nightly only stores
+Actions artifacts. GitHub Release, GHCR pushes and Cloud registration belong
+to the separate release workflow.
+
+Configure the repository Actions secret `NIGHTLY_FEISHU_WEBHOOK` with the
+target Feishu group's bot URL. Scheduled failures send one message with the
+failed jobs and the Actions run link. Manual runs and scheduled successes
+are silent.
+
 ## Real connector fixture inputs
 
-The scheduled/manual Real connectors lane builds seven checked connector kinds,
+The real-connectors workflow is called by Nightly Test and release. Its default
+Nightly input policy builds seven checked upstream connector kinds,
 including `mongodb-atlas` and `aws-rds-mysql`. Connector production uses Maven
 3.9.16 with a verified distribution checksum. Its snapshot manifest, sealed JAR
 set and witness admission must agree; adding unchecked files to a cache is not
-a replacement for building the selected artifacts.
+a replacement for building the selected artifacts. For a pinned-artifact
+comparison, choose the `release` connector input policy on a manual Nightly run.
 
 External managed Atlas acceptance is temporarily deferred under
 [#702](https://github.com/tapstate/tapstate/issues/702). The exact four live classes

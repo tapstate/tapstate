@@ -88,9 +88,14 @@ final class ClearStateCompletionInterleaving implements AutoCloseable {
                 .collect(java.util.stream.Collectors.joining(System.lineSeparator()));
     }
 
-    void observed(boolean stopped) {
+    void observed(ControlPlane control) {
         if (held == null) return;
-        assertThat(stopped).as("the original generation's STOPPED is still visible before replacement").isTrue();
+        var observations = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(client.getDatabase(storage.cacheDatabase()));
+        assertThat(observations.find(new Document("pipelineId", pipeline).append("_id.scope.stateGeneration", 1L)
+                .append("state", "STOPPED")).first())
+                .as("the original generation still has a stored STOPPED observation").isNotNull();
+        assertThat(control.pipelineStatus(pipeline))
+                .containsEntry("displayState", "STOPPING").doesNotContainKey("observedState");
         var pending = SystemCollections.PIPELINE_INTENTS.on(client.getDatabase(storage.configurationDatabase()))
                 .find(new Document("_id", pipeline)).first();
         assertThat(pending).containsEntry("stateGeneration", 1L).containsEntry("purgeState", true);

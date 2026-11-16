@@ -36,6 +36,25 @@ class CloudPipelineDraftPublicationTest {
     private static final CanonicalWriter WRITER = new CanonicalWriter();
 
     @Test
+    void previewUsesTheSameDependencySliceAsPublicationWithoutScanningUnrelatedArtifacts() {
+        var fixture = new Fixture(true, PipelineDraft.Mode.WIZARD);
+        var expected = fixture.service.preview("orders", 1);
+        fixture.artifacts.save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: unrelated
+                connector: mongodb
+                config: { uri: "mongodb://localhost:27017/unrelated" }
+                """));
+        fixture.artifacts.useSlice = true;
+        fixture.artifacts.scans = 0;
+        assertThat(fixture.service.preview("orders", 1)).isEqualTo(expected);
+        assertThat(fixture.artifacts.scans).as("preview must not hydrate the entire workspace").isZero();
+        assertThat(fixture.artifacts.sliceReads).isEqualTo(1);
+        assertThat(fixture.drafts.lastPublication).isNull();
+    }
+
+    @Test
     void publicationPassesThePlannedSourceSchemaToDerivation() {
         var reads = new LinkedHashMap<String, Integer>();
         var model = new io.tapstate.spi.store.DiscoveredSourceModel("mongo_input", "mongodb", NOW.toEpochMilli(),
@@ -258,6 +277,18 @@ class CloudPipelineDraftPublicationTest {
     private static final class CanonicalStore implements ArtifactStore {
         private final Map<String, String> canonical = new LinkedHashMap<>();
         private final DslParser parser = new DslParser();
+        private boolean useSlice;
+        private int scans;
+        private int sliceReads;
+
+        @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
+            if (!useSlice) return Optional.empty();
+            sliceReads++;
+            var ids = new java.util.LinkedHashSet<String>(); ids.add(candidate.id());
+            io.tapstate.core.dsl.ReferenceGraph.declaredReferences(candidate).forEach(edge -> ids.add(edge.id()));
+            var resources = ids.stream().flatMap(id -> get(id).stream()).toList();
+            return Optional.of(new ReadableInventory(resources, Optional.empty(), Optional.empty(), ids));
+        }
 
         @Override
         public void saveAll(List<Resource> resources) {
@@ -271,6 +302,7 @@ class CloudPipelineDraftPublicationTest {
 
         @Override
         public List<Resource> list() {
+            scans++;
             return canonical.values().stream().map(parser::parse).toList();
         }
     }

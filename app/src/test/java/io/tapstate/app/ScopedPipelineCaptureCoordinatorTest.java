@@ -266,7 +266,13 @@ class ScopedPipelineCaptureCoordinatorTest {
             try(var executor=Executors.newSingleThreadExecutor(task -> new Thread(task,"old-source-callback"))) {
                 var pending=executor.submit(() -> output.get().accept(Envelope.read(1,"orders",Map.of("id",1),null)));
                 try {
-                    assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue(); run.stopCapture("flow",false); resume.countDown(); pending.get(3,TimeUnit.SECONDS);
+                    assertThat(entered.await(3,TimeUnit.SECONDS)).isTrue();
+                    run.stopCapture("flow", false);
+                    resume.countDown();
+                    assertThatThrownBy(() -> pending.get(3, TimeUnit.SECONDS))
+                            .isInstanceOfSatisfying(java.util.concurrent.ExecutionException.class, failure ->
+                                    assertThat(failure.getCause()).isInstanceOfSatisfying(TapstateException.class,
+                                            refused -> assertThat(refused.code()).isEqualTo(IoError.PIPELINE_INTENT_FENCED)));
                     assertThat(f.buffer.drain(bindings.bufferKey("input"),SrsRingbuffer.ringName("mck-key","orders"))).isEmpty();
                 } finally { resume.countDown(); }
             }

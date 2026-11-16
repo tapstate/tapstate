@@ -40,6 +40,22 @@ final class ConfigurationVersion {
         advanceRaw(session, versions, revision);
     }
 
+    /** Claims the ordering document before publication reads its dependency snapshot. */
+    static void advanceForPublication(ClientSession session, MongoCollection<Document> versions,
+            com.mongodb.client.MongoClient originalClient) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("publication requires an active transaction");
+        var legalRevision = new Document("$gte", 0L).append("$lt", Long.MAX_VALUE - 1);
+        var filter = new Document("_id", ID).append("revision", legalRevision)
+                .append("$expr", new Document("$eq", java.util.List.of(new Document("$type", "$revision"), "long")));
+        var previous = versions.findOneAndUpdate(session, filter,
+                new Document("$inc", new Document("revision", 1L)));
+        if (previous == null) throw unreadable("revision");
+        // The provisional increment rolls back with every refusal. Maintenance is still checked
+        // against this same snapshot before any artifact, draft marker or note reservation commits.
+        requireNoValidationMaintenance(session, versions, null,
+                originalClient.getDatabase(versions.getNamespace().getDatabaseName()));
+    }
+
     static void advanceValidationPreparation(ClientSession session, MongoCollection<Document> versions, String operation,
             com.mongodb.client.MongoClient originalClient) {
         long revision = requireNoValidationMaintenance(session, versions, java.util.Objects.requireNonNull(operation),

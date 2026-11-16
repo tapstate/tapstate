@@ -161,6 +161,10 @@ public final class PipelineObservationQueryService {
         return Map.copyOf(result);
     }
 
+    Map<String, PipelineState> currentEngineStates(Map<String, io.tapstate.spi.store.PipelineIntentScope> scopes) {
+        return diagnostics.currentStates(scopes);
+    }
+
     PipelineStatus statusOf(Observation observation) {
         var stored = new PipelineStatus(observation.pipelineId(), observation.state(), observation.failure(), observation.observedAt());
         if (observation.failure() != null || (observation.state() != PipelineState.RUNNING

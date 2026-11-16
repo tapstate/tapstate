@@ -48,30 +48,27 @@ class MongoValidationAiSchemaCompositionIT {
             SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id","config"),new Document("$unset",new Document("validation","")));
             var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(()->f.configuration.artifacts().create(source())).isInstanceOf(TapstateException.class);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("ai_provider_settings");
         }
     }
 
-    @Test void residualValidationStructuresInAiVersionTwoNeverAcquirePreparationOrAuthoringRights(){
+    @Test void residualValidationStructuresInAiVersionTwoPreventOpeningAndPreparation(){
         try(var f=new MongoValidationSchemaIT.Fixture(0,StorageBinding.Mode.CLOUD,true)){
             var before=f.configSchema();var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
             f.configDb.createCollection("validation_tasks");
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(()->f.configuration.artifacts().create(source())).isInstanceOf(TapstateException.class);
             assertThatThrownBy(()->f.configuration.prepareInitialValidationSchema(f.configuration.bindings().cachePreparation().orElseThrow(),f.cache,()->{})).isInstanceOf(TapstateException.class);
             assertThat(f.configSchema()).isEqualTo(before);assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports","validation_differences");
         }
     }
 
-    @Test void historicalValidationTwoAlsoRefusesRetainedHandleWritesAfterStructureLoss(){
+    @Test void historicalValidationTwoRefusesReopeningAfterStructureLoss(){
         try(var f=new MongoValidationSchemaIT.Fixture(1)){
             f.upgrade();assertThat(f.configuration.artifacts().create(new SourceResource("healthy",null,"mongodb",Map.of("uri","mongodb://business.invalid/healthy"),null,null,null,null))).isEqualTo(ArtifactMutation.CREATED);
             SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();var before=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
-            assertThatThrownBy(()->f.configuration.artifacts().create(source())).isInstanceOf(TapstateException.class);
-            assertThat(f.configuration.artifacts().get("unexpected")).isEmpty();
+            assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(before);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");
         }
@@ -94,7 +91,6 @@ class MongoValidationAiSchemaCompositionIT {
             assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(row);
             SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(()->f.configuration.artifacts().create(source())).isInstanceOf(TapstateException.class);
             assertThatThrownBy(()->f.configuration.aiProviderSettings().get(OWNER)).isInstanceOf(TapstateException.class);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");

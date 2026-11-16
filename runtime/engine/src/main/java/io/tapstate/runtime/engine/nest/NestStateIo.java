@@ -40,6 +40,8 @@ final class NestStateIo {
     private final long readGatherNanos;
     private final BooleanSupplier rootBulkReads;
     private final LongSupplier readNanos;
+    // Volatile publishes the lazy batcher. The batcher protects its queue with its own lock.
+    @SuppressWarnings("java:S3077")
     private volatile Batcher reads;
     private final Batcher writes = new Batcher(true);
 
@@ -243,6 +245,8 @@ final class NestStateIo {
             }
         }
 
+        // Both gatherers recompute the original deadline and let submit restore the interrupt after completion.
+        @SuppressWarnings({"java:S899", "java:S2142"})
         private boolean gatherWrites() {
             if (!writing || writeGatherNanos == 0 || isolatedWrites >= 2) return false;
             boolean interrupted = false;
@@ -261,6 +265,7 @@ final class NestStateIo {
             return interrupted;
         }
 
+        @SuppressWarnings({"java:S899", "java:S2142"})
         private boolean gatherReads() {
             if (readGatherNanos == 0 || isolatedBulkReads >= 2 || !pending.element().gatherRead) return false;
             boolean interrupted = false;
