@@ -444,3 +444,48 @@ For live displays, poll current reads and `pipeline.explain` as independent obse
 history by fetching a new first page instead of caching or extending a completed cursor walk. Respect
 `no-store`, keep gaps as gaps, and leave an absent value unknown. These rules prevent a stopped
 publisher, reset counter, expired sample, and measured zero from collapsing into the same graph.
+
+## Periodic observation pressure
+
+Regular observations of running Pipelines collect and write in bounded background
+workers. There are four workers, up to 64 queued Pipeline jobs, and at most one
+running request plus one latest pending request per Pipeline. Repeated pending
+requests coalesce; capacity exhaustion rejects work instead of running it on the
+convergence caller. These are observation requests, not data records.
+
+At normal log levels, `Periodic observation backpressure` reports entry into
+coalescing or rejection, and `Periodic observation backpressure cleared` reports
+that the backlog drained. A publication failure is logged once while it remains
+unavailable; the next successful publication logs recovery. The last stored
+`observedAt` continues to age while no new observation can be published. A successful
+HTTP read does not make those old facts fresh.
+
+This isolation covers periodic collection and publication. Lifecycle actions and
+the final observation needed before completion keep their existing ordering.
+A slow lifecycle action can still delay the convergence pass; its actual state,
+desired intent, and monitoring freshness must be inspected separately.
+
+## Stored facts and wide Pipelines
+
+Stored observation facts use the same per-instrument cardinality rules as metric
+export. For table-scoped movement instruments the budget retains 1,000 named tables
+per Pipeline; excess detail is combined into points marked
+`otel.metric.overflow=true`. Counters and histogram counts, sums, and buckets add;
+lag retains its worst value. Overflow is reduced detail, not missing work.
+
+Only the stored `facts` projection is folded. The flat `metrics`, snapshot,
+positions, initial-load information, state, failure and observation time keep
+their original values. Those other fields can still grow, so the facts budget is
+not a fixed upper bound on the complete BSON document. Fresh consumers continue
+to use the same original measured frame; retained terminal facts read back from
+storage already contain its folded projection.
+
+## Pipeline log lifetimes
+
+Pipeline log tails remain bounded, node-local, and in memory. Deleting and
+recreating a Pipeline with the same ID starts a different lifetime: logs captured
+by its predecessor, including delayed connector callbacks, are excluded from the
+successor's tail. Pause and resume retain the current lifetime, and rebuilding
+its physical state does not by itself discard its earlier valid log lines.
+Older generations cannot crowd newer log lines out of the retained buffer.
+A process restart still loses that node's in-memory log tail.
