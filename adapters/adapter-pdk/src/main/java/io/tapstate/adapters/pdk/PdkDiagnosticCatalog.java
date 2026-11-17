@@ -1,0 +1,182 @@
+package io.tapstate.adapters.pdk;
+
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.StreamReadConstraints;
+import com.fasterxml.jackson.core.StreamReadFeature;
+import io.tapstate.core.common.JsonReader;
+import io.tapstate.core.common.DiagnosticDefinitionLookup;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.jar.JarFile;
+
+/** A connector's optional data catalog, read only from the artifact selected by registration. */
+final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
+    static final String RESOURCE = "META-INF/tapstate/connection-diagnostics.json";
+    private static final int MAX_BYTES = 256 * 1024;
+    private static final int MAX_DEFINITIONS = 1024;
+    private static final String DYNAMIC = "dynamic";
+    private static final JsonFactory JSON = JsonFactory.builder()
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
+            .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(12).build()).build();
+    private static final PdkDiagnosticCatalog UNAVAILABLE = new PdkDiagnosticCatalog(Map.of(), Map.of(), Set.of());
+    private static final PdkDiagnosticCatalog NO_CATALOG = new PdkDiagnosticCatalog(Map.of(), Map.of(), Set.of());
+
+    static final class Cache {
+        private static final int MAX_ENTRIES = 16;
+        private final LinkedHashMap<ArtifactKey, PdkDiagnosticCatalog> entries =
+                new LinkedHashMap<>(MAX_ENTRIES, 0.75f, true);
+
+        PdkDiagnosticCatalog resolve(String connectorId, ConnectorRef ref) {
+            if (ref.contentHash() == null || ref.classpath().size() != 1) return UNAVAILABLE;
+            var key = new ArtifactKey(connectorId, ref.contentHash());
+            synchronized (entries) {
+                var cached = entries.get(key);
+                if (cached != null) return cached;
+            }
+            // The provisioner resolves and verifies the artifact before each lookup. Do not
+            // hold the cache lock during archive I/O, or cache an unreadable artifact.
+            var loaded = load(connectorId, ref);
+            if (loaded == UNAVAILABLE) return loaded;
+            synchronized (entries) {
+                var cached = entries.putIfAbsent(key, loaded);
+                if (entries.size() > MAX_ENTRIES) entries.pollFirstEntry();
+                return cached == null ? loaded : cached;
+            }
+        }
+
+        private record ArtifactKey(String connectorId, String hash) {
+        }
+    }
+
+    record Definition(String code, Map<String, String> english, Map<String, String> simplifiedChinese,
+                      Map<String, String> traditionalChinese) {
+        Map<String, String> text(Locale locale) {
+            if (!"zh".equals(locale.getLanguage())) return english;
+            if (("Hant".equals(locale.getScript()) || Set.of("TW", "HK", "MO").contains(locale.getCountry()))
+                    && !traditionalChinese.isEmpty()) return traditionalChinese;
+            return simplifiedChinese.isEmpty() ? english : simplifiedChinese;
+        }
+    }
+
+    private final Map<String, Definition> byFullCode;
+    private final Map<String, Definition> byRawCode;
+    private final Set<String> ambiguousRawCodes;
+
+    private PdkDiagnosticCatalog(Map<String, Definition> byFullCode, Map<String, Definition> byRawCode,
+            Set<String> ambiguousRawCodes) {
+        this.byFullCode = Map.copyOf(byFullCode);
+        this.byRawCode = Map.copyOf(byRawCode);
+        this.ambiguousRawCodes = Set.copyOf(ambiguousRawCodes);
+    }
+
+    static PdkDiagnosticCatalog load(String connectorId, ConnectorRef ref) {
+        if (ref.contentHash() == null || !ref.contentHash().matches("[0-9a-f]{64}") || ref.classpath().size() != 1) {
+            return UNAVAILABLE;
+        }
+        try (var jar = new JarFile(ref.classpath().getFirst().toFile(), false)) {
+            var entry = jar.getJarEntry(RESOURCE);
+            if (entry == null) return NO_CATALOG;
+            if (entry.isDirectory()) return UNAVAILABLE;
+            long declaredSize = entry.getSize();
+            if (declaredSize < 0 || declaredSize > MAX_BYTES
+                    || jar.stream().filter(candidate -> candidate.getName().equals(RESOURCE)).limit(2).count() != 1) {
+                return UNAVAILABLE;
+            }
+            try (var input = jar.getInputStream(entry)) {
+                // Check actual expanded bytes independently of the archive directory.
+                byte[] data = input.readNBytes(MAX_BYTES + 1);
+                return data.length == declaredSize ? read(connectorId, data) : UNAVAILABLE;
+            }
+        } catch (IOException | IllegalArgumentException invalid) {
+            return UNAVAILABLE;
+        }
+    }
+
+    static PdkDiagnosticCatalog read(String connectorId, byte[] data) throws IOException {
+        try (var parser = JSON.createParser(data)) {
+            while (parser.nextToken() != null) {
+                // The streaming parser refuses duplicate fields before map materialization.
+            }
+        }
+        Object tree = JsonReader.parse(StandardCharsets.UTF_8.newDecoder().decode(ByteBuffer.wrap(data)).toString());
+        if (!(tree instanceof Map<?, ?> root) || !root.keySet().equals(Set.of("formatVersion", "connectorId", "definitions"))
+                || !Long.valueOf(1L).equals(root.get("formatVersion")) || !connectorId.equals(root.get("connectorId"))
+                || !(root.get("definitions") instanceof List<?> definitions) || definitions.size() > MAX_DEFINITIONS) {
+            throw new IllegalArgumentException("invalid connector diagnostic catalog");
+        }
+        Map<String, Definition> full = new HashMap<>();
+        Map<String, Definition> raw = new HashMap<>();
+        Set<String> ambiguous = new HashSet<>();
+        for (Object value : definitions) {
+            if (!(value instanceof Map<?, ?> item)
+                    || !(item.get("rawCode") instanceof String original) || original.isBlank()
+                    || !(item.get("code") instanceof String code) || code.isBlank() || !code.endsWith(original)) {
+                throw new IllegalArgumentException("invalid connector diagnostic identity");
+            }
+            var entry = new Definition(code, readText(item.get("en")), readText(item.get("zh-CN")), readText(item.get("zh-TW")));
+            if (entry.english().isEmpty() || full.putIfAbsent(code, entry) != null) {
+                throw new IllegalArgumentException("incomplete or repeated full connector diagnostic code");
+            }
+            if (raw.putIfAbsent(original, entry) != null) ambiguous.add(original);
+        }
+        ambiguous.forEach(raw::remove);
+        return new PdkDiagnosticCatalog(full, raw, ambiguous);
+    }
+
+    private static Map<String, String> readText(Object value) {
+        if (value == null) return Map.of();
+        if (!(value instanceof Map<?, ?> text)) throw new IllegalArgumentException("invalid connector diagnostic text");
+        Map<String, String> entries = new HashMap<>();
+        for (String field : List.of("message", "solution", DYNAMIC)) {
+            if (text.get(field) instanceof String content && !content.isBlank()) entries.put(field, content);
+            else if (text.containsKey(field)) throw new IllegalArgumentException("invalid connector diagnostic text");
+        }
+        if (!entries.keySet().equals(text.keySet())) throw new IllegalArgumentException("unknown connector diagnostic text field");
+        return Map.copyOf(entries);
+    }
+
+    Definition definition(String code) {
+        if (code == null || ambiguousRawCodes.contains(code)) return null;
+        Definition exact = byFullCode.get(code);
+        Definition raw = byRawCode.get(code);
+        if (exact == null) return raw;
+        return raw == null || exact == raw ? exact : null;
+    }
+
+    @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
+        Definition definition = definition(code);
+        if (definition == null || !named.isEmpty()) return Optional.empty();
+        var text = definition.text(locale);
+        String message = text.get("message");
+        String template = text.get(DYNAMIC);
+        if (template != null) {
+            String substitution = renderPositional(template, positional);
+            if (substitution != null) message = message == null ? substitution : message + "\n" + substitution;
+        }
+        return Optional.of(new Resolved(definition.code(), message, text.get("solution")));
+    }
+
+    private static String renderPositional(String template, List<String> args) {
+        StringBuilder rendered = new StringBuilder();
+        int from = 0;
+        int index = 0;
+        int token;
+        while ((token = template.indexOf("{}", from)) >= 0) {
+            if (index >= args.size()) return null;
+            rendered.append(template, from, token).append(args.get(index++));
+            from = token + 2;
+        }
+        if (index != args.size()) return null;
+        return rendered.append(template, from, template.length()).toString();
+    }
+}
