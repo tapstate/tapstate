@@ -620,7 +620,11 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run();
         // Management can arrive before the background rule snapshot publishes its services.
         if (!closed.get() && services.get() == null) {
-            try { servicesReady.await(5, TimeUnit.SECONDS); }
+            try {
+                if (!servicesReady.await(5, TimeUnit.SECONDS)) {
+                    throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+                }
+            }
             catch (InterruptedException interrupted) {
                 Thread.currentThread().interrupt();
                 throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);

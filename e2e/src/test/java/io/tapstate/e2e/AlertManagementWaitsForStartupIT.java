@@ -8,6 +8,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -65,9 +66,9 @@ class AlertManagementWaitsForStartupIT {
                 }
                 var response = pending.get(10, TimeUnit.SECONDS);
                 assertThat(response.statusCode()).as(response.body()).isEqualTo(200);
-                var catalog = (Map<?, ?>) JsonReader.parse(response.body());
-                assertThat(catalog.get("clusterId")).isEqualTo(storage.clusterId());
-                assertThat(catalog.get("deployment")).isEqualTo("ON_PREM");
+                var catalog = new HashMap<Object, Object>((Map<?, ?>) JsonReader.parse(response.body()));
+                assertThat(catalog).containsEntry("clusterId", storage.clusterId());
+                assertThat(catalog).containsEntry("deployment", "ON_PREM");
                 assertThat((List<?>) catalog.get("types")).isNotEmpty();
                 assertThat(control.alert("center", Map.of("limit", 1))).containsKey("rows");
             } finally {
