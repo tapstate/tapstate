@@ -23,7 +23,7 @@ import java.util.Objects;
 import java.util.function.Function;
 import io.tapstate.spi.metrics.MetricsExport;
 import io.tapstate.spi.store.DesiredStore;
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Collection;
 import java.util.function.Consumer;
 import java.util.List;
@@ -54,6 +54,8 @@ final class ConvergenceDriver {
     private final PipelineActuationOwnership actuation;
     private final ScopedPorts scoped;
     private final PeriodicObservations periodicObservations;
+    private final PipelineConvergences pipelineConvergences;
+    private int nextPipeline;
     private final java.util.Set<String> unavailableObservations = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
@@ -86,10 +88,8 @@ final class ConvergenceDriver {
     private record ObservationVersion(PipelineIntentSnapshot intent, WorkloadClaimFence claim,
             CheckpointDoc checkpoint) {}
 
-    // Consecutive failed-reconcile passes per pipeline, so a pipeline that keeps throwing surfaces as a
-    // climbing errorCount rather than an empty read face. Reconcile runs on a single scheduler thread with a
-    // fixed delay (passes never overlap), so a plain map needs no synchronization.
-    private final Map<String, FailureStreak> reconcileFailures = new HashMap<>();
+    // Each Pipeline is single-flight; distinct Pipelines and retention may run concurrently.
+    private final Map<String, FailureStreak> reconcileFailures = new ConcurrentHashMap<>();
 
     private final RateSampler sampler;
 
@@ -127,7 +127,7 @@ final class ConvergenceDriver {
     ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export, BooleanSupplier reconcileEligible,
             PipelineActuationOwnership actuation) {
-        this(converger, desired, publisher, sampler, export, reconcileEligible, actuation, null, null);
+        this(converger, desired, publisher, sampler, export, reconcileEligible, actuation, null, null, null);
     }
 
     static ConvergenceDriver scoped(PipelineConverger converger, ObservationPublisher publisher,
@@ -139,15 +139,25 @@ final class ConvergenceDriver {
     static ConvergenceDriver scoped(PipelineConverger converger, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export, BooleanSupplier reconcileEligible,
             PipelineActuationOwnership actuation, ScopedPorts scoped, PeriodicObservations periodicObservations) {
+        return scoped(converger, publisher, sampler, export, reconcileEligible, actuation, scoped,
+                periodicObservations, null);
+    }
+
+    static ConvergenceDriver scoped(PipelineConverger converger, ObservationPublisher publisher,
+            RateSampler sampler, MetricsExport export, BooleanSupplier reconcileEligible,
+            PipelineActuationOwnership actuation, ScopedPorts scoped, PeriodicObservations periodicObservations,
+            PipelineConvergences pipelineConvergences) {
         return new ConvergenceDriver(converger, null, publisher, sampler, export, reconcileEligible,
-                actuation, Objects.requireNonNull(scoped, "scoped"), periodicObservations);
+                actuation, Objects.requireNonNull(scoped, "scoped"), periodicObservations, pipelineConvergences);
     }
 
     private ConvergenceDriver(PipelineConverger converger, DesiredStore desired, ObservationPublisher publisher,
             RateSampler sampler, MetricsExport export, BooleanSupplier reconcileEligible,
-            PipelineActuationOwnership actuation, ScopedPorts scoped, PeriodicObservations periodicObservations) {
+            PipelineActuationOwnership actuation, ScopedPorts scoped, PeriodicObservations periodicObservations,
+            PipelineConvergences pipelineConvergences) {
         this.scoped = scoped;
         this.periodicObservations = periodicObservations;
+        this.pipelineConvergences = pipelineConvergences;
         this.converger = converger;
         this.desired = scoped == null ? Objects.requireNonNull(desired, "desired") : null;
         this.publisher = publisher;
@@ -162,141 +172,23 @@ final class ConvergenceDriver {
         if (!reconcileEligible.getAsBoolean()) {
             return;
         }
-        List<String> pipelineIds = scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds();
-        int coalesced = 0;
-        int rejected = 0;
-        for (String pipelineId : pipelineIds) {
-            // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
-            // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
-            MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
-            PipelineConvergencePass pass = null;
-            PipelineActuationOwnership.Pass localPass = null;
-            boolean periodic = false;
-            try {
-                PipelineActuationOwnership.Permit permit;
-                if (scoped == null) {
-                    permit = actuation.permit(pipelineId);
-                } else {
-                    var snapshot = scoped.intents().loadForActuation(pipelineId);
-                    if (snapshot.isEmpty()) {
-                        var pendingStart = scoped.prepareStart() == null
-                                ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
-                        if (pendingStart.isPresent()) {
-                            var pending = pendingStart.orElseThrow();
-                            MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
-                                    Long.toString(pending.intent().scope().stateGeneration()));
-                            prepareStart(pending);
-                        } else if (scoped.resumeRebuild() != null) {
-                            scoped.resumeRebuild().accept(pipelineId);
-                        }
-                        continue;
-                    }
-                    if (snapshot.get().deleted()) continue;
-                    if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
-                        throw new TapstateException(
-                                IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
-                    }
-                    MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
-                            Long.toString(snapshot.get().scope().stateGeneration()));
-                    permit = actuation.permit(snapshot.get().scope());
-                    if (permit.granted()) {
-                        localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
-                        pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
-                                scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
-                        actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
-                    }
-                }
-                if (!permit.granted()) {
-                    // Another member drives this pipeline. Observe desired and actual; drive neither. Both
-                    // halves matter: converging here would call the same lifecycle verb a second time --
-                    // this member is carrying no job, which is exactly the condition the converge side
-                    // starts one in -- and publishing here would overwrite the driver's observation with
-                    // this member's own run statistics, which are absent because the run is not here.
-                    continue;
-                }
-                PipelineConvergencePass originalPass = pass;
-                if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
-                ConvergeResult result = scoped == null ? converger.converge(pipelineId)
-                        : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
-                                scoped.rebuilds().apply(pass), ignored -> {
-                                    discardPeriodic(pipelineId);
-                                    publisher.publishScoped(originalPass.scope(), originalPass.state(),
-                                            originalPass.observationSample(), null);
-                                },
-                                () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
-                if (result.status() == ConvergeStatus.RECOVERING) continue;
-                if (periodicObservations != null && result.status() == ConvergeStatus.CONVERGED
-                        && result.checkpoint().filter(checkpoint ->
-                                StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING).isPresent()) {
-                    var observedPass = Objects.requireNonNull(pass);
-                    var original = observedPass.claim();
-                    var checkpoint = result.checkpoint().orElseThrow();
-                    // The worker owns observations only, never the local lifecycle pass.
-                    periodic = true;
-                    switch (periodicObservations.offer(pipelineId,
-                            new ObservationVersion(observedPass.intent(), original, checkpoint),
-                            admitted -> publishPeriodicObservation(observedPass, original, checkpoint, admitted))) {
-                        case COALESCED -> coalesced++;
-                        case REJECTED -> rejected++;
-                        case ACCEPTED -> { }
-                    }
-                    reconcileFailures.remove(pipelineId);
-                    continue;
-                }
-                discardPeriodic(pipelineId);
-                ObservationFailure failure = null;
-                if (result.status() == ConvergeStatus.FAILED) {
-                    // The job died on its own; the converge side moved the pipeline to the observable FAILED
-                    // state. This is the only pass that holds the cause, so it goes two ways: coded onto the
-                    // observation, so a read face can say why, and into the log with its code and stack.
-                    // Every later pass while the checkpoint stays FAILED publishes null and the publisher
-                    // carries the stored reason forward — durably, so it survives a process restart too.
-                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
-                    LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
-                            failure.code(), result.failure().orElse(null));
-                }
-                var projection = scoped == null ? publisher.publish(pipelineId, failure)
-                        : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
-                PipelineConvergencePass sampledPass = pass;
-                projection.ifPresent(published -> {
-                    if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
-                    sample(published, sampledPass);
-                    export(published);
-                });
-                // A clean pass ends the failure streak; the next throw starts counting from one again.
-                reconcileFailures.remove(pipelineId);
-            } catch (RuntimeException e) {
-                discardPeriodic(pipelineId);
-                PipelineConvergencePass failedPass = pass;
-                if (scoped != null) alert(() -> scoped.alerts().unavailable(failedPass));
-                // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
-                // permanently broken pipeline would look identical to a slow one. Count the consecutive
-                // failures and publish them as an error observation so the failure is observable, not just
-                // logged. Isolate this pipeline: one bad pipeline must not starve the rest of the pass.
-                PipelineIntentScope failedScope = pass == null ? null : pass.scope();
-                FailureStreak previous = reconcileFailures.get(pipelineId);
-                long failures = previous != null && Objects.equals(previous.scope(), failedScope) ? previous.count() + 1 : 1;
-                reconcileFailures.put(pipelineId, new FailureStreak(failedScope, failures));
-                LOG.warn("Reconcile pass for pipeline {} failed {} time(s) in a row; retrying on the next tick",
-                        pipelineId, failures, e);
-                try {
-                    if (scoped == null) publisher.publishReconcileFailure(pipelineId, failures);
-                    else if (pass != null) publisher.publishReconcileFailureScoped(
-                            pass.scope(), pass.state(), pass.observationSample(), failures);
-                } catch (RuntimeException unpublishable) {
-                    // The read face is unreachable too (e.g. the same store backs both), so nothing can be
-                    // surfaced this tick; the warning above is the only record.
-                    LOG.warn("Could not publish the reconcile failure for pipeline {}", pipelineId, unpublishable);
-                }
-            } finally {
-                if (!periodic) discardPeriodic(pipelineId);
-                if (localPass != null) localPass.close();
-                MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
-                MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
-            }
+        List<String> listed = scoped == null ? desired.pipelineIds() : scoped.intents().pipelineIds();
+        int first = pipelineConvergences == null || listed.isEmpty() ? 0 : nextPipeline % listed.size();
+        if (!listed.isEmpty()) nextPipeline = (first + 1) % listed.size();
+        for (int offset = 0; offset < listed.size(); offset++) {
+            String pipelineId = listed.get((first + offset) % listed.size());
+            if (pipelineConvergences == null) reconcilePipeline(pipelineId);
+            else pipelineConvergences.offer(pipelineId, () -> reconcilePipeline(pipelineId));
         }
-        if (coalesced != 0 || rejected != 0) {
-            LOG.debug("Periodic observation backpressure: {} requests coalesced, {} rejected", coalesced, rejected);
+        List<String> pipelineIds;
+        if (pipelineConvergences != null) {
+            pipelineConvergences.retain(listed);
+            // A deleted Pipeline keeps its claim and budgets until its original local pass has ended.
+            var retained = new java.util.HashSet<>(listed);
+            retained.addAll(pipelineConvergences.pipelineIds());
+            pipelineIds = List.copyOf(retained);
+        } else {
+            pipelineIds = listed;
         }
         // Forget what is kept per pipeline for pipelines that are no longer desired, so a
         // deleted-while-failing pipeline does not leak a counter that nothing will ever clear. Both live
@@ -323,6 +215,134 @@ final class ConvergenceDriver {
             periodicObservations.retain(pipelineIds);
         }
         export.forgetPipelinesOutside(pipelineIds);
+    }
+
+    private void reconcilePipeline(String pipelineId) {
+        if (!reconcileEligible.getAsBoolean()) return;
+        // Attribute every line logged while reconciling this pipeline to it, so the logs read face can
+        // tail per pipeline. Cleared per pipeline so the slot never leaks onto the next one or an idle tick.
+        MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+        PipelineConvergencePass pass = null;
+        PipelineActuationOwnership.Pass localPass = null;
+        boolean periodic = false;
+        try {
+            PipelineActuationOwnership.Permit permit;
+            if (scoped == null) {
+                permit = actuation.permit(pipelineId);
+            } else {
+                var snapshot = scoped.intents().loadForActuation(pipelineId);
+                if (snapshot.isEmpty()) {
+                    var pendingStart = scoped.prepareStart() == null
+                            ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
+                    if (pendingStart.isPresent()) {
+                        var pending = pendingStart.orElseThrow();
+                        MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                                Long.toString(pending.intent().scope().stateGeneration()));
+                        prepareStart(pending);
+                    } else if (scoped.resumeRebuild() != null) {
+                        scoped.resumeRebuild().accept(pipelineId);
+                    }
+                    return;
+                }
+                if (snapshot.get().deleted()) return;
+                if (!pipelineId.equals(snapshot.get().scope().pipelineId())) {
+                    throw new TapstateException(
+                            IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+                }
+                MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                        Long.toString(snapshot.get().scope().stateGeneration()));
+                permit = actuation.permit(snapshot.get().scope());
+                if (permit.granted()) {
+                    localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
+                    pass = new PipelineConvergencePass(snapshot.get(), permit.claim(),
+                            scoped.stores(), scoped.requireActive(), advanced -> alert(() -> scoped.alerts().expecting(advanced)));
+                    actuation.renewalFailure(snapshot.get().scope(), permit.claim()).ifPresent(pass::renewalFailed);
+                }
+            }
+            if (!permit.granted()) {
+                // Another member drives this pipeline. Observe desired and actual; drive neither. Both
+                // halves matter: converging here would call the same lifecycle verb a second time --
+                // this member is carrying no job, which is exactly the condition the converge side
+                // starts one in -- and publishing here would overwrite the driver's observation with
+                // this member's own run statistics, which are absent because the run is not here.
+                return;
+            }
+            PipelineConvergencePass originalPass = pass;
+            if (scoped != null) alert(() -> scoped.alerts().expecting(originalPass));
+            ConvergeResult result = scoped == null ? converger.converge(pipelineId)
+                    : converger.convergeScoped(pass.intent(), pass.state(), scoped.actuators().apply(pass),
+                            scoped.rebuilds().apply(pass), ignored -> {
+                                discardPeriodic(pipelineId);
+                                publisher.publishScoped(originalPass.scope(), originalPass.state(),
+                                        originalPass.observationSample(), null);
+                            },
+                            () -> scoped.intents().loadForActuation(pipelineId).filter(originalPass.intent()::equals).isPresent());
+            if (result.status() == ConvergeStatus.RECOVERING) return;
+            if (periodicObservations != null && result.status() == ConvergeStatus.CONVERGED
+                    && result.checkpoint().filter(checkpoint ->
+                            StateJson.parse(checkpoint.stateJson()) == PipelineState.RUNNING).isPresent()) {
+                var observedPass = Objects.requireNonNull(pass);
+                var original = observedPass.claim();
+                var checkpoint = result.checkpoint().orElseThrow();
+                // The worker owns observations only, never the local lifecycle pass.
+                periodic = true;
+                periodicObservations.offer(pipelineId,
+                        new ObservationVersion(observedPass.intent(), original, checkpoint),
+                        admitted -> publishPeriodicObservation(observedPass, original, checkpoint, admitted));
+                reconcileFailures.remove(pipelineId);
+                return;
+            }
+            discardPeriodic(pipelineId);
+            ObservationFailure failure = null;
+            if (result.status() == ConvergeStatus.FAILED) {
+                // The job died on its own; the converge side moved the pipeline to the observable FAILED
+                // state. This is the only pass that holds the cause, so it goes two ways: coded onto the
+                // observation, so a read face can say why, and into the log with its code and stack.
+                // Every later pass while the checkpoint stays FAILED publishes null and the publisher
+                // carries the stored reason forward — durably, so it survives a process restart too.
+                failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
+                LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
+                        failure.code(), result.failure().orElse(null));
+            }
+            var projection = scoped == null ? publisher.publish(pipelineId, failure)
+                    : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);
+            PipelineConvergencePass sampledPass = pass;
+            projection.ifPresent(published -> {
+                if (scoped != null) alert(() -> scoped.alerts().published(sampledPass, published, result.failure().orElse(null)));
+                sample(published, sampledPass);
+                export(published);
+            });
+            // A clean pass ends the failure streak; the next throw starts counting from one again.
+            reconcileFailures.remove(pipelineId);
+        } catch (RuntimeException e) {
+            discardPeriodic(pipelineId);
+            PipelineConvergencePass failedPass = pass;
+            if (scoped != null) alert(() -> scoped.alerts().unavailable(failedPass));
+            // A pass that keeps throwing never reaches publish(), so the read face would stay empty and a
+            // permanently broken pipeline would look identical to a slow one. Count the consecutive
+            // failures and publish them as an error observation so the failure is observable, not just
+            // logged. Isolate this pipeline: one bad pipeline must not starve the rest of the pass.
+            PipelineIntentScope failedScope = pass == null ? null : pass.scope();
+            FailureStreak previous = reconcileFailures.get(pipelineId);
+            long failures = previous != null && Objects.equals(previous.scope(), failedScope) ? previous.count() + 1 : 1;
+            reconcileFailures.put(pipelineId, new FailureStreak(failedScope, failures));
+            LOG.warn("Reconcile pass for pipeline {} failed {} time(s) in a row; retrying on the next tick",
+                    pipelineId, failures, e);
+            try {
+                if (scoped == null) publisher.publishReconcileFailure(pipelineId, failures);
+                else if (pass != null) publisher.publishReconcileFailureScoped(
+                        pass.scope(), pass.state(), pass.observationSample(), failures);
+            } catch (RuntimeException unpublishable) {
+                // The read face is unreachable too (e.g. the same store backs both), so nothing can be
+                // surfaced this tick; the warning above is the only record.
+                LOG.warn("Could not publish the reconcile failure for pipeline {}", pipelineId, unpublishable);
+            }
+        } finally {
+            if (!periodic) discardPeriodic(pipelineId);
+            if (localPass != null) localPass.close();
+            MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
+            MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+        }
     }
 
     private void discardPeriodic(String pipelineId) {

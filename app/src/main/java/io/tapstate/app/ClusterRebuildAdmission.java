@@ -4,7 +4,7 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.runtime.engine.EngineError;
 import io.tapstate.runtime.scheduler.RebuildAdmission;
 import java.time.Duration;
-import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.LongSupplier;
@@ -45,8 +45,8 @@ import org.slf4j.LoggerFactory;
  * <p>A refusal is logged with its reason, once for each reason, so a pipeline left failed says what kept
  * it there.
  *
- * <p>Not synchronized: one convergence pass at a time asks this, on a single scheduler thread with a
- * fixed delay, so passes never overlap.
+ * <p>Convergence is single-flight per Pipeline. Different Pipelines may ask concurrently; retention
+ * includes every queued or running Pipeline so it cannot remove an active pass's budget.
  */
 final class ClusterRebuildAdmission implements RebuildAdmission {
 
@@ -60,9 +60,9 @@ final class ClusterRebuildAdmission implements RebuildAdmission {
     private final long backoffNanos;
     private final long detectionWindowNanos;
     private final LongSupplier nanoTime;
-    private final Map<String, Attempts> attempts = new HashMap<>();
+    private final Map<String, Attempts> attempts = new ConcurrentHashMap<>();
     /** The refusal last logged for each pipeline, so the same refusal of the same run is logged once. */
-    private final Map<String, Refusal> refusals = new HashMap<>();
+    private final Map<String, Refusal> refusals = new ConcurrentHashMap<>();
 
     /** Which run a refusal was about, and why it was refused. */
     private record Refusal(long executionGeneration, PipelineActuationOwnership.Departure why) {}

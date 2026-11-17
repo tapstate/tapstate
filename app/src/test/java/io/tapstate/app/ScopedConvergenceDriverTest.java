@@ -73,6 +73,7 @@ class ScopedConvergenceDriverTest {
     private Runnable onFinalObservation = () -> {};
     private PipelineAlertFeed alertFeed = PipelineAlertFeed.none();
     private MetricsExport metricsExport = MetricsExport.none();
+    private PipelineConvergences pipelineConvergences;
 
     private ConvergenceDriver driver() {
         claims.acquire(KEY, OWNER, 7, Duration.ofMinutes(1));
@@ -124,7 +125,7 @@ class ScopedConvergenceDriverTest {
                             Map.of("orders",new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true)),T0)
                             : io.tapstate.core.lifecycle.SnapshotReading.NONE;
                 }),
-                sampler, metricsExport, eligible::get, ownership, bindings);
+                sampler, metricsExport, eligible::get, ownership, bindings, null, pipelineConvergences);
     }
 
     @Test void originalScopedPublicationReachesAlertsBeforeARefusingExporter() {
@@ -276,6 +277,83 @@ class ScopedConvergenceDriverTest {
         }
         if (startFailure != null) throw startFailure;
         carrying.set(true);
+    }
+
+    @Test void aRejectedTailPipelineGetsAnAdmissionBeforeCompletedFrontPipelinesRefillTheQueue() throws Exception {
+        var firstEntered = new java.util.concurrent.CountDownLatch(1);
+        var firstRelease = new java.util.concurrent.CountDownLatch(1);
+        var secondEntered = new java.util.concurrent.CountDownLatch(1);
+        var secondRelease = new java.util.concurrent.CountDownLatch(1);
+        var tailEntered = new java.util.concurrent.CountDownLatch(1);
+        var input = mock(PipelineIntentStore.class);
+        when(input.pipelineIds()).thenReturn(List.of("a", "b", "c"));
+        when(input.loadForActuation(any())).thenAnswer(call -> {
+            String id = call.getArgument(0);
+            if (id.equals("a")) { firstEntered.countDown(); assertThat(firstRelease.await(5, TimeUnit.SECONDS)).isTrue(); }
+            if (id.equals("b")) { secondEntered.countDown(); assertThat(secondRelease.await(5, TimeUnit.SECONDS)).isTrue(); }
+            if (id.equals("c")) tailEntered.countDown();
+            return Optional.empty();
+        });
+        try (var work = new PipelineConvergences(1, 1)) {
+            var ports = new ConvergenceDriver.ScopedPorts(input, mock(PipelineStoreViews.class), () -> {},
+                    ignored -> { throw new AssertionError("no prepared intent"); }, ignored -> RebuildAdmission.never(), ignored -> {});
+            var driver = ConvergenceDriver.scoped(mock(PipelineConverger.class), mock(ObservationPublisher.class),
+                    null, MetricsExport.none(), () -> true, mock(PipelineActuationOwnership.class), ports, null, work);
+            try {
+                driver.reconcile();
+                assertThat(firstEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                driver.reconcile();
+                assertThat(work.health().rejectedRequests()).isPositive();
+                firstRelease.countDown();
+                assertThat(secondEntered.await(5, TimeUnit.SECONDS)).isTrue();
+                driver.reconcile();
+                secondRelease.countDown();
+                assertThat(tailEntered.await(2, TimeUnit.SECONDS)).isTrue();
+            } finally { firstRelease.countDown(); secondRelease.countDown(); }
+        }
+    }
+
+    @Test void aHeldWorkerKeepsItsClaimAndBudgetUntilTheOriginalPassEnds() throws Exception {
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try (var work = new PipelineConvergences(1, 2)) {
+            pipelineConvergences = work;
+            onStart = pass -> {
+                entered.countDown();
+                try { assertThat(release.await(5, TimeUnit.SECONDS)).isTrue(); }
+                catch (InterruptedException stopped) { Thread.currentThread().interrupt(); throw new AssertionError(stopped); }
+                advance(pass);
+            };
+            var driver = driver();
+            try {
+                driver.reconcile();
+                assertThat(entered.await(5, TimeUnit.SECONDS)).isTrue();
+                driver.reconcile();
+                intents.ids = List.of();
+                driver.reconcile();
+                assertThat(retained).allSatisfy(ids -> assertThat(ids).contains("orders"));
+                verify(ownership, org.mockito.Mockito.atLeastOnce()).retain(List.of("orders"));
+            } finally { release.countDown(); }
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            driver.reconcile();
+            assertThat(passes).hasSize(1);
+            assertThat(retained.getLast()).isEmpty();
+            verify(ownership).retain(List.of());
+        }
+    }
+
+    @Test void completionKeepsItsPublicationAndFencedCleanupOrderOnTheLifecycleWorker() {
+        try (var work = new PipelineConvergences(1, 2)) {
+            pipelineConvergences = work;
+            var driver = driver();
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            views.writes.clear(); readyToComplete = true;
+            driver.reconcile();
+            org.awaitility.Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> work.pipelineIds().isEmpty());
+            assertThat(completionTrace).containsExactly("final-observation", "completion-cas", "cleanup");
+            assertThat(views.observations(FIRST).read("orders").orElseThrow().state()).isEqualTo(PipelineState.COMPLETED);
+        }
     }
 
     @Test void scopedCompletionPublishesBeforeItsFencedCasAndRetainsTheFinalReadingAfterCleanup() {
@@ -487,11 +565,12 @@ class ScopedConvergenceDriverTest {
 
     private static final class Intents implements PipelineIntentStore {
         private PipelineIntentSnapshot snapshot = snapshot(FIRST);
+        private List<String> ids = List.of("orders");
         private RuntimeException loadFailure;
         private int loads;
         @Override public Optional<PipelineIntentSnapshot> load(String id) { throw new AssertionError("authoring load does not prove preparation readiness"); }
         @Override public Optional<PipelineIntentSnapshot> loadForActuation(String id) { loads++; if (loadFailure != null) throw loadFailure; return Optional.ofNullable(snapshot); }
-        @Override public List<String> pipelineIds() { return List.of("orders"); }
+        @Override public List<String> pipelineIds() { return ids; }
         @Override public PipelineIntentStore guardedBy(Runnable active) { throw new AssertionError("read-only driver"); }
         @Override public boolean compareAndSet(PipelineIntentScope scope, long revision, DesiredState desired) { throw new AssertionError("read-only driver"); }
         @Override public boolean remove(PipelineIntentScope scope, long revision) { throw new AssertionError("read-only driver"); }

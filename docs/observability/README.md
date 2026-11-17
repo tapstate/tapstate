@@ -460,10 +460,17 @@ unavailable; the next successful publication logs recovery. The last stored
 `observedAt` continues to age while no new observation can be published. A successful
 HTTP read does not make those old facts fresh.
 
-This isolation covers periodic collection and publication. Lifecycle actions and
-the final observation needed before completion keep their existing ordering.
-A slow lifecycle action can still delay the convergence pass; its actual state,
-desired intent, and monitoring freshness must be inspected separately.
+Lifecycle convergence uses a separate bounded queue with four workers and 64
+queued Pipeline jobs. Each Pipeline keeps at most one running pass and one latest
+pending pass. A slow start or stop therefore leaves other workers able to converge
+and schedule observations for other Pipelines. Saturated admission rotates across
+Pipelines on later ticks; rejected work is retried rather than executed by the
+scheduler. Normal logs report `Lifecycle convergence backpressure` and its recovery.
+
+Each pass still uses the original execution identity and fences. The final
+observation, completion transition and cleanup retain their order within the same
+Pipeline. Inspect actual state, desired intent and monitoring freshness separately;
+queuing a lifecycle pass does not establish that its requested state was reached.
 
 ## Stored facts and wide Pipelines
 
