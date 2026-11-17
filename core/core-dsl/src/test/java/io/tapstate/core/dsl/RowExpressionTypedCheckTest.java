@@ -133,6 +133,36 @@ class RowExpressionTypedCheckTest {
         assertThat(RowExpressions.typedValueError("after.created", columns())).isNull();
     }
 
+    @Test
+    @DisplayName("two values of one temporal type may be ordered, since that needs no zone")
+    void sameTypeTemporalOrderingIsAccepted() {
+        Map<String, TapstateType> temporal = Map.of(
+                "a", TapstateType.DATETIME, "b", TapstateType.DATETIME,
+                "d1", TapstateType.DATE, "d2", TapstateType.DATE,
+                "t1", TapstateType.TIME, "t2", TapstateType.TIME);
+        for (String operator : List.of("<", "<=", ">", ">=")) {
+            assertThat(RowExpressions.typedPredicateError("after.a " + operator + " before.b", temporal))
+                    .as("datetime %s datetime", operator).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.d1 " + operator + " after.d2", temporal))
+                    .as("date %s date", operator).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.t1 " + operator + " after.t2", temporal))
+                    .as("time %s time", operator).isNull();
+        }
+        assertThat(RowExpressions.typedPredicateError(
+                "op != 'u' || after.a >= before.a", temporal)).isNull();
+    }
+
+    @Test
+    @DisplayName("ordering two different temporal types, or one against a number or string, stays refused")
+    void mixedTemporalOrderingIsRefused() {
+        Map<String, TapstateType> temporal = Map.of(
+                "a", TapstateType.DATETIME, "d", TapstateType.DATE, "s", TapstateType.STRING);
+        assertThat(RowExpressions.typedPredicateError("after.a < after.d", temporal)).isNotNull();
+        assertThat(RowExpressions.typedPredicateError("after.a < after.s", temporal)).isNotNull();
+        assertThat(RowExpressions.typedPredicateError("after.a < 0", temporal)).isNotNull();
+        assertThat(RowExpressions.typedValueError("after.a + after.a", temporal)).isNotNull();
+    }
+
     // ---- a column the source model does not carry --------------------------------------
 
     @Test
