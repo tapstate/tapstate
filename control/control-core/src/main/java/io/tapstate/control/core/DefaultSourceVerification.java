@@ -74,14 +74,16 @@ public final class DefaultSourceVerification implements ConnectionTestService.Ob
             private boolean terminal;
             @Override public java.util.OptionalLong deadlineNanos() { return java.util.OptionalLong.of(deadlineNanos); }
             @Override public void completed(ConnectionTestResult result) { throw new IllegalStateException("managed result must use conditional publication"); }
-            @Override public void publish(ConnectionTestResult result, ConnectionTestResultStore ignored) {
+            @Override public ConnectionTestResult publish(ConnectionTestResult result, ConnectionTestResultStore.Publication publication) {
                 boolean timeout = result.outcome() == ConnectionTestResult.Outcome.FAILED && controlledTimeout.test(result);
                 if (!target().filter(target::equals).isPresent() || !live.test(owner) || result.testedAt() < started.acceptedAt()
                         || result.testedAt() > clock.millis() || (clock.millis() >= started.deadlineAt() || System.nanoTime() - deadlineNanos >= 0) && !timeout) throw unavailable();
                 var state = result.outcome() == ConnectionTestResult.Outcome.PASSED
                         ? io.tapstate.spi.store.DefaultSourceTestAttempt.State.PASSED : io.tapstate.spi.store.DefaultSourceTestAttempt.State.FAILED;
-                if (!results.finishDefaultAttempt(started.finish(state, clock.millis(), result), timeout)) throw unavailable();
+                var published = results.publishDefaultReport(started.finish(state, clock.millis(), result), timeout)
+                        .orElseThrow(DefaultSourceVerification::unavailable);
                 terminal = true;
+                return published;
             }
             @Override public void close() {
                 if (!terminal) results.finishDefaultAttempt(started.finish(io.tapstate.spi.store.DefaultSourceTestAttempt.State.UNKNOWN,

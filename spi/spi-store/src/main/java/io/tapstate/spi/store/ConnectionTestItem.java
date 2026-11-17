@@ -1,5 +1,8 @@
 package io.tapstate.spi.store;
 
+import io.tapstate.core.common.DiagnosticProjection;
+
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -19,11 +22,18 @@ public record ConnectionTestItem(
         String message,
         String reason,
         String solution,
-        String connectorErrorCode) {
+        String connectorErrorCode,
+        Map<String, Object> diagnostic) {
 
     public ConnectionTestItem {
         Objects.requireNonNull(name, "name");
         Objects.requireNonNull(status, "status");
+        diagnostic = DiagnosticProjection.read(diagnostic);
+    }
+
+    public ConnectionTestItem(String name, Status status, String message, String reason,
+            String solution, String connectorErrorCode) {
+        this(name, status, message, reason, solution, connectorErrorCode, Map.of());
     }
 
     /** The outcome of a single connection-test item. */

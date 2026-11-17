@@ -93,7 +93,8 @@ public final class SourceConnectionResolver {
 
         ConnectionConfig config = new ConnectionConfig(
                 source == null ? connectionId : source.id(), connectorId, resolved);
-        return new ResolvedConnection(config, secretValues(secretPaths, config.settings()), catalogSnapshot);
+        return new ResolvedConnection(config, secretValues(secretPaths, config.settings()), catalogSnapshot,
+                source == null ? null : source.id());
     }
 
     /** Resolves the connection config without exposing the credential snapshot to older callers. */
@@ -125,7 +126,7 @@ public final class SourceConnectionResolver {
         }
         Object uri = settings.get("uri");
         if (uri instanceof String text) {
-            values.addAll(MongoUriUserInfo.secretValues(text));
+            values.addAll(MongoUriUserInfo.diagnosticSecretValues(text));
         }
         return List.copyOf(values);
     }
@@ -150,7 +151,7 @@ public final class SourceConnectionResolver {
 
     /** The connection config and the credentials needed to redact its diagnostics. */
     record ResolvedConnection(
-            ConnectionConfig config, List<String> secretValues, TapstateCatalog catalogSnapshot) {
+            ConnectionConfig config, List<String> secretValues, TapstateCatalog catalogSnapshot, String sourceId) {
 
         public ResolvedConnection {
             Objects.requireNonNull(config, "config");
