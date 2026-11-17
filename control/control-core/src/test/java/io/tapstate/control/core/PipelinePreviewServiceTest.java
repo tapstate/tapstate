@@ -125,15 +125,7 @@ class PipelinePreviewServiceTest {
             assertThat(context.get("parentPointerPattern")).isEqualTo("/items");
             assertThat(context.get("pointerPatterns")).isEqualTo(List.of("/items/labels"));
         });
-        // The soft-delete marker is written per row - true on the update a delete becomes - so it is
-        // not reported as a constant. Read off the map's own context, so no other context can answer.
-        Map<?, ?> mapContext = contexts.stream().map(Map.class::cast)
-                .filter(context -> "transform:map".equals(context.get("id"))).findFirst().orElseThrow();
-        assertThat((List<?>) mapContext.get("effects")).anySatisfy(effect -> {
-            Map<?, ?> marker = (Map<?, ?>) effect;
-            assertThat(marker.get("pointer")).isEqualTo("/is_deleted");
-            assertThat(marker.get("kind")).isEqualTo("computed");
-        });
+        assertTheSoftDeleteMarkerIsComputed(contexts);
         session.cancel();
         assertThat(cancellations).hasValue(1);
         assertThat(previews).hasValue(1);
@@ -320,5 +312,19 @@ class PipelinePreviewServiceTest {
         public List<Resource> list() {
             return List.of();
         }
+    }
+
+    /**
+     * The soft-delete marker is written per row - true on the update a delete becomes - so it is not
+     * reported as a constant. Read off the map's own context, so no other context can answer.
+     */
+    @SuppressWarnings("unchecked")
+    private static void assertTheSoftDeleteMarkerIsComputed(List<?> contexts) {
+        Map<?, ?> mapContext = contexts.stream().map(Map.class::cast)
+                .filter(context -> "transform:map".equals(context.get("id"))).findFirst().orElseThrow();
+        assertThat((List<?>) mapContext.get("effects")).anySatisfy(effect ->
+                assertThat((Map<String, Object>) effect)
+                        .containsEntry("pointer", "/is_deleted")
+                        .containsEntry("kind", "computed"));
     }
 }

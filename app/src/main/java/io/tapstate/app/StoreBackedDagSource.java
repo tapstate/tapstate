@@ -3483,37 +3483,40 @@ final class StoreBackedDagSource implements DagSource {
             return resolved;
         }
         NestTable behind = nestTable(FromRef.literal(walked.stream()), sourceTables);
-        List<String> primaryKey = carriedKey(behind.primaryKey(), walked.projections());
-        return new NestTable(resolved.name(), primaryKey == null ? List.of() : primaryKey,
+        return new NestTable(resolved.name(),
+                carriedKey(behind.primaryKey(), walked.projections()).orElse(List.of()),
                 behind.uniqueIndexes().stream()
                         .map(index -> carriedKey(index, walked.projections()))
-                        .filter(Objects::nonNull).toList(),
+                        .flatMap(Optional::stream).toList(),
                 resolved.fields());
     }
 
     /**
-     * Key columns as they are named after the given maps, nearest the source first, or null where a
+     * Key columns as they are named after the given maps, nearest the source first, or empty where a
      * map writes something else over one of them. A rename carries the key's values under a new name;
      * a literal, a computed value, a drop or another column renamed onto the key's name replaces them,
      * and a key inferred over replaced values would give distinct rows one identity.
      */
-    private static List<String> carriedKey(List<String> key, List<Map<String, FieldRule>> projections) {
+    private static Optional<List<String>> carriedKey(List<String> key, List<Map<String, FieldRule>> projections) {
         List<String> current = key;
         for (Map<String, FieldRule> rules : projections) {
             List<String> renamed = KeyProjection.renamed(current, rules);
             if (renamed.size() != current.size()) {
-                return null;
+                return Optional.empty();
             }
             for (int i = 0; i < current.size(); i++) {
-                if (renamed.get(i).equals(current.get(i)) && rules.containsKey(current.get(i))
-                        && !(rules.get(current.get(i)) instanceof FieldRule.Rename rename
-                                && rename.sourceField().equals(current.get(i)))) {
-                    return null;
+                if (renamed.get(i).equals(current.get(i)) && replaces(rules.get(current.get(i)), current.get(i))) {
+                    return Optional.empty();
                 }
             }
             current = renamed;
         }
-        return current;
+        return Optional.of(current);
+    }
+
+    /** Whether a map's rule for a column writes something other than that column's own value. */
+    private static boolean replaces(FieldRule rule, String column) {
+        return rule != null && !(rule instanceof FieldRule.Rename rename && rename.sourceField().equals(column));
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
@@ -4430,62 +4433,77 @@ final class StoreBackedDagSource implements DagSource {
         if (projections.isEmpty()) {
             return model;
         }
-        List<TargetField> fields = model.fields();
-        Map<String, String> carriedFrom = new LinkedHashMap<>();
-        for (TargetField field : fields) {
-            carriedFrom.put(field.name(), field.name());
-        }
+        ProjectedColumns projected = ProjectedColumns.of(model.fields());
         for (Map<String, FieldRule> rules : projections) {
-            Map<String, TargetField> upstream = new LinkedHashMap<>();
-            fields.forEach(field -> upstream.put(field.name(), field));
-            Map<String, TapstateType> types = new LinkedHashMap<>();
-            fields.forEach(field -> types.put(field.name(),
-                    field.inferredType() == null ? TapstateType.UNKNOWN : field.inferredType()));
-            Map<String, TargetField> out = new LinkedHashMap<>();
-            Map<String, String> carried = new LinkedHashMap<>();
-            Set<String> consumed = new HashSet<>();
-            Set<String> dropped = new HashSet<>();
-            Map<String, String> from = carriedFrom;
-            rules.forEach((output, rule) -> {
-                switch (rule) {
-                    case FieldRule.Rename rename -> {
-                        consumed.add(rename.sourceField());
-                        TargetField field = upstream.get(rename.sourceField());
-                        if (field != null) {
-                            out.put(output, new TargetField(output, field.type(), field.primaryKey(),
-                                    field.inferredType(), field.numericType(), field.stringType()));
-                            if (from.containsKey(rename.sourceField())) {
-                                carried.put(output, from.get(rename.sourceField()));
-                            }
-                        }
-                    }
-                    case FieldRule.Drop ignored -> dropped.add(output);
-                    case FieldRule.Literal literal -> out.put(output,
-                            new TargetField(output, null, false, NodeColumns.literalType(literal.value())));
-                    case FieldRule.Computed computed -> out.put(output, new TargetField(output, null, false,
-                            RowExpressions.typedValueType(computed.celExpr(), types)));
-                }
-            });
-            for (TargetField field : fields) {
-                String name = field.name();
-                if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
-                    out.put(name, field);
-                    if (from.containsKey(name)) {
-                        carried.put(name, from.get(name));
-                    }
-                }
-            }
-            fields = List.copyOf(out.values());
-            carriedFrom = carried;
+            projected = projected.through(rules);
         }
         Map<String, String> nowNamed = new LinkedHashMap<>();
-        carriedFrom.forEach((output, source) -> nowNamed.put(source, output));
+        projected.carriedFrom().forEach((output, source) -> nowNamed.put(source, output));
         List<TargetIndex> indexes = model.indexes().stream()
                 .filter(index -> nowNamed.keySet().containsAll(index.fields()))
                 .map(index -> new TargetIndex(index.fields().stream().map(nowNamed::get).toList(),
                         index.unique(), index.constrainsEveryRow()))
                 .toList();
-        return new TargetTable(model.name(), fields, indexes, model.unwindIdentity());
+        return new TargetTable(model.name(), projected.fields(), indexes, model.unwindIdentity());
+    }
+
+    /**
+     * A table's columns after some maps, and for each column that still holds a source column's value,
+     * which source column that is.
+     */
+    private record ProjectedColumns(List<TargetField> fields, Map<String, String> carriedFrom) {
+
+        static ProjectedColumns of(List<TargetField> fields) {
+            Map<String, String> carriedFrom = new LinkedHashMap<>();
+            for (TargetField field : fields) {
+                carriedFrom.put(field.name(), field.name());
+            }
+            return new ProjectedColumns(fields, carriedFrom);
+        }
+
+        /** These columns as one map writes them: its named columns in its order, then the ones it passes through. */
+        ProjectedColumns through(Map<String, FieldRule> rules) {
+            Map<String, TargetField> upstream = new LinkedHashMap<>();
+            Map<String, TapstateType> types = new LinkedHashMap<>();
+            for (TargetField field : fields) {
+                upstream.put(field.name(), field);
+                types.put(field.name(), field.inferredType() == null ? TapstateType.UNKNOWN : field.inferredType());
+            }
+            Map<String, TargetField> out = new LinkedHashMap<>();
+            Map<String, String> carried = new LinkedHashMap<>();
+            Set<String> consumed = new HashSet<>();
+            rules.forEach((output, rule) -> {
+                if (rule instanceof FieldRule.Rename rename) {
+                    consumed.add(rename.sourceField());
+                    TargetField field = upstream.get(rename.sourceField());
+                    if (field != null) {
+                        out.put(output, new TargetField(output, field.type(), field.primaryKey(),
+                                field.inferredType(), field.numericType(), field.stringType()));
+                        carry(output, rename.sourceField(), carried);
+                    }
+                } else if (rule instanceof FieldRule.Literal literal) {
+                    out.put(output, new TargetField(output, null, false, NodeColumns.literalType(literal.value())));
+                } else if (rule instanceof FieldRule.Computed computed) {
+                    out.put(output, new TargetField(output, null, false,
+                            RowExpressions.typedValueType(computed.celExpr(), types)));
+                }
+            });
+            for (TargetField field : fields) {
+                if (!out.containsKey(field.name()) && !consumed.contains(field.name())
+                        && !(rules.get(field.name()) instanceof FieldRule.Drop)) {
+                    out.put(field.name(), field);
+                    carry(field.name(), field.name(), carried);
+                }
+            }
+            return new ProjectedColumns(List.copyOf(out.values()), carried);
+        }
+
+        private void carry(String output, String upstreamName, Map<String, String> carried) {
+            String source = carriedFrom.get(upstreamName);
+            if (source != null) {
+                carried.put(output, source);
+            }
+        }
     }
 
     /** The source reference that determines an assembly's physical output name and source ownership. */
