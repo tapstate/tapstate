@@ -28,6 +28,24 @@ class AReferenceWakeBeforeItsRootSharesTheAbsentReadTest {
     private static final NestLookup CUSTOMERS = TOPOLOGY.lookups().getFirst();
     private static final Map<String, Object> CUSTOMER = row("customer_id", "C1", "name", "Ada");
 
+    @Test
+    void multipleWakesShareOneReadWithoutLosingEitherDocument() throws Exception {
+        Fixture f = new Fixture();
+        f.customers.save(List.of("C1"), CUSTOMER);
+        TestInbox wakes = new TestInbox();
+        wakes.add(new NestTouch(List.of(1), 1L, Map.of(), false, true));
+        wakes.add(new NestTouch(List.of(2), 1L, Map.of(), false, true));
+        f.assembler.process(CUSTOMERS.touchOrdinal(), wakes);
+        assertThat(wakes).isEmpty();
+        f.order();
+        f.feed(0, Envelope.insert(2L, "order", row("order_id", 2, "cust_ref", "C1"), null).withOrder(at(2)));
+        assertThat(f.drain()).extracting(Envelope::after).containsExactly(
+                row("order_id", 1, "cust_ref", "C1", "customer", CUSTOMER),
+                row("order_id", 2, "cust_ref", "C1", "customer", CUSTOMER));
+        assertThat(f.roots.reads).isEqualTo(1);
+        assertThat(f.roots.keysRead).isEqualTo(2);
+    }
+
     @ParameterizedTest
     @CsvSource({"true, false", "false, true"})
     void aWakeThatOvertakesItsRootDoesNotAddASecondStateRead(boolean onlyIfWaiting, boolean firstFiling)
@@ -103,8 +121,15 @@ class AReferenceWakeBeforeItsRootSharesTheAbsentReadTest {
     private static final class CountingStore implements NestStore<RootAssembly> {
         private final HeapNestStore<RootAssembly> delegate = new HeapNestStore<>();
         private int reads;
+        private int keysRead;
 
-        @Override public RootAssembly load(Object key) { reads++; return delegate.load(key); }
+        @Override public Map<Object, RootAssembly> loadAll(java.util.Collection<Object> keys) {
+            reads++;
+            keysRead += keys.size();
+            return delegate.loadAll(keys);
+        }
+
+        @Override public RootAssembly load(Object key) { reads++; keysRead++; return delegate.load(key); }
         @Override public void save(Object key, RootAssembly state) { delegate.save(key, state); }
         @Override public void remove(Object key) { delegate.remove(key); }
         @Override public long count() { return delegate.count(); }
