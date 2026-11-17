@@ -6,6 +6,7 @@ import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
+import io.tapstate.core.dsl.DecimalComparisonFunctions;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
@@ -31,9 +32,10 @@ import java.util.function.UnaryOperator;
  */
 final class RowExpressionProgram {
 
-    // A standard runtime with no custom function bindings. It is immutable and shared: building the
+    // A runtime with exact decimal comparison function bindings. It is immutable and shared: building the
     // per-expression program is the only per-instance cost.
-    private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder().build();
+    private static final CelRuntime RUNTIME = DecimalComparisonFunctions.configureRuntime(
+            CelRuntimeFactory.standardCelRuntimeBuilder()).build();
 
     private final CelRuntime.Program program;
     // The source expression, kept so an evaluation failure can name the expression that failed.

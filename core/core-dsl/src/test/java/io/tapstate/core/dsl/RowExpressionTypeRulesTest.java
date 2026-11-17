@@ -91,6 +91,19 @@ class RowExpressionTypeRulesTest {
     }
 
     @Test
+    @DisplayName("comparing an exact fixed-point column to an integer or double passes without precision loss")
+    void decimalComparisonPasses() {
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.amount > 25")), model("amount", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+
+        assertThatCode(() -> RowExpressionTypeRules.validate(
+                batch(filterPipeline("after.i_name != 'cK6J3' && after.i_price > 25")),
+                model("i_name", TapstateType.STRING, "i_price", TapstateType.DECIMAL)))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("a lossless numeric column passes, so the gate is not refusing numbers as a class")
     void losslessNumericPasses() {
         assertThatCode(() -> RowExpressionTypeRules.validate(
@@ -509,7 +522,7 @@ class RowExpressionTypeRulesTest {
                 kind: transform
                 id: keep_big
                 type: filter
-                expr: "after.amount > 0"
+                expr: "after.amount * 2 > 0"
                 """;
         String pipeline = """
                 version: tapstate/v1

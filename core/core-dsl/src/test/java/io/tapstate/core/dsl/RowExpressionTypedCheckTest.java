@@ -95,9 +95,33 @@ class RowExpressionTypedCheckTest {
     }
 
     @Test
-    @DisplayName("comparing an exact fixed-point column is refused too, not only arithmetic")
-    void decimalComparisonIsRefused() {
-        assertThat(RowExpressions.typedPredicateError("after.amount > 0", columns())).isNotNull();
+    @DisplayName("an exact fixed-point column supports comparison operations with integers, doubles, and decimals")
+    void decimalComparisonIsAccepted() {
+        Map<String, TapstateType> columns = Map.of(
+                "amount", TapstateType.DECIMAL,
+                "target", TapstateType.DECIMAL,
+                "limit", TapstateType.INT64,
+                "ratio", TapstateType.DOUBLE);
+
+        for (String op : List.of(">", ">=", "<", "<=", "==", "!=")) {
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 0", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 25", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("25 " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 25.5", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("25.5 " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.target", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.limit", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.limit " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.ratio", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.ratio " + op + " after.amount", columns())).isNull();
+        }
+    }
+
+    @Test
+    @DisplayName("temporal opaque types refuse numerical comparisons")
+    void temporalComparisonIsRefused() {
+        Map<String, TapstateType> temporal = Map.of("d", TapstateType.DATE);
+        assertThat(RowExpressions.typedPredicateError("after.d > 0", temporal)).isNotNull();
     }
 
     @Test

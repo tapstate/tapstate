@@ -41,6 +41,79 @@ class FilterTransformTest {
     }
 
     @Test
+    @DisplayName("filters decimal column using user reported compound predicate")
+    void filtersDecimalColumnWithUserReportedExpression() {
+        TransformPort filter = StatelessTransforms.filter("after.i_name != 'cK6J3' && after.i_price > 25");
+        Envelope match = Envelope.insert(1L, "bmsql_item",
+                Map.of("i_name", "validItem", "i_price", new java.math.BigDecimal("25.01")), null);
+        Envelope wrongName = Envelope.insert(2L, "bmsql_item",
+                Map.of("i_name", "cK6J3", "i_price", new java.math.BigDecimal("30.00")), null);
+        Envelope lowPrice = Envelope.insert(3L, "bmsql_item",
+                Map.of("i_name", "validItem", "i_price", new java.math.BigDecimal("25.00")), null);
+
+        assertThat(filter.transform(match)).containsExactly(match);
+        assertThat(filter.transform(wrongName)).isEmpty();
+        assertThat(filter.transform(lowPrice)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("retracts a row when a decimal update causes it to stop matching a threshold filter")
+    void emitsADeleteWhenDecimalFieldStopsMatchingFilter() {
+        TransformPort filter = StatelessTransforms.filter("after.amount > 25");
+        Map<String, Object> matching = Map.of("id", 1, "amount", new java.math.BigDecimal("30.00"));
+        Map<String, Object> notMatching = Map.of("id", 1, "amount", new java.math.BigDecimal("20.00"));
+
+        Envelope insert = Envelope.insert(1L, "orders", matching, null);
+        assertThat(filter.transform(insert)).containsExactly(insert);
+
+        Envelope dropsBelow = Envelope.update(2L, "orders", matching, notMatching, null);
+        assertThat(filter.transform(dropsBelow))
+                .as("stopping to match must emit a DELETE retraction with before image")
+                .singleElement().satisfies(retraction -> {
+                    assertThat(retraction.op()).isEqualTo(Op.DELETE);
+                    assertThat(retraction.before()).isEqualTo(matching);
+                    assertThat(retraction.after()).isNull();
+                });
+
+        Envelope staysBelow = Envelope.update(3L, "orders", notMatching,
+                Map.of("id", 1, "amount", new java.math.BigDecimal("15.00")), null);
+        assertThat(filter.transform(staysBelow)).isEmpty();
+
+        Envelope recovers = Envelope.update(4L, "orders", notMatching, matching, null);
+        assertThat(filter.transform(recovers)).containsExactly(recovers);
+    }
+
+    @Test
+    @DisplayName("decimal equality in filter ignores trailing scale zeros")
+    void decimalEqualityIgnoresTrailingScaleZerosInFilter() {
+        TransformPort filter = StatelessTransforms.filter("after.amount == 25");
+        Envelope exactZeroScale = Envelope.insert(1L, "orders", Map.of("id", 1, "amount", new java.math.BigDecimal("25")), null);
+        Envelope exactMultiScale = Envelope.insert(2L, "orders", Map.of("id", 2, "amount", new java.math.BigDecimal("25.0000")), null);
+        Envelope differentValue = Envelope.insert(3L, "orders", Map.of("id", 3, "amount", new java.math.BigDecimal("25.0001")), null);
+
+        assertThat(filter.transform(exactZeroScale)).containsExactly(exactZeroScale);
+        assertThat(filter.transform(exactMultiScale)).containsExactly(exactMultiScale);
+        assertThat(filter.transform(differentValue)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("decimal column compared with other decimal and double columns in same row")
+    void decimalComparedWithOtherColumns() {
+        TransformPort filter = StatelessTransforms.filter("after.price > after.cost && after.price > after.factor");
+        Envelope match = Envelope.insert(1L, "items", Map.of(
+                "price", new java.math.BigDecimal("100.00"),
+                "cost", new java.math.BigDecimal("80.50"),
+                "factor", 99.5), null);
+        Envelope noMatch = Envelope.insert(2L, "items", Map.of(
+                "price", new java.math.BigDecimal("100.00"),
+                "cost", new java.math.BigDecimal("105.00"),
+                "factor", 99.5), null);
+
+        assertThat(filter.transform(match)).containsExactly(match);
+        assertThat(filter.transform(noMatch)).isEmpty();
+    }
+
+    @Test
     @DisplayName("removes a previously matching shipment from the view when its status changes")
     void emitsADeleteWhenAShipmentStopsMatchingTheViewFilter() {
         TransformPort filter = StatelessTransforms.filter("after.status == 'in_transit'");

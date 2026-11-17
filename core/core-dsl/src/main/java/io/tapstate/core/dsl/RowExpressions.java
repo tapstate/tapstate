@@ -101,7 +101,8 @@ public final class RowExpressions {
                 .addVar("ts", SimpleType.INT)
                 .addVar("src", SimpleType.STRING)
                 .addVar("schema", MapType.create(SimpleType.STRING, SimpleType.DYN))
-                .addFunctionDeclarations(NOW);
+                .addFunctionDeclarations(NOW)
+                .addFunctionDeclarations(DecimalComparisonFunctions.orderingDeclarations());
     }
 
     /** A compiler over the envelope root with an untyped row, and no result-type constraint. */
@@ -262,7 +263,7 @@ public final class RowExpressions {
         }
         StructType row = StructType.create(ROW_TYPE, ImmutableSet.copyOf(fields.keySet()),
                 name -> Optional.ofNullable(fields.get(name)));
-        return envelope(row);
+        return envelope(row).addFunctionDeclarations(DecimalComparisonFunctions.crossTypeEqualityDeclarations());
     }
 
     /**
