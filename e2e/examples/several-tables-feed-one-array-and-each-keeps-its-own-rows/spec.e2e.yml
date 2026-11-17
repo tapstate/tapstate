@@ -1,0 +1,88 @@
+# One array in a document fed by several tables, and one array fed by one table split into shards.
+#
+# A ledger-style document wants a player's point, comp and award rows as one list of movements, and a
+# player's sessions as one list although the sessions live in one table per shard. A nest embed reads one
+# stream, so the tables are merged before the nest: each table's rows are tagged with where they came from
+# by a map, the tagged streams go through a union (or, for the shards, one map reads them all by pattern
+# and tags each row with its own table name), and the embed's element identity is the tag together with
+# the row's own id.
+#
+# What the assertions have to discriminate:
+#
+# - The ids collide on purpose. Every movement table has a row 1, and session 7 exists in two shards. An
+#   element identity without the tag folds those rows into one element and the document still has a
+#   non-empty array, so the array lengths are read: three movements and three sessions for player 1.
+#
+# - An update and two deletes each land in one table while a row with the same id sits in another. A
+#   change addressed by the id alone reaches the wrong element, or every element sharing that id. Each
+#   element is picked out by its tag and id into a field of its own, so the rows that must not change are
+#   read back by value after every change, not only counted.
+#
+# - Two players, so an implementation that piles every element onto whichever root arrived first is
+#   caught by the second player's arrays.
+#
+# - A row inserted into one of the tables while the pipeline runs reaches the array, so the merge is shown
+#   to keep following its inputs after the snapshot rather than only assembling them once.
+#
+# The order of the elements inside an array is deliberately not asserted: a snapshot read is free to return
+# rows in any order, and what this example is about is which elements exist and what they hold.
+#
+# Runs only where real connector jars are available: naming no -Dtapstate.e2e.connectors-dir skips this
+# example, naming a directory whose jars do not resolve fails it.
+name: several-tables-feed-one-array-and-each-keeps-its-own-rows
+setup:
+  databases:
+    ledger: { kind: mysql }
+    store: { kind: mongo }
+  connectors: [mysql, mongodb]
+  managed_target: views.tap.yml
+  apply: [ledger_db.tap.yml, pipeline.tap.yml]
+  discover: [ledger_db]
+pipeline: pipeline.tap.yml
+seed:
+  ledger_db.ledger_players:
+    values:
+      - { id: 1, name: ada }
+      - { id: 2, name: grace }
+  ledger_db.ledger_points:
+    values:
+      - { id: 1, player_id: 1, note: point-1 }
+      - { id: 2, player_id: 2, note: point-2 }
+  ledger_db.ledger_comps:
+    values:
+      - { id: 1, player_id: 1, note: comp-1 }
+  ledger_db.ledger_awards:
+    values:
+      - { id: 1, player_id: 1, note: award-1 }
+  ledger_db.ledger_session0:
+    values:
+      - { id: 7, player_id: 1, note: shard0-7 }
+      - { id: 8, player_id: 1, note: shard0-8 }
+  ledger_db.ledger_session3:
+    values:
+      - { id: 7, player_id: 1, note: shard3-7 }
+      - { id: 9, player_id: 2, note: shard3-9 }
+steps:
+  - start
+  - await: { count: { views.ledger_state: 2 } }
+  # The control: every row of every table is its own element before anything changes.
+  - await: { doc: { views.ledger_state: { where: { id: 1 }, expect: { name: ada }, size: { item_movement: 3, sessions: 3 } } } }
+  - await: { doc: { views.ledger_state: { where: { id: 2 }, expect: { name: grace }, size: { item_movement: 1, sessions: 1 } } } }
+  - assert: { doc: { views.ledger_state: { where: { id: 1 }, expect: { "point_1[0]": point-1, "comp_1[0]": comp-1, "award_1[0]": award-1, "session0_7[0]": shard0-7, "session3_7[0]": shard3-7 } } } }
+  # An update in one table reaches its own element and not the rows sharing its id in the others.
+  - cdc: { ledger_db.ledger_points: { update: { where: { id: 1 }, set: { note: point-1-changed } } } }
+  - await: { doc: { views.ledger_state: { where: { id: 1 }, expect: { "point_1[0]": point-1-changed } } } }
+  - assert: { doc: { views.ledger_state: { where: { id: 1 }, expect: { "comp_1[0]": comp-1, "award_1[0]": award-1 }, size: { item_movement: 3 } } } }
+  # A delete in one table removes its own element and leaves the rows sharing its id.
+  - cdc: { ledger_db.ledger_comps: { delete: { where: { id: 1 } } } }
+  - await: { doc: { views.ledger_state: { where: { id: 1 }, size: { item_movement: 2, comp_1: 0 } } } }
+  - assert: { doc: { views.ledger_state: { where: { id: 1 }, expect: { "point_1[0]": point-1-changed, "award_1[0]": award-1 } } } }
+  # The same across shards: session 7 leaves shard 3 and stays in shard 0.
+  - cdc: { ledger_db.ledger_session3: { delete: { where: { id: 7 } } } }
+  - await: { doc: { views.ledger_state: { where: { id: 1 }, size: { sessions: 2, session3_7: 0 } } } }
+  - assert: { doc: { views.ledger_state: { where: { id: 1 }, expect: { "session0_7[0]": shard0-7 } } } }
+  # A row arriving while the pipeline runs joins the right player's array.
+  - cdc: { ledger_db.ledger_awards: { insert: { values: [ { id: 2, player_id: 2, note: award-2 } ] } } }
+  - await: { doc: { views.ledger_state: { where: { id: 2 }, size: { item_movement: 2, sessions: 1 } } } }
+  - assert: { doc: { views.ledger_state: { where: { id: 1 }, size: { item_movement: 2, sessions: 2 } } } }
+  - assert: { count: { views.ledger_state: 2 } }

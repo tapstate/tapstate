@@ -122,3 +122,5 @@ many-parents-share-flat-children on IN_PROCESS
 many-parents-share-flat-children on REAL_PROCESS
 nest-rollup-fields-snapshot on IN_PROCESS
 nest-rollup-fields-snapshot on REAL_PROCESS
+several-tables-feed-one-array-and-each-keeps-its-own-rows on IN_PROCESS
+several-tables-feed-one-array-and-each-keeps-its-own-rows on REAL_PROCESS
