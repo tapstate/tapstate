@@ -544,24 +544,23 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Set<String> unchanged = new LinkedHashSet<>();
         Set<String> consumed = new LinkedHashSet<>();
         Set<String> dropped = new LinkedHashSet<>();
+
+        applyRules(rules, upstream, upstreamTypes, out, numbers, strings, unchanged, consumed, dropped);
+        passThrough(upstream, out, numbers, strings, unchanged, consumed, dropped);
+        Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
+
+        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields());
+    }
+
+    private static void applyRules(
+            Map<String, FieldRule> rules, NodeColumns upstream, Map<String, TapstateType> upstreamTypes,
+            Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         rules.forEach((output, rule) -> {
             switch (rule) {
-                case FieldRule.Rename rename -> {
-                    consumed.add(rename.sourceField());
-                    String renamed = upstream.columns().get(rename.sourceField());
-                    if (renamed != null) {
-                        out.put(output, renamed);
-                        if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
-                            unchanged.add(output);
-                        }
-                        if (upstream.stringTypes().containsKey(rename.sourceField())) {
-                            strings.put(output, upstream.stringTypes().get(rename.sourceField()));
-                        }
-                        if (upstream.numericTypes().containsKey(rename.sourceField())) {
-                            numbers.put(output, upstream.numericTypes().get(rename.sourceField()));
-                        }
-                    }
-                }
+                case FieldRule.Rename rename ->
+                        applyRename(rename, output, upstream, out, numbers, strings, unchanged, consumed);
                 case FieldRule.Drop ignored -> dropped.add(output);
                 // A literal is the one column here that is known not to be absent: it is the same
                 // written-down value on every row.
@@ -576,45 +575,80 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                 }
             }
         });
+    }
+
+    private static void applyRename(
+            FieldRule.Rename rename, String output, NodeColumns upstream,
+            Map<String, String> out, Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed) {
+        consumed.add(rename.sourceField());
+        String renamed = upstream.columns().get(rename.sourceField());
+        if (renamed != null) {
+            out.put(output, renamed);
+            if (output.equals(rename.sourceField()) && upstream.unchangedFields().contains(output)) {
+                unchanged.add(output);
+            }
+            copyTypeDescriptors(output, rename.sourceField(), upstream, numbers, strings);
+        }
+    }
+
+    private static void passThrough(
+            NodeColumns upstream, Map<String, String> out,
+            Map<String, NumericType> numbers, Map<String, StringType> strings,
+            Set<String> unchanged, Set<String> consumed, Set<String> dropped) {
         upstream.columns().forEach((name, type) -> {
             if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
                 out.put(name, type);
                 if (upstream.unchangedFields().contains(name)) {
                     unchanged.add(name);
                 }
-                if (upstream.stringTypes().containsKey(name)) {
-                    strings.put(name, upstream.stringTypes().get(name));
-                }
-                if (upstream.numericTypes().containsKey(name)) {
-                    numbers.put(name, upstream.numericTypes().get(name));
-                }
+                copyTypeDescriptors(name, name, upstream, numbers, strings);
             }
         });
+    }
+
+    private static void copyTypeDescriptors(
+            String target, String source, NodeColumns upstream,
+            Map<String, NumericType> numbers, Map<String, StringType> strings) {
+        if (upstream.stringTypes().containsKey(source)) {
+            strings.put(target, upstream.stringTypes().get(source));
+        }
+        if (upstream.numericTypes().containsKey(source)) {
+            numbers.put(target, upstream.numericTypes().get(source));
+        }
+    }
+
+    private static Map<String, String> projectedOrigins(
+            Map<String, FieldRule> rules, NodeColumns upstream, Set<String> outputColumns) {
         Map<String, String> origins = new LinkedHashMap<>();
-        for (String output : out.keySet()) {
-            FieldRule rule = rules.get(output);
-            // A rename with no source emits nothing. The original output-named column can still
-            // pass through, so its identity must follow that actual value rather than the rule.
-            if (rule instanceof FieldRule.Rename rename
-                    && !upstream.columns().containsKey(rename.sourceField())) {
-                rule = null;
-            }
-            String moved = rule instanceof FieldRule.Computed computed
-                    ? RowExpressions.movedColumn(computed.celExpr()) : null;
-            if (moved != null && !upstream.columns().containsKey(moved)) {
-                moved = null;
-            }
-            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField()
-                    : moved != null ? moved : output;
-            if (rule == null || rule instanceof FieldRule.Rename || moved != null) {
-                String origin = upstream.origins().get(source);
-                if (origin != null) {
-                    origins.put(output, origin);
-                }
+        for (String output : outputColumns) {
+            String origin = resolveOrigin(rules.get(output), output, upstream);
+            if (origin != null) {
+                origins.put(output, origin);
             }
         }
-        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields());
+        return origins;
+    }
+
+    private static String resolveOrigin(FieldRule rule, String output, NodeColumns upstream) {
+        // A rename with no source emits nothing. The original output-named column can still
+        // pass through, so its identity must follow that actual value rather than the rule.
+        if (rule instanceof FieldRule.Rename rename) {
+            String source = rename.sourceField();
+            return upstream.columns().containsKey(source)
+                    ? upstream.origins().get(source) : upstream.origins().get(output);
+        }
+        if (rule instanceof FieldRule.Computed computed) {
+            String moved = RowExpressions.movedColumn(computed.celExpr());
+            if (moved != null && upstream.columns().containsKey(moved)) {
+                return upstream.origins().get(moved);
+            }
+            return null;
+        }
+        if (rule == null) {
+            return upstream.origins().get(output);
+        }
+        return null;
     }
 
     /**

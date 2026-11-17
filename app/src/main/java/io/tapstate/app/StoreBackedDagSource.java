@@ -1940,8 +1940,8 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (base.fields().stream().filter(TargetField::primaryKey)
                 .anyMatch(field -> !parentNames.containsKey(field.name()))) {
-            // Element locators distinguish siblings only while the complete parent key survives;
-            // clearing the key leaves an unresolved output identity that preview refuses and sync
+            // Element locators distinguish siblings only while the complete parent key survives,
+            // so clearing the key leaves an unresolved output identity that preview refuses and sync
             // publishes without a declared key.
             key.clear();
         }

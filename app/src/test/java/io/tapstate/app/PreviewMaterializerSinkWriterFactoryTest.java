@@ -123,7 +123,7 @@ class PreviewMaterializerSinkWriterFactoryTest {
         String controlMap = mapName();
         try (SinkWriter writer = factory(controlMap, Map.of("orders", List.of("id", "tenant")), WriteMode.UPSERT).getEx()) {
             assertThat(writer.write(input).toCompletableFuture().join().written()).isEqualTo(2);
-            assertThat(member.getMap(controlMap).size()).isEqualTo(2);
+            assertThat((Map<?, ?>) member.getMap(controlMap)).hasSize(2);
         }
 
         var projection = new io.tapstate.core.model.TransformBody.MapProjection(
@@ -139,11 +139,12 @@ class PreviewMaterializerSinkWriterFactoryTest {
                 .map(io.tapstate.spi.sink.TargetField::name).toList();
         String resultMap = mapName();
         try (SinkWriter writer = factory(resultMap, Map.of("orders", keys), WriteMode.UPSERT).getEx()) {
-            assertThatThrownBy(() -> writer.write(output).toCompletableFuture().join())
+            var writeFuture = writer.write(output).toCompletableFuture();
+            assertThatThrownBy(writeFuture::join)
                     .isInstanceOf(CompletionException.class)
                     .hasCauseInstanceOf(io.tapstate.core.common.TapstateException.class)
                     .hasRootCauseMessage("actuation.preview-refused {reason=the output identity for stream 'orders' is unresolved}");
-            assertThat(member.getMap(resultMap).size()).isZero();
+            assertThat((Map<?, ?>) member.getMap(resultMap)).isEmpty();
         }
     }
 
