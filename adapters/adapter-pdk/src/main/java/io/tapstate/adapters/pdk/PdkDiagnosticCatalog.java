@@ -27,7 +27,7 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
     private static final JsonFactory JSON = JsonFactory.builder()
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(12).build()).build();
-    private static final PdkDiagnosticCatalog UNAVAILABLE = new PdkDiagnosticCatalog(Map.of(), Map.of());
+    private static final PdkDiagnosticCatalog UNAVAILABLE = new PdkDiagnosticCatalog(Map.of(), Map.of(), Set.of());
 
     record Definition(String code, Map<String, String> english, Map<String, String> simplifiedChinese,
                       Map<String, String> traditionalChinese) {
@@ -41,10 +41,13 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
 
     private final Map<String, Definition> byFullCode;
     private final Map<String, Definition> byRawCode;
+    private final Set<String> ambiguousRawCodes;
 
-    private PdkDiagnosticCatalog(Map<String, Definition> byFullCode, Map<String, Definition> byRawCode) {
+    private PdkDiagnosticCatalog(Map<String, Definition> byFullCode, Map<String, Definition> byRawCode,
+            Set<String> ambiguousRawCodes) {
         this.byFullCode = Map.copyOf(byFullCode);
         this.byRawCode = Map.copyOf(byRawCode);
+        this.ambiguousRawCodes = Set.copyOf(ambiguousRawCodes);
     }
 
     static PdkDiagnosticCatalog load(String connectorId, ConnectorRef ref) {
@@ -97,7 +100,7 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
             if (raw.putIfAbsent(original, entry) != null) ambiguous.add(original);
         }
         ambiguous.forEach(raw::remove);
-        return new PdkDiagnosticCatalog(full, raw);
+        return new PdkDiagnosticCatalog(full, raw, ambiguous);
     }
 
     private static Map<String, String> readText(Object value) {
@@ -113,7 +116,7 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
     }
 
     Definition definition(String code) {
-        if (code == null) return null;
+        if (code == null || ambiguousRawCodes.contains(code)) return null;
         Definition exact = byFullCode.get(code);
         Definition raw = byRawCode.get(code);
         if (exact == null) return raw;

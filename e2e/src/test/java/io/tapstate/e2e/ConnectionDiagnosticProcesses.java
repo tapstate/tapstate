@@ -45,8 +45,12 @@ final class ConnectionDiagnosticProcesses {
         var builder = new ProcessBuilder(java, "-jar", mcpJar, "--server", server.toString());
         builder.environment().put("TAPSTATE_TOKEN", control.mintToken("read"));
         builder.redirectError(ProcessBuilder.Redirect.DISCARD);
-        Process mcp = builder.start();
-        try (var in = mcp.outputWriter(StandardCharsets.UTF_8); var out = mcp.inputReader(StandardCharsets.UTF_8)) {
+        verifyMcp(builder.start(), id, expected);
+    }
+
+    private static void verifyMcp(Process mcp, String id, Map<?, ?> expected) throws Exception {
+        var out = mcp.inputReader(StandardCharsets.UTF_8);
+        try (var in = mcp.outputWriter(StandardCharsets.UTF_8)) {
             send(in, Map.of("jsonrpc", "2.0", "id", 1, "method", "initialize", "params",
                     Map.of("protocolVersion", "2025-06-18", "capabilities", Map.of(),
                             "clientInfo", Map.of("name", "connection-witness", "version", "1"))));
@@ -57,10 +61,26 @@ final class ConnectionDiagnosticProcesses {
             var reply = (Map<?, ?>) receive(out).get("result");
             assertThat(reply.get("isError")).isEqualTo(false);
             assertSameDiagnostics(expected, (Map<?, ?>) reply.get("structuredContent"));
+        } catch (Exception | Error failure) {
+            mcp.destroyForcibly();
+            throw failure;
         } finally {
-            if (!mcp.waitFor(5, TimeUnit.SECONDS)) mcp.destroyForcibly();
+            finishMcp(mcp, out);
         }
         assertThat(mcp.exitValue()).isZero();
+    }
+
+    private static void finishMcp(Process mcp, BufferedReader output) throws IOException, InterruptedException {
+        try {
+            if (!mcp.waitFor(5, TimeUnit.SECONDS)) {
+                mcp.destroyForcibly();
+                if (!mcp.waitFor(5, TimeUnit.SECONDS)) throw new IOException("MCP process did not terminate");
+            }
+        } finally {
+            // A pending read can hold the reader lock until the child closes stdout.
+            if (mcp.isAlive()) mcp.destroyForcibly();
+            else output.close();
+        }
     }
 
     private static void assertSameDiagnostics(Map<?, ?> expected, Map<?, ?> report) {

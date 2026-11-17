@@ -50,6 +50,11 @@ final class PdkConnectionDiagnostic {
                 if (failure instanceof TapCodeException coded) arguments(node, coded.getDynamicDescriptionParameters());
             }
             identifyCode(node, failure, catalog, locale);
+            if (failure instanceof TapTestItemException
+                    && DiagnosticCodeSource.CONNECTOR.equals(node.get(DiagnosticCodeSource.FIELD))) {
+                String original = failure.getMessage();
+                if (!java.util.Objects.equals(original, node.get("message"))) put(node, RAW_MESSAGE, original);
+            }
             stack(node, failure, reportedStack);
             addCause(node, failure, seen, 1, catalog, locale);
             return DiagnosticProjection.read(node);

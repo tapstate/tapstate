@@ -49,10 +49,12 @@ class PdkDiagnosticCatalogTest {
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("repeated full code");
 
         var failure = new TapTestItemException();
+        failure.setMessage("Driver refused 127.0.0.1:5432");
         failure.setDynamicDescriptionParameters(new String[]{"alpha", "beta"});
         var document = PdkConnectionDiagnostic.capture(failure, "Fallback", null, "043001", catalog, Locale.ENGLISH);
         assertThat(document).containsEntry("code", "EXAMPLE043001").containsEntry("arguments", List.of("alpha", "beta"))
                 .containsEntry("message", "The operation was refused.\nOrdered alpha then beta.")
+                .containsEntry("rawMessage", "Driver refused 127.0.0.1:5432")
                 .doesNotContainKey("definitionStatus");
     }
 
@@ -136,6 +138,23 @@ class PdkDiagnosticCatalogTest {
         assertThat(catalog.definition("EXT043")).isNull();
         assertThat(catalog.definition("OTHER043").text(Locale.ENGLISH)).containsEntry("message", "Second");
         assertThat(catalog.definition("OUTEREXT043").text(Locale.ENGLISH)).containsEntry("message", "Third");
+    }
+
+    @Test
+    void anAmbiguousRawCodeCannotResolveThroughTheFullCodeIndex() throws Exception {
+        var resource = """
+                {"formatVersion":1,"connectorId":"fixture","definitions":[
+                  {"rawCode":"043","code":"EXT043","en":{"message":"First"}},
+                  {"rawCode":"EXT043","code":"ALTEXT043","en":{"message":"Second"}},
+                  {"rawCode":"EXT043","code":"OTHEREXT043","en":{"message":"Third"}}
+                ]}
+                """.getBytes(StandardCharsets.UTF_8);
+        var catalog = PdkDiagnosticCatalog.read("fixture", resource);
+
+        assertThat(catalog.definition("EXT043")).isNull();
+        assertThat(catalog.resolve("EXT043", Map.of(), List.of(), Locale.ENGLISH)).isEmpty();
+        assertThat(catalog.definition("043").text(Locale.ENGLISH)).containsEntry("message", "First");
+        assertThat(catalog.definition("ALTEXT043").text(Locale.ENGLISH)).containsEntry("message", "Second");
     }
 
     @Test
