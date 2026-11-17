@@ -8,6 +8,7 @@ import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 
@@ -19,7 +20,8 @@ final class PeriodicObservations implements AutoCloseable {
 
     enum Offer { ACCEPTED, COALESCED, REJECTED }
 
-    private static final Logger LOG = LoggerFactory.getLogger(PeriodicObservations.class);
+    private final Logger log;
+    private final String workName;
     private final ThreadPoolExecutor workers;
     private final Map<String, Slot> slots = new HashMap<>();
     private final Object healthReports = new Object();
@@ -59,12 +61,12 @@ final class PeriodicObservations implements AutoCloseable {
         return health();
     }
 
-    private static void reportHealth(Health snapshot) {
+    private void reportHealth(Health snapshot) {
         if (snapshot == null) return;
         if (snapshot.backpressured()) {
-            LOG.warn("Periodic observation backpressure: requests are being coalesced or dropped; {}", snapshot);
+            log.warn("{} backpressure: requests are being coalesced or dropped; {}", workName, snapshot);
         } else {
-            LOG.info("Periodic observation backpressure cleared; {}", snapshot);
+            log.info("{} backpressure cleared; {}", workName, snapshot);
         }
     }
 
@@ -72,12 +74,12 @@ final class PeriodicObservations implements AutoCloseable {
         private Runnable pending;
 
         private Object version;
-        private volatile Object ticket;
+        private final AtomicReference<Object> ticket = new AtomicReference<>();
 
         private void discard() {
             pending = null;
             version = null;
-            ticket = null;
+            ticket.set(null);
         }
     }
 
@@ -86,9 +88,16 @@ final class PeriodicObservations implements AutoCloseable {
     }
 
     PeriodicObservations(int concurrency, int capacity) {
+        this(concurrency, capacity, PeriodicObservations.class, "Periodic observation",
+                "tapstate-periodic-observation-");
+    }
+
+    PeriodicObservations(int concurrency, int capacity, Class<?> loggerType, String workName, String threadPrefix) {
+        this.log = LoggerFactory.getLogger(loggerType);
+        this.workName = workName;
         workers = new ThreadPoolExecutor(concurrency, concurrency, 0, TimeUnit.SECONDS,
                 new ArrayBlockingQueue<>(capacity), Thread.ofPlatform().daemon(true)
-                        .name("tapstate-periodic-observation-", 1).factory());
+                        .name(threadPrefix, 1).factory());
     }
 
     private synchronized Offer offerLocked(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
@@ -100,15 +109,19 @@ final class PeriodicObservations implements AutoCloseable {
         boolean replaced = slot.pending != null;
         if (!version.equals(slot.version)) {
             slot.version = version;
-            slot.ticket = new Object();
+            slot.ticket.set(new Object());
         }
-        Object ticket = slot.ticket;
-        slot.pending = () -> task.accept(() -> !closed && ticket == slot.ticket);
+        Object ticket = slot.ticket.get();
+        slot.pending = () -> task.accept(() -> !closed && ticket == slot.ticket.get());
         if (existing != null) {
             return replaced ? Offer.COALESCED : Offer.ACCEPTED;
         }
         slots.put(pipelineId, slot);
         return enqueue(pipelineId, slot) ? Offer.ACCEPTED : Offer.REJECTED;
+    }
+
+    synchronized Set<String> pipelineIds() {
+        return Set.copyOf(slots.keySet());
     }
 
     synchronized void discard(String pipelineId) {

@@ -359,10 +359,13 @@ final class ConvergenceDriver {
         MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
                 Long.toString(scope.stateGeneration()));
         try {
-            BooleanSupplier current = () -> admitted.getAsBoolean() && reconcileEligible.getAsBoolean()
-                    && scoped.intents().loadForActuation(pipelineId).filter(pass.intent()::equals).isPresent()
-                    && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
-                    && actuation.proveObservationClaim(scope, original) && admitted.getAsBoolean();
+            BooleanSupplier current = () -> {
+                if (!admitted.getAsBoolean()) return false;
+                return reconcileEligible.getAsBoolean()
+                        && scoped.intents().loadForActuation(pipelineId).filter(pass.intent()::equals).isPresent()
+                        && pass.state().read(pipelineId).filter(checkpoint::equals).isPresent()
+                        && actuation.proveObservationClaim(scope, original) && admitted.getAsBoolean();
+            };
             var observation = scoped.stores().pipelineObservations(scope, original, scoped.requireActive());
             publisher.publishRunningScoped(scope, checkpoint, observation, current).ifPresent(published -> {
                 if (unavailableObservations.remove(pipelineId)) {
