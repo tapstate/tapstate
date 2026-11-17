@@ -51,7 +51,7 @@ class NativePipelineDeleteBudgetIT {
         }
     }
 
-    @Test void preparedAndUnpreparedDeletionKeepAConstantPointReadBudget(@TempDir Path directory) throws Exception {
+    @Test void preparedAndUnpreparedFixturesStayWithinTheirRequestThreadCommandBudgets(@TempDir Path directory) throws Exception {
         READINGS.clear();
         try (var storage = PreparedNativeStore.create();
              var server = InProcessServer.startPrepared(storage,
