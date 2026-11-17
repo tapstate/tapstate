@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="740" viewBox="0 0 1500 740" role="img" aria-labelledby="title description">
+<title id="title">Tapstate Operational State Layer architecture</title>
+<desc id="description">Operational systems CRM, Orders, Inventory, and Payments flow through CDC into Tapstate: Capture, Transform, Consolidate, Materialize. Live business state supports Agentic AI and mission-critical applications, with API and MCP interfaces.</desc>
+<defs>
+  <linearGradient id="header" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#0e2b4b"/><stop offset="0.6" stop-color="#08778a"/><stop offset="1" stop-color="#1ecf92"/></linearGradient>
+  <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0"><stop stop-color="#099ac0"/><stop offset="1" stop-color="#23cc82"/></linearGradient>
+  <clipPath id="middle"><rect x="365" y="177" width="770" height="438" rx="23"/></clipPath>
+</defs>
+<rect width="1500" height="740" fill="#ffffff"/>
+<text x="750" y="59" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="42" font-weight="750" text-anchor="middle" fill="#0d2036">Tapstate — Operational State Layer</text>
+<text x="750" y="96" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="23" font-weight="400" text-anchor="middle" fill="#5f6f83">From fragmented database changes to one live view of the business</text>
+<rect x="650" y="117" width="200" height="5" rx="2.5" fill="url(#accent)"/>
+<!-- source systems -->
+<rect x="26" y="177" width="285" height="438" rx="22" fill="#f5f8fc" stroke="#e0e7ef"/>
+<text x="168" y="219" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="26" font-weight="720" text-anchor="middle" fill="#10243c">Operational Systems</text>
+<rect x="54" y="250" width="228" height="65" rx="12" fill="#ffffff" stroke="#dfe7f0"/><ellipse cx="94" cy="271" rx="19" ry="8" fill="none" stroke="#067f89" stroke-width="3"/><path d="M75 271v25c0 11 38 11 38 0v-25M75 284c0 11 38 11 38 0" fill="none" stroke="#067f89" stroke-width="3"/><text x="138" y="290" font-size="23" font-weight="600" fill="#10243c" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">CRM</text>
+<rect x="54" y="327" width="228" height="65" rx="12" fill="#ffffff" stroke="#dfe7f0"/><ellipse cx="94" cy="348" rx="19" ry="8" fill="none" stroke="#067f89" stroke-width="3"/><path d="M75 348v25c0 11 38 11 38 0v-25M75 361c0 11 38 11 38 0" fill="none" stroke="#067f89" stroke-width="3"/><text x="138" y="367" font-size="23" font-weight="600" fill="#10243c" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">Orders</text>
+<rect x="54" y="404" width="228" height="65" rx="12" fill="#ffffff" stroke="#dfe7f0"/><ellipse cx="94" cy="425" rx="19" ry="8" fill="none" stroke="#067f89" stroke-width="3"/><path d="M75 425v25c0 11 38 11 38 0v-25M75 438c0 11 38 11 38 0" fill="none" stroke="#067f89" stroke-width="3"/><text x="138" y="444" font-size="23" font-weight="600" fill="#10243c" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">Inventory</text>
+<rect x="54" y="481" width="228" height="65" rx="12" fill="#ffffff" stroke="#dfe7f0"/><ellipse cx="94" cy="502" rx="19" ry="8" fill="none" stroke="#067f89" stroke-width="3"/><path d="M75 502v25c0 11 38 11 38 0v-25M75 515c0 11 38 11 38 0" fill="none" stroke="#067f89" stroke-width="3"/><text x="138" y="521" font-size="23" font-weight="600" fill="#10243c" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif">Payments</text>
+<text x="168" y="586" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="27" font-weight="500" text-anchor="middle" fill="#5f6f83">· · ·</text>
+<!-- data flow -->
+<path d="M311 410 H365" stroke="#0d9aa0" stroke-width="4" fill="none" stroke-linecap="round"/>
+<rect x="312" y="384" width="58" height="33" rx="16" fill="#e4f8f3" stroke="#8adfc1"/>
+<text x="341" y="407" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="17" font-weight="700" text-anchor="middle" fill="#087e80">CDC</text>
+<path d="m356 400 10 10-10 10" fill="none" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<!-- Tapstate operational state engine -->
+<rect x="365" y="177" width="770" height="438" rx="23" fill="#ffffff" stroke="#12a995" stroke-width="2"/>
+<g clip-path="url(#middle)">
+  <rect x="366" y="178" width="768" height="145" fill="url(#header)"/>
+  <path d="M815 310 Q1010 300 1135 220 V323 H815Z" fill="#52dec0" opacity=".16"/>
+  <rect x="367" y="319" width="766" height="294" fill="#ffffff"/>
+</g>
+<g fill="none" stroke="#ffffff" stroke-width="4" stroke-linejoin="round">
+  <path d="m571 232 28-12 28 12-28 12z"/>
+  <path d="m571 244 28 12 28-12"/>
+  <path d="m571 256 28 12 28-12"/>
+</g>
+<text x="647" y="247" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="45" font-weight="750" text-anchor="start" fill="#ffffff">Tapstate</text>
+<text x="750" y="286" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="23" font-weight="500" text-anchor="middle" fill="#e1f5f6">Operational State Layer</text>
+<rect x="393" y="346" width="159" height="174" rx="18" fill="#eff7fb" stroke="#d7e9f4"/><g fill="none" stroke="#078c99" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="472" cy="396" rx="19" ry="8"/><path d="M453 396v24c0 12 38 12 38 0v-24M453 407c0 12 38 12 38 0"/></g><text x="472.5" y="469" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#10243c">Capture</text><text x="472.5" y="493" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="14" font-weight="400" text-anchor="middle" fill="#52667d">CDC</text>
+<rect x="576" y="346" width="159" height="174" rx="18" fill="#eff7fb" stroke="#d7e9f4"/><g fill="none" stroke="#078c99" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="655" cy="387" r="9"/><circle cx="635" cy="422" r="9"/><circle cx="675" cy="422" r="9"/><path d="M651 396l-13 17M659 396l13 17"/></g><text x="655.5" y="469" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#10243c">Transform</text><text x="655.5" y="493" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="14" font-weight="400" text-anchor="middle" fill="#52667d">Incremental</text>
+<rect x="759" y="346" width="159" height="174" rx="18" fill="#eff7fb" stroke="#d7e9f4"/><g fill="none" stroke="#078c99" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="m824 382 25-11 25 11-25 11-25-11zm0 14 25 11 25-11m-50 14 25 11 25-11"/></g><text x="838.5" y="469" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#10243c">Consolidate</text><text x="838.5" y="493" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="14" font-weight="400" text-anchor="middle" fill="#52667d">Current entities</text>
+<rect x="942" y="346" width="159" height="174" rx="18" fill="#e9f8ee" stroke="#bde9d5"/><g fill="none" stroke="#08a76b" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><path d="m1015 370-21 35h17l-5 30 26-40h-19z"/></g><text x="1021.5" y="469" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="700" text-anchor="middle" fill="#10243c">Materialize</text><text x="1021.5" y="493" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="14" font-weight="400" text-anchor="middle" fill="#52667d">Live state</text>
+<path d="M551 428H571" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round"/><path d="m561 418 10 10-10 10" stroke="#0d9aa0" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M734 428H754" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round"/><path d="m744 418 10 10-10 10" stroke="#0d9aa0" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<path d="M917 428H937" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round"/><path d="m927 418 10 10-10 10" stroke="#0d9aa0" stroke-width="4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="539" y="551" width="422" height="43" rx="21.5" fill="#e6f8f1"/>
+<text x="750" y="580" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="22" font-weight="650" text-anchor="middle" fill="#087a78">Continuously updated business state</text>
+<!-- Consumer outputs -->
+<path d="M1135 410H1210" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round"/>
+<path d="m1200 400 10 10-10 10" fill="none" stroke="#0d9aa0" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+<rect x="1210" y="177" width="264" height="438" rx="22" fill="#f5f8fc" stroke="#e0e7ef"/>
+<text x="1342" y="219" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="26" font-weight="720" text-anchor="middle" fill="#10243c">Consumers</text>
+<rect x="1228" y="258" width="228" height="98" rx="14" fill="#ffffff" stroke="#dfe7f0"/>
+<g stroke="#088d94" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"><rect x="1250" y="285" width="44" height="41" rx="10"/><circle cx="1263" cy="303" r="2" fill="#088d94"/><circle cx="1281" cy="303" r="2" fill="#088d94"/><path d="M1272 285v-8m-8 38h16"/></g>
+<text x="1311" y="310" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="700" text-anchor="start" fill="#10243c">Agentic AI</text>
+<rect x="1228" y="385" width="228" height="101" rx="14" fill="#ffffff" stroke="#dfe7f0"/>
+<g stroke="#088d94" stroke-width="3" fill="none"><rect x="1248" y="415" width="42" height="38" rx="5"/><path d="M1248 428h42M1258 420h4M1266 420h4"/></g>
+<text x="1305" y="427" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="700" text-anchor="start" fill="#10243c">Mission-critical</text>
+<text x="1305" y="452" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="700" text-anchor="start" fill="#10243c">applications</text>
+<path d="M1234 519H1450" stroke="#d5dfe8" stroke-width="2"/>
+<text x="1342" y="565" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="20" font-weight="500" text-anchor="middle" fill="#64768b">API  ·  MCP  ·  …</text>
+<!-- benefits -->
+<path d="M486 663v49M991 663v49" stroke="#e6ecf2" stroke-width="2"/>
+<g stroke="#0eaa9c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"><path d="m72 666-17 26h14l-5 24 25-33H75z"/></g>
+<text x="106" y="687" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="24" font-weight="700" text-anchor="start" fill="#10243c">Real-time</text>
+<text x="106" y="715" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#65778c">Current business facts</text>
+<g fill="none" stroke="#0eaa9c" stroke-width="3" stroke-linejoin="round"><path d="m548 679 24-10 24 10-24 10zM548 690l24 10 24-10M548 701l24 10 24-10"/></g>
+<text x="618" y="687" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="24" font-weight="700" text-anchor="start" fill="#10243c">Unified</text>
+<text x="618" y="715" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#65778c">One operational state path</text>
+<g fill="none" stroke="#0eaa9c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="m1056 672-15 15 15 15m35-30 15 15-15 15m-9-37-15 45"/></g>
+<text x="1130" y="687" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="24" font-weight="700" text-anchor="start" fill="#10243c">Open Source</text>
+<text x="1130" y="715" font-family="Inter,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="18" font-weight="400" text-anchor="start" fill="#65778c">Extend and contribute</text>
+</svg>
