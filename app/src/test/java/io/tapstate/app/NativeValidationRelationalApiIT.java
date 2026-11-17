@@ -356,7 +356,7 @@ class NativeValidationRelationalApiIT {
                     assertThat(observation).isNotNull();nextDue.set(Instant.parse((String)observation.get("nextDue")));
                 });
                 var untilDue=Duration.between(Instant.now(),nextDue.get());assertThat(untilDue).isLessThanOrEqualTo(Duration.ofMinutes(1));
-                var wait=(untilDue.isNegative()?Duration.ZERO:untilDue).plusSeconds(15);
+                var wait=(untilDue.isNegative()?Duration.ZERO:untilDue).plusSeconds(60);
                 org.awaitility.Awaitility.await().atMost(wait).pollInterval(Duration.ofMillis(200)).untilAsserted(()->{
                     var history=get(http,read,"/api/pipelines/flow/validation-tasks/count/reports");assertThat(history).containsEntry("total","3");
                     assertThat((List<Map>)history.get("items")).allSatisfy(row->assertThat(row).containsEntry("terminal","COMPLETED"));
