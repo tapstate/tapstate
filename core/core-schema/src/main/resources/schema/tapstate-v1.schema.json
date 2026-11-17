@@ -1379,16 +1379,31 @@
           "const": "map"
         },
         "fields": {
-          "description": "Output fields keyed by name, each mapped by a field rule; declared order is the output order.",
+          "description": "Output fields keyed by name, each mapped by a field rule; declared order is the output order. Required unless soft_delete is set.",
           "type": "object",
           "additionalProperties": {
             "$ref": "#/$defs/FieldRule"
           }
+        },
+        "soft_delete": {
+          "description": "Name of a boolean column marking deleted rows. A delete becomes an update of the last row image with this column set to true, and every other row carries it as false. Absent leaves deletes as deletes.",
+          "type": "string"
         }
       },
       "required": [
-        "type",
-        "fields"
+        "type"
+      ],
+      "anyOf": [
+        {
+          "required": [
+            "fields"
+          ]
+        },
+        {
+          "required": [
+            "soft_delete"
+          ]
+        }
       ]
     },
     "TransformBody.Nest": {

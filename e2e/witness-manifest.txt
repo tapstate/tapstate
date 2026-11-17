@@ -26,6 +26,8 @@ a-declared-view-materializes-with-no-serve-block on IN_PROCESS
 a-declared-view-materializes-with-no-serve-block on REAL_PROCESS
 a-deleted-customer-takes-its-orders-out-of-the-target on IN_PROCESS
 a-deleted-customer-takes-its-orders-out-of-the-target on REAL_PROCESS
+a-deleted-row-stays-in-the-document-marked-deleted on IN_PROCESS
+a-deleted-row-stays-in-the-document-marked-deleted on REAL_PROCESS
 a-dimension-change-reaches-the-orders-already-written on IN_PROCESS
 a-dimension-change-reaches-the-orders-already-written on REAL_PROCESS
 a-join-naming-a-column-its-table-lacks-fails-with-a-code on IN_PROCESS

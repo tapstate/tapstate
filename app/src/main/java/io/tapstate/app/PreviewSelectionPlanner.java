@@ -287,7 +287,7 @@ final class PreviewSelectionPlanner {
         private Lineage mapLineage(Lineage upstream, TransformBody.MapProjection projection) {
             Map<String, String> fields = new LinkedHashMap<>(upstream.physicalByLogical());
             Set<String> consumed = new HashSet<>();
-            projection.fields().forEach((output, rule) -> {
+            projection.outputFields().forEach((output, rule) -> {
                 switch (rule) {
                     case FieldRule.Rename rename -> {
                         String physical = upstream.physicalByLogical().get(rename.sourceField());

@@ -1414,7 +1414,7 @@ final class StoreBackedDagSource implements DagSource {
             if (!(inline.body() instanceof TransformBody.Nest nest)) {
                 continue;
             }
-            NestTable root = byAlias.get(nest.root().from());
+            NestTable root = assembledRootTable(pipeline, nest, byAlias, sourceVertices);
             if (root == null) {
                 continue;
             }
@@ -4387,7 +4387,7 @@ final class StoreBackedDagSource implements DagSource {
             Step step = stepOf(pipeline, stream);
             String table = null;
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
-                NestTable root = roots.get(nest.root().from());
+                NestTable root = assembledRootTable(pipeline, nest, roots, vertices);
                 if (root != null) table = root.name();
             } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
                 // A join's compiled fact name retains qualification when physical source names repeat.
@@ -4405,6 +4405,54 @@ final class StoreBackedDagSource implements DagSource {
             }
         }
         return names;
+    }
+
+    /**
+     * The table a nest's documents are written as: the root alias's own table, or - where the alias
+     * names a step - the table that step reads, followed through steps that keep each row as one row
+     * under the same key. A map or a filter over a single input is such a step: a map that adds a
+     * column, or turns deletes into marked updates, still writes the root table's rows. Without this
+     * the alias resolves to the step's name with no key, and the target is then created under that
+     * name and appended to on every change instead of upserted by the root key.
+     *
+     * <p>Anything else - a script, a union, an unwind, a nest - stops the walk where it is, since what
+     * such a step emits is not the table it reads one row for one row.
+     */
+    private NestTable assembledRootTable(PipelineResource pipeline, TransformBody.Nest nest,
+            Map<String, NestTable> byAlias, Map<String, SourceVertex> sourceVertices) {
+        NestTable alias = byAlias.get(nest.root().from());
+        if (alias == null || !alias.primaryKey().isEmpty()) {
+            return alias;
+        }
+        FromRef ref = null;
+        for (Step step : pipeline.transforms()) {
+            if (step instanceof Step.Inline inline && inline.body() == nest
+                    && inline.from() instanceof FromClause.Aliases aliases) {
+                ref = aliases.aliases().get(nest.root().from());
+            }
+        }
+        FromRef table = rowPreservingSource(pipeline, ref);
+        if (table instanceof FromRef.Literal literal && sourceVertices.containsKey(literal.ref())) {
+            // A source selecting one table is read by its id; the table it selects is what the walk ends at.
+            table = FromRef.literal(sourceVertices.get(literal.ref()).table());
+        }
+        return table == null || table.equals(ref) ? alias : nestTable(table, sourceTablesByName(sourceVertices));
+    }
+
+    /** {@code ref} followed back through single-input maps and filters; null where it is not a literal. */
+    private static FromRef rowPreservingSource(PipelineResource pipeline, FromRef ref) {
+        Set<String> seen = new HashSet<>();
+        while (ref instanceof FromRef.Literal literal && seen.add(literal.ref())) {
+            Step step = stepOf(pipeline, literal.ref());
+            if (!(step instanceof Step.Inline inline)
+                    || !(inline.body() instanceof TransformBody.MapProjection
+                            || inline.body() instanceof TransformBody.Filter)
+                    || !(inline.from() instanceof FromClause.Flow flow) || flow.refs().size() != 1) {
+                break;
+            }
+            ref = flow.refs().get(0);
+        }
+        return ref instanceof FromRef.Literal ? ref : null;
     }
 
     /** The source reference that determines an assembly's physical output name and source ownership. */

@@ -1,10 +1,12 @@
 package io.tapstate.adapters.transform;
 
 import io.tapstate.core.event.Envelope;
+import io.tapstate.core.event.Op;
 import io.tapstate.spi.transform.TransformPort;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -55,8 +57,13 @@ final class MapPort implements TransformPort {
         if (event.before() == null && event.after() == null) {
             return List.of(event);
         }
+        String marker = spec.softDelete();
+        if (marker != null && event.op() == Op.DELETE) {
+            return List.of(softDeleted(event, marker));
+        }
         return List.of(new Envelope(event.op(), event.ts(), event.src(),
-                project(event, event.before()), project(event, event.after()), event.schema())
+                marked(project(event, event.before()), marker, false),
+                marked(project(event, event.after()), marker, false), event.schema())
                 // Carried through, not added to. What travels beside a row is the set of fields an
                 // earlier step said the row no longer has, and it is the only way a target ever hears
                 // that one went - so a projection that rebuilds the row and forgets it silently
@@ -64,7 +71,52 @@ final class MapPort implements TransformPort {
                 // arrives still correct. Dropping a field here is a different thing and deliberately
                 // adds nothing: it means the field is not carried onward, never that a target should
                 // delete what it already holds. Rebuilding two rows is two chances to lose it.
-                .withRemoved(event.removed()));
+                .withRemoved(carriedRemovals(event, marker)));
+    }
+
+    /**
+     * A delete turned into an update of the row it removed. Both sides are that row through the rules,
+     * so the update changes nothing but the marker: before it the row read as live, after it as
+     * deleted. Keeping the before side is what lets a downstream step that compares the two - a nest
+     * deciding whether an element moved, a filter deciding whether a row left - see one column change
+     * and nothing else. The rules read the removed row exactly as they would have read it live.
+     *
+     * <p>The update holds only what the delete carried. A source that sends a whole earlier row gives
+     * a whole row marked deleted; one that sends only the identifying columns gives just those and the
+     * marker, which a target applying the update field by field keeps beside what it already holds.
+     */
+    private Envelope softDeleted(Envelope event, String marker) {
+        Envelope reading = new Envelope(Op.UPDATE, event.ts(), event.src(), event.before(), event.before(),
+                event.schema());
+        Map<String, Object> was = project(reading, event.before());
+        return new Envelope(Op.UPDATE, event.ts(), event.src(),
+                marked(was, marker, false), marked(was, marker, true), event.schema())
+                .withRemoved(carriedRemovals(event, marker));
+    }
+
+    /**
+     * The removals an earlier step declared, less the marker column: this step writes the marker on
+     * every row it emits, so a removal of a column of that name upstream no longer applies to it, and
+     * a target applying removals after the row would otherwise strip the marker it was just given.
+     */
+    private static Set<String> carriedRemovals(Envelope event, String marker) {
+        if (marker == null || !event.removed().contains(marker)) {
+            return event.removed();
+        }
+        Set<String> kept = new LinkedHashSet<>(event.removed());
+        kept.remove(marker);
+        return kept;
+    }
+
+    /** The row with the marker column set last, or the row itself where there is no marker or no row. */
+    private static Map<String, Object> marked(Map<String, Object> row, String marker, boolean deleted) {
+        if (row == null || marker == null) {
+            return row;
+        }
+        Map<String, Object> out = new LinkedHashMap<>(row);
+        out.remove(marker);
+        out.put(marker, deleted);
+        return out;
     }
 
     /**

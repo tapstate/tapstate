@@ -217,7 +217,9 @@ class StructuralKeyDerivationTest {
             PushElement.class, QueryElement.class, Storage.Hot.class, Storage.Warm.class,
             NestRoot.class, NestStateStorage.class, Embed.class, ViewResource.class, ServeResource.class,
             ViewBlock.Inline.class,
-            TransformResource.class, TransformBody.Js.class, TransformBody.MapProjection.class,
+            // Not MapProjection: its fields are required unless soft_delete is given, a one-of no
+            // per-component flag can state, so the parser checks it and DslMapSoftDeleteParseTest pins it.
+            TransformResource.class, TransformBody.Js.class,
             TransformBody.Filter.class, TransformBody.Unwind.class, TransformBody.Nest.class,
             TransformBody.Join.class);
 
