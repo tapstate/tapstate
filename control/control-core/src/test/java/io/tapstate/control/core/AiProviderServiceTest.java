@@ -12,6 +12,22 @@ import java.util.*;
 import static org.assertj.core.api.Assertions.*;
 
 class AiProviderServiceTest {
+    @Test void modelDiscoveryValidationDoesNotClaimAModelIsRequired() {
+        AiProviderSettingsStore store = new AiProviderSettingsStore() {
+            public Optional<Settings> get(String owner) { return Optional.empty(); }
+            public void put(String owner, Settings settings) { }
+            public void delete(String owner) { }
+        };
+        AuditStore audit = new AuditStore() {
+            public void record(AuditRecord record) { }
+            public List<AuditRecord> query(Instant since, int limit) { return List.of(); }
+        };
+        var service = new AiProviderService(store, new AuditGate(audit, Clock.systemUTC()));
+        assertThatThrownBy(() -> service.resolveModels("owner", new AiProviderSettings(
+                "unsupported", "https://example.com/v1", null, "test-key")))
+                .isInstanceOfSatisfying(TapstateException.class, failure ->
+                        assertThat(failure.args().toString()).doesNotContain("model"));
+    }
     @Test void acceptsArbitraryOpenAiCompatibleHttpsEndpoints() {
         for (String endpoint : List.of(
                 "https://api.super-nb.me",

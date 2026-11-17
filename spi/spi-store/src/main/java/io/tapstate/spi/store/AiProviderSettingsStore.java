@@ -4,6 +4,9 @@ import java.util.Optional;
 
 /** Owner-scoped provider credentials; implementations encrypt secrets before durable writes. */
 public interface AiProviderSettingsStore {
+    static boolean supportsProvider(String provider) {
+        return "openai-compatible".equals(provider) || "openai-responses".equals(provider);
+    }
     Optional<Settings> get(String owner);
     void put(String owner, Settings settings);
     void delete(String owner);
