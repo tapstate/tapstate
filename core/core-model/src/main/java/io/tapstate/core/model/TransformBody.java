@@ -33,15 +33,50 @@ public sealed interface TransformBody {
         }
     }
 
-    /** {@code type: map} — field projection; declared order is semantic (output order). */
+    /**
+     * {@code type: map} — field projection; declared order is semantic (output order).
+     *
+     * <p>{@code soft_delete} names a boolean column the step adds to every row. A delete leaving the
+     * step is turned into an update of the row as it last was, with that column set to true; every
+     * other row carries it as false, so a row that is deleted and then inserted again reads as live.
+     * The rules still run on the deleted row, so the update carries the same projected shape as the
+     * rows before it. With {@code soft_delete} set, {@code fields} may be left out.
+     */
     @YamlType("map")
     @Doc("Field projection transform; the declared field order is the output order.")
     record MapProjection(
-            @Doc(value = "Output fields keyed by name, each mapped by a field rule; declared order is the output order.", required = true)
-            Map<String, FieldRule> fields) implements TransformBody {
+            @Doc(value = "Output fields keyed by name, each mapped by a field rule; declared order is the "
+                    + "output order. Required unless soft_delete is set.")
+            Map<String, FieldRule> fields,
+            @Doc(value = "Name of a boolean column marking deleted rows. A delete becomes an update of "
+                    + "the last row image with this column set to true, and every other row carries it "
+                    + "as false. Absent leaves deletes as deletes.",
+                    key = "soft_delete")
+            String softDelete) implements TransformBody {
         public MapProjection {
-            Objects.requireNonNull(fields, "fields");
-            fields = Collections.unmodifiableMap(new LinkedHashMap<>(fields));
+            fields = fields == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(fields));
+            if (softDelete != null && fields.containsKey(softDelete)) {
+                throw new IllegalArgumentException("the soft-delete column is also a declared field: " + softDelete);
+            }
+        }
+
+        /** A projection that leaves deletes as deletes. */
+        public MapProjection(Map<String, FieldRule> fields) {
+            this(Objects.requireNonNull(fields, "fields"), null);
+        }
+
+        /**
+         * The rules that decide the output columns: the declared ones, then the soft-delete column as a
+         * constant false, which is its value on every row but a delete. Schema and type derivation read
+         * this rather than {@link #fields()}, so the added column is known before the step runs.
+         */
+        public Map<String, FieldRule> outputFields() {
+            if (softDelete == null) {
+                return fields;
+            }
+            Map<String, FieldRule> out = new LinkedHashMap<>(fields);
+            out.put(softDelete, FieldRule.literal(Boolean.FALSE));
+            return Collections.unmodifiableMap(out);
         }
 
         @Override

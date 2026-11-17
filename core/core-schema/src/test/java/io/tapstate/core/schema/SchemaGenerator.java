@@ -3,6 +3,7 @@ package io.tapstate.core.schema;
 import io.tapstate.core.model.Doc;
 import io.tapstate.core.model.Embed;
 import io.tapstate.core.model.Resource;
+import io.tapstate.core.model.TransformBody;
 import io.tapstate.core.model.YamlFlatten;
 import io.tapstate.core.model.YamlForm;
 import io.tapstate.core.model.YamlScalarOrList;
@@ -194,6 +195,9 @@ final class SchemaGenerator {
         if (record == Embed.class) {
             entries.add(new Json.Entry("allOf", new Json.Arr(List.of(flatEmbedShape()))));
         }
+        if (record == TransformBody.MapProjection.class) {
+            entries.add(new Json.Entry("anyOf", mapPayloadShape()));
+        }
         if (flattened != null) {
             // The discriminated union's variant fields merge into this object: allOf brings them
             // in, and unevaluatedProperties (not additionalProperties) closes the merged whole —
@@ -246,6 +250,17 @@ final class SchemaGenerator {
 
     private static Json not(Json schema) {
         return new Json.Obj(List.of(new Json.Entry("not", schema)));
+    }
+
+    /**
+     * A map needs something to do: its fields, its soft-delete column, or both. Neither is required on
+     * its own, so the record carries no required payload key and the either-or is stated here.
+     */
+    private static Json mapPayloadShape() {
+        return new Json.Arr(List.of(
+                new Json.Obj(List.of(new Json.Entry("required", new Json.Arr(List.of(new Json.Str("fields")))))),
+                new Json.Obj(List.of(new Json.Entry("required",
+                        new Json.Arr(List.of(new Json.Str("soft_delete"))))))));
     }
 
     private static RecordComponent flattenedComponent(Class<?> record) {

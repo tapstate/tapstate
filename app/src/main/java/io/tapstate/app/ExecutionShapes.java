@@ -157,7 +157,7 @@ final class ExecutionShapes {
             }
             Map<String, List<String>> input = inputOf(inline.from(), graph, emitted);
             emitted.put(step.id(), switch (body) {
-                case TransformBody.MapProjection map -> projected(input, map.fields());
+                case TransformBody.MapProjection map -> projected(input, map.outputFields());
                 case TransformBody.Unwind ignored -> withoutKeys(input);
                 default -> input;
             });

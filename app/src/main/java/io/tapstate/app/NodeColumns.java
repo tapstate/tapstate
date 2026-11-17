@@ -211,7 +211,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
             case TransformBody.Js ignored ->
                     unknown("js: a script settles its own columns while it runs, not before");
             case TransformBody.MapProjection projection ->
-                    project(projection.fields(), merged(inputs.values()));
+                    project(projection.outputFields(), merged(inputs.values()));
             // A predicate decides which rows travel on, never which columns they carry. Handing what
             // reached it back unchanged is the whole of it - including when that answer is an unknown,
             // which then keeps naming the step that actually went dark.
