@@ -27,7 +27,16 @@ record PipelineExplanationResponse(
         Pending pending,
         ExecutionPlanResponse plan,
         List<String> awaitingRebalance,
-        List<Rollup> rollups) {
+        List<Rollup> rollups,
+        List<Aggregate> aggregates) {
+
+    /**
+     * What one aggregate step keeps in state; absent when the pipeline has none. The estimate and the
+     * count are each absent when not known, never zero.
+     */
+    record Aggregate(String step, int entriesPerRow, List<String> keptInputFields, Long inputRows,
+            Long estimatedEntries, Long storedEntries) {
+    }
 
     /** One rollup field the pipeline declares, as written; absent when it declares none. */
     record Rollup(String step, String level, String embed, String field, String function, String argument,
@@ -67,6 +76,11 @@ record PipelineExplanationResponse(
                 explanation.rollups().isEmpty() ? null : explanation.rollups().stream()
                         .map(r -> new Rollup(r.step(), r.level(), r.embed(), r.field(), r.function(), r.argument(),
                                 r.filter(), r.references().isEmpty() ? null : r.references()))
+                        .toList(),
+                explanation.aggregates().isEmpty() ? null : explanation.aggregates().stream()
+                        .map(a -> new Aggregate(a.step(), a.entriesPerRow(),
+                                a.keptInputFields().isEmpty() ? null : a.keptInputFields(), a.inputRows(),
+                                a.estimatedEntries(), a.storedEntries()))
                         .toList());
     }
 

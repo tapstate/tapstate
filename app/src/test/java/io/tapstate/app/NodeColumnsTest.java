@@ -438,14 +438,55 @@ class NodeColumnsTest {
     }
 
     @Test
-    @DisplayName("a ninth kind of node cannot land without an arm here")
-    void aNinthKindOfNodeCannotLandWithoutAnArmHere() {
+    @DisplayName("a grouped step produces the group names as its key, then its fields, and none of its input")
+    void aGroupedStepProducesGroupsThenFields() {
+        Map<String, String> orders = new LinkedHashMap<>();
+        orders.put("id", JoinSchemaDrift.declaredType(TapstateType.INT64, false));
+        orders.put("region", JoinSchemaDrift.declaredType(TapstateType.STRING, true));
+        orders.put("qty", JoinSchemaDrift.declaredType(TapstateType.INT64, true));
+        Map<String, String> groupBy = new LinkedHashMap<>();
+        groupBy.put("region", "$region");
+        Map<String, io.tapstate.core.model.RollupField> fields = new LinkedHashMap<>();
+        fields.put("orders", io.tapstate.core.model.RollupField.of(
+                io.tapstate.core.model.RollupFunction.COUNT, Boolean.TRUE, null, null, null));
+        fields.put("units", io.tapstate.core.model.RollupField.of(
+                io.tapstate.core.model.RollupFunction.SUM, "$qty", null, null, null));
+        TransformBody.Aggregate step = new TransformBody.Aggregate(List.of("id"), null, groupBy, fields);
+
+        NodeColumns out = NodeColumns.of("by_region", step, Map.of("orders", NodeColumns.known(orders)), null);
+
+        assertThat(out.known()).isTrue();
+        assertThat(out.key()).containsExactly("region");
+        assertThat(out.columns()).containsExactly(
+                Map.entry("region", JoinSchemaDrift.declaredType(TapstateType.STRING, true)),
+                // A count is never absent; a sum over rows that all carry null is.
+                Map.entry("orders", JoinSchemaDrift.declaredType(TapstateType.INT64, false)),
+                Map.entry("units", JoinSchemaDrift.declaredType(TapstateType.INT64, true)));
+    }
+
+    @Test
+    @DisplayName("a grouped step over an input nobody can describe hands that answer on")
+    void aGroupedStepOverAnUnknownInputStaysUnknown() {
+        Map<String, io.tapstate.core.model.RollupField> fields = Map.of("orders",
+                io.tapstate.core.model.RollupField.of(
+                        io.tapstate.core.model.RollupFunction.COUNT, Boolean.TRUE, null, null, null));
+        TransformBody.Aggregate step = new TransformBody.Aggregate(null, null, null, fields);
+
+        NodeColumns out = NodeColumns.of(step, Map.of("up", NodeColumns.unknown("js: dark")), null);
+
+        assertThat(out.known()).isFalse();
+        assertThat(out.unknownBecause()).isEqualTo("js: dark");
+    }
+
+    @Test
+    @DisplayName("a tenth kind of node cannot land without an arm here")
+    void aTenthKindOfNodeCannotLandWithoutAnArmHere() {
         // The compiler is what actually enforces this - every switch over these faces is exhaustive and
         // carries no catch-all, so a new variant stops the build until somebody answers for it. This
         // case covers the one way that guarantee is lost without the build ever going red: a catch-all
         // added to make the error go away. The counts are the arms; a variant absorbed by a catch-all
         // moves the count and not the arms.
-        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(7);
+        assertThat(TransformBody.class.getPermittedSubclasses()).hasSize(8);
         assertThat(PushFormat.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ViewBlock.class.getPermittedSubclasses()).hasSize(2);
         assertThat(ServeBlock.class.getPermittedSubclasses()).hasSize(2);
