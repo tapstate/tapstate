@@ -4,6 +4,7 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.NullValue;
 import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
+import dev.cel.runtime.CelFunctionBinding;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
 import io.tapstate.core.dsl.RowExpressions;
@@ -11,9 +12,12 @@ import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.function.IntPredicate;
 import java.util.function.UnaryOperator;
 
 /**
@@ -31,9 +35,53 @@ import java.util.function.UnaryOperator;
  */
 final class RowExpressionProgram {
 
-    // A standard runtime with no custom function bindings. It is immutable and shared: building the
-    // per-expression program is the only per-instance cost.
-    private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder().build();
+    // A standard runtime plus the same-type temporal orderings the compiler declares. It is immutable and
+    // shared: building the per-expression program is the only per-instance cost.
+    private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder()
+            .addFunctionBindings(sameTypeOrderings())
+            .build();
+
+    /**
+     * One runtime binding per ordering operator, serving every temporal type the compiler declares it
+     * for. The compiler admits these only where both operands carry the same temporal column type, so at
+     * runtime both are that column's own values and are ordered by the ordering those values carry. The
+     * runtime program is built from the untyped expression, where every declared overload of an operator
+     * is a candidate; binding one per operator keeps the dispatch unambiguous, and the type judgement has
+     * already been made where the columns' types are known. A pair with no order in common - two different
+     * classes, or a class with no natural order - fails the evaluation rather than being guessed at.
+     */
+    private static List<CelFunctionBinding> sameTypeOrderings() {
+        List<CelFunctionBinding> bindings = new ArrayList<>();
+        Set<String> bound = new HashSet<>();
+        for (RowExpressions.SameTypeComparison comparison : RowExpressions.sameTypeComparisonOverloads()) {
+            if (!bound.add(comparison.function())) {
+                continue;
+            }
+            IntPredicate holds = switch (comparison.function()) {
+                case "_<_" -> order -> order < 0;
+                case "_<=_" -> order -> order <= 0;
+                case "_>_" -> order -> order > 0;
+                case "_>=_" -> order -> order >= 0;
+                default -> throw new IllegalStateException("no ordering for " + comparison.function());
+            };
+            bindings.add(CelFunctionBinding.from(comparison.overloadId(), Object.class, Object.class,
+                    (left, right) -> holds.test(order(left, right))));
+        }
+        return List.copyOf(bindings);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static int order(Object left, Object right) throws CelEvaluationException {
+        if (left instanceof Comparable comparable && right != null && left.getClass() == right.getClass()) {
+            return comparable.compareTo(right);
+        }
+        throw new CelEvaluationException("cannot order a " + className(left) + " against a "
+                + className(right));
+    }
+
+    private static String className(Object value) {
+        return value == null ? "null" : value.getClass().getName();
+    }
 
     private final CelRuntime.Program program;
     // The source expression, kept so an evaluation failure can name the expression that failed.
