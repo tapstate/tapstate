@@ -227,7 +227,10 @@ final class ValidationMemberResources implements AutoCloseable {
             synchronized(this){require();if(submitted)throw invalid("resources.controlSubmitted");submitted=true;}
             Runnable original=()->{
                 Throwable failure=null;
-                try{require();command.run();}catch(RuntimeException|Error failed){failure=failed;throw failed;}
+                try{
+                    try{require();}catch(TapstateException refused){failure=refused;return;}
+                    command.run();
+                }catch(RuntimeException|Error failed){failure=failed;throw failed;}
                 finally{finish(failure);}
             };
             try{controls.execute(original);}

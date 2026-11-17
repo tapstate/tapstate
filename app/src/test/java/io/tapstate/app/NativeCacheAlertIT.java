@@ -29,6 +29,12 @@ class NativeCacheAlertIT {
             .withCommand("--replSet","docker-rs","--setParameter","enableTestCommands=1");
     @TempDir Path work;
     @Test void anActualRequiredCacheCommandFailureCanBeAcceptedAfterTheDataMemberFailsClosed() throws Exception {
+        verifyFailureAndRecovery(false);
+    }
+    @Test void aQueuedControlRejectionCannotInterruptTheIndependentCacheAlert() throws Exception {
+        verifyFailureAndRecovery(true);
+    }
+    private void verifyFailureAndRecovery(boolean queuedControl) throws Exception {
         var storage=NativeAppStorage.createOnPremWithAdmin(MONGO,"native_cache_alert","cache-admin","isolated-cache-password");
         var settings=new MongoConnectionSettings(storage.configurationUri(),null,Duration.ofSeconds(5));
         try(var observer=MongoClients.create(storage.configurationUri())) {
@@ -49,6 +55,9 @@ class NativeCacheAlertIT {
                     assertThat(healthy).isNotNull();assertThat(healthy).containsEntry("status","CLEAR");
                 });
                 var child=NativeAppStorage.business(app);var runtime=child.getBean(PipelineAlertRuntime.class);
+                var controlRelease=new java.util.concurrent.CountDownLatch(queuedControl?1:0);
+                try {
+                    if(queuedControl)holdQueuedControl(child,controlRelease);
                 var entered=new java.util.concurrent.CountDownLatch(2);var release=new java.util.concurrent.CountDownLatch(1);
                 Runnable block=()->{entered.countDown();try{if(!release.await(10,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("bounded fixture gate expired");}
                     catch(InterruptedException stopped){Thread.currentThread().interrupt();}};
@@ -61,6 +70,7 @@ class NativeCacheAlertIT {
                     await().atMost(Duration.ofSeconds(8)).until(()->!child.getBean(NodeSessionLease.class).active());
                     release.countDown();
                     await().atMost(Duration.ofSeconds(15)).untilAsserted(()->{
+                        controlRelease.countDown();
                         var raw=config.getCollection("alert_instances").find(new Document("_id.resourceKind","cluster-storage").append("_id.resourceId","cache")).first();
                         assertThat(raw).isNotNull();assertThat(raw).containsEntry("status","FIRING");
                     });
@@ -72,6 +82,7 @@ class NativeCacheAlertIT {
                             .map(value->value.value()).filter(value->value.snapshot().rule().key().resource().id().equals("cache")).findFirst().orElseThrow();
                     originalKey=head.snapshot().rule().key();assertThat(head.operationalEvidence().failedCapabilities()).isEqualTo(1<<OperationalEvidence.Capability.CACHE_WRITE.ordinal());
                 }
+                } finally {controlRelease.countDown();}
             }
             await().atMost(Duration.ofSeconds(10)).until(()->{
                 var row=observer.getDatabase(storage.cacheDatabase()).getCollection("workload_claims").find(new Document("_id.resourceId",storage.clusterId())).first();
@@ -90,6 +101,19 @@ class NativeCacheAlertIT {
         }finally{
             try(var cleanup=MongoClients.create(storage.configurationUri())){cleanup.getDatabase(storage.configurationDatabase()).drop();cleanup.getDatabase(storage.cacheDatabase()).drop();cleanup.getDatabase(storage.masterDatabase()).drop();}
         }
+    }
+    private static void holdQueuedControl(org.springframework.context.ConfigurableApplicationContext child,
+            java.util.concurrent.CountDownLatch release)throws Exception {
+        var controls=(java.util.concurrent.ThreadPoolExecutor)org.springframework.test.util.ReflectionTestUtils.getField(
+                child.getBean(ValidationMemberResources.class),"controls");
+        var entered=new java.util.concurrent.CountDownLatch(4);
+        for(int index=0;index<4;index++)controls.execute(()->{
+            entered.countDown();
+            try{if(!release.await(20,java.util.concurrent.TimeUnit.SECONDS))throw new AssertionError("bounded control gate expired");}
+            catch(InterruptedException interrupted){Thread.currentThread().interrupt();}
+        });
+        assertThat(entered.await(5,java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        await().atMost(Duration.ofSeconds(5)).until(()->!controls.getQueue().isEmpty());
     }
     private static Map<String,Object> post(HttpClient client,String base,String path,String token,Map<String,?> body)throws Exception {
         var builder=HttpRequest.newBuilder(URI.create(base+path)).header("Content-Type","application/json");if(token!=null)builder.header("Authorization","Bearer "+token);
