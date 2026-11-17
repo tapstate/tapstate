@@ -3,6 +3,7 @@ package io.tapstate.app;
 import io.tapstate.core.model.PipelineNode;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.hazelcast.function.SupplierEx;
 import io.tapstate.core.dsl.DslParser;
@@ -27,6 +28,8 @@ import io.tapstate.spi.sink.SinkWriter;
 import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
@@ -141,6 +144,71 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
         assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
                 .as("the key an upsert matches a re-sent document on")
                 .containsExactly("id");
+        assertThat(assembled.fields())
+                .as("the marker the map writes on every document, declared like the columns it carries")
+                .filteredOn(field -> field.name().equals("is_deleted"))
+                .singleElement()
+                .satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.BOOLEAN);
+                    assertThat(field.primaryKey()).isFalse();
+                });
+    }
+
+    /**
+     * The target is created to the shape the map writes: a column the map drops is not declared, and a
+     * computed column is, with the type its expression gives and no part in the key.
+     */
+    @Test
+    void aRootFedThroughAMapIsDeclaredWithTheColumnsTheMapWrites() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { name: false, label: "='order'" }
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.fields().stream().map(TargetField::name))
+                .as("the key first, then the columns in the order the map writes them")
+                .containsExactly("id", "label", "is_deleted");
+        assertThat(assembled.fields())
+                .filteredOn(field -> field.name().equals("label"))
+                .singleElement()
+                .satisfies(field -> {
+                    assertThat(field.inferredType()).isEqualTo(TapstateType.STRING);
+                    assertThat(field.primaryKey()).isFalse();
+                });
+    }
+
+    /**
+     * A map that writes a literal over the table's key column. Every row then carries the same value
+     * under the key's name, so that name no longer tells rows apart: inferring it as the root's key
+     * would upsert every document onto one. With no key declared, the nest is refused for having no
+     * root key instead of being keyed on the literal.
+     */
+    @Test
+    void aRootWhoseKeyAMapReplacesTakesNoKeyFromTheTable() {
+        StoreBackedDagSource dag = new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("      key: [ id ]\n", "")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { id: 0 }
+                            soft_delete: is_deleted
+                        """)), capturing(new AtomicReference<>()));
+
+        assertThatThrownBy(() -> dag.dagFor(PIPELINE))
+                .as("the root's key would otherwise be the column every row now holds 0 in")
+                .isInstanceOf(TapstateException.class)
+                .hasMessageContaining("nest.root-key-required");
     }
 
     /**

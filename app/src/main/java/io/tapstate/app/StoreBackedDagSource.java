@@ -12,6 +12,8 @@ import io.tapstate.control.core.PipelineWriteTargets;
 import io.tapstate.control.core.PipelineOutputNames;
 import io.tapstate.core.dsl.PipelineInputs;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.TapstateType;
+import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.lifecycle.ParallelismBudget;
@@ -3481,10 +3483,37 @@ final class StoreBackedDagSource implements DagSource {
             return resolved;
         }
         NestTable behind = nestTable(FromRef.literal(walked.stream()), sourceTables);
-        return new NestTable(resolved.name(), projectedKey(behind.primaryKey(), walked.projections()),
+        List<String> primaryKey = carriedKey(behind.primaryKey(), walked.projections());
+        return new NestTable(resolved.name(), primaryKey == null ? List.of() : primaryKey,
                 behind.uniqueIndexes().stream()
-                        .map(index -> projectedKey(index, walked.projections())).toList(),
+                        .map(index -> carriedKey(index, walked.projections()))
+                        .filter(Objects::nonNull).toList(),
                 resolved.fields());
+    }
+
+    /**
+     * Key columns as they are named after the given maps, nearest the source first, or null where a
+     * map writes something else over one of them. A rename carries the key's values under a new name;
+     * a literal, a computed value, a drop or another column renamed onto the key's name replaces them,
+     * and a key inferred over replaced values would give distinct rows one identity.
+     */
+    private static List<String> carriedKey(List<String> key, List<Map<String, FieldRule>> projections) {
+        List<String> current = key;
+        for (Map<String, FieldRule> rules : projections) {
+            List<String> renamed = KeyProjection.renamed(current, rules);
+            if (renamed.size() != current.size()) {
+                return null;
+            }
+            for (int i = 0; i < current.size(); i++) {
+                if (renamed.get(i).equals(current.get(i)) && rules.containsKey(current.get(i))
+                        && !(rules.get(current.get(i)) instanceof FieldRule.Rename rename
+                                && rename.sourceField().equals(current.get(i)))) {
+                    return null;
+                }
+            }
+            current = renamed;
+        }
+        return current;
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
@@ -4368,7 +4397,7 @@ final class StoreBackedDagSource implements DagSource {
                 return null;
             }
             if (inline.body() instanceof TransformBody.MapProjection projection) {
-                projections.add(projection.fields());
+                projections.add(projection.outputFields());
             }
             walked = true;
             ref = flow.refs().get(0);
@@ -4389,32 +4418,72 @@ final class StoreBackedDagSource implements DagSource {
         return streams.size() == 1 ? streams.iterator().next() : ref;
     }
 
-    /** Key columns as they are named after the given maps, nearest the source first. */
-    private static List<String> projectedKey(List<String> key, List<Map<String, FieldRule>> projections) {
-        List<String> current = key;
-        for (Map<String, FieldRule> rules : projections) {
-            current = KeyProjection.renamed(current, rules);
-        }
-        return current;
-    }
-
     /**
-     * A source table's model with the columns the given maps renamed under their new names, so a key
-     * written in the names the nest sees finds its columns. Columns no map renamed keep their names;
-     * nothing is added for literal or computed values, whose types the source model does not know.
+     * A source table's model as the given maps write its rows, nearest the source first: the columns
+     * each map names, in its order and including any soft-delete marker it adds, then the columns it
+     * passes through. A renamed or passed-through column keeps what the source declared about it; a
+     * literal or computed column is a new value with only the type the pipeline gives it, and is never
+     * part of the source's key. An index survives only while every column it covers still carries the
+     * source's value.
      */
     private static TargetTable projectedModel(TargetTable model, List<Map<String, FieldRule>> projections) {
         if (projections.isEmpty()) {
             return model;
         }
-        List<TargetField> fields = model.fields().stream()
-                .map(field -> new TargetField(projectedKey(List.of(field.name()), projections).get(0),
-                        field.type(), field.primaryKey(), field.inferredType(), field.numericType(),
-                        field.stringType()))
-                .toList();
+        List<TargetField> fields = model.fields();
+        Map<String, String> carriedFrom = new LinkedHashMap<>();
+        for (TargetField field : fields) {
+            carriedFrom.put(field.name(), field.name());
+        }
+        for (Map<String, FieldRule> rules : projections) {
+            Map<String, TargetField> upstream = new LinkedHashMap<>();
+            fields.forEach(field -> upstream.put(field.name(), field));
+            Map<String, TapstateType> types = new LinkedHashMap<>();
+            fields.forEach(field -> types.put(field.name(),
+                    field.inferredType() == null ? TapstateType.UNKNOWN : field.inferredType()));
+            Map<String, TargetField> out = new LinkedHashMap<>();
+            Map<String, String> carried = new LinkedHashMap<>();
+            Set<String> consumed = new HashSet<>();
+            Set<String> dropped = new HashSet<>();
+            Map<String, String> from = carriedFrom;
+            rules.forEach((output, rule) -> {
+                switch (rule) {
+                    case FieldRule.Rename rename -> {
+                        consumed.add(rename.sourceField());
+                        TargetField field = upstream.get(rename.sourceField());
+                        if (field != null) {
+                            out.put(output, new TargetField(output, field.type(), field.primaryKey(),
+                                    field.inferredType(), field.numericType(), field.stringType()));
+                            if (from.containsKey(rename.sourceField())) {
+                                carried.put(output, from.get(rename.sourceField()));
+                            }
+                        }
+                    }
+                    case FieldRule.Drop ignored -> dropped.add(output);
+                    case FieldRule.Literal literal -> out.put(output,
+                            new TargetField(output, null, false, NodeColumns.literalType(literal.value())));
+                    case FieldRule.Computed computed -> out.put(output, new TargetField(output, null, false,
+                            RowExpressions.typedValueType(computed.celExpr(), types)));
+                }
+            });
+            for (TargetField field : fields) {
+                String name = field.name();
+                if (!out.containsKey(name) && !consumed.contains(name) && !dropped.contains(name)) {
+                    out.put(name, field);
+                    if (from.containsKey(name)) {
+                        carried.put(name, from.get(name));
+                    }
+                }
+            }
+            fields = List.copyOf(out.values());
+            carriedFrom = carried;
+        }
+        Map<String, String> nowNamed = new LinkedHashMap<>();
+        carriedFrom.forEach((output, source) -> nowNamed.put(source, output));
         List<TargetIndex> indexes = model.indexes().stream()
-                .map(index -> new TargetIndex(projectedKey(index.fields(), projections), index.unique(),
-                        index.constrainsEveryRow()))
+                .filter(index -> nowNamed.keySet().containsAll(index.fields()))
+                .map(index -> new TargetIndex(index.fields().stream().map(nowNamed::get).toList(),
+                        index.unique(), index.constrainsEveryRow()))
                 .toList();
         return new TargetTable(model.name(), fields, indexes, model.unwindIdentity());
     }

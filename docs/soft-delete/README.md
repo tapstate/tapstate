@@ -78,7 +78,10 @@ player keeps its document marked deleted.
 
 The documents are still written to the root table's name and upserted by the root's key when the root
 is fed through maps and filters, as here. The key may be written in a name a map gave the column, and a
-root or embed that leaves its key out takes the table's key under those names. A root fed through any
+root or embed that leaves its key out takes the table's key under those names. A map that writes a
+literal or computed value over a key column ends that inference, since the column no longer tells rows
+apart; declare the key yourself in that case. The target's columns follow the maps too, so it declares
+the marker column alongside the ones the rows carry. A root fed through any
 other step (a `js` step, a union) loses that: the target is named after the step and has no key to
 upsert by.
 
