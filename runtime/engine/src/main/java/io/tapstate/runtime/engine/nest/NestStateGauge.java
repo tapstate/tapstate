@@ -20,6 +20,10 @@ interface NestStateGauge {
      * been seen holding for something that has not arrived. It travels with the rest because it is about the
      * same namespace and is wanted at the same time, not because it means the same kind of thing.
      */
+    /** Leaves {@code namespace}'s weight readings; a gauge that keeps none ignores them. */
+    default void weightReading(String namespace, NestStateStats.Weight weight) {
+    }
+
     void reading(String namespace, long entries, long accesses, long backfills, long backfillMillis,
             long pendingHighWater);
 

@@ -95,6 +95,31 @@ class EveryMetricMeasuredReachesTheStoredViewTest {
                 .satisfies(point -> assertThat(point.value()).isEqualTo(6L));
     }
 
+    @Test void howHeavyStateIsToKeepReachesTheFacts() {
+        var documents = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_DOCUMENT_BYTES, 900_000);
+        var groups = histogram(io.tapstate.core.lifecycle.HistogramBounds.STATE_COMMIT_BYTES, 900_000);
+        var folds = histogram(io.tapstate.core.lifecycle.HistogramBounds.ROLLUP_FOLD_DURATION, 0.002);
+        var root = new NestStateReading(1, 2, 3, 4).withWeight(
+                new io.tapstate.core.lifecycle.StateWeightReading(documents, 1_400_000L, groups, folds, LOAD_BEGAN));
+        var level = new NestStateReading(1, 2, 3, 4).withWeight(
+                new io.tapstate.core.lifecycle.StateWeightReading(documents, 900_000L, groups, null, LOAD_BEGAN));
+        var facts = everythingWired().facts("orders", PipelineState.RUNNING, AT,
+                Map.of("root", root, "level", level), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), loaded());
+        var named = new HashMap<String, MetricFact>();
+        facts.forEach(fact -> named.put(fact.name(), fact));
+        assertThat(named.get("tapstate.pipeline.state.document.bytes").unit()).isEqualTo("By");
+        assertThat(named.get("tapstate.pipeline.state.document.bytes").points()).hasSize(2);
+        assertThat(named.get("tapstate.pipeline.state.commit.bytes").points()).hasSize(2);
+        assertThat(named.get("tapstate.pipeline.state.document.bytes.max").points())
+                .anySatisfy(point -> {
+                    assertThat(point.attributes()).containsEntry(MetricAttributes.NEST_NAMESPACE, "root");
+                    assertThat(point.value()).isEqualTo(1_400_000L);
+                });
+        // only the level that renders rollup fields has folds to report
+        assertThat(named.get("tapstate.pipeline.nest.rollup.fold.duration").points()).singleElement()
+                .satisfies(point -> assertThat(point.histogram()).isEqualTo(folds));
+    }
+
     private static io.tapstate.core.lifecycle.HistogramValue histogram(io.tapstate.core.lifecycle.HistogramBounds bounds, double value) {
         var buckets = new java.util.ArrayList<Long>(java.util.Collections.nCopies(bounds.buckets(), 0L));
         int bucket = (int) bounds.bounds().stream().takeWhile(bound -> value > bound).count();

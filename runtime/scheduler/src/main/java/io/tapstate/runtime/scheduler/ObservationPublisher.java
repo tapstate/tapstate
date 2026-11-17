@@ -21,6 +21,7 @@ import io.tapstate.core.lifecycle.ObservationFailure;
 import io.tapstate.core.lifecycle.NestOrigin;
 import io.tapstate.core.lifecycle.NestStateReading;
 import io.tapstate.core.lifecycle.StateCommitReading;
+import io.tapstate.core.lifecycle.StateWeightReading;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.lifecycle.SnapshotReading;
 import io.tapstate.core.lifecycle.StageReading;
@@ -194,6 +195,10 @@ public final class ObservationPublisher {
     static final String STATE_COMMIT_KEYS_METRIC = "tapstate.pipeline.state.commit.keys";
     static final String STATE_COMMIT_ROUND_TRIPS_METRIC = "tapstate.pipeline.state.commit.round_trips";
     static final String STATE_COMMIT_DURATION_METRIC = "tapstate.pipeline.state.commit.duration";
+    static final String STATE_DOCUMENT_BYTES_METRIC = "tapstate.pipeline.state.document.bytes";
+    static final String STATE_DOCUMENT_BYTES_MAX_METRIC = "tapstate.pipeline.state.document.bytes.max";
+    static final String STATE_COMMIT_BYTES_METRIC = "tapstate.pipeline.state.commit.bytes";
+    static final String ROLLUP_FOLD_DURATION_METRIC = "tapstate.pipeline.nest.rollup.fold.duration";
     static final String STATE_EVICTIONS_METRIC = "tapstate.pipeline.state.evictions";
     /**
      * Where each namespace comes from in the pipeline's definition, as one reading of 1 per namespace whose
@@ -1095,6 +1100,7 @@ public final class ObservationPublisher {
                 .ifPresent(facts::add);
         rootsRendered(pipelineId, at, nestReadings).ifPresent(facts::add);
         facts.addAll(stateCommits(pipelineId, at, nestReadings));
+        facts.addAll(stateWeights(pipelineId, at, nestReadings));
         nestOrigins(pipelineId, at, nestReadings).ifPresent(facts::add);
         // One point per namespace that discarded something, and none for a namespace that discarded
         // nothing. The absence is load-bearing here rather than merely tidy: rows that never reach a
@@ -1167,6 +1173,48 @@ public final class ObservationPublisher {
                 new MetricFact(STATE_COMMIT_DURATION_METRIC, MetricType.HISTOGRAM,
                         HistogramBounds.STATE_COMMIT_DURATION.unit(), took),
                 new MetricFact(STATE_EVICTIONS_METRIC, MetricType.COUNTER, "{entry}", evicted));
+    }
+
+    /**
+     * How heavy each namespace's state is to keep, one point per namespace that has written any: bytes per
+     * written key (at a root level, per document), the largest of them, bytes per commit group, and where a level
+     * renders rollup fields, how long folding them took. Nothing at all for a pipeline that has written nothing.
+     */
+    private static List<MetricFact> stateWeights(String pipelineId, Instant at,
+            Map<String, NestStateReading> nestReadings) {
+        List<MetricPoint> documents = new ArrayList<>();
+        List<MetricPoint> largest = new ArrayList<>();
+        List<MetricPoint> groups = new ArrayList<>();
+        List<MetricPoint> folds = new ArrayList<>();
+        nestReadings.forEach((namespace, reading) -> {
+            StateWeightReading weight = reading.weight();
+            if (weight == null) {
+                return;
+            }
+            Map<String, String> attributes =
+                    Map.of(PIPELINE_ID_ATTRIBUTE, pipelineId, NEST_NAMESPACE_ATTRIBUTE, namespace);
+            Instant since = weight.countingSince();
+            documents.add(MetricPoint.distribution(attributes, since, at, weight.documentBytes()));
+            largest.add(MetricPoint.reading(attributes, at, weight.largestDocumentBytes()));
+            groups.add(MetricPoint.distribution(attributes, since, at, weight.commitBytes()));
+            if (weight.foldDuration() != null) {
+                folds.add(MetricPoint.distribution(attributes, since, at, weight.foldDuration()));
+            }
+        });
+        if (documents.isEmpty()) {
+            return List.of();
+        }
+        List<MetricFact> facts = new ArrayList<>(List.of(
+                new MetricFact(STATE_DOCUMENT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_DOCUMENT_BYTES.unit(), documents),
+                new MetricFact(STATE_DOCUMENT_BYTES_MAX_METRIC, MetricType.GAUGE, "By", largest),
+                new MetricFact(STATE_COMMIT_BYTES_METRIC, MetricType.HISTOGRAM,
+                        HistogramBounds.STATE_COMMIT_BYTES.unit(), groups)));
+        if (!folds.isEmpty()) {
+            facts.add(new MetricFact(ROLLUP_FOLD_DURATION_METRIC, MetricType.HISTOGRAM,
+                    HistogramBounds.ROLLUP_FOLD_DURATION.unit(), folds));
+        }
+        return facts;
     }
 
     private static Optional<MetricFact> nestOrigins(String pipelineId, Instant at,

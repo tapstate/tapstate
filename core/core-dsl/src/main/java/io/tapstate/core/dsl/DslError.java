@@ -173,7 +173,19 @@ public enum DslError implements TapstateErrorCode {
      *  pattern names a set whose members can change, so it is refused even where it matches exactly
      *  one table today. */
     JOIN_INPUT_IS_A_PATTERN(
-            "dsl.join-input-is-a-pattern", Set.of("step", "alias", "pattern", "path"));
+            "dsl.join-input-is-a-pattern", Set.of("step", "alias", "pattern", "path")),
+    /** A rollup field names no function, an unknown one, or more than one. {@code field} is the rollup
+     *  field, {@code function} what it gave in the function's place and {@code known} the functions there
+     *  are. One function per field, so which one applies never depends on key order. */
+    ROLLUP_FUNCTION_UNKNOWN(
+            "dsl.rollup-function-unknown", Set.of("field", "function", "known", "path")),
+    /** {@code rollup:} on an embed that holds at most one row ({@code as: object} or {@code as: flat}).
+     *  {@code as} is the embed's shape. A value computed over one row is that row's own column. */
+    ROLLUP_ON_SINGLE_ROW_EMBED(
+            "dsl.rollup-on-single-row-embed", Set.of("as", "path")),
+    /** {@code as: rollup} with no {@code rollup:} fields: the level would be held and never shown. */
+    ROLLUP_LEVEL_WITHOUT_FIELDS(
+            "dsl.rollup-level-without-fields", Set.of("path"));
 
     private final String code;
     private final Set<String> placeholders;

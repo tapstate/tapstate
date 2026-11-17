@@ -1,0 +1,3 @@
+rule: rollup-on-single-row-embed
+path: transforms[1].root.embed[0].rollup
+note: "an object embed holds at most one row, so there is nothing to roll up"
