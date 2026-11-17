@@ -287,7 +287,7 @@ public final class PipelinePreviewService {
         List<String> pointers = new ArrayList<>();
         boolean pointerPatternsComplete = true;
         if (body instanceof TransformBody.MapProjection map) {
-            map.outputFields().forEach((output, rule) -> {
+            map.fields().forEach((output, rule) -> {
                 String pointer = pointerField(output);
                 Map<String, Object> effect = new LinkedHashMap<>();
                 effect.put("pointer", pointer);
@@ -310,6 +310,14 @@ public final class PipelinePreviewService {
                 effects.add(Map.copyOf(effect));
                 pointers.add(pointer);
             });
+            if (map.softDelete() != null) {
+                // Not a constant: the step writes false on live rows and true on the update a delete
+                // becomes, so it reads as a value the step works out per row.
+                String pointer = pointerField(map.softDelete());
+                effects.add(Map.of("pointer", pointer, "kind", "computed", "origin", "computed",
+                        "annotation", "map: soft_delete (true where the source row was deleted)"));
+                pointers.add(pointer);
+            }
         } else if (body instanceof TransformBody.Unwind unwind) {
             pointers.add(pointerPath(unwind.path()));
             if (unwind.includeArrayIndex() != null && !unwind.includeArrayIndex().isBlank()) {

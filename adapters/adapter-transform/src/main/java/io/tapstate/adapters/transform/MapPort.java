@@ -108,13 +108,15 @@ final class MapPort implements TransformPort {
         return kept;
     }
 
-    /** The row with the marker column set last, or the row itself where there is no marker or no row. */
+    /**
+     * The projected row with the marker set to {@code deleted}, in the place the projection gave it, or
+     * the row itself where there is no marker or no row.
+     */
     private static Map<String, Object> marked(Map<String, Object> row, String marker, boolean deleted) {
         if (row == null || marker == null) {
             return row;
         }
         Map<String, Object> out = new LinkedHashMap<>(row);
-        out.remove(marker);
         out.put(marker, deleted);
         return out;
     }
@@ -151,6 +153,11 @@ final class MapPort implements TransformPort {
                 case MapRule.Literal l -> out.put(l.output(), l.value());
                 case MapRule.Computed c -> out.put(c.output(), computed.get(c.output()).eval(reading));
             }
+        }
+        // The soft-delete marker sits right after the rules, where the derived schema puts it. It is
+        // written as live here; the delete path flips the same entry, so its position never moves.
+        if (spec.softDelete() != null) {
+            out.put(spec.softDelete(), Boolean.FALSE);
         }
         // A source field passes through unless a rule already produced its name (so a rename / literal
         // / computed output wins over the same-named source), a rename consumed it, or a drop removed

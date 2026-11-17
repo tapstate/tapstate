@@ -77,8 +77,10 @@ Here a deleted e-mail stays in `emails` marked deleted, a deleted phone leaves `
 player keeps its document marked deleted.
 
 The documents are still written to the root table's name and upserted by the root's key when the root
-is fed through a map, as here, or a filter. A root fed through any other step (a `js` step, a union)
-loses that: the target is named after the step and has no key to upsert by.
+is fed through maps and filters, as here. The key may be written in a name a map gave the column, and a
+root or embed that leaves its key out takes the table's key under those names. A root fed through any
+other step (a `js` step, a union) loses that: the target is named after the step and has no key to
+upsert by.
 
 When a source cascades a parent delete to its children, each child delete arrives as its own event, so
 the children are marked too if their stream passes through a soft-delete step. Marking a document's

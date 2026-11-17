@@ -168,6 +168,128 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
     }
 
     /**
+     * A map that renames the root's key column: the key is written in the name the map gave it, and
+     * the target is keyed on that name. Read off the raw source table instead, the key names a column
+     * the table does not have, nothing is marked primary, and every change is appended.
+     */
+    @Test
+    void aRootKeyedOnAColumnTheMapRenamedIsKeyedOnTheNewName() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("key: [ id ]", "key: [ order_key ]")
+                .replace("on: { order_id: id }", "on: { order_id: order_key }")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { order_key: $id }
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("order_key");
+    }
+
+    /**
+     * A root that leaves its key to discovery, fed through a map: the map writes the root table's rows,
+     * so that table's key identifies them, and the nest is not refused for having no key.
+     */
+    @Test
+    void aRootFedThroughAMapTakesItsTablesKeyWhenItDeclaresNone() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("      key: [ id ]\n", "")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.name()).isEqualTo(PARENT_TABLE);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .containsExactly("id");
+    }
+
+    /**
+     * A script between the table and the map ends the walk. What a script emits is not the table it
+     * reads, so the target stays where it was before the walk existed - under the alias's step - rather
+     * than moving to the script's name.
+     */
+    @Test
+    void aWalkThatMeetsAScriptLeavesTheTargetWhereItWas() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: cleanup
+                            type: js
+                            from: [ src_orders.orders ]
+                            script: |
+                              function process(record, ctx) { return record; }
+                          - id: live_orders
+                            type: map
+                            from: [ cleanup ]
+                            soft_delete: is_deleted
+                        """)), capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(STEP).name()).isEqualTo("live_orders");
+    }
+
+    /**
+     * Two sources read tables of one name, and the map reads the second by its source id. The walk has
+     * to end at that source's own stream: ending at the bare table name lets the first source's model
+     * answer, and the target then neither carries the second source's key nor matches its stream.
+     */
+    @Test
+    void aRootReadThroughASourceIdKeepsThatSourcesStreamWhenTableNamesRepeat() {
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("source: [ src_orders, src_items ]", "source: [ src_orders, src_items, src_archive ]")
+                // The other source's same-named table is read too, as a second embed, so both are streams.
+                .replace("from: { o: src_orders.orders, i: src_items.order_items }",
+                        "from: { o: live_orders, i: src_items.order_items, c: src_orders.orders }")
+                .replace("key: [ id ]", "key: [ archive_id ]")
+                .replace("- { from: i, on: { order_id: id }, as: array, path: items, arrayKey: [ id ] }",
+                        "- { from: i, on: { order_id: archive_id }, as: array, path: items, arrayKey: [ id ] }\n"
+                        + "        - { from: c, on: { id: archive_id }, as: object, path: current }")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_archive ]
+                            soft_delete: is_deleted
+                        """),
+                List.of("""
+                        version: tapstate/v1
+                        kind: source
+                        id: src_archive
+                        connector: mysql
+                        config: { host: h, port: 3306, database: d2, username: u, password: p }
+                        mode: cdc
+                        tables: [ orders ]
+                        """),
+                List.of(new DiscoveredSourceModel("src_archive", "mysql", 0L,
+                        new SourceModel(List.of(new SourceTable(PARENT_TABLE,
+                                List.of(new SourceField("archive_id", "int"), new SourceField("name", "string")),
+                                List.of("archive_id"), List.of())))))),
+                capturing(bound)).dagFor(PIPELINE);
+
+        TargetTable assembled = bound.get().get(STEP);
+        assertThat(assembled.fields().stream().filter(TargetField::primaryKey).map(TargetField::name))
+                .as("the key of the source the map reads, not of the other source's same-named table")
+                .containsExactly("archive_id");
+    }
+
+    /**
      * The table half of the same claim, over a root that was never discovered. The columns are a
      * discovery's to supply and are absent here; which table the documents land in is the topology's, and
      * is known without one.
@@ -221,6 +343,11 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
     }
 
     private static InMemoryStorePort parsedStore(String pipeline) {
+        return parsedStore(pipeline, List.of(), List.of());
+    }
+
+    private static InMemoryStorePort parsedStore(String pipeline, List<String> moreSources,
+            List<DiscoveredSourceModel> moreModels) {
         DslParser parser = new DslParser();
         InMemoryArtifactStore artifacts = new InMemoryArtifactStore();
         for (String document : List.of(
@@ -252,6 +379,7 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                 pipeline)) {
             artifacts.save(parser.parse(document));
         }
+        moreSources.forEach(document -> artifacts.save(parser.parse(document)));
 
         InMemoryStorePort store = new InMemoryStorePort(artifacts);
         // The connector id has to be the one the parsed sources declare: a discovery belonging to another
@@ -266,6 +394,7 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                         List.of(new SourceField("id", "int"), new SourceField("order_id", "int"),
                                 new SourceField("sku", "string")),
                         List.of("id"), List.of())))));
+        moreModels.forEach(store.schemas()::save);
         return store;
     }
 
