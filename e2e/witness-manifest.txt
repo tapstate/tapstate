@@ -114,3 +114,5 @@ an-unwind-element-key-cannot-overwrite-a-parent-column on IN_PROCESS
 an-unwind-element-key-cannot-overwrite-a-parent-column on REAL_PROCESS
 many-parents-share-flat-children on IN_PROCESS
 many-parents-share-flat-children on REAL_PROCESS
+nest-rollup-fields-snapshot on IN_PROCESS
+nest-rollup-fields-snapshot on REAL_PROCESS

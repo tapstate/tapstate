@@ -109,6 +109,20 @@ public enum CardinalityBudget {
     STATE_COMMIT_DURATION("tapstate.pipeline.state.commit.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
             Fold.ADDED),
     STATE_EVICTIONS("tapstate.pipeline.state.evictions", MetricAttributes.NEST_NAMESPACE, 1_000, Fold.ADDED),
+    /**
+     * How heavy state is to keep, per namespace: bytes per written key and per commit group add when folded;
+     * the largest key is a reading of its own namespace, so a fold keeps the heaviest rather than a sum no
+     * document weighs.
+     */
+    STATE_DOCUMENT_BYTES("tapstate.pipeline.state.document.bytes", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    STATE_DOCUMENT_BYTES_MAX("tapstate.pipeline.state.document.bytes.max", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.HIGHEST),
+    STATE_COMMIT_BYTES("tapstate.pipeline.state.commit.bytes", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
+    /** How long folding rollup fields took, per nest namespace that renders any. */
+    ROLLUP_FOLD_DURATION("tapstate.pipeline.nest.rollup.fold.duration", MetricAttributes.NEST_NAMESPACE, 1_000,
+            Fold.ADDED),
     JOIN_RECOMPUTE_ROWS("tapstate.pipeline.join.recompute.rows", MetricAttributes.JOIN_NAMESPACE, 1_000,
             Fold.ADDED),
     JOIN_RECOMPUTE_ROWS_TOTAL("tapstate.pipeline.join.recompute.rows.total", MetricAttributes.JOIN_NAMESPACE,

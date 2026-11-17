@@ -5477,6 +5477,25 @@ final class Repl {
             out.println("  awaiting   " + String.join(", ", answer.awaitingRebalance())
                     + " -- joined after this run was planned; given no part of it until a rebalance");
         }
+        answer.rollups().forEach(rollup -> out.println(rollupLine(rollup)));
+    }
+
+    /**
+     * One declared rollup field: where it lands, what it computes over which embed, its filter, and the
+     * references it reads - the ones that make it null, not smaller, while they cannot be resolved.
+     */
+    static String rollupLine(ExplainOutcome.Rollup rollup) {
+        StringBuilder line = new StringBuilder("  rollup     ")
+                .append(rollup.step()).append(": ").append(rollup.level()).append('.').append(rollup.field())
+                .append(" = ").append(rollup.function()).append('(')
+                .append(rollup.argument() == null ? "" : rollup.argument()).append(") over ").append(rollup.embed());
+        if (rollup.filter() != null) {
+            line.append(" where ").append(rollup.filter());
+        }
+        if (!rollup.references().isEmpty()) {
+            line.append(" -- null while ").append(String.join(", ", rollup.references())).append(" is missing");
+        }
+        return line.toString();
     }
 
     /**
