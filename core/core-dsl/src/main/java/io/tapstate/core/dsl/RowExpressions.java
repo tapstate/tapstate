@@ -25,8 +25,10 @@ import dev.cel.parser.CelStandardMacro;
 import dev.cel.parser.Operator;
 import io.tapstate.core.common.TapstateType;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -62,7 +64,8 @@ import java.util.Set;
  * exact fixed-point number, the temporal shapes, a value that is only known to be JSON — becomes a
  * named opaque type instead, which carries the value through unchanged but matches no operator
  * overload, so computing on it is refused and the diagnostic names the type. Guessing an
- * approximation here is exactly the silent conversion the typed check exists to prevent.
+ * approximation here is exactly the silent conversion the typed check exists to prevent. The one
+ * exception is ordering two values of the same temporal type, which is exact without a zone.
  *
  * <p>A column the source model does not carry stays {@code dyn} and compiles. For a source whose
  * model comes from sampling, a column missing from the model is a normal state rather than an error,
@@ -76,6 +79,19 @@ public final class RowExpressions {
     /** {@code now()} — current event time; the one builtin beyond the CEL standard library. */
     private static final CelFunctionDecl NOW = CelFunctionDecl.newFunctionDeclaration(
             "now", CelOverloadDecl.newGlobalOverload("now_timestamp", SimpleType.TIMESTAMP));
+
+    /**
+     * The temporal types two values of which may be ordered against each other. Comparing two values
+     * of one of these types needs no zone - both sides are read on the same clock - so it is exact,
+     * unlike converting either to an instant. Mixing two of them, or one with a string or a number,
+     * still matches no overload and stays refused.
+     */
+    private static final List<TapstateType> ORDERED_OPAQUE = List.of(
+            TapstateType.DATE, TapstateType.TIME, TapstateType.DATETIME);
+
+    /** The ordering operators declared for {@link #ORDERED_OPAQUE}, by CEL function name. */
+    private static final List<Operator> ORDERING = List.of(
+            Operator.LESS, Operator.LESS_EQUALS, Operator.GREATER, Operator.GREATER_EQUALS);
 
     /** The name the typed row carries in the compiler's type namespace. */
     private static final String ROW_TYPE = "tapstate.Row";
@@ -101,7 +117,43 @@ public final class RowExpressions {
                 .addVar("ts", SimpleType.INT)
                 .addVar("src", SimpleType.STRING)
                 .addVar("schema", MapType.create(SimpleType.STRING, SimpleType.DYN))
-                .addFunctionDeclarations(NOW);
+                .addFunctionDeclarations(NOW)
+                .addFunctionDeclarations(sameTypeComparisons());
+    }
+
+    /**
+     * One declared same-type comparison: the CEL operator function, the overload id it is bound under
+     * at runtime, and the column type both operands carry.
+     */
+    public record SameTypeComparison(String function, String overloadId, TapstateType type) {
+    }
+
+    /** Every same-type comparison the typed environment declares, for the runtime to bind. */
+    public static List<SameTypeComparison> sameTypeComparisonOverloads() {
+        List<SameTypeComparison> all = new ArrayList<>();
+        for (Operator operator : ORDERING) {
+            for (TapstateType type : ORDERED_OPAQUE) {
+                all.add(new SameTypeComparison(operator.getFunction(),
+                        "tapstate_" + operator.name().toLowerCase(Locale.ROOT) + "_"
+                                + type.name().toLowerCase(Locale.ROOT),
+                        type));
+            }
+        }
+        return List.copyOf(all);
+    }
+
+    private static List<CelFunctionDecl> sameTypeComparisons() {
+        Map<String, List<CelOverloadDecl>> byFunction = new LinkedHashMap<>();
+        for (SameTypeComparison comparison : sameTypeComparisonOverloads()) {
+            CelType operand = opaqueTypeOf(comparison.type());
+            byFunction.computeIfAbsent(comparison.function(), f -> new ArrayList<>())
+                    .add(CelOverloadDecl.newGlobalOverload(
+                            comparison.overloadId(), SimpleType.BOOL, operand, operand));
+        }
+        List<CelFunctionDecl> declarations = new ArrayList<>();
+        byFunction.forEach((function, overloads) ->
+                declarations.add(CelFunctionDecl.newFunctionDeclaration(function, overloads)));
+        return declarations;
     }
 
     /** A compiler over the envelope root with an untyped row, and no result-type constraint. */
@@ -306,7 +358,8 @@ public final class RowExpressions {
             // No exact counterpart: an exact fixed-point number loses its scale in any binary
             // floating point type, a temporal value without a zone cannot become an instant without
             // assuming one, and a JSON value is not known to be any single shape. Each stays a named
-            // opaque type that carries through but matches no overload.
+            // opaque type that carries through but matches no overload, except the same-type ordering
+            // declared for the temporal ones.
             case DECIMAL, DATE, TIME, DATETIME, YEAR, JSON, UNKNOWN -> opaqueTypeOf(type);
         };
     }
