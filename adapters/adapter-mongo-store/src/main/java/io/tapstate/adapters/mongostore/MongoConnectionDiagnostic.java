@@ -22,6 +22,8 @@ import java.util.function.Predicate;
 
 /** Versioned diagnostic subdocuments inside the existing CACHE result layouts. */
 final class MongoConnectionDiagnostic {
+    private static final String CAUSE = "cause";
+    private static final String CAUSES = "causes";
     private static final int ORIGINAL_VERSION = 1;
     private static final int CODE_SOURCE_VERSION = 2;
     private static final int MAX_BSON_BYTES = 256 * 1024;
@@ -38,8 +40,8 @@ final class MongoConnectionDiagnostic {
 
     private static boolean hasCodeSource(Map<?, ?> node) {
         if (node.containsKey(DiagnosticCodeSource.FIELD)) return true;
-        if (node.get("cause") instanceof Map<?, ?> cause) return hasCodeSource(cause);
-        if (node.get("causes") instanceof List<?> causes) {
+        if (node.get(CAUSE) instanceof Map<?, ?> cause) return hasCodeSource(cause);
+        if (node.get(CAUSES) instanceof List<?> causes) {
             for (Object cause : causes) {
                 if (cause instanceof Map<?, ?> child && hasCodeSource(child)) return true;
             }
@@ -116,8 +118,8 @@ final class MongoConnectionDiagnostic {
             Object value = entry.getValue();
             switch (field) {
                 case "stackTrace", "rawMessage" -> { }
-                case "cause" -> result.put(field, compactNode((Map<?, ?>) value));
-                case "causes" -> result.put(field, ((List<?>) value).stream()
+                case CAUSE -> result.put(field, compactNode((Map<?, ?>) value));
+                case CAUSES -> result.put(field, ((List<?>) value).stream()
                         .map(child -> compactNode((Map<?, ?>) child)).toList());
                 case "message", "solution" -> result.put(field, compactText((String) value));
                 case "params" -> {
@@ -180,8 +182,8 @@ final class MongoConnectionDiagnostic {
         while (!pending.isEmpty()) {
             Map<?, ?> node = pending.pop();
             if (node.get("references") instanceof List<?> references) count += references.size();
-            if (node.get("cause") instanceof Map<?, ?> cause) pending.push(cause);
-            if (node.get("causes") instanceof List<?> causes) {
+            if (node.get(CAUSE) instanceof Map<?, ?> cause) pending.push(cause);
+            if (node.get(CAUSES) instanceof List<?> causes) {
                 for (Object cause : causes) pending.push((Map<?, ?>) cause);
             }
         }

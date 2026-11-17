@@ -138,15 +138,16 @@ final class PdkConnectionDiagnostic {
     private static boolean isSharedPdkCode(Throwable failure) {
         if (!(failure instanceof TapCodeException)) return false;
         Class<?> concrete = failure.getClass();
-        if (concrete.getClassLoader() != TapCodeException.class.getClassLoader()) return false;
-        // The runtime PDK exceptions are outside the adapter's compile-time API. A plugin can
-        // subclass the shared base with a code of its own, so require the same defining domain.
-        for (Class<?> type = concrete; type != TapCodeException.class; type = type.getSuperclass()) {
-            if (type.getName().equals("io.tapdata.exception.TapPdkBaseException")) {
-                return concrete.getProtectionDomain() == type.getProtectionDomain();
-            }
+        ClassLoader sharedLoader = TapCodeException.class.getClassLoader();
+        if (concrete.getClassLoader() != sharedLoader) return false;
+        // The runtime PDK type is outside the adapter's compile-time API. Resolve only
+        // the shared type, without initialization, and exclude subclasses from other artifacts.
+        try {
+            Class<?> base = Class.forName("io.tapdata.exception.TapPdkBaseException", false, sharedLoader);
+            return base.isInstance(failure) && concrete.getProtectionDomain() == base.getProtectionDomain();
+        } catch (ClassNotFoundException absentRuntimeType) {
+            return false;
         }
-        return false;
     }
 
     private static void resolveDefinition(Map<String, Object> node, String code, PdkDiagnosticCatalog catalog, Locale locale) {

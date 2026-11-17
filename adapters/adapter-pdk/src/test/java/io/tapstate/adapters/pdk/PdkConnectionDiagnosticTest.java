@@ -53,6 +53,11 @@ class PdkConnectionDiagnosticTest {
         assertThat(cause.get("code")).isEqualTo("28P01");
         assertThat(cause.get("codeSource")).isEqualTo("jdbc-sqlstate");
 
+        var connectorSubclass = new TapPdkUserPwdInvalidEx("fixture", "account", jdbc) { };
+        assertThat(PdkConnectionDiagnostic.capture(connectorSubclass, "Rejected", null,
+                connectorSubclass.getCode(), catalog, Locale.ENGLISH))
+                .containsEntry("code", "EXT10002").containsEntry("codeSource", "connector");
+
         var opaque = new TapTestItemException(new TapCodeException("410003", "Original detail"));
         assertThat(PdkConnectionDiagnostic.capture(opaque, opaque.getMessage(), null, opaque.getErrorCode(),
                 catalog, Locale.ENGLISH)).containsEntry("code", "410003").doesNotContainKey("codeSource");
