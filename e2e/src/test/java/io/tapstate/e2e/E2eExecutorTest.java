@@ -258,6 +258,24 @@ class E2eExecutorTest {
     }
 
     @Test
+    void publishedUnreachableViewStoreWaitsForTheDiagnosisAfterTheFailedState() {
+        var workspace = Examples.ROOT.resolve("a-view-whose-store-cannot-be-reached-fails-with-a-named-code");
+        binding.states(PipelineState.FAILED);
+        // The checkpoint exposes FAILED before the observation publishes its diagnosis.
+        binding.failureCodesUnobservedThen("actuation.view-store-unreachable");
+        var target = new TableAlias("tgt_file", "orders");
+        binding.countsOverTime(target, 0L);
+
+        new E2eExecutor(binding, new FilePipelineLoader(workspace),
+                Duration.ofMillis(200), Duration.ofMillis(1))
+                .execute(EnvelopeParser.parse(Examples.read(workspace.resolve("spec.e2e.yml"))));
+
+        assertThat(binding.failureCodedPipelineIds).containsOnly("e2e_pipeline");
+        assertThat(binding.failureCodeReads).isGreaterThanOrEqualTo(2);
+        assertThat(binding.readTables).contains(target);
+    }
+
+    @Test
     void reportsTheFailureCodeMismatchAgainstTheResolvedPipeline() {
         binding.failureCodes("io.store-unauthorized");
 
