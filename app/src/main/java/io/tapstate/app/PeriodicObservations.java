@@ -22,7 +22,51 @@ final class PeriodicObservations implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(PeriodicObservations.class);
     private final ThreadPoolExecutor workers;
     private final Map<String, Slot> slots = new HashMap<>();
+    private final Object healthReports = new Object();
     private volatile boolean closed;
+    private boolean backpressured;
+    private long coalesced;
+    private long rejected;
+
+    record Health(int retainedPipelines, int activeWorkers, int queuedPipelines,
+            long coalescedRequests, long rejectedRequests, boolean backpressured) {}
+
+    synchronized Health health() {
+        return new Health(slots.size(), workers.getActiveCount(), workers.getQueue().size(),
+                coalesced, rejected, backpressured);
+    }
+
+    Offer offer(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
+        synchronized (healthReports) {
+            Offer result;
+            Health report = null;
+            synchronized (this) {
+                result = offerLocked(pipelineId, version, task);
+                if (!closed && (result == Offer.COALESCED || result == Offer.REJECTED)) {
+                    if (result == Offer.COALESCED) coalesced++;
+                    else rejected++;
+                    report = enterBackpressure();
+                }
+            }
+            reportHealth(report);
+            return result;
+        }
+    }
+
+    private Health enterBackpressure() {
+        if (backpressured) return null;
+        backpressured = true;
+        return health();
+    }
+
+    private static void reportHealth(Health snapshot) {
+        if (snapshot == null) return;
+        if (snapshot.backpressured()) {
+            LOG.warn("Periodic observation backpressure: requests are being coalesced or dropped; {}", snapshot);
+        } else {
+            LOG.info("Periodic observation backpressure cleared; {}", snapshot);
+        }
+    }
 
     private static final class Slot {
         private Runnable pending;
@@ -47,7 +91,7 @@ final class PeriodicObservations implements AutoCloseable {
                         .name("tapstate-periodic-observation-", 1).factory());
     }
 
-    synchronized Offer offer(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
+    private synchronized Offer offerLocked(String pipelineId, Object version, Consumer<BooleanSupplier> task) {
         if (closed) {
             return Offer.REJECTED;
         }
@@ -108,17 +152,25 @@ final class PeriodicObservations implements AutoCloseable {
                 task.run();
             }
         } finally {
-            boolean discarded = false;
-            synchronized (this) {
-                if (closed || slot.pending == null) {
-                    slots.remove(pipelineId);
-                } else {
-                    // A busy pipeline goes to the back of the queue rather than occupying a worker indefinitely.
-                    discarded = !enqueue(pipelineId, slot);
+            // Sequence edge reports without holding the slot monitor during logging.
+            synchronized (healthReports) {
+                Health report = null;
+                synchronized (this) {
+                    if (closed || slot.pending == null) {
+                        slots.remove(pipelineId);
+                    } else {
+                        // A busy pipeline goes to the back of the queue rather than occupying a worker indefinitely.
+                        if (!enqueue(pipelineId, slot)) {
+                            rejected++;
+                            report = enterBackpressure();
+                        }
+                    }
+                    if (!closed && backpressured && slots.isEmpty()) {
+                        backpressured = false;
+                        report = health();
+                    }
                 }
-            }
-            if (discarded) {
-                LOG.debug("Periodic observation queue full; dropped a follow-up for pipeline {}", pipelineId);
+                reportHealth(report);
             }
         }
     }

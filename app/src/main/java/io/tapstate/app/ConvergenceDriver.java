@@ -54,6 +54,7 @@ final class ConvergenceDriver {
     private final PipelineActuationOwnership actuation;
     private final ScopedPorts scoped;
     private final PeriodicObservations periodicObservations;
+    private final java.util.Set<String> unavailableObservations = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** The fixed store root and per-pass bindings; no current-scope or current-claim lookup is supplied. */
     record ScopedPorts(PipelineIntentStore intents, PipelineStoreViews stores, Runnable requireActive,
@@ -305,6 +306,7 @@ final class ConvergenceDriver {
         // pipeline: the control ring's synchronous surface into the runtime is a closed set, and this set
         // is already crossing once a tick with the same answer in it.
         reconcileFailures.keySet().retainAll(pipelineIds);
+        unavailableObservations.retainAll(pipelineIds);
         // Same for the claims: a pipeline that is gone still has this member named as its driver until the
         // lease runs out, which delays nothing but reads as an owner over something that no longer exists.
         actuation.retain(pipelineIds);
@@ -334,6 +336,8 @@ final class ConvergenceDriver {
         var scope = pass.scope();
         String pipelineId = scope.pipelineId();
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, pipelineId);
+        MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                Long.toString(scope.stateGeneration()));
         try {
             BooleanSupplier current = () -> admitted.getAsBoolean() && reconcileEligible.getAsBoolean()
                     && scoped.intents().loadForActuation(pipelineId).filter(pass.intent()::equals).isPresent()
@@ -341,6 +345,9 @@ final class ConvergenceDriver {
                     && actuation.proveObservationClaim(scope, original) && admitted.getAsBoolean();
             var observation = scoped.stores().pipelineObservations(scope, original, scoped.requireActive());
             publisher.publishRunningScoped(scope, checkpoint, observation, current).ifPresent(published -> {
+                if (unavailableObservations.remove(pipelineId)) {
+                    LOG.info("Periodic observation publication recovered for pipeline {}", pipelineId);
+                }
                 alert(() -> scoped.alerts().publishedPeriodic(pass, published, admitted));
                 sample(published, pass);
                 if (current.getAsBoolean()) {
@@ -349,8 +356,13 @@ final class ConvergenceDriver {
             });
         } catch (RuntimeException unavailable) {
             // A failed measurement is not a new state reading. The last successful frame ages normally.
-            LOG.warn("Could not publish periodic observation for pipeline {}", pipelineId, unavailable);
+            if (admitted.getAsBoolean() && unavailableObservations.add(pipelineId)) {
+                LOG.warn("Could not publish periodic observation for pipeline {}", pipelineId, unavailable);
+            } else {
+                LOG.debug("Periodic observation was refused or remains unavailable for pipeline {}", pipelineId, unavailable);
+            }
         } finally {
+            MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
             MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
         }
     }
