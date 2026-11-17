@@ -40,7 +40,7 @@ class NativePipelineDeletionTest {
         when(configuration.requiredNotes()).thenReturn(notes); when(configuration.rebuilds()).thenReturn(mock(PipelineStateRebuilds.class));
         when(configuration.retireValidation(any(),same(cache),any(),any())).thenAnswer(call -> { ((Runnable)call.getArgument(3)).run(); return true; });
         when(cache.pipelineRetirements(any(),any())).thenReturn(retirement); when(cache.srs(any(),any())).thenReturn(sources);
-        when(sources.consumers()).thenReturn(consumers); when(ownership.unpreparedControl(scope)).thenReturn(control);
+        when(sources.consumers()).thenReturn(consumers); when(ownership.controlAfterPass(scope,true,java.time.Duration.ofSeconds(5))).thenReturn(control);
         when(lifecycle.begin(any())).thenAnswer(call -> {
             var preparation=mock(PipelineRetirementPreparation.class);
             when(preparation.request()).thenReturn(call.getArgument(0)); held.set(preparation); return preparation;
@@ -68,6 +68,7 @@ class NativePipelineDeletionTest {
         verify(operators,atLeastOnce()).requireRetired(eq(scope),isNull(),any());
         verify(control,atLeastOnce()).requireActive();
         verify(control).close();
+        verify(ownership).controlAfterPass(scope,true,java.time.Duration.ofSeconds(5));
     }
 
     @Test void aCommandDelayedByAuditCannotAdoptARecreatedSameHashPipeline() {
@@ -84,7 +85,7 @@ class NativePipelineDeletionTest {
         when(configuration.intents()).thenReturn(mock(PipelineIntentStore.class)); when(configuration.retirements()).thenReturn(lifecycle);
         when(configuration.requiredNotes()).thenReturn(mock(RequiredNoteStore.class)); when(configuration.rebuilds()).thenReturn(mock(PipelineStateRebuilds.class));
         when(cache.pipelineRetirements(any(),any())).thenReturn(retirement); when(cache.srs(any(),any())).thenReturn(sources);
-        when(sources.consumers()).thenReturn(mock(SrsConsumerStore.class)); when(ownership.unpreparedControl(any())).thenReturn(control);
+        when(sources.consumers()).thenReturn(mock(SrsConsumerStore.class)); when(ownership.controlAfterPass(any(),anyBoolean(),any())).thenReturn(control);
         doThrow(new TapstateException(IoError.PIPELINE_INTENT_FENCED,Map.of(),null)).when(lifecycle).begin(any());
         var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),new WorkloadOwner("node","boot"),1,0,1);
         var deletion=new NativePipelineDeletion(configuration,cache,new CacheBusinessScope("cluster",1,"cache"),ownership,() -> node,() -> {},
@@ -93,6 +94,58 @@ class NativePipelineDeletionTest {
         generation.set(2);
         assertThatThrownBy(command::run).isInstanceOf(TapstateException.class);
         verify(lifecycle,never()).begin(any());
-        verify(ownership,never()).unpreparedControl(any());
+        verify(ownership,never()).controlAfterPass(any(),anyBoolean(),any());
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"generation","definition","preparation","running-intent"})
+    void aWaitingDeletionRevalidatesItsOriginalAuthorityBeforeRetirement(String changed) {
+        var configuration=mock(MongoConfigurationDomain.class); var cache=mock(MongoCacheDomain.class);
+        var artifacts=mock(ArtifactStore.class); var mappings=mock(PipelineStateMappings.class);
+        var preparations=mock(PipelineStatePreparations.class); var intents=mock(PipelineIntentStore.class);
+        var lifecycle=mock(PipelineRetirements.class); var retirement=mock(PipelineCacheRetirements.class);
+        var ownership=mock(PipelineActuationOwnership.class); var control=mock(PipelineActuationOwnership.Control.class);
+        var original=new PipelineResource("pipeline",null,List.of(),null,null,null,null,null);
+        var scope=new PipelineIntentScope("cluster",1,"cache","pipeline",1);
+        var generation=new AtomicLong(1);
+        var definition=new java.util.concurrent.atomic.AtomicReference<>(original);
+        var preparation=new java.util.concurrent.atomic.AtomicReference<>(new PipelinePreparation(
+                "pipeline",1,PipelinePreparation.Phase.UNASSIGNED,null,null,null));
+        var intent=new java.util.concurrent.atomic.AtomicReference<PipelineIntentSnapshot>();
+        when(configuration.artifacts()).thenReturn(artifacts);
+        when(artifacts.get("pipeline")).thenAnswer(call -> Optional.of(definition.get()));
+        when(configuration.pipelineStates()).thenReturn(mappings);
+        when(mappings.read("pipeline")).thenAnswer(call -> Optional.of(new PipelineStateMapping(
+                "pipeline",generation.get(),PipelineStateMapping.Phase.ACTIVE,null)));
+        when(configuration.preparations()).thenReturn(preparations);
+        when(preparations.read("pipeline")).thenAnswer(call -> Optional.of(preparation.get()));
+        when(configuration.intents()).thenReturn(intents);
+        when(intents.load("pipeline")).thenAnswer(call -> Optional.ofNullable(intent.get()));
+        when(configuration.retirements()).thenReturn(lifecycle);
+        when(configuration.requiredNotes()).thenReturn(mock(RequiredNoteStore.class));
+        when(configuration.rebuilds()).thenReturn(mock(PipelineStateRebuilds.class));
+        when(cache.pipelineRetirements(any(),any())).thenReturn(retirement);
+        var srs=mock(SrsStores.class); when(cache.srs(any(),any())).thenReturn(srs);
+        when(srs.consumers()).thenReturn(mock(SrsConsumerStore.class));
+        when(ownership.controlAfterPass(scope,true,java.time.Duration.ofSeconds(5))).thenAnswer(call -> {
+            switch (changed) {
+                case "generation" -> generation.set(2);
+                case "definition" -> definition.set(new PipelineResource("pipeline",null,List.of(io.tapstate.core.model.SourceRef.bare("another_source")),null,null,null,null,null));
+                case "preparation" -> preparation.set(new PipelinePreparation("pipeline",2,PipelinePreparation.Phase.UNASSIGNED,null,null,null));
+                case "running-intent" -> intent.set(new PipelineIntentSnapshot(scope,1,
+                        new io.tapstate.core.lifecycle.DesiredState("pipeline",io.tapstate.core.lifecycle.PipelineState.RUNNING,CanonicalHash.of(original))));
+                default -> throw new AssertionError(changed);
+            }
+            return control;
+        });
+        var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),new WorkloadOwner("node","boot"),1,0,1);
+        var deletion=new NativePipelineDeletion(configuration,cache,new CacheBusinessScope("cluster",1,"cache"),ownership,() -> node,() -> {},
+                mock(Engine.class),mock(EngineLifecycleActuator.class),mock(HazelcastOperatorReadiness.class),
+                mock(HazelcastExecutionPlans.class),mock(ConnectorProvisioner.class));
+        var command=deletion.prepare(original,CanonicalHash.of(original));
+        assertThatThrownBy(command::run).isInstanceOf(TapstateException.class);
+        verify(lifecycle,never()).begin(any());
+        verify(retirement,never()).retire(any(),any(),any());
+        verify(control).close();
+    }
+
 }

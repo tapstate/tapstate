@@ -18,6 +18,7 @@ import java.util.function.Supplier;
 
 /** Original lifecycle retirement behind the common artifact API, including a pending operation after restart. */
 final class NativePipelineDeletion implements ArtifactMutationService.PipelineDeletion {
+    private static final Duration LOCAL_PASS_WAIT = Duration.ofSeconds(5);
     private final MongoConfigurationDomain configuration;
     private final MongoCacheDomain cache;
     private final CacheBusinessScope business;
@@ -69,9 +70,14 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
         if (preparation.phase()==PipelinePreparation.Phase.ISSUED) throw fenced();
         boolean alreadyRetired=pending.isPresent() && pending.orElseThrow().request().cache().isPresent()
                 && retirement.completed(pending.orElseThrow(),node.get()).isPresent();
-        try (var control=alreadyRetired || preparation.phase()==PipelinePreparation.Phase.UNASSIGNED
-                ? ownership.unpreparedControl(scope) : ownership.control(scope)) {
+        boolean unprepared = alreadyRetired || preparation.phase()==PipelinePreparation.Phase.UNASSIGNED;
+        try (var control=ownership.controlAfterPass(scope,unprepared,LOCAL_PASS_WAIT)) {
             control.requireHeld(); active.run();
+            // Waiting never adopts a successor scope, definition, preparation or newly running intent.
+            if (!mapping.equals(mapping(original.id()))) throw fenced();
+            requireHash(original.id(),expectedHash);
+            if (!preparation.equals(configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced))) throw fenced();
+            if (mapping.phase()==PipelineStateMapping.Phase.ACTIVE) requireRest(scope);
             Optional<PipelineRetirementRequest.CacheOriginal> isolated=alreadyRetired ? pending.orElseThrow().request().cache()
                     : preparation.phase()==PipelinePreparation.Phase.UNASSIGNED ? Optional.empty()
                     : Optional.of(new PipelineRetirementRequest.CacheOriginal(control.claim(),state(scope).epoch()));
