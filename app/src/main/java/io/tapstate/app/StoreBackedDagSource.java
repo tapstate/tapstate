@@ -2256,7 +2256,9 @@ final class StoreBackedDagSource implements DagSource {
                                 new ScopedNestStateLedger(operators.pass(),operators.defaultDatabase(),operators.coordinates().nestDatabases(),originalOperators.claim()),
                                 nestSettings,NestClock.SYSTEM)
                                 .withCompiledSteps(pipeline.id(),operators.coordinates().compiledNests())).withSnapshotEpochs(snapshotEpochs),
-                joinBinding(compiledJoins,manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest)));
+                joinBinding(compiledJoins, manifest == null ? JoinStoresBinding.onTheCluster() : JoinStoresBinding.onTheCluster(manifest),
+                        manifest != null && manifest.executionIdentity() instanceof ExecutionFence scoped && scoped.scope() != null
+                                ? scoped.scope().stateGeneration() : 0));
     }
 
     private Map<String, Long> sourceEpochs(
@@ -3183,15 +3185,15 @@ final class StoreBackedDagSource implements DagSource {
      * <p>A pipeline with no join step compiles nothing and asks nothing of the schema store.
      */
     private JoinBinding joinBinding(Map<String,CompiledJoin> byStep) {
-        return joinBinding(byStep,JoinStoresBinding.onTheCluster());
+        return joinBinding(byStep, JoinStoresBinding.onTheCluster(), 0);
     }
-    private JoinBinding joinBinding(Map<String,CompiledJoin> byStep,JoinStoresBinding stores) {
+    private JoinBinding joinBinding(Map<String, CompiledJoin> byStep, JoinStoresBinding stores, long stateGeneration) {
         return new JoinBinding(
                 step -> compiledJoin(byStep, step).plan(),
                 step -> compiledJoin(byStep, step).factKeyColumns(),
                 step -> compiledJoin(byStep, step).dimensionRowKeyColumns(),
                 stores,
-                new LoggingDimensionRowDisplacedAlert());
+                new LoggingDimensionRowDisplacedAlert(stateGeneration));
     }
 
     /**

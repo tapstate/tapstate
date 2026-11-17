@@ -42,6 +42,7 @@ class LoggingDimensionRowDisplacedAlertTest {
     @AfterEach
     void stopCapturing() {
         MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
+        MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
         logger.detachAppender(written);
         written.stop();
         logger.setLevel(previousLevel);
@@ -89,8 +90,12 @@ class LoggingDimensionRowDisplacedAlertTest {
         appender.start();
         logger.addAppender(appender);
         MDC.put(PipelineLogAppender.PIPELINE_ID_MDC_KEY, "outer_pipeline");
+        String generationKey = io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY;
+        MDC.put(generationKey, "8");
         try {
-            bound().displaced("customers", JoinKey.of(List.of(1L)).name());
+            new LoggingDimensionRowDisplacedAlert(3).bind("orders_sync", "join_customers")
+                    .displaced("customers", JoinKey.of(List.of(1L)).name());
+            assertThat(MDC.get(generationKey)).isEqualTo("8");
 
             assertThat(MDC.get(PipelineLogAppender.PIPELINE_ID_MDC_KEY))
                     .as("the caller's attribution is restored after the scoped warning")
@@ -100,7 +105,7 @@ class LoggingDimensionRowDisplacedAlertTest {
             appender.stop();
         }
 
-        assertThat(sink.tail("orders_sync"))
+        assertThat(sink.tail("orders_sync", 3, 3))
                 .extracting(LogLine::message)
                 .as("the warning is visible through the affected pipeline's logs read face")
                 .singleElement()

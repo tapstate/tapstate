@@ -20,6 +20,9 @@ public final class PipelineAttribution {
     /** The diagnostic-context key a log line's pipeline id is carried in. */
     public static final String MDC_KEY = "pipeline_id";
 
+    /** The original physical state generation carried by the log producer. */
+    public static final String STATE_GENERATION_MDC_KEY = "pipeline_state_generation";
+
     private PipelineAttribution() {
     }
 }

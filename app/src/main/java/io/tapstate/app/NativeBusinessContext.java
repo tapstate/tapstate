@@ -55,6 +55,11 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         this.configuration = root.runtime().requireConfiguration();
     }
 
+    java.util.Optional<PipelineStateMappings.LogWindow> pipelineLogWindow(String id) {
+        original.requireBusiness();
+        return configuration.pipelineStates().logWindow(id);
+    }
+
     @Override public synchronized void start() {
         original.requireBusiness();
         if (context != null) throw ThreeLayerStorePort.refused();

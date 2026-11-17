@@ -180,8 +180,12 @@ final class ConvergenceDriver {
                     if (snapshot.isEmpty()) {
                         var pendingStart = scoped.prepareStart() == null
                                 ? Optional.<PipelineIntentStore.PendingStart>empty() : scoped.intents().pendingStart(pipelineId);
-                        if (pendingStart.isPresent()) prepareStart(pendingStart.orElseThrow());
-                        else if (scoped.resumeRebuild() != null) {
+                        if (pendingStart.isPresent()) {
+                            var pending = pendingStart.orElseThrow();
+                            MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                                    Long.toString(pending.intent().scope().stateGeneration()));
+                            prepareStart(pending);
+                        } else if (scoped.resumeRebuild() != null) {
                             scoped.resumeRebuild().accept(pipelineId);
                         }
                         continue;
@@ -191,6 +195,8 @@ final class ConvergenceDriver {
                         throw new TapstateException(
                                 IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
                     }
+                    MDC.put(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY,
+                            Long.toString(snapshot.get().scope().stateGeneration()));
                     permit = actuation.permit(snapshot.get().scope());
                     if (permit.granted()) {
                         localPass = Objects.requireNonNull(actuation.enterPass(snapshot.get().scope()), "local convergence pass");
@@ -284,6 +290,7 @@ final class ConvergenceDriver {
             } finally {
                 if (!periodic) discardPeriodic(pipelineId);
                 if (localPass != null) localPass.close();
+                MDC.remove(io.tapstate.core.logging.PipelineAttribution.STATE_GENERATION_MDC_KEY);
                 MDC.remove(PipelineLogAppender.PIPELINE_ID_MDC_KEY);
             }
         }

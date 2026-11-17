@@ -903,8 +903,10 @@ class ControlPlaneConfiguration {
     }
 
     @Bean
-    PipelineLogQueryService pipelineLogQueryService(LogSink logSink) {
-        return new PipelineLogQueryService(logSink);
+    PipelineLogQueryService pipelineLogQueryService(LogSink logSink, ObjectProvider<NativeBusinessContext> business) {
+        var nativeContext = business.getIfAvailable();
+        return nativeContext == null ? new PipelineLogQueryService(logSink)
+                : PipelineLogQueryService.scoped(logSink, nativeContext::pipelineLogWindow);
     }
 
     @Bean

@@ -16,6 +16,7 @@ import org.bson.Document;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.BiFunction;
 
 /** One current mapping per Pipeline; authoring creates it in the same configuration transaction. */
 public final class MongoPipelineStateMappings implements PipelineStateMappings {
@@ -35,6 +36,28 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
     }
 
     @Override public Optional<PipelineStateMapping> read(String pipelineId) {
+        return read(pipelineId, (state, mapping) -> Optional.of(state));
+    }
+
+    @Override public Optional<LogWindow> logWindow(String pipelineId) {
+        return read(pipelineId, (state, mapping) -> {
+            if (state.phase() == PipelineStateMapping.Phase.RETIRING
+                    || state.phase() == PipelineStateMapping.Phase.RETIRED) {
+                return Optional.empty();
+            }
+            long firstGeneration = 1;
+            if (mapping.containsKey("retirement")) {
+                var retirement = MongoPipelineRetirementFacts.read(mapping);
+                if (!retirement.phase().equals("COMPLETE")) throw unreadable(pipelineId);
+                long retiredGeneration = retirement.completed().scope().stateGeneration();
+                if (retiredGeneration >= state.stateGeneration()) throw unreadable(pipelineId);
+                firstGeneration = retiredGeneration + 1;
+            }
+            return Optional.of(new LogWindow(firstGeneration, state.stateGeneration()));
+        });
+    }
+
+    private <T> Optional<T> read(String pipelineId, BiFunction<PipelineStateMapping, Document, Optional<T>> project) {
         Objects.requireNonNull(pipelineId, "pipelineId");
         return StoreIo.call(() -> {
             try (ClientSession session = client.startSession()) {
@@ -44,7 +67,7 @@ public final class MongoPipelineStateMappings implements PipelineStateMappings {
                     if (pipeline == null && mapping == null) return Optional.empty();
                     PipelineStateMapping state = decode(pipelineId, mapping);
                     if ((state.phase() == PipelineStateMapping.Phase.RETIRED) != (pipeline == null)) throw unreadable(pipelineId);
-                    return Optional.of(state);
+                    return project.apply(state, mapping);
                 }, TRANSACTION);
             }
         });

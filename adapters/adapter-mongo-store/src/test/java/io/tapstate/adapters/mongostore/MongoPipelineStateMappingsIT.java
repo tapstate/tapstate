@@ -54,6 +54,19 @@ class MongoPipelineStateMappingsIT {
     }
 
     @Test
+    void anUnreadableRetirementReceiptCannotWidenTheLogWindow() {
+        withConfiguration(f -> {
+            f.domain.artifacts().create(pipeline("flow"));
+            assertThat(f.domain.pipelineStates().logWindow("unknown")).isEmpty();
+            f.mapping().updateOne(new Document("_id", "flow"),
+                    new Document("$set", new Document("retirement", new Document())));
+            assertThatThrownBy(() -> f.domain.pipelineStates().logWindow("flow"))
+                    .satisfies(MongoPipelineStateMappingsIT::unreadable);
+            assertThat(f.mapping().find().first()).containsEntry("retirement", new Document());
+        });
+    }
+
+    @Test
     void aSiblingRefusalRollsBackTheNewPipelineMappingAndRevisionTogether() {
         withConfiguration(f -> {
             f.domain.artifacts().create(source("occupied"));
