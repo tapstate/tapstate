@@ -34,6 +34,82 @@ class MongoAlertStorageSchemaIT {
     @Container static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
 
+    @Test void structureListingUsesNoFilterAndConsumesEveryBatchWithinItsBudget() {
+        withConfiguration(false, f -> {
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
+            var returnedMetadata = new java.util.concurrent.atomic.AtomicInteger();
+            var failedGetMore = new java.util.concurrent.atomic.AtomicInteger();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(event.getCommand().clone());
+                }
+                @Override public void commandSucceeded(com.mongodb.event.CommandSucceededEvent event) {
+                    var cursor = event.getResponse().getDocument("cursor", null);
+                    if (cursor == null || !cursor.getString("ns").getValue().endsWith(".$cmd.listCollections")) return;
+                    returnedMetadata.addAndGet(cursor.containsKey("firstBatch") ? cursor.getArray("firstBatch").size()
+                            : cursor.getArray("nextBatch").size());
+                }
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    if (event.getCommandName().equals("getMore")) failedGetMore.incrementAndGet();
+                }
+            };
+            String appName = "alert-metadata-" + UUID.randomUUID();
+            try (var client = MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(appName).addCommandListener(listener).build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                String keyId = schema(f).get("alerting", Document.class).getString("keyId");
+                var reader = new MongoAlertStorageSchema(client, smallMetadataBatches(client.getDatabase(f.database().getName())),
+                        "cluster-a", keyId, () -> {});
+                var originalSchema = schema(f);var originalCounter = versions(f).find().first();
+                int created = 0;
+                for (int unrelated : List.of(0, 1, 125)) {
+                    while (created < unrelated) f.database().createCollection("unrelated_" + created++);
+                    commands.clear();returnedMetadata.set(0);
+                    assertThat(reader.load(new MongoReadBudget(Duration.ofSeconds(5)))).isEqualTo(MongoAlertStorageSchema.VERSION);
+                    var listings = commands.stream().filter(c -> c.containsKey("listCollections")).toList();
+                    assertThat(listings).hasSize(1).allSatisfy(c -> {
+                        assertThat(c).doesNotContainKey("filter");
+                        assertThat(c.getBoolean("nameOnly", org.bson.BsonBoolean.FALSE).getValue()).isFalse();
+                    });
+                    assertThat(commands.stream().filter(c -> c.containsKey("listIndexes"))).hasSize(MongoAlertStorageSchema.COLLECTIONS.size());
+                    long pages = commands.stream().filter(c -> c.containsKey("getMore")).count();
+                    assertThat(commands).hasSize(6 + MongoAlertStorageSchema.COLLECTIONS.size() + (int) pages);
+                    assertThat(returnedMetadata).hasValue(names(f).size());
+                    if (unrelated == 125) assertThat(pages).isPositive();
+                }
+                f.client().getDatabase("admin").runCommand(new Document("configureFailPoint", "failCommand")
+                        .append("mode", "alwaysOn").append("data", new Document("failCommands", List.of("getMore"))
+                                .append("appName", appName).append("blockConnection", true).append("blockTimeMS", 1500)));
+                long began = System.nanoTime();
+                try {
+                    assertThatThrownBy(() -> reader.load(new MongoReadBudget(Duration.ofMillis(700))))
+                            .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.STORE_UNAVAILABLE));
+                    assertThat(failedGetMore).hasValue(1);
+                    assertThat(Duration.ofNanos(System.nanoTime() - began)).isLessThan(Duration.ofSeconds(3));
+                } finally { clearFailPoint(f); }
+                assertThat(reader.load(new MongoReadBudget(Duration.ofSeconds(5)))).isEqualTo(MongoAlertStorageSchema.VERSION);
+                assertThat(schema(f)).isEqualTo(originalSchema);assertThat(versions(f).find().first()).isEqualTo(originalCounter);
+            }
+        });
+    }
+
+    @Test void aViewCannotReplaceARequiredAlertCollection() {
+        withConfiguration(false, f -> {
+            var marker = schema(f);var counter = versions(f).find().first();
+            String name = SystemCollections.ALERT_EPISODES.collectionName();
+            SystemCollections.ALERT_EPISODES.on(f.database()).drop();
+            f.database().createView(name, SystemCollections.ALERT_RULES.collectionName(), List.of());
+            assertUnreadable(f.domain()::alertSchemaVersion);
+            assertUnreadable(() -> f.domain().prepareAlertStorage("cannot-repair-view"));
+            try (var reopened = MongoConfigurationDomain.open(f.settings(), "cluster-a")) {
+                assertUnreadable(reopened::alertSchemaVersion);
+            }
+            assertThat(f.database().listCollections().filter(new Document("name", name)).first().getString("type")).isEqualTo("view");
+            assertThat(schema(f)).isEqualTo(marker);assertThat(versions(f).find().first()).isEqualTo(counter);
+        });
+    }
+
     @Test void operationalVersionFourNeedsExplicitNodeAndDomainPreparationWithOriginalFactsPreserved() {
         withConfiguration(false,f->{
             SystemCollections.ALERT_NODE_LIFECYCLES.on(f.database()).drop();
@@ -594,6 +670,19 @@ class MongoAlertStorageSchemaIT {
         catch (InterruptedException failure) { Thread.currentThread().interrupt(); throw new AssertionError(failure); }
     }
     private static final class AbortProbe extends RuntimeException { }
+
+    private static MongoDatabase smallMetadataBatches(MongoDatabase original) {
+        return (MongoDatabase) java.lang.reflect.Proxy.newProxyInstance(MongoDatabase.class.getClassLoader(),
+                new Class<?>[]{MongoDatabase.class}, (proxy, method, args) -> {
+                    try {
+                        Object value = method.invoke(original, args);
+                        if (value instanceof MongoDatabase database) return smallMetadataBatches(database);
+                        if (method.getName().equals("listCollections")
+                                && value instanceof com.mongodb.client.ListCollectionsIterable<?> listing) return listing.batchSize(4);
+                        return value;
+                    } catch (java.lang.reflect.InvocationTargetException failure) { throw failure.getCause(); }
+                });
+    }
 
     private record Fixture(MongoClient client, MongoDatabase database, MongoConfigurationDomain domain,
             MongoConnectionSettings settings) { }

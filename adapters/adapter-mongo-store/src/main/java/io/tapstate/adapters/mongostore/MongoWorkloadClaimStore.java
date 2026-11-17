@@ -210,16 +210,40 @@ public final class MongoWorkloadClaimStore implements WorkloadClaimStore {
             throw new IllegalArgumentException("topologyRevision must not be negative");
         }
         validateExisting(expected.key());
+        Document advanced = findOneAndUpdate(liveOrNodeBacked(expected, topologyRevision),
+                List.of(executionAdvanceUpdate(executionNodeIds)), false);
+        return Optional.ofNullable(advanced).map(this::effectiveClaim);
+    }
+
+    /** Acquires the original finite Pipeline tenure before establishing a validation snapshot. */
+    Optional<ExecutionAdvance> advanceExecutionBeforeReads(WorkloadClaim expected, long topologyRevision,
+            Set<String> executionNodeIds) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(executionNodeIds, "executionNodeIds");
+        if (topologyRevision < 0) throw new IllegalArgumentException("topologyRevision must not be negative");
+        if (session == null || !strict || expected.key().type() != WorkloadClaimType.PIPELINE_ACTUATION)
+            throw new IllegalStateException("execution-first requires a strict Pipeline transaction");
+        var before = collection.findOneAndUpdate(session, liveExpected(expected, topologyRevision),
+                List.of(executionAdvanceUpdate(executionNodeIds)),
+                new FindOneAndUpdateOptions().returnDocument(ReturnDocument.BEFORE));
+        if (before == null) return Optional.empty();
+        // The update must not repair malformed execution context or failure facts before validation.
+        read(before);
+        var row = collection.find(session, new Document("_id", id(expected.key()))).first();
+        return Optional.of(new ExecutionAdvance(read(row), before, row));
+    }
+
+    record ExecutionAdvance(WorkloadClaim claim, Document before, Document row) {}
+
+    private static Document executionAdvanceUpdate(Set<String> executionNodeIds) {
         Document nextGeneration = new Document("$add", List.of(
                 new Document("$ifNull", List.of("$executionGeneration", 0L)), 1L));
-        Document next = new Document("$set", new Document("executionGeneration", nextGeneration)
+        return new Document("$set", new Document("executionGeneration", nextGeneration)
                 .append("contextExecutionGeneration", nextGeneration)
                 .append("executionClaimGeneration", "$claimGeneration")
                 .append("executionNodeIds", executionNodeIds.stream().sorted().toList())
                 .append("failureClaimGeneration", 0L)
                 .append("failureAfterMemberLoss", false));
-        Document advanced = findOneAndUpdate(liveOrNodeBacked(expected, topologyRevision), List.of(next), false);
-        return Optional.ofNullable(advanced).map(this::effectiveClaim);
     }
 
     @Override

@@ -1241,6 +1241,7 @@ class MongoSrsConsumerStoreIT {
 
             assertThat(raw.release(renewedNode)).isTrue();
             assertThat(authority.readPipeline(positionScope(A)).orElseThrow().leased()).isFalse();
+            assertThat(authority.advanceExecution(next, 1, Set.of(SCOPE.clusterId()))).isEmpty();
             assertThatThrownBy(() -> f.consumers().beginWriterRun(A, member.revision(), "second", roster,
                     WorkloadClaimFence.from(next))).satisfies(MongoSrsConsumerStoreIT::fenced);
             var replacement = raw.acquire(nodeKey, new WorkloadOwner(SCOPE.clusterId(), "second-boot"), 1, ttl).claim();

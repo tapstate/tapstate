@@ -257,6 +257,24 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     }
     @Override public Optional<WorkloadClaim> advanceExecution(WorkloadClaim expected, long topologyRevision, Set<String> nodeIds) {
         requireKey(Objects.requireNonNull(expected, "expected").key());
+        if (expected.key().type() == WorkloadClaimType.PIPELINE_ACTUATION) {
+            return transaction(false, null, (store, session) -> {
+                var first = store.advanceExecutionBeforeReads(expected, topologyRevision, nodeIds);
+                if (first.isEmpty()) {
+                    // Preserve existing refusal diagnostics and the original node-backed lease path.
+                    validateMutationScope(session, store, expected);
+                    var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
+                    if (advanced.isPresent()) fenceProgress(session, storedScope(session, expected.key()));
+                    return advanced;
+                }
+                var advanced = first.orElseThrow();
+                var retained = decodeScope(advanced.before(), expected.key());
+                if (!retained.equals(decodeScope(advanced.row(), expected.key()))) throw claimFenced();
+                validateState(session, retained);
+                fenceProgress(session, retained);
+                return Optional.of(advanced.claim());
+            }, true);
+        }
         return transaction(false, (store, session) -> {
             validateMutationScope(session, store, expected);
             var advanced = store.advanceExecution(expected, topologyRevision, nodeIds);
@@ -438,7 +456,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             if (admission) access.updateState(session, current, new Document(), false);
         }
         T result = operation.apply(store, session);
-        // Renewal reads follow the exact lease mutation in the original transaction snapshot.
+        // Business validation follows the exact fenced mutation in the original transaction snapshot.
         if (renewalFirst) identity.requireAdmissionState(session);
         return result;
     }
