@@ -9,9 +9,9 @@ final class MongoLogSanitizer {
     private static final String MONGO_CREDENTIAL_END = "mechanismProperties=<hidden>}";
     private static final String PROXY_SETTINGS = "ProxySettings{";
     private static final Pattern REPORT_URI_USERINFO = Pattern.compile(
-            "(mongodb(?:\\+srv)?://)(?:[^\\s/?#]*"
-                    + "|[^\\s:/?#@\\[\\],]++:(?![0-9]+[\\s,;.!)])[^\\s/?#@]*+\\s[^/?#@]*+"
-                    + "|[^\\s/?#@]*+\\s[^/?#@]*+(?=@[^\\s/?#@]++[/?#]))@",
+            "(mongodb(?:\\+srv)?://)(?:[^\\s/?#]*+\\h[^\\v/?#]*(?=@[^\\s/?#@]++[/?#])"
+                    + "|[^\\s:/?#@\\[\\],]++:(?![0-9]++[\\s,;.!)])[^\\s/?#]*+\\h[^\\v/?#]*"
+                    + "|[^\\s/?#]*)@",
             Pattern.UNICODE_CHARACTER_CLASS);
 
     private MongoLogSanitizer() {
@@ -51,8 +51,8 @@ final class MongoLogSanitizer {
             // part of that value, so a report cannot reliably restore any text after it.
             safe = safe.substring(0, proxy) + "ProxySettings" + MongoUriUserInfo.REDACTED;
         }
-        // Extend past whitespace if the first token looks like userinfo, or an
-        // explicit path, query or fragment confirms the following URI authority.
+        // Prefer the final credential separator even when rejected userinfo contains spaces or
+        // embedded at-signs. Only extend across spaces for likely userinfo or an explicit URI suffix.
         return REPORT_URI_USERINFO.matcher(safe).replaceAll("$1" + MongoUriUserInfo.REDACTED + "@");
     }
 

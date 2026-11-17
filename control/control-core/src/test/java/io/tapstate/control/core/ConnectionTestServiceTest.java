@@ -118,6 +118,27 @@ class ConnectionTestServiceTest {
     }
 
     @Test
+    void masksHttpAuthorizationBeforePublishingAndSavingDiagnosticFields() {
+        String rawMessage = "Rejected HTTP request: Authorization: Bearer fixture-header-token";
+        String stackTrace = "Authorization: Basic Zml4dHVyZTpwYXNz==\n"
+                + "\tat example.Client.connect(Client.java:42)";
+        var result = new ConnectionTestResult(CONFIG.id(), CONFIG.connectorId(), Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Login failed", null, null, null,
+                        Map.of("rawMessage", rawMessage, "stackTrace", stackTrace))), 1_700_000_000_000L);
+        var store = new RecordingResultStore();
+        var service = new ConnectionTestService(
+                config -> result, store, gate(new RecordingAuditStore()), null,
+                SourceConnectionResolver.forAdHocConnections());
+
+        var report = service.test(CONFIG.id(), CONFIG.connectorId(), CONFIG.settings(), "alice");
+        var expected = Map.of("rawMessage", "Rejected HTTP request: Authorization: Bearer <redacted>",
+                "stackTrace", "Authorization: Basic <redacted>\n\tat example.Client.connect(Client.java:42)");
+        assertThat(report.checks().getFirst().diagnostic()).isEqualTo(expected);
+        assertThat(store.saved.items().getFirst().diagnostic()).isEqualTo(expected);
+    }
+
+    @Test
     void validatesAgainstTheSameCatalogSnapshotUsedToResolveSecrets() {
         TapstateCatalog catalog = TapstateCatalog.load();
         AtomicInteger catalogReads = new AtomicInteger();

@@ -145,7 +145,7 @@ class ConnectionTestResultQueryServiceTest {
         MapResultStore store = new MapResultStore();
         store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
                 List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
-                        "Unable to connect to mongodb://fixture-user:two words@db.example/data",
+                        "Unable to connect to mongodb://fixture-user:two@parts words@db.example/data",
                         "Refused ProxySettings{host=proxy, port=1080, username=fixture-user, password=head}tail",
                         "Check the server address", null)), 1_700_000_000_000L, true));
 
@@ -173,6 +173,24 @@ class ConnectionTestResultQueryServiceTest {
                 .checks().getFirst().diagnostic();
         assertThat(diagnostic).containsEntry("rawMessage", "MongoCredential<redacted>")
                 .containsEntry("stackTrace", "ProxySettings<redacted>");
+    }
+
+    @Test
+    void masksHttpAuthorizationInPreviouslyStoredDiagnosticFields() {
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Login failed", null, null, null,
+                        Map.of("rawMessage", "Authorization: Bearer fixture-header-token",
+                                "stackTrace", "authentication failed\nauthorization: basic Zml4dHVyZTpwYXNz==\n"
+                                        + "\tat example.Client.connect(Client.java:42)"))),
+                1_700_000_000_000L, true));
+
+        var diagnostic = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst().diagnostic();
+        assertThat(diagnostic).containsEntry("rawMessage", "Authorization: Bearer <redacted>")
+                .containsEntry("stackTrace", "authentication failed\nauthorization: basic <redacted>\n"
+                        + "\tat example.Client.connect(Client.java:42)");
     }
 
     @Test

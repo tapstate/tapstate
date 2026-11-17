@@ -90,6 +90,16 @@ class MongoLogSanitizerTest {
     }
 
     @Test
+    void hidesCompleteMalformedUserInfoWithEmbeddedAtSign() {
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:part@word rest@db.example/data"))
+                .isEqualTo("Failed mongodb://<redacted>@db.example/data");
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:part@word rest@db.example"))
+                .isEqualTo("Failed mongodb://<redacted>@db.example");
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:x@host.example/data contact ops@example.org"))
+                .isEqualTo("Failed mongodb://<redacted>@host.example/data contact ops@example.org");
+    }
+
+    @Test
     void repeatedLogRedactionKeepsMarkersAndRegisteredShortSecretsIntact() {
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source", java.util.List.of("ed", "known-password"));

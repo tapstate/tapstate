@@ -20,6 +20,9 @@ public final class SecretRedactor {
     private static final Pattern WORD = Pattern.compile("[\\p{L}\\p{N}_]+");
     private static final Pattern WORD_BOUNDARY = Pattern.compile("(?<![\\p{L}\\p{N}_])%s(?![\\p{L}\\p{N}_])");
 
+    private static final Pattern HTTP_AUTHORIZATION = Pattern.compile(
+            "(?i)(\\bAuthorization\"?\\h*+[:=]\\h*+[\"\\[]?\\h*+(?:Basic|Bearer)\\h++)[A-Za-z0-9._~+/\\-]+=*");
+
     private final Map<String, List<String>> valuesByOwner = new LinkedHashMap<>();
     private final AtomicReference<List<String>> snapshot = new AtomicReference<>(List.of());
 
@@ -65,9 +68,13 @@ public final class SecretRedactor {
         return redact(MongoLogSanitizer.redact(text));
     }
 
-    /** Hides Mongo credential structures and the admitted operation's known secret values. */
+    /** Hides connection credentials and the admitted operation's known secret values. */
     public static String redactConnectionDiagnostic(String text, Collection<String> values) {
-        return redactValues(MongoLogSanitizer.redactReport(text), values, MongoUriUserInfo.REDACTED);
+        if (text == null) {
+            return null;
+        }
+        String safe = HTTP_AUTHORIZATION.matcher(text).replaceAll("$1" + MongoUriUserInfo.REDACTED);
+        return redactValues(MongoLogSanitizer.redactReport(safe), values, MongoUriUserInfo.REDACTED);
     }
 
     /** Redacts supplied values using the same matcher as the process-wide log registry. */
