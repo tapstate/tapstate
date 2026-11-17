@@ -126,7 +126,8 @@ class PipelineAssistantController {
                 streamEvents.event(Map.of("type", "text-end", "id", textId));
                 completeCandidate(base, id, candidate, context, workspace.requireActive(), streamEvents);
             } catch (UncheckedIOException disconnected) {
-                // Client cancellation closes the provider body through the streaming consumer.
+                // A cancelled request consumes its interrupt before returning the pooled thread.
+                if (disconnected.getCause() instanceof java.io.InterruptedIOException) Thread.interrupted();
             } catch (TapstateException failure) {
                 streamEvents.failure(failure.code().code());
             } finally { heartbeat.shutdownNow(); CAPACITY.release(); }

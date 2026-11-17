@@ -136,7 +136,7 @@ class GuardedAssistantTextTest {
             producer.interrupt();
             assertThat(interrupted.await(3, TimeUnit.SECONDS)).as("cancellation reaches the blocked writer").isTrue();
             assertThat(cleaned.await(3, TimeUnit.SECONDS)).as("producer cleanup does not wait for client reads").isTrue();
-            assertThat(interruptedOnCancellation).isFalse();
+            assertThat(interruptedOnCancellation).isTrue();
         } finally { outputBarrier.countDown(); producer.interrupt(); producer.join(3000); }
     }
 

@@ -65,7 +65,7 @@ final class GuardedAssistantText implements AiProviderClient.Output, AutoCloseab
             else pending.addLast(new Segment(part, text));
             pendingChars += size;
             changed.signalAll();
-        } catch (InterruptedException interrupted) { throw interrupted(); }
+        } catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw interrupted(); }
         finally { lock.unlock(); }
     }
 
@@ -91,7 +91,7 @@ final class GuardedAssistantText implements AiProviderClient.Output, AutoCloseab
         try { finished = true; changed.signalAll(); }
         finally { lock.unlock(); }
         try { drained.get(); }
-        catch (InterruptedException interrupted) { throw interrupted(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw interrupted(); }
         catch (ExecutionException failed) { throwIfFailed(); throw new IllegalStateException(failed); }
     }
 
@@ -165,7 +165,7 @@ final class GuardedAssistantText implements AiProviderClient.Output, AutoCloseab
 
     private void acquire() {
         try { lock.lockInterruptibly(); }
-        catch (InterruptedException interrupted) { throw interrupted(); }
+        catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); throw interrupted(); }
     }
 
     private java.io.UncheckedIOException interrupted() {
