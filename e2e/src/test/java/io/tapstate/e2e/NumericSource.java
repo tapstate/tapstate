@@ -119,6 +119,33 @@ final class NumericSource {
         return resources;
     }
 
+    /** Source, target and a pipeline whose filter expression is the one thing that varies. */
+    static Map<String, String> filterWorkspace(
+            Map<String, Object> config, String targetUri, String pipelineId, String filterExpr) {
+        Map<String, String> resources = new LinkedHashMap<>();
+        resources.put("src_numeric.tap.yml", sourceYaml(config));
+        resources.put("tgt_numeric.tap.yml", targetYaml(targetUri));
+        resources.put("pipeline.tap.yml", filterPipelineYaml(pipelineId, filterExpr));
+        return resources;
+    }
+
+    private static String filterPipelineYaml(String pipelineId, String filterExpr) {
+        return """
+                version: tapstate/v1
+                kind: pipeline
+                id: %s
+                source: %s
+                settings: { read_mode: snapshot_and_cdc }
+                transforms:
+                  - { id: filtered, from: [%s], type: filter, expr: "%s" }
+                serve:
+                  from: filtered
+                  sync:
+                    - source: %s
+                """
+                .formatted(pipelineId, SOURCE_ID, TABLE, filterExpr, TARGET_ID);
+    }
+
     private static String sourceYaml(Map<String, Object> config) {
         return """
                 version: tapstate/v1
