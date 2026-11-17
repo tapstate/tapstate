@@ -28,6 +28,7 @@ import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -120,6 +121,42 @@ class ObservationPublisherTest {
         assertThat(collecting.publishRunningScoped(scope, checkpoint, observations, current::get)).isEmpty();
         assertThat(current).isFalse();
         assertThat(observations.read("orders").orElseThrow()).isSameAs(previous);
+    }
+
+    @Test
+    void aFailedPassRetainsTheOriginalFlatValuesWhenItsStoredLagFactsHaveOverflow() {
+        state.seed("orders", PipelineState.RUNNING);
+        Map<String, Long> times = new LinkedHashMap<>();
+        for (int i = 0; i < 1002; i++) {
+            times.put("table_" + i, T0.toEpochMilli());
+        }
+        var wired = new ObservationPublisher(state, observations, id -> OptionalLong.empty(), id -> Map.of(),
+                id -> new SnapshotReading(Map.of("landed", new TableSnapshot(1, 1L, 100, true)), T0),
+                id -> Map.of(), id -> Map.of(),
+                new NestColdLayerWatch(NestColdLayerPressure.DEFAULT, NestColdLayerAlert.NONE),
+                id -> Map.of(), new FrontierStallWatch(FrontierStallPressure.DEFAULT, FrontierStallAlert.NONE),
+                id -> Map.of(), id -> Map.of(), id -> Map.of(), id -> io.tapstate.core.lifecycle.CaptureReading.NONE,
+                id -> new io.tapstate.core.lifecycle.DeliveryReading(Map.of(), Map.of(), times, T0),
+                Clock.fixed(OBSERVED_AT, ZoneOffset.UTC));
+        var raw = wired.publish("orders").orElseThrow();
+        assertThat(observations.read("orders").orElseThrow().facts()).anySatisfy(fact ->
+                assertThat(fact.points()).anySatisfy(point ->
+                        assertThat(point.attributes()).containsEntry("otel.metric.overflow", "true")));
+
+        wired.publishReconcileFailure("orders", 2);
+
+        var saved = observations.read("orders").orElseThrow();
+        assertThat(saved.metrics()).containsAllEntriesOf(raw.metrics()).containsEntry("reconcileFailuresInARow", 2L);
+        assertThat(saved.snapshot()).isEqualTo(raw.snapshot());
+
+        state.seed("orders", PipelineState.COMPLETED);
+        observations.save(new Observation(saved.pipelineId(), PipelineState.COMPLETED, saved.metrics(),
+                saved.snapshot(), saved.positions(), saved.failure(), saved.observedAt(), saved.facts(), saved.initialLoad()));
+        var terminal = wired.publish("orders").orElseThrow();
+        assertThat(terminal.metrics()).isEqualTo(raw.metrics());
+        assertThat(terminal.facts()).filteredOn(fact -> fact.name().equals("tapstate.pipeline.lag"))
+                .singleElement().satisfies(fact -> assertThat(fact.points()).hasSize(1001));
+        assertThat(observations.read("orders").orElseThrow()).isEqualTo(terminal);
     }
 
     @Test
