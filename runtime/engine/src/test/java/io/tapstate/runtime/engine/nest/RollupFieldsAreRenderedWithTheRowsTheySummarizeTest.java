@@ -129,7 +129,7 @@ class RollupFieldsAreRenderedWithTheRowsTheySummarizeTest {
     void theStoredElementIsTheSameWhateverTheLevelRendersAs() throws IOException {
         NestTopology plain = compile(new Embed("i", Map.of("transaction_id", "id"), EmbedAs.ARRAY,
                 "item_movement", null, List.of("id"), null, null,
-                List.of(RollupFieldsAreCheckedWithTheTreeTest.prize()), null));
+                List.of(RollupFieldsAreCheckedWithTheTreeTest.prize()), null, null));
         RootAssembly withRollups = transaction();
         RootAssembly withoutRollups = transaction();
         withRollups.render(TREE.slots(), prizes(5L, 3L), "t1");

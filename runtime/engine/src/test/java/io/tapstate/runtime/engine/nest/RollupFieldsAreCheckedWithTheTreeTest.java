@@ -100,7 +100,7 @@ class RollupFieldsAreCheckedWithTheTreeTest {
         Embed prizeWithRollup = new Embed("pd", Map.of("id", "prize_definition_id"), EmbedAs.ARRAY, "prizes",
                 null, null, null, null, null, Map.of("n", RollupField.of(RollupFunction.COUNT, true, null, null, null)));
         Embed items = new Embed("i", Map.of("transaction_id", "id"), EmbedAs.ARRAY, "item_movement", null,
-                List.of("id"), null, null, List.of(prizeWithRollup), null);
+                List.of("id"), null, null, List.of(prizeWithRollup), null, null);
         assertThatThrownBy(() -> compile(items)).isInstanceOfSatisfying(TapstateException.class, e -> {
             assertThat(e.code()).isEqualTo(RollupError.ON_REFERENCE_EMBED);
             assertThat(e.args()).containsEntry("embedPath", "item_movement.prizes");
