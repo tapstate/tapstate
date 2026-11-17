@@ -1899,7 +1899,9 @@ final class StoreBackedDagSource implements DagSource {
      *
      * <p>The key starts as the table's complete key, key columns leading, because that is the order
      * the sink matches an upsert in. If a projection drops or replaces any component, output identity
-     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source.
+     * is unresolved: a surviving subset cannot uniquely identify rows from a composite-key source,
+     * so the target table is published without a key (which preview materialization refuses, while
+     * sync proceeds with a keyless table).
      *
      * <p><b>The table's own key is the default and no longer the whole rule</b>, because a node that
      * expands a list emits several rows carrying one parent's key, and what tells them apart is a
@@ -1938,7 +1940,9 @@ final class StoreBackedDagSource implements DagSource {
         }
         if (base.fields().stream().filter(TargetField::primaryKey)
                 .anyMatch(field -> !parentNames.containsKey(field.name()))) {
-            // Element locators distinguish siblings only while the complete parent key survives.
+            // Element locators distinguish siblings only while the complete parent key survives;
+            // clearing the key leaves an unresolved output identity that preview refuses and sync
+            // publishes without a declared key.
             key.clear();
         }
         return TargetModelResolver.keyedOn(

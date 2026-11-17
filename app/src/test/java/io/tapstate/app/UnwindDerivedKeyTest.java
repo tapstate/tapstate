@@ -107,6 +107,33 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void aPlainMapPreservesTheSourcePrimaryKeyUnderPureReadComputedExpression() {
+        NodeColumns sameName = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.computed("after.o_id"))), one(atTheSource()), null);
+        assertThat(sameName.origins()).containsEntry("o_id", "o_id");
+        assertThat(publishedKey(sameName)).containsExactly("o_id");
+
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("order_id", FieldRule.computed("after.o_id"));
+        rules.put("o_id", FieldRule.drop());
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(rules), one(atTheSource()), null);
+        assertThat(renamed.origins()).containsEntry("order_id", "o_id");
+        assertThat(publishedKey(renamed)).containsExactly("order_id");
+    }
+
+    @Test
+    void aParentKeyMovedByPureReadComputedExpressionReachesTheTarget() {
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("order_id", FieldRule.computed("after.o_id"));
+        rules.put("o_id", FieldRule.drop());
+        NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(rules), one(atTheSource()), null);
+        NodeColumns expanded = NodeColumns.of(unwind(null, "sku"), one(renamed), null);
+
+        assertThat(publishedKey(expanded)).containsExactly("order_id", "sku");
+        assertThat(publishedKey(renamed)).containsExactly("order_id");
+    }
+
+    @Test
     void aParentKeyRenamedBeforeExpansionReachesTheTarget() {
         NodeColumns renamed = NodeColumns.of(new TransformBody.MapProjection(
                 Map.of("order_id", FieldRule.rename("o_id"))), one(atTheSource()), null);

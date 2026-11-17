@@ -1,5 +1,6 @@
 package io.tapstate.app;
 
+import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.model.FieldRule;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -12,15 +13,21 @@ final class KeyProjection {
     }
 
     /**
-     * Follows renames without discarding required columns. A dropped key keeps its required name,
-     * so the expansion's before-image check still refuses its absence; removing it here would
-     * silently weaken the parent identity. This does not infer identity from computed values.
+     * Follows renames and pure-read computed aliases without discarding required columns.
+     * A dropped key keeps its required name, so the expansion's before-image check still refuses
+     * its absence; removing it here would silently weaken the parent identity. Modified computed
+     * values do not inherit identity.
      */
     static List<String> renamed(List<String> key, Map<String, FieldRule> rules) {
         Map<String, String> renamedTo = new LinkedHashMap<>();
         rules.forEach((output, rule) -> {
             if (rule instanceof FieldRule.Rename rename) {
                 renamedTo.put(rename.sourceField(), output);
+            } else if (rule instanceof FieldRule.Computed computed) {
+                String moved = RowExpressions.movedColumn(computed.celExpr());
+                if (moved != null) {
+                    renamedTo.put(moved, output);
+                }
             }
         });
         LinkedHashSet<String> names = new LinkedHashSet<>();

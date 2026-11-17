@@ -62,6 +62,40 @@ class StoreBackedDagSourceTargetModelTest {
     }
 
     @Test
+    void aPlainMapPublishesItsPureReadComputedPrimaryKeyToTheSyncTarget() {
+        Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
+        rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.computed("after.id"));
+        rules.put("id", io.tapstate.core.model.FieldRule.drop());
+        InMemoryStorePort store = seededProjectingPipeline(rules);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("ORDER_ID", true)));
+    }
+
+    @Test
+    void aPlainMapPublishesSameNamedPureReadComputedPrimaryKeyToTheSyncTarget() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("id", io.tapstate.core.model.FieldRule.computed("after.id")));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "bigint", io.tapstate.core.common.TapstateType.INT64)),
+                List.of("id"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).extracting(TargetField::name, TargetField::primaryKey)
+                        .containsExactly(tuple("id", true)));
+    }
+
+    @Test
     void aPlainMapCannotPublishOnlyTheSurvivingPartOfACompositeKey() {
         for (var rule : List.of(io.tapstate.core.model.FieldRule.drop(),
                 io.tapstate.core.model.FieldRule.literal(0),

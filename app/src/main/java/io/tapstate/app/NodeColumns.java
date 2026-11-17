@@ -599,8 +599,14 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     && !upstream.columns().containsKey(rename.sourceField())) {
                 rule = null;
             }
-            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField() : output;
-            if (rule == null || rule instanceof FieldRule.Rename) {
+            String moved = rule instanceof FieldRule.Computed computed
+                    ? RowExpressions.movedColumn(computed.celExpr()) : null;
+            if (moved != null && !upstream.columns().containsKey(moved)) {
+                moved = null;
+            }
+            String source = rule instanceof FieldRule.Rename rename ? rename.sourceField()
+                    : moved != null ? moved : output;
+            if (rule == null || rule instanceof FieldRule.Rename || moved != null) {
                 String origin = upstream.origins().get(source);
                 if (origin != null) {
                     origins.put(output, origin);

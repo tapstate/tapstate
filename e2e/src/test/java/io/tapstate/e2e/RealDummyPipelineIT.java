@@ -350,7 +350,7 @@ class RealDummyPipelineIT {
                 var sinkLimited = sampleCdcRate(control, documents, "sink_limited", 10, 1);
                 assertThat(limited.sourcePerSecond()).isBetween(5.0, 15.0);
                 // An unrestricted source can fill the bounded direct channel during warm-up.
-                assertThat(unrestricted.sourceFrom()).isGreaterThan(limited.sourceFrom());
+                assertThat(unrestricted.sourceFrom()).isGreaterThan(2 * limited.sourceFrom());
                 assertThat(unrestricted.outputPerSecond()).isGreaterThan(2 * limited.outputPerSecond());
                 assertThat(sinkLimited.sourcePerSecond()).isBetween(5.0, 15.0);
                 assertThat(sinkLimited.outputPerSecond()).isLessThan(limited.outputPerSecond());
@@ -367,12 +367,12 @@ class RealDummyPipelineIT {
         applyRatePipeline(control, id, sourceLimit, sinkLimit);
         long startRequested = System.nanoTime();
         control.lifecycle(id, LifecycleVerb.START);
-        var from = Await.answered(id + " warm-up with acknowledged output", Duration.ofSeconds(30),
+        var from = Await.answered(id + " warm-up with acknowledged output", Duration.ofSeconds(20),
                 () -> rateReading(control, id));
         long sourceFrom = capturedRows(documents, id);
         long warmupMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startRequested);
         // The observation publisher can re-publish the same underlying job counters.
-        var to = Await.answered(id + " fresh counters after the measurement window", Duration.ofSeconds(30),
+        var to = Await.answered(id + " fresh counters after the measurement window", Duration.ofSeconds(15),
                 () -> rateReading(control, id).filter(reading ->
                         !reading.at().isBefore(from.at().plusSeconds(3)) && reading.output() > from.output()));
         var rate = new CdcRate(from, to, sourceFrom, capturedRows(documents, id));
@@ -403,12 +403,7 @@ class RealDummyPipelineIT {
     }
 
     private static Optional<RateReading> rateReading(ControlPlane control, String id) {
-        Optional<PipelineState> state;
-        try {
-            state = control.state(id);
-        } catch (AssertionError ignored) {
-            return Optional.empty();
-        }
+        var state = control.state(id);
         if (state.filter(PipelineState.FAILED::equals).isPresent()) {
             throw new AssertionError(id + " failed while measuring rates: " + control.logs(id));
         }
