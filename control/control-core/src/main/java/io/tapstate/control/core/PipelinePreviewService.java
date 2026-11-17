@@ -42,6 +42,7 @@ public final class PipelinePreviewService {
     private static final String ORIGIN_KEY = "origin";
     private static final String ANNOTATION_KEY = "annotation";
     private static final String COMPUTED = "computed";
+    private static final String UNKNOWN = "unknown";
 
     public static final int DEFAULT_ROOT_LIMIT = 100;
     public static final Duration DEADLINE = Duration.ofSeconds(45);
@@ -320,7 +321,7 @@ public final class PipelinePreviewService {
     }
 
     private static Map<String, Object> transformContext(Step step, TransformBody body) {
-        String type = body == null ? "unknown" : body.type();
+        String type = body == null ? UNKNOWN : body.type();
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("id", "transform:" + step.id());
         context.put(KIND_KEY, "transform");
@@ -340,9 +341,9 @@ public final class PipelinePreviewService {
         } else if (body instanceof TransformBody.Filter) {
             context.put("countEffect", "drop");
         } else if (body instanceof TransformBody.Js) {
-            context.put(ORIGIN_KEY, "unknown");
+            context.put(ORIGIN_KEY, UNKNOWN);
             context.put("lastChangedBy", step.id());
-            context.put("determinism", "unknown");
+            context.put("determinism", UNKNOWN);
             pointerPatternsComplete = false;
         } else if (body instanceof TransformBody.Union) {
             context.put("countEffect", "merge");
