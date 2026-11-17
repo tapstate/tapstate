@@ -18,6 +18,18 @@ class MongoUriUserInfoTest {
     }
 
     @Test
+    void diagnosticArgumentsHideTheRawAndDecodedUsernameOnItsOwn() {
+        String uri = "mongodb://al%69ce+data:pa%40ss@cluster.example/test";
+
+        assertThat(MongoUriUserInfo.diagnosticSecretValues(uri))
+                .containsExactly("al%69ce+data:pa%40ss", "pa%40ss", "pa@ss", "al%69ce+data", "alice+data");
+        assertThat(MongoUriUserInfo.secretValues(uri))
+                .containsExactly("al%69ce+data:pa%40ss", "pa%40ss", "pa@ss");
+        assertThat(MongoUriUserInfo.diagnosticSecretValues("mongodb://al%69ce@cluster.example/test"))
+                .containsExactly("al%69ce", "alice");
+    }
+
+    @Test
     void leavesAConnectionWithoutUserInfoVisible() {
         String uri = "mongodb://db-a.example:27017,db-b.example:27017/test?replicaSet=rs0";
 

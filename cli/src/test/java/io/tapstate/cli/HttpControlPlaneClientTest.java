@@ -1497,6 +1497,45 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void testAndLatestReadTheSameOptionalDiagnosticWithoutChangingLegacyChecks() throws Exception {
+        HttpServer server = apiServer("/api/connections", 200, """
+                {
+                  "connectionId": "orders",
+                  "connectorId": "mysql",
+                  "outcome": "FAILED",
+                  "testedAt": 1752000000000,
+                  "checks": [
+                    {"name": "Connect", "status": "FAILED", "message": "Try again",
+                     "diagnostic": {"code": "TS0060001", "causes": [
+                       {"code": "MYSQL43001", "arguments": ["orders", "primary"]},
+                       {"message": "Second cause", "references": [{"type": "connection", "id": "orders"}]}
+                     ], "futureField": "ignored"}},
+                    {"name": "Read log", "status": "WARNING", "reason": "Legacy reason",
+                     "diagnostic": {"cause": {"code": "DRIVER"}, "causes": [], "truncated": true}}
+                  ]
+                }
+                """, new AtomicReference<>());
+        try {
+            HttpControlPlaneClient client = new HttpControlPlaneClient();
+            ConnectionTestOutcome.Tested immediate = (ConnectionTestOutcome.Tested)
+                    client.test(baseOf(server), "tok", "orders", "mysql", Map.of());
+            ConnectionTestResultOutcome.Found latest = (ConnectionTestResultOutcome.Found)
+                    client.testResult(baseOf(server), "tok", "orders");
+
+            assertThat(latest.report()).isEqualTo(immediate.report());
+            assertThat(latest.report().checks()).containsExactly(
+                    new ConnectionReport.Check("Connect", "FAILED", "Try again", null, null, null,
+                            Map.of("code", "TS0060001", "causes", List.of(
+                                    Map.of("code", "MYSQL43001", "arguments", List.of("orders", "primary")),
+                                    Map.of("message", "Second cause", "references",
+                                            List.of(Map.of("type", "connection", "id", "orders")))))),
+                    new ConnectionReport.Check("Read log", "WARNING", null, "Legacy reason", null, null));
+        } finally {
+            server.stop(0);
+        }
+    }
+
+    @Test
     void testResultReturnsRejectedWithTheServerCodeAndMessageOnACodedErrorStatus() throws Exception {
         HttpServer server = apiServer("/api/connections/", 403,
                 "{\"code\":\"control.forbidden\",\"params\":{},\"message\":\"You lack the grade.\"}",
@@ -1516,6 +1555,29 @@ class HttpControlPlaneClientTest {
         assertThat(new HttpControlPlaneClient()
                 .testResult(unreachableBase(), "tok", "c"))
                 .isInstanceOf(ConnectionTestResultOutcome.Unreachable.class);
+    }
+
+    @Test
+    void preservesTheDiagnosticOfARefusedConnectionRequestInBothPaths() throws Exception {
+        HttpServer server = apiServer("/api/connections", 500, """
+                {"code":"connector.test-failed","message":"Unable to run the test",
+                 "params":{"connector":"postgres"},
+                 "diagnostic":{"causes":[{"code":"DRIVER"}],"truncated":true}}
+                """, new AtomicReference<>());
+        try {
+            var client = new HttpControlPlaneClient();
+            var params = Map.<String, Object>of("connector", "postgres");
+            var diagnostic = Map.<String, Object>of(
+                    "causes", List.of(Map.of("code", "DRIVER")), "truncated", true);
+            assertThat(client.test(baseOf(server), "tok", "orders", "postgres", Map.of()))
+                    .isEqualTo(new ConnectionTestOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+            assertThat(client.testResult(baseOf(server), "tok", "orders"))
+                    .isEqualTo(new ConnectionTestResultOutcome.Rejected(
+                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+        } finally {
+            server.stop(0);
+        }
     }
 
     // --- schema discovery: POST /api/connections:discover-schema, decodes the discovered model ---------

@@ -78,7 +78,7 @@ class CliFaceProjectionGatesTest {
      * registry with no verb must turn this gate red, and deleting its entry is how it earns one.
      */
     private static final Set<String> DEFERRED_WITH_NO_VERB = Set.of(
-            "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check",
+            "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
             "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
             "auth.current-user",
             "connector.get",
