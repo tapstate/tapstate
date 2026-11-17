@@ -158,6 +158,24 @@ class ConnectionTestResultQueryServiceTest {
     }
 
     @Test
+    void hidesAnIncompleteCredentialDumpAfterACompleteOneInStoredDiagnostics() {
+        String credentials = "MongoCredential{userName='first', mechanismProperties=<hidden>}"
+                + " then MongoCredential{userName='hidden-tail-user'";
+        String proxy = "ProxySettings{username=first, password=first-secret}"
+                + " then ProxySettings{username=hidden-tail-proxy, password=hidden-tail-secret";
+        MapResultStore store = new MapResultStore();
+        store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
+                List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
+                        "Login failed", null, null, null,
+                        Map.of("rawMessage", credentials, "stackTrace", proxy))), 1_700_000_000_000L, true));
+
+        var diagnostic = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()
+                .checks().getFirst().diagnostic();
+        assertThat(diagnostic).containsEntry("rawMessage", "MongoCredential<redacted>")
+                .containsEntry("stackTrace", "ProxySettings<redacted>");
+    }
+
+    @Test
     void aNullConnectionIdIsRejected() {
         ConnectionTestResultQueryService query = new ConnectionTestResultQueryService(new MapResultStore());
         assertThatThrownBy(() -> query.find(null)).isInstanceOf(NullPointerException.class);
