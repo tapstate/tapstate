@@ -54,12 +54,30 @@ def check(workflows, contexts, inputs):
         'matrix IDs must come from the actual emitted plan'
     build = ci.get('build', '')
     assert build, 'required check build must exist'
-    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('test-shards', 'build', 'image-smoke')]
+    versions = [re.findall(r"java-version:\s*['\"]([^'\"]+)['\"]", ci.get(role, '')) for role in ('snapshot-lock', 'test-shards', 'build', 'image-smoke')]
     assert all(len(value) == 1 for value in versions) and len({value[0] for value in versions}) == 1, \
         'test, build and image jobs must use the same Java version'
-    for role in ('test-shards', 'build'):
+    for role in ('snapshot-lock', 'test-shards', 'build'):
         assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
             'each receipt producer must verify the resolved Java build'
+    assert 'mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install' in ci['snapshot-lock'], \
+        'snapshot inputs must come from a complete reactor preparation'
+    lock = ci['snapshot-lock']
+    assert 'ci-maven-cache.sh seed-stable' in lock and 'ci-snapshot-lock.py capture' in lock, \
+        'one fresh dependency resolution must be captured before the workers'
+    assert 'needs: [shard-plan, snapshot-lock]' in ci['test-shards'], \
+        'workers must wait for the frozen snapshots'
+    for role in ('test-shards', 'build'):
+        block = ci[role]
+        assert 'name: ci-snapshot-lock' in block and 'ci-snapshot-lock.py restore' in block, \
+            'every producer must restore the same snapshot artifact'
+        assert "echo 'MAVEN_ARGS=-nsu'" in block, 'snapshot updates must be suppressed after restore'
+        assert 0 <= block.find('ci-snapshot-lock.py restore') < block.find('ci-build-observation.sh'), \
+            'the lock must be restored before each producer builds'
+    assert 'export MAVEN_ARGS="$MAVEN_ARGS -nsu"' in ci['test-shards'], \
+        'the test step must retain the snapshot lock when it sets test arguments'
+    assert 'python3 .github/scripts/ci-snapshot-lock-smoke.py' in ci['catalog-scripts'], \
+        'snapshot lock controls must run in CI'
     assert not re.search(r'^\s+matrix:', build, re.M), 'build must not be a matrix'
     assert not re.search(r'^    name:', build, re.M), 'build must retain its check name'
     assert re.search(r'^    needs:.*test-shards', build, re.M), 'build must wait for all shards'
@@ -229,6 +247,13 @@ assert contexts, 'required context list is empty'
 check(workflows, contexts, inputs)
 mutations = 0
 for original, replacement in [
+    ('ci-maven-cache.sh seed-stable', 'ci-maven-cache.sh seed'),
+    ('ci-snapshot-lock.py capture', 'echo capture-removed'),
+    ('needs: [shard-plan, snapshot-lock]', 'needs: [shard-plan]'),
+    ('ci-snapshot-lock.py restore', 'echo restore-removed'),
+    ("echo 'MAVEN_ARGS=-nsu'", 'echo updates-not-suppressed'),
+    ('export MAVEN_ARGS="$MAVEN_ARGS -nsu"', 'echo test-updates-not-suppressed'),
+    ('python3 .github/scripts/ci-snapshot-lock-smoke.py', 'echo snapshot-smoke-removed'),
     ("java-version: '21.0.13+9.0.LTS'", "java-version: '21.0.12+8.0.LTS'"),
     ('Verify exact Java build', 'Missing exact Java build'),
     (MAVEN_ARGS, ''),
