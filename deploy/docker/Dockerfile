@@ -124,7 +124,7 @@ ENV LOGGING_LEVEL_IO_TAPSTATE_DIAGNOSTICS_HTTP=DEBUG
 RUN set -eu; \
     cd /opt/tapstate/connectors; \
     sha256sum -c /opt/tapstate/release/connectors.sha256; \
-    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 8
+    test "$(find . -maxdepth 1 -type f -name '*-connector.jar' | wc -l | tr -d ' ')" = 9
 
 FROM runtime-base AS onprem-base
 LABEL org.opencontainers.image.source="https://github.com/tapstate/tapstate" \

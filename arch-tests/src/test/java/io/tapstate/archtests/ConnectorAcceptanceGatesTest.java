@@ -222,7 +222,7 @@ class ConnectorAcceptanceGatesTest {
             "postgres", "aliyun-rds-postgres", "aliyun-adb-postgres", "polar-db-postgres",
             "tencent-db-postgres",
             "mongodb", "mongodb-atlas", "aliyun-db-mongodb", "tencent-db-mongodb", "oracle", "sqlserver",
-            "db2", "db2i");
+            "db2", "db2i", "dummy");
 
     @Test
     @DisplayName("what a shipped deployment accepts out of the box is exactly this set")
