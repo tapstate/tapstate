@@ -67,7 +67,7 @@ class HowHeavyStateIsToKeepIsCountedTest {
                 Map.of("n", RollupField.of(RollupFunction.COUNT, true, null, null, null)));
         assertThat(folds(policies)).isEqualTo(1);
         Embed plain = new Embed("policy", Map.of("customer_id", "customer_id"), EmbedAs.ARRAY, "policies", null,
-                List.of("policy_no"), null, null, null, null);
+                List.of("policy_no"), null, null, null, null, null);
         assertThat(folds(plain)).isZero();
     }
 

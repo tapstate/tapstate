@@ -37,6 +37,17 @@ public record RollupSpec(
 
     private static final long serialVersionUID = 1L;
 
+    /**
+     * A field computed outside any nest level, such as an aggregate step's: it renders no document, so no
+     * element boundary applies to it.
+     */
+    public RollupSpec(String field, RollupFunction function, String argument, List<String> by, String filter,
+            ValueType argumentType, ValueType resultType, RollupResultType convert, Object defaultValue,
+            Set<String> references) {
+        this(field, function, argument, by, filter, argumentType, resultType, convert, defaultValue, references,
+                Long.MAX_VALUE);
+    }
+
     public RollupSpec {
         Objects.requireNonNull(field, "field");
         Objects.requireNonNull(function, "function");
