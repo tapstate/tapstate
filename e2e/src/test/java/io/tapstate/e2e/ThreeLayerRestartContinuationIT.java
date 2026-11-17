@@ -7,6 +7,7 @@ import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
+import io.tapstate.core.lifecycle.TableSnapshot;
 import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.*;
 import io.tapstate.core.dsl.DslParser;
@@ -23,6 +24,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -136,7 +138,15 @@ class ThreeLayerRestartContinuationIT {
                 Await.until("the real bounded job and target writes to complete",BOUND,
                         () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent(),() -> control.logs(PIPELINE));
                 awaitRows(mongo,source,target,"the completed bounded target values");
-                assertThat(control.snapshotTable(PIPELINE,TABLE)).contains(new io.tapstate.core.lifecycle.TableSnapshot(8,8L,100,true));
+                var expectedSnapshot = new TableSnapshot(8, 8L, 100, true);
+                var completedSnapshot = new AtomicReference<Map<String, TableSnapshot>>(Map.of());
+                // The completion checkpoint precedes publication of the final snapshot observation.
+                Await.until("the completed bounded snapshot observation", BOUND, () -> {
+                    var reading = control.snapshotTables(PIPELINE);
+                    completedSnapshot.set(reading);
+                    return expectedSnapshot.equals(reading.get(TABLE));
+                }, () -> "pipeline=" + control.state(PIPELINE) + ", snapshot=" + completedSnapshot.get());
+                assertThat(completedSnapshot.get()).containsEntry(TABLE, expectedSnapshot);
                 var observed=Await.answered("the completed observation timestamp",BOUND,() -> control.observedAt(PIPELINE));
                 mongo.insert(source,TABLE,List.of(Map.of("id",99L,"seq",999L)));
                 lastObservation=Await.answered("another completed pass after capture cleanup",BOUND,
