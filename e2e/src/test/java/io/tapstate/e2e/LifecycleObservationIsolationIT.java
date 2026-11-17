@@ -31,7 +31,8 @@ class LifecycleObservationIsolationIT {
             return amount == value && recordsOut > prior.recordsOut && observedAt.isAfter(prior.observedAt);
         }
     }
-    private record Held(EventSet set, String stack, java.util.concurrent.atomic.AtomicBoolean draining,
+    private record Held(EventSet set, String stack, ThreadReference thread, ObjectReference observations,
+            java.util.concurrent.atomic.AtomicBoolean draining,
             Thread pendingEvents) implements AutoCloseable {
         @Override public void close() throws InterruptedException {
             set.resume();
@@ -41,7 +42,7 @@ class LifecycleObservationIsolationIT {
         }
     }
 
-    private static Held holding(VirtualMachine vm, EventSet set, String stack) {
+    private static Held holding(VirtualMachine vm, EventSet set, String stack, ThreadReference thread, ObjectReference observations) {
         // Deleting a request does not resume events already queued for another event thread.
         var draining = new java.util.concurrent.atomic.AtomicBoolean(true);
         var pending = Thread.startVirtualThread(() -> {
@@ -68,7 +69,7 @@ class LifecycleObservationIsolationIT {
                 } catch (VMDisconnectedException closed) { return; }
             }
         });
-        return new Held(set, stack, draining, pending);
+        return new Held(set, stack, thread, observations, draining, pending);
     }
 
     @org.junit.jupiter.api.BeforeAll static void requireConnectors() {
@@ -140,8 +141,9 @@ class LifecycleObservationIsolationIT {
                             stop.completeExceptionally(failure);
                         }
                     }))) {
-                        // Drain any work submitted before the scheduler was held, then ask for a new source update.
-                        Thread.sleep(3000);
+                        // Require a fresh request scheduled while A is held, rather than a pre-existing queued sample.
+                        invalidatePriorPeriodicRequests(vm, held);
+                        System.out.println("PRIOR_PERIODIC_REQUESTS_INVALIDATED pipeline=" + B);
                         beforeHold = read.get();
                         System.out.println("HOLD " + mode + " baseline=" + beforeHold + " stack=" + held.stack);
                         update(sb);
@@ -152,7 +154,7 @@ class LifecycleObservationIsolationIT {
                         var until = System.nanoTime() + DELIVERY.toNanos();
                         int polls = 0;
                         do {
-                            Thread.sleep(350);
+                            Await.pauseBeforeNextPoll(Duration.ofMillis(350));
                             endHold = read.get();
                             ++polls;
                         } while (System.nanoTime() < until && !endHold.follows(beforeHold, expect));
@@ -237,12 +239,28 @@ class LifecycleObservationIsolationIT {
                                 .reduce((x,y) -> x + " <- " + y).orElseThrow();
                         request.disable();
                         accepted = true;
-                        return holding(vm, set, bp.thread().name() + " " + stack);
+                        var driver = frames.stream().filter(f -> frameIs(f, DRIVER, "reconcile")
+                                || frameIs(f, DRIVER, "reconcilePipeline")).findFirst().orElseThrow().thisObject();
+                        var field = driver.referenceType().fieldByName("periodicObservations");
+                        var observations = field == null ? null : (ObjectReference) driver.getValue(field);
+                        return holding(vm, set, bp.thread().name() + " " + stack, bp.thread(), observations);
                     }
                 } finally { if (!accepted) set.resume(); }
             }
             throw new AssertionError("Never reached owned " + mode + " path for A");
         } finally { manager.deleteEventRequest(request); }
+    }
+
+    private static void invalidatePriorPeriodicRequests(VirtualMachine vm, Held held) {
+        // The legacy inline publisher has no queued work. Invalidation does not change B's intent or data.
+        if (held.observations() == null) return;
+        try {
+            var discard = held.observations().referenceType().methodsByName("discard").getFirst();
+            held.observations().invokeMethod(held.thread(), discard, List.of(vm.mirrorOf(B)),
+                    ObjectReference.INVOKE_SINGLE_THREADED);
+        } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException | InvocationException failure) {
+            throw new AssertionError("Could not invalidate requests preceding the held stop", failure);
+        }
     }
 
     private static boolean frameIs(StackFrame frame, String type, String method) {

@@ -137,7 +137,7 @@ class PeriodicObservationIsolationIT {
                         var until = System.nanoTime() + DELIVERY.toNanos();
                         int polls = 0;
                         do {
-                            Thread.sleep(350);
+                            Await.pauseBeforeNextPoll(Duration.ofMillis(350));
                             endHold = read.get();
                             ++polls;
                         } while (System.nanoTime() < until && !endHold.follows(beforeHold, expect));
