@@ -4,6 +4,7 @@ import io.tapstate.spi.store.ConnectionTestItem;
 import io.tapstate.spi.store.ConnectionTestResult;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The surface-facing report of a connection test: the control ring's own projection of the storage-port
@@ -41,11 +42,16 @@ public record ConnectionTestReport(
      */
     public record Check(
             String name, Status status, String message, String reason, String solution,
-            String connectorErrorCode) {
+            String connectorErrorCode, Map<String, Object> diagnostic) {
+
+        public Check(String name, Status status, String message, String reason,
+                String solution, String connectorErrorCode) {
+            this(name, status, message, reason, solution, connectorErrorCode, Map.of());
+        }
 
         static Check from(ConnectionTestItem item) {
             return new Check(item.name(), Status.valueOf(item.status().name()),
-                    item.message(), item.reason(), item.solution(), item.connectorErrorCode());
+                    item.message(), item.reason(), item.solution(), item.connectorErrorCode(), item.diagnostic());
         }
 
         /** The outcome of a single check. */
