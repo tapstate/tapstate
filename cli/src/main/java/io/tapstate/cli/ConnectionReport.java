@@ -1,6 +1,7 @@
 package io.tapstate.cli;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * The CLI's view of a connection test the server ran: the overall outcome, the per-check reports the
@@ -20,6 +21,11 @@ record ConnectionReport(
      */
     record Check(
             String name, String status, String message, String reason, String solution,
-            String connectorErrorCode) {
+            String connectorErrorCode, Map<String, Object> diagnostic) {
+
+        Check(String name, String status, String message, String reason, String solution,
+                String connectorErrorCode) {
+            this(name, status, message, reason, solution, connectorErrorCode, Map.of());
+        }
     }
 }

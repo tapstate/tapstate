@@ -78,6 +78,18 @@ class AiProviderController {
             CHECK_CAPACITY.release();
         }
     }
+    @Verb("ai-provider.models") @PostMapping("/ai-provider-settings:models")
+    ResponseEntity<Map<String, Object>> models(HttpServletRequest request, @RequestBody AiProviderSettings settings) {
+        var workspace = workspace(request);
+        if (!CHECK_CAPACITY.tryAcquire()) throw AiProviderService.error(ControlError.AI_OVERLOADED);
+        try {
+            var models = client.models(service().resolveModels(workspace.owner(), settings));
+            workspace.requireActive().run();
+            return ResponseEntity.ok().cacheControl(CacheControl.noStore()).body(Map.of("models", models));
+        } finally {
+            CHECK_CAPACITY.release();
+        }
+    }
     record Workspace(String owner, Runnable requireActive) { }
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {
