@@ -100,6 +100,64 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
+    @org.junit.jupiter.api.RepeatedTest(3)
+    void oneUncommittedTimeoutDoesNotTrapHealthyRenewalsBehindRepeatedConfirmation() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var id = IDS.getFirst();
+            var original = seedOne(io, owner, id);
+            var attempts = new java.util.concurrent.atomic.AtomicInteger();
+            var confirmations = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                int attempt = attempts.incrementAndGet();
+                if (attempt == 1) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.UNCONFIRMED, "one transient checkout timeout before commit");
+                long remaining = io.budget.get() - System.nanoTime();
+                io.allowances.add(remaining);
+                System.out.println("RENEWAL_RECOVERY attempt=" + attempt + " remainingMs="
+                        + TimeUnit.NANOSECONDS.toMillis(remaining));
+                long required = Duration.ofMillis(3500).toNanos();
+                if (remaining < required) {
+                    TimeUnit.NANOSECONDS.sleep(Math.max(0, remaining));
+                    throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.UNCONFIRMED,
+                            "the transaction exhausted its original allowance without committing");
+                }
+                Thread.sleep(3500);
+                io.syncClock();
+                return io.raw.renew(call.getArgument(0), call.getArgument(1));
+            }).when(io.store).renew(any(), any());
+            when(io.store.readPipeline(scope(id))).thenAnswer(call -> {
+                confirmations.incrementAndGet();
+                Thread.sleep(2200);
+                io.syncClock();
+                return io.raw.read(original.key());
+            });
+            io.localOffset.addAndGet(Duration.ofSeconds(10).toNanos());
+            owner.renewDue();
+            for (int retry = 0; retry < 3; retry++) {
+                io.localOffset.addAndGet(Duration.ofSeconds(2).toNanos());
+                owner.renewDue();
+                io.awaitQuiescence(deadline(5000));
+                if (retry == 0) {
+                    assertThat(confirmations).hasValue(1);
+                    assertThat(attempts).hasValue(1);
+                    assertThat(owner.permit(scope(id)).granted()).isFalse();
+                    assertThat(owner.beginExecution(scope(id), WorkloadClaimFence.from(original)).allowed()).isFalse();
+                }
+            }
+            assertThat(confirmations).hasValue(1);
+            assertThat(attempts).hasValue(2);
+            assertThat(io.allowances).hasSize(1).allSatisfy(allowance ->
+                    assertThat(allowance).isBetween(Duration.ofMillis(3500).toNanos(), Duration.ofSeconds(5).toNanos()));
+            var current = io.raw.read(original.key()).orElseThrow().claim();
+            System.out.println("RENEWAL_RECOVERY confirmations=" + confirmations.get()
+                    + " attempts=" + attempts.get() + " extended=" + current.leaseUntil().isAfter(original.leaseUntil()));
+            assertThat(WorkloadClaimFence.from(current)).isEqualTo(WorkloadClaimFence.from(original));
+            assertThat(current.leaseUntil()).as("healthy IO after one transient failure can renew the original tenure")
+                    .isAfter(original.leaseUntil());
+        }
+    }
+
     @Test void independentRenewalsDoNotSpendTheUncontactedTailsBudget() throws Exception {
         try (var io = new ControlledIo()) {
             var owner = io.owner();

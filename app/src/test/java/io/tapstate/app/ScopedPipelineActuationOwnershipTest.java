@@ -269,9 +269,91 @@ class ScopedPipelineActuationOwnershipTest {
             assertThat(renewals).hasValue(1);
             assertThat(owner.proveExecution(run.fence())).isFalse();
         } else {
+            assertThat(renewals).hasValue(1);
+            assertThat(owner.permit(FIRST).granted()).isFalse();
+            raw.elapse(Duration.ofSeconds(1));
+            nanos.addAndGet(Duration.ofSeconds(1).toNanos());
+            owner.renewDue();
             assertThat(renewals).hasValue(2);
             assertThat(WorkloadClaimFence.from(owner.permit(FIRST).claim())).isEqualTo(run.claimFence());
         }
+        assertThat(acquisitions).hasValue(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"expired", "replacement", "missing", "membership", "shutdown"})
+    void anUnchangedConfirmationCannotReviveALostOriginalLeaseOnTheNextAttempt(String loss) {
+        var owner = ownership();
+        var permit = owner.permit(FIRST);
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(permit.claim()));
+        var original = raw.read(KEY).orElseThrow().claim();
+        var renewals = new AtomicInteger();
+        doAnswer(call -> {
+            if (renewals.incrementAndGet() == 1)
+                throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), new java.util.concurrent.TimeoutException());
+            assertThat(WorkloadClaimFence.from(call.<WorkloadClaim>getArgument(0))).isEqualTo(run.claimFence());
+            return raw.renew(call.getArgument(0), call.getArgument(1));
+        }).when(store).renew(any(), any());
+        raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        assertThat(renewals).hasValue(1);
+        assertThat(owner.permit(FIRST).granted()).isFalse();
+        switch (loss) {
+            case "expired" -> { raw.elapse(TTL);nanos.addAndGet(TTL.toNanos()); }
+            case "replacement" -> {
+                assertThat(raw.release(original)).isTrue();
+                assertThat(raw.acquire(KEY, new WorkloadOwner("node-b", "replacement-boot"), 1, TTL).acquired()).isTrue();
+            }
+            case "missing" -> {
+                doReturn(java.util.Optional.empty()).when(store).renew(any(), any());
+                doReturn(java.util.Optional.empty()).when(store).readPipeline(FIRST);
+            }
+            case "membership" -> membership.canCommit(Set.of("node-a"));
+            case "shutdown" -> owner.stopForShutdown();
+            default -> throw new AssertionError(loss);
+        }
+        raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        assertThat(owner.proveExecution(run.fence())).isFalse();
+        assertThat(acquisitions).hasValue(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "expired", "replacement", "unavailable"})
+    void confirmationRefusalOrRepeatedTimeoutNeverWritesBeyondTheOriginalLease(String result) {
+        var owner = ownership();
+        var run = owner.beginExecution(FIRST, WorkloadClaimFence.from(owner.permit(FIRST).claim()));
+        var original = raw.read(KEY).orElseThrow().claim();
+        var renewals = new AtomicInteger();
+        doAnswer(call -> {
+            renewals.incrementAndGet();
+            throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), new java.util.concurrent.TimeoutException());
+        }).when(store).renew(any(), any());
+        var confirmations = new AtomicInteger();
+        doAnswer(call -> {
+            confirmations.incrementAndGet();
+            return switch (result) {
+                case "missing" -> java.util.Optional.empty();
+                case "expired" -> { raw.elapse(TTL);yield raw.read(KEY); }
+                case "replacement" -> {
+                    assertThat(raw.release(original)).isTrue();
+                    raw.acquire(KEY, new WorkloadOwner("node-b", "replacement-boot"), 1, TTL);
+                    yield raw.read(KEY);
+                }
+                case "unavailable" -> throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,
+                        Map.of(), new java.util.concurrent.TimeoutException());
+                default -> throw new AssertionError(result);
+            };
+        }).when(store).readPipeline(FIRST);
+        raw.elapse(RENEW);nanos.addAndGet(RENEW.toNanos());owner.renewDue();
+        for (int second = 0; second < TTL.toSeconds() + 1; second++) {
+            raw.elapse(Duration.ofSeconds(1));nanos.addAndGet(Duration.ofSeconds(1).toNanos());owner.renewDue();
+        }
+        assertThat(renewals).hasValue(1);
+        if (!result.equals("unavailable")) assertThat(confirmations).hasValue(1);
+        int completed = confirmations.get();
+        nanos.addAndGet(TTL.toNanos());owner.renewDue();
+        assertThat(confirmations).hasValue(completed);
+        assertThat(owner.beginExecution(FIRST, run.claimFence()).allowed()).isFalse();
         assertThat(acquisitions).hasValue(1);
     }
 

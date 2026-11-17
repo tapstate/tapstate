@@ -851,7 +851,6 @@ final class PipelineActuationOwnership {
                         lease.expected().key().resourceId(), lease.expected().claimGeneration(),
                         lease.expected().executionGeneration(), TimeUnit.NANOSECONDS.toMillis(lease.deadline() - now),
                         lease.expected().leaseUntil(), lease.retries() + 1);
-                long attemptDeadline = now + budget;
                 if (confirm) {
                     var readback = claims.confirmPipelineRenewal(state.scope, lease.expected(), budget);
                     var exact = WorkloadClaimFence.from(lease.expected());
@@ -867,10 +866,8 @@ final class PipelineActuationOwnership {
                             renewedDue = now + Math.min(renewIntervalNanos, remaining / 2);
                             LOG.log(System.Logger.Level.DEBUG, "Confirmed earlier Pipeline renewal for {0}", exact.key().resourceId());
                         } else {
-                            long started = nanoTime.getAsLong();
-                            renewed = renewOriginal(lease, attemptDeadline - started);
-                            renewedDeadline = started + ttl.toNanos();
-                            renewedDue = started + renewIntervalNanos;
+                            // A confirmed unchanged lease gets a separate renewal attempt before its original deadline.
+                            retry = true;
                         }
                     }
                 } else renewed = renewOriginal(lease, budget);
