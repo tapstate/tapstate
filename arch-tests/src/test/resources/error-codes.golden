@@ -376,6 +376,7 @@ nest.key-change-tracking-requires-before-image
 nest.memory-budget-below-partition-count
 nest.memory-budget-changed-while-running
 nest.migration-parking-limit-exceeded
+nest.or-on-not-a-reference
 nest.parent-absent
 nest.pending-limit-exceeded
 nest.reference-fanout-limit-exceeded

@@ -1085,6 +1085,9 @@ nest.key-ambiguous:
 nest.referenced-level-carries-embeds:
   message: "{embedPath} is a row this document points at rather than one grouped under it, and it carries embeds of its own: {children}."
   solution: "Move those embeds to a level the document holds, or join {table} the other way round so its rows hang under this document instead of being pointed at."
+nest.or-on-not-a-reference:
+  message: "Embed {embedPath} lists orOn alternatives, and one of them matches on {fields}, which identifies its parent ({parentKey})."
+  solution: "Use orOn only where the parent points at one shared row, such as a location looked up by code or by hub id. An embed that gathers several rows under its parent matches on one condition; give it a single on."
 nest.resolver-vertex-limit-exceeded:
   message: "This nest compiles to {vertices} resolver vertices, past the limit of {limit}."
   solution: "Flatten the tree or split the pipeline: every vertex takes a thread of its own."

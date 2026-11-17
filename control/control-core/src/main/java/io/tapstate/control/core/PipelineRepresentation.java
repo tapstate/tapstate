@@ -456,6 +456,9 @@ public final class PipelineRepresentation {
             Map<String, Object> value = new LinkedHashMap<>();
             value.put("from", embed.from());
             value.put("on", embed.on());
+            if (embed.orOn() != null) {
+                value.put("orOn", embed.orOn());
+            }
             value.put("as", embed.as() == null ? null : embed.as().name());
             if (embed.as() != EmbedAs.FLAT && embed.as() != EmbedAs.ROLLUP) {
                 value.put("path", embed.path());
@@ -718,7 +721,28 @@ public final class PipelineRepresentation {
                     booleanOrNull(value(value, "ignoreUpdates", "ignore_updates"), entryPath + ".ignoreUpdates"),
                     booleanOrNull(value(value, "trackKeyChanges", "track_key_changes"), entryPath + ".trackKeyChanges"),
                     embeds(listOrNull(value(value, "embed"), entryPath + ".embed"), entryPath + ".embed"),
-                    rollup));
+                    rollup,
+                    alternatives(listOrNull(value(value, "orOn", "or_on"), entryPath + ".orOn"), entryPath + ".orOn")));
+        }
+        return List.copyOf(result);
+    }
+
+    /** An embed's orOn alternatives, each an object of child field to parent field; null when absent. */
+    private static List<Map<String, String>> alternatives(List<?> values, String path) {
+        if (values == null) {
+            return null;
+        }
+        if (values.isEmpty()) {
+            throw malformed(path + " must list at least one alternative");
+        }
+        List<Map<String, String>> result = new ArrayList<>(values.size());
+        for (int index = 0; index < values.size(); index++) {
+            String entryPath = path + "[" + index + "]";
+            Map<String, String> alternative = stringMap(object(values.get(index), entryPath), entryPath);
+            if (alternative.isEmpty()) {
+                throw malformed(entryPath + " must map at least one field");
+            }
+            result.add(alternative);
         }
         return List.copyOf(result);
     }
