@@ -115,15 +115,24 @@ class PipelinePreviewServiceTest {
         assertThat(contexts).anySatisfy(value -> {
             Map<?, ?> context = (Map<?, ?>) value;
             if ("transform:map".equals(context.get("id"))) {
-                assertThat((List<?>) context.get("effects")).hasSize(4);
+                assertThat((List<?>) context.get("effects")).hasSize(5);
                 assertThat(((List<?>) context.get("pointerPatterns")).stream().map(String.class::cast).toList())
-                        .contains("/renamed~1field", "/total", "/constant", "/secret");
+                        .contains("/renamed~1field", "/total", "/constant", "/secret", "/is_deleted");
             }
         }).anySatisfy(value -> {
             Map<?, ?> context = (Map<?, ?>) value;
             assertThat(context.get("id")).isEqualTo("relation:nest:items/labels");
             assertThat(context.get("parentPointerPattern")).isEqualTo("/items");
             assertThat(context.get("pointerPatterns")).isEqualTo(List.of("/items/labels"));
+        });
+        // The soft-delete marker is written per row - true on the update a delete becomes - so it is
+        // not reported as a constant. Read off the map's own context, so no other context can answer.
+        Map<?, ?> mapContext = contexts.stream().map(Map.class::cast)
+                .filter(context -> "transform:map".equals(context.get("id"))).findFirst().orElseThrow();
+        assertThat((List<?>) mapContext.get("effects")).anySatisfy(effect -> {
+            Map<?, ?> marker = (Map<?, ?>) effect;
+            assertThat(marker.get("pointer")).isEqualTo("/is_deleted");
+            assertThat(marker.get("kind")).isEqualTo("computed");
         });
         session.cancel();
         assertThat(cancellations).hasValue(1);
@@ -237,7 +246,7 @@ class PipelinePreviewServiceTest {
         fields.put("constant", FieldRule.literal("value"));
         fields.put("secret", FieldRule.drop());
         Step map = Step.inline("map", FromClause.list(FromRef.literal("source.orders")),
-                new TransformBody.MapProjection(fields), null);
+                new TransformBody.MapProjection(fields, "is_deleted"), null);
         Step filter = Step.inline("filter", FromClause.list(FromRef.literal("map")),
                 new TransformBody.Filter("true"), null);
         Step unwind = Step.inline("unwind", FromClause.list(FromRef.literal("filter")),

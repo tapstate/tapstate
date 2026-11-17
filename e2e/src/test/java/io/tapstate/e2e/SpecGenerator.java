@@ -176,10 +176,8 @@ final class SpecGenerator {
 
     /** The two scalars every store in this vocabulary spells the same way. */
     private static Map<String, Object> scalarValue() {
-        Map<String, Object> value = new LinkedHashMap<>();
-        value.put("type", List.of("integer", "string"));
-        value.put("description", "An integer or a string; wider value types are a widening of the vocabulary.");
-        return value;
+        return valueOf(List.of("integer", "string"),
+                "An integer or a string; wider value types are a widening of the vocabulary.");
     }
 
     /**
@@ -188,9 +186,14 @@ final class SpecGenerator {
      * and locators stay on the two scalars every store spells the same way.
      */
     private static Map<String, Object> expectedValue() {
+        return valueOf(List.of("integer", "string", "boolean"),
+                "An integer, a string or a boolean; wider value types are a widening of the vocabulary.");
+    }
+
+    private static Map<String, Object> valueOf(List<String> types, String description) {
         Map<String, Object> value = new LinkedHashMap<>();
-        value.put("type", List.of("integer", "string", "boolean"));
-        value.put("description", "An integer, a string or a boolean; wider value types are a widening of the vocabulary.");
+        value.put("type", types);
+        value.put("description", description);
         return value;
     }
 

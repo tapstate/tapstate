@@ -17,6 +17,7 @@ import io.tapstate.core.dsl.UnwindWriteKeys;
 import io.tapstate.core.lifecycle.ParallelismBudget;
 import io.tapstate.core.lifecycle.PipelineStateHolding;
 import io.tapstate.core.lifecycle.PipelineStateInventory;
+import io.tapstate.core.model.FieldRule;
 import io.tapstate.core.model.FromClause;
 import io.tapstate.core.model.FromRef;
 import io.tapstate.core.model.PipelineNode;
@@ -1406,11 +1407,12 @@ final class StoreBackedDagSource implements DagSource {
             if (!(inline.body() instanceof TransformBody.Nest nest)) {
                 continue;
             }
-            NestTable root = assembledRootTable(pipeline, nest, byAlias, sourceVertices);
+            RootTable root = assembledRootTable(pipeline, nest, byAlias, sourceVertices);
             if (root == null) {
                 continue;
             }
-            TargetTable model = bySourceTable.get(root.name());
+            TargetTable source = bySourceTable.get(root.name());
+            TargetTable model = source == null ? null : projectedModel(source, root.projections());
             assembled.put(step.id(), model != null
                     ? TargetModelResolver.keyedOn(model, nest.root().key())
                     : new TargetTable(root.name(), List.of()));
@@ -3450,7 +3452,7 @@ final class StoreBackedDagSource implements DagSource {
                 continue;
             }
             aliases.aliases().forEach((alias, ref) -> {
-                NestTable resolved = nestTable(ref, sourceTables);
+                NestTable resolved = keyedThroughSteps(pipeline, ref, nestTable(ref, sourceTables), sourceTables);
                 NestTable existing = byAlias.putIfAbsent(alias, resolved);
                 if (existing != null && !existing.name().equals(resolved.name())) {
                     throw new IllegalStateException("alias '" + alias + "' names table '" + existing.name()
@@ -3460,6 +3462,29 @@ final class StoreBackedDagSource implements DagSource {
             });
         }
         return byAlias;
+    }
+
+    /**
+     * An alias over a map or a filter keyed as the table that step's rows come from. The step writes
+     * that table's rows one for one, so its key - under the names the maps gave it - identifies them;
+     * without this an alias that leaves its key to discovery is refused for having none. The name is
+     * left as the alias resolved it, since state is named after it, and so are the fields, which only
+     * feed a collision check that a map's computed columns would make incomplete.
+     */
+    private NestTable keyedThroughSteps(PipelineResource pipeline, FromRef ref, NestTable resolved,
+            Map<String, SourceVertex> sourceTables) {
+        if (!resolved.primaryKey().isEmpty() || !resolved.uniqueIndexes().isEmpty()) {
+            return resolved;
+        }
+        RowPreservingSource walked = rowPreservingSource(pipeline, ref, sourceTables);
+        if (walked == null) {
+            return resolved;
+        }
+        NestTable behind = nestTable(FromRef.literal(walked.stream()), sourceTables);
+        return new NestTable(resolved.name(), projectedKey(behind.primaryKey(), walked.projections()),
+                behind.uniqueIndexes().stream()
+                        .map(index -> projectedKey(index, walked.projections())).toList(),
+                resolved.fields());
     }
 
     /** One alias's table: its discovered key when the reference names a table, no key otherwise. */
@@ -4246,7 +4271,7 @@ final class StoreBackedDagSource implements DagSource {
             Step step = stepOf(pipeline, stream);
             String table = null;
             if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest) {
-                NestTable root = assembledRootTable(pipeline, nest, roots, vertices);
+                RootTable root = assembledRootTable(pipeline, nest, roots, vertices);
                 if (root != null) table = root.name();
             } else if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Join) {
                 // A join's compiled fact name retains qualification when physical source names repeat.
@@ -4273,41 +4298,125 @@ final class StoreBackedDagSource implements DagSource {
      * <p>Anything else - a script, a union, an unwind, a nest - stops the walk where it is, since what
      * such a step emits is not the table it reads one row for one row.
      */
-    private NestTable assembledRootTable(PipelineResource pipeline, TransformBody.Nest nest,
+    private RootTable assembledRootTable(PipelineResource pipeline, TransformBody.Nest nest,
             Map<String, NestTable> byAlias, Map<String, SourceVertex> sourceVertices) {
         NestTable alias = byAlias.get(nest.root().from());
-        if (alias == null || !alias.primaryKey().isEmpty()) {
-            return alias;
+        if (alias == null) {
+            return null;
         }
-        FromRef ref = null;
+        Map<String, SourceVertex> sourceTables = sourceTablesByName(sourceVertices);
+        RowPreservingSource walked = rowPreservingSource(pipeline, aliasRef(pipeline, nest), sourceTables);
+        return walked == null
+                ? new RootTable(alias, List.of())
+                : new RootTable(nestTable(FromRef.literal(walked.stream()), sourceTables), walked.projections());
+    }
+
+    /**
+     * The table an assembly's documents land in, and the maps between that table and the nest, nearest
+     * the table first. The maps are what turn the table's column names into the ones the root's key is
+     * written in.
+     */
+    private record RootTable(NestTable table, List<Map<String, FieldRule>> projections) {
+        String name() {
+            return table.name();
+        }
+    }
+
+    /** The reference a nest step binds its root alias to, or null where the step declares no aliases. */
+    private static FromRef aliasRef(PipelineResource pipeline, TransformBody.Nest nest) {
         for (Step step : pipeline.transforms()) {
             if (step instanceof Step.Inline inline && inline.body() == nest
                     && inline.from() instanceof FromClause.Aliases aliases) {
-                ref = aliases.aliases().get(nest.root().from());
+                return aliases.aliases().get(nest.root().from());
             }
         }
-        FromRef table = rowPreservingSource(pipeline, ref);
-        if (table instanceof FromRef.Literal literal && sourceVertices.containsKey(literal.ref())) {
-            // A source selecting one table is read by its id; the table it selects is what the walk ends at.
-            table = FromRef.literal(sourceVertices.get(literal.ref()).table());
-        }
-        return table == null || table.equals(ref) ? alias : nestTable(table, sourceTablesByName(sourceVertices));
+        return null;
     }
 
-    /** {@code ref} followed back through single-input maps and filters; null where it is not a literal. */
-    private static FromRef rowPreservingSource(PipelineResource pipeline, FromRef ref) {
+    /**
+     * Where the rows behind a reference come from when they reach it one row per source row: the source
+     * stream, and the maps they passed on the way, nearest the source first.
+     *
+     * <p>The walk follows single-input maps and filters only. It answers null where the reference is not
+     * a step at all (it already names its table), and where the walk stops at any other step - a script,
+     * a union, an unwind, a nest - because what such a step emits is not the table it reads, and naming
+     * that step's input as the table would move an existing target somewhere its rows never were.
+     *
+     * <p>A source that selects one table is read by its id, and that id is not a stream: the walk ends
+     * at the stream that source's table is read as, which keeps a requalified stream - two sources
+     * reading tables of one name - attached to the source it was named through.
+     */
+    private static RowPreservingSource rowPreservingSource(PipelineResource pipeline, FromRef ref,
+            Map<String, SourceVertex> sourceTables) {
+        List<Map<String, FieldRule>> projections = new ArrayList<>();
         Set<String> seen = new HashSet<>();
-        while (ref instanceof FromRef.Literal literal && seen.add(literal.ref())) {
+        boolean walked = false;
+        while (ref instanceof FromRef.Literal literal) {
             Step step = stepOf(pipeline, literal.ref());
-            if (!(step instanceof Step.Inline inline)
+            if (step == null) {
+                if (!walked) {
+                    return null;
+                }
+                projections = new ArrayList<>(projections);
+                java.util.Collections.reverse(projections);
+                return new RowPreservingSource(streamOf(literal.ref(), sourceTables), List.copyOf(projections));
+            }
+            if (!seen.add(literal.ref()) || !(step instanceof Step.Inline inline)
                     || !(inline.body() instanceof TransformBody.MapProjection
                             || inline.body() instanceof TransformBody.Filter)
                     || !(inline.from() instanceof FromClause.Flow flow) || flow.refs().size() != 1) {
-                break;
+                return null;
             }
+            if (inline.body() instanceof TransformBody.MapProjection projection) {
+                projections.add(projection.fields());
+            }
+            walked = true;
             ref = flow.refs().get(0);
         }
-        return ref instanceof FromRef.Literal ? ref : null;
+        return null;
+    }
+
+    private record RowPreservingSource(String stream, List<Map<String, FieldRule>> projections) { }
+
+    /** A reference as the stream it reads: a stream or table name as written, a one-table source's id as that table's stream. */
+    private static String streamOf(String ref, Map<String, SourceVertex> sourceTables) {
+        if (sourceTables.containsKey(ref)) {
+            return ref;
+        }
+        Set<String> streams = new LinkedHashSet<>();
+        sourceTables.values().stream().filter(vertex -> vertex.sourceId().equals(ref))
+                .forEach(vertex -> streams.add(vertex.stream()));
+        return streams.size() == 1 ? streams.iterator().next() : ref;
+    }
+
+    /** Key columns as they are named after the given maps, nearest the source first. */
+    private static List<String> projectedKey(List<String> key, List<Map<String, FieldRule>> projections) {
+        List<String> current = key;
+        for (Map<String, FieldRule> rules : projections) {
+            current = KeyProjection.renamed(current, rules);
+        }
+        return current;
+    }
+
+    /**
+     * A source table's model with the columns the given maps renamed under their new names, so a key
+     * written in the names the nest sees finds its columns. Columns no map renamed keep their names;
+     * nothing is added for literal or computed values, whose types the source model does not know.
+     */
+    private static TargetTable projectedModel(TargetTable model, List<Map<String, FieldRule>> projections) {
+        if (projections.isEmpty()) {
+            return model;
+        }
+        List<TargetField> fields = model.fields().stream()
+                .map(field -> new TargetField(projectedKey(List.of(field.name()), projections).get(0),
+                        field.type(), field.primaryKey(), field.inferredType(), field.numericType(),
+                        field.stringType()))
+                .toList();
+        List<TargetIndex> indexes = model.indexes().stream()
+                .map(index -> new TargetIndex(projectedKey(index.fields(), projections), index.unique(),
+                        index.constrainsEveryRow()))
+                .toList();
+        return new TargetTable(model.name(), fields, indexes, model.unwindIdentity());
     }
 
     /** The source reference that determines an assembly's physical output name and source ownership. */
