@@ -2460,8 +2460,13 @@ final class ControlPlane {
 
     /** Leaves an explicitly tested alternative outcome to the calling witness's own assertions. */
     HttpResponse<String> sourceResponse(String method,String path,Map<String,?> body,String etag) {
+        return sourceResponse(method, path, body, etag, null);
+    }
+
+    HttpResponse<String> sourceResponse(String method, String path, Map<String, ?> body, String etag, String language) {
         HttpRequest.Builder request = authenticate(HttpRequest.newBuilder(baseUrl.resolve(path)).timeout(TIMEOUT))
                 .header("Content-Type", "application/json");
+        if (language != null) request.header("Accept-Language", language);
         if (etag != null) request.header("If-Match", etag);
         request.method(method, body == null ? HttpRequest.BodyPublishers.noBody()
                 : HttpRequest.BodyPublishers.ofString(JsonWriter.write(body), StandardCharsets.UTF_8));
