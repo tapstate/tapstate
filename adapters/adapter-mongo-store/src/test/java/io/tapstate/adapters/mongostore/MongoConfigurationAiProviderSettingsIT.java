@@ -44,6 +44,29 @@ class MongoConfigurationAiProviderSettingsIT {
             }
         });
     }
+    @Test void responsesUsesTheExistingEncryptedRowAndReopensWithoutChangingLegacySettings() {
+        fixture((uri, config, raw) -> {
+            var store = config.aiProviderSettings();
+            store.put(OWNER, setting());
+            assertThat(store.get(OWNER)).contains(setting());
+            var responses = new AiProviderSettingsStore.Settings("openai-responses", setting().baseUrl(), "gpt-6.1-sol", SECRET);
+            store.put(OWNER, responses);
+            var rows = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw);
+            assertThat(rows.countDocuments()).isEqualTo(1);
+            var saved = rows.find().first();
+            assertThat(saved.getInteger("formatVersion")).isEqualTo(1);
+            assertThat(saved.toJson()).doesNotContain(SECRET);
+            try (var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
+                assertThat(reopened.aiProviderSettings().get(OWNER)).contains(responses);
+            }
+            var tampered = new Document(saved).append("providerId", "openai-compatible");
+            rows.replaceOne(new Document(), tampered);
+            assertThatThrownBy(() -> store.get(OWNER)).isInstanceOf(TapstateException.class);
+            rows.replaceOne(new Document(), saved);
+            store.put(OWNER, setting());
+            assertThat(store.get(OWNER)).contains(setting());
+        });
+    }
     @Test void corruptedOrForeignRowsCannotBeReadOverwrittenOrDeleted() {
         fixture((uri, config, raw) -> {
             var store = config.aiProviderSettings(); store.put(OWNER, setting());

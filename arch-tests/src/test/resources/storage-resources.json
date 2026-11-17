@@ -917,7 +917,7 @@
         "One dedicated CONFIG ai_provider_settings collection with only its implicit unique _id index, no TTL and at most one current row for the fixed canonical Cloud organization/Cluster owner. No prompts, dialogue, request log or version history.",
         "Format 1 has exactly _id, formatVersion, owner, providerId, baseUrl, model and secret. The id is ai-provider: plus SHA-256 of canonical server-derived owner JSON [cloud, organizationId, clusterId]. Request JSON cannot choose owner. Unsupported schema, missing collection/index, malformed fields, owner/hash mismatch or bad ciphertext refuse without lazy DDL or overwriting corruption.",
         "The existing CONFIG key supplies the existing tsai:1 provider AES/GCM ciphertext with owner and provider/baseUrl/model authenticated. No replacement key, rotation, node ACK, lease or CACHE/MASTER fallback. No plaintext key in database, API, logs, draft or browser storage.",
-        "Provider remains openai-compatible with existing HTTPS public endpoint policy. Owner/baseUrl are each at most 4096 UTF-8 bytes, model at most 200 UTF-16 code units, API key at most 8192 characters without controls, and complete encoded BSON at most 256 KiB before any mutation.",
+        "Provider is openai-compatible for Chat Completions or openai-responses for Responses. Existing openai-compatible rows retain their protocol without migration. Both use the existing HTTPS public endpoint policy, row format, authenticated ciphertext context and CONFIG recovery boundary. Owner/baseUrl are each at most 4096 UTF-8 bytes, model at most 200 UTF-16 code units, API key at most 8192 characters without controls, and complete encoded BSON at most 256 KiB before any mutation.",
         "Absence of the owner row under verified schema/collection/indexes returns unconfigured, including explicit delete. No separate tombstone distinguishes arbitrary external whole-row deletion. Normal restart never recreates missing known structures or imports old settings.",
         "Native AI access accepts only its positively verified original schema 2 without validation markers/residual structures, or composed CONFIG schema 3 with both complete components. Historical validation schema 2 and base schema 1 refuse AI; normal access never upgrades, migrates or creates structures. The owner row format and original cryptographic and transaction bounds are unchanged."
       ]
@@ -4272,7 +4272,7 @@
     {
       "id": "mongo.config.ai_provider_settings",
       "resourceVersion": 1,
-      "proposalVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
