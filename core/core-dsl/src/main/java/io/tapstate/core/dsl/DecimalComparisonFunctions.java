@@ -32,6 +32,16 @@ public final class DecimalComparisonFunctions {
 
     public static final CelType DECIMAL_TYPE = OpaqueType.create("tapstate.decimal");
 
+    private static final String OP_EQUALS = "equals";
+    private static final String OP_NOT_EQUALS = "not_equals";
+    private static final String SUFFIX_DECIMAL_DECIMAL = "_decimal_decimal";
+    private static final String SUFFIX_DECIMAL_INT64 = "_decimal_int64";
+    private static final String SUFFIX_INT64_DECIMAL = "_int64_decimal";
+    private static final String SUFFIX_DECIMAL_UINT64 = "_decimal_uint64";
+    private static final String SUFFIX_UINT64_DECIMAL = "_uint64_decimal";
+    private static final String SUFFIX_DECIMAL_DOUBLE = "_decimal_double";
+    private static final String SUFFIX_DOUBLE_DECIMAL = "_double_decimal";
+
     private enum ComparisonOp {
         LT, LE, GT, GE, EQ, NE
     }
@@ -96,33 +106,33 @@ public final class DecimalComparisonFunctions {
 
     private static ImmutableList<CelFunctionDecl> buildCrossTypeEqualityDeclarations() {
         List<CelFunctionDecl> decls = new ArrayList<>();
-        decls.add(buildCrossTypeEqualityDecl(Operator.EQUALS, "equals"));
-        decls.add(buildCrossTypeEqualityDecl(Operator.NOT_EQUALS, "not_equals"));
+        decls.add(buildCrossTypeEqualityDecl(Operator.EQUALS, OP_EQUALS));
+        decls.add(buildCrossTypeEqualityDecl(Operator.NOT_EQUALS, OP_NOT_EQUALS));
         return ImmutableList.copyOf(decls);
     }
 
     private static CelFunctionDecl buildOrderingDecl(Operator operator, String prefix) {
         return CelFunctionDecl.newFunctionDeclaration(
                 operator.getFunction(),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_decimal", SimpleType.BOOL, DECIMAL_TYPE, DECIMAL_TYPE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_int64", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.INT),
-                CelOverloadDecl.newGlobalOverload(prefix + "_int64_decimal", SimpleType.BOOL, SimpleType.INT, DECIMAL_TYPE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_uint64", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.UINT),
-                CelOverloadDecl.newGlobalOverload(prefix + "_uint64_decimal", SimpleType.BOOL, SimpleType.UINT, DECIMAL_TYPE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_double", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.DOUBLE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_double_decimal", SimpleType.BOOL, SimpleType.DOUBLE, DECIMAL_TYPE)
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_DECIMAL, SimpleType.BOOL, DECIMAL_TYPE, DECIMAL_TYPE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_INT64, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.INT),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_INT64_DECIMAL, SimpleType.BOOL, SimpleType.INT, DECIMAL_TYPE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_UINT64, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.UINT),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_UINT64_DECIMAL, SimpleType.BOOL, SimpleType.UINT, DECIMAL_TYPE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_DOUBLE, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.DOUBLE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DOUBLE_DECIMAL, SimpleType.BOOL, SimpleType.DOUBLE, DECIMAL_TYPE)
         );
     }
 
     private static CelFunctionDecl buildCrossTypeEqualityDecl(Operator operator, String prefix) {
         return CelFunctionDecl.newFunctionDeclaration(
                 operator.getFunction(),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_int64", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.INT),
-                CelOverloadDecl.newGlobalOverload(prefix + "_int64_decimal", SimpleType.BOOL, SimpleType.INT, DECIMAL_TYPE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_uint64", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.UINT),
-                CelOverloadDecl.newGlobalOverload(prefix + "_uint64_decimal", SimpleType.BOOL, SimpleType.UINT, DECIMAL_TYPE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_decimal_double", SimpleType.BOOL, DECIMAL_TYPE, SimpleType.DOUBLE),
-                CelOverloadDecl.newGlobalOverload(prefix + "_double_decimal", SimpleType.BOOL, SimpleType.DOUBLE, DECIMAL_TYPE)
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_INT64, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.INT),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_INT64_DECIMAL, SimpleType.BOOL, SimpleType.INT, DECIMAL_TYPE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_UINT64, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.UINT),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_UINT64_DECIMAL, SimpleType.BOOL, SimpleType.UINT, DECIMAL_TYPE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DECIMAL_DOUBLE, SimpleType.BOOL, DECIMAL_TYPE, SimpleType.DOUBLE),
+                CelOverloadDecl.newGlobalOverload(prefix + SUFFIX_DOUBLE_DECIMAL, SimpleType.BOOL, SimpleType.DOUBLE, DECIMAL_TYPE)
         );
     }
 
@@ -134,60 +144,52 @@ public final class DecimalComparisonFunctions {
         addOrderingBindings(bindings, "greater_equals", ComparisonOp.GE);
 
         // Standard equals / not_equals overload replacement to handle exact equality:
-        bindings.add(CelFunctionBinding.from("equals", Object.class, Object.class, DecimalComparisonFunctions::objectEquals));
-        bindings.add(CelFunctionBinding.from("not_equals", Object.class, Object.class,
+        bindings.add(CelFunctionBinding.from(OP_EQUALS, Object.class, Object.class, DecimalComparisonFunctions::objectEquals));
+        bindings.add(CelFunctionBinding.from(OP_NOT_EQUALS, Object.class, Object.class,
                 (Object x, Object y) -> !objectEquals(x, y)));
 
         // Concrete cross-type equality bindings matching typed check overloads:
-        addCrossTypeBindings(bindings, "equals", ComparisonOp.EQ);
-        addCrossTypeBindings(bindings, "not_equals", ComparisonOp.NE);
+        addCrossTypeBindings(bindings, OP_EQUALS, ComparisonOp.EQ);
+        addCrossTypeBindings(bindings, OP_NOT_EQUALS, ComparisonOp.NE);
 
         return ImmutableList.copyOf(bindings);
     }
 
     private static boolean objectEquals(Object x, Object y) {
         if (x instanceof BigDecimal a) {
-            if (y instanceof BigDecimal b) {
-                return a.compareTo(b) == 0;
-            }
-            if (y instanceof Long b) {
-                return a.compareTo(BigDecimal.valueOf(b)) == 0;
-            }
-            if (y instanceof Integer b) {
-                return a.compareTo(BigDecimal.valueOf(b)) == 0;
-            }
-            if (y instanceof Double b) {
-                return compareDecimalDouble(a, b, ComparisonOp.EQ);
-            }
-            if (y instanceof Float b) {
-                return compareDecimalDouble(a, b.doubleValue(), ComparisonOp.EQ);
-            }
-            if (y instanceof UnsignedLong b) {
-                return compareDecimalUint64(a, b, ComparisonOp.EQ);
-            }
-        } else if (y instanceof BigDecimal b) {
-            if (x instanceof Long a) {
-                return BigDecimal.valueOf(a).compareTo(b) == 0;
-            }
-            if (x instanceof Integer a) {
-                return BigDecimal.valueOf(a).compareTo(b) == 0;
-            }
-            if (x instanceof Double a) {
-                return compareDoubleDecimal(a, b, ComparisonOp.EQ);
-            }
-            if (x instanceof Float a) {
-                return compareDoubleDecimal(a.doubleValue(), b, ComparisonOp.EQ);
-            }
-            if (x instanceof UnsignedLong a) {
-                return compareUint64Decimal(a, b, ComparisonOp.EQ);
-            }
+            return decimalEquals(a, y);
+        }
+        if (y instanceof BigDecimal b) {
+            return decimalEquals(b, x);
         }
         return DEFAULT_EQUALITY.objectEquals(x, y);
     }
 
+    private static boolean decimalEquals(BigDecimal dec, Object other) {
+        if (other instanceof BigDecimal b) {
+            return dec.compareTo(b) == 0;
+        }
+        if (other instanceof Long b) {
+            return dec.compareTo(BigDecimal.valueOf(b)) == 0;
+        }
+        if (other instanceof Integer b) {
+            return dec.compareTo(BigDecimal.valueOf(b)) == 0;
+        }
+        if (other instanceof Double b) {
+            return compareDecimalDouble(dec, b, ComparisonOp.EQ);
+        }
+        if (other instanceof Float b) {
+            return compareDecimalDouble(dec, b.doubleValue(), ComparisonOp.EQ);
+        }
+        if (other instanceof UnsignedLong b) {
+            return compareDecimalUint64(dec, b, ComparisonOp.EQ);
+        }
+        return DEFAULT_EQUALITY.objectEquals(dec, other);
+    }
+
     private static void addOrderingBindings(List<CelFunctionBinding> bindings, String prefix, ComparisonOp op) {
         bindings.add(CelFunctionBinding.from(
-                prefix + "_decimal_decimal", BigDecimal.class, BigDecimal.class,
+                prefix + SUFFIX_DECIMAL_DECIMAL, BigDecimal.class, BigDecimal.class,
                 (BigDecimal x, BigDecimal y) -> compareDecimalDecimal(x, y, op)));
 
         addCrossTypeBindings(bindings, prefix, op);
@@ -195,27 +197,27 @@ public final class DecimalComparisonFunctions {
 
     private static void addCrossTypeBindings(List<CelFunctionBinding> bindings, String prefix, ComparisonOp op) {
         bindings.add(CelFunctionBinding.from(
-                prefix + "_decimal_int64", BigDecimal.class, Long.class,
+                prefix + SUFFIX_DECIMAL_INT64, BigDecimal.class, Long.class,
                 (BigDecimal x, Long y) -> compareDecimalInt64(x, y, op)));
 
         bindings.add(CelFunctionBinding.from(
-                prefix + "_int64_decimal", Long.class, BigDecimal.class,
+                prefix + SUFFIX_INT64_DECIMAL, Long.class, BigDecimal.class,
                 (Long x, BigDecimal y) -> compareInt64Decimal(x, y, op)));
 
         bindings.add(CelFunctionBinding.from(
-                prefix + "_decimal_uint64", BigDecimal.class, UnsignedLong.class,
+                prefix + SUFFIX_DECIMAL_UINT64, BigDecimal.class, UnsignedLong.class,
                 (BigDecimal x, UnsignedLong y) -> compareDecimalUint64(x, y, op)));
 
         bindings.add(CelFunctionBinding.from(
-                prefix + "_uint64_decimal", UnsignedLong.class, BigDecimal.class,
+                prefix + SUFFIX_UINT64_DECIMAL, UnsignedLong.class, BigDecimal.class,
                 (UnsignedLong x, BigDecimal y) -> compareUint64Decimal(x, y, op)));
 
         bindings.add(CelFunctionBinding.from(
-                prefix + "_decimal_double", BigDecimal.class, Double.class,
+                prefix + SUFFIX_DECIMAL_DOUBLE, BigDecimal.class, Double.class,
                 (BigDecimal x, Double y) -> compareDecimalDouble(x, y, op)));
 
         bindings.add(CelFunctionBinding.from(
-                prefix + "_double_decimal", Double.class, BigDecimal.class,
+                prefix + SUFFIX_DOUBLE_DECIMAL, Double.class, BigDecimal.class,
                 (Double x, BigDecimal y) -> compareDoubleDecimal(x, y, op)));
     }
 
