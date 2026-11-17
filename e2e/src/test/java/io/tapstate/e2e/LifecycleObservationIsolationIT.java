@@ -31,8 +31,44 @@ class LifecycleObservationIsolationIT {
             return amount == value && recordsOut > prior.recordsOut && observedAt.isAfter(prior.observedAt);
         }
     }
-    private record Held(EventSet set, String stack) implements AutoCloseable {
-        @Override public void close() { set.resume(); }
+    private record Held(EventSet set, String stack, java.util.concurrent.atomic.AtomicBoolean draining,
+            Thread pendingEvents) implements AutoCloseable {
+        @Override public void close() throws InterruptedException {
+            set.resume();
+            draining.set(false);
+            pendingEvents.join(2000);
+            if (pendingEvents.isAlive()) throw new AssertionError("Owned debugger event drain did not stop");
+        }
+    }
+
+    private static Held holding(VirtualMachine vm, EventSet set, String stack) {
+        // Deleting a request does not resume events already queued for another event thread.
+        var draining = new java.util.concurrent.atomic.AtomicBoolean(true);
+        var pending = Thread.startVirtualThread(() -> {
+            while (draining.get()) {
+                try {
+                    var next = vm.eventQueue().remove(100);
+                    if (next == null) continue;
+                    try {
+                        for (var event : next) {
+                            if (event instanceof LocatableEvent location) {
+                                var frames = location.thread().frames();
+                                var collector = frames.stream().filter(frame -> frameIs(frame, ENGINE, "nestStateReadings"))
+                                        .findFirst().orElse(null);
+                                String pipeline = collector != null && collector.getArgumentValues().getFirst() instanceof StringReference id
+                                        ? id.value() : "<other>";
+                                System.out.println("JDI_PENDING_RESUMED pipeline=" + pipeline + " thread=" + location.thread().name()
+                                        + " stack=" + frames.stream().limit(8).map(frame -> frame.location().toString()).toList());
+                            }
+                        }
+                    } finally { next.resume(); }
+                } catch (InterruptedException stopped) {
+                    Thread.currentThread().interrupt(); return;
+                } catch (IncompatibleThreadStateException invalid) { throw new AssertionError(invalid);
+                } catch (VMDisconnectedException closed) { return; }
+            }
+        });
+        return new Held(set, stack, draining, pending);
     }
 
     @org.junit.jupiter.api.BeforeAll static void requireConnectors() {
@@ -199,8 +235,9 @@ class LifecycleObservationIsolationIT {
                         String stack = frames.stream().limit(24).map(f -> f.location().declaringType().name()
                                 + "." + f.location().method().name() + ":" + f.location().lineNumber())
                                 .reduce((x,y) -> x + " <- " + y).orElseThrow();
+                        request.disable();
                         accepted = true;
-                        return new Held(set, bp.thread().name() + " " + stack);
+                        return holding(vm, set, bp.thread().name() + " " + stack);
                     }
                 } finally { if (!accepted) set.resume(); }
             }
