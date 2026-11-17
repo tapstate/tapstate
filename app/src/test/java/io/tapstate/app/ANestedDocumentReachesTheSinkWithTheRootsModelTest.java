@@ -29,11 +29,13 @@ import io.tapstate.spi.sink.TargetField;
 import io.tapstate.spi.sink.TargetTable;
 import io.tapstate.spi.sink.WriteMode;
 import io.tapstate.core.common.TapstateException;
+import io.tapstate.core.common.NumericType;
 import io.tapstate.core.common.TapstateType;
 import io.tapstate.spi.store.DiscoveredSourceModel;
 import io.tapstate.spi.store.SourceField;
 import io.tapstate.spi.store.SourceModel;
 import io.tapstate.spi.store.SourceTable;
+import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -183,6 +185,38 @@ class ANestedDocumentReachesTheSinkWithTheRootsModelTest {
                     assertThat(field.inferredType()).isEqualTo(TapstateType.STRING);
                     assertThat(field.primaryKey()).isFalse();
                 });
+    }
+
+    /**
+     * A computed column that only moves another keeps that column's descriptors, as a rename does:
+     * without them a moved decimal reaches the target with no precision, scale or range to build its
+     * column from.
+     */
+    @Test
+    void aDecimalAMapMovesKeepsItsPrecisionAndScale() {
+        NumericType money = new NumericType(null, true, false, null,
+                new BigDecimal("-99999999.99"), new BigDecimal("99999999.99"), 10, 2);
+        DiscoveredSourceModel withAmount = new DiscoveredSourceModel(PARENT_SOURCE, "mysql", 1L,
+                new SourceModel(List.of(new SourceTable(PARENT_TABLE,
+                        List.of(new SourceField("id", "int"), new SourceField("name", "string"),
+                                new SourceField("amount", "decimal(10,2)", TapstateType.DECIMAL, null, money)),
+                        List.of("id"), List.of()))));
+        AtomicReference<Map<String, TargetTable>> bound = new AtomicReference<>();
+        new StoreBackedDagSource(parsedStore(PARSED_PIPELINE
+                .replace("from: { o: src_orders.orders,", "from: { o: live_orders,")
+                .replace("transforms:\n", """
+                        transforms:
+                          - id: live_orders
+                            type: map
+                            from: [ src_orders.orders ]
+                            fields: { amount_copy: "=after.amount" }
+                            soft_delete: is_deleted
+                        """), List.of(), List.of(withAmount)), capturing(bound)).dagFor(PIPELINE);
+
+        assertThat(bound.get().get(STEP).fields())
+                .filteredOn(field -> field.name().equals("amount_copy"))
+                .singleElement()
+                .satisfies(field -> assertThat(field.numericType()).isEqualTo(money));
     }
 
     /**

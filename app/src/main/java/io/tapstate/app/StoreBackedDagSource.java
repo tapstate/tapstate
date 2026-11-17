@@ -1931,8 +1931,13 @@ final class StoreBackedDagSource implements DagSource {
             fields.add(publishedField(column, carried, produced, atTheSource));
             TargetField identity = produced.expanded()
                     ? declared.get(produced.origins().get(column)) : carried;
+            // Not expanded, a key column must still hold the source's own value: a literal or computed
+            // value written under its name, such as a soft-delete marker named after it, would key
+            // every row on one value.
             if (identity != null && identity.primaryKey()
-                    && (!produced.expanded() || column.equals(parentNames.get(identity.name())))) {
+                    && (produced.expanded()
+                            ? column.equals(parentNames.get(identity.name()))
+                            : produced.unchangedFields().contains(column))) {
                 key.add(column);
             }
         }
@@ -4484,8 +4489,7 @@ final class StoreBackedDagSource implements DagSource {
                 } else if (rule instanceof FieldRule.Literal literal) {
                     out.put(output, new TargetField(output, null, false, NodeColumns.literalType(literal.value())));
                 } else if (rule instanceof FieldRule.Computed computed) {
-                    out.put(output, new TargetField(output, null, false,
-                            RowExpressions.typedValueType(computed.celExpr(), types)));
+                    out.put(output, computedField(output, computed.celExpr(), upstream, types));
                 }
             });
             for (TargetField field : fields) {
@@ -4496,6 +4500,20 @@ final class StoreBackedDagSource implements DagSource {
                 }
             }
             return new ProjectedColumns(List.copyOf(out.values()), carried);
+        }
+
+        /**
+         * A computed column. One that does nothing but read another column holds that column's own
+         * value, so it keeps the numeric and string descriptors a rename keeps; any other expression
+         * produces a value nothing was declared about.
+         */
+        private static TargetField computedField(String output, String expr, Map<String, TargetField> upstream,
+                Map<String, TapstateType> types) {
+            TapstateType type = RowExpressions.typedValueType(expr, types);
+            String movedColumn = RowExpressions.movedColumn(expr);
+            TargetField moved = movedColumn == null ? null : upstream.get(movedColumn);
+            return moved == null ? new TargetField(output, null, false, type)
+                    : new TargetField(output, null, false, type, moved.numericType(), moved.stringType());
         }
 
         private void carry(String output, String upstreamName, Map<String, String> carried) {
