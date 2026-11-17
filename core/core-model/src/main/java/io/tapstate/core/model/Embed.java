@@ -1,5 +1,6 @@
 package io.tapstate.core.model;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -9,6 +10,11 @@ import java.util.Objects;
 /**
  * One embedded child of a nest tree. {@code from} names an alias of the step's {@code from:}
  * map; {@code on} maps child join fields to parent fields.
+ *
+ * <p>{@code orOn} lists further ways of matching the same child, tried in order after {@code on}: the
+ * child row is the one the first alternative with a live match names. It turns an embed into a
+ * reference - the parent points at one shared child row - because an ordered choice between rows
+ * only means something when there is at most one row to choose per alternative.
  */
 @Doc("One child of a nest tree, joined onto its parent and either placed at a path or merged into it.")
 public record Embed(
@@ -42,7 +48,12 @@ public record Embed(
         List<Embed> embed,
         @Doc("Fields computed over this embed's live elements and written on its parent, keyed by field name. "
                 + "Allowed on array and rollup embeds; a rollup embed must declare at least one.")
-        Map<String, RollupField> rollup) {
+        Map<String, RollupField> rollup,
+        @Doc(value = "Further ways to match the child row, each mapping child fields to parent fields like on. "
+                + "They are tried in order after on, and the first one that matches a live row supplies the "
+                + "child. Only for an embed that points at one shared row (many to one).",
+                key = "orOn")
+        List<Map<String, String>> orOn) {
 
     /**
      * An embed that names no row identity of its own, which is what every embed written before this field
@@ -51,13 +62,27 @@ public record Embed(
      */
     public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> arrayKey,
             Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed) {
-        this(from, on, as, path, null, arrayKey, ignoreUpdates, trackKeyChanges, embed, null);
+        this(from, on, as, path, null, arrayKey, ignoreUpdates, trackKeyChanges, embed, null, null);
+    }
+
+    /** An embed with neither rollup fields nor alternatives, which is every embed written before they existed. */
+    public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> key,
+            List<String> arrayKey, Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed) {
+        this(from, on, as, path, key, arrayKey, ignoreUpdates, trackKeyChanges, embed, null, null);
+    }
+
+    /** An embed matched on {@code on} alone, which is every embed written before alternatives existed. */
+    public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> key,
+            List<String> arrayKey, Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed,
+            Map<String, RollupField> rollup) {
+        this(from, on, as, path, key, arrayKey, ignoreUpdates, trackKeyChanges, embed, rollup, null);
     }
 
     /** An embed that declares no rollup fields, which is every embed written before they existed. */
     public Embed(String from, Map<String, String> on, EmbedAs as, String path, List<String> key,
-            List<String> arrayKey, Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed) {
-        this(from, on, as, path, key, arrayKey, ignoreUpdates, trackKeyChanges, embed, null);
+            List<String> arrayKey, Boolean ignoreUpdates, Boolean trackKeyChanges, List<Embed> embed,
+            List<Map<String, String>> orOn) {
+        this(from, on, as, path, key, arrayKey, ignoreUpdates, trackKeyChanges, embed, null, orOn);
     }
 
     public Embed {
@@ -83,6 +108,39 @@ public record Embed(
         arrayKey = arrayKey == null ? null : List.copyOf(arrayKey);
         embed = embed == null ? null : List.copyOf(embed);
         rollup = rollup == null ? null : Collections.unmodifiableMap(new LinkedHashMap<>(rollup));
+        if (orOn != null) {
+            if (orOn.isEmpty()) {
+                throw new IllegalArgumentException("orOn names no alternative; omit it instead");
+            }
+            List<Map<String, String>> copied = new ArrayList<>(orOn.size());
+            for (Map<String, String> alternative : orOn) {
+                Objects.requireNonNull(alternative, "orOn alternative");
+                if (alternative.isEmpty()) {
+                    throw new IllegalArgumentException("an orOn alternative maps no field");
+                }
+                copied.add(Collections.unmodifiableMap(new LinkedHashMap<>(alternative)));
+            }
+            orOn = Collections.unmodifiableList(copied);
+        }
+    }
+
+    /**
+     * Every way this embed matches its child row, in the order they are tried: {@code on} first, then each
+     * {@code orOn} alternative. One entry for an embed that declares no alternatives.
+     */
+    public List<Map<String, String>> alternatives() {
+        if (orOn == null) {
+            return List.of(on);
+        }
+        List<Map<String, String>> all = new ArrayList<>(1 + orOn.size());
+        all.add(on);
+        all.addAll(orOn);
+        return Collections.unmodifiableList(all);
+    }
+
+    /** Whether this embed declares alternatives beyond {@code on}. */
+    public boolean hasAlternatives() {
+        return orOn != null;
     }
 
     /**

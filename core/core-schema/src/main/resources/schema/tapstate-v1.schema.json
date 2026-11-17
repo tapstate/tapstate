@@ -99,6 +99,16 @@
           "additionalProperties": {
             "$ref": "#/$defs/RollupField"
           }
+        },
+        "orOn": {
+          "description": "Further ways to match the child row, each mapping child fields to parent fields like on. They are tried in order after on, and the first one that matches a live row supplies the child. Only for an embed that points at one shared row (many to one).",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
         }
       },
       "required": [

@@ -804,13 +804,22 @@ public final class RootAssembly implements Serializable {
             Map<String, Set<List<Object>>> needed, boolean allowMissingObjects, Set<String> completedObjectLookups) {
         for (EmbedSlot slot : slots) {
             if (slot.isReference()) {
-                if (slot.as() == EmbedAs.OBJECT
-                        && (allowMissingObjects || completedObjectLookups.contains(slot.lookupMap()))) {
-                    continue;
-                }
-                List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
-                if (!key.contains(null)) {
-                    needed.computeIfAbsent(slot.lookupMap(), namespace -> new LinkedHashSet<>()).add(key);
+                // An alternative settles the way an object does, whatever the slot's shape: a document whose
+                // first choice is absent renders its second, and its first choice turning up later redraws it.
+                // Waiting for ever on every alternative instead would hold back each document whose row is
+                // named by only one of them, which is every document an author writes alternatives for.
+                boolean settles = slot.as() == EmbedAs.OBJECT || slot.hasAlternatives();
+                for (EmbedSlot.Reference reference : slot.references()) {
+                    if (settles && (allowMissingObjects
+                            || completedObjectLookups.contains(reference.lookupMap()))) {
+                        continue;
+                    }
+                    List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(),
+                            reference.lookupMap());
+                    if (!key.contains(null)) {
+                        needed.computeIfAbsent(reference.lookupMap(), namespace -> new LinkedHashSet<>())
+                                .add(key);
+                    }
                 }
                 continue;
             }
@@ -883,11 +892,14 @@ public final class RootAssembly implements Serializable {
             List<String> path = new ArrayList<>(parentPath);
             path.add(slot.stateField());
             if (slot.isReference()) {
-                if (slot.as() == EmbedAs.OBJECT) {
-                    List<Object> key = NestKeys.valuesOf(fields, slot.referenceFields(), slot.lookupMap());
-                    if (!key.contains(null) && (resolved == null
-                            || !resolved.getOrDefault(slot.lookupMap(), Map.of()).containsKey(key))) {
-                        into.add(new MissingObjectReference(path, slot.lookupMap(), key));
+                if (slot.as() == EmbedAs.OBJECT || slot.hasAlternatives()) {
+                    for (EmbedSlot.Reference reference : slot.references()) {
+                        List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(),
+                                reference.lookupMap());
+                        if (!key.contains(null) && (resolved == null
+                                || !resolved.getOrDefault(reference.lookupMap(), Map.of()).containsKey(key))) {
+                            into.add(new MissingObjectReference(path, reference.lookupMap(), key));
+                        }
                     }
                 }
                 continue;
@@ -1219,12 +1231,11 @@ public final class RootAssembly implements Serializable {
             if (slot.isReference()) {
                 // Read off the row this level already carries. The columns holding the reference are ones
                 // the row has anyway, so pointing at something costs the document no bytes of its own.
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
-                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
                 // A row that is not filed at all has not been fetched; one filed and empty has been
                 // deleted. Neither is something to render, and frozen at its last value is the one thing
                 // it must not be: the source no longer has that row, so neither may the document.
-                boolean live = row != null && !row.isEmpty();
+                Map<String, Object> row = pointedAt(document, slot, resolved);
+                boolean live = row != null;
                 // The shape is whatever `as` says, here exactly as for a gathered embed. Which side of the
                 // join carries the other's identity decides where a row is read from - it does not decide,
                 // and is not decided by, what the row looks like once it is in. An array holds the one row
@@ -1276,9 +1287,8 @@ public final class RootAssembly implements Serializable {
             }
             Map<String, Object> flat = null;
             if (slot.isReference()) {
-                List<Object> key = NestKeys.valuesOf(document, slot.referenceFields(), slot.lookupMap());
-                Map<String, Object> row = resolved.getOrDefault(slot.lookupMap(), Map.of()).get(key);
-                if (row != null && !row.isEmpty()) {
+                Map<String, Object> row = pointedAt(document, slot, resolved);
+                if (row != null) {
                     flat = new LinkedHashMap<>(row);
                 }
             } else {
@@ -1292,6 +1302,23 @@ public final class RootAssembly implements Serializable {
                 mergeFlat(document, flat, slot, occupied, rememberTopLevelFlatFields);
             }
         }
+    }
+
+    /**
+     * The live row a referenced slot shows, or null where it shows none: the first of its references, in the
+     * order they were declared, whose row is filed and not deleted. A slot with no alternatives has one
+     * reference, so this is exactly the read it always made.
+     */
+    private static Map<String, Object> pointedAt(Map<String, Object> fields, EmbedSlot slot,
+            Map<String, Map<Object, Map<String, Object>>> resolved) {
+        for (EmbedSlot.Reference reference : slot.references()) {
+            List<Object> key = NestKeys.valuesOf(fields, reference.referenceFields(), reference.lookupMap());
+            Map<String, Object> row = resolved.getOrDefault(reference.lookupMap(), Map.of()).get(key);
+            if (row != null && !row.isEmpty()) {
+                return row;
+            }
+        }
+        return null;
     }
 
     private Map<String, Object> renderOne(ElementNode element, EmbedSlot slot,

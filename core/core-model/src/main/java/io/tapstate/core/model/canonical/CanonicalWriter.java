@@ -407,6 +407,11 @@ public final class CanonicalWriter {
             B b = new B();
             b.scalar("from", e.from());
             b.freeMap("on", new TreeMap<>(e.on()));
+            if (e.orOn() != null) {
+                // The alternatives keep the order they were written in: it is the order they are tried in, so
+                // it is part of what the embed means. Each one's own pairs are sorted like on's.
+                b.put("orOn", fromValue(e.orOn()));
+            }
             b.scalar("as", e.as().yaml());
             if (e.as() != EmbedAs.FLAT && e.as() != EmbedAs.ROLLUP) {
                 b.scalar("path", e.path());

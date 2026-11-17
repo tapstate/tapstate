@@ -386,6 +386,15 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         this.vertex = Objects.requireNonNull(vertex, "vertex");
         this.slots = List.copyOf(slots);
         this.rollupBoundary = rollupBoundaryOf(this.slots);
+        // An alternative whose snapshot nothing is tracking has no moment at which its absence becomes known,
+        // so it is settled from the start: the document renders whichever alternative is live, and a row
+        // turning up later under an earlier one redraws it. Holding the document instead would hold it for
+        // ever wherever only a later alternative names a row - which is the case alternatives exist for.
+        for (String alternative : alternativeLookups(this.slots)) {
+            if (!this.lookupSnapshots.containsKey(alternative)) {
+                completedObjectLookups.add(alternative);
+            }
+        }
         this.store = Objects.requireNonNull(store, "store");
         this.outputStream = Objects.requireNonNull(outputStream, "outputStream");
         this.sending = Objects.requireNonNull(sending, "sending");
@@ -702,8 +711,20 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
         return true;
     }
 
+    /** Every namespace a slot with alternatives reads from, at any depth of the tree. */
+    private static Set<String> alternativeLookups(List<EmbedSlot> slots) {
+        Set<String> found = new LinkedHashSet<>();
+        for (EmbedSlot slot : slots) {
+            if (slot.hasAlternatives()) {
+                slot.references().forEach(reference -> found.add(reference.lookupMap()));
+            }
+            found.addAll(alternativeLookups(slot.children()));
+        }
+        return found;
+    }
+
     private boolean hasDirectOwnedSnapshotShape() {
-        return slots.stream().allMatch(slot -> slot.children().isEmpty()
+        return slots.stream().allMatch(slot -> slot.children().isEmpty() && !slot.hasAlternatives()
                 && (slot.isReference() ? slot.as() == io.tapstate.core.model.EmbedAs.OBJECT
                         : slot.as() == io.tapstate.core.model.EmbedAs.ARRAY));
     }
@@ -747,7 +768,7 @@ public final class AssemblerProcessor extends AbstractProcessor implements Stage
 
     private boolean referenceOnlyRootShape() {
         return vertex.pathId().isEmpty() && !slots.isEmpty()
-                && slots.stream().allMatch(slot -> slot.isReference()
+                && slots.stream().allMatch(slot -> slot.isReference() && !slot.hasAlternatives()
                         && slot.as() == io.tapstate.core.model.EmbedAs.OBJECT && slot.children().isEmpty());
     }
 

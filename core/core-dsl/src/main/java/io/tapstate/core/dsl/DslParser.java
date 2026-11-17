@@ -128,7 +128,8 @@ public final class DslParser {
     static final Set<String> NEST_STATE_KEYS = Set.of("database");
     static final Set<String> REQUIRED_NEST_STATE_KEYS = Set.of("database");
     private static final Set<String> EMBED_KEYS = Set.of(
-            "from", "on", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed", "rollup");
+            "from", "on", "orOn", "as", "path", "key", "arrayKey", "ignoreUpdates", "trackKeyChanges", "embed",
+            "rollup");
     /** The keys that qualify a rollup field's one function rather than naming it. */
     static final Set<String> ROLLUP_OPTION_KEYS = Set.of("filter", "type", "default");
     static final Set<String> ROLLUP_PICK_KEYS = Set.of("value", "by");
@@ -702,7 +703,43 @@ public final class DslParser {
                     boolValue(e, "ignoreUpdates"),
                     boolValue(e, "trackKeyChanges"),
                     embeds(e.seq("embed"), e.childPath("embed")),
-                    rollup));
+                    rollup,
+                    alternatives(e, "orOn")));
+        }
+        return out;
+    }
+
+    /**
+     * An embed's further ways of matching its child, each a mapping of child field to parent field like
+     * {@code on}. An empty list, or an alternative that maps nothing, is refused rather than read as absent:
+     * either is an author who meant to write an alternative and did not, and dropping it silently would
+     * leave the embed matching on fewer conditions than written.
+     */
+    private static List<Map<String, String>> alternatives(YamlMap owner, String key) {
+        List<Node> items = owner.seq(key);
+        if (items == null) {
+            return null;
+        }
+        String expected = "a list of non-empty mappings from child field to parent field";
+        if (items.isEmpty()) {
+            throw owner.errorAt(key, DslError.ILLEGAL_VALUE, Map.of(VALUE_TOKEN, "[]", EXPECTED_TOKEN, expected));
+        }
+        List<Map<String, String>> out = new ArrayList<>(items.size());
+        for (Node item : items) {
+            Object raw = YamlMap.nodeValue(item);
+            if (!(raw instanceof Map<?, ?> pairs) || pairs.isEmpty()) {
+                throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                        Map.of(VALUE_TOKEN, String.valueOf(raw), EXPECTED_TOKEN, expected));
+            }
+            Map<String, String> alternative = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> pair : pairs.entrySet()) {
+                if (!(pair.getValue() instanceof String parentField)) {
+                    throw owner.errorAt(key, DslError.ILLEGAL_VALUE,
+                            Map.of(VALUE_TOKEN, String.valueOf(pair.getValue()), EXPECTED_TOKEN, "a string"));
+                }
+                alternative.put(String.valueOf(pair.getKey()), parentField);
+            }
+            out.add(alternative);
         }
         return out;
     }

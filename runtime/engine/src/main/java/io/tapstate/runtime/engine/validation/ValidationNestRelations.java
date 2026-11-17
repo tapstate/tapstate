@@ -102,6 +102,8 @@ public final class ValidationNestRelations {
                 for (String existing : paths) if (overlap(existing, segment)) throw unsupported(segment, "nest.overlappingPaths");
                 paths.add(segment);
             }
+            // A relation with alternatives has no single join to compare by; refused rather than read as its first.
+            if (embed.hasAlternatives()) throw unsupported(segment, "nest.orOn");
             var on = new LinkedHashMap<String, String>();
             if (embed.on().isEmpty() || embed.on().size() > 32) throw unsupported(segment, "nest.onArity");
             for (var pair : embed.on().entrySet()) {

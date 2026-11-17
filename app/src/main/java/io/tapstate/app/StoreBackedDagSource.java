@@ -3379,10 +3379,14 @@ final class StoreBackedDagSource implements DagSource {
         Set<String> declaredAliases = step.from() instanceof FromClause.Aliases declared
                 ? declared.aliases().keySet()
                 : Set.of();
+        // A source the front end added for an OR alternative answers to the alias it stands in for.
         for (io.tapstate.core.sql.JoinTree.Source source : plan.from().sources()) {
-            if (!declaredAliases.contains(source.name())) {
+            if (!declaredAliases.contains(source.declared())) {
                 throw new TapstateException(ActuationError.JOIN_SOURCE_NOT_DECLARED,
-                        Map.of("step", step.id(), "name", source.name()), null);
+                        Map.of("step", step.id(), "name", source.declared()), null);
+            }
+            if (!source.declared().equals(source.name())) {
+                tableByName.put(source.name(), tableByName.getOrDefault(source.declared(), source.table()));
             }
         }
         String driving = plan.factSource().table();
@@ -3396,7 +3400,7 @@ final class StoreBackedDagSource implements DagSource {
             if (source.name().equals(plan.factSource().name())) {
                 continue;
             }
-            List<String> sourceKey = keyByTable.getOrDefault(source.name(), List.of());
+            List<String> sourceKey = keyByTable.getOrDefault(source.declared(), List.of());
             if (!sourceKey.isEmpty()) {
                 dimensionRowKeyColumns.put(source.name(), List.copyOf(sourceKey));
             }
