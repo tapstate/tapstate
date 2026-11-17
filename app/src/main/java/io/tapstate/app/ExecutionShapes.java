@@ -145,6 +145,16 @@ final class ExecutionShapes {
                 nodes.put(step.id(), planned(pipelineId, ParallelismPlanner.plan(request, members, budget)));
                 continue;
             }
+            if (body instanceof TransformBody.Aggregate) {
+                // Its rows are rows of its own, keyed by the group names, and one processor writes its state.
+                emitted.put(step.id(), Map.of(step.id(), graph.assembledKeys().getOrDefault(step.id(), List.of())));
+                ExecutionSpec execution = step.execution();
+                ParallelismRequest request = new ParallelismRequest(step.id(), ParallelismRequest.Kind.TRANSFORM,
+                        writtenIn(execution), ParallelismRequest.Singleton.STATE_HAS_ONE_WRITER, false,
+                        batchOf(execution).effectiveMaxRecords(), 0);
+                nodes.put(step.id(), planned(pipelineId, ParallelismPlanner.plan(request, members, budget)));
+                continue;
+            }
             Map<String, List<String>> input = inputOf(inline.from(), graph, emitted);
             emitted.put(step.id(), switch (body) {
                 case TransformBody.MapProjection map -> projected(input, map.fields());

@@ -19,13 +19,23 @@ sealed interface ExplainOutcome {
             Pending pending,
             Plan plan,
             List<String> awaitingRebalance,
-            List<Rollup> rollups) implements ExplainOutcome {
+            List<Rollup> rollups,
+            List<Aggregate> aggregates) implements ExplainOutcome {
 
         public Found {
             evidence = List.copyOf(evidence);
             cannotSay = List.copyOf(cannotSay);
             awaitingRebalance = awaitingRebalance == null ? List.of() : List.copyOf(awaitingRebalance);
             rollups = rollups == null ? List.of() : List.copyOf(rollups);
+            aggregates = aggregates == null ? List.of() : List.copyOf(aggregates);
+        }
+
+        /** An explanation of a pipeline with no aggregate step. */
+        Found(String pipelineId, String state, String kind, String message, String observedAt,
+                Long observedAgeMillis, String freshness, List<Evidence> evidence, List<String> cannotSay, Next next,
+                Pending pending, Plan plan, List<String> awaitingRebalance, List<Rollup> rollups) {
+            this(pipelineId, state, kind, message, observedAt, observedAgeMillis, freshness, evidence, cannotSay,
+                    next, pending, plan, awaitingRebalance, rollups, List.of());
         }
 
         /** An explanation of a pipeline that declares no rollup fields. */
@@ -132,6 +142,17 @@ sealed interface ExplainOutcome {
     }
 
     record Unreachable() implements ExplainOutcome {
+    }
+
+    /**
+     * What one aggregate step keeps in state, as the server listed it. The row count, the estimate and the
+     * count are each null when the server did not know them.
+     */
+    record Aggregate(String step, int entriesPerRow, List<String> keptInputFields, Long inputRows,
+            Long estimatedEntries, Long storedEntries) {
+        public Aggregate {
+            keptInputFields = keptInputFields == null ? List.of() : List.copyOf(keptInputFields);
+        }
     }
 
     /** One rollup field the pipeline declares, as the server listed it. */

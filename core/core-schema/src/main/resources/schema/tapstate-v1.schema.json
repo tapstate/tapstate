@@ -1265,8 +1265,50 @@
           "$ref": "#/$defs/TransformBody.Nest"
         },
         {
+          "$ref": "#/$defs/TransformBody.Aggregate"
+        },
+        {
           "$ref": "#/$defs/TransformBody.Join"
         }
+      ]
+    },
+    "TransformBody.Aggregate": {
+      "type": "object",
+      "description": "Groups the rows of one input and keeps one output row per group, with fields computed over the group's rows.",
+      "properties": {
+        "type": {
+          "description": "Transform type discriminator.",
+          "const": "aggregate"
+        },
+        "key": {
+          "description": "The columns that identify one input row. Absent uses the input's primary key; required when the input has none.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "where": {
+          "description": "A predicate over the input row: a row that fails it belongs to no group, and a row that stops passing it leaves its group.",
+          "type": "string"
+        },
+        "groupBy": {
+          "description": "Output key fields by name, each a $column or an =expression over the input row; declared order is the order of the output key. Absent or empty gives one group holding every row.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "fields": {
+          "description": "Output fields by name, each one function over the group's rows.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/RollupField"
+          }
+        }
+      },
+      "required": [
+        "type",
+        "fields"
       ]
     },
     "TransformBody.Filter": {

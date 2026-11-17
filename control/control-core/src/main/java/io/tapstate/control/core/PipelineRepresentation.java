@@ -174,6 +174,11 @@ public final class PipelineRepresentation {
         if (body.containsKey("script")) {
             return "js";
         }
+        // Read before map: both carry fields, and only an aggregate says how rows are grouped. One
+        // with neither key has to name its type, as an unqualified fields map is a projection.
+        if (body.containsKey("groupBy") || body.containsKey("where")) {
+            return "aggregate";
+        }
         if (body.containsKey("fields")) {
             return "map";
         }
@@ -202,6 +207,11 @@ public final class PipelineRepresentation {
                     fieldRules(requiredObject(payload, "fields", path), path + ".fields"));
             case "filter" -> new TransformBody.Filter(requiredText(payload, "expr", path));
             case "union" -> new TransformBody.Union();
+            case "aggregate" -> new TransformBody.Aggregate(
+                    stringsOrNull(payload.get("key"), path + ".key"),
+                    textOrNull(payload.get("where"), path + ".where"),
+                    groupBy(payload.get("groupBy"), path + ".groupBy"),
+                    rollupFields(requiredObject(payload, "fields", path), path + ".fields"));
             // An expansion's four optional keys are read as absent when absent, never defaulted:
             // this face round-trips what it wrote, and answering with a spelled-out false for a
             // key nobody wrote turns reading a pipeline into editing it.
@@ -384,6 +394,12 @@ public final class PipelineRepresentation {
                 value.put("sourceIdField", unwind.sourceIdField());
             }
             case TransformBody.Union ignored -> {
+            }
+            case TransformBody.Aggregate aggregate -> {
+                value.put("key", aggregate.key());
+                value.put("where", aggregate.where());
+                value.put("groupBy", aggregate.groupBy());
+                value.put("fields", rollupValues(aggregate.fields()));
             }
             case TransformBody.Nest nest -> {
                 value.put("primaryKey", nest.primaryKey());
@@ -683,6 +699,16 @@ public final class PipelineRepresentation {
                     rollup));
         }
         return List.copyOf(result);
+    }
+
+    /** Group names to the expression each is computed from, in the order written. */
+    private static Map<String, String> groupBy(Object raw, String path) {
+        if (raw == null) {
+            return Map.of();
+        }
+        Map<String, String> result = new LinkedHashMap<>();
+        object(raw, path).forEach((name, expression) -> result.put(name, text(expression, path + "." + name)));
+        return result;
     }
 
     /** Rollup fields read back from their written shape; exactly one function key per field. */
