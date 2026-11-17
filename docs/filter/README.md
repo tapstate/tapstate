@@ -59,3 +59,27 @@ ALTER TABLE shipments REPLICA IDENTITY FULL;
 If predicate evaluation reads a missing before-image field, it reports the
 existing `transform.expression-failed` diagnostic. The filter does not fetch
 old rows from the source or reconstruct missing values.
+
+## Ignoring an update that carries an older timestamp
+
+Two DATETIME, DATE or TIME values of the same type can be ordered with `<`,
+`<=`, `>` and `>=`. A filter can use that to ignore an update whose
+last-updated column is older than the row it replaces, so a late write from
+an upstream system does not overwrite a newer version:
+
+```yaml
+expr: "op != 'u' || (after != before && after.updated_at >= before.updated_at)"
+```
+
+The `after != before` part matters. Without it, a stale update stops
+matching, the filter evaluates the previous row as `after`, that row matches,
+and the filter sends a delete: the row leaves the view instead of keeping its
+newer version. With it, the previous row does not match either, so the stale
+update produces no row event. An update that changes nothing is dropped too.
+
+Mixed operands, such as a DATETIME against a DATE, a string or a number, are
+refused at validation, and so is arithmetic on these types. A null operand
+fails evaluation with `transform.expression-failed`; guard a nullable column
+with `has()` or a null check. The filter judges each update against the row it
+replaces, so a stale value that a partial update has already merged into the
+source row travels on with the next newer update.
