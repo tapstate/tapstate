@@ -109,6 +109,74 @@ class AnAlternativeKeyThatIsNullMatchesNothingTest {
                 .containsExactly(List.of(4L));
     }
 
+    @Test
+    void anAlternativeColumnMissingFromAFullEarlierRowIsReadAsNull() throws Exception {
+        // A document store leaves a field out rather than holding null in it, so a transaction that
+        // never had a hub id carries none in its earlier row either. That row is a full one - it holds
+        // the transaction's other columns - so the missing field is the null it would be anywhere else.
+        NestLookup byHub = TOPOLOGY.lookups().get(1);
+        HeapNestStore<Map<String, Object>> rows = new HeapNestStore<>();
+        HeapNestStore<Set<Object>> references = new HeapNestStore<>();
+        TestOutbox outbox = new TestOutbox(1024);
+        LookupProcessor processor = new LookupProcessor(byHub, rows, references, 2L, null);
+        processor.init(outbox, new TestProcessorContext());
+
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("tran_id", 5L);
+        before.put("locn_code", "A");
+        before.put("status", "open");
+        Map<String, Object> after = new LinkedHashMap<>(before);
+        after.put("status", "closed");
+
+        assertThatCode(() -> feed(processor, LookupProcessor.DEPARTED_REGISTRATIONS,
+                Envelope.update(5L, "wallet_tran", before, after, null).withOrder(at(5))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void anEarlierRowHoldingOnlyTheIdentityStillSaysNothingAboutWhereItPointed() throws Exception {
+        // What a change stream sends with no pre-image configured: the key of the row and nothing else.
+        // Reading the missing hub id as null there would leave an entry recorded under the real one.
+        NestLookup byHub = TOPOLOGY.lookups().get(1);
+        LookupProcessor processor = new LookupProcessor(byHub, new HeapNestStore<>(), new HeapNestStore<>(), 2L, null);
+        processor.init(new TestOutbox(1024), new TestProcessorContext());
+
+        Map<String, Object> after = new LinkedHashMap<>();
+        after.put("tran_id", 6L);
+        after.put("hub_locn_id", "H2");
+        assertThatThrownBy(() -> feed(processor, LookupProcessor.DEPARTED_REGISTRATIONS,
+                Envelope.update(6L, "wallet_tran", Map.of("tran_id", 6L), after, null).withOrder(at(6))))
+                .isInstanceOf(TapstateException.class)
+                .satisfies(e -> assertThat(((TapstateException) e).code())
+                        .isEqualTo(NestError.REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE));
+    }
+
+    @Test
+    void aPlainReferenceMissingFromAFullEarlierRowIsTakenOutFromUnderNull() throws Exception {
+        // The same document store, an embed with a single on: the transaction named no location, so it was
+        // recorded under the null the missing field reads as, and pointing it somewhere takes it out of there.
+        NestLookup byRef = NestTopology.compile("p", "doc", tree(Map.of("locn_id", "locn_ref"), null), TABLES::get)
+                .lookups().getFirst();
+        HeapNestStore<Set<Object>> references = new HeapNestStore<>();
+        LookupProcessor processor = new LookupProcessor(byRef, new HeapNestStore<>(), references, 2L, null);
+        processor.init(new TestOutbox(1024), new TestProcessorContext());
+
+        Map<String, Object> before = new LinkedHashMap<>();
+        before.put("tran_id", 7L);
+        before.put("status", "open");
+        Map<String, Object> after = new LinkedHashMap<>(before);
+        after.put("locn_ref", 1L);
+        feed(processor, LookupProcessor.REGISTRATIONS, Envelope.insert(7L, "wallet_tran", before, null).withOrder(at(7)));
+        Object underNull = NestLookup.bucketKey(Arrays.asList((Object) null),
+                NestLookup.bucketOf(List.of(7L)));
+        assertThat(references.load(underNull)).as("control: recorded under null to begin with").isNotEmpty();
+
+        assertThatCode(() -> feed(processor, LookupProcessor.DEPARTED_REGISTRATIONS,
+                Envelope.update(8L, "wallet_tran", before, after, null).withOrder(at(8))))
+                .doesNotThrowAnyException();
+        assertThat(references.load(underNull)).as("and taken out once it points somewhere").isNullOrEmpty();
+    }
+
     private static Envelope tran(long id, String hub) {
         Map<String, Object> fields = new LinkedHashMap<>();
         fields.put("tran_id", id);
