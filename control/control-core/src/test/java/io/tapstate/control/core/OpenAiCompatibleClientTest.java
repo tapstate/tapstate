@@ -282,9 +282,10 @@ class OpenAiCompatibleClientTest {
                 .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));
     }
 
-    @Test void connectionCheckAcceptsAChoicesEnvelopeAndRejectsAnEmptyChoicesList() throws Exception {
-        withServer(200, "{\"choices\":[{}]}", settings ->
-                assertThatCode(() -> localClient().check(settings)).doesNotThrowAnyException());
+    @Test void connectionCheckRequiresToolSupportAndRejectsAnEmptyChoicesList() throws Exception {
+        withServer(200, "{\"choices\":[{\"message\":{\"content\":\"OK\"}}]}", settings ->
+                assertThatThrownBy(() -> localClient().check(settings)).isInstanceOfSatisfying(TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_REQUEST_REJECTED)));
         withServer(200, "{\"choices\":[]}", settings -> assertThatThrownBy(() -> localClient().check(settings))
                 .isInstanceOfSatisfying(TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)));

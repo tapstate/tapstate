@@ -34,6 +34,7 @@ public final class ControlOperations {
     public static final Operation AI_PROVIDER_GET = new Operation("ai-provider.get", Scope.READ, false, null, "Read the current caller provider metadata without a credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_REPLACE = new Operation("ai-provider.replace", Scope.WRITE, true, null, "Replace the current caller encrypted provider credential.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_DELETE = new Operation("ai-provider.delete", Scope.WRITE, true, null, "Delete the current caller provider credential.", CLI_AND_REST);
+    public static final Operation AI_PROVIDER_MODELS = new Operation("ai-provider.models", Scope.WRITE, false, null, "Discover provider model identifiers without persisting credentials.", CLI_AND_REST);
     public static final Operation AI_PROVIDER_CHECK = new Operation("ai-provider.check", Scope.WRITE, false, null, "Test an ephemeral provider credential without persisting it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT = new Operation("pipeline-draft.assistant", Scope.WRITE, false, null, "Stream a validated Pipeline Builder proposal without saving it.", CLI_AND_REST);
     public static final Operation PIPELINE_DRAFT_ASSISTANT_VALIDATE = new Operation("pipeline-draft.assistant-validate", Scope.READ, false, null, "Validate a Pipeline Builder proposal against the current draft revision.", CLI_AND_REST);
@@ -433,6 +434,7 @@ public final class ControlOperations {
             AI_PROVIDER_REPLACE,
             AI_PROVIDER_DELETE,
             AI_PROVIDER_CHECK,
+            AI_PROVIDER_MODELS,
             PIPELINE_DRAFT_ASSISTANT,
             PIPELINE_DRAFT_ASSISTANT_VALIDATE,
             SYSTEM_VERSION,
