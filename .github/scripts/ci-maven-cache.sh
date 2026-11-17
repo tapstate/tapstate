@@ -2,11 +2,11 @@
 # Share downloaded dependencies while keeping every install's project artifacts local.
 set -euo pipefail
 if [ "$#" -ne 3 ]; then
-  echo 'usage: ci-maven-cache.sh seed|collect CACHE REPOSITORY' >&2
+  echo 'usage: ci-maven-cache.sh seed|seed-stable|collect CACHE REPOSITORY' >&2
   exit 2
 fi
 mode="$1"
-case "$mode" in seed|collect) ;; *) echo 'expected seed or collect' >&2; exit 2 ;; esac
+case "$mode" in seed|seed-stable|collect) ;; *) echo 'expected seed, seed-stable or collect' >&2; exit 2 ;; esac
 mkdir -p "$2" "$3"
 cache="$(cd "$2" && pwd -P)"
 repository="$(cd "$3" && pwd -P)"
@@ -20,4 +20,8 @@ if [ "$mode" = collect ]; then
   source="$repository"
   destination="$cache"
 fi
-rsync -a --exclude='/io/tapstate/' -- "$source/" "$destination/"
+if [ "$mode" = seed-stable ]; then
+  rsync -a --exclude='/io/tapstate/' --exclude='*-SNAPSHOT/' -- "$source/" "$destination/"
+else
+  rsync -a --exclude='/io/tapstate/' -- "$source/" "$destination/"
+fi
