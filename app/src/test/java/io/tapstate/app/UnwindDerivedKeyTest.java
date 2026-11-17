@@ -122,6 +122,36 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void anUnwindKeyFollowsAPureReadComputedExpressionInASubsequentMap() {
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
+        assertThat(expanded.key()).contains("item_no");
+
+        NodeColumns mapped = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("renamed_item_no", FieldRule.computed("after.item_no"))), one(expanded), null);
+
+        assertThat(mapped.key()).containsExactly("renamed_item_no");
+    }
+
+    @Test
+    void anUnwindKeyIgnoresAModifiedComputedExpressionInASubsequentMap() {
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("renamed_item_no", FieldRule.computed("after.item_no + 1"));
+        rules.put("item_no", FieldRule.drop());
+        NodeColumns mapped = NodeColumns.of(new TransformBody.MapProjection(rules), one(expanded), null);
+
+        assertThat(mapped.key()).isEmpty();
+    }
+
+    @Test
+    void aPureReadComputedExpressionWithMissingSourceEmitsNoOrigin() {
+        NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("missing_alias", FieldRule.computed("after.absent"))), one(atTheSource()), null);
+
+        assertThat(projected.origins()).doesNotContainKey("missing_alias");
+    }
+
+    @Test
     void aParentKeyMovedByPureReadComputedExpressionReachesTheTarget() {
         Map<String, FieldRule> rules = new LinkedHashMap<>();
         rules.put("order_id", FieldRule.computed("after.o_id"));
