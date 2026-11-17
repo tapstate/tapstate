@@ -145,8 +145,8 @@ class ConnectionTestResultQueryServiceTest {
         MapResultStore store = new MapResultStore();
         store.save(new ConnectionTestResult("conn-orders", "mongodb", Outcome.FAILED,
                 List.of(new ConnectionTestItem("Login", ConnectionTestItem.Status.FAILED,
-                        "Unable to connect to mongodb://fixture-user:fixture-secret@db.example/data",
-                        "Refused ProxySettings{host=proxy, port=1080, username=fixture-user, password=fixture-secret}",
+                        "Unable to connect to mongodb://fixture-user:two words@db.example/data",
+                        "Refused ProxySettings{host=proxy, port=1080, username=fixture-user, password=head}tail",
                         "Check the server address", null)), 1_700_000_000_000L, true));
 
         var check = new ConnectionTestResultQueryService(store).find("conn-orders").orElseThrow()

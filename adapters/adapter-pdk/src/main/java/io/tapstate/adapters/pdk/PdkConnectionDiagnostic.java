@@ -70,11 +70,12 @@ final class PdkConnectionDiagnostic {
         List<CoreException> additional = failure instanceof CoreException grouped ? grouped.getMoreExceptions() : null;
         if (additional != null && !additional.isEmpty() && (cause != null || additional.size() > 1)) {
             appendGroup(node, cause, additional, seen, depth, catalog, locale);
-        } else if (cause != null) {
+            return;
+        }
+        if (cause == null && additional != null && additional.size() == 1) cause = additional.getFirst();
+        if (cause != null) {
             var child = child(node, cause, seen, depth, catalog, locale);
             if (!child.isEmpty()) node.put("cause", child);
-        } else if (additional != null && additional.size() == 1) {
-            appendRawDetail(node, additional.getFirst());
         }
     }
 
@@ -91,13 +92,6 @@ final class PdkConnectionDiagnostic {
         }
         if (children.size() < 2) node.put(TRUNCATED, true);
         node.put("causes", List.copyOf(children));
-    }
-
-    private static void appendRawDetail(Map<String, Object> node, CoreException detail) {
-        String message = detail == null ? null : detail.getMessage();
-        if (message == null) return;
-        Object original = node.get(RAW_MESSAGE);
-        put(node, RAW_MESSAGE, original == null ? message : original + "\n" + message);
     }
 
     private static void addIfPresent(List<Map<String, Object>> children, Map<String, Object> child) {

@@ -11,6 +11,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -28,6 +29,34 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
             .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION)
             .streamReadConstraints(StreamReadConstraints.builder().maxNestingDepth(12).build()).build();
     private static final PdkDiagnosticCatalog UNAVAILABLE = new PdkDiagnosticCatalog(Map.of(), Map.of(), Set.of());
+    private static final PdkDiagnosticCatalog NO_CATALOG = new PdkDiagnosticCatalog(Map.of(), Map.of(), Set.of());
+
+    static final class Cache {
+        private static final int MAX_ENTRIES = 16;
+        private final LinkedHashMap<ArtifactKey, PdkDiagnosticCatalog> entries =
+                new LinkedHashMap<>(MAX_ENTRIES, 0.75f, true);
+
+        PdkDiagnosticCatalog resolve(String connectorId, ConnectorRef ref) {
+            if (ref.contentHash() == null || ref.classpath().size() != 1) return UNAVAILABLE;
+            var key = new ArtifactKey(connectorId, ref.contentHash());
+            synchronized (entries) {
+                var cached = entries.get(key);
+                if (cached != null) return cached;
+            }
+            // The provisioner resolves and verifies the artifact before each lookup. Do not
+            // hold the cache lock during archive I/O, or cache an unreadable artifact.
+            var loaded = load(connectorId, ref);
+            if (loaded == UNAVAILABLE) return loaded;
+            synchronized (entries) {
+                var cached = entries.putIfAbsent(key, loaded);
+                if (entries.size() > MAX_ENTRIES) entries.pollFirstEntry();
+                return cached == null ? loaded : cached;
+            }
+        }
+
+        private record ArtifactKey(String connectorId, String hash) {
+        }
+    }
 
     record Definition(String code, Map<String, String> english, Map<String, String> simplifiedChinese,
                       Map<String, String> traditionalChinese) {
@@ -56,7 +85,8 @@ final class PdkDiagnosticCatalog implements DiagnosticDefinitionLookup {
         }
         try (var jar = new JarFile(ref.classpath().getFirst().toFile(), false)) {
             var entry = jar.getJarEntry(RESOURCE);
-            if (entry == null || entry.isDirectory()) return UNAVAILABLE;
+            if (entry == null) return NO_CATALOG;
+            if (entry.isDirectory()) return UNAVAILABLE;
             long declaredSize = entry.getSize();
             if (declaredSize < 0 || declaredSize > MAX_BYTES
                     || jar.stream().filter(candidate -> candidate.getName().equals(RESOURCE)).limit(2).count() != 1) {

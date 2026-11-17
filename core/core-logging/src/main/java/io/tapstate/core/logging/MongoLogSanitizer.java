@@ -9,7 +9,10 @@ final class MongoLogSanitizer {
     private static final String MONGO_CREDENTIAL_END = "mechanismProperties=<hidden>}";
     private static final String PROXY_SETTINGS = "ProxySettings{";
     private static final Pattern REPORT_URI_USERINFO = Pattern.compile(
-            "(mongodb(?:\\+srv)?://)[^\\s/?#]*@", Pattern.UNICODE_CHARACTER_CLASS);
+            "(mongodb(?:\\+srv)?://)(?:[^\\s/?#]*"
+                    + "|[^\\s:/?#@\\[\\],]++:(?![0-9]+[\\s,;.!)])[^\\s/?#@]*+\\s[^/?#@]*+"
+                    + "|[^\\s/?#@]*+\\s[^/?#@]*+(?=@[^\\s/?#@]++[/?#]))@",
+            Pattern.UNICODE_CHARACTER_CLASS);
 
     private MongoLogSanitizer() {
     }
@@ -44,9 +47,12 @@ final class MongoLogSanitizer {
         String safe = hideBlock(text, MONGO_CREDENTIAL, MONGO_CREDENTIAL_END, true);
         int proxy = safe.indexOf(PROXY_SETTINGS);
         if (proxy >= 0 && (safe.indexOf("username=", proxy) >= 0 || safe.indexOf("password=", proxy) >= 0)) {
-            safe = hideBlock(safe, PROXY_SETTINGS, "}", true);
+            // ProxySettings prints the password without escaping. A trailing brace can be
+            // part of that value, so a report cannot reliably restore any text after it.
+            safe = safe.substring(0, proxy) + "ProxySettings" + MongoUriUserInfo.REDACTED;
         }
-        // Do not extend a host-only endpoint into prose containing an unrelated at-sign.
+        // Extend past whitespace if the first token looks like userinfo, or an
+        // explicit path, query or fragment confirms the following URI authority.
         return REPORT_URI_USERINFO.matcher(safe).replaceAll("$1" + MongoUriUserInfo.REDACTED + "@");
     }
 

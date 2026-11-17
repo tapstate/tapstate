@@ -72,6 +72,20 @@ class PdkDiagnosticCatalogTest {
     }
 
     @Test
+    void reusesTheCatalogOnlyForTheSameConnectorAndArtifact(@TempDir Path temp) throws Exception {
+        var first = jar(temp.resolve("first.jar"), export("fixture", List.of(First.class)));
+        var replacement = jar(temp.resolve("replacement.jar"), export("fixture", List.of(Second.class)));
+        var cache = new PdkDiagnosticCatalog.Cache();
+
+        var original = cache.resolve("fixture", first);
+        assertThat(cache.resolve("fixture", first)).isSameAs(original);
+        assertThat(cache.resolve("other", first).definition("EXAMPLE043001")).isNull();
+        var revised = cache.resolve("fixture", replacement);
+        assertThat(revised).isNotSameAs(original);
+        assertThat(revised.definition("EXAMPLE043001").text(Locale.ENGLISH).get("message")).startsWith("Another");
+    }
+
+    @Test
     void rejectsRepeatedKeysAndRepeatedFullCodesInSuppliedCatalogs() {
         String row = "{\"rawCode\":\"0043\",\"code\":\"EXT0043\",\"en\":{\"message\":\"Reason\"}}";
         String repeatedCode = "{\"formatVersion\":1,\"connectorId\":\"fixture\",\"definitions\":[" + row + "," + row + "]}";

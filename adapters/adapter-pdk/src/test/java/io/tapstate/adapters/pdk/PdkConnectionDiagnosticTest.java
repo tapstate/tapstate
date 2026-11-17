@@ -64,18 +64,23 @@ class PdkConnectionDiagnosticTest {
     }
 
     @Test
-    void aSingletonCommonDetailAugmentsTheExistingRawMessage() throws Exception {
+    void aSingletonCommonDetailKeepsItsNestedDriverCause() throws Exception {
         var group = new CoreException(7, "Common failure");
-        group.coreException(new CoreException("Supplementary detail"));
+        group.coreException(new CoreException(new SQLException("Driver refused", "28P01"), "Supplementary detail"));
         var outer = new TapTestItemException();
         outer.initCause(group);
 
         var nested = (Map<?, ?>) capture(outer).get("cause");
 
-        assertThat(nested.get("rawMessage")).isEqualTo("Common failure\nSupplementary detail");
+        assertThat(nested.get("rawMessage")).isEqualTo("Common failure");
         assertThat(nested.get("code")).isEqualTo("7");
-        assertThat(nested.get("definitionStatus")).isEqualTo("unverified");
-        assertThat(nested.keySet()).noneMatch(key -> "cause".equals(key) || "causes".equals(key));
+        var detail = (Map<?, ?>) nested.get("cause");
+        assertThat(detail).isNotNull();
+        assertThat(detail.get("rawMessage")).isEqualTo("Supplementary detail");
+        var sql = (Map<?, ?>) detail.get("cause");
+        assertThat(sql.get("code")).isEqualTo("28P01");
+        assertThat(sql.get("codeSource")).isEqualTo("jdbc-sqlstate");
+        assertThat(sql.get("stackTrace")).isInstanceOf(String.class);
     }
 
     @Test

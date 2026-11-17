@@ -47,6 +47,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     private final java.time.Duration defaultBudget;
     private final boolean ownsSlot;
     private final boolean captureDiagnostics;
+    private final PdkDiagnosticCatalog.Cache diagnosticCatalogs = new PdkDiagnosticCatalog.Cache();
     private final Supplier<Locale> diagnosticLocale;
     private volatile boolean closed;
 
@@ -338,7 +339,7 @@ public final class PdkConnectionTester implements ConnectionTester, AutoCloseabl
     }
 
     private PdkDiagnosticCatalog diagnostics(String connectorId, ConnectorRef ref) {
-        return captureDiagnostics ? PdkDiagnosticCatalog.load(connectorId, ref) : null;
+        return captureDiagnostics ? diagnosticCatalogs.resolve(connectorId, ref) : null;
     }
 
     private static List<ConnectionTestItem> translate(List<TestItem> raw, PdkDiagnosticCatalog diagnostics, Locale locale) {
