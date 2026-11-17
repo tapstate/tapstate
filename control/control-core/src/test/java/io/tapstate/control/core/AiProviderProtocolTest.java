@@ -147,6 +147,94 @@ class AiProviderProtocolTest {
         assertThat(output.text.toString()).isEqualTo("Answer.");
     }
 
+    @Test void secretSplitAcrossReasoningPartsIsNotExposed() throws Exception {
+        var output = new RecordingOutput();
+        var type = Class.forName("io.tapstate.control.core.OpenAiCompatibleClient$RedactedOutput");
+        var constructor = type.getDeclaredConstructor(String.class, AiProviderClient.Output.class);
+        constructor.setAccessible(true);
+        var redacted = (AiProviderClient.Output) constructor.newInstance("test-key", output);
+        redacted.reasoning(new AiProviderClient.Reasoning("a", AiProviderClient.Reasoning.Phase.START, ""));
+        redacted.reasoning(new AiProviderClient.Reasoning("a", AiProviderClient.Reasoning.Phase.DELTA, "test-"));
+        redacted.reasoning(new AiProviderClient.Reasoning("a", AiProviderClient.Reasoning.Phase.END, ""));
+        redacted.reasoning(new AiProviderClient.Reasoning("b", AiProviderClient.Reasoning.Phase.START, ""));
+        redacted.reasoning(new AiProviderClient.Reasoning("b", AiProviderClient.Reasoning.Phase.DELTA, "key"));
+        redacted.reasoning(new AiProviderClient.Reasoning("b", AiProviderClient.Reasoning.Phase.END, ""));
+        assertThat(output.summary()).doesNotContain("test-key");
+        assertThat(output.summary()).isEqualTo("[redacted]key");
+        redacted.reasoning(new AiProviderClient.Reasoning("c", AiProviderClient.Reasoning.Phase.START, ""));
+        redacted.reasoning(new AiProviderClient.Reasoning("c", AiProviderClient.Reasoning.Phase.DELTA, "test-"));
+        redacted.reasoning(new AiProviderClient.Reasoning("c", AiProviderClient.Reasoning.Phase.END, ""));
+        redacted.accept("key and ordinary text.");
+        assertThat(output.summary() + output.text).doesNotContain("test-key");
+        assertThat(output.text.toString()).contains("key and ordinary text");
+    }
+
+    @Test void reasoningWithoutSummaryDoesNotDiscardCompletedAnswer() {
+        var output = new RecordingOutput();
+        var stream = new OpenAiResponsesProtocol.Stream(output, false);
+        var reasoning = Map.of("type", "reasoning", "id", "rs");
+        var message = Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "Done")));
+        stream.accept(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output", List.of(reasoning, message))));
+        assertThat(output.text.toString()).isEqualTo("Done");
+    }
+
+    @Test void providerFailureIsNotReportedAsInvalidProposal() {
+        for (String type : List.of("error", "response.failed", "response.incomplete")) {
+            var stream = new OpenAiResponsesProtocol.Stream(new RecordingOutput(), false);
+            assertThatThrownBy(() -> stream.accept(Map.of("type", type)))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED));
+        }
+    }
+
+    @Test void responsesRetriesAnEmptyTransientFailureBeforeDeliveringTheAnswer() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/responses", exchange -> {
+            exchange.getRequestBody().readAllBytes();
+            String payload = calls.incrementAndGet() == 1
+                    ? event(Map.of("type", "error", "code", "server_error"))
+                    : event(Map.of("type", "response.completed", "response", Map.of("status", "completed", "output", List.of(
+                            Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "OK")))))));
+            byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.start();
+        try {
+            var output = new RecordingOutput();
+            var settings = new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "model", "test-key");
+            new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions"))
+                    .propose(settings, List.of(), Map.of("proposalEnabled", false), output);
+            assertThat(calls).hasValue(2);
+            assertThat(output.text.toString()).isEqualTo("OK");
+        } finally { server.stop(0); }
+    }
+
+    @Test void responsesDoesNotReplayAfterPartialOutput() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/v1/responses", exchange -> {
+            calls.incrementAndGet(); exchange.getRequestBody().readAllBytes();
+            String payload = event(Map.of("type", "response.output_text.delta", "delta", "partial"))
+                    + event(Map.of("type", "error", "code", "server_error"));
+            byte[] bytes = payload.getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, bytes.length);
+            try (var out = exchange.getResponseBody()) { out.write(bytes); }
+        });
+        server.start();
+        try {
+            var output = new RecordingOutput();
+            var settings = new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "model", "test-key");
+            assertThatThrownBy(() -> new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions"))
+                    .propose(settings, List.of(), Map.of("proposalEnabled", false), output))
+                    .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                            error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED));
+            assertThat(calls).hasValue(1);
+            assertThat(output.text.toString()).startsWith("partial");
+        } finally { server.stop(0); }
+    }
+
     @Test void malformedOrTruncatedSummaryCannotAuthorizeAProposal() {
         for (Map<String, Object> invalid : List.of(
                 summaryEvent("response.reasoning_summary_text.done", 0, "Different."),
@@ -268,6 +356,14 @@ class AiProviderProtocolTest {
                 assertThat(client.models(settings)).containsExactly("a-model", "z-model"), new AtomicReference<>());
     }
 
+    @Test void malformedModelEntryIsAProviderFailure() throws Exception {
+        withEndpoint("/v1/models", JsonWriter.write(Map.of("data", List.of("not-an-object"))),
+                (settings, client) -> assertThatThrownBy(() -> client.models(settings))
+                        .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                error -> assertThat(error.code()).isEqualTo(ControlError.AI_PROVIDER_FAILED)),
+                new AtomicReference<>());
+    }
+
     @Test void responsesConnectionCheckVerifiesTextAndToolCapabilities() throws Exception {
         java.util.concurrent.atomic.AtomicInteger count = new java.util.concurrent.atomic.AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
@@ -287,6 +383,51 @@ class AiProviderProtocolTest {
                     new AiProviderSettings("openai-responses", "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "gpt-6.1-sol", "key"));
             assertThat(count).hasValue(2);
         } finally { server.stop(0); }
+    }
+
+    @Test void connectionCheckDistinguishesExhaustedOutputFromUnsupportedTools() throws Exception {
+        for (boolean responses : List.of(false, true)) {
+            String payload = responses
+                    ? JsonWriter.write(Map.of("status", "incomplete", "incomplete_details", Map.of("reason", "max_output_tokens")))
+                    : JsonWriter.write(Map.of("choices", List.of(Map.of("finish_reason", "length", "message", Map.of("content", "")))));
+            withEndpoint("/v1/" + (responses ? "responses" : "chat/completions"), payload,
+                    (settings, client) -> assertThatThrownBy(() -> client.check(new AiProviderSettings(
+                            responses ? "openai-responses" : "openai-compatible", settings.baseUrl(), settings.model(), settings.apiKey())))
+                            .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                                    error -> assertThat(error.code().code()).isEqualTo("control.ai-provider-output-limit")),
+                    new AtomicReference<>());
+        }
+    }
+
+    @Test void connectionCheckRetriesOnlyAfterAnExhaustedProbe() throws Exception {
+        for (boolean responses : List.of(false, true)) {
+            var budgets = new java.util.ArrayList<Integer>();
+            HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+            server.createContext("/v1/" + (responses ? "responses" : "chat/completions"), exchange -> {
+                var body = (Map<?, ?>) JsonReader.parse(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+                budgets.add(((Number) body.get(responses ? "max_output_tokens" : "max_tokens")).intValue());
+                boolean tools = body.containsKey("tools");
+                Object payload = budgets.size() == 1
+                        ? (responses ? Map.of("status", "incomplete", "incomplete_details", Map.of("reason", "max_output_tokens"))
+                                : Map.of("choices", List.of(Map.of("finish_reason", "length", "message", Map.of("content", "")))))
+                        : (responses ? Map.of("status", "completed", "output", List.of(tools
+                                ? Map.of("type", "function_call", "name", "connection_check", "arguments", "{\"ok\":true}")
+                                : Map.of("type", "message", "content", List.of(Map.of("type", "output_text", "text", "OK")))))
+                                : Map.of("choices", List.of(Map.of("message", tools
+                                        ? Map.of("tool_calls", List.of(Map.of("function", Map.of("name", "connection_check", "arguments", "{\"ok\":true}"))))
+                                        : Map.of("content", "OK")))));
+                byte[] bytes = JsonWriter.write(payload).getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, bytes.length);
+                try (var out = exchange.getResponseBody()) { out.write(bytes); }
+            });
+            server.start();
+            try {
+                var settings = new AiProviderSettings(responses ? "openai-responses" : "openai-compatible",
+                        "http://127.0.0.1:" + server.getAddress().getPort() + "/v1", "model", "test-key");
+                new OpenAiCompatibleClient(base -> URI.create(base + "/chat/completions")).check(settings);
+                assertThat(budgets).containsExactly(128, 8192, 128);
+            } finally { server.stop(0); }
+        }
     }
 
     @Test void malformedConnectionToolArgumentsAreCodedForBothProtocols() throws Exception {

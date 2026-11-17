@@ -108,8 +108,10 @@ class GuardedAssistantTextTest {
 
     @Test void cancellationInterruptsABlockedPublicationAndReleasesTheProducer() throws Exception {
         var writing = new CountDownLatch(1);
+        var finishing = new CountDownLatch(1);
         var interrupted = new CountDownLatch(1);
         var cleaned = new CountDownLatch(1);
+        var interruptedOnCancellation = new java.util.concurrent.atomic.AtomicBoolean(true);
         var outputBarrier = new CountDownLatch(1);
         var producer = Thread.ofPlatform().daemon().start(() -> {
             try (var stream = new GuardedAssistantText(() -> {}, batch -> {
@@ -119,18 +121,22 @@ class GuardedAssistantTextTest {
             })) {
                 stream.accept("prefix");
                 assertThat(writing.await(3, TimeUnit.SECONDS)).isTrue();
+                finishing.countDown();
                 stream.finish();
             } catch (java.io.UncheckedIOException cancelled) {
                 // Request cancellation exits without trying to publish another error frame.
+                interruptedOnCancellation.set(Thread.currentThread().isInterrupted());
             } catch (InterruptedException unexpected) {
                 throw new AssertionError(unexpected);
             } finally { cleaned.countDown(); }
         });
         try {
             assertThat(writing.await(3, TimeUnit.SECONDS)).isTrue();
+            assertThat(finishing.await(3, TimeUnit.SECONDS)).isTrue();
             producer.interrupt();
             assertThat(interrupted.await(3, TimeUnit.SECONDS)).as("cancellation reaches the blocked writer").isTrue();
             assertThat(cleaned.await(3, TimeUnit.SECONDS)).as("producer cleanup does not wait for client reads").isTrue();
+            assertThat(interruptedOnCancellation).isFalse();
         } finally { outputBarrier.countDown(); producer.interrupt(); producer.join(3000); }
     }
 

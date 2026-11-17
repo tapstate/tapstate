@@ -168,6 +168,7 @@ class ApiExceptionHandler {
             Map.entry("control.ai-provider-request-rejected", HttpStatus.BAD_GATEWAY),
             Map.entry("control.ai-provider-rate-limited", HttpStatus.TOO_MANY_REQUESTS),
             Map.entry("control.ai-provider-failed", HttpStatus.BAD_GATEWAY),
+            Map.entry("control.ai-provider-output-limit", HttpStatus.BAD_GATEWAY),
             Map.entry("control.ai-invalid-proposal", HttpStatus.UNPROCESSABLE_CONTENT),
             Map.entry("control.ai-overloaded", HttpStatus.TOO_MANY_REQUESTS),
             Map.entry("control.auth-failed", HttpStatus.UNAUTHORIZED),

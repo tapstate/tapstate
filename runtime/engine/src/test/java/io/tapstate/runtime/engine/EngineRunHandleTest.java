@@ -22,6 +22,29 @@ import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class EngineRunHandleTest {
+    @Test void submissionRefusesWhenExistingJobMetadataVanishes() {
+        var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
+        var fixture = new Fixture(first);
+        first.onConfig = () -> { throw new com.hazelcast.jet.core.JobNotFoundException(1); };
+        assertThatThrownBy(() -> fixture.engine.submitRun("p", new DAG(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), "run-a"))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThat(fixture.submits.get()).isZero();
+    }
+
+    @Test void submissionRefusesWhenSubmittedJobMetadataVanishes() {
+        var submitted = new FakeJob(2, "run-a", JobStatus.RUNNING);
+        var fixture = new Fixture(null);
+        submitted.onConfig = () -> { throw new com.hazelcast.jet.core.JobNotFoundException(2); };
+        fixture.onSubmit = () -> submitted.job;
+        assertThatThrownBy(() -> fixture.engine.submitRun("p", new DAG(), Map.of(),
+                io.tapstate.runtime.engine.nest.NestSettings.defaults(), "run-a"))
+                .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
+                        failure -> assertThat(failure.code()).isEqualTo(EngineError.EXECUTION_NOT_AUTHORIZED));
+        assertThat(fixture.submits.get()).isOne();
+        assertThat(submitted.cancels.get()).isZero();
+    }
     @Test void aJobThatVanishesAfterNameLookupIsAbsentWithoutAdoptingItsReplacement() {
         var first = new FakeJob(1, "run-a", JobStatus.RUNNING);
         var second = new FakeJob(2, "run-b", JobStatus.RUNNING);

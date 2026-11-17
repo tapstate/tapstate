@@ -48,15 +48,18 @@ public final class AiProviderService {
     }
     private static AiProviderSettings validated(AiProviderSettings settings, boolean requireModel) {
         String base = OpenAiCompatibleEndpointPolicy.normalizedBaseUrl(settings.baseUrl());
-        if (!("openai-compatible".equals(settings.providerId()) || "openai-responses".equals(settings.providerId()))
-                || requireModel && (settings.model() == null || settings.model().isBlank())
-                || settings.model() != null && (settings.model().length() > 200 || settings.model().chars().anyMatch(Character::isISOControl))
-                || settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
-                || settings.apiKey().chars().anyMatch(c -> c < 32 || c == 127)) {
-            throw new TapstateException(ControlError.MALFORMED_REQUEST,
-                    Map.of("reason", "provider settings require a supported HTTPS API endpoint, model and API key"), null);
-        }
+        if (!AiProviderSettingsStore.supportsProvider(settings.providerId()))
+            throw malformedSettings("a supported AI provider is required");
+        if (requireModel && (settings.model() == null || settings.model().isBlank())
+                || settings.model() != null && (settings.model().length() > 200 || settings.model().chars().anyMatch(Character::isISOControl)))
+            throw malformedSettings("a valid model is required");
+        if (settings.apiKey() == null || settings.apiKey().isBlank() || settings.apiKey().length() > 8192
+                || settings.apiKey().chars().anyMatch(c -> c < 32 || c == 127))
+            throw malformedSettings("a valid API key is required");
         return new AiProviderSettings(settings.providerId(), base, settings.model(), settings.apiKey());
+    }
+    private static TapstateException malformedSettings(String reason) {
+        return new TapstateException(ControlError.MALFORMED_REQUEST, Map.of("reason", reason), null);
     }
     public static TapstateException error(ControlError error) { return new TapstateException(error, Map.of(), null); }
 }

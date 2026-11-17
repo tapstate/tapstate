@@ -63,7 +63,7 @@ final class OpenAiResponsesProtocol {
             if (!(event.get("type") instanceof String type)) throw invalid();
             reasoning.accept(event);
             switch (type) {
-                case "error", "response.failed", "response.incomplete" -> throw invalid();
+                case "error", "response.failed", "response.incomplete" -> throw AiProviderService.error(ControlError.AI_PROVIDER_FAILED);
                 case "response.output_item.added" -> {
                     Map<String, Object> item = object(event.get("item"));
                     if ("function_call".equals(item.get("type"))) {

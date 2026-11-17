@@ -212,7 +212,7 @@ class NativeValidationSchedulerIT {
         }catch(org.awaitility.core.ConditionTimeoutException failed){
             throw new AssertionError("scheduled completion: due="+occurrence+"; fact="+fact(facts,coordinator,task,1)
                     +"; original="+observed(facts,coordinator,task,1)
-                    +"; mode="+fixture.tasks.read("flow",task.taskId()).orElseThrow().full()
+                    +"; mode="+fixture.tasks.read("flow",task.taskId()).map(value->String.valueOf(value.full())).orElse("<absent>")
                     +"; resources="+fixture.resources.snapshot()
                     +"; reports="+fixture.configuration.validationReports(()->{}).history("flow",task.taskId(),ValidationMode.FULL,
                             new ValidationReports.Paging(0,10)),failed);

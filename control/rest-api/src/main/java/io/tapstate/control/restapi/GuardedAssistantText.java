@@ -169,7 +169,6 @@ final class GuardedAssistantText implements AiProviderClient.Output, AutoCloseab
     }
 
     private java.io.UncheckedIOException interrupted() {
-        Thread.currentThread().interrupt();
         throwIfFailed();
         return new java.io.UncheckedIOException(new java.io.InterruptedIOException("assistant stream cancelled"));
     }

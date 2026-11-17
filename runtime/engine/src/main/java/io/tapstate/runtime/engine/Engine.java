@@ -159,13 +159,24 @@ public final class Engine {
         Objects.requireNonNull(originalIdentity, "originalIdentity");
         refuseIfLost(pipelineId);
         Job previous = jobNamed(pipelineId);
-        if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING
-                && (!originalIdentity.equals(previous.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
-                || !Objects.equals(manifest, previous.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT)))) throw runRefused(pipelineId);
+        try {
+            if (previous != null && !previous.getStatus().isTerminal() && previous.getStatus() != JobStatus.COMPLETING) {
+                JobConfig config = previous.getConfig();
+                if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
+                        || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+            }
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            throw runRefused(pipelineId);
+        }
         configureNestState(stateDatabases, settings);
         Job submitted = submitJob(pipelineId, dag, originalIdentity, manifest);
-        if (!originalIdentity.equals(submitted.getConfig().getArgument(RUN_IDENTITY_ARGUMENT))
-                || !Objects.equals(manifest, submitted.getConfig().getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+        try {
+            JobConfig config = submitted.getConfig();
+            if (!originalIdentity.equals(config.getArgument(RUN_IDENTITY_ARGUMENT))
+                    || !Objects.equals(manifest, config.getArgument(OPERATOR_MANIFEST_ARGUMENT))) throw runRefused(pipelineId);
+        } catch (com.hazelcast.jet.core.JobNotFoundException vanished) {
+            throw runRefused(pipelineId);
+        }
         JobFailureRegistry.of(member).attach(pipelineId, submitted.getId(), originalIdentity);
         return new Run(pipelineId, originalIdentity, submitted, manifest);
     }

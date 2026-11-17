@@ -27,6 +27,7 @@ import java.util.function.Function;
 public final class OpenAiCompatibleClient implements AiProviderClient {
     private static final int MAX_BYTES = 524288;
     private static final int STREAM_ATTEMPTS = 2;
+    private static final int CHECK_RETRY_MAX_TOKENS = 8192;
     private static final String JSON_TYPE = "type";
     private static final String JSON_STRING = "string";
     private static final String JSON_OBJECT = "object";
@@ -70,20 +71,16 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             HttpRequest request = HttpRequest.newBuilder(endpoint(settings, "/models"))
                     .timeout(timeout).header("Authorization", "Bearer " + settings.apiKey()).GET().build();
             var response = http.send(request, HttpResponse.BodyHandlers.ofInputStream());
-            try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                requireSuccessfulResponse(response.statusCode());
-                byte[] bytes = input.readNBytes(MAX_BYTES + 1);
-                if (bytes.length > MAX_BYTES || System.nanoTime() >= deadline) throw failed();
-                Map<String, Object> json = object(JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)));
-                if (!(json.get("data") instanceof List<?> data) || data.size() > 2000) throw failed();
-                java.util.SortedSet<String> models = new java.util.TreeSet<>();
-                for (Object raw : data) {
-                    Object id = object(raw).get("id");
-                    if (id instanceof String model && !model.isBlank() && model.length() <= 200
-                            && model.chars().noneMatch(Character::isISOControl) && !model.contains(settings.apiKey())) models.add(model);
-                }
-                return List.copyOf(models);
+            Map<String, Object> json = readResponseObject(response, deadline);
+            if (!(json.get("data") instanceof List<?> data) || data.size() > 2000) throw failed();
+            java.util.SortedSet<String> models = new java.util.TreeSet<>();
+            for (Object raw : data) {
+                if (!(raw instanceof Map<?, ?>)) throw failed();
+                Object id = object(raw).get("id");
+                if (id instanceof String model && !model.isBlank() && model.length() <= 200
+                        && model.chars().noneMatch(Character::isISOControl) && !model.contains(settings.apiKey())) models.add(model);
             }
+            return List.copyOf(models);
         } catch (java.io.IOException | InterruptedException | IllegalArgumentException error) {
             if (error instanceof InterruptedException) Thread.currentThread().interrupt();
             throw failed();
@@ -92,7 +89,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
     @Override public void check(AiProviderSettings settings) {
         Map<String, Object> body = Map.of("model", settings.model(), "max_tokens", 128,
                 "messages", List.of(Map.of("role", "user", "content", "Reply OK.")));
-        Map<String, Object> plain = checkResponse(settings, body);
+        Map<String, Object> plain = checkProbe(settings, body);
         if (responses(settings)) {
             OpenAiResponsesProtocol.validateCompleted(plain);
         } else {
@@ -103,7 +100,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         probe.put("tools", List.of(Map.of("type", "function", "function", Map.of("name", "connection_check",
                 "parameters", Map.of("type", "object", "properties", Map.of("ok", Map.of("type", "boolean")), "required", List.of("ok"))))));
         probe.put("tool_choice", Map.of("type", "function", "function", Map.of("name", "connection_check")));
-        Map<String, Object> checked = checkResponse(settings, probe);
+        Map<String, Object> checked = checkProbe(settings, probe);
         List<?> calls;
         if (responses(settings)) {
             calls = OpenAiResponsesProtocol.validateCompleted(checked).stream()
@@ -125,6 +122,23 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         try { return Boolean.TRUE.equals(object(JsonReader.parse(arguments)).get("ok")); }
         catch (IllegalArgumentException malformed) { return false; }
     }
+    private Map<String, Object> checkProbe(AiProviderSettings settings, Map<String, Object> body) {
+        Map<String, Object> response = checkResponse(settings, body);
+        if (!outputLimitReached(response, responses(settings))) return response;
+        Map<String, Object> retry = new java.util.LinkedHashMap<>(body);
+        retry.put("max_tokens", CHECK_RETRY_MAX_TOKENS);
+        response = checkResponse(settings, retry);
+        if (outputLimitReached(response, responses(settings))) throw AiProviderService.error(ControlError.AI_PROVIDER_OUTPUT_LIMIT);
+        return response;
+    }
+    private static boolean outputLimitReached(Map<String, Object> response, boolean responses) {
+        return responses
+                ? "incomplete".equals(response.get("status"))
+                        && response.get("incomplete_details") instanceof Map<?, ?> details
+                        && "max_output_tokens".equals(details.get("reason"))
+                : response.get("choices") instanceof List<?> choices && !choices.isEmpty()
+                        && choices.getFirst() instanceof Map<?, ?> choice && "length".equals(choice.get("finish_reason"));
+    }
     private static Map<String, Object> checkMessage(Map<String, Object> response) {
         if (!(response.get("choices") instanceof List<?> choices) || choices.isEmpty()) throw failed();
         return object(object(choices.getFirst()).get("message"));
@@ -133,15 +147,21 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         long deadline = System.nanoTime() + responseTimeout.toNanos();
         try {
             var response = send(settings, body);
-            try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
-                requireSuccessfulResponse(response.statusCode());
-                byte[] bytes = input.readNBytes(MAX_BYTES + 1);
-                if (bytes.length > MAX_BYTES || System.nanoTime() >= deadline) throw failed();
-                return object(JsonReader.parse(new String(bytes, StandardCharsets.UTF_8)));
-            }
+            return readResponseObject(response, deadline);
         } catch (java.io.IOException | InterruptedException | IllegalArgumentException error) {
             if (error instanceof InterruptedException) Thread.currentThread().interrupt();
             throw failed();
+        }
+    }
+    private static Map<String, Object> readResponseObject(HttpResponse<InputStream> response, long deadline)
+            throws java.io.IOException {
+        try (var input = response.body(); var bounded = new ResponseDeadline(input, deadline)) {
+            requireSuccessfulResponse(response.statusCode());
+            byte[] bytes = input.readNBytes(MAX_BYTES + 1);
+            if (bytes.length > MAX_BYTES || System.nanoTime() >= deadline) throw failed();
+            Object value = JsonReader.parse(new String(bytes, StandardCharsets.UTF_8));
+            if (!(value instanceof Map<?, ?>)) throw failed();
+            return object(value);
         }
     }
     @Override public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
@@ -187,6 +207,7 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         private final AiProviderClient.Output output;
         private final RedactedText text;
         private final Map<String, RedactedText> summaries = new java.util.LinkedHashMap<>();
+        private RedactedText active;
 
         private RedactedOutput(String secret, AiProviderClient.Output output) {
             this.secret = secret;
@@ -194,18 +215,31 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             this.text = new RedactedText(secret, output);
         }
 
-        @Override public void accept(String delta) { text.accept(delta); }
+        private void activate(RedactedText next) {
+            if (active != null && active != next) active.sealBoundary();
+            active = next;
+        }
+
+        @Override public void accept(String delta) { activate(text); text.accept(delta); }
 
         @Override public void reasoning(AiProviderClient.Reasoning part) {
             switch (part.phase()) {
                 case START -> {
+                    if (active != null) active.sealBoundary();
+                    active = null;
                     summaries.put(part.id(), new RedactedText(secret, delta -> output.reasoning(
                             new AiProviderClient.Reasoning(part.id(), AiProviderClient.Reasoning.Phase.DELTA, delta))));
                     output.reasoning(part);
                 }
-                case DELTA -> summaries.get(part.id()).accept(part.text());
+                case DELTA -> {
+                    RedactedText current = summaries.get(part.id());
+                    activate(current);
+                    current.accept(part.text());
+                }
                 case END -> {
-                    summaries.remove(part.id()).finish();
+                    RedactedText current = summaries.remove(part.id());
+                    current.sealBoundary();
+                    if (active == current) active = null;
                     output.reasoning(part);
                 }
             }
@@ -235,6 +269,14 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
         }
 
         private void finish() { if (!withheld.isEmpty()) output.accept(withheld.toString()); }
+
+        // A suffix matching a credential prefix cannot safely cross a channel or part boundary.
+        private void sealBoundary() {
+            if (!withheld.isEmpty()) {
+                output.accept("[redacted]");
+                withheld.setLength(0);
+            }
+        }
     }
 
     private static String guidance(boolean proposalEnabled, Map<String, Object> context) {
@@ -396,7 +438,10 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
                 }
             } catch (RetryableStreamException error) {
                 if (emitted[0]) throw failed();
-                if (attempt >= STREAM_ATTEMPTS - 1) return readNonStreaming(settings, body, text, proposalEnabled);
+                if (attempt >= STREAM_ATTEMPTS - 1) {
+                    if (responses(settings)) throw failed();
+                    return readNonStreaming(settings, body, text, proposalEnabled);
+                }
                 LOG.log(System.Logger.Level.WARNING, "Retrying AI provider after an empty upstream error stream");
             } catch (java.io.IOException | InterruptedException error) {
                 if (error instanceof InterruptedException) Thread.currentThread().interrupt();
@@ -663,7 +708,13 @@ public final class OpenAiCompatibleClient implements AiProviderClient {
             if (!line.value().startsWith("data:")) continue;
             String data = line.value().substring(5).strip();
             if ("[DONE]".equals(data)) break;
-            if (stream.accept(object(JsonReader.parse(data)))) return stream.result();
+            Map<String, Object> event = object(JsonReader.parse(data));
+            Object code = event.get("code");
+            if ("response.failed".equals(event.get("type")) && event.get("response") instanceof Map<?, ?> response
+                    && response.get("error") instanceof Map<?, ?> error) code = error.get("code");
+            if (("error".equals(event.get("type")) || "response.failed".equals(event.get("type")))
+                    && ("server_error".equals(code) || "upstream_error".equals(code))) throw new RetryableStreamException();
+            if (stream.accept(event)) return stream.result();
         }
         throw invalid();
     }

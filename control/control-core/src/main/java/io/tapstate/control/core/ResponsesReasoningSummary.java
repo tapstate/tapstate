@@ -32,6 +32,7 @@ final class ResponsesReasoningSummary {
 
     private void completeItem(Map<?, ?> item) {
         if (!"reasoning".equals(item.get("type"))) return;
+        if (!item.containsKey("summary")) return;
         String source = string(item.get("id"));
         if (!(item.get("summary") instanceof List<?> summaries)) throw invalid();
         for (int index = 0; index < summaries.size(); index++) {
