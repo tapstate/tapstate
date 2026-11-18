@@ -138,7 +138,7 @@ public interface AlertStore {
     /** Background evaluation only, scoped by the original Host; unknown records fail the whole page. */
     DefinitionPage evaluationRules(String after,int limit);
     EvaluationPage evaluationStates(AlarmKey after,int limit);
-    /** All current rules and one retained-state page from the same bounded evaluation snapshot. */
+    /** All current rules and one retained-state page. Cluster-node rows require evaluationStates after observer refresh. */
     record EvaluationSnapshot(DefinitionPage rules,EvaluationPage states) { }
     EvaluationSnapshot evaluationSnapshot(AlarmKey after,int limit);
     Outcome saveDefinition(AlertConfiguration.Definition before,AlertConfiguration.Definition after,Access access);

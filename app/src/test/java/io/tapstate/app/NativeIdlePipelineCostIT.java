@@ -47,9 +47,13 @@ class NativeIdlePipelineCostIT {
             var fixture=new NativeIdlePipelineCostIT();fixture.work=Path.of(args[0]);fixture.verifyNativeFixture();
         }
     }
-    private static Path connectorDirectory(){
-        String local=System.getProperty("tapstate.test.idle.connectors");
-        return local==null?CloudConnectorTestInputs.seedDirectory():Path.of(local);
+    private Path connectorDirectory() throws java.io.IOException {
+        String local = System.getProperty("tapstate.test.idle.connectors");
+        if (local != null) return Path.of(local);
+        Path publishedMongo = CloudConnectorTestInputs.seedDirectory().resolve("mongodb-connector.jar");
+        Path seeds = Files.createDirectory(work.resolve("seeds"));
+        Files.copy(publishedMongo, seeds.resolve(publishedMongo.getFileName()));
+        return seeds;
     }
     private void verifyNativeFixture()throws Exception{
         try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))

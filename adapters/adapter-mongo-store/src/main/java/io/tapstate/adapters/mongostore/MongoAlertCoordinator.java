@@ -223,10 +223,14 @@ final class MongoAlertCoordinator implements AlertStore {
         for(var value:page.rows()){var issue=ruleCapability((Rule)value);if(issue.isPresent())unavailable.put(value.header().identity().id(),issue.orElseThrow());else available.add(value);}
         return new DefinitionPage(available,page.nextId(),unavailable);
     }
-    @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->evaluationStates(s,after,limit));}
-    private EvaluationPage evaluationStates(ClientSession s,AlarmKey after,int limit){
+    @Override public EvaluationPage evaluationStates(AlarmKey after,int limit){return tx(null,false,false,s->evaluationStates(s,after,limit,true));}
+    private EvaluationPage evaluationStates(ClientSession s,AlarmKey after,int limit,boolean nodeEvidenceReady){
         var page=new MongoAlertReads(db,host.scope(),states,clock).evaluationStates(s,after,limit);var removed=new HashSet<AlarmKey.Resource>();var superseded=new HashSet<AlarmKey>();
-        for(var row:page.rows()){var resource=row.value().snapshot().rule().key().resource();if(resourceRemoved(s,resource))removed.add(resource);else if(sourceBindingChanged(s,row.value()))superseded.add(row.value().snapshot().rule().key());}
+        for(var row:page.rows()){
+            var key=row.value().snapshot().rule().key();
+            if(!nodeEvidenceReady && key.resource().kind().equals("cluster-node"))continue;
+            if(resourceRemoved(s,key.resource()))removed.add(key.resource());else if(sourceBindingChanged(s,row.value()))superseded.add(key);
+        }
         return new EvaluationPage(page.rows(),page.next(),removed,superseded);
     }
     @Override public EvaluationSnapshot evaluationSnapshot(AlarmKey after,int limit){return tx(null,false,false,s->{
@@ -234,7 +238,7 @@ final class MongoAlertCoordinator implements AlertStore {
         do{
             var page=evaluationRules(s,cursor,100);definitions.addAll(page.rows());unavailable.putAll(page.unavailableRules());cursor=page.nextId();
         }while(cursor!=null&&definitions.size()+unavailable.size()<1000);
-        return new EvaluationSnapshot(new DefinitionPage(definitions,cursor,unavailable),evaluationStates(s,after,limit));
+        return new EvaluationSnapshot(new DefinitionPage(definitions,cursor,unavailable),evaluationStates(s,after,limit,false));
     });}
     @Override public Outcome saveDefinition(Definition before,Definition after,Access access) {
         Objects.requireNonNull(access);management(after,access);

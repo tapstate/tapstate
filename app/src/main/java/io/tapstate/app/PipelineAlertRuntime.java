@@ -266,6 +266,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         observerTick.get().run();
         if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
         var retained = snapshot.states();
+        // Node lifecycle evidence is published by the observer after the current rules are installed.
+        if (retained.rows().stream().anyMatch(row -> row.value().snapshot().rule().key().resource().kind().equals("cluster-node")))
+            retained = resolved.store().evaluationStates(after,50);
         for(var row:retained.rows())if((row.value().binding()==null||!unavailableRules.contains(row.value().binding().ruleIdentity().id()))&&retained.removedResources().contains(row.value().snapshot().rule().key().resource())){
             if(row.value().retiredAt()==null)AlertEvaluationHost.requireResult(resolved.evaluator().end(row.value().snapshot().rule().key(),AlertSnapshot.EndReason.RESOURCE_REMOVED,active));
             var resource=row.value().snapshot().rule().key().resource();ResourceSlot obsolete;

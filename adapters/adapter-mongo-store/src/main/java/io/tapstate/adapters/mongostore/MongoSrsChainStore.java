@@ -66,7 +66,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
     MongoSrsChainStore(MongoClient client,MongoDatabase database,CacheBusinessScope scope,Runnable requireActive,
             Runnable requireStructure,MongoSrsLease appendLease,MongoSrsControlProofs proofs){
         this.controlProofs=proofs;
-        this.appendLease = Objects.requireNonNull(appendLease, "appendLease");this.controlLease=appendLease.fork();
+        this.appendLease = Objects.requireNonNull(appendLease, "appendLease");
+        this.controlLease = requireStructure instanceof MongoStructureProof.Check ? appendLease.fork() : MongoSrsLease.perTransaction();
         this.client = Objects.requireNonNull(client, "client"); this.database = Objects.requireNonNull(database, "database");
         this.scope = Objects.requireNonNull(scope, "scope"); this.requireActive = Objects.requireNonNull(requireActive, "requireActive");
         this.requireStructure = Objects.requireNonNull(requireStructure, "requireStructure");
@@ -273,6 +274,7 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
     void invalidateControlProofs(){controlProofs.clear();}
     SrsChainState readState(ClientSession session,Document row,boolean businessChecked){
+        if (!controlLease.enabled()) return state(session, row, businessChecked);
         var decoded=decode(row);String fingerprint=controlFingerprint(row);
         if(referencesProved(row,fingerprint)){
             if(!businessChecked)new MongoCacheBusinessIdentity(database,scope).requireReady(session);
