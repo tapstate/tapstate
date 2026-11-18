@@ -115,7 +115,18 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         require(); var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view"); require(); return bound;
     }
 
+    private io.tapstate.core.common.FailureFact openingFailure;
+
+    @Override public synchronized io.tapstate.core.common.FailureFact actuationFailureFact(String pipeline, Throwable failure) {
+        // Reading a captured fact does not authorize another actuation after an uncertain submission.
+        if (!id().equals(pipeline)) throw fenced();
+        var fact = openingFailure;
+        openingFailure = null;
+        return fact != null && fact.cause() == failure ? fact : new io.tapstate.core.common.FailureFact(failure);
+    }
+
     @Override public synchronized void start(String pipeline) {
+        openingFailure = null;
         checkingStart = true;
         try {
             startOwned(pipeline);
@@ -162,6 +173,9 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
             submissions.returned(manifest); require();
         } catch (RuntimeException | Error failed) {
+            if (!(failed instanceof VirtualMachineError) && capture != null) {
+                openingFailure = capture.openingFailureFact(pipeline, failed);
+            }
             if (submissionAttempted && run == null) {
                 // The original writer may exist. A later pass must observe this exact manifest before proceeding.
                 invalidated = true;

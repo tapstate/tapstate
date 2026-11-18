@@ -32,6 +32,26 @@ class PipelineFailuresTest {
     }
 
     @Test
+    void sinkClassificationDoesNotStringifyDriverParameters() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw connector parameter accessed"); } };
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,
+                Map.of("connector", "demo", "detail", raw), null);
+        assertThat(PipelineFailures.isSinkWriteFailure("orders", cause)).isTrue();
+    }
+
+    @Test
+    void anEarlyConnectorRefusalWithoutOwnerFactsDoesNotReadRawParameters() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw connector parameter accessed"); } };
+        var cause = new TapstateException(io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED,
+                Map.of("connector", "demo", "detail", raw), null);
+        var result = PipelineFailures.of("orders", cause, Map.of(), null);
+        assertThat(result.code()).isEqualTo(cause.code().code());
+        assertThat(result.params()).containsOnly(entry("connector", "[diagnostic unavailable]"),
+                entry("detail", "[diagnostic unavailable]"));
+        assertThat(result.diagnostic()).containsEntry("truncated", true);
+    }
+
+    @Test
     void aCodedCauseKeepsItsOwnCodeAndArguments() {
         TapstateException coded = new TapstateException(
                 EngineError.NO_SUCH_JOB, Map.of("pipeline", "orders"), null);

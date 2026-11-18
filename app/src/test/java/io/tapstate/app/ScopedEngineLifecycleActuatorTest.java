@@ -128,6 +128,20 @@ class ScopedEngineLifecycleActuatorTest {
         verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }
 
+    @Test void failedSubmissionKeepsItsDiagnosticReadableAfterInvalidatingActuation() {
+        var failure = new TapstateException(EngineError.JOB_FAILED,
+                Map.of("pipeline", "p", "cause", "submission refused"), null);
+        var fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+        when(fixedCapture.openingFailureFact("p", failure)).thenReturn(fact);
+        when(engine.submitRun(eq("p"), any(DAG.class), anyMap(), any(NestSettings.class), any(OperatorRunManifest.class)))
+                .thenThrow(failure);
+        var actor = actuator();
+        assertThatThrownBy(() -> actor.start("p")).isSameAs(failure);
+        assertThat(actor.actuationFailureFact("p", failure)).isSameAs(fact);
+        assertThatThrownBy(() -> actor.actuationFailureFact("other", failure)).isInstanceOf(TapstateException.class);
+        assertThatThrownBy(() -> actor.stop("p", false)).isInstanceOf(TapstateException.class);
+    }
+
     @Test void targetAcknowledgementAloneCannotCompleteAStillRunningOriginalJob() {
         boundedCapture();
         assertThat(actuator().completed("p")).isFalse();

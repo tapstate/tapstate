@@ -1248,6 +1248,23 @@ final class Synthetic {
         return SyntheticJar.compileToJar(dir, "synthetic.StaticThrows", src);
     }
 
+    static Path refusedInitSource(Path dir, String channel) {
+        String code = source("RefusedInitSource", "",
+                "functions.supportBatchRead((a,b,c,d,e) -> {});functions.supportStreamRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (RuntimeException) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.RefusedInitSource", code);
+    }
+
+    static Path fatalInitSource(Path dir, String channel) {
+        String code = source("FatalInitSource", "", "functions.supportBatchRead((a,b,c,d,e) -> {});")
+                .replace("public void init(TapConnectionContext c) {}",
+                        "public void init(TapConnectionContext c) { throw (Error) System.getProperties().get(\""
+                                + channel + "\"); }");
+        return SyntheticJar.compileToJar(dir, "synthetic.FatalInitSource", code);
+    }
+
     /**
      * A source that registers batch read but throws from every lifecycle method (init / stop /
      * discover / connectionTest / tableCount). A capability derive reads only the registered ids, so a

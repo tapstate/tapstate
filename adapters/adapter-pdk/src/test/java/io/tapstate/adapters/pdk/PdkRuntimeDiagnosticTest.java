@@ -13,6 +13,48 @@ class PdkRuntimeDiagnosticTest {
             "credential":{"type":"string","x-component":"Password"}}}}}
             """;
 
+    @Test void actualPluginInitializationRetainsItsCatalogAndSqlCauseWithoutSecrets(
+            @org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        String channel = "tapstate.test.refused-init." + java.util.UUID.randomUUID();
+        var original = new io.tapdata.exception.TapCodeException("043", "init-secret denied");
+        original.initCause(new java.sql.SQLException("init-secret database refusal", "28000"));
+        System.getProperties().put(channel, original);
+        try {
+            var jar = Synthetic.refusedInitSource(dir, channel);
+            var catalog = dir.resolve("catalog.jar");
+            catalogJar(catalog, "Original plugin catalog");
+            try (var source = new java.util.jar.JarFile(catalog.toFile());
+                    var archive = java.nio.file.FileSystems.newFileSystem(jar)) {
+                var entry = archive.getPath("/" + PdkDiagnosticCatalog.RESOURCE);
+                java.nio.file.Files.createDirectories(entry.getParent());
+                try (var input = source.getInputStream(source.getJarEntry(PdkDiagnosticCatalog.RESOURCE))) {
+                    java.nio.file.Files.write(entry, input.readAllBytes());
+                }
+            }
+            var hash = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(java.nio.file.Files.readAllBytes(jar)));
+            var ref = new ConnectorRef(List.of(jar), "synthetic.RefusedInitSource", "2.0.8", null, SPEC, hash, false);
+            var config = new io.tapstate.spi.capture.CaptureConfig("fixture", Map.of("credential", "init-secret"), List.of("t1"));
+            for (boolean streaming : List.of(false, true)) {
+                var facts = new java.util.ArrayList<io.tapstate.core.common.FailureFact>();
+                try (var port = new PdkCapturePort(id -> ref).withOpeningFailure(facts::add)
+                        .withStreamPreparation(tables -> {})) {
+                    var thrown = org.assertj.core.api.Assertions.catchThrowable(() -> {
+                        if (streaming) port.cdc(config, io.tapstate.spi.capture.CaptureStart.present(), (events, position) -> {});
+                        else port.snapshot(config);
+                    });
+                    assertThat(thrown).isInstanceOf(TapstateException.class).hasCause(original);
+                    assertThat(facts).singleElement().satisfies(fact -> {
+                        assertThat(fact.cause()).isSameAs(thrown);
+                        assertThat(fact.diagnostic().toString()).contains("EXT043", "28000", "Original plugin catalog")
+                                .doesNotContain("init-secret");
+                        assertThat(fact.publicFailure().params().toString()).doesNotContain("init-secret");
+                    });
+                }
+            }
+        } finally { System.getProperties().remove(channel); }
+    }
+
     @Test void aLaterReaderFailureCannotEraseTheAlreadyObservedDecodeFailure(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
         var jar = Synthetic.countingSink(dir);
         var connector = PdkConnector.open("fixture", new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null, SPEC),

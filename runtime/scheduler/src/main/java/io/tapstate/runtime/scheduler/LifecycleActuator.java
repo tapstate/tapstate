@@ -50,6 +50,11 @@ public interface LifecycleActuator {
         return failure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
     }
 
+    /** Reads a synchronous refusal before driving FAILED can retire its original owner. */
+    default io.tapstate.core.common.FailureFact actuationFailureFact(String pipelineId, Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /** A terminal Jet execution that was rejected by its original lease fence. */
     record LeaseLoss(long executionGeneration, Throwable cause) {}
 

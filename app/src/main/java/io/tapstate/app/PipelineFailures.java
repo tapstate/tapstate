@@ -62,6 +62,12 @@ final class PipelineFailures {
 
     static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic,
             io.tapstate.core.common.FailureFact.PublicFailure publicFailure) {
+        var firstCoded = codedCause(failure);
+        if (publicFailure == null && firstCoded != null && firstCoded.code() instanceof ConnectorError) {
+            var unavailable = io.tapstate.core.common.FailureFact.unavailable(failure);
+            return of(pipelineId, failure, diagnostic.isEmpty() ? unavailable.diagnostic() : diagnostic,
+                    unavailable.publicFailure());
+        }
         if (publicFailure == null) {
             var primary = of(pipelineId, failure);
             return new ObservationFailure(primary.code(), primary.params(), diagnostic);
@@ -77,8 +83,8 @@ final class PipelineFailures {
 
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */
     static boolean isSinkWriteFailure(String pipelineId, Throwable failure) {
-        return failure != null
-                && ConnectorError.WRITE_FAILED.code().equals(of(pipelineId, failure).code());
+        var coded = codedCause(failure);
+        return coded != null && coded.code() == ConnectorError.WRITE_FAILED;
     }
 
     /**

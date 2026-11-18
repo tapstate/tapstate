@@ -635,6 +635,10 @@ class ScopedPipelineCaptureCoordinatorTest {
         return ownedShared(f,false);
     }
     private static OwnedShared ownedShared(Fixture f,boolean openPort) {
+        return ownedShared(f, openPort, run -> run.startCapture("flow", f.snapshot(), f.models()), () -> {});
+    }
+    private static OwnedShared ownedShared(Fixture f, boolean openPort,
+            java.util.function.Consumer<PipelineCaptureCoordinator> start, Runnable afterPort) {
         String canonical="mck-key",physical="srs-recovery-"+"b".repeat(64),operation=UUID.randomUUID().toString();
         String captureId=SourceCaptureIdentity.sharedCapture(canonical);
         var prepared=new CapturePreparation(BUSINESS,CapturePreparation.Mode.SHARED_SRS,physical,captureId,
@@ -671,11 +675,30 @@ class ScopedPipelineCaptureCoordinatorTest {
         doNothing().when(f.runtime).retain(any(),anyString(),any(),any());
         var tail=mock(NativeSrsCaptureRunUnit.Tail.class);when(tail.health()).thenReturn(new CaptureHealth());
         doAnswer(call->{
-            if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));}
+            if(openPort){f.tailGuard.set(call.getArgument(6));java.util.function.Function<SrsCaptureWriter,CapturePort> factory=call.getArgument(5);factory.apply(mock(SrsCaptureWriter.class));afterPort.run();}
             return tail;
         }).when(f.runtime).startTail(any(),any(),any(),any(),any(),any(),any(),anyBoolean());
-        var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
+        var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);start.accept(run);
         return new OwnedShared(run, capture, tail, physical,prepared);
+    }
+
+    @Test void aSharedTailOpeningFailureBelongsOnlyToTheRunThatOpenedIt() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var failure = new TapstateException(ConnectorError.CAPTURE_FAILED,
+                    Map.of("connector", "fixture", "detail", "refused"), null);
+            var fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+            var receiver = new AtomicReference<java.util.function.Consumer<io.tapstate.core.common.FailureFact>>();
+            var port = mock(PdkCapturePort.class, RETURNS_SELF);
+            doAnswer(call -> { receiver.set(call.getArgument(0)); return port; }).when(port).withOpeningFailure(any());
+            f.portOverride.set(port);
+            var held = ownedShared(f, true,
+                    run -> assertThatThrownBy(() -> run.startCapture("flow", f.snapshot(), f.models())).isSameAs(failure),
+                    () -> { receiver.get().accept(fact); throw failure; });
+            var other = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            assertThat(other.openingFailureFact("flow", failure).diagnostic()).isEmpty();
+            assertThat(held.run().openingFailureFact("flow", failure)).isSameAs(fact);
+            assertThat(held.run().openingFailureFact("flow", failure).diagnostic()).isEmpty();
+        }
     }
 
     @Test void aTrustedReplacementUsesPhysicalRingsWhileKeepingCanonicalCaptureNotesAndHistory() {

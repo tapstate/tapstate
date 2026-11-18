@@ -100,6 +100,11 @@ interface PipelineCaptureCoordinator {
         return captureFailure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
     }
 
+    /** A refused opening belongs to this start, not to a previous or replacement run. */
+    default io.tapstate.core.common.FailureFact openingFailureFact(String pipelineId, Throwable failure) {
+        return new io.tapstate.core.common.FailureFact(failure);
+    }
+
     /**
      * Whether every table this pipeline reads has had its initial load confirmed at this pipeline's target.
      *

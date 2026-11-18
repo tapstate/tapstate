@@ -436,10 +436,13 @@ public final class PipelineConverger {
      * by a different road.
      */
     private ConvergeResult failedWith(String pipelineId, Throwable cause) {
+        var captured = actuator.actuationFailureFact(pipelineId, cause);
+        var fact = captured != null && captured.cause() == cause ? captured
+                : io.tapstate.core.common.FailureFact.unavailable(cause);
         ConvergeResult driven =
                 driveTo(pipelineId, PipelineState.FAILED, false, requireCheckpoint(pipelineId), false);
         return driven.checkpoint()
-                .map(checkpoint -> ConvergeResult.failed(checkpoint, cause))
+                .map(checkpoint -> ConvergeResult.failed(checkpoint, fact))
                 .orElse(driven);
     }
 
