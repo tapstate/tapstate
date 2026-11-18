@@ -7,7 +7,9 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 # Product error diagnostics
 
 This page describes an unshipped migration candidate. The first migrated request
-refusal is `TS0210001`. DSL errors use `TS0010001` through `TS0010031`, and
+refusal is `TS0210001`. Authentication rejection, missing authentication,
+insufficient capability and an unreachable control service use `TS0210002`
+through `TS0210005`, respectively. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
 product contract switches with a coordinated major release; this candidate does
@@ -25,6 +27,15 @@ The HTTP response remains 400. CLI diagnostic exit status and MCP `isError`
 remain unchanged. A new identity does not mean that a request was accepted or
 executed. Preserve typed refusal payloads, uncertain outcomes, cancellation and
 cleanup behavior when migrating other families.
+
+Authentication refusals retain their status and information boundaries: invalid
+credentials do not reveal whether a username exists, missing authentication is
+distinct from insufficient capability, and an unreachable service does not
+prove an operation failed. CLI and browser consumers recognize the new codes
+and still read the corresponding historical server replies during migration.
+This read compatibility does not create aliases in the authoritative catalog.
+Browser session refresh must retain account binding and must not replay an
+operation as a different user.
 
 DSL definitions live in `DslErrorDefinitions`, with the existing `DslError` and
 `ExecutionAdvisoryError` enums retaining their typed APIs. Corpus rule symbols

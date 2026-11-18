@@ -474,7 +474,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", "orders"));
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.unreachable");
+            assertThat(result.body()).containsEntry("code", "TS0210005");
         }
     }
 

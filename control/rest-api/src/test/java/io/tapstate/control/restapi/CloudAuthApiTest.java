@@ -152,7 +152,7 @@ class CloudAuthApiTest {
                         .header("X-Forwarded-Host", AUDIENCE)
                         .header("Forwarded", "host=" + AUDIENCE))
                 .andExpect(status().isUnauthorized()).andReturn().getResponse();
-        assertThat(response.getContentAsString()).contains("control.unauthenticated");
+        assertThat(response.getContentAsString()).contains("TS0210003");
         assertThat(requestAudience.get()).isEqualTo("different.example");
         assertThat(exchanges.get()).isEqualTo(1);
         assertThat(validations.get()).isEqualTo(1);

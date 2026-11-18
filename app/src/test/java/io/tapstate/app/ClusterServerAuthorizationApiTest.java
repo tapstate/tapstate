@@ -104,7 +104,7 @@ class ClusterServerAuthorizationApiTest {
                 for (String code : List.of("tampered", "wrong-org")) {
                     var rejected = request(client, origin, "GET", "/auth/exchange?code=" + code,
                             null, null, Map.of());
-                    assertError(rejected, 401, "control.unauthenticated");
+                    assertError(rejected, 401, "TS0210003");
                     for (String jwt : provider.issuedJwts) {
                         assertThat(rejected.body().contains(jwt)).as("login refusal contains no issued JWT").isFalse();
                     }
@@ -134,7 +134,7 @@ class ClusterServerAuthorizationApiTest {
 
                 var deniedWrite = request(client, origin, "POST", "/api/connections:test", read,
                         CONNECTION, Map.of());
-                assertError(deniedWrite, 403, "control.forbidden");
+                assertError(deniedWrite, 403, "TS0210004");
                 assertThat(body(deniedWrite).get("params"))
                         .isEqualTo(Map.of("op", "connection.test", "required", "write"));
                 assertThat(state.probes.get()).isZero();
@@ -157,7 +157,7 @@ class ClusterServerAuthorizationApiTest {
                 Map<String, ConnectionTestResult> resultsBefore = Map.copyOf(state.results);
                 var deniedAdmin = request(client, origin, "POST", "/api/tokens", write,
                         Map.of("scope", "read"), Map.of());
-                assertError(deniedAdmin, 403, "control.forbidden");
+                assertError(deniedAdmin, 403, "TS0210004");
                 assertThat(body(deniedAdmin).get("params"))
                         .isEqualTo(Map.of("op", "token.create", "required", "admin"));
                 assertThat(state.tokens).isEmpty();
@@ -168,13 +168,13 @@ class ClusterServerAuthorizationApiTest {
                         "X-Global-Control-Plane-Signature", "forged-signature-sentinel",
                         "X-Cloud-Signature", "forged-signature-sentinel");
                 assertError(request(client, origin, "GET", "/api/auth/me", null, null, forged),
-                        401, "control.unauthenticated");
+                        401, "TS0210003");
                 assertError(request(client, origin, "POST", "/api/connections:test", null, CONNECTION, forged),
-                        401, "control.unauthenticated");
+                        401, "TS0210003");
                 Map<String, CloudSessionRecord> callbackBefore = state.sessions.snapshot();
                 assertError(request(client, origin, "POST", "/auth/invalidate-session?jti=jti-write&ts="
                                 + Instant.now().toEpochMilli() + "&nonce=authorization-nonce&sign=forged",
-                        null, null, forged), 401, "control.unauthenticated");
+                        null, null, forged), 401, "TS0210003");
                 assertThat(state.sessions.snapshot()).isEqualTo(callbackBefore);
                 assertThat(state.sessions.revocations.get()).isZero();
                 assertThat(state.probes.get()).isEqualTo(1);

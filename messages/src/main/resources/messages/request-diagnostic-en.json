@@ -2,5 +2,21 @@
   "TS0210001": {
     "message": "The request is malformed: {reason}.",
     "solution": "Correct the request body, then send it again."
+  },
+  "TS0210002": {
+    "message": "Authentication failed: invalid username or password.",
+    "solution": "Check the username and password are correct, then sign in again."
+  },
+  "TS0210003": {
+    "message": "This operation requires authentication.",
+    "solution": "Sign in with `login` to obtain a session token, or present a machine token with `--token`."
+  },
+  "TS0210004": {
+    "message": "Operation '{op}' requires {required} capability.",
+    "solution": "Sign in as a user with that capability, or use a token issued with that scope."
+  },
+  "TS0210005": {
+    "message": "The Tapstate Server is unreachable.",
+    "solution": "Check the Server URL and availability, then retry the tool call."
   }
 }

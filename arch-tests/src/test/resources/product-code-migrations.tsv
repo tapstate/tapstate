@@ -33,3 +33,7 @@ dsl.unwind-column-already-exists	TS0010027
 dsl.unwind-needs-an-element-key	TS0010024
 dsl.unwind-needs-an-upsert-target	TS0010025
 dsl.upsert-needs-key	TS0010023
+control.auth-failed	TS0210002
+control.unauthenticated	TS0210003
+control.forbidden	TS0210004
+control.unreachable	TS0210005

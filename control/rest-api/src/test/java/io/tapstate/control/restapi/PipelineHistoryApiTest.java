@@ -181,7 +181,7 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(unauthenticated.code()).isEqualTo("control.unauthenticated");
+        assertThat(unauthenticated.code()).isEqualTo("TS0210003");
     }
 
     @Test

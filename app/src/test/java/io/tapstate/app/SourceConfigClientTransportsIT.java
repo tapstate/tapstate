@@ -274,7 +274,7 @@ class SourceConfigClientTransportsIT {
             // --allow-write exposes write tools but does not upgrade this actual read-scoped credential.
             try (McpSession exposed = mcp(fixture, mcp.token, true)) {
                 exposed.refused("artifact_apply", drafts(source(id, "mysql", config("mysql", REPLACEMENT)), null),
-                        "control.forbidden");
+                        "TS0210004");
             }
             assertThat(fixture.snapshot()).isEqualTo(artifacts);
             assertThat(fixture.audit()).isEqualTo(audit);
@@ -350,17 +350,17 @@ class SourceConfigClientTransportsIT {
             List<Document> audit = cloud.audit();
             for (String credential : List.of(localToken, "controlled-outbound-token", cloud.credential)) {
                 for (CliFlavor flavor : cliFlavors()) {
-                    refusal(cli(cloud, flavor, credential, "get", id), "control.unauthenticated");
+                    refusal(cli(cloud, flavor, credential, "get", id), "TS0210003");
                     refusal(cli(cloud, flavor, credential, "apply", file(source(
                             "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT))).toString()),
-                            "control.unauthenticated");
+                            "TS0210003");
                 }
                 try (McpSession mcp = mcp(cloud, credential, true)) {
-                    mcp.refused("artifact_get", Map.of("id", id), "control.unauthenticated");
-                    mcp.refused("source_list", Map.of(), "control.unauthenticated");
+                    mcp.refused("artifact_get", Map.of("id", id), "TS0210003");
+                    mcp.refused("source_list", Map.of(), "TS0210003");
                     mcp.refused("artifact_apply", drafts(source(
                             "cloud_rejected_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT)), null),
-                            "control.unauthenticated");
+                            "TS0210003");
                 }
             }
             assertThat(cloud.snapshot()).isEqualTo(before);

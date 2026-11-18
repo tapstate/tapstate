@@ -683,7 +683,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the read endpoints are a derivation of the registry ----

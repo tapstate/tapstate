@@ -191,7 +191,7 @@ class CloudAtlasObservabilityRecoveryIT {
                 var response = client.send(request.GET().build(), HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(401);
                 assertThat(((Map<?, ?>) JsonReader.parse(response.body())).get("code"))
-                        .isEqualTo("control.unauthenticated");
+                        .isEqualTo("TS0210003");
             }
         }
     }

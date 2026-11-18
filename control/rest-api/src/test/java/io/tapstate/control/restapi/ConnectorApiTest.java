@@ -485,7 +485,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "connector.register").containsEntry("required", "write");
         // A refused write must not reach the registrar at all.
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();

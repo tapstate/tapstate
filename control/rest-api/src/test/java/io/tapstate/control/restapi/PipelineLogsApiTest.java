@@ -158,7 +158,7 @@ class PipelineLogsApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the logs endpoint is a derivation of the registry ----

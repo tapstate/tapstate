@@ -143,7 +143,7 @@ class CloudStateStoreSetupApiTest {
         String cookie = enter("write-code");
         client.get().uri("/api/tokens").header(HttpHeaders.COOKIE, cookie).exchange((request, response) -> {
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
-            assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("control.forbidden");
+            assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("TS0210004");
             return null;
         });
         verifyNoInteractions(context.getBean(TokenAdminService.class));

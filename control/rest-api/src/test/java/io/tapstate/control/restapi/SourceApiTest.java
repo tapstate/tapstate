@@ -631,12 +631,12 @@ class SourceApiTest {
     @Test
     void authenticationScopesAndAuditGateProtectEveryOperation() {
         assertError(RestClient.create(base()).get().uri("/api/sources"),
-                HttpStatus.UNAUTHORIZED, "control.unauthenticated");
+                HttpStatus.UNAUTHORIZED, "TS0210003");
         assertError(request("invalid").get().uri("/api/sources"),
-                HttpStatus.UNAUTHORIZED, "control.unauthenticated");
+                HttpStatus.UNAUTHORIZED, "TS0210003");
         assertError(request("reader").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "before")),
-                HttpStatus.FORBIDDEN, "control.forbidden");
+                HttpStatus.FORBIDDEN, "TS0210004");
 
         context.getBean(RecordingAuditStore.class).fail = true;
         assertError(request("writer").post().uri("/api/sources")

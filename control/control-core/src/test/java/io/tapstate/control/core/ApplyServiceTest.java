@@ -992,7 +992,7 @@ class ApplyServiceTest {
         List<String> attempted = new ArrayList<>();
         List<String> refreshed = new ArrayList<>();
         boolean[] fail = {true};
-        ValidationDiagnostic advisory = new ValidationDiagnostic("control.unreachable", Map.of());
+        ValidationDiagnostic advisory = new ValidationDiagnostic("TS0210005", Map.of());
         ApplyService deriving = new ApplyService(
                 TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
                 (resources, discovered) -> List.of(advisory), pipeline -> {

@@ -68,7 +68,7 @@ public enum ControlError implements TapstateErrorCode {
      * covers both cases and it carries no placeholder on purpose — echoing nothing back means the
      * failure cannot be used to tell an existing username from an absent one (no user enumeration).
      */
-    AUTH_FAILED("control.auth-failed", Set.of()),
+    AUTH_FAILED(RequestErrorDefinitions.AUTH_FAILED),
 
     /** The caller reached an authentication flow that the selected deployment mode does not expose. */
     AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
@@ -93,10 +93,10 @@ public enum ControlError implements TapstateErrorCode {
      * operation's own rejection of a username / password, and from {@code forbidden}, which is a known
      * caller who simply lacks the grade.
      */
-    UNAUTHENTICATED("control.unauthenticated", Set.of()),
+    UNAUTHENTICATED(RequestErrorDefinitions.UNAUTHENTICATED),
 
     /** The HTTP control service could not be reached within the configured request budget. */
-    UNREACHABLE("control.unreachable", Set.of()),
+    UNREACHABLE(RequestErrorDefinitions.UNREACHABLE),
 
     /**
      * An authenticated caller's credential does not carry the capability grade the operation requires;
@@ -104,7 +104,7 @@ public enum ControlError implements TapstateErrorCode {
      * {@code auth-failed}, which is pre-authentication: here the caller is known, they simply lack the
      * grade, so echoing the operation and the grade it needs is a help, not an information leak.
      */
-    FORBIDDEN("control.forbidden", Set.of("op", "required")),
+    FORBIDDEN(RequestErrorDefinitions.FORBIDDEN),
 
     STORAGE_DATABASES_OVERLAP("control.storage-databases-overlap", Set.of()),
     STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),

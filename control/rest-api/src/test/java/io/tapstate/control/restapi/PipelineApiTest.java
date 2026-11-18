@@ -592,7 +592,7 @@ class PipelineApiTest {
     void wholePipelineDeletionRequiresWriteScopeAndTheDraftRevisionThatWasRead() {
         String hash = seedDeletionDraft();
         ApiError forbidden = deleteWebPipeline(hash, "1", Scope.READ, HttpStatus.FORBIDDEN);
-        assertThat(forbidden.code()).isEqualTo("control.forbidden");
+        assertThat(forbidden.code()).isEqualTo("TS0210004");
         ApiError stale = deleteWebPipeline(hash, "2", Scope.WRITE, HttpStatus.PRECONDITION_FAILED);
         assertThat(stale.code()).isEqualTo("pipeline-draft.revision-conflict");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
@@ -1191,7 +1191,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "pipeline.start").containsEntry("required", "write");
     }
 
@@ -1203,7 +1203,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     // ---- the authenticated caller becomes the audit principal of the audited write ----
@@ -1418,7 +1418,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(forbidden.code()).isEqualTo("control.forbidden");
+        assertThat(forbidden.code()).isEqualTo("TS0210004");
         assertThat(forbidden.params()).containsEntry("op", "pipeline.layout.update").containsEntry("required", "write");
     }
 

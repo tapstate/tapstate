@@ -432,7 +432,7 @@ Every coded REST error is `{code, params, message}` and carries `Cache-Control: 
 | 400 | `TS0210001` (migration candidate; legacy releases use `control.malformed-request`) | Correct timestamps, range, resolution, limit, or selectors. |
 | 400 | `monitor.invalid-cursor` | Repeat the exact query or start a new first page. |
 | 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
-| 401/403 | `control.unauthenticated` / `control.forbidden` | Supply a valid read-scoped credential. |
+| 401/403 | `TS0210003` / `TS0210004` | Supply a valid read-scoped credential. |
 | 404 | `lifecycle.unknown-pipeline` | Check the id and apply the pipeline first. |
 | 404 | `monitor.no-observation` | The pipeline exists; wait for its first observation before retrying reads that require runtime data. |
 | 410 | `monitor.cursor-expired` | Start a new history query; do not resume the old walk. |

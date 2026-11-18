@@ -227,7 +227,7 @@ class ConnectionApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "connection.test").containsEntry("required", "write");
     }
 
@@ -332,7 +332,7 @@ class ConnectionApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "connection.discover-schema").containsEntry("required", "write");
     }
 

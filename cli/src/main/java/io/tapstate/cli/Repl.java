@@ -5837,7 +5837,7 @@ final class Repl {
      * {@code POST /auth/login}, and on success stores the returned bearer credential. Login requires an
      * established connection (authenticating is decoupled from connecting) and a username operand — both
      * absences are benign usage lines, not coded errors. A server refusal renders the server's coded
-     * message (a bad credential is {@code control.auth-failed}, revealing nothing about which half was
+     * message (a bad credential is {@code TS0210002}, revealing nothing about which half was
      * wrong); an unreachable landing node is a benign transient line. The member set for failover is the
      * seeds until membership discovery lands.
      */

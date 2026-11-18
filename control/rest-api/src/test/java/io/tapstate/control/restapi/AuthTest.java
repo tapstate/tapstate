@@ -398,7 +398,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         // The refusal echoes nothing back, so it cannot be used to probe which credentials exist.
         assertThat(body.params()).isEmpty();
     }
@@ -410,7 +410,7 @@ class AuthTest {
                 assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                 return response.bodyTo(ApiError.class);
             });
-            assertThat(anonymous.code()).isEqualTo("control.unauthenticated");
+            assertThat(anonymous.code()).isEqualTo("TS0210003");
         }
         String reader = machineToken(Scope.READ);
         ResponseEntity<String> catalog = client().get().uri("/api/sample-sources/catalog")
@@ -424,7 +424,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.code()).isEqualTo("TS0210004");
         assertThat(refused.params()).containsEntry("op", "sample-source.install");
     }
 
@@ -437,7 +437,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -449,7 +449,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.unauthenticated");
+        assertThat(body.code()).isEqualTo("TS0210003");
         assertThat(body.params()).isEmpty();
     }
 
@@ -468,7 +468,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.forbidden");
+        assertThat(body.code()).isEqualTo("TS0210004");
         assertThat(body.params()).containsEntry("op", "artifact.apply").containsEntry("required", "write");
     }
 
@@ -577,8 +577,8 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(malformed.code()).isEqualTo("control.unauthenticated");
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(malformed.code()).isEqualTo("TS0210003");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -592,7 +592,7 @@ class AuthTest {
                 });
 
         assertThat(unknownApi).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(unknownRoot.code()).isEqualTo("control.unauthenticated");
+        assertThat(unknownRoot.code()).isEqualTo("TS0210003");
 
         HttpStatusCode wrongMethod = client().put().uri("/api/sources")
                 .header("Authorization", "Bearer " + machineToken(Scope.ADMIN))
@@ -737,7 +737,7 @@ class AuthTest {
 
         assertThat(logout).isEqualTo(HttpStatus.NO_CONTENT);
         assertThat(logoutAgain).isEqualTo(HttpStatus.NO_CONTENT);
-        assertThat(afterLogout.code()).isEqualTo("control.unauthenticated");
+        assertThat(afterLogout.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -755,7 +755,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(bearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(bearer.code()).isEqualTo("TS0210003");
 
         ApiError sessionAsApiBearer = client().get().uri("/api/artifacts")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + login.sessionToken())
@@ -763,7 +763,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(sessionAsApiBearer.code()).isEqualTo("control.unauthenticated");
+        assertThat(sessionAsApiBearer.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -788,7 +788,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(duplicate.code()).isEqualTo("control.unauthenticated");
+        assertThat(duplicate.code()).isEqualTo("TS0210003");
 
         context.getBean(FakeSessionStore.class).replaceIssuer("tok-1", "urn:other");
         assertSessionUnauthorized(AuthWire.SESSION_PATH, AuthWire.sessionAuthorization(login.sessionToken()));
@@ -802,7 +802,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(error.code()).isEqualTo("control.unauthenticated");
+        assertThat(error.code()).isEqualTo("TS0210003");
     }
 
     @Test
@@ -836,7 +836,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.auth-failed");
+        assertThat(body.code()).isEqualTo("TS0210002");
         assertThat(body.params()).as("the login failure reveals nothing about which half was wrong").isEmpty();
     }
 

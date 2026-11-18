@@ -25,7 +25,7 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(java.util.Arrays.stream(ProductErrorModule.values()).map(ProductErrorModule::number).toList())
                 .doesNotHaveDuplicates().allMatch(number -> number.matches("(?!000)[0-9]{3}"));
         var request = RequestErrorDefinitions.MALFORMED_REQUEST;
-        assertThat(RequestErrorDefinitions.registered()).containsExactly(request);
+        assertThat(RequestErrorDefinitions.registered()).hasSize(5).contains(request);
         assertThat(request.code()).isEqualTo("TS0210001");
         assertThat(request.parameters()).isEqualTo(Set.of("reason"));
         assertThat(request.severity()).isEqualTo(Severity.ERROR);
@@ -61,9 +61,39 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(34);
+        assertThat(replacements).hasSize(38);
         baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
+    }
+
+    @Test
+    void authenticationDefinitionsPreserveTypedContractsAndHistoricalEnglishText() {
+        var definitions = List.of(RequestErrorDefinitions.AUTH_FAILED, RequestErrorDefinitions.UNAUTHENTICATED,
+                RequestErrorDefinitions.FORBIDDEN, RequestErrorDefinitions.UNREACHABLE);
+        var owners = List.of(ControlError.AUTH_FAILED, ControlError.UNAUTHENTICATED,
+                ControlError.FORBIDDEN, ControlError.UNREACHABLE);
+        var historical = List.of("control.auth-failed", "control.unauthenticated", "control.forbidden", "control.unreachable");
+        var catalog = io.tapstate.messages.MessageCatalog.bundled();
+        for (int i = 0; i < definitions.size(); i++) {
+            var definition = definitions.get(i);
+            var owner = owners.get(i);
+            assertThat(owner.code()).isEqualTo(definition.code());
+            assertThat(owner.placeholders()).isEqualTo(definition.parameters());
+            assertThat(owner.severity()).isEqualTo(definition.severity()).isEqualTo(Severity.ERROR);
+            Map<String, Object> args = new java.util.HashMap<>();
+            definition.parameters().forEach(name -> args.put(name, "value-" + name));
+            assertThat(catalog.render(definition.code(), args)).isEqualTo(catalog.render(historical.get(i), args));
+            var messages = new java.util.HashSet<String>();
+            for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+                var resolved = RequestDiagnosticCatalog.bundled().resolve(definition.code(), args, List.of(), locale).orElseThrow();
+                messages.add(resolved.message());
+                assertThat(resolved.solution()).isNotBlank();
+                for (var parameter : definition.parameters())
+                    assertThat(resolved.message()).contains("value-" + parameter).doesNotContain("{" + parameter + "}");
+            }
+            assertThat(messages).hasSize(3);
+            assertThat(RequestDiagnosticCatalog.bundled().resolve(historical.get(i), args, List.of(), Locale.ENGLISH)).isEmpty();
+        }
     }
 
     private static Set<String> readCodes(String file) throws Exception {

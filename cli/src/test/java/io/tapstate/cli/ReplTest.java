@@ -6792,6 +6792,10 @@ class ReplTest {
         assertThat(service.login(context, "alice", "pw", false))
                 .isEqualTo(new AuthService.LoginResult.Rejected("control.auth-failed", "alice"));
 
+        client.loginOutcome = new LoginOutcome.Rejected("TS0210002", "bad credential");
+        assertThat(service.login(context, "alice", "pw", false))
+                .isEqualTo(new AuthService.LoginResult.Rejected("TS0210002", "alice"));
+
         client.loginOutcome = new LoginOutcome.Rejected("control.rate-limited", "try later");
         assertThat(service.login(context, "alice", "pw", false))
                 .isEqualTo(new AuthService.LoginResult.Rejected("unknown", "alice"));

@@ -137,7 +137,7 @@ class CloudHttpDiagnosticsFilterTest {
         filter.doFilter(request, response, (suppliedRequest, suppliedResponse) -> {
             MDC.put(CloudHttpDiagnosticsFilter.STAGE_MDC, "jwt-verification");
             MDC.put(CloudHttpDiagnosticsFilter.REASON_MDC, "bad-issuer");
-            MDC.put(CloudHttpDiagnosticsFilter.ERROR_CODE_MDC, "control.unauthenticated");
+            MDC.put(CloudHttpDiagnosticsFilter.ERROR_CODE_MDC, "TS0210003");
             response.setStatus(401);
         });
 
@@ -145,7 +145,7 @@ class CloudHttpDiagnosticsFilterTest {
         assertThat(written.list.getLast().getLevel()).isEqualTo(Level.WARN);
         assertThat(written.list.getLast().getFormattedMessage()).contains(
                 "status=401", "stage=jwt-verification", "reason=bad-issuer",
-                "error_code=control.unauthenticated", "cloudSessionCookiePresent=false");
+                "error_code=TS0210003", "cloudSessionCookiePresent=false");
         assertThat(MDC.getCopyOfContextMap()).isNullOrEmpty();
     }
 
