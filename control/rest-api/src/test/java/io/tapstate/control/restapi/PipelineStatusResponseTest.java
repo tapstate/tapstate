@@ -28,6 +28,23 @@ class PipelineStatusResponseTest {
     private final MessageCatalog catalog = MessageCatalog.bundled();
 
     @Test
+    void runtimeAttachmentKeepsCapturedFactsAndLegacyResponsesOmitIt() throws Exception {
+        var diagnostic = java.util.Map.<String, Object>of("message", "captured message",
+                "cause", java.util.Map.of("rawMessage", "captured cause"));
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                java.util.Map.of("connector", "fixture", "detail", "refused"), diagnostic);
+        var status = new PipelineStatus("orders", PipelineState.FAILED, null, OBSERVED_AT).diagnosed(failure);
+        var response = PipelineStatusResponse.of(status, catalog);
+        assertThat(response.failure().diagnostic()).isEqualTo(diagnostic);
+        assertThat(response.failure().params()).containsEntry("detail", "refused");
+        var mapper = tools.jackson.databind.json.JsonMapper.builder().build();
+        assertThat(mapper.readTree(mapper.writeValueAsString(response.failure())).path("diagnostic").path("cause")
+                .path("rawMessage").asText()).isEqualTo("captured cause");
+        assertThat(mapper.readTree(mapper.writeValueAsString(new PipelineStatusResponse.Failure("legacy", java.util.Map.of(), "old")))
+                .has("diagnostic")).isFalse();
+    }
+
+    @Test
     void aCurrentDiagnosisKeepsTheLastStoredStateAndAgeExplicit() {
         var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0440009", java.util.Map.of("pipeline", "orders"));
         var status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT).diagnosed(failure);

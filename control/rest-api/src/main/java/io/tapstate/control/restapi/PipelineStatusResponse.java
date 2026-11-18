@@ -39,7 +39,11 @@ record PipelineStatusResponse(
      * A coded failure as a client reads it: the canonical code string, its named arguments sorted for a stable
      * machine contract, and the message rendered through the shared catalog.
      */
-    record Failure(String code, Map<String, Object> params, String message) {
+    record Failure(String code, Map<String, Object> params, String message,
+            @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Object> diagnostic) {
+        Failure(String code, Map<String, Object> params, String message) {
+            this(code, params, message, Map.of());
+        }
     }
 
     static PipelineStatusResponse of(PipelineStatus status, MessageCatalog catalog) {
@@ -117,6 +121,6 @@ record PipelineStatusResponse(
             return null;
         }
         Map<String, Object> params = new TreeMap<>(failure.params());
-        return new Failure(failure.code(), params, catalog.render(failure.code(), params).message());
+        return new Failure(failure.code(), params, catalog.render(failure.code(), params).message(), failure.diagnostic());
     }
 }
