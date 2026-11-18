@@ -59,13 +59,14 @@ class MessageCatalogTest {
     @Test
     void connectionDefinitionsRenderThreeLanguagesWithTheSameStableIdentity() {
         var testFailed = new TapstateErrorCode() {
-            @Override public String code() { return "connector.test-failed"; }
+            @Override public String code() { return io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED.code(); }
             @Override public Severity severity() { return Severity.ERROR; }
             @Override public Set<String> placeholders() { return Set.of("connector", "detail"); }
         };
         var catalog = ConnectionDiagnosticCatalog.bundled();
         var params = Map.<String, Object>of("connector", "fixture", "detail", "driver detail");
         var error = new TapstateException(testFailed, params, null);
+        assertThat(catalog.resolve("connector.test-failed", params, List.of(), Locale.ENGLISH)).isEmpty();
         var english = catalog.snapshot(error, Locale.ENGLISH);
         var simplified = catalog.snapshot(error, Locale.SIMPLIFIED_CHINESE);
         var traditional = catalog.snapshot(error, Locale.TRADITIONAL_CHINESE);
@@ -76,7 +77,7 @@ class MessageCatalogTest {
         }
         assertThat(simplified.get("message")).isNotEqualTo(english.get("message")).isNotEqualTo(traditional.get("message"));
         assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH))
-                .isEqualTo(Map.of("code", "connector.test-failed", "codeSource", "tapstate-legacy"));
+                .isEqualTo(Map.of("code", testFailed.code(), "codeSource", "tapstate-legacy"));
         assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH))
                 .isEqualTo(Map.of("code", DslError.UNKNOWN_FIELD.code(), "codeSource", "tapstate-legacy"));
     }
@@ -95,7 +96,7 @@ class MessageCatalogTest {
 
     @Test
     void connectionCatalogPreservesExplicitLocaleAndParameterContracts() {
-        String code = "connector.test-failed";
+        String code = io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED.code();
         var catalog = ConnectionDiagnosticCatalog.bundled();
         var arguments = Map.<String, Object>of("connector", "orders", "detail", "Refused");
         var traditional = catalog.resolve(code, arguments, List.of(), Locale.TRADITIONAL_CHINESE).orElseThrow();

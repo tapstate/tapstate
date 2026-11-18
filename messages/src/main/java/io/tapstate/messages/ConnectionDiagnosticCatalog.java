@@ -4,7 +4,6 @@ import io.tapstate.core.common.DiagnosticCodeSource;
 import io.tapstate.core.common.DiagnosticDefinitionLookup;
 import io.tapstate.core.common.TapstateException;
 
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -33,12 +32,9 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
         public Set<String> parameters() { return definition.parameters(); }
     }
 
-    private final Map<String, Definition> byLegacy;
     private final ProductDiagnosticCatalog catalog;
 
-    private ConnectionDiagnosticCatalog(
-            Map<String, Definition> byLegacy, ProductDiagnosticCatalog catalog) {
-        this.byLegacy = byLegacy;
+    private ConnectionDiagnosticCatalog(ProductDiagnosticCatalog catalog) {
         this.catalog = catalog;
     }
 
@@ -60,8 +56,7 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
-        Definition definition = byLegacy.get(code);
-        return catalog.resolve(definition == null ? code : definition.code(), named, positional, locale);
+        return catalog.resolve(code, named, positional, locale);
     }
 
     static String language(Locale locale) {
@@ -69,17 +64,11 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     static ConnectionDiagnosticCatalog load(Function<String, String> readResource) {
-        Map<String, Definition> byLegacy = new LinkedHashMap<>();
-        for (Definition definition : Definition.values()) {
-            if (byLegacy.putIfAbsent(definition.legacy(), definition) != null) {
-                throw new IllegalStateException("invalid or repeated connection diagnostic definition " + definition.code());
-            }
-        }
         var registered = io.tapstate.core.common.ConnectorErrorDefinitions.registered().stream()
                 .map(definition -> new ProductDiagnosticCatalog.Definition(definition.code(), definition.parameters()))
                 .toList();
         var catalog = ProductDiagnosticCatalog.load("006", registered,
                 language -> readResource.apply("/messages/connector-diagnostic-" + language + ".json"));
-        return new ConnectionDiagnosticCatalog(Map.copyOf(byLegacy), catalog);
+        return new ConnectionDiagnosticCatalog(catalog);
     }
 }
