@@ -13,7 +13,9 @@ public enum ProductErrorModule {
     SCHEMA("027"),
     LIFECYCLE("028"),
     START_CHECK("029"),
-    VALIDATION("030");
+    VALIDATION("030"),
+    BOOT("031"),
+    ROLE("032");
 
     private final String number;
 

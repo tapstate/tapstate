@@ -1,0 +1,6 @@
+{
+  "TS0320001": {
+    "message": "Unsupported --role value '{role}'.",
+    "solution": "L1 runs the whole platform in one process; use --role=all (the default)."
+  }
+}

@@ -117,12 +117,12 @@ class CloudExternalConfigStartupIT {
     }
 
     enum Mismatch {
-        CLOUD_EMPTY(Distribution.CLOUD, 0, "boot.web-profile-mode-mismatch"),
-        CLOUD_PARTIAL(Distribution.CLOUD, 1, "boot.cloud-config-incomplete"),
-        ON_PREM_COMPLETE(Distribution.ON_PREM, 4, "boot.web-profile-mode-mismatch"),
-        ON_PREM_PARTIAL(Distribution.ON_PREM, 1, "boot.cloud-config-incomplete"),
-        MISSING_PROFILE(Distribution.MISSING, 4, "boot.web-profile-invalid"),
-        UNKNOWN_PROFILE(Distribution.UNKNOWN, 4, "boot.web-profile-invalid");
+        CLOUD_EMPTY(Distribution.CLOUD, 0, "TS0310006"),
+        CLOUD_PARTIAL(Distribution.CLOUD, 1, "TS0310002"),
+        ON_PREM_COMPLETE(Distribution.ON_PREM, 4, "TS0310006"),
+        ON_PREM_PARTIAL(Distribution.ON_PREM, 1, "TS0310002"),
+        MISSING_PROFILE(Distribution.MISSING, 4, "TS0310005"),
+        UNKNOWN_PROFILE(Distribution.UNKNOWN, 4, "TS0310005");
 
         private final Distribution distribution;
         private final int settings;
@@ -411,7 +411,7 @@ class CloudExternalConfigStartupIT {
     void cloudCannotStartWithoutItsMandatoryConnectorRelease() throws Exception {
         String uri = prepareNative(uniqueDatabase("missing_cloud_seeds"), true).configurationUri();
         Running running = start(Carrier.FILE, cloudValues(uri), uri);
-        running.awaitUnavailable("boot.cloud-connectors-invalid", "LOGIN");
+        running.awaitUnavailable("TS0310013", "LOGIN");
         assertThat(cloudRequests.get()).as("unexpected Cloud calls: %s", cloudPaths).isZero();
         assertSafeOutput(running, uri);
     }
@@ -449,7 +449,7 @@ class CloudExternalConfigStartupIT {
         Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(selected));
         values.remove("tapstate.cloud.cluster-id");
         Running running = start(carrier, values, MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-config-incomplete");
+        running.awaitFailure("TS0310002");
         assertUntouched(ignored);
         assertUntouched(selected);
         assertSafeOutput(running, values.get("tapstate.cloud.atlas-uri"));
@@ -461,7 +461,7 @@ class CloudExternalConfigStartupIT {
         Map<String, String> values = cloudValues(MONGO.getReplicaSetUrl(uniqueDatabase("invalid_selected")));
         values.put("tapstate.cloud.base-url", "https://accidental-user:base-password-sentinel@cloud.example");
         Running running = start(Carrier.JVM, values, MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-base-url-invalid");
+        running.awaitFailure("TS0310003");
         assertUntouched(ignored);
         assertSafeOutput(running, values.get("tapstate.cloud.atlas-uri"));
         assertAbsent(running, "base-password-sentinel", "accidental-user");
@@ -486,7 +486,7 @@ class CloudExternalConfigStartupIT {
         String selected = uniqueDatabase("disabled_selected");
         Running running = start(Carrier.FILE, cloudValues(MONGO.getReplicaSetUrl(selected)),
                 MONGO.getReplicaSetUrl(ignored), "--tapstate.store.mongo.enabled=false");
-        running.awaitFailure("boot.cloud-store-required");
+        running.awaitFailure("TS0310008");
         assertUntouched(ignored);
         assertUntouched(selected);
         assertSafeOutput(running, MONGO.getReplicaSetUrl(selected));
@@ -497,7 +497,7 @@ class CloudExternalConfigStartupIT {
         String ignored = uniqueDatabase("invalid_atlas_ignored");
         String uri = "https://accidental-user:atlas-uri-password-sentinel@atlas.example/metadata";
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored));
-        running.awaitFailure("boot.cloud-atlas-uri-invalid");
+        running.awaitFailure("TS0310004");
         assertUntouched(ignored);
         assertSafeOutput(running, uri);
         assertAbsent(running, "atlas-uri-password-sentinel");
@@ -558,7 +558,7 @@ class CloudExternalConfigStartupIT {
     void anOnPremProcessCannotEnableCloudStatusReporting() throws Exception {
         Running running = start(Carrier.FILE, Map.of(), MONGO.getReplicaSetUrl(uniqueDatabase("status_onprem")),
                 "--SDK_STATUS_SENDER_ENABLED=true");
-        running.awaitFailure("boot.cloud-status-mode-required");
+        running.awaitFailure("TS0310011");
         assertThat(cloudRequests.get()).as("unexpected Cloud calls: %s", cloudPaths).isZero();
         assertSafeOutput(running, null);
     }
