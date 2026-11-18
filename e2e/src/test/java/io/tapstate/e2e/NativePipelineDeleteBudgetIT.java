@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @RequiresDocker
 class NativePipelineDeleteBudgetIT {
     // One-table fixture budgets include authentication, lazy schema checks, and transaction completion.
-    private static final int PREPARED_MAX_COMMANDS = 8500;
+    private static final int PREPARED_MAX_COMMANDS = 4000;
     private static final int UNPREPARED_MAX_COMMANDS = 3000;
     private static final ConcurrentLinkedQueue<Map<String, Object>> READINGS = new ConcurrentLinkedQueue<>();
 

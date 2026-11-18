@@ -175,8 +175,8 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                     var execution=(ExecutionFence)fixedManifest.executionIdentity();
                     plans.forRun(execution,proof).forget(scope.pipelineId());
                 }
-                Runnable retired=() -> {
-                    proof.run();
+                java.util.function.Consumer<Runnable> verifyRuntime = check -> {
+                    check.run();
                     if (captured.filter(Engine.Run::isCarryingAJob).isPresent()) throw fenced();
                     var observed=engine.captureRun(scope.pipelineId());
                     if (observed.isPresent()) {
@@ -185,10 +185,21 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
                                 || !observed.orElseThrow().operatorManifest().equals(known.orElseThrow().operatorManifest())
                                 || observed.orElseThrow().isCarryingAJob()) throw fenced();
                     }
-                    operators.requireRetired(scope,ceiling,proof); proof.run();
+                    operators.requireRetired(scope,ceiling,check); check.run();
                 };
-                retired.run(); return new PipelineDeletionCoordinator.Isolated(isolated,retired,
-                        () -> {active.run();control.requireHeld();active.run();});
+                Runnable local = () -> { active.run(); control.requireHeld(); };
+                Runnable retired = () -> verifyRuntime.accept(proof);
+                return new PipelineDeletionCoordinator.Isolated(isolated, retired, local, receipt -> {
+                    if (isolated.isEmpty()) {
+                        retired.run();
+                        return;
+                    }
+                    if (!request.equals(receipt.preparation().request())) throw fenced();
+                    verifyRuntime.accept(local);
+                    lifecycle.requirePending(receipt.preparation());
+                    cache.requireCurrentPipelineRetirement(receipt, node.get());
+                    local.run();
+                });
             },(fixed,current,local) -> configuration.retireValidation(fixed,cache,current,local));
             try {
                 if (pending.isPresent()) { if (coordinator.resume(scope,request.operationId(),manifest).isEmpty()) throw fenced(); }

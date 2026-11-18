@@ -518,6 +518,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCachePipelinePreparations(client, database, expected, () -> { businessActive(); requireActive.run(); }, true);
     }
 
+    public void requireCurrentPipelineRetirement(io.tapstate.spi.store.PipelineRetirementReceipt receipt,
+            io.tapstate.spi.store.WorkloadClaimFence node) {
+        businessActive();
+        MongoCachePipelineRetirements.requireCurrentReceipt(receipt, Objects.requireNonNull(node));
+    }
+
     public io.tapstate.spi.store.PipelineCacheRetirements pipelineRetirements(CacheBusinessScope expected,Runnable requireActive) {
         Objects.requireNonNull(requireActive);return new MongoCachePipelineRetirements(client,database,expected,() -> {businessActive();requireActive.run();});
     }

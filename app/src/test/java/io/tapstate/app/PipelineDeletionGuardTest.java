@@ -12,7 +12,7 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class PipelineDeletionGuardTest {
-    @ParameterizedTest @ValueSource(strings = {"none", "consumer-read", "consumer-detach", "notes-list", "connector-release", "note-completion"})
+    @ParameterizedTest @ValueSource(strings = {"none", "consumer-read", "consumer-detach", "receipt", "notes-list", "connector-release", "note-completion"})
     void storageAndConnectorCallbacksUseLocalGuardsWhileDurableProofsRemainOutsideTransactions(String failingStage) {
         var inside = new AtomicBoolean();
         var currentStage = new AtomicReference<String>();
@@ -59,10 +59,16 @@ class PipelineDeletionGuardTest {
                 });
         var node = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.NODE_SESSION, "node"),
                 new WorkloadOwner("node", "boot"), 1, 0, 1);
+        var receiptChecked = new AtomicBoolean();
         var coordinator = new PipelineDeletionCoordinator(configuration, cache, consumers, releases, () -> node, () -> {},
-                (fixed, manifest) -> new PipelineDeletionCoordinator.Isolated(Optional.empty(), durable, local));
+                (fixed, manifest) -> new PipelineDeletionCoordinator.Isolated(Optional.empty(), durable, local, receiptToCheck -> {
+                    assertThat(receiptToCheck).isSameAs(receipt);
+                    durable.run();
+                    if (failingStage.equals("receipt")) throw failure;
+                    if (receiptChecked.compareAndSet(false, true)) visited.add("receipt");
+                }));
 
-        var stages = List.of("consumer-read", "consumer-detach", "notes-list", "connector-release", "note-completion");
+        var stages = List.of("consumer-read", "consumer-detach", "receipt", "notes-list", "connector-release", "note-completion");
         if (!failingStage.equals("none")) {
             assertThatThrownBy(() -> coordinator.delete(request, Optional.empty())).isSameAs(failure);
             int failedAt = stages.indexOf(failingStage);
@@ -73,7 +79,7 @@ class PipelineDeletionGuardTest {
             if (failedAt < 2) verifyNoInteractions(notes, retirement);
         } else {
             assertThat(coordinator.delete(request, Optional.empty())).isSameAs(result);
-            assertThat(visited).contains("consumer-read", "consumer-detach", "notes-list", "connector-release", "note-completion");
+            assertThat(visited).contains("consumer-read", "consumer-detach", "receipt", "notes-list", "connector-release", "note-completion");
             verify(configuration, atLeastOnce()).requirePending(original);
             verify(retirement).completeAfterVerifiedRelease();
         }
