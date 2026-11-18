@@ -7,11 +7,13 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.ManagedAuthenticationContext;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonWriter;
+import io.tapstate.spi.store.AiProviderSettingsStore;
 import io.tapstate.control.core.AiProviderSettings;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -93,8 +95,13 @@ class AiProviderController {
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {
         if (mode == AuthenticationMode.ON_PREM) {
-            AuthenticatedCaller.principal();
-            return new Workspace(JsonWriter.write(java.util.List.of("on-prem")), () -> {});
+            var authentication = SecurityContextHolder.getContext().getAuthentication();
+            if (!(authentication instanceof TapstateAuthentication verified) || verified.original() == null) {
+                throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+            }
+            Runnable active = verified.original().requireActive();
+            active.run();
+            return new Workspace(AiProviderSettingsStore.ON_PREM_OWNER, active);
         }
         var provider = contexts == null ? null : contexts.getIfAvailable();
         var selected = provider == null ? null : provider.current();

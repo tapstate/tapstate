@@ -7,6 +7,10 @@ import io.tapstate.control.core.AiProviderService;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CredentialAuthentication;
+import io.tapstate.control.core.Scope;
+import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.core.VerifiedToken;
 import io.tapstate.control.core.SourceProjectionService;
 import io.tapstate.control.core.SourceRepresentation;
 import io.tapstate.control.core.ApplyService;
@@ -28,6 +32,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.security.core.context.SecurityContextHolder;
 import tools.jackson.databind.json.JsonMapper;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -46,6 +52,55 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
 
 class PipelineAssistantControllerTest {
+    @Test void onPremStreamStopsPublishingWhenTheOriginalAuthenticationRetires() throws Exception {
+        var drafts = new PipelineApiTest.FakePipelineDraftStore();
+        drafts.create(draft());
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts));
+        beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
+        var providerService = org.mockito.Mockito.mock(AiProviderService.class);
+        org.mockito.Mockito.when(providerService.require("[\"on-prem\"]"))
+                .thenReturn(new AiProviderSettings("openai-compatible", "https://api.openai.com/v1", "model", "test-key"));
+        beans.registerSingleton("providerService", providerService);
+
+        var active = new AtomicBoolean(true);
+        AiProviderClient client = new AiProviderClient() {
+            public void check(AiProviderSettings settings) { }
+
+            public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
+                    Map<String, Object> context, java.util.function.Consumer<String> text) {
+                active.set(false);
+                text.accept("Output after authentication retired");
+                return Optional.empty();
+            }
+        };
+        var providers = new AiProviderController(beans.getBeanProvider(AiProviderService.class), null,
+                beans.getBeanProvider(AuthenticationMode.class), client);
+        var assistant = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
+                beans.getBeanProvider(SourceProjectionService.class),
+                beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers, client,
+                JsonMapper.builder().build());
+        var token = new VerifiedToken("operator", Scope.WRITE);
+        var original = new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {
+            if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
+        });
+        SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(TapstatePrincipal.humanJwt(token), original));
+        org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody stream;
+        try {
+            stream = assistant.assistant("orders", Map.of("revision", 1,
+                    "messages", List.of(Map.of("role", "user", "text", "Suggest a pipeline"))),
+                    new MockHttpServletRequest(), new MockHttpServletResponse()).getBody();
+        } finally {
+            SecurityContextHolder.clearContext();
+        }
+        var output = new ByteArrayOutputStream();
+        stream.writeTo(output);
+        assertThat(active.get()).isFalse();
+        assertThat(output.toString(StandardCharsets.UTF_8))
+                .contains(ControlError.UNAUTHENTICATED.code(), "[DONE]")
+                .doesNotContain("Output after authentication retired", "data-proposal");
+    }
+
     @Test void malformedMessageEntryIsRejectedWithCodedRequestErrorBeforeStreaming() {
         var store = new PipelineApiTest.FakePipelineDraftStore();
         store.create(draft());

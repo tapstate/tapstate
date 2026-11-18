@@ -7,6 +7,7 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.CloudSessionService;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.CredentialAuthentication;
 import io.tapstate.control.core.GeneratedSecret;
 import io.tapstate.control.core.Scope;
 import io.tapstate.control.core.TapstatePrincipal;
@@ -172,9 +173,11 @@ class AiProviderSettingsApiTest {
         var controller = new AiProviderController(beans.getBeanProvider(AiProviderService.class),
                 beans.getBeanProvider(CloudAuthenticationService.class), beans.getBeanProvider(AuthenticationMode.class), null);
         var request = new MockHttpServletRequest();
-        assertThatThrownBy(() -> controller.get(request)).isInstanceOf(IllegalStateException.class);
+        assertThatThrownBy(() -> controller.get(request)).isInstanceOfSatisfying(TapstateException.class,
+                failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+        var token = new VerifiedToken("local-user", Scope.WRITE);
         SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(
-                TapstatePrincipal.humanJwt(new VerifiedToken("local-user", Scope.WRITE))));
+                TapstatePrincipal.humanJwt(token), new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {})));
         try {
             controller.put(request, new AiProviderSettings("openai-compatible", null, "model", "private-key"));
             assertThat(controller.get(request).getBody()).containsEntry("configured", true).doesNotContainKey("apiKey");

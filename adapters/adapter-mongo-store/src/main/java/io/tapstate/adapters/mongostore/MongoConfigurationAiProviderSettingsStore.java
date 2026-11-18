@@ -134,12 +134,14 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
     }
 
     private void requireOwner(String owner) {
+        if (ON_PREM_OWNER.equals(owner)) {
+            return;
+        }
         try {
             if (owner == null || owner.getBytes(StandardCharsets.UTF_8).length > 4096
-                    || !(JsonReader.parse(owner) instanceof List<?> values) || !owner.equals(JsonWriter.write(values))
-                    || !(values.equals(List.of("on-prem")) || values.size() == 3
-                    && "cloud".equals(values.get(0)) && values.get(1) instanceof String org && !org.isBlank()
-                    && cluster.equals(values.get(2)))) throw invalid("owner");
+                    || !(JsonReader.parse(owner) instanceof List<?> values) || values.size() != 3
+                    || !"cloud".equals(values.get(0)) || !(values.get(1) instanceof String org) || org.isBlank()
+                    || !cluster.equals(values.get(2)) || !owner.equals(JsonWriter.write(values))) throw invalid("owner");
         } catch (IllegalArgumentException | ClassCastException | NullPointerException invalid) { throw invalid("owner"); }
     }
     private static void fields(String provider, String endpoint, String model) {
