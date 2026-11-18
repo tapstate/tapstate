@@ -107,7 +107,7 @@ comment=step(build,'Comment quality gate on PR')
 assert "steps.analyze.outcome != 'skipped'" in comment and 'always()' in comment
 assert 'types=BUG' not in comment, 'PR comment must not hide non-BUG findings'
 assert 'resolved=false&ps=100' in comment
-upload=step(build,'Upload complete SonarQube PR findings')
+upload=step(build,'Upload SonarQube PR findings report')
 assert "if: always() && steps.sonar-comment.outputs.findings_path != ''" in upload
 assert 'continue-on-error: true' in upload and 'uses: actions/upload-artifact@v4' in upload
 assert 'name: ${{ steps.sonar-comment.outputs.findings_name }}' in upload
@@ -255,12 +255,35 @@ esac
     assert first_page['issues'][0]['message'] in report.read_text(encoding='utf-8')
 
     page_two.unlink()
+    for finding in first_page['issues']:
+        finding['message']='Page-one maintainability finding.'
+    page_one.write_text(json.dumps(first_page))
     run=run_comment()
     assert run.returncode==0,run.stdout+run.stderr
     body=captured.read_text()
-    assert 'SonarQube results are incomplete. Retrieved 100 unresolved issues' in body
+    incomplete='SonarQube results are incomplete. Retrieved 100 unresolved issues before pagination stopped.'
+    assert incomplete in body
+    assert len(re.findall(r'^- `java:', body, re.M))==100
     assert 'Open the pull-request dashboard' in body and 'workflow run artifacts' not in body
     assert not outputs.read_text() and not report.exists()
+
+    for finding in first_page['issues']:
+        finding['message']='Check the related validation. '*18+'Review the issue.'
+    page_one.write_text(json.dumps(first_page))
+    run=run_comment()
+    assert run.returncode==0,run.stdout+run.stderr
+    body=captured.read_text()
+    shown=len(re.findall(r'^- `java:', body, re.M))
+    assert 0 < shown < 100, shown
+    assert incomplete in body and 'Open the pull-request dashboard' in body
+    assert f'Showing {shown} of 100 retrieved unresolved issues ({100-shown} omitted' in body
+    assert report.exists(), f'Comment showed {shown} of 100 retrieved findings without a report'
+    assert '[workflow run artifacts](https://github.com/tapstate/tapstate/actions/runs/123)' in body
+    assert 'sonar-pr-findings-attempt-1' in body
+    assert outputs.read_text().splitlines()==[f'findings_path={report}', 'findings_name=sonar-pr-findings-attempt-1']
+    full=report.read_text(encoding='utf-8')
+    assert incomplete in full
+    assert re.findall(r'^- `(java:\w+)`', full, re.M)==[finding['rule'] for finding in first_page['issues']]
 command=script(step(reporter,'Report analysis outcome'))
 with tempfile.TemporaryDirectory() as tmp:
     for build_result, enabled, outcome, expect in [
@@ -374,5 +397,5 @@ printf '%s' "${GH_TOKEN+present}${GITHUB_TOKEN+present}" > "$SCANNER_AUTH"
     revision_controls+=1
     calls=[json.loads(line) for line in api_log.read_text().splitlines()]
     assert calls and all(row==['api','--method','GET','repos/tapstate/tapstate/git/ref/heads/main','--jq','.object.sha'] for row in calls)
-print(f'sonar-workflow smoke: 7 event/ref cases, 25 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including bounded comments and the full paginated report')
+print(f'sonar-workflow smoke: 7 event/ref cases, 26 runtime cases, {revision_controls} revision-order controls and {lock_mutations} lock mutations passed, including bounded comments and reports for complete and interrupted pagination')
 PY

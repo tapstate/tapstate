@@ -567,6 +567,9 @@ jobs:
             if [ -n "${details:-}" ]; then
               printf 'Failing conditions:\n%s\n\n' "$details"
             fi
+            if [ "$complete" = false ]; then
+              printf 'SonarQube results are incomplete. Retrieved %s unresolved issues before pagination stopped.\n\n' "$retrieved"
+            fi
             if [ "$retrieved" -gt 0 ]; then
               printf 'Open unresolved issues:\n'
             fi
@@ -574,9 +577,6 @@ jobs:
           {
             if [ "$retrieved" -gt 0 ]; then
               printf '\n'
-            fi
-            if [ "$complete" = false ]; then
-              printf 'SonarQube results are incomplete. Retrieved %s unresolved issues before pagination stopped.\n\n' "$retrieved"
             fi
             printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
             printf '_Posted by CI from the SonarQube pull-request quality gate._\n'
@@ -587,10 +587,8 @@ jobs:
           artifact_name="sonar-pr-findings-attempt-${GITHUB_RUN_ATTEMPT}"
           omission_notice() {
             printf '\nShowing %s of %s retrieved unresolved issues (%s omitted from this comment).\n\n' "$1" "$retrieved" "$((retrieved - $1))"
-            if [ "$complete" = true ]; then
-              # shellcheck disable=SC2016
-              printf 'Look for `%s` in the [workflow run artifacts](https://github.com/%s/actions/runs/%s).\n\n' "$artifact_name" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
-            fi
+            # shellcheck disable=SC2016
+            printf 'Look for `%s` in the [workflow run artifacts](https://github.com/%s/actions/runs/%s).\n\n' "$artifact_name" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
           }
           jq -r '.' "$entries" > "$scratch/findings.md"
           base_bytes=$(($(wc -c < "$scratch/header") + $(wc -c < "$scratch/footer")))
@@ -625,7 +623,7 @@ jobs:
             echo '::notice::PR head changed during decoration; preserving the current decoration.'
             exit 0
           fi
-          if [[ "$complete" = true && "$overflow" = true ]]; then
+          if [ "$overflow" = true ]; then
             report="${RUNNER_TEMP:-$PWD}/sonar-pr-findings.md"
             cat "$scratch/header" "$scratch/findings.md" > "$report"
             printf 'findings_path=%s\nfindings_name=%s\n' "$report" "$artifact_name" >> "${GITHUB_OUTPUT:-/dev/null}"
@@ -637,7 +635,7 @@ jobs:
           fi
           echo "Posted quality gate comment (status=${status})."
 
-      - name: Upload complete SonarQube PR findings
+      - name: Upload SonarQube PR findings report
         if: always() && steps.sonar-comment.outputs.findings_path != ''
         continue-on-error: true
         uses: actions/upload-artifact@v4
