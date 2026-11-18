@@ -844,11 +844,11 @@ public final class DslParser {
         String value = rollupExpression(pick, "value");
         List<String> by = new ArrayList<>();
         Node byNode = pick.node("by");
-        if (byNode instanceof SequenceNode) {
-            List<String> written = scalarList(pick.seq("by"), "by");
-            for (int i = 0; i < written.size(); i++) {
-                checkRollupExpression(pick, "by", written.get(i));
-                by.add(written.get(i));
+        if (byNode instanceof SequenceNode byList) {
+            for (Node item : byList.getValue()) {
+                String written = YamlMap.requireScalar(item, "by");
+                checkRollupExpression(pick, "by", written);
+                by.add(written);
             }
         } else {
             by.add(rollupExpression(pick, "by"));
