@@ -14,7 +14,9 @@ through `TS0210005`, respectively. AI assistant and provider refusals use
 model-refresh warning use `TS0210014` through `TS0210023`. Storage request
 refusals use `TS0210024` through `TS0210031`. Source mutation errors use `TS0220001`
 through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
-`023`, `024` and `025`. DSL errors use `TS0010001` through `TS0010031`, and
+`023`, `024` and `025`. Local MCP adapter refusals use `TS0260001` through
+`TS0260004`; structured remote refusals retain the Server's code, status and
+parameters. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
 product contract switches with a coordinated major release; this candidate does

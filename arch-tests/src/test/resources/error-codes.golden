@@ -94,6 +94,10 @@ TS0250004
 TS0250005
 TS0250006
 TS0250007
+TS0260001
+TS0260002
+TS0260003
+TS0260004
 actuation.connector-differs-across-members
 actuation.connector-unavailable-on-member
 actuation.from-regex-empty
@@ -354,10 +358,6 @@ lifecycle.purge-state-not-stated
 lifecycle.start-blocked
 lifecycle.start-needs-confirmation
 lifecycle.unknown-pipeline
-mcp.connector-spec-unavailable
-mcp.environment-missing
-mcp.invalid-server-response
-mcp.server-rejected
 migration.changeset-failed
 migration.data-newer-than-binary
 migration.lock-timeout

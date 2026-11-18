@@ -90,3 +90,7 @@ control.storage-cache-database-occupied-suggested	TS0210028
 control.storage-scope-conflict	TS0210029
 control.storage-unavailable	TS0210030
 control.storage-quota-exceeded	TS0210031
+mcp.connector-spec-unavailable	TS0260001
+mcp.environment-missing	TS0260002
+mcp.invalid-server-response	TS0260003
+mcp.server-rejected	TS0260004

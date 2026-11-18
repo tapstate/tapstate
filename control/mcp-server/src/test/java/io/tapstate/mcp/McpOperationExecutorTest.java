@@ -368,8 +368,8 @@ class McpOperationExecutorTest {
             McpResult missingItems = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
             McpResult missingConnector = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
-            assertThat(missingItems.body()).containsEntry("code", "mcp.invalid-server-response");
-            assertThat(missingConnector.body()).containsEntry("code", "mcp.invalid-server-response");
+            assertThat(missingItems.body()).containsEntry("code", "TS0260003");
+            assertThat(missingConnector.body()).containsEntry("code", "TS0260003");
         } finally {
             server.stop(0);
         }
@@ -986,7 +986,7 @@ class McpOperationExecutorTest {
     private static void assertSourceDraftUnavailable(
             int connectorStatus, String connectorBody, String draftBody) throws Exception {
         assertThat(sourceDraftResult(connectorStatus, connectorBody, draftBody).body())
-                .containsEntry("code", "mcp.connector-spec-unavailable");
+                .containsEntry("code", "TS0260001");
     }
 
     private static void answer(HttpExchange exchange, int status, String body) throws IOException {

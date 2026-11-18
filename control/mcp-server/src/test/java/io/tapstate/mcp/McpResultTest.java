@@ -77,7 +77,7 @@ class McpResultTest {
 
         assertThat(result.error()).isTrue();
         assertThat(result.body())
-                .containsEntry("code", "mcp.server-rejected")
+                .containsEntry("code", "TS0260004")
                 .containsEntry("params", Map.of("status", 502));
     }
 
@@ -92,7 +92,7 @@ class McpResultTest {
 
         McpResult coded = McpResult.coded(McpError.ENVIRONMENT_MISSING,
                 Map.of("variable", "MYSQL_PASSWORD"));
-        assertThat(coded.body()).containsEntry("code", "mcp.environment-missing")
+        assertThat(coded.body()).containsEntry("code", "TS0260002")
                 .containsKey("solution");
     }
 }

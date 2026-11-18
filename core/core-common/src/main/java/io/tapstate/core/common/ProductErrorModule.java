@@ -8,7 +8,8 @@ public enum ProductErrorModule {
     SOURCE("022"),
     PIPELINE("023"),
     ARTIFACT("024"),
-    PIPELINE_DRAFT("025");
+    PIPELINE_DRAFT("025"),
+    MCP("026");
 
     private final String number;
 
