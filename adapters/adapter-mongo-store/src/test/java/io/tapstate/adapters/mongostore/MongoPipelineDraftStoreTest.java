@@ -76,6 +76,28 @@ class MongoPipelineDraftStoreTest {
     }
 
     @Test
+    void roundTripsRollupFieldsOnWizardRelations() {
+        Map<String, Object> rollup = new LinkedHashMap<>();
+        rollup.put("item_count", Map.of("count", true));
+        rollup.put("latest", Map.of("last", Map.of("value", "$sku", "by", List.of("$created_at", "$id"))));
+        PipelineDraft draft = new PipelineDraft("orders", 1, 4, PipelineDraft.Mode.WIZARD,
+                "Orders", "", null,
+                new PipelineDraft.Wizard(
+                        new PipelineDraft.Root("orders", "mysql", "orders", List.of("id"), List.of()),
+                        List.of(new PipelineDraft.Related("items", "orders", "mysql", "order_items",
+                                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("item_id"), rollup),
+                                List.of())),
+                        List.of(), null),
+                null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
+
+        PipelineDraft restored = MongoPipelineDraftStore.fromDocument(MongoPipelineDraftStore.toDocument(draft));
+
+        assertThat(restored).isEqualTo(draft);
+        assertThat(restored.wizard().related().getFirst().relation().rollup()).containsOnlyKeys("item_count", "latest");
+    }
+
+    @Test
     void roundTripsAnIncompleteWizardWithoutARoot() {
         PipelineDraft draft = new PipelineDraft("incomplete", 1, 1, PipelineDraft.Mode.WIZARD,
                 "Incomplete", "", null, new PipelineDraft.Wizard(null, List.of(), List.of(), null),

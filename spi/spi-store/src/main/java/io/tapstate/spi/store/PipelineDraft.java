@@ -121,23 +121,38 @@ public record PipelineDraft(
         }
     }
 
+    /**
+     * How a related table joins its parent. {@code rollup} holds the relation's rollup fields as authored:
+     * field name to one function and its options, in the spelling of a nest embed's {@code rollup:}. It is
+     * kept as written and judged when the draft is compiled, because a draft may be saved half-finished.
+     */
     public record Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
-            List<String> arrayKey) {
+            List<String> arrayKey, Map<String, Object> rollup) {
         public Relation(List<FieldPair> on, Shape shape, String path, List<String> arrayKey) {
             this(on, shape, path, List.of(), arrayKey);
+        }
+
+        /** A relation with no rollup fields, which every relation saved before they existed is. */
+        public Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
+                List<String> arrayKey) {
+            this(on, shape, path, key, arrayKey, null);
         }
 
         public Relation {
             on = List.copyOf(on);
             Objects.requireNonNull(shape, "shape");
-            if (shape != Shape.ARRAY && arrayKey != null && !arrayKey.isEmpty()) {
-                throw new IllegalArgumentException("arrayKey is only valid for array relations");
+            if (!shape.holdsRows() && arrayKey != null && !arrayKey.isEmpty()) {
+                throw new IllegalArgumentException("arrayKey is only valid for array and rollup relations");
             }
-            if (shape == Shape.FLAT && path != null && !path.isBlank()) {
-                throw new IllegalArgumentException("flat relations do not have a path");
+            if (!shape.hasPath() && path != null && !path.isBlank()) {
+                throw new IllegalArgumentException("flat and rollup relations do not have a path");
+            }
+            if (!shape.holdsRows() && rollup != null && !rollup.isEmpty()) {
+                throw new IllegalArgumentException("rollup fields are only valid on array and rollup relations");
             }
             key = key == null ? List.of() : List.copyOf(key);
             arrayKey = arrayKey == null ? List.of() : List.copyOf(arrayKey);
+            rollup = rollup == null || rollup.isEmpty() ? null : copy(rollup);
         }
     }
 
@@ -151,7 +166,19 @@ public record PipelineDraft(
     public enum Shape {
         FLAT,
         OBJECT,
-        ARRAY
+        ARRAY,
+        /** Keeps the related rows only to compute the relation's rollup fields; renders no array. */
+        ROLLUP;
+
+        /** Whether matched rows are kept as many elements: an array, or a level that only rolls up. */
+        public boolean holdsRows() {
+            return this == ARRAY || this == ROLLUP;
+        }
+
+        /** Whether the relation renders at a target path of its own. */
+        public boolean hasPath() {
+            return this == OBJECT || this == ARRAY;
+        }
     }
 
     public record Transform(String id, String type, Map<String, Object> fields) {

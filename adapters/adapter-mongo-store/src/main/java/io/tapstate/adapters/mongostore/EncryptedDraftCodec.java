@@ -195,7 +195,12 @@ final class EncryptedDraftCodec {
             for (Document related : documents(value, "related")) {
                 keys(related, "id", "parentId", "sourceId", "table", "relation", "preTransforms");
                 Document relation = related.get("relation", Document.class);
-                keys(relation, "on", "shape", "path", "key", "arrayKey"); strings(relation, "key"); strings(relation, "arrayKey");
+                if (relation != null && relation.containsKey("rollup")) {
+                    keys(relation, "on", "shape", "path", "key", "arrayKey", "rollup"); normalize(relation, "rollup");
+                } else {
+                    keys(relation, "on", "shape", "path", "key", "arrayKey");
+                }
+                strings(relation, "key"); strings(relation, "arrayKey");
                 for (Document pair : documents(relation, "on")) keys(pair, "childField", "parentField");
                 transforms(related, "preTransforms");
             }
