@@ -7,11 +7,17 @@ import com.sun.jdi.ClassNotLoadedException;
 import com.sun.jdi.IncompatibleThreadStateException;
 import com.sun.jdi.InvalidTypeException;
 import com.sun.jdi.InvocationException;
+import com.sun.jdi.LongValue;
 import com.sun.jdi.ObjectReference;
+import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.event.ClassPrepareEvent;
+import com.sun.jdi.event.EventSet;
+import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.EventRequestManager;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
@@ -26,6 +32,7 @@ import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.Statement;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -281,45 +288,108 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             var converger = vm.classesByName("io.tapstate.runtime.scheduler.PipelineConverger").getFirst();
             var running = converger.methodsByName("convergeRunning").getFirst();
             var requests = vm.eventRequestManager();
+            var convergenceBreakpoints = new ArrayList<BreakpointRequest>();
             for (var location : running.allLineLocations()) {
                 var breakpoint = requests.createBreakpointRequest(location);
                 breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
-                breakpoint.enable();
+                convergenceBreakpoints.add(breakpoint);
             }
+            String jetContext = "com.hazelcast.jet.impl.MasterJobContext";
+            var preparing = requests.createClassPrepareRequest();
+            preparing.addClassFilter(jetContext);
+            preparing.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+            preparing.enable();
+            var finishing = vm.classesByName(jetContext).stream().filter(ReferenceType::isPrepared).findFirst()
+                    .map(type -> jetFinalizerBreakpoint(requests, type)).orElse(null);
+            if (finishing != null) preparing.disable();
             var started = CompletableFuture.runAsync(() -> control.lifecycle(pipelineId, LifecycleVerb.START));
 
-            // Hold the convergence thread after it reads an unfinished job. Jet and the real sink
-            // can finish the original execution before the same pass asks if a live job remains.
-            long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
-            while (System.nanoTime() < deadline) {
+            // Keep convergence running while Jet processes the load. Once Jet is ready to finalize,
+            // hold it until a convergence pass reads an empty completion for this job.
+            EventSet jetPaused = null;
+            LongValue finalizingJob = null;
+            EventSet convergencePaused = null;
+            ThreadReference convergenceThread = null;
+            ObjectReference run = null;
+            Duration waitBound = Duration.ofSeconds(60);
+            long deadline = System.nanoTime() + waitBound.toNanos();
+            while ((jetPaused == null || convergencePaused == null) && System.nanoTime() < deadline) {
                 if (started.isCompletedExceptionally()) started.join();
                 var events = vm.eventQueue().remove(250);
                 if (events == null) continue;
-                boolean held = false;
                 try {
                     for (var event : events) {
-                        if (!(event instanceof BreakpointEvent stopped)) continue;
-                        var run = originalRunAfterIncompleteRead(stopped, pipelineId);
-                        if (run == null) continue;
-                        requests.deleteEventRequests(List.copyOf(requests.breakpointRequests()));
-                        // Jet can log success before publishing its terminal job status.
-                        Await.until("the original Jet execution to report COMPLETED while convergence is paused",
-                                () -> jetCompleted(run, stopped.thread()), () -> process.output().toString());
-                        held = true;
-                        break;
+                        if (event instanceof ClassPrepareEvent prepared && finishing == null) {
+                            finishing = jetFinalizerBreakpoint(requests, prepared.referenceType());
+                            preparing.disable();
+                        } else if (event instanceof BreakpointEvent stopped) {
+                            if (stopped.request() == finishing) {
+                                var jobId = finalizingJobId(stopped, pipelineId);
+                                if (jobId != null) {
+                                    finalizingJob = jobId;
+                                    jetPaused = events;
+                                    requests.deleteEventRequest(finishing);
+                                    convergenceBreakpoints.forEach(BreakpointRequest::enable);
+                                    deadline = System.nanoTime() + waitBound.toNanos();
+                                }
+                                continue;
+                            }
+                            var observed = originalRunAfterIncompleteRead(stopped, pipelineId);
+                            if (observed == null) continue;
+                            run = observed;
+                            convergenceThread = stopped.thread();
+                            convergencePaused = events;
+                            // Start the completion budget at the empty read.
+                            deadline = System.nanoTime() + waitBound.toNanos();
+                            requests.deleteEventRequests(convergenceBreakpoints);
+                        }
                     }
                 } finally {
-                    events.resume();
-                }
-                if (held) {
-                    started.join();
-                    return;
+                    if (events != jetPaused && events != convergencePaused) events.resume();
                 }
             }
-            throw new AssertionError("convergence did not observe the original job before it completed");
+            if (jetPaused == null || convergencePaused == null) {
+                throw new AssertionError("timed out arranging Jet completion between convergence reads: "
+                        + "Jet at finalizer=" + (jetPaused != null)
+                        + ", convergence read empty=" + (convergencePaused != null) + ", server log=" + process.output());
+            }
+            var originalRun = run;
+            var stoppedThread = convergenceThread;
+            try {
+                var originalJob = (LongValue) originalRun.invokeMethod(stoppedThread,
+                        originalRun.referenceType().methodsByName("jobId").getFirst(),
+                        List.of(), ObjectReference.INVOKE_SINGLE_THREADED);
+                assertThat(finalizingJob.longValue()).as("Jet job held before convergence checks for a live run")
+                        .isEqualTo(originalJob.longValue());
+                jetPaused.resume();
+                // Jet can log success before publishing its terminal job status.
+                var remaining = Duration.ofNanos(Math.max(0, deadline - System.nanoTime()));
+                Await.until("the original Jet execution to report COMPLETED while convergence is paused",
+                        remaining, () -> jetCompleted(originalRun, stoppedThread), () -> process.output().toString());
+            } finally {
+                convergencePaused.resume();
+            }
+            started.join();
         } finally {
             vm.dispose();
         }
+    }
+
+    private static BreakpointRequest jetFinalizerBreakpoint(EventRequestManager requests, ReferenceType context) {
+        var location = context.methodsByName("completeVertices").getFirst().location();
+        var breakpoint = requests.createBreakpointRequest(location);
+        breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+        breakpoint.enable();
+        return breakpoint;
+    }
+
+    private static LongValue finalizingJobId(BreakpointEvent stopped, String pipelineId) throws Exception {
+        var finalizer = stopped.thread().frame(0).thisObject();
+        var context = (ObjectReference) finalizer.getValue(finalizer.referenceType().fieldByName("mc"));
+        var contextType = context.referenceType();
+        var jobName = (StringReference) context.getValue(contextType.fieldByName("jobName"));
+        return jobName != null && pipelineId.equals(jobName.value())
+                ? (LongValue) context.getValue(contextType.fieldByName("jobId")) : null;
     }
 
     private static ObjectReference originalRunAfterIncompleteRead(BreakpointEvent stopped, String pipelineId)
