@@ -108,6 +108,16 @@ final class PdkCaptureBatch implements CaptureBatch {
     boolean isClosed() { return closed.get(); }
     boolean isReading() { return reader.isAlive(); }
 
+    private volatile io.tapstate.core.common.FailureFact readerFailure;
+    private volatile io.tapstate.core.common.FailureFact decodeFailure;
+
+    @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+        var decoded = decodeFailure;
+        if (decoded != null && decoded.cause() == failure) return decoded;
+        var read = readerFailure;
+        return read != null && read.cause() == failure ? read : new io.tapstate.core.common.FailureFact(failure);
+    }
+
     PdkCaptureBatch awaitSeam() {
         try {
             seam.get();
@@ -175,6 +185,7 @@ final class PdkCaptureBatch implements CaptureBatch {
                 // A batch that cannot be taken ends the read as a failure of the read does: what would come
                 // after it is not the rest of the table.
                 over = true;
+                if (!(refused instanceof VirtualMachineError)) decodeFailure = connector.failureFact(refused);
                 throw refused;
             }
         }
@@ -239,6 +250,7 @@ final class PdkCaptureBatch implements CaptureBatch {
         } catch (CancellationException abandoned) {
             seam.completeExceptionally(abandoned);
         } catch (Throwable failure) {
+            if (!closed.get() && !(failure instanceof VirtualMachineError)) readerFailure = connector.failureFact(failure);
             if (!seam.completeExceptionally(failure) && !closed.get()) {
                 put(new Failure(failure));
             }

@@ -330,6 +330,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 closeObserver(connector);return opened;
             }
             return new CaptureBatch() {
+                public io.tapstate.core.common.FailureFact failureFact(Throwable failure){return opened.failureFact(failure);}
                 public Optional<SourcePosition> seam(){return opened.seam();}
                 public boolean hasNext(){return opened.hasNext();}
                 public Envelope next(){return opened.next();}
@@ -376,6 +377,10 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             this.config = config;
             this.batch = batch;
             this.preparation = preparation;
+        }
+
+        @Override public synchronized io.tapstate.core.common.FailureFact failureFact(Throwable failure) {
+            return active == null ? new io.tapstate.core.common.FailureFact(failure) : active.failureFact(failure);
         }
 
         @Override

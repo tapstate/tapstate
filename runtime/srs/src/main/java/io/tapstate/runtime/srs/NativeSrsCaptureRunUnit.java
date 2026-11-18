@@ -317,6 +317,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private SnapshotSession retainSession(SnapshotSession original,Runnable owner) {
         Runnable close=original::close;pendingCloses.put(close,owner);
         return new SnapshotSession() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure){return original.failureFact(failure);}
             @Override public CaptureBatch read(String table){return original.read(table);}
             @Override public void close(){closePending(close);}
         };
@@ -324,6 +325,7 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     private CaptureBatch retainBatch(CaptureBatch original,Runnable owner) {
         Runnable close=original::close;pendingCloses.put(close,owner);
         return new CaptureBatch() {
+            @Override public io.tapstate.core.common.FailureFact failureFact(Throwable failure){return original.failureFact(failure);}
             @Override public boolean hasNext(){return original.hasNext();}
             @Override public io.tapstate.core.event.Envelope next(){return original.next();}
             @Override public Optional<SourcePosition> seam(){return original.seam();}

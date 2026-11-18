@@ -13,6 +13,49 @@ class PdkRuntimeDiagnosticTest {
             "credential":{"type":"string","x-component":"Password"}}}}}
             """;
 
+    @Test void aLaterReaderFailureCannotEraseTheAlreadyObservedDecodeFailure(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        var jar = Synthetic.countingSink(dir);
+        var connector = PdkConnector.open("fixture", new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null, SPEC),
+                Map.of("credential", "snapshot-secret"));
+        var decode = new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", "fixture", "detail", "snapshot-secret decode"), null);
+        var reader = new TapstateException(ConnectorError.CAPTURE_FAILED, Map.of("connector", "fixture", "detail", "snapshot-secret reader"), null);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        try (var batch = PdkCaptureBatch.start(connector, reading -> {
+            reading.seamSampled(java.util.Optional.empty());
+            reading.rowsRead(() -> { throw decode; });
+            if (!release.await(3, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("reader fixture deadline");
+            throw reader;
+        }, "snapshot-pair-test")) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(batch::hasNext).isSameAs(decode);
+            release.countDown();
+            long deadline = System.nanoTime() + java.time.Duration.ofSeconds(3).toNanos();
+            while (batch.isReading() && System.nanoTime() < deadline) Thread.sleep(5);
+            assertThat(batch.isReading()).isFalse();
+            assertThat(batch.failureFact(decode).publicFailure()).isNotNull();
+            assertThat(batch.failureFact(decode).publicFailure().params().toString()).doesNotContain("snapshot-secret");
+            assertThat(batch.failureFact(reader).publicFailure()).isNotNull();
+        } finally { release.countDown(); }
+    }
+
+    @Test void aSnapshotWorkerKeepsTheFailureOfItsOwnConnector(@org.junit.jupiter.api.io.TempDir java.nio.file.Path dir) throws Exception {
+        var jar = Synthetic.countingSink(dir);
+        var ref = new ConnectorRef(List.of(jar), "synthetic.CountingSink", "2.0.8", null, SPEC);
+        var connector = PdkConnector.open("fixture", ref, Map.of("credential", "snapshot-secret"));
+        var failure = new TapstateException(ConnectorError.CAPTURE_FAILED,
+                Map.of("connector", "fixture", "detail", "snapshot-secret"), null);
+        try (var batch = PdkCaptureBatch.start(connector, reading -> {
+            reading.seamSampled(java.util.Optional.empty());
+            throw failure;
+        }, "snapshot-owner-test")) {
+            org.assertj.core.api.Assertions.assertThatThrownBy(batch::hasNext).isSameAs(failure);
+            var fact = batch.failureFact(failure);
+            assertThat(fact.cause()).isSameAs(failure);
+            assertThat(fact.publicFailure()).isNotNull();
+            assertThat(fact.publicFailure().params().toString()).doesNotContain("snapshot-secret");
+            assertThat(batch.failureFact(new IllegalStateException("other owner")).diagnostic()).isEmpty();
+        }
+    }
+
     @Test void missingLogicalNodeDoesNotDisableSecretProtection() {
         var context = PdkRuntimeDiagnostic.bind("fixture", new ConnectorRef(List.of(), "fixture", null, null, SPEC),
                 Map.of("credential", "node-less-secret"), null);
