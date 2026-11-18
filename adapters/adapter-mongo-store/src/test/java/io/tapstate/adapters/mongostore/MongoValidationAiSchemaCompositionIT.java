@@ -35,7 +35,9 @@ class MongoValidationAiSchemaCompositionIT {
                 assertThat(reopened.prepareInitialValidationSchema(original,f.cache,()->{})).isEqualTo(receipt);
             }
             var before=f.configSchema();SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).drop();
-            assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.aiProviderSettings().get(OWNER)).isEmpty();
+            }
             assertThat(f.configuration.aiProviderSettings().get(OWNER)).isEmpty();
             assertThat(f.configSchema()).isEqualTo(before);assertThat(f.configDb.listCollectionNames()).doesNotContain("ai_provider_settings");
         }
@@ -70,11 +72,16 @@ class MongoValidationAiSchemaCompositionIT {
         }
     }
 
-    @Test void historicalValidationTwoRefusesReopeningAfterStructureLoss(){
+    @Test void historicalValidationMarkerStillDeterminesFeatureIdentityAfterStructureLoss(){
         try(var f=new MongoValidationSchemaIT.Fixture(1)){
             f.upgrade();assertThat(f.configuration.artifacts().create(new SourceResource("healthy",null,"mongodb",Map.of("uri","mongodb://business.invalid/healthy"),null,null,null,null))).isEqualTo(ArtifactMutation.CREATED);
             SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();var before=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
-            assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.artifacts().get("healthy")).isPresent();
+                assertThatThrownBy(() -> reopened.aiProviderSettings().put(OWNER, SETTING))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                                assertThat(error.code()).isEqualTo(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED));
+            }
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(before);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");
         }
@@ -96,7 +103,9 @@ class MongoValidationAiSchemaCompositionIT {
             try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster")){assertThat(reopened.aiProviderSettings().get(OWNER)).contains(SETTING);}
             assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(row);
             SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
-            assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.aiProviderSettings().get(OWNER)).contains(SETTING);
+            }
             assertThat(f.configuration.aiProviderSettings().get(OWNER)).contains(SETTING);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");

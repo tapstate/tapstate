@@ -113,6 +113,22 @@ class MongoConfigurationAiProviderSettingsIT {
             }
         });
     }
+    @Test void ambiguousVersionTwoOpenChecksOneNamespaceListAndNoIndexes() {
+        fixture((uri, config, raw) -> {
+            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).createIndex(new Document("model", 1));
+            try (var diagnostics = MongoHttpDiagnosticsScope.open();
+                 var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
+                assertThat(reopened.aiProviderSettings().get(OWNER)).isEmpty();
+                var groups = (List<?>) diagnostics.snapshot().get("mongo_groups");
+                assertThat(groups).noneSatisfy(group ->
+                        assertThat(((java.util.Map<?, ?>) group).get("command")).isEqualTo("listIndexes"));
+                assertThat(groups).filteredOn(group -> "listCollections".equals(((java.util.Map<?, ?>) group).get("command")))
+                        .singleElement().satisfies(group ->
+                                assertThat(((java.util.Map<?, ?>) group).get("started")).isEqualTo(1L));
+            }
+        });
+    }
+
     @Test void oldSchemaKeepsSourceConfigurationButRefusesProviderAccess() {
         fixture((uri, config, raw) -> {
             SystemCollections.SCHEMA_MIGRATIONS.on(raw).updateOne(new Document("_id", "config"), new Document("$set", new Document("installedVersion", 1)));

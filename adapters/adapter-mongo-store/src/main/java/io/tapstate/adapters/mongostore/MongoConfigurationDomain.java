@@ -90,7 +90,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         }
         this.installedSchemaVersion = installed;
         this.openedWithAiOnlySchema = installed == 2 && !schema.containsKey("validation");
-        if (StoreIo.call(() -> MongoValidationSchema.configurationHasValidation(database, schema)))
+        if (openedWithAiOnlySchema) StoreIo.run(() -> MongoValidationSchema.requireAiOnlyIdentity(database));
+        if (MongoValidationSchema.configurationDeclaresValidation(schema))
             StoreIo.run(() -> MongoValidationSchema.requireReady(database, true));
         Document version = facts.version();
         if (version == null || !(version.get("revision") instanceof Long revision)

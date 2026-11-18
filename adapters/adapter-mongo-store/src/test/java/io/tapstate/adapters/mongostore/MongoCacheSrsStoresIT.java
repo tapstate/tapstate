@@ -295,14 +295,15 @@ class MongoCacheSrsStoresIT {
         });
     }
 
-    @Test void nativeRuntimeKeepsModelAndLogWritesWithoutCatalogQueries() {
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void scopedSrsKeepsModelAndLogWritesWithoutCatalogQueries(boolean runtime) {
         withFixture(f -> {
             var prepared = f.pipeline();
             f.domain.verifyBusinessReady(f.scope);
             var index = SystemCollections.SRS_MODELS.indexes().getFirst();
             SystemCollections.SRS_MODELS.on(f.database).dropIndex(index.indexName());
             try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
-                var stores = f.domain.runtimeSrs(f.scope, ACTIVE);
+                var stores = runtime ? f.domain.runtimeSrs(f.scope, ACTIVE) : f.domain.srs(f.scope, ACTIVE);
                 var model = f.model();
                 stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
                 assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);

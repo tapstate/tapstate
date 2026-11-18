@@ -1407,10 +1407,15 @@ class MongoSrsModelStoreIT {
 
     @ParameterizedTest
     @ValueSource(strings = {"SRS_CHAINS", "SRS_MODELS", "SRS_MODEL_CONTEXTS", "SRS_EVENTS", "SRS_LOG_BOUNDS"})
-    void losingAnEmptySnapshotResourceIsNotAnUnpublishedTable(String missing) {
+    void snapshotReadsUseRetainedModelsWhileCatalogLossLeavesEmptyResourcesAbsent(String missing) {
         withBusiness(f -> {
             var resource = SystemCollections.valueOf(missing); resource.on(f.database()).drop();
-            assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).satisfies(MongoSrsModelStoreIT::unreadable);
+            if (resource == SystemCollections.SRS_CHAINS) {
+                assertThatThrownBy(() -> f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING)))
+                        .satisfies(MongoSrsModelStoreIT::unavailable);
+            } else {
+                assertThat(f.models().publishedForNewSnapshot(CHAIN, Map.of("orders", RING))).isEmpty();
+            }
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain(resource.collectionName());
         });
     }

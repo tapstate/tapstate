@@ -194,6 +194,16 @@ final class MongoValidationSchema {
         return true;
     }
 
+    /** Only unclassified version two needs namespace evidence to distinguish the existing feature formats. */
+    static void requireAiOnlyIdentity(MongoDatabase database) {
+        var expected = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.collectionName();
+        var candidates = new ArrayList<>(CONFIG.stream().map(SystemCollections::collectionName).toList());
+        candidates.add(expected);
+        var found = MongoCollectionMetadata.matching(database, candidates);
+        if (found.size() != 1 || !expected.equals(found.getFirst().getString("name"))
+                || !"collection".equals(found.getFirst().getString("type"))) throw unreadable("version");
+    }
+
     static Document configurationMarker(Document schema) {
         if (schema == null || !(schema.get("installedVersion") instanceof Integer version)
                 || version != VERSION && version != COMPOSED_CONFIGURATION_VERSION) throw unreadable("version");

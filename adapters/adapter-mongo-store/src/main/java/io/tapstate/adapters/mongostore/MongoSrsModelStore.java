@@ -431,7 +431,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (chainId == null || chainId.isBlank()) throw new IllegalArgumentException("blank mining chain");
         var selected = snapshotRings(tableRings);
         return transaction(session -> {
-            requireSnapshotResources(); requireBusiness(session);
+            requireBusiness(session);
             String firstTable = selected.keySet().iterator().next();
             Document chain = SystemCollections.SRS_CHAINS.on(database).find(session, new Document("_id", chainId)).first();
             if (chain == null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation"))) {
@@ -506,13 +506,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (!facts.prefetchExactIds(SystemCollections.SRS_MODELS, models, requireActive)) return;
         facts.prefetchExactIds(SystemCollections.SRS_LOG_BOUNDS,
                 selected.values().stream().map(MongoSrsLogStore::boundsId).toList(), requireActive);
-    }
-
-    private void requireSnapshotResources() {
-        var names = java.util.List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS,
-                SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS).stream().map(SystemCollections::collectionName).toList();
-        var present = MongoCollectionMetadata.matching(database, names);
-        if (present.size() != names.size() || present.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadable();
     }
 
     @Override public Optional<SrsModel> load(SrsModelKey key) {

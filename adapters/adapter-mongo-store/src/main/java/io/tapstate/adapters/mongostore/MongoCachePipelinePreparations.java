@@ -187,7 +187,6 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         Objects.requireNonNull(expected,"expected"); requireScope(scope);
         var access = new MongoCachePipelineAccess(client,database,scope,null,requireActive);
         access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS,false,session -> {
-            new MongoCacheMetadataStructure(database,MongoRateHistoryStore.DEFAULT_RETENTION).verifyDirect();
             var original = MongoPipelineSourcePreparations.retained(session,database,scope);
             if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
             var added = new java.util.TreeSet<String>();

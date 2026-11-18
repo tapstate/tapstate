@@ -74,7 +74,7 @@ class MongoValidationSchemaIT {
         }
     }
 
-    @Test void publishedQueryIndexesAreRequiredAndOrdinaryOpenNeverRepairsThem() {
+    @Test void publishedQueryIndexesAreReportedByInspectionAndRequiredByPreparation() {
         try (var f = new Fixture(0)) {
             var original = f.configuration.bindings().cachePreparation().orElseThrow();
             f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {});
@@ -85,7 +85,15 @@ class MongoValidationSchemaIT {
                         .containsEntry("terminalMetadata.endedAt.nanos", -1);
             });
             reports.dropIndex("validation_reports_history");
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster")).isInstanceOf(TapstateException.class);
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(reopened.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.index()).isEqualTo("validation_reports_history");
+                            assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                        });
+            }
+            assertThatThrownBy(() -> f.configuration.prepareInitialValidationSchema(original, f.cache, () -> {}))
+                    .isInstanceOf(TapstateException.class);
             assertThat(reports.listIndexes()).noneMatch(index -> "validation_reports_history".equals(index.get("name")));
         }
     }
@@ -270,7 +278,14 @@ class MongoValidationSchemaIT {
     @Test void versionTwoMissingCollectionsOrIndexesNeverCauseDdlOnOpenOrReplay() {
         try (var f = new Fixture(1)) {
             var operation = f.upgrade(); SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster")).isInstanceOf(TapstateException.class);
+            try (var ordinary = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                assertThat(ordinary.schemaVersion()).isEqualTo(2);
+                assertThat(ordinary.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .anySatisfy(issue -> {
+                            assertThat(issue.collection()).isEqualTo("validation_reports");
+                            assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+                        });
+            }
             assertThatThrownBy(() -> f.resume(operation)).isInstanceOf(TapstateException.class);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");
         }
