@@ -10,7 +10,9 @@ public enum ProductErrorModule {
     ARTIFACT("024"),
     PIPELINE_DRAFT("025"),
     MCP("026"),
-    SCHEMA("027");
+    SCHEMA("027"),
+    LIFECYCLE("028"),
+    START_CHECK("029");
 
     private final String number;
 

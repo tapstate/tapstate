@@ -134,7 +134,7 @@ class PipelineStatusWatchHandlerTest {
 
     @Test
     void aPipelineThatWasNeverAppliedClosesTheSessionInsteadOfPollingForever() {
-        // lifecycle.unknown-pipeline is permanent -- no future tick will ever answer differently, so
+        // TS0280005 is permanent -- no future tick will ever answer differently, so
         // treating it like the transient case would hang the watch silently for as long as the client
         // holds the socket open.
         PipelineObservationQueryService observations = serviceWith(emptyObservations());
@@ -144,7 +144,7 @@ class PipelineStatusWatchHandlerTest {
         handler.poll(session, "ghost");
 
         assertThat(session.closeStatus).isNotNull();
-        assertThat(session.closeStatus.getReason()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(session.closeStatus.getReason()).isEqualTo("TS0280005");
         assertThat(session.sent).isEmpty();
     }
 
@@ -184,7 +184,7 @@ class PipelineStatusWatchHandlerTest {
         handler.poll(session, "src_orders");
 
         assertThat(session.closeStatus).isNotNull();
-        assertThat(session.closeStatus.getReason()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(session.closeStatus.getReason()).isEqualTo("TS0280005");
     }
 
     @Test

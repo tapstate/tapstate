@@ -18,6 +18,11 @@ through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
 `TS0260004`; structured remote refusals retain the Server's code, status and
 parameters. The document-key advisory uses `TS0270001` and remains a warning
 on a successful apply, with the source column and destination attribution intact.
+Lifecycle refusals use `TS0280001` through `TS0280008`; start-check report text
+uses `TS0290001` through `TS0290012`. A report's behavior determines whether to
+pass, warn, ask or block; its text definition's warning severity does not authorize
+a start. Render declared text parameters separately from the complete finding
+metadata, and preserve decisions, definition changes and unknown outcomes.
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

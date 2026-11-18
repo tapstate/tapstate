@@ -1422,7 +1422,7 @@ final class ControlPlane {
 
     private static boolean refusedAsAlreadyRunning(String body) {
         return JsonReader.parse(body) instanceof Map<?, ?> refusal
-                && "lifecycle.illegal-transition".equals(refusal.get("code"))
+                && "TS0280001".equals(refusal.get("code"))
                 && refusal.get("params") instanceof Map<?, ?> params
                 && PipelineState.RUNNING.name().equals(params.get("from"));
     }

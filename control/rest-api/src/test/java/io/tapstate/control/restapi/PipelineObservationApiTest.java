@@ -567,7 +567,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
     }
 
     // ---- a known pipeline returns merged status before its first runtime observation ----
@@ -585,7 +585,7 @@ class PipelineObservationApiTest {
 
         // Never applied is permanent: a caller that read this as the transient unconverged window would
         // wait out its whole bound on what is almost always a mistyped id.
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
         assertThat(body.params()).containsEntry("pipeline", "ghost");
         assertThat(observations.reads()).isEqualTo(1);
     }

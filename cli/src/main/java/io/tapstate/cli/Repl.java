@@ -161,7 +161,9 @@ final class Repl {
      * The refusal a resume gets when the pipeline's definition was edited while it ran. Matched by code
      * rather than by message: the message is prose for a person, and this is a branch.
      */
-    private static final String INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
+    private static final String INCOMPATIBLE_REVISION =
+            io.tapstate.core.common.LifecycleErrorDefinitions.INCOMPATIBLE_REVISION.code();
+    private static final String LEGACY_INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
 
     private static final Set<String> BUSY_CODES =
             Set.of("connector.instances-busy", "connector.instance-limit-reached");
@@ -1783,7 +1785,8 @@ final class Repl {
                 }
                 LifecycleOutcome resumed = drive("resume", id, null);
                 if (resumed instanceof LifecycleOutcome.Rejected rejected
-                        && INCOMPATIBLE_REVISION.equals(rejected.code())) {
+                        && (INCOMPATIBLE_REVISION.equals(rejected.code())
+                        || LEGACY_INCOMPATIBLE_REVISION.equals(rejected.code()))) {
                     // The one refusal worth more than its own text. Carrying on runs the pipeline as it
                     // was when it paused, and the definition has been edited since -- so the refusal is
                     // right, and "try again" is the one thing that will never work. What the caller

@@ -588,7 +588,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         Map<?, ?> document = structured(format);
-        assertThat(document.get("code")).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(document.get("code")).isEqualTo("TS0280006");
         assertThat(document.get("params")).isInstanceOfSatisfying(Map.class,
                 params -> assertThat(params.get("subject")).isEqualTo("warehouse/customers"));
         assertThat(document.get("message")).isInstanceOf(String.class);

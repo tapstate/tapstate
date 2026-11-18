@@ -190,7 +190,7 @@ class PipelineStreamRoundTripTest {
         assertThat(watcher.isAlive())
                 .as("the watch must end on its own; a live thread here means it is reconnecting forever")
                 .isFalse();
-        assertThat(refusal.get()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(refusal.get()).isEqualTo("TS0280005");
     }
 
     @Test

@@ -4483,15 +4483,16 @@ class ReplTest {
         assertThat(h.sink().toString()).contains("running restart again picks it up");
     }
 
-    @Test
-    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0280002", "lifecycle.incompatible-revision"})
+    void restartOnAPipelineWhoseDefinitionChangedNamesTheOptionThatWorks(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcomes.add(new StatusOutcome.Found("pl1", "RUNNING"));
         client.statusOutcomes.add(new StatusOutcome.Found("pl1", "PAUSED"));
         // The pause goes through; the resume is refused because the definition moved under the run.
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "PAUSED", "rev-old");
         client.lifecycleOutcomeByVerb.put("resume", new LifecycleOutcome.Rejected(
-                "lifecycle.incompatible-revision", "rev-old is not rev-new."));
+                code, "rev-old is not rev-new."));
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1");

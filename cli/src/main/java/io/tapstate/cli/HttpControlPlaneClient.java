@@ -1200,7 +1200,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             Rejection r = rejection(response.body(), "The server refused to read the start checks.");
             // A server released before start checks has no such resource at all: its 404 carries no code of
             // ours, which is what tells it apart from a pipeline this server does not have.
-            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")) {
+            if (response.statusCode() == 404 && !r.code().startsWith("lifecycle.")
+                    && !io.tapstate.core.common.LifecycleErrorDefinitions.UNKNOWN_PIPELINE.code().equals(r.code())) {
                 return new StartChecksOutcome.NotSupported();
             }
             return new StartChecksOutcome.Rejected(r.code(), r.params(), r.message());

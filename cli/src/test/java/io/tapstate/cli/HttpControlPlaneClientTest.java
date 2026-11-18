@@ -23,6 +23,29 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class HttpControlPlaneClientTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0280005", "lifecycle.unknown-pipeline"})
+    void codedUnknownPipelineDoesNotEnableTheUncheckedLegacyStartPath(String code) throws Exception {
+        HttpServer server = serverReplying("/api/pipelines/ghost/start-checks", 404,
+                "{\"code\":\"" + code + "\",\"params\":{\"pipeline\":\"ghost\"},\"message\":\"Not applied.\"}");
+        try {
+            var result = new HttpControlPlaneClient().startChecks(baseOf(server), "token", "ghost", "rerun");
+            assertThat(result).isInstanceOfSatisfying(StartChecksOutcome.Rejected.class, rejected -> {
+                assertThat(rejected.code()).isEqualTo(code);
+                assertThat(rejected.params()).containsEntry("pipeline", "ghost");
+            });
+        } finally { server.stop(0); }
+    }
+
+    @Test
+    void absentStartChecksResourceStillUsesTheLegacyCompatibilityOutcome() throws Exception {
+        HttpServer server = serverReplying("/api/pipelines/ghost/start-checks", 404, "{}");
+        try {
+            assertThat(new HttpControlPlaneClient().startChecks(baseOf(server), "token", "ghost", "rerun"))
+                    .isInstanceOf(StartChecksOutcome.NotSupported.class);
+        } finally { server.stop(0); }
+    }
+
     private static HttpServer serverReplying(int status, String body) throws Exception {
         return serverReplying("/healthz", status, body);
     }

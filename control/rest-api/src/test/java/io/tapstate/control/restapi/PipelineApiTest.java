@@ -1090,7 +1090,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.purge-state-not-stated");
+        assertThat(body.code()).isEqualTo("TS0280003");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
         // The refusal is worth nothing if the stop happened anyway: this is the assertion that says the
         // pipeline is untouched, not merely that the caller was told off.
@@ -1113,7 +1113,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.purge-state-not-stated");
+        assertThat(body.code()).isEqualTo("TS0280003");
     }
 
     private DesiredState verb(String token, String id, String verb) {
@@ -1141,7 +1141,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
         assertThat(body.params()).containsEntry("pipeline", "ghost");
     }
 
@@ -1155,7 +1155,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.illegal-transition");
+        assertThat(body.code()).isEqualTo("TS0280001");
         assertThat(body.params()).containsEntry("from", "NEW").containsEntry("verb", "pause");
     }
 
@@ -1174,7 +1174,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.incompatible-revision");
+        assertThat(body.code()).isEqualTo("TS0280002");
         assertThat(body.params())
                 .containsEntry("requested", revisionOf(PIPELINE_V1))
                 .containsEntry("latest", revisionOf(PIPELINE_V2));
@@ -2013,7 +2013,7 @@ class PipelineApiTest {
             return response.bodyTo(ApiError.class);
         });
 
-        assertThat(plain.code()).isEqualTo("lifecycle.start-needs-confirmation");
+        assertThat(plain.code()).isEqualTo("TS0280006");
         assertThat(plain.params()).containsEntry("pipeline", "pl1").containsEntry("count", 1)
                 .containsEntry("check", "target-not-empty").containsEntry("subject", "tgt_x/orders");
         assertThat(plain.message()).as("the message alone says how to answer")
@@ -2121,7 +2121,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.start-blocked");
+        assertThat(body.code()).isEqualTo("TS0280007");
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
     }
 
@@ -2137,7 +2137,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("lifecycle.invalid-start-decision");
+        assertThat(body.code()).isEqualTo("TS0280008");
         assertThat(body.params()).containsEntry("finding", TARGET_KEY).containsEntry("action", "truncate");
     }
 
@@ -2178,7 +2178,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(body.code()).isEqualTo("lifecycle.unknown-pipeline");
+        assertThat(body.code()).isEqualTo("TS0280005");
     }
 
     @Test
@@ -2207,7 +2207,7 @@ class PipelineApiTest {
             assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
             return response.bodyTo(ApiError.class);
         });
-        assertThat(body.code()).isEqualTo("lifecycle.pipeline-not-runnable");
+        assertThat(body.code()).isEqualTo("TS0280004");
     }
 
     // ---- fakes ----
