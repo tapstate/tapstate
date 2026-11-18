@@ -1699,7 +1699,10 @@ class MongoSrsConsumerStoreIT {
             log.storeAll(ring("orders"),0,events);
             f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
             assertThat(f.consumers().startReadingAfter(A,1,0,"orders",4,f.fenceA())).isTrue();
-            long oldCut=f.consumers().progress(A).orElseThrow().ringDoneThrough().get("orders");
+            var proposal = f.consumers().retentionSnapshot(CHAIN).orElseThrow();
+            assertThat(proposal.consumers()).singleElement()
+                    .satisfies(consumer -> assertThat(consumer.membership().context()).isEqualTo(A));
+            long oldCut = proposal.consumers().getFirst().ringDoneThrough().get("orders");
             f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
             log.trim(ring("orders"),oldCut,f.captureFence());
             assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(-1);
@@ -1709,6 +1712,10 @@ class MongoSrsConsumerStoreIT {
             assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(1);
             assertThat(log.readBatch(ring("orders"),2,3).records().keySet()).containsExactly(2L,3L,4L);
             assertThat(f.consumers().advanceReadSequence(B,1,"orders",4,f.fenceB())).isTrue();
+            var current = f.consumers().retentionSnapshot(CHAIN).orElseThrow();
+            assertThat(current.consumers()).extracting(
+                    consumer -> consumer.membership().context(), consumer -> consumer.ringDoneThrough().get("orders"))
+                    .containsExactlyInAnyOrder(org.assertj.core.groups.Tuple.tuple(A, 4L), org.assertj.core.groups.Tuple.tuple(B, 1L));
             log.trim(ring("orders"),oldCut,f.captureFence());assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(1);
             f.consumers().detach(B,1,f.fenceB()).orElseThrow();log.trim(ring("orders"),oldCut,f.captureFence());
             assertThat(log.bounds(ring("orders")).trimmedThrough()).isEqualTo(4);assertThat(log.readBatch(ring("orders"),0,5).records()).isEmpty();

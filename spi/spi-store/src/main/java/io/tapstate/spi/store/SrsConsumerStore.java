@@ -34,6 +34,20 @@ public interface SrsConsumerStore {
     /** Complete topology, checkpoint and current progress from one original storage snapshot. */
     default Optional<ControlSnapshot> controlSnapshot(String chain){throw new UnsupportedOperationException();}
 
+    record RetentionConsumer(SrsConsumerMembership membership, Map<String, Long> ringDoneThrough) {
+        public RetentionConsumer { ringDoneThrough = Map.copyOf(ringDoneThrough); }
+    }
+
+    record RetentionSnapshot(SrsChainState chain, List<RetentionConsumer> consumers) {
+        public RetentionSnapshot { consumers = List.copyOf(consumers); }
+    }
+
+    /**
+     * Reads the chain and its consumers' confirmed retention floors together. Empty selects the
+     * ordinary reads. The returned floors are proposals for a separately fenced trim.
+     */
+    default Optional<RetentionSnapshot> retentionSnapshot(String chain) { return Optional.empty(); }
+
     record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
 
     /** Reads original progress and the boundaries for its missing rings from one snapshot. */

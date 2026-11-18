@@ -556,17 +556,40 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireChainName(chain);
         return readSnapshot(session -> {
             var view = readView(session, chain);
-            List<SrsConsumerMembership> active = view.members().values().stream().filter(member -> !member.detached())
-                    .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
+            var active = activeConsumers(view);
             var topology = new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active);
             return new AttachedChain(topology, view.state());
         });
     }
 
     @Override public boolean supportsControlSnapshot(){return true;}
-    @Override public Optional<ControlSnapshot> controlSnapshot(String chain){
+    @Override public Optional<ControlSnapshot> controlSnapshot(String chain) {
+        return readControlSnapshot(chain, view -> {
+            var active = activeConsumers(view);
+            var cursors = active.stream().map(member -> view.cursors().get(member.context().key().consumerId()).value()).toList();
+            return new ControlSnapshot(new SrsConsumerTopology(scope, chain, view.state().consumerRevision(), active),
+                    view.state(), cursors);
+        });
+    }
+
+    @Override public Optional<RetentionSnapshot> retentionSnapshot(String chain) {
+        return readControlSnapshot(chain, view -> {
+            var consumers = activeConsumers(view).stream()
+                    .map(member -> new RetentionConsumer(member,
+                            view.cursors().get(member.context().key().consumerId()).ringDoneThrough()))
+                    .toList();
+            return new RetentionSnapshot(view.state(), consumers);
+        });
+    }
+
+    private static List<SrsConsumerMembership> activeConsumers(View view) {
+        return view.members().values().stream().filter(member -> !member.detached())
+                .sorted(Comparator.comparing(member -> member.context().key().consumerId())).toList();
+    }
+
+    private <T> Optional<T> readControlSnapshot(String chain, Function<View, T> project) {
         requireChainName(chain);
-        return readSnapshot(session->{
+        return readSnapshot(session -> {
             var root=chains.readRoot(session,chain);if(root==null)return Optional.empty();
             var state=MongoSrsChainStore.decode(root,scope,new MongoSrsModelContexts(database,scope));
             var view=relations(session,chain,root,state);
@@ -585,9 +608,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 if(!models.isEmpty())new MongoSrsModelStore(client,database,scope,requireActive,requireStructure).requireSnapshotReferences(session,models);
                 chains.rememberReferences(session,root,fingerprint,started);
             }
-            var active=view.members().values().stream().filter(member->!member.detached()).sorted(Comparator.comparing(member->member.context().key().consumerId())).toList();
-            var cursors=active.stream().map(member->view.cursors().get(member.context().key().consumerId()).value()).toList();
-            return Optional.of(new ControlSnapshot(new SrsConsumerTopology(scope,chain,state.consumerRevision(),active),state,cursors));
+            return Optional.of(project.apply(view));
         });
     }
 

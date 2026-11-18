@@ -103,18 +103,15 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
     /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
     public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
-        var chain=stores.chains().load(chainId).orElseThrow(() -> new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN,Map.of("chain",chainId),null));
-        var members=stores.consumers().attached(chainId);
-        var floors=new TreeMap<String,Long>();
-        for(var member:members.consumers()) {
-            if(Collections.disjoint(member.tables(),chain.servingTables()))continue;
-            var held=stores.consumers().progress(member.context());
-            // Read each original consumer once. A coherent detach or replacement abandons this pass;
-            // CACHE still rechecks current subscribers in each actual trim transaction.
-            if(held.isEmpty())return;
-            var progress=held.orElseThrow();if(progress.membershipRevision()!=member.revision())return;
-            for(String table:member.tables())if(chain.servingTables().contains(table))
-                floors.merge(table,progress.ringDoneThrough().getOrDefault(table,-1L),Math::min);
+        var floors = new TreeMap<String, Long>();
+        var snapshot = stores.consumers().retentionSnapshot(chainId);
+        if (snapshot.isPresent()) {
+            var retained = snapshot.orElseThrow();
+            for (var consumer : retained.consumers()) {
+                recordRetentionFloors(floors, retained.chain(), consumer.membership(), consumer.ringDoneThrough());
+            }
+        } else if (!readRetentionFloors(stores, chainId, floors)) {
+            return;
         }
         for(var entry:floors.entrySet())if(entry.getValue()>=0) {
             fixed.run();String ring=SrsRingbuffer.ringName(chainId,entry.getKey());
@@ -122,6 +119,28 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
             if(entry.getValue()>trimmed) {stores.log().trim(ring,entry.getValue(),originalCapture);fixed.run();}
         }
         stores.models().reclaim(chainId,originalCapture);fixed.run();
+    }
+
+    private static boolean readRetentionFloors(SrsStores stores, String chainId, Map<String, Long> floors) {
+        var chain = stores.chains().load(chainId).orElseThrow(() ->
+                new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chainId), null));
+        for (var member : stores.consumers().attached(chainId).consumers()) {
+            if (Collections.disjoint(member.tables(), chain.servingTables())) continue;
+            var held = stores.consumers().progress(member.context());
+            // An intervening detach or replacement abandons the separate-read pass.
+            if (held.isEmpty() || held.orElseThrow().membershipRevision() != member.revision()) return false;
+            recordRetentionFloors(floors, chain, member, held.orElseThrow().ringDoneThrough());
+        }
+        return true;
+    }
+
+    private static void recordRetentionFloors(Map<String, Long> floors, SrsChainState chain,
+            SrsConsumerMembership member, Map<String, Long> confirmed) {
+        for (String table : member.tables()) {
+            if (chain.servingTables().contains(table)) {
+                floors.merge(table, confirmed.getOrDefault(table, -1L), Math::min);
+            }
+        }
     }
 
     /** Resolves the existing durable read rule without publishing a cursor or treating read-ahead as confirmation. */
