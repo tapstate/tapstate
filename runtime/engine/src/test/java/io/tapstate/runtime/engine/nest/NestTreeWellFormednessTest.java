@@ -61,7 +61,7 @@ class NestTreeWellFormednessTest {
 
         assertThatThrownBy(() -> compile(tree))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.root-key-required")
+                .hasMessageContaining("TS0490006")
                 .hasMessageContaining("rootAlias=keyless");
     }
 
@@ -79,7 +79,7 @@ class NestTreeWellFormednessTest {
                 .describedAs("each embed answers for itself before anything compares it with a sibling,"
                         + " so the one at fault is named rather than the level they disagree under")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.embed-target-not-parent-key")
+                .hasMessageContaining("TS0490002")
                 .hasMessageContaining("embedPath=policies.docs")
                 .hasMessageContaining("fields=policy_no")
                 .hasMessageContaining("parentKey=policy_id");
@@ -95,7 +95,7 @@ class NestTreeWellFormednessTest {
         assertThatThrownBy(() -> compile(tree))
                 .describedAs("the assembler is keyed by the root key and can look up nothing else")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.embed-target-not-parent-key")
+                .hasMessageContaining("TS0490002")
                 .hasMessageContaining("embedPath=policies")
                 .hasMessageContaining("fields=legacy_id")
                 .hasMessageContaining("parentKey=customer_id");
@@ -143,7 +143,7 @@ class NestTreeWellFormednessTest {
         assertThatThrownBy(() -> compile(tree))
                 .describedAs("one would overwrite the other, and their names from the root would collide")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.embed-path-conflict")
+                .hasMessageContaining("TS0490003")
                 .hasMessageContaining("path=book");
     }
 
@@ -163,7 +163,7 @@ class NestTreeWellFormednessTest {
         assertThatThrownBy(() -> compile(tree))
                 .describedAs("without an element identity every update piles up as another duplicate")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.array-key-unresolvable")
+                .hasMessageContaining("TS0490007")
                 .hasMessageContaining("table=keyless_rows");
     }
 
@@ -189,7 +189,7 @@ class NestTreeWellFormednessTest {
         assertThatThrownBy(() -> compile(tree))
                 .describedAs("moving a subtree holds emissions back, which is what append-only forbids")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.append-mode-conflicts-with-key-tracking")
+                .hasMessageContaining("TS0490012")
                 .hasMessageContaining("embedPath=policies.claims");
     }
 
@@ -222,7 +222,7 @@ class NestTreeWellFormednessTest {
         assertThatThrownBy(() -> compile(tree, 1))
                 .describedAs("each resolver takes a thread of its own, so the count is a real budget")
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.resolver-vertex-limit-exceeded")
+                .hasMessageContaining("TS0490010")
                 .hasMessageContaining("vertices=2")
                 .hasMessageContaining("limit=1");
         assertThat(compile(tree, 2).resolvers()).hasSize(2);

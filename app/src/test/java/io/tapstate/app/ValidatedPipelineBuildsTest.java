@@ -215,7 +215,7 @@ class ValidatedPipelineBuildsTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("flat"))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("nest.flat-field-conflict");
+                    assertThat(error.code().code()).isEqualTo("TS0490005");
                     assertThat(error.args()).containsEntry("fields", "name");
                 });
     }
@@ -343,7 +343,7 @@ class ValidatedPipelineBuildsTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("nested"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("nest.array-key-unresolvable"));
+                        .isEqualTo("TS0490007"));
     }
 
     /** Two nest steps that both call an alias {@code o}, over different tables. */

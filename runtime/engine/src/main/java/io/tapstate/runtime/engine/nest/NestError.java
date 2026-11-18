@@ -1,6 +1,8 @@
 package io.tapstate.runtime.engine.nest;
 
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.NestErrorDefinitions;
 import io.tapstate.core.common.TapstateErrorCode;
 
 import java.util.Set;
@@ -23,8 +25,7 @@ public enum NestError implements TapstateErrorCode {
      * Checking the tree: the embeds under one parent join on different parent fields, so that parent has
      * no single identity for its children to point at.
      */
-    SIBLING_EMBEDS_TARGET_DIFFERENT_PARENT_KEYS(
-            "nest.sibling-embeds-target-different-parent-keys", Set.of("embedPath", "fields")),
+    SIBLING_EMBEDS_TARGET_DIFFERENT_PARENT_KEYS(NestErrorDefinitions.SIBLING_EMBEDS_TARGET_DIFFERENT_PARENT_KEYS),
 
     /**
      * Checking the tree: an embed joins onto a column that does not identify its parent, so many parent rows
@@ -32,42 +33,41 @@ public enum NestError implements TapstateErrorCode {
      * this by disagreeing with each other; an only child has nobody to disagree with, so the column it names
      * is taken as the level's identity however wrong it is.
      */
-    EMBED_TARGET_NOT_PARENT_KEY(
-            "nest.embed-target-not-parent-key", Set.of("embedPath", "fields", "parentKey")),
+    EMBED_TARGET_NOT_PARENT_KEY(NestErrorDefinitions.EMBED_TARGET_NOT_PARENT_KEY),
 
     /** Checking the tree: two embeds under one parent claim the same path, where one would overwrite the other. */
-    EMBED_PATH_CONFLICT("nest.embed-path-conflict", Set.of("path", "embedPathA", "embedPathB")),
+    EMBED_PATH_CONFLICT(NestErrorDefinitions.EMBED_PATH_CONFLICT),
 
     /**
      * Checking the tree: pathless flat siblings reuse one alias, so they would share one durable state
      * identity and changes from one would be read as changes from the other.
      */
-    FLAT_EMBED_ALIAS_CONFLICT("nest.flat-embed-alias-conflict", Set.of("parentPath", "alias")),
+    FLAT_EMBED_ALIAS_CONFLICT(NestErrorDefinitions.FLAT_EMBED_ALIAS_CONFLICT),
 
     /**
      * Checking or rendering the tree: a flat embed contributes a field already occupied by its parent,
      * a path-based sibling, or another flat embed. Refused rather than resolved by declaration order.
      */
-    FLAT_FIELD_CONFLICT("nest.flat-field-conflict", Set.of("embedPath", "fields", "occupiedBy")),
+    FLAT_FIELD_CONFLICT(NestErrorDefinitions.FLAT_FIELD_CONFLICT),
 
     /**
      * Checking the tree: the root declares no key, so its documents have no identity for children to be
      * grouped under and nothing to partition the assembled documents by.
      */
-    ROOT_KEY_REQUIRED("nest.root-key-required", Set.of("rootAlias")),
+    ROOT_KEY_REQUIRED(NestErrorDefinitions.ROOT_KEY_REQUIRED),
 
     /**
      * Checking the tree: a level declares no key and its stream offers neither a primary key nor a unique
      * index to take one from, leaving its rows with no identity — updates would pile up as duplicates.
      */
-    ARRAY_KEY_UNRESOLVABLE("nest.array-key-unresolvable", Set.of("embedPath", "table")),
+    ARRAY_KEY_UNRESOLVABLE(NestErrorDefinitions.ARRAY_KEY_UNRESOLVABLE),
 
     /**
      * Checking the tree: a level declares no key and its table offers no primary key but more than one
      * unique index. Each identifies a row equally well, so taking either would settle the identity of the
      * level on catalog order rather than on anything the author said.
      */
-    KEY_AMBIGUOUS("nest.key-ambiguous", Set.of("embedPath", "table", "candidates")),
+    KEY_AMBIGUOUS(NestErrorDefinitions.KEY_AMBIGUOUS),
 
     /**
      * Checking the tree: a level the document points at has embeds hanging beneath it. A row that is pointed
@@ -76,39 +76,35 @@ public enum NestError implements TapstateErrorCode {
      * Refused rather than assembled: the two shapes are written identically, and left to compile the rows
      * beneath would be gathered into state nothing renders from, with every document still going out.
      */
-    REFERENCED_LEVEL_CARRIES_EMBEDS("nest.referenced-level-carries-embeds",
-            Set.of("embedPath", "table", "children")),
+    REFERENCED_LEVEL_CARRIES_EMBEDS(NestErrorDefinitions.REFERENCED_LEVEL_CARRIES_EMBEDS),
 
     /** Checking the tree: it compiles to more resolver vertices than the limit allows, each taking a thread. */
-    RESOLVER_VERTEX_LIMIT_EXCEEDED("nest.resolver-vertex-limit-exceeded", Set.of("vertices", "limit")),
+    RESOLVER_VERTEX_LIMIT_EXCEEDED(NestErrorDefinitions.RESOLVER_VERTEX_LIMIT_EXCEEDED),
 
     /**
      * Building the job: the pipeline draws from more chains than there are axes for their bounds to travel
      * on, so one of them would have no way to report how far the frontier may go. {@code chains} is how
      * many it draws from, {@code limit} how many there are.
      */
-    CHAIN_AXIS_LIMIT_EXCEEDED("nest.chain-axis-limit-exceeded", Set.of("chains", "limit")),
+    CHAIN_AXIS_LIMIT_EXCEEDED(NestErrorDefinitions.CHAIN_AXIS_LIMIT_EXCEEDED),
 
     /**
      * Checking the tree: an append-only root cannot also track structural key changes, because moving a
      * subtree has to hold emissions back until it lands, and holding them back is what append-only forbids.
      */
-    APPEND_MODE_CONFLICTS_WITH_KEY_TRACKING(
-            "nest.append-mode-conflicts-with-key-tracking", Set.of("rootAlias", "embedPath")),
+    APPEND_MODE_CONFLICTS_WITH_KEY_TRACKING(NestErrorDefinitions.APPEND_MODE_CONFLICTS_WITH_KEY_TRACKING),
 
     /** Checking the tree: a nest may not pass its snapshot reads straight to the sink, unassembled. */
-    SNAPSHOT_PASSTHROUGH_FORBIDDEN("nest.snapshot-passthrough-forbidden", Set.of("rootCollection")),
+    SNAPSHOT_PASSTHROUGH_FORBIDDEN(NestErrorDefinitions.SNAPSHOT_PASSTHROUGH_FORBIDDEN),
 
     /** Running: more than one live row belongs to one flat embed of one parent document. */
-    FLAT_CARDINALITY_VIOLATION(
-            "nest.flat-cardinality-violation", Set.of("embedPath", "rows")),
+    FLAT_CARDINALITY_VIOLATION(NestErrorDefinitions.FLAT_CARDINALITY_VIOLATION),
 
     /**
      * Starting up: the memory budget a namespace was given is smaller than the partitions it is spent
      * across, so what is held is the partition count rather than the number that was asked for.
      */
-    MEMORY_BUDGET_BELOW_PARTITION_COUNT(
-            "nest.memory-budget-below-partition-count", Set.of("entries", "partitions")),
+    MEMORY_BUDGET_BELOW_PARTITION_COUNT(NestErrorDefinitions.MEMORY_BUDGET_BELOW_PARTITION_COUNT),
 
     /**
      * Starting up: this pipeline asks its levels to hold a different number than they were already
@@ -120,21 +116,17 @@ public enum NestError implements TapstateErrorCode {
      * had. Swallowed, the pipeline would run on the earlier budget while the artifact it was started from
      * reads as the later one, which is the exact shape of "configured, and not in effect".
      */
-    MEMORY_BUDGET_CHANGED_WHILE_RUNNING(
-            "nest.memory-budget-changed-while-running",
-            Set.of("namespace", "configured", "requested")),
+    MEMORY_BUDGET_CHANGED_WHILE_RUNNING(NestErrorDefinitions.MEMORY_BUDGET_CHANGED_WHILE_RUNNING),
 
     /** Starting up: this process already fixed a namespace to another operator-state database. */
-    STATE_DATABASE_CHANGED_WHILE_RUNNING(
-            "nest.state-database-changed-while-running",
-            Set.of("namespace", "configured", "requested")),
+    STATE_DATABASE_CHANGED_WHILE_RUNNING(NestErrorDefinitions.STATE_DATABASE_CHANGED_WHILE_RUNNING),
 
     /**
      * Starting up: the tree keeps its state under names it no longer compiles to, because an embed path
      * was renamed or a level inserted. What was stored is left where nothing reads it and the new names
      * answer nothing, so the run would rebuild from empty while reporting that it resumed.
      */
-    STATE_PATHS_CHANGED("nest.state-paths-changed", Set.of("stepId", "recorded", "compiled")),
+    STATE_PATHS_CHANGED(NestErrorDefinitions.STATE_PATHS_CHANGED),
 
     /**
      * Running: one document has grown past the elements a single document may hold. One of the two counts
@@ -143,7 +135,7 @@ public enum NestError implements TapstateErrorCode {
      * documents there are, and how many keys a level below holds, are bounded by what stays in memory rather
      * than by a count.
      */
-    ROOT_FANOUT_LIMIT_EXCEEDED("nest.root-fanout-limit-exceeded", Set.of("rootKey", "elements", "limit")),
+    ROOT_FANOUT_LIMIT_EXCEEDED(NestErrorDefinitions.ROOT_FANOUT_LIMIT_EXCEEDED),
 
     /**
      * Running: more rows point at one row than are allowed to, so editing that row would redraw and write
@@ -163,8 +155,7 @@ public enum NestError implements TapstateErrorCode {
      * only when it is first edited - which is also the first moment the cost this bounds is about to be
      * paid.
      */
-    REFERENCE_FANOUT_LIMIT_EXCEEDED("nest.reference-fanout-limit-exceeded",
-            Set.of("refPath", "identity", "referrers", "limit")),
+    REFERENCE_FANOUT_LIMIT_EXCEEDED(NestErrorDefinitions.REFERENCE_FANOUT_LIMIT_EXCEEDED),
 
     /**
      * Running: one key is holding more changes for something that has not arrived than it is allowed to.
@@ -177,8 +168,7 @@ public enum NestError implements TapstateErrorCode {
      * document - which is what the wait's own three-layer judgement exists to avoid deciding without
      * evidence.
      */
-    PENDING_LIMIT_EXCEEDED("nest.pending-limit-exceeded",
-            Set.of("namespace", "key", "pending", "limit")),
+    PENDING_LIMIT_EXCEEDED(NestErrorDefinitions.PENDING_LIMIT_EXCEEDED),
 
     /**
      * Running: one document is keeping the record of more deleted elements than it is allowed to, and they
@@ -190,8 +180,7 @@ public enum NestError implements TapstateErrorCode {
      * rather than that the work is heavy. Failed rather than dropped: a record dropped early is a row the
      * source deleted coming back at the next restart, which no assertion about the document would catch.
      */
-    TOMBSTONE_LIMIT_EXCEEDED("nest.tombstone-limit-exceeded",
-            Set.of("namespace", "key", "tombstones", "limit")),
+    TOMBSTONE_LIMIT_EXCEEDED(NestErrorDefinitions.TOMBSTONE_LIMIT_EXCEEDED),
 
     /**
      * Running: rows on their way between two documents have parked more than the limit allows. The fourth
@@ -203,8 +192,7 @@ public enum NestError implements TapstateErrorCode {
      * on every hand-over, which is the one cost the state layer is built to avoid, and every other limit
      * here is a count an operator can weigh against the width they already allowed.
      */
-    MIGRATION_PARKING_LIMIT_EXCEEDED(
-            "nest.migration-parking-limit-exceeded", Set.of("address", "changes", "limit")),
+    MIGRATION_PARKING_LIMIT_EXCEEDED(NestErrorDefinitions.MIGRATION_PARKING_LIMIT_EXCEEDED),
 
     /**
      * Running: an event can never be placed in a document, because the row it hangs from is known to be
@@ -213,8 +201,7 @@ public enum NestError implements TapstateErrorCode {
      * in any document. How long it had been waiting is what says which of the two this is - a reference
      * that has dangled all along, or a parent deleted while its children were in flight.
      */
-    PARENT_ABSENT("nest.parent-absent",
-            Set.of("chain", "bucket", "order", "heldFor"), Severity.WARNING),
+    PARENT_ABSENT(NestErrorDefinitions.PARENT_ABSENT),
 
     /**
      * Running: a namespace's state is being served from the storage behind its memory rather than from the
@@ -223,9 +210,7 @@ public enum NestError implements TapstateErrorCode {
      * is whatever the storage can sustain — and that is exactly why it is said out loud: per-key state is a
      * buffer backpressure cannot see, so no other statistic moves when this happens.
      */
-    STATE_SERVED_FROM_COLD_LAYER("nest.state-served-from-cold-layer",
-            Set.of("namespace", "backfills", "accesses", "share", "millis", "entries", "stored", "resident"),
-            Severity.WARNING),
+    STATE_SERVED_FROM_COLD_LAYER(NestErrorDefinitions.STATE_SERVED_FROM_COLD_LAYER),
 
     /**
      * Running: a stream tracks structural key changes but the row an update replaces does not carry the
@@ -237,8 +222,7 @@ public enum NestError implements TapstateErrorCode {
      * earlier row is present and the compared column is not - an operator told only the stream and the
      * table would go looking for a row image that is, from where they stand, already there.
      */
-    KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.key-change-tracking-requires-before-image", Set.of("alias", "table", "columns")),
+    KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE(NestErrorDefinitions.KEY_CHANGE_TRACKING_REQUIRES_BEFORE_IMAGE),
 
     /**
      * Running: the rows of a stream are recorded against the row they point at, but its source sends an
@@ -251,35 +235,13 @@ public enum NestError implements TapstateErrorCode {
      * a row nothing points at any more kept for the life of the job, or an edit refused on a per-row
      * reference count that was never real.
      */
-    REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE(
-            "nest.reference-tracking-requires-before-image", Set.of("alias", "refPath"));
+    REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE(NestErrorDefinitions.REFERENCE_TRACKING_REQUIRES_BEFORE_IMAGE);
 
-    private final String code;
-    private final Set<String> placeholders;
-    private final Severity severity;
+    private final ProductErrorDefinition definition;
 
-    NestError(String code, Set<String> placeholders) {
-        this(code, placeholders, Severity.ERROR);
-    }
+    NestError(ProductErrorDefinition definition) { this.definition = definition; }
 
-    NestError(String code, Set<String> placeholders, Severity severity) {
-        this.code = code;
-        this.placeholders = placeholders;
-        this.severity = severity;
-    }
-
-    @Override
-    public String code() {
-        return code;
-    }
-
-    @Override
-    public Severity severity() {
-        return severity;
-    }
-
-    @Override
-    public Set<String> placeholders() {
-        return placeholders;
-    }
+    @Override public String code() { return definition.code(); }
+    @Override public Severity severity() { return definition.severity(); }
+    @Override public Set<String> placeholders() { return definition.parameters(); }
 }

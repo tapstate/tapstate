@@ -55,7 +55,7 @@ class NestSaysWhenItIsServedFromTheColdLayerIT {
     private static final String PIPELINE_ID = "alerting_orders";
 
     /** The code the product names this condition by; the alert is the code, not a sentence about it. */
-    private static final String EXPECTED_CODE = "nest.state-served-from-cold-layer";
+    private static final String EXPECTED_CODE = "TS0490025";
 
     /**
      * This invocation's pipeline id, which carries the tier so the two tiers do not share a nest's state,

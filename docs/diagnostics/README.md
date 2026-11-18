@@ -82,6 +82,13 @@ Typed ownership fences, unreadable-document isolation and quota handling retain
 their existing decisions. Damaged document diagnostics carry both the document
 identity and a safe field category, without embedding the damaged payload.
 
+Nest assembly diagnostics use module `049`. Missing-parent dead-letter handoff and
+cold-state access remain warnings while the Pipeline continues. Shape mismatch,
+state database or memory budget changes and structural-key tracking retain their
+original refusal and recovery boundaries. Restarting a Pipeline does not change
+a process-fixed memory budget; changing a state database still requires stopping
+all writers and preserving or explicitly rebuilding the original state.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

@@ -53,7 +53,7 @@ Which end refuses depends on the source, and the two read differently:
 | what happens | when | what you see |
 |---|---|---|
 | the connector refuses to start | the server itself is configured without before images - `binlog_row_image=MINIMAL` on MySQL, for one | `connector.capture-failed`, carrying the connector's own sentence naming the setting to change |
-| the tree refuses the update | the source starts and streams, but an individual update arrives carrying no earlier row | `nest.key-change-tracking-requires-before-image`, naming the stream and the table |
+| the tree refuses the update | the source starts and streams, but an individual update arrives carrying no earlier row | `TS0490026`, naming the stream and the table |
 
 On MySQL it is the first: the connector checks `binlog_row_image` as it starts and stops
 there, so no update is produced for the tree to check. Set it to `FULL` (the default) and
@@ -105,7 +105,7 @@ that the source's own rows are now orphaned. Nothing guesses that they meant to 
 ## Append-only roots cannot track key changes
 
 `root.mode: append` and `trackKeyChanges` are refused together, when the pipeline is
-checked, with `nest.append-mode-conflicts-with-key-tracking`.
+checked, with `TS0490012`.
 
 A move has to hold a document back until the rows land, and holding changes back is the one
 thing an append-only root forbids: under append every change is a record of its own, so
@@ -129,7 +129,7 @@ Two bounds apply, both per namespace and both settable:
 
 | bound | default | what happens at it |
 |---|---|---|
-| how many changes one move may park | 50 000 | the pipeline stops with `nest.migration-parking-limit-exceeded` |
+| how many changes one move may park | 50 000 | the pipeline stops with `TS0490023` |
 | how long a move may sit uncollected | 10 minutes | the rows go to the dead-letter channel and the durable position is let go of |
 
 Reaching the second one usually means the half of the move that collects the rows is not

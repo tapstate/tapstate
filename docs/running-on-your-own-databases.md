@@ -139,7 +139,7 @@ lag        not published
 The reason itself is in the server's log, once per tick:
 
 ```
-io.tapstate.core.common.TapstateException: nest.embed-target-not-parent-key {embedPath=lines, ...}
+io.tapstate.core.common.TapstateException: TS0490002 {embedPath=lines, ...}
 ```
 
 So the status tells you to read the log, and how long it has been failing; the log tells you what

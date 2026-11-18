@@ -66,7 +66,7 @@ class WhatIsParkedIsBoundedInSizeAndInTimeTest {
 
         assertThatThrownBy(() -> feed(losing, DEPARTURES, renamed("C1", "C2")))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("nest.migration-parking-limit-exceeded");
+                .hasMessageContaining("TS0490023");
     }
 
     /** The positive control: the same move under a limit that allows it goes through untouched. */
