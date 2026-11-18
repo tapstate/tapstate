@@ -13,7 +13,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.CacheControl;
 import org.springframework.http.ResponseEntity;
-import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.web.bind.annotation.*;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -95,11 +94,7 @@ class AiProviderController {
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {
         if (mode == AuthenticationMode.ON_PREM) {
-            var authentication = SecurityContextHolder.getContext().getAuthentication();
-            if (!(authentication instanceof TapstateAuthentication verified) || verified.original() == null) {
-                throw AiProviderService.error(ControlError.UNAUTHENTICATED);
-            }
-            Runnable active = verified.original().requireActive();
+            Runnable active = AuthenticatedCaller.requestGuard();
             active.run();
             return new Workspace(AiProviderSettingsStore.ON_PREM_OWNER, active);
         }
