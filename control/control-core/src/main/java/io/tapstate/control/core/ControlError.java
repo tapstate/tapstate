@@ -17,21 +17,15 @@ import java.util.Set;
  */
 public enum ControlError implements TapstateErrorCode {
 
-    /**
-     * A request was refused at the HTTP boundary because it is structurally malformed — a required field
-     * left null or blank, a missing body — before it could reach a service; {@code reason} is a short,
-     * human-readable statement of what was wrong (e.g. which field is required). This is a
-     * client-attributable input error, deliberately distinct from a service-layer invariant violation (a
-     * programmer bug), which stays a bare crash rather than being laundered into a coded error.
-     */
-    AI_NOT_CONFIGURED("control.ai-not-configured", Set.of()),
-    AI_PROVIDER_AUTH_FAILED("control.ai-provider-auth-failed", Set.of()),
-    AI_PROVIDER_REQUEST_REJECTED("control.ai-provider-request-rejected", Set.of()),
-    AI_PROVIDER_RATE_LIMITED("control.ai-provider-rate-limited", Set.of()),
-    AI_PROVIDER_FAILED("control.ai-provider-failed", Set.of()),
-    AI_PROVIDER_OUTPUT_LIMIT("control.ai-provider-output-limit", Set.of()),
-    AI_INVALID_PROPOSAL("control.ai-invalid-proposal", Set.of()),
-    AI_OVERLOADED("control.ai-overloaded", Set.of()),
+    AI_NOT_CONFIGURED(RequestErrorDefinitions.AI_NOT_CONFIGURED),
+    AI_PROVIDER_AUTH_FAILED(RequestErrorDefinitions.AI_PROVIDER_AUTH_FAILED),
+    AI_PROVIDER_REQUEST_REJECTED(RequestErrorDefinitions.AI_PROVIDER_REQUEST_REJECTED),
+    AI_PROVIDER_RATE_LIMITED(RequestErrorDefinitions.AI_PROVIDER_RATE_LIMITED),
+    AI_PROVIDER_FAILED(RequestErrorDefinitions.AI_PROVIDER_FAILED),
+    AI_PROVIDER_OUTPUT_LIMIT(RequestErrorDefinitions.AI_PROVIDER_OUTPUT_LIMIT),
+    AI_INVALID_PROPOSAL(RequestErrorDefinitions.AI_INVALID_PROPOSAL),
+    AI_OVERLOADED(RequestErrorDefinitions.AI_OVERLOADED),
+    /** Structurally invalid client input; programmer invariant violations remain bare failures. */
     MALFORMED_REQUEST(RequestErrorDefinitions.MALFORMED_REQUEST),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */

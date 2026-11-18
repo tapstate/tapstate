@@ -25,7 +25,7 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(java.util.Arrays.stream(ProductErrorModule.values()).map(ProductErrorModule::number).toList())
                 .doesNotHaveDuplicates().allMatch(number -> number.matches("(?!000)[0-9]{3}"));
         var request = RequestErrorDefinitions.MALFORMED_REQUEST;
-        assertThat(RequestErrorDefinitions.registered()).hasSize(5).contains(request);
+        assertThat(RequestErrorDefinitions.registered()).hasSize(13).contains(request);
         assertThat(request.code()).isEqualTo("TS0210001");
         assertThat(request.parameters()).isEqualTo(Set.of("reason"));
         assertThat(request.severity()).isEqualTo(Severity.ERROR);
@@ -61,7 +61,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(65);
+        assertThat(replacements).hasSize(73);
         baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
     }
@@ -93,6 +93,37 @@ class RequestDiagnosticDefinitionGatesTest {
             }
             assertThat(messages).hasSize(3);
             assertThat(RequestDiagnosticCatalog.bundled().resolve(historical.get(i), args, List.of(), Locale.ENGLISH)).isEmpty();
+        }
+    }
+
+    @Test
+    void assistantDefinitionsPreserveTypedContractsAndLocalizedRecoveryWithoutAliases() {
+        var owners = List.of(ControlError.AI_NOT_CONFIGURED, ControlError.AI_PROVIDER_AUTH_FAILED,
+                ControlError.AI_PROVIDER_REQUEST_REJECTED, ControlError.AI_PROVIDER_RATE_LIMITED,
+                ControlError.AI_PROVIDER_FAILED, ControlError.AI_PROVIDER_OUTPUT_LIMIT,
+                ControlError.AI_INVALID_PROPOSAL, ControlError.AI_OVERLOADED);
+        var historical = List.of("control.ai-not-configured", "control.ai-provider-auth-failed",
+                "control.ai-provider-request-rejected", "control.ai-provider-rate-limited",
+                "control.ai-provider-failed", "control.ai-provider-output-limit",
+                "control.ai-invalid-proposal", "control.ai-overloaded");
+        var catalog = io.tapstate.messages.MessageCatalog.bundled();
+        for (int i = 0; i < owners.size(); i++) {
+            var owner = owners.get(i);
+            assertThat(owner.code()).isEqualTo("TS021" + String.format("%04d", i + 6));
+            assertThat(owner.placeholders()).isEmpty();
+            assertThat(owner.severity()).isEqualTo(Severity.ERROR);
+            var current = catalog.render(owner.code(), Map.of());
+            var previous = catalog.render(historical.get(i), Map.of());
+            assertThat(current.message()).isEqualTo(previous.message());
+            if (previous.solution() != null) assertThat(current.solution()).isEqualTo(previous.solution());
+            var messages = new java.util.HashSet<String>();
+            for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+                var resolved = RequestDiagnosticCatalog.bundled().resolve(owner.code(), Map.of(), List.of(), locale).orElseThrow();
+                messages.add(resolved.message());
+                assertThat(resolved.solution()).isNotBlank();
+            }
+            assertThat(messages).hasSize(3);
+            assertThat(RequestDiagnosticCatalog.bundled().resolve(historical.get(i), Map.of(), List.of(), Locale.ENGLISH)).isEmpty();
         }
     }
 

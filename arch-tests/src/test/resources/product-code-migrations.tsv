@@ -64,3 +64,11 @@ pipeline-draft.revision-conflict	TS0250004
 pipeline-draft.invalid	TS0250005
 pipeline-draft.mode-conflict	TS0250006
 pipeline-draft.artifact-conflict	TS0250007
+control.ai-not-configured	TS0210006
+control.ai-provider-auth-failed	TS0210007
+control.ai-provider-request-rejected	TS0210008
+control.ai-provider-rate-limited	TS0210009
+control.ai-provider-failed	TS0210010
+control.ai-provider-output-limit	TS0210011
+control.ai-invalid-proposal	TS0210012
+control.ai-overloaded	TS0210013

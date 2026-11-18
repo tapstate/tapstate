@@ -9,7 +9,8 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 This page describes an unshipped migration candidate. The first migrated request
 refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
-through `TS0210005`, respectively. Source mutation errors use `TS0220001`
+through `TS0210005`, respectively. AI assistant and provider refusals use
+`TS0210006` through `TS0210013`. Source mutation errors use `TS0220001`
 through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
 `023`, `024` and `025`. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
@@ -38,6 +39,14 @@ and still read the corresponding historical server replies during migration.
 This read compatibility does not create aliases in the authoritative catalog.
 Browser session refresh must retain account binding and must not replay an
 operation as a different user.
+
+AI provider errors retain the existing HTTP and streaming boundaries. Provider
+credential refusal is distinct from workbench authentication: it must not end a
+valid workbench session. Keep failed-check key cleanup, proposal rejection without
+applying partial output, bounded provider behavior and explicit user recovery.
+The numeric identity does not authorize an additional retry. Existing English
+messages and recovery advice remain; entries without advice now supply localized
+recovery guidance through the shared catalog.
 
 DSL definitions live in `DslErrorDefinitions`, with the existing `DslError` and
 `ExecutionAdvisoryError` enums retaining their typed APIs. Corpus rule symbols

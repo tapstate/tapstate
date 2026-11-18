@@ -15,10 +15,28 @@ public final class RequestErrorDefinitions {
             new ProductErrorDefinition(ProductErrorModule.CONTROL, 4, Severity.ERROR, Set.of("op", "required"));
     public static final ProductErrorDefinition UNREACHABLE =
             new ProductErrorDefinition(ProductErrorModule.CONTROL, 5, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_NOT_CONFIGURED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 6, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_PROVIDER_AUTH_FAILED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 7, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_PROVIDER_REQUEST_REJECTED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 8, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_PROVIDER_RATE_LIMITED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 9, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_PROVIDER_FAILED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 10, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_PROVIDER_OUTPUT_LIMIT =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 11, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_INVALID_PROPOSAL =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 12, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition AI_OVERLOADED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 13, Severity.ERROR, Set.of());
 
     private RequestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
-        return List.of(MALFORMED_REQUEST, AUTH_FAILED, UNAUTHENTICATED, FORBIDDEN, UNREACHABLE);
+        return List.of(MALFORMED_REQUEST, AUTH_FAILED, UNAUTHENTICATED, FORBIDDEN, UNREACHABLE,
+                AI_NOT_CONFIGURED, AI_PROVIDER_AUTH_FAILED, AI_PROVIDER_REQUEST_REJECTED,
+                AI_PROVIDER_RATE_LIMITED, AI_PROVIDER_FAILED, AI_PROVIDER_OUTPUT_LIMIT, AI_INVALID_PROPOSAL, AI_OVERLOADED);
     }
 }
