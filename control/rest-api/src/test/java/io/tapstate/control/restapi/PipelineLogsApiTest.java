@@ -110,6 +110,16 @@ class PipelineLogsApiTest {
     }
 
     @Test
+    void logsRoundTripsTheSafeDiagnosticThroughTheAuthenticatedRead() {
+        var diagnostic = Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        context.getBean(FakeLogSink.class).append("pl1", new LogLine(2L, "WARN", "safe failure", diagnostic));
+        var body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().toEntity(PipelineLogs.class).getBody();
+        assertThat(body.lines()).singleElement().satisfies(line -> assertThat(line.diagnostic()).isEqualTo(diagnostic));
+    }
+
+    @Test
     void logsHonorsTheRequestedLineLimit() {
         PipelineLogs body = client().get().uri("/api/pipelines/pl1/logs?limit=1")
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))

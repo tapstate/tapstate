@@ -2204,6 +2204,22 @@ class HttpControlPlaneClientTest {
     }
 
     @Test
+    void logsKeepsValidDiagnosticButDropsOnlyTheMalformedAttachment() throws Exception {
+        var server = apiServer("/api/pipelines/pl1/logs", 200, """
+                {"pipelineId":"pl1","lines":[
+                  {"timestampMillis":1,"level":"WARN","message":"safe failure","diagnostic":{"code":"28000","codeSource":"jdbc-sqlstate","rawMessage":"access denied"}},
+                  {"timestampMillis":2,"level":"WARN","message":"original line","diagnostic":{"unsupported":true}}]}
+                """, new AtomicReference<>());
+        try {
+            var found = (LogsOutcome.Found) new HttpControlPlaneClient().logs(baseOf(server), "tok", "pl1");
+            assertThat(found.lines()).hasSize(2);
+            assertThat(found.lines().getFirst().diagnostic()).containsEntry("code", "28000");
+            assertThat(found.lines().getLast().diagnostic()).isEmpty();
+            assertThat(found.lines().getLast().message()).isEqualTo("original line");
+        } finally { server.stop(0); }
+    }
+
+    @Test
     void logsWithNoLinesIsABenignEmptyFound() throws Exception {
         HttpServer server = apiServer("/api/pipelines/pl1/logs", 200,
                 "{\"pipelineId\":\"pl1\",\"lines\":[]}", new AtomicReference<>());

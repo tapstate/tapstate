@@ -307,6 +307,32 @@ class ConvergenceDriverTest {
     }
 
     @Test
+    void aCapturedConnectorFailureDoesNotSendRawSecretsToAnyLogAppender() {
+        var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        captured.start(); logger.addAppender(captured);
+        var actuator = new FailingActuator();
+        var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
+        var driver = new ConvergenceDriver(current, desired, new ObservationPublisher(state, observations));
+        var code = io.tapstate.adapters.pdk.ConnectorError.WRITE_FAILED;
+        var raw = new io.tapstate.core.common.TapstateException(code,
+                Map.of("connector", "fixture", "detail", "log-secret"), new IllegalStateException("log-secret"));
+        var safe = Map.of("connector", "fixture", "detail", "access denied");
+        var diagnostic = Map.<String, Object>of("code", code.code(), "codeSource", "tapstate-standard", "params", safe);
+        try {
+            desired.save(new DesiredState("orders", RUNNING, "rev-1")); driver.reconcile();
+            actuator.fact = new io.tapstate.core.common.FailureFact(raw, diagnostic,
+                    new io.tapstate.core.common.FailureFact.PublicFailure(code.code(), safe));
+            driver.reconcile();
+        } finally { logger.detachAppender(captured); captured.stop(); }
+        assertThat(captured.list).singleElement().satisfies(event -> {
+            assertThat(event.getThrowableProxy()).isNull();
+            assertThat(event.getFormattedMessage()).contains(code.code(), "access denied").doesNotContain("log-secret");
+        });
+        assertThat(observations.read("orders").orElseThrow().failure().params()).isEqualTo(safe);
+    }
+
+    @Test
     void aPipelineWhoseJobDiedPublishesTheCodedReasonAlongsideTheFailedState() {
         // The state says the run died and the error count says it was counted; neither says why. The driver
         // holds the only copy of the cause, so it must carry it into the published observation -- otherwise
@@ -477,6 +503,10 @@ class ConvergenceDriverTest {
     /** A no-op actuator whose failure() a test can arm, to drive a pipeline to FAILED without a real job. */
     private static final class FailingActuator implements LifecycleActuator {
         private Throwable failure;
+        private io.tapstate.core.common.FailureFact fact;
+        @Override public Optional<io.tapstate.core.common.FailureFact> failureFact(String pipelineId) {
+            return fact == null ? LifecycleActuator.super.failureFact(pipelineId) : Optional.of(fact);
+        }
         private boolean completed;
         private Runnable cleanup = () -> { };
         private int cleanupCalls;

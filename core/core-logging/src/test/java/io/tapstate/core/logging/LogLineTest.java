@@ -8,6 +8,15 @@ import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 class LogLineTest {
 
     @Test
+    void oversizedDiagnosticKeepsTheOriginalLineAndMarksTheAttachmentTruncated() {
+        var params = new java.util.LinkedHashMap<String, Object>();
+        for (int i = 0; i < 32; i++) params.put("field" + i, "x".repeat(4096));
+        var line = new LogLine(7L, "ERROR", "original", java.util.Map.of("params", params));
+        assertThat(line.message()).isEqualTo("original");
+        assertThat(line.diagnostic()).isEqualTo(java.util.Map.of("truncated", true));
+    }
+
+    @Test
     void holdsTheTimestampLevelAndMessage() {
         LogLine line = new LogLine(1_700_000_000_000L, "INFO", "converged orders_sync to RUNNING");
 

@@ -248,6 +248,7 @@ class ReplTest {
         /** The coded reason carried alongside every emitted watch state, when a test needs one. */
         String watchFailureCode;
         String watchFailureMessage;
+        Map<String, Object> watchDiagnostic = Map.of();
         List<List<RemoteLogLine>> followBatches = List.of();
         final List<String> applyCalls = new ArrayList<>();
         /** The drafts each apply carried, kept whole: what reaches the wire is the thing under test. */
@@ -675,7 +676,7 @@ class ReplTest {
                 if (stop.getAsBoolean()) {
                     return null;
                 }
-                sink.state(pipelineId, state, watchFailureCode, watchFailureMessage);
+                sink.state(new StatusOutcome.Found(pipelineId, state, watchFailureCode, watchFailureMessage, null, Map.of(), watchDiagnostic));
             }
             endOfAttach();
             return streamRefusalCode;
@@ -5672,6 +5673,28 @@ class ReplTest {
     }
 
     @Test
+    void statusAndExplainRenderCapturedRuntimeBranchesWithoutReinterpretingThePrimary() {
+        for (String command : List.of("status pl1", "explain pl1")) {
+            FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+            Map<String, Object> diagnostic = Map.of("message", "captured owner", "truncated", true,
+                    "causes", List.of(Map.of("code", "28000", "message", "first cause"),
+                            Map.of("code", "08006", "message", "second cause")),
+                    "references", List.of(Map.of("type", "pipeline-node", "pipelineId", "pl1", "id", "sink")));
+            client.explainOutcome = new ExplainOutcome.Found("pl1", "FAILED", "CODED_FAILURE",
+                    "safe primary", null, 0L, "FRESH", List.of(new ExplainOutcome.Evidence("status", "failure",
+                            Map.of("code", "historic.failure", "params", Map.of(), "diagnostic", diagnostic))),
+                    List.of(), null, null);
+            SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
+            int mark = h.out().toString().length();
+            int errMark = h.err().toString().length();
+            assertThat(h.repl().dispatch(command)).isTrue();
+            assertThat(h.out().toString().substring(mark)).contains("safe primary", "historic.failure",
+                    "28000 first cause", "08006 second cause", "pipeline-node: pl1/sink", "[Diagnostic truncated]");
+            assertThat(h.err().toString().substring(errMark)).isEmpty();
+        }
+    }
+
+    @Test
     void explainShowsHowWideEachNodeOfTheRunWasPlannedAndWhy() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.explainOutcome = planned(noMatch("pl1", "RUNNING", 2_000L));
@@ -5999,6 +6022,17 @@ class ReplTest {
         assertThat(out).contains("submitted job").contains("INFO").contains("slow tick").contains("WARN");
         // oldest to newest
         assertThat(out.indexOf("submitted job")).isLessThan(out.indexOf("slow tick"));
+    }
+
+    @Test
+    void logsShowsTheCapturedCauseAndItsSafeOriginalDetail() {
+        var client = new FakeControlPlane(URI.create("http://node1:7900"));
+        var diagnostic = Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        client.logsOutcome = new LogsOutcome.Found("pl1", List.of(new RemoteLogLine(1L, "WARN", "safe failure", diagnostic)));
+        var h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+        h.repl().dispatch("logs pl1");
+        assertThat(h.sink().toString().substring(mark)).contains("safe failure", "28000", "access denied");
     }
 
     @Test
@@ -6412,6 +6446,21 @@ class ReplTest {
         assertThat(out).contains("failed");
         assertThat(out).contains("TS0440008");
         assertThat(out).contains("the sink rejected the batch");
+    }
+
+    @Test
+    void statusWatchPreservesCapturedCausesReferencesAndTruncation() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.watchStates = List.of("FAILED");
+        client.watchFailureCode = "TS0060027";
+        client.watchFailureMessage = "The sink refused the write.";
+        client.watchDiagnostic = Map.of("cause", Map.of("code", "28000", "message", "captured authentication refusal"),
+                "references", List.of(Map.of("type", "pipeline-node", "id", "sink", "pipelineId", "pl1")), "truncated", true);
+        SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
+        int mark = h.out().toString().length();
+        assertThat(h.repl().dispatch("status pl1 --watch")).isTrue();
+        assertThat(h.out().toString().substring(mark)).contains("28000", "captured authentication refusal", "pl1/sink", "[Diagnostic truncated]");
+        assertThat(h.err().toString()).isEmpty();
     }
 
     @Test

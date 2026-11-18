@@ -81,6 +81,10 @@ final class PipelineFailures {
         return new ObservationFailure(code, safe, diagnostic);
     }
 
+    static boolean isCoded(Throwable failure) {
+        return codedCause(failure) != null;
+    }
+
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */
     static boolean isSinkWriteFailure(String pipelineId, Throwable failure) {
         var coded = codedCause(failure);

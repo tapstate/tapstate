@@ -1353,8 +1353,11 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
             if (preflight != null && preflight.completeExceptionally(reported)) {
                 return;
             }
-            LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
-            listener.onFailure(connector.failureFact(reported));
+            var fact = connector.failureFact(reported);
+            LOG.atWarn().addKeyValue("diagnostic", io.tapstate.core.logging.FailureLogSnapshot.of(fact))
+                    .log("cdc stream for connector {} stopped on a failure [{}]: {}", connector.connectorId(),
+                            reported.code().code(), fact.publicFailure().params());
+            listener.onFailure(fact);
         }
     }
 
@@ -1512,9 +1515,11 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     Map.of("connector", connector.connectorId(), "detail", detail(failure)), failure);
             failuresSinceWarning++;
             if (!warned || now - lastWarningNanos >= ACKNOWLEDGE_WARNING_INTERVAL_NANOS) {
-                LOG.warn("cdc stream for connector {} could not tell its source how far it may release its change "
-                        + "log; the stream carries on and retries (failures since the last warning: {})",
-                        connector.connectorId(), failuresSinceWarning, coded);
+                var fact = connector.failureFact(coded);
+                LOG.atWarn().addKeyValue("diagnostic", io.tapstate.core.logging.FailureLogSnapshot.of(fact))
+                        .log("cdc stream for connector {} could not tell its source how far it may release its change "
+                                + "log; the stream carries on and retries (failures since the last warning: {}) [{}]: {}",
+                                connector.connectorId(), failuresSinceWarning, coded.code().code(), fact.publicFailure().params());
                 warned = true;
                 lastWarningNanos = now;
                 failuresSinceWarning = 0;

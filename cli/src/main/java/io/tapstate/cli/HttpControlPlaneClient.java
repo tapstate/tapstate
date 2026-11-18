@@ -2022,7 +2022,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
                         && line.get("timestampMillis") instanceof Number ts
                         && line.get("level") instanceof String level
                         && line.get("message") instanceof String message) {
-                    parsed.add(new RemoteLogLine(ts.longValue(), level, message));
+                    parsed.add(new RemoteLogLine(ts.longValue(), level, message, io.tapstate.core.common.RuntimeDiagnosticProjection.read(line.get("diagnostic"))));
                 }
             }
             return new LogsOutcome.Found(id, parsed);
@@ -2044,7 +2044,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         return stream(wsUri(baseUrl, "/api/pipelines/" + pipelineId + "/status/watch"), credential, stop, frame -> {
             StatusOutcome decoded = statusFound(frame);
             if (decoded instanceof StatusOutcome.Found found) {
-                sink.state(found.pipelineId(), found.state(), found.failureCode(), found.failureMessage());
+                sink.state(found);
             }
         });
     }

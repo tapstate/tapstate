@@ -64,6 +64,7 @@ final class StreamFrames {
             encoded.put("timestampMillis", line.timestampMillis());
             encoded.put("level", line.level());
             encoded.put("message", line.message());
+            if (!line.diagnostic().isEmpty()) encoded.put("diagnostic", line.diagnostic());
             lines.add(encoded);
         }
         Map<String, Object> frame = new LinkedHashMap<>();

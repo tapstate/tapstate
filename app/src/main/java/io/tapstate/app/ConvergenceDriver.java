@@ -204,8 +204,14 @@ final class ConvergenceDriver {
                     // Every later pass while the checkpoint stays FAILED publishes null and the publisher
                     // carries the stored reason forward — durably, so it survives a process restart too.
                     failure = PipelineFailures.of(pipelineId, result.failure().orElse(null), result.diagnostic(), result.publicFailure());
-                    LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
-                            failure.code(), result.failure().orElse(null));
+                    var original = result.failure().orElse(null);
+                    var logDiagnostic = original == null ? failure.diagnostic()
+                            : io.tapstate.core.logging.FailureLogSnapshot.of(new io.tapstate.core.common.FailureFact(
+                                    original, failure.diagnostic(), result.publicFailure()));
+                    var logParams = PipelineFailures.isCoded(original) ? failure.params()
+                            : Map.of("pipeline", pipelineId, "cause", original == null ? "unknown" : original.getClass().getName());
+                    LOG.atWarn().addKeyValue("diagnostic", logDiagnostic)
+                            .log("Pipeline {} entered FAILED [{}]: {}", pipelineId, failure.code(), logParams);
                 }
                 var projection = scoped == null ? publisher.publish(pipelineId, failure)
                         : publisher.publishScoped(pass.scope(), pass.state(), pass.observationSample(), failure);

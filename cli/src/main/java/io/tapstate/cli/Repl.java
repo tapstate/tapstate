@@ -3592,6 +3592,9 @@ final class Repl {
         if (!code.isEmpty() || !message.isEmpty()) {
             out.println(indent + (code + " " + message).strip());
         }
+        if (node.get("rawMessage") instanceof String raw && !raw.equals(message)) {
+            out.println(indent + raw);
+        }
         if (node.get("solution") instanceof String solution) {
             out.println(indent + solution);
         }
@@ -4240,7 +4243,14 @@ final class Repl {
 
     /** One tailed line as {@code <iso-timestamp> <level> <message>}. */
     private static String renderLogLine(RemoteLogLine line) {
-        return Instant.ofEpochMilli(line.timestampMillis()) + "  " + line.level() + "  " + line.message();
+        String heading = Instant.ofEpochMilli(line.timestampMillis()) + "  " + line.level() + "  " + line.message();
+        if (line.diagnostic().isEmpty()) return heading;
+        var text = new java.io.StringWriter();
+        var out = new PrintWriter(text);
+        out.println(heading);
+        renderConnectionDiagnostic(out, line.diagnostic(), "  ");
+        out.flush();
+        return text.toString().stripTrailing();
     }
 
     /**
@@ -4280,16 +4290,19 @@ final class Repl {
             // again after a move is a re-poll, and a watcher who just saw the connection move is owed it.
             return streamAcrossMembers(frames, () -> controlPlane.watchStatus(
                     session.landingNode(), session.credential(), id,
-                    (pipelineId, state, failureCode, failureMessage) -> {
-                        frames.incrementAndGet();
-                        out.println(pipelineId + "  " + state.toLowerCase(Locale.ROOT));
-                        if (failureCode != null) {
-                            // Mirrors the one-shot `status` read: a failed state that cannot say what failed
-                            // sends the watcher hunting through logs instead of the frame that just reported it.
-                            // This frame arrived over an open stream, not a refusal, so it renders to stdout.
-                            renderStatusFailure(failureCode, failureMessage);
+                    new StatusStream() {
+                        @Override public void state(String pipelineId, String state, String failureCode, String failureMessage) {
+                            state(new StatusOutcome.Found(pipelineId, state, failureCode, failureMessage));
                         }
-                        out.flush();
+                        @Override public void state(StatusOutcome.Found found) {
+                            frames.incrementAndGet();
+                            out.println(found.pipelineId() + "  " + found.state().toLowerCase(Locale.ROOT));
+                            if (found.failureCode() != null) {
+                                renderStatusFailure(found.failureCode(), found.failureMessage());
+                                renderConnectionDiagnostic(out, found.diagnostic(), "  ");
+                            }
+                            out.flush();
+                        }
                     },
                     this::isStreamCancelled), code -> renderStreamRefusal(code, id));
         } finally {
@@ -5519,8 +5532,24 @@ final class Repl {
         out.println(Ansi.AUTO.string("@|bold why:|@") + " " + answer.message());
         out.println("  kind       " + answer.kind());
         out.println("  freshness  " + answer.freshness().toLowerCase(Locale.ROOT));
-        answer.evidence().forEach(reading -> out.println("  read       "
-                + reading.source() + "." + reading.field() + " = " + evidenceValue(reading.value())));
+        answer.evidence().forEach(reading -> {
+            Object value = reading.value();
+            if ("failure".equals(reading.field()) && value instanceof Map<?, ?> failure
+                    && failure.containsKey("diagnostic")) {
+                Map<Object, Object> primary = new java.util.LinkedHashMap<>(failure);
+                primary.remove("diagnostic");
+                value = primary;
+            }
+            out.println("  read       " + reading.source() + "." + reading.field() + " = "
+                    + evidenceValue(value));
+            if ("failure".equals(reading.field()) && reading.value() instanceof Map<?, ?> failure) {
+                Map<String, Object> diagnostic = io.tapstate.core.common.RuntimeDiagnosticProjection.read(
+                        failure.get("diagnostic"));
+                if (!diagnostic.isEmpty()) {
+                    renderConnectionDiagnostic(out, diagnostic, "    ");
+                }
+            }
+        });
         if (answer.next() != null) {
             out.println("  next       " + answer.next().message() + " [" + answer.next().action() + "]");
         }

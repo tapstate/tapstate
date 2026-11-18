@@ -63,6 +63,15 @@ class StreamFramesTest {
     }
 
     @Test
+    void logsFrameKeepsTheCapturedDiagnostic() {
+        var diagnostic = java.util.Map.<String, Object>of("code", "28000", "codeSource", "jdbc-sqlstate", "rawMessage", "access denied");
+        var frame = StreamFrames.logs(new PipelineLogs("p", List.of(new LogLine(1L, "WARN", "safe failure", diagnostic))));
+        var parsed = (java.util.Map<?, ?>) io.tapstate.core.common.JsonReader.parse(frame);
+        var line = (java.util.Map<?, ?>) ((List<?>) parsed.get("lines")).getFirst();
+        assertThat(line.get("diagnostic")).isEqualTo(diagnostic);
+    }
+
+    @Test
     void logsFrameEscapesAnArbitraryMessage() {
         PipelineLogs logs = new PipelineLogs("p", List.of(
                 new LogLine(1L, "WARN", "quote\" and newline\n")));
