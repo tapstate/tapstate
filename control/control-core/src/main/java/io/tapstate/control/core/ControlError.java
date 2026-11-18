@@ -2,6 +2,8 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Severity;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.core.common.RequestErrorDefinitions;
 
 import java.util.Set;
 
@@ -30,7 +32,7 @@ public enum ControlError implements TapstateErrorCode {
     AI_PROVIDER_OUTPUT_LIMIT("control.ai-provider-output-limit", Set.of()),
     AI_INVALID_PROPOSAL("control.ai-invalid-proposal", Set.of()),
     AI_OVERLOADED("control.ai-overloaded", Set.of()),
-    MALFORMED_REQUEST("control.malformed-request", Set.of("reason")),
+    MALFORMED_REQUEST(RequestErrorDefinitions.MALFORMED_REQUEST),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */
     PREVIEW_OVERLOADED("control.preview-overloaded", Set.of()),
@@ -118,6 +120,12 @@ public enum ControlError implements TapstateErrorCode {
 
     private final String code;
     private final Set<String> placeholders;
+
+    ControlError(ProductErrorDefinition definition) {
+        this(definition.code(), definition.parameters());
+        if (definition.severity() != Severity.ERROR)
+            throw new IllegalArgumentException("request refusal must have error severity");
+    }
 
     ControlError(String code, Set<String> placeholders) {
         this.code = code;

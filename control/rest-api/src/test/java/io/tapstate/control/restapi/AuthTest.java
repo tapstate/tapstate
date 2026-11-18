@@ -547,7 +547,7 @@ class AuthTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(malformed.code()).isEqualTo("control.malformed-request");
+        assertThat(malformed.code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -843,7 +843,7 @@ class AuthTest {
     @Test
     void loginWithABlankCredentialIsABadRequestWithACodedBody() {
         // A missing / blank credential field is a malformed request — the client omitted a required value —
-        // refused at the boundary with a coded control.malformed-request (400). This is distinct from a
+        // refused at the boundary with a coded TS0210001 (400). This is distinct from a
         // present-but-wrong credential (the auth-failed 401), and it never reaches the login service's bare
         // argument crash.
         ApiError body = client().post().uri("/auth/login")
@@ -854,7 +854,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 
@@ -895,7 +895,7 @@ class AuthTest {
     @Test
     void bootstrapWithABlankCredentialIsABadRequestWithACodedBody() {
         // The test client is on loopback and the store is empty, so the bootstrap channel is open. A blank
-        // password is still refused at the boundary with a coded control.malformed-request (400) — it would
+        // password is still refused at the boundary with a coded TS0210001 (400) — it would
         // otherwise be hashed into a non-blank hash and silently create an admin with an empty password.
         ApiError body = client().post().uri("/auth/bootstrap")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -905,7 +905,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
     }
 

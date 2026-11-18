@@ -4038,8 +4038,9 @@ final class Repl {
 
     private int renderMalformedRequest(String reason) {
         Map<String, Object> args = Map.of(REASON_PARAM, reason);
-        String message = MessageCatalog.bundled().render("control.malformed-request", args).message();
-        return renderRejection("control.malformed-request", message, args);
+        String code = io.tapstate.core.common.RequestErrorDefinitions.MALFORMED_REQUEST.code();
+        String message = MessageCatalog.bundled().render(code, args).message();
+        return renderRejection(code, message, args);
     }
 
     private static void renderHistory(PrintWriter out, HistoryOutcome.Found history) {

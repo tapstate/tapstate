@@ -67,6 +67,16 @@ public final class MessageCatalog {
      * code renders as itself rather than blank, so a message never silently disappears.
      */
     public Rendered render(String code, Map<String, Object> args) {
+        return render(code, args, Locale.ENGLISH);
+    }
+
+    /** Localizes registered product codes; legacy text retains its original catalog language. */
+    public Rendered render(String code, Map<String, Object> args, Locale locale) {
+        var registered = RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isPresent()) {
+            var resolved = registered.orElseThrow();
+            return new Rendered(resolved.message(), resolved.solution());
+        }
         Entry entry = entries.get(code);
         if (entry == null) {
             return new Rendered(code, null);

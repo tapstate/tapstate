@@ -769,7 +769,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(overflowRevision.code()).isEqualTo("control.malformed-request");
+        assertThat(overflowRevision.code()).isEqualTo("TS0210001");
         assertThat(context.getBean(FakePipelineDraftStore.class).get("overflow-revision").orElseThrow().revision())
                 .isEqualTo(1L);
         assertThat(context.getBean(FakeArtifactStore.class).get("overflow-revision")).isEmpty();
@@ -785,7 +785,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(overflowSchema.code()).isEqualTo("control.malformed-request");
+        assertThat(overflowSchema.code()).isEqualTo("TS0210001");
         assertThat(context.getBean(FakePipelineDraftStore.class).get("overflow-schema")).isEmpty();
 
         ApiError overflowEtag = client().put().uri("/api/pipelines/overflow-revision/draft")
@@ -897,7 +897,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(malformedCandidate.code()).isEqualTo("control.malformed-request");
+        assertThat(malformedCandidate.code()).isEqualTo("TS0210001");
     }
 
     @Test
@@ -927,7 +927,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(invalidHash.code()).isEqualTo("control.malformed-request");
+        assertThat(invalidHash.code()).isEqualTo("TS0210001");
 
         ResponseEntity<Map> rebased = client().post().uri("/api/pipelines/rebase-draft/draft:rebase")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
@@ -2189,7 +2189,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
     }
 
     @Test

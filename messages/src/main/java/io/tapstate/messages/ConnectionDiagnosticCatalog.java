@@ -1,7 +1,6 @@
 package io.tapstate.messages;
 
 import io.tapstate.core.common.DiagnosticCodeSource;
-import io.tapstate.core.common.JsonReader;
 import io.tapstate.core.common.DiagnosticDefinitionLookup;
 import io.tapstate.core.common.TapstateException;
 
@@ -12,15 +11,11 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Function;
-import java.util.regex.Pattern;
 
 /** Product definitions used by the connection diagnostic projection. */
 public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLookup {
-    private static final Pattern PARAMETER = Pattern.compile("\\{([a-z][A-Za-z0-9]*)}");
-    private static final String ENGLISH = "en";
     private static final String MESSAGE = "message";
     private static final String SOLUTION = "solution";
-    private static final List<String> LANGUAGES = List.of(ENGLISH, "zh-CN", "zh-TW");
 
     public enum Definition {
         TEST_EXECUTION_FAILED("TS0060001", "connector.test-failed", Set.of("connector", "detail"));
@@ -41,12 +36,12 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     private final Map<String, Definition> byLegacy;
-    private final Map<String, Map<String, MessageCatalog.Rendered>> text;
+    private final ProductDiagnosticCatalog catalog;
 
     private ConnectionDiagnosticCatalog(
-            Map<String, Definition> byLegacy, Map<String, Map<String, MessageCatalog.Rendered>> text) {
+            Map<String, Definition> byLegacy, ProductDiagnosticCatalog catalog) {
         this.byLegacy = byLegacy;
-        this.text = text;
+        this.catalog = catalog;
     }
 
     private static final class Bundled {
@@ -68,52 +63,26 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
         Definition definition = byLegacy.get(code);
-        if (definition == null || !positional.isEmpty() || !named.keySet().equals(definition.parameters())) return Optional.empty();
-        var template = text.get(language(locale)).get(definition.code());
-        return Optional.of(new Resolved(definition.code(),
-                MessageCatalog.substitute(template.message(), named), MessageCatalog.substitute(template.solution(), named)));
+        return definition == null ? Optional.empty()
+                : catalog.resolve(definition.code(), named, positional, locale);
     }
 
     static String language(Locale locale) {
-        if (!"zh".equals(locale.getLanguage())) return ENGLISH;
-        return "Hant".equals(locale.getScript()) || Set.of("HK", "MO", "TW").contains(locale.getCountry())
-                ? "zh-TW" : "zh-CN";
+        return ProductDiagnosticCatalog.language(locale);
     }
 
     static ConnectionDiagnosticCatalog load(Function<String, String> readResource) {
         Map<String, Definition> byLegacy = new LinkedHashMap<>();
-        Map<String, Definition> byCode = new LinkedHashMap<>();
         for (Definition definition : Definition.values()) {
-            if (!definition.code().matches("TS006(?!0000)[0-9]{4}")
-                    || byCode.putIfAbsent(definition.code(), definition) != null
-                    || byLegacy.putIfAbsent(definition.legacy(), definition) != null) {
+            if (byLegacy.putIfAbsent(definition.legacy(), definition) != null) {
                 throw new IllegalStateException("invalid or repeated connection diagnostic definition " + definition.code());
             }
         }
-        Map<String, Map<String, MessageCatalog.Rendered>> languages = new LinkedHashMap<>();
-        for (String language : LANGUAGES) {
-            Object parsed = JsonReader.parse(readResource.apply("/messages/connection-diagnostic-" + language + ".json"));
-            if (!(parsed instanceof Map<?, ?> entries) || !entries.keySet().equals(byCode.keySet())) {
-                throw new IllegalStateException("incomplete connection diagnostic catalog " + language);
-            }
-            Map<String, MessageCatalog.Rendered> templates = new LinkedHashMap<>();
-            byCode.forEach((code, definition) -> {
-                if (!(entries.get(code) instanceof Map<?, ?> entry)
-                        || !entry.keySet().equals(Set.of(MESSAGE, SOLUTION))
-                        || !(entry.get(MESSAGE) instanceof String message) || message.isBlank()
-                        || !(entry.get(SOLUTION) instanceof String solution) || solution.isBlank()) {
-                    throw new IllegalStateException("invalid language entry " + language + "/" + code);
-                }
-                Set<String> used = new java.util.HashSet<>();
-                PARAMETER.matcher(message).results().forEach(token -> used.add(token.group(1)));
-                PARAMETER.matcher(solution).results().forEach(token -> used.add(token.group(1)));
-                if (!used.equals(definition.parameters())) {
-                    throw new IllegalStateException("incorrect diagnostic parameters " + language + "/" + code);
-                }
-                templates.put(code, new MessageCatalog.Rendered(message, solution));
-            });
-            languages.put(language, Map.copyOf(templates));
-        }
-        return new ConnectionDiagnosticCatalog(Map.copyOf(byLegacy), Map.copyOf(languages));
+        var registered = java.util.Arrays.stream(Definition.values())
+                .map(definition -> new ProductDiagnosticCatalog.Definition(definition.code(), definition.parameters()))
+                .toList();
+        var catalog = ProductDiagnosticCatalog.load("006", registered,
+                language -> readResource.apply("/messages/connection-diagnostic-" + language + ".json"));
+        return new ConnectionDiagnosticCatalog(Map.copyOf(byLegacy), catalog);
     }
 }

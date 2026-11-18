@@ -107,7 +107,7 @@ class ArtifactDeleteRefusalIT {
                 if (kind.equals("sources")) {
                     // The native managed-target gate precedes reference checks on Source authoring.
                     assertThat(refusal.status()).isEqualTo(400);
-                    assertThat(refusal.code()).isEqualTo("control.malformed-request");
+                    assertThat(refusal.code()).isEqualTo("TS0210001");
                     assertThat(refusal.params()).isEqualTo(Map.of("reason",
                             "the managed default target cannot be changed through authoring"));
                 } else {

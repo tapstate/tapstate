@@ -1,0 +1,6 @@
+{
+  "TS0210001": {
+    "message": "The request is malformed: {reason}.",
+    "solution": "Correct the request body, then send it again."
+  }
+}

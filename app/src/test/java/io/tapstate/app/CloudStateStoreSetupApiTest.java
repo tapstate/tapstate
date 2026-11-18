@@ -158,7 +158,7 @@ class CloudStateStoreSetupApiTest {
                         "metadata", Map.of("labels", Map.of("store", "true")), "config", SETTINGS))
                 .exchange((request, response) -> {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-                    assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("control.malformed-request");
+                    assertThat(response.bodyTo(Map.class).get("code")).isEqualTo("TS0210001");
                     return null;
                 });
         assertThat(artifacts().list()).isEmpty();

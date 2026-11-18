@@ -429,7 +429,7 @@ Every coded REST error is `{code, params, message}` and carries `Cache-Control: 
 
 | HTTP | Code | Response |
 |---|---|---|
-| 400 | `control.malformed-request` | Correct timestamps, range, resolution, limit, or selectors. |
+| 400 | `TS0210001` (migration candidate; legacy releases use `control.malformed-request`) | Correct timestamps, range, resolution, limit, or selectors. |
 | 400 | `monitor.invalid-cursor` | Repeat the exact query or start a new first page. |
 | 400 | `monitor.query-budget-exceeded` | Narrow the range or select fewer table series. |
 | 401/403 | `control.unauthenticated` / `control.forbidden` | Supply a valid read-scoped credential. |

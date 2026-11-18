@@ -4,6 +4,8 @@ import com.tngtech.archunit.core.domain.JavaClass;
 import com.tngtech.archunit.core.domain.JavaClasses;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Domain;
+import io.tapstate.core.common.RequestErrorDefinitions;
+import io.tapstate.messages.RequestDiagnosticCatalog;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -123,6 +125,12 @@ class ErrorCodeGatesTest {
     void everyCodeMatchesFormatAndRegisteredDomain() {
         for (TapstateErrorCode c : codes) {
             String code = c.code();
+            if (code.equals(RequestErrorDefinitions.MALFORMED_REQUEST.code())) {
+                assertThat(code).matches("TS021(?!0000)[0-9]{4}");
+                assertThat(c.placeholders()).isEqualTo(RequestErrorDefinitions.MALFORMED_REQUEST.parameters());
+                assertThat(c.severity()).isEqualTo(RequestErrorDefinitions.MALFORMED_REQUEST.severity());
+                continue;
+            }
             int dot = code.indexOf('.');
             assertThat(dot).as("code '%s' must be <domain>.<symbol>", code).isPositive();
             String domain = code.substring(0, dot);
@@ -159,6 +167,10 @@ class ErrorCodeGatesTest {
                 .distinct()
                 .sorted()
                 .filter(code -> {
+                    if (code.equals(RequestErrorDefinitions.MALFORMED_REQUEST.code())) {
+                        return RequestDiagnosticCatalog.bundled().resolve(code, Map.of("reason", "fixture"),
+                                List.of(), java.util.Locale.ENGLISH).isEmpty();
+                    }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();
                 })
@@ -195,6 +207,12 @@ class ErrorCodeGatesTest {
                         .as("connector-diagnostic wording '%s' is rendered with no arguments, so its "
                                 + "template must carry no placeholders", code)
                         .isEmpty();
+                continue;
+            }
+            // Retained historical text is readable, but no current producer owns the retired identity.
+            if (code.equals("control.malformed-request")) {
+                assertThat(declared).doesNotContainKey(code);
+                assertThat(used).containsExactly("reason");
                 continue;
             }
             assertThat(declared)

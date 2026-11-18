@@ -23,12 +23,12 @@ class ListWindowTest {
     void rejectsInvalidListBoundsAtTheHttpBoundary() {
         assertThatThrownBy(() -> ListWindow.page(List.of("alpha"), 0, 0))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("control.malformed-request");
+                .hasMessageContaining("TS0210001");
         assertThatThrownBy(() -> ListWindow.page(List.of("alpha"), 201, 0))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("control.malformed-request");
+                .hasMessageContaining("TS0210001");
         assertThatThrownBy(() -> ListWindow.page(List.of("alpha"), 1, -1))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("control.malformed-request");
+                .hasMessageContaining("TS0210001");
     }
 }

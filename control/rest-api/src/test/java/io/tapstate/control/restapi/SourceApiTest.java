@@ -278,7 +278,7 @@ class SourceApiTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .body(Map.of("id", "masked", "connector", "mysql",
                                 "config", Map.of("host", "db.example", "password", "<redacted>"))),
-                HttpStatus.BAD_REQUEST, "control.malformed-request");
+                HttpStatus.BAD_REQUEST, "TS0210001");
         assertThat(context.getBean(InMemoryArtifactStore.class).get("masked")).isEmpty();
     }
 
@@ -568,11 +568,11 @@ class SourceApiTest {
             String body = sourceJson("bad", "bad").replaceFirst("\\}$", ",\"" + field + "\":[]}");
             assertError(request("writer").post().uri("/api/sources")
                             .contentType(MediaType.APPLICATION_JSON).body(body),
-                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+                    HttpStatus.BAD_REQUEST, "TS0210001");
         }
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body("{\"id\":"),
-                HttpStatus.BAD_REQUEST, "control.malformed-request");
+                HttpStatus.BAD_REQUEST, "TS0210001");
 
         context.getBean(InMemoryArtifactStore.class).save(
                 new PipelineResource("pipeline", null, List.of(SourceRef.bare("orders")), null, null, null, null, null));
@@ -593,7 +593,7 @@ class SourceApiTest {
             assertThat(body).doesNotContain(required);
             assertError(request("writer").post().uri("/api/sources")
                             .contentType(MediaType.APPLICATION_JSON).body(body),
-                    HttpStatus.BAD_REQUEST, "control.malformed-request");
+                    HttpStatus.BAD_REQUEST, "TS0210001");
         }
     }
 
@@ -614,7 +614,7 @@ class SourceApiTest {
 
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(body),
-                HttpStatus.BAD_REQUEST, "control.malformed-request");
+                HttpStatus.BAD_REQUEST, "TS0210001");
     }
 
     @Test

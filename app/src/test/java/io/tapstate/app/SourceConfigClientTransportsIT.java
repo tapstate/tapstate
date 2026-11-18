@@ -178,9 +178,9 @@ class SourceConfigClientTransportsIT {
                     "rejected_batch_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT)));
             Map<String, Object> staleEdit = Map.of("content", partial, "expectedContentHash", hash);
             mcp.refused("artifact_apply", Map.of("drafts", List.of(validNew, staleEdit)), "artifact.version-conflict");
-            mcp.refused("artifact_apply", drafts(envelope(id, "mysql"), null), "control.malformed-request");
+            mcp.refused("artifact_apply", drafts(envelope(id, "mysql"), null), "TS0210001");
             mcp.refused("artifact_apply", drafts(source(id, "mongodb-atlas", Map.of("uri", "<redacted>")), null),
-                    "control.malformed-request");
+                    "TS0210001");
             assertThat(fixture.snapshot()).isEqualTo(beforeRejectedBatch);
             assertThat(fixture.audit()).isEqualTo(auditBeforeRejectedBatch);
 

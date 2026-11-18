@@ -514,7 +514,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();
     }
@@ -530,7 +530,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         assertThat(context.getBean(FakeConnectorRegistrar.class).received()).isNull();
     }

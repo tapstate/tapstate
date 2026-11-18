@@ -25,6 +25,22 @@ class MessageCatalogTest {
     private static final MessageCatalog EN = MessageCatalog.bundled();
 
     @Test
+    void requestDefinitionIsReadableByIndependentClientsAndHistoricalTextStaysReadable() {
+        String code = io.tapstate.core.common.RequestErrorDefinitions.MALFORMED_REQUEST.code();
+        var params = Map.<String, Object>of("reason", "missing id");
+        var english = EN.render(code, params);
+        assertThat(code).isEqualTo("TS0210001");
+        assertThat(english.message()).isEqualTo("The request is malformed: missing id.");
+        assertThat(english.solution()).isEqualTo("Correct the request body, then send it again.");
+        assertThat(EN.render("control.malformed-request", params)).isEqualTo(english);
+        assertThat(EN.render(code, params, Locale.SIMPLIFIED_CHINESE).message())
+                .contains("missing id").isNotEqualTo(english.message())
+                .isNotEqualTo(EN.render(code, params, Locale.TRADITIONAL_CHINESE).message());
+        assertThat(EN.render(code, Map.of()).message()).isEqualTo(code);
+        assertThat(EN.render("TS0219999", params).message()).isEqualTo("TS0219999");
+    }
+
+    @Test
     void connectionDefinitionsRenderThreeLanguagesWithTheSameStableIdentity() {
         var testFailed = new TapstateErrorCode() {
             @Override public String code() { return "connector.test-failed"; }

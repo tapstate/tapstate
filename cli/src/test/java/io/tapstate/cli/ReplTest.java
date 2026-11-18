@@ -5714,7 +5714,7 @@ class ReplTest {
 
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(h.sink().toString().substring(mark))
-                .contains("control.malformed-request")
+                .contains("TS0210001")
                 .contains("history requires both --from and --to");
         assertThat(client.historyCalls).isEmpty();
     }

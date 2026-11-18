@@ -635,7 +635,7 @@ class ControlApiTest {
     void applyingWithNullDraftsIsABadRequestWithACodedBody() {
         // A structurally malformed request — an apply body with no drafts array ({} deserializes to a null
         // drafts field) — is a client-attributable, diagnosable error. It is refused at the HTTP boundary
-        // with a coded control.malformed-request (400) carrying a human reason, not a bare invariant crash
+        // with a coded TS0210001 (400) carrying a human reason, not a bare invariant crash
         // (a 500) deeper in the service.
         ApiError body = client().post().uri("/api/artifacts:apply")
                 .contentType(MediaType.APPLICATION_JSON)
@@ -646,10 +646,10 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
         assertThat(body.params()).containsKey("reason");
         // the message is rendered from the catalog with the reason substituted, not the bare code
-        assertThat(body.message()).isNotBlank().isNotEqualTo("control.malformed-request").contains("drafts");
+        assertThat(body.message()).isNotBlank().isNotEqualTo("TS0210001").contains("drafts");
     }
 
     @Test
@@ -664,7 +664,7 @@ class ControlApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
             assertThat(body.params()).containsKey("reason");
         }
     }

@@ -152,7 +152,7 @@ class DataBrowserServiceTest {
                 new DataBrowserSortOrder("price\\usd", DataBrowserSortOrder.Direction.ASC), 10))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("control.malformed-request");
+                .isEqualTo("TS0210001");
     }
 
     @Test

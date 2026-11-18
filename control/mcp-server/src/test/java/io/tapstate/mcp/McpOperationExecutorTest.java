@@ -314,7 +314,7 @@ class McpOperationExecutorTest {
     @Test
     void sourceListPreservesServerErrorsInsteadOfProjectingThem() throws Exception {
         HttpServer server = server(exchange -> answer(exchange, 400,
-                "{\"code\":\"control.malformed-request\",\"message\":\"bad page\"}"));
+                "{\"code\":\"TS0210001\",\"message\":\"bad page\"}"));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -322,7 +322,7 @@ class McpOperationExecutorTest {
             McpResult result = executor.execute(ControlOperations.SOURCE_LIST, Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -374,10 +374,10 @@ class McpOperationExecutorTest {
 
             assertThat(floatingPoint.error()).isFalse();
             assertThat(paths).containsExactly("/api/pipelines:artifacts?limit=2&offset=1");
-            assertThat(fractional.body()).containsEntry("code", "control.malformed-request");
-            assertThat(text.body()).containsEntry("code", "control.malformed-request");
-            assertThat(negativeOffset.body()).containsEntry("code", "control.malformed-request");
-            assertThat(largeOffset.body()).containsEntry("code", "control.malformed-request");
+            assertThat(fractional.body()).containsEntry("code", "TS0210001");
+            assertThat(text.body()).containsEntry("code", "TS0210001");
+            assertThat(negativeOffset.body()).containsEntry("code", "TS0210001");
+            assertThat(largeOffset.body()).containsEntry("code", "TS0210001");
         } finally {
             server.stop(0);
         }
@@ -869,7 +869,7 @@ class McpOperationExecutorTest {
                     new Operation("test.unsupported", Scope.READ, false, null, Map.of()), Map.of());
 
             assertThat(result.error()).isTrue();
-            assertThat(result.body()).containsEntry("code", "control.malformed-request");
+            assertThat(result.body()).containsEntry("code", "TS0210001");
         }
     }
 
@@ -882,8 +882,8 @@ class McpOperationExecutorTest {
             McpResult missing = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of());
             McpResult blank = executor.execute(ControlOperations.PIPELINE_STATUS, Map.of("id", " "));
 
-            assertThat(missing.body()).containsEntry("code", "control.malformed-request");
-            assertThat(blank.body()).containsEntry("code", "control.malformed-request");
+            assertThat(missing.body()).containsEntry("code", "TS0210001");
+            assertThat(blank.body()).containsEntry("code", "TS0210001");
             assertThat(missing.error()).isTrue();
             assertThat(blank.error()).isTrue();
         }

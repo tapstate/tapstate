@@ -215,8 +215,8 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("control.malformed-request");
-        assertThat(body.message()).contains("a `username` is required").isNotEqualTo("control.malformed-request");
+        assertThat(body.code()).isEqualTo("TS0210001");
+        assertThat(body.message()).contains("a `username` is required").isNotEqualTo("TS0210001");
         assertThat(body.params()).containsEntry("reason", "a `username` is required");
     }
 

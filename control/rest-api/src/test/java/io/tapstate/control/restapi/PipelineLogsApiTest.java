@@ -129,7 +129,7 @@ class PipelineLogsApiTest {
                         return response.bodyTo(ApiError.class);
                     });
 
-            assertThat(body.code()).isEqualTo("control.malformed-request");
+            assertThat(body.code()).isEqualTo("TS0210001");
         }
     }
 

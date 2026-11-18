@@ -310,7 +310,7 @@ class PipelineAssistantControllerTest {
         assertThat(schemaReads.get()).isEqualTo(sourceCount > 3 ? 0 : discovered ? sourceCount : 0);
         assertThat(stream).contains("Connect a PostgreSQL or MySQL Source", "data-status", "complete",
                 "\"finishReason\":\"stop\"")
-                .doesNotContain("data-proposal", "control.malformed-request", "\\\"type\\\":\\\"error\\\"");
+                .doesNotContain("data-proposal", "TS0210001", "\\\"type\\\":\\\"error\\\"");
         if (sourceCount == 2 && tableCount == 1) {
             var candidate = AssistantWizardJson.view(AssistantWizardJson.object(
                     PipelineDraftJson.write(JsonMapper.builder().build(), configured).get("wizard")));

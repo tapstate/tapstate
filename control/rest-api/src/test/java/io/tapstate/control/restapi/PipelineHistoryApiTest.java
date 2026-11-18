@@ -138,7 +138,7 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(largePage.code()).isEqualTo("control.malformed-request");
+        assertThat(largePage.code()).isEqualTo("TS0210001");
 
         ApiError selectors = client().get().uri(uri -> {
                     uri.path("/api/pipelines/pl1/metrics/history")
@@ -169,7 +169,7 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(unbounded.code()).isEqualTo("control.malformed-request");
+        assertThat(unbounded.code()).isEqualTo("TS0210001");
 
         ApiError unauthenticated = client().get().uri(uri -> uri
                         .path("/api/pipelines/pl1/metrics/history")

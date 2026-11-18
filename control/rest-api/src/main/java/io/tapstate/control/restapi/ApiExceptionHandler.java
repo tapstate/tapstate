@@ -38,7 +38,7 @@ import java.util.TreeMap;
  * user-facing, diagnosable failure — becomes a {@code {code, params, message}} body: the canonical code
  * string, the named arguments, and the message rendered from them through the shared catalog. The status
  * is chosen from the code: a client input error (a {@code dsl.*} validation failure or a
- * {@code control.malformed-request} refused at the boundary) is a 400; the authentication codes map to
+ * {@link ControlError#MALFORMED_REQUEST} refused at the boundary) is a 400; the authentication codes map to
  * 401 / 403 / 409; a lifecycle verb on an unknown pipeline is a 404 and a forbidden transition or stale
  * revision is a 409; a metrics, snapshot, or explanation read that requires an observation is a 404 when
  * none has been published; a member that cannot read the cluster right now is a 503, because it is neither the
@@ -137,7 +137,7 @@ class ApiExceptionHandler {
      * The HTTP status for a coded error. The authentication codes are client-attributable and map to the
      * usual auth statuses: no / invalid credential and a rejected login are 401, an under-scoped or
      * non-loopback caller is 403, and a bootstrap channel that has already closed is a 409 state conflict.
-     * A client input error — a {@code dsl.*} validation failure or a {@code control.malformed-request} refused
+     * A client input error — a {@code dsl.*} validation failure or a {@link ControlError#MALFORMED_REQUEST} refused
      * at the boundary — is a 400. A lifecycle verb on a pipeline that was never applied is a 404; a transition
      * the state machine forbids, or a start/resume at a stale revision, is a 409 state conflict. A metrics,
      * snapshot, or explanation read that requires a published observation is likewise a 404 when none exists.
