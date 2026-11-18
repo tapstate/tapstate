@@ -184,12 +184,18 @@ final class AlertEvaluationHost {
         }
     }
 
-    Result tick(Binding binding) { return tick(binding,null); }
+    Result tick(Binding binding) {
+        return tick(binding, () -> store.state(binding.key(), read));
+    }
 
-    Result tick(Binding binding,Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded) {
+    Result tick(Binding binding, Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded) {
+        return tick(binding, () -> loaded);
+    }
+
+    private Result tick(Binding binding, java.util.function.Supplier<Optional<AlertStore.Stored<AlertStateRecord.Head>>> firstRead) {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
-            var retained = retry==0&&loaded!=null?loaded:store.state(binding.key(), read);
+            var retained = retry == 0 ? firstRead.get() : store.state(binding.key(), read);
             if (retained.isEmpty()) return Result.IGNORED;
             var before = retained.orElseThrow().value();
             if (before.retiredAt() != null) return Result.IGNORED;

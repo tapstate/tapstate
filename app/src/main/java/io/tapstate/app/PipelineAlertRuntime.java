@@ -105,11 +105,22 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private boolean legacyBindingsInScan,legacyBindingsUnavailable,legacyScanComplete;
     private record EvaluationRead(long round,long deadline,boolean complete,Map<AlarmKey,AlertStore.Stored<AlertStateRecord.Head>> rows) { }
     private final AtomicLong evaluationRound=new AtomicLong();
-    private volatile EvaluationRead evaluationRead;
-    private Optional<AlertStore.Stored<AlertStateRecord.Head>> loaded(long round,AlarmKey key){
-        var read=evaluationRead;
-        if(read==null||read.round()!=round||evaluationRound.get()!=round||System.nanoTime()-read.deadline()>=0)return null;
-        var row=read.rows().get(key);return row!=null||read.complete()?Optional.ofNullable(row):null;
+    private final AtomicReference<EvaluationRead> evaluationRead = new AtomicReference<>();
+    private record CachedState(Optional<AlertStore.Stored<AlertStateRecord.Head>> row) { }
+
+    private Optional<CachedState> loaded(long round, AlarmKey key) {
+        var read = evaluationRead.get();
+        if (read == null || read.round() != round || evaluationRound.get() != round
+                || System.nanoTime() - read.deadline() >= 0) return Optional.empty();
+        var row = read.rows().get(key);
+        return row != null || read.complete() ? Optional.of(new CachedState(Optional.ofNullable(row))) : Optional.empty();
+    }
+
+    private void tickBinding(long round, AlertEvaluationHost.Binding binding) {
+        var evaluator = services.get().evaluator();
+        var cached = loaded(round, binding.key());
+        AlertEvaluationHost.requireResult(cached.isPresent()
+                ? evaluator.tick(binding, cached.orElseThrow().row()) : evaluator.tick(binding));
     }
     private final String runtimeId = UUID.randomUUID().toString();
 
@@ -207,7 +218,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                     var binding=new AlertEvaluationHost.Binding(current.orElseThrow(),previous.resource(),previous.producer(),
                             previous.sourceBindingRevision(),active,()->null,previous.domainToken());
                     entryBinding.setValue(binding);
-                    AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding,loaded(round,binding.key())));
+                    tickBinding(round, binding);
                 }
             }finally{slot.tickQueued.set(false);}},()->slot.tickQueued.set(false));
         }
@@ -231,10 +242,10 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                             var retained=loaded(round,binding.key());
                             accept(binding, sequence, new AlertInput.Freshness(now, expected, slot.expectedSince, slot.publication,
                                     AlertEvaluationHost.seconds(rule, "startup-grace", 120), AlertEvaluationHost.seconds(rule, "max-age", 120)),
-                                    false,retained!=null,retained==null?Optional.empty():retained);
+                                    false, retained.isPresent(), retained.flatMap(CachedState::row));
                         } else {
                             if (slot.discontinuous()) accept(binding, slot.sequence.get(), new AlertInput.Discontinuity(clock.instant()));
-                            AlertEvaluationHost.requireResult(services.get().evaluator().tick(binding,loaded(round,binding.key())));
+                            tickBinding(round, binding);
                         }
                     }
                     requireCurrent(slot,proved);
@@ -319,7 +330,8 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         else if (slots.values().stream().noneMatch(Slot::discontinuous)) failure.compareAndSet(previousFailure,null);
         var rows=new HashMap<AlarmKey,AlertStore.Stored<AlertStateRecord.Head>>();
         retained.rows().forEach(row->rows.put(row.value().snapshot().rule().key(),row));
-        evaluationRead=new EvaluationRead(round,readStarted+TimeUnit.SECONDS.toNanos(1),after==null&&retained.next()==null,Map.copyOf(rows));
+        evaluationRead.set(new EvaluationRead(round, readStarted + TimeUnit.SECONDS.toNanos(1),
+                after == null && retained.next() == null, Map.copyOf(rows)));
     }
     /** The original operation has already occurred; enqueueing alone is never durable acceptance. */
     void resourceInput(AlarmKey.Resource resource, String typeId, long sourceRevision, String producer,
