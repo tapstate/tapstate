@@ -33,15 +33,16 @@ commit_msg() { # commit_msg <message>
   git add -A && git commit -q -m "$1"
 }
 
-expect() { # expect <name> <mode> <want code> <want text>
+expect() { # expect <name> <mode> <want code> <want text> [<grep flags>]
   local name="$1" mode="$2" want_code="$3" want_text="$4" out code
+  local grep_flags="${5:--qF}"
   bash "$gate" "$mode" > "$scratch/out" 2>&1; code=$?
   out="$(cat "$scratch/out")"
-  if [ "$code" = "$want_code" ] && grep -qF "$want_text" <<<"$out"; then
+  if [ "$code" = "$want_code" ] && grep "$grep_flags" -- "$want_text" <<<"$out"; then
     printf '  ok    %s\n' "$name"; passed=$((passed + 1))
   else
-    printf '  FAIL  %s\n        wanted exit %s containing %s\n        got exit %s: %s\n' \
-      "$name" "$want_code" "$want_text" "$code" "$out"
+    printf '  FAIL  %s\n        wanted exit %s and a match for %s (grep %s)\n        got exit %s: %s\n' \
+      "$name" "$want_code" "$want_text" "$grep_flags" "$code" "$out"
     failed=$((failed + 1))
   fi
 }
@@ -53,7 +54,7 @@ tracked_coordinator_history_case() {
     printf '%s\n' 'Could not prepare the tracked repair-coordinator history fixture.' >&2
     return 2
   fi
-  expect "tracked repair-coordinator history at the root is refused" files 1 "./.issue-loop-contract-golden"
+  expect "tracked repair-coordinator history at the root is refused" files 1 "./.issue-loop-contract-golden" -qFx
 }
 
 if [ "${1:-}" = tracked-coordinator-history ]; then
@@ -95,7 +96,7 @@ git add -- fixtures/.issue-loop-contract-golden.json || exit $?
 expect "untracked coordinator history and a similarly named tracked fixture pass" files 0 "clean:"
 mv .issue-loop-contract-golden fixtures/.issue-loop-contract-golden
 git add -f -- fixtures/.issue-loop-contract-golden || exit $?
-expect "tracked repair-coordinator history in a subdirectory is refused" files 1 "./fixtures/.issue-loop-contract-golden"
+expect "tracked repair-coordinator history in a subdirectory is refused" files 1 "./fixtures/.issue-loop-contract-golden" -qFx
 
 echo "-- mode: dir"
 fresh_repo
