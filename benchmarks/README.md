@@ -49,3 +49,43 @@ Run the bounded replica-set witness from the repository root:
 ```sh
 mvn -pl e2e -am -Dtest=MongoWorkloadGeneratorIT -Dsurefire.failIfNoSpecifiedTests=false test
 ```
+
+## Select and execute bounded qualification runs
+
+The common runner reads the same versioned catalog for selection, allocation, and
+execution. Repeat a filter for alternatives within a dimension. Filters across
+different dimensions are combined.
+
+```sh
+python3 -B benchmarks/runner.py list --where operators=nest --limit 10
+python3 -B benchmarks/runner.py describe copy.snapshot.basic.standard@1
+mvn -pl e2e -am -DskipTests package
+python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output /tmp/perf-connectors
+python3 -B benchmarks/runner.py run --suite basic --connectors /tmp/perf-connectors --output /tmp/perf-run
+```
+
+The basic qualification suite includes Dummy snapshot and MongoDB Copy snapshot,
+live, and backlog. Each repeat uses an isolated OP process and separate data and
+state databases. Results include workload and connector identities, phase timings,
+target readback, and diagnostic metrics. Output directories must be fresh.
+The production latency histogram is retained as diagnostic evidence. Qualified
+window latency requires independently correlated source events and target
+acknowledgements on a comparable clock.
+
+For deterministic allocation, provide whole-case estimates (including preparation,
+all repeats, verification, and cleanup) measured in the declared environment.
+
+```json
+{"environment":"local-op","durations_seconds":{"copy.snapshot.basic.standard":90}}
+```
+
+```sh
+python3 -B benchmarks/runner.py allocate --id copy.snapshot.basic.standard \
+  --slots 1 --batch-seconds 300 --deadline-seconds 360 --reserve-seconds 60 \
+  --environment local-op --estimates /tmp/estimates.json --output /tmp/perf-manifest.json
+python3 -B benchmarks/runner.py run --manifest /tmp/perf-manifest.json --batch 0 \
+  --connectors /tmp/perf-connectors --output /tmp/perf-replay
+```
+
+The manifest binds the exact checkout, definitions and effective load. A missing
+estimate or case that does not fit is recorded in the allocation and blocks replay.
