@@ -325,7 +325,15 @@ class BenchmarkRunIT {
                 throw new AssertionError("Stopped pipeline changed target state during backlog prewrite");
             }
             int events = backlog.batch().streams().get(RECORDS).observed().total();
-            control.writeBackPosition(PIPELINE, resume.get("chainId"), resume.get("token"));
+            evidence.stage = "resume-position";
+            var retainedPosition = control.resumePoint(PIPELINE);
+            if (!resume.equals(retainedPosition)) {
+                control.writeBackPosition(PIPELINE, resume.get("chainId"), resume.get("token"));
+            }
+            if (!resume.equals(control.resumePoint(PIPELINE))) {
+                throw new Unverified("The confirmed pre-batch position was not restored");
+            }
+            evidence.result.put("resumed_from_retained_position", resume.equals(retainedPosition));
             evidence.stage = "catch-up";
             long catchup = System.nanoTime();
             control.lifecycle(PIPELINE, LifecycleVerb.START);
