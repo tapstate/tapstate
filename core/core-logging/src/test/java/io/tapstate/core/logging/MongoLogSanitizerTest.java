@@ -80,6 +80,26 @@ class MongoLogSanitizerTest {
     }
 
     @Test
+    void reportRedactionKeepsEndpointProseAndMasksSpacedUserInfoBeforeAnExplicitPath() {
+        String text = "No response from mongodb://db.example:27017; contact ops@example.org";
+        assertThat(MongoLogSanitizer.redactReport(text)).isEqualTo(text);
+        String ipv6 = "No response from mongodb://[::1]:27017; contact ops@example.org";
+        assertThat(MongoLogSanitizer.redactReport(ipv6)).isEqualTo(ipv6);
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture user:123 words@db.example/data"))
+                .isEqualTo("Failed mongodb://<redacted>@db.example/data");
+    }
+
+    @Test
+    void hidesCompleteMalformedUserInfoWithEmbeddedAtSign() {
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:part@word rest@db.example/data"))
+                .isEqualTo("Failed mongodb://<redacted>@db.example/data");
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:part@word rest@db.example"))
+                .isEqualTo("Failed mongodb://<redacted>@db.example");
+        assertThat(MongoLogSanitizer.redactReport("Failed mongodb://fixture:x@host.example/data contact ops@example.org"))
+                .isEqualTo("Failed mongodb://<redacted>@host.example/data contact ops@example.org");
+    }
+
+    @Test
     void repeatedLogRedactionKeepsMarkersAndRegisteredShortSecretsIntact() {
         SecretRedactor redactor = new SecretRedactor();
         redactor.replace("source", java.util.List.of("ed", "known-password"));

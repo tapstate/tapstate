@@ -69,6 +69,16 @@ final class CliOnce {
         command.addAll(jvmArgs);
         command.addAll(List.of("-cp", classpath(), "io.tapstate.cli.Cli"));
         command.addAll(List.of(args));
+        return launch(command, password, script);
+    }
+
+    static Run runNative(Path executable, Path home, String password, String... args) {
+        List<String> command = new ArrayList<>(List.of(executable.toString(), "-Duser.home=" + home));
+        command.addAll(List.of(args));
+        return launch(command, password, null);
+    }
+
+    private static Run launch(List<String> command, String password, String script) {
         try {
             Path outFile = Files.createTempFile("cli-out", ".txt");
             Path errFile = Files.createTempFile("cli-err", ".txt");

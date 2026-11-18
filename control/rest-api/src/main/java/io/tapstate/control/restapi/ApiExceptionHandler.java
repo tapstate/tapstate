@@ -60,7 +60,8 @@ class ApiExceptionHandler {
         markCloudError(e.code());
         MessageCatalog.Rendered rendered = catalog.render(e.code(), e.args());
         // Sorted so the params render identically regardless of throw-site order (a stable machine contract).
-        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), diagnosticMessage(rendered.message()));
+        var diagnostic = e instanceof io.tapstate.control.core.ConnectionTestRefusal refusal ? refusal.diagnostic() : Map.<String, Object>of();
+        ApiError body = new ApiError(e.code().code(), new TreeMap<>(e.args()), diagnosticMessage(rendered.message()), diagnostic);
         HttpStatus status=statusFor(e.code());
         if(e.code()==io.tapstate.core.validation.ValidationError.VALUE_LIMIT_EXCEEDED
                 &&java.util.Set.of("validation.metadataFrames","validation.processEnvelope","validation.cooperativeHeadroom").contains(e.args().get("limit")))status=HttpStatus.TOO_MANY_REQUESTS;
@@ -172,7 +173,10 @@ class ApiExceptionHandler {
             Map.entry("store.tls-trust-invalid", HttpStatus.BAD_REQUEST),
             Map.entry("control.ai-not-configured", HttpStatus.CONFLICT),
             Map.entry("control.ai-provider-auth-failed", HttpStatus.UNPROCESSABLE_CONTENT),
+            Map.entry("control.ai-provider-request-rejected", HttpStatus.BAD_GATEWAY),
+            Map.entry("control.ai-provider-rate-limited", HttpStatus.TOO_MANY_REQUESTS),
             Map.entry("control.ai-provider-failed", HttpStatus.BAD_GATEWAY),
+            Map.entry("control.ai-provider-output-limit", HttpStatus.BAD_GATEWAY),
             Map.entry("control.ai-invalid-proposal", HttpStatus.UNPROCESSABLE_CONTENT),
             Map.entry("control.ai-overloaded", HttpStatus.TOO_MANY_REQUESTS),
             Map.entry("control.auth-failed", HttpStatus.UNAUTHORIZED),
