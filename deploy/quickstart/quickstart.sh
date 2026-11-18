@@ -55,6 +55,15 @@ shell_quote() {
     esac
 }
 
+# $1, a command printed for the reader to paste, in the form that runs where it has to. In place it
+# stays bare: the reader's shell is already in the demo directory. Piped, it becomes
+# (cd <demo directory> && $1). The subshell reaches the stack without moving the reader's shell, so the
+# installer run again from that shell is still the piped form and lands back in the directory it made,
+# instead of running in place there and taking that directory for the user's own.
+in_demo_dir() {
+    if [ -n "$demo_cd" ]; then printf '(%s && %s)' "$demo_cd" "$1"; else printf '%s' "$1"; fi
+}
+
 # Download $1 to the file $2 with whichever of curl / wget is present.
 #
 # The transfer lands in $2.part and is moved into place only once it has completed, so an interrupted
@@ -385,7 +394,7 @@ print_next_steps() {
         agent_lines="    1. Give your agent the Tapstate authoring skills. Without them it can write a pipeline that
        validates and runs but does not mean what you asked:
          npx --yes skills add tapstate/tapstate-skills
-    2. Connect it: $agent_config in this directory starts Tapstate's MCP server with a write token.
+    2. Connect it: $agent_config in $this_dir starts Tapstate's MCP server with a write token.
          Claude Code:   claude --mcp-config $agent_config
          other agents:  copy its \"tapstate\" entry into the agent's MCP settings
     3. Ask it, for example:
@@ -400,7 +409,7 @@ print_next_steps() {
     # nothing to say, and the line stays empty.
     go_there=""
     [ -z "$demo_cd" ] || go_there="
-The commands below run in $this_dir, which this run made; your shell is still where you started:
+The commands below run in $this_dir, the directory this run works in; your shell is still where you started:
   $demo_cd
 "
     # How long a pasted wait keeps trying. Taken for the slowest healthy machine, not the fastest: a
@@ -575,7 +584,7 @@ await_entry() {
         i=$((i + 1))
         sleep "$poll"
     done
-    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: ${run_here}docker compose logs server"
+    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: $(in_demo_dir 'docker compose logs server')"
 }
 
 setup_post() {
@@ -625,17 +634,17 @@ main() {
     # Where every command printed from here on has to run, said in the command itself. In place, the
     # reader's shell is already in this directory and the commands stay bare. Piped from elsewhere, the
     # script works in a directory the reader's shell is not in -- and no child process can move the
-    # shell that started it -- so each printed command opens with the cd that gets there, and the prose
-    # names the directory rather than calling it "this directory". The `working in` line below is no
-    # substitute: it is the first line of the run, long scrolled away by the time a failure is printed.
-    this_dir="this directory"; demo_cd=""; run_here=""
+    # shell that started it -- so each printed failure command carries the cd that gets there (see
+    # in_demo_dir), and the prose names the directory rather than calling it "this directory". The
+    # `working in` line below is no substitute: it is the first line of the run, long scrolled away by
+    # the time a failure is printed.
+    this_dir="this directory"; demo_cd=""
     if [ ! -f ./quickstart.sh ] && [ ! -f ./docker-compose.yml ]; then
         mkdir -p tapstate-demo
         cd tapstate-demo
         demo_dir_is_ours=yes
         this_dir="$PWD"
         demo_cd="cd $(shell_quote "$PWD")"
-        run_here="$demo_cd && "
         printf 'quickstart: working in %s\n' "$PWD"
     fi
 
@@ -801,7 +810,7 @@ main() {
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
-            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: ${run_here}docker compose down -v (it deletes the demo's data), then run the installer again." ;;
+            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: $(in_demo_dir 'docker compose down -v') (it deletes the demo's data), then run the installer again." ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the
     # REPL running but makes it exit 1, while older CLIs can still exit zero.
@@ -870,7 +879,7 @@ main() {
     # only evidence the script has that a pipeline is moving data. The stack is left standing rather
     # than torn down -- the server log is the next thing to read, and a teardown would take it along.
     { [ "$orders" -ge "$seeded_orders" ] && [ "$shipments" -ge "$seeded_shipments" ]; } \
-        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: ${run_here}docker compose logs server"
+        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: $(in_demo_dir 'docker compose logs server')"
     printf 'quickstart: %s orders from MySQL, each carrying its shipments from PostgreSQL -- %s of them, in one object per order\n' \
         "$orders" "$shipments"
 

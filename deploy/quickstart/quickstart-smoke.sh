@@ -491,7 +491,10 @@ DOCK
   chmod +x "$scratch/compose/docker" "$scratch/nap/sleep"
 
   for scenario in installation-never-ready login-refused nothing-assembled success; do
-    n=$((n + 1)); start="$scratch/user$n"; demo="$start/tapstate-demo"
+    # Every other start directory holds a space and a single quote, so the printed cd has to be quoted
+    # to paste back as the one directory it names.
+    n=$((n + 1)); start="$scratch/user$n"; [ $((n % 2)) -eq 1 ] || start="$scratch/it's user $n"
+    demo="$start/tapstate-demo"
     mkdir -p "$demo"; cp "$QUICKSTART_SH" "$demo/quickstart.sh"
     case "$scenario" in
       installation-never-ready)
@@ -521,6 +524,10 @@ DOCK
         failures="$failures
       $scenario: the closing text says \"run in this directory\" and never names $demo, so it reads as the user's own"
       fi
+      if [ "$(printf '%s\n' "$RUN_OUT" | grep -cF -e "(run in $demo)" -e "(run in $real)")" -lt 2 ]; then
+        failures="$failures
+      $scenario: the Stop and Tear down headings do not both name $demo"
+      fi
       continue
     fi
     ran=0
@@ -536,7 +543,7 @@ DOCK
         failures="$failures
       $scenario: \`$cmd\`, run as printed from $start, answers: $(tr '\n' ' ' < "$scratch/said")"
       fi
-    done < <(printf '%s\n' "$RUN_OUT" | grep -oE '(cd [^&;|()]+ && )?docker compose[^;,()&|]*')
+    done < <(printf '%s\n' "$RUN_OUT" | grep -oE '\(?(cd [^&;|()]+ && )?docker compose[^;,()&|]*\)?')
     [ "$ran" -gt 0 ] || failures="$failures
       $scenario: the failure printed no command to run at all: $RUN_OUT"
   done
