@@ -12,7 +12,8 @@ public enum ProductErrorModule {
     MCP("026"),
     SCHEMA("027"),
     LIFECYCLE("028"),
-    START_CHECK("029");
+    START_CHECK("029"),
+    VALIDATION("030");
 
     private final String number;
 

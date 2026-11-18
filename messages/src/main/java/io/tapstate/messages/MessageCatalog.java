@@ -90,6 +90,8 @@ public final class MessageCatalog {
             registered = LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isEmpty())
             registered = StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -111,7 +113,8 @@ public final class MessageCatalog {
                 .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+                .or(() -> StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
         if (registered.isPresent()) {
             var text = registered.orElseThrow();
             return Optional.of(new Rendered(text.message(), text.solution()));

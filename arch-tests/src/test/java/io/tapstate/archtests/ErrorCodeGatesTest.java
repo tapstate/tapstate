@@ -77,7 +77,8 @@ class ErrorCodeGatesTest {
                 io.tapstate.core.common.McpErrorDefinitions.registered(),
                 io.tapstate.core.common.SchemaErrorDefinitions.registered(),
                 io.tapstate.core.common.LifecycleErrorDefinitions.registered(),
-                io.tapstate.core.common.StartCheckDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+                io.tapstate.core.common.StartCheckDefinitions.registered(),
+                io.tapstate.core.common.ValidationErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
         return registered;
@@ -197,7 +198,8 @@ class ErrorCodeGatesTest {
                                 && io.tapstate.messages.McpDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.SchemaDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.LifecycleDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
-                                && io.tapstate.messages.StartCheckDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                                && io.tapstate.messages.StartCheckDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ValidationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();

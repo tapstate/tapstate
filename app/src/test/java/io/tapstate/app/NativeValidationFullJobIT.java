@@ -340,7 +340,7 @@ class NativeValidationFullJobIT {
                 await(()->f.resources.snapshot().metadataFrames()==0&&f.resources.snapshot().processReserved().isEmpty());
                 var failure=access.reports().find(reference).orElseThrow().failure();assertThat(failure).isNotNull();
                 assertThat(failure.code()).isEqualTo(ValidationError.OWNER_NOT_AUTHORIZED.code());assertThat(failure.params()).containsEntry("pipeline","flow");
-                assertThat(failure.technical()).contains("validation.owner-not-authorized","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
+                assertThat(failure.technical()).contains("TS0300014","last-reader-after-owner-failure");assertThat(failure.fatal()).isFalse();
             }finally{state.readers.set(true);state.callbackRelease.countDown();state.delayedReceipt.completeExceptionally(new java.util.concurrent.CancellationException("Fixture cleanup"));}
         }finally{if(identity!=null)ValidationJobExecutionTest.forgetOriginal(identity);}
     }

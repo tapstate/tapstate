@@ -166,7 +166,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> ValidationDeclarations.inspect(pipeline, resources,
                 new ValidationDeclarations.Output(ValidationDeclarations.OutputKind.VIEW, "output"),
                 new ValidationDeclarations.Limits(128, 1024, 128, 32, 8192)))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
     }
 
     @Test
@@ -175,7 +175,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> ValidationDeclarations.inspect(pipeline, definitions(),
                 new ValidationDeclarations.Output(ValidationDeclarations.OutputKind.VIEW, "output"),
                 new ValidationDeclarations.Limits(128, 1024, 128, 32, 1024)))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012");
         var result = inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.VIEW, "output");
         assertThat(result.accountedMetadataBytes()).isBetween(512L, LIMITS.metadataBytes());
         assertThatThrownBy(() -> result.requiredResourceIds().clear()).isInstanceOf(UnsupportedOperationException.class);

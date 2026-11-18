@@ -1104,6 +1104,16 @@
         "validationCountOwner formatVersion 1 holds generation, preparationId, nodeId, bootId, claimGeneration, executionGeneration, and topologyRevision. It has authority only when it matches the current COMPLETE validationPreparation and the current scope. Older rows without it remain readable and a verified manual COUNT acquisition creates it. A different Pipeline lifetime never inherits this authority.",
         "First COUNT acquisition publishes the exact committed CACHE birth and lease under the original ISSUED preparation only when CONFIG advances that original to COMPLETE. An expired or mismatching original is discarded. No replay creates another lease or revives a superseded owner."
       ]
+    },
+    "validation-report-product-codes": {
+      "goal": "Retain original validation configuration, one-time report birth rights and complete retained observations without recreating old runs.",
+      "entry": "Restore the original matching CONFIG backup; explicitly prepare or upgrade the validation schema before admitting work.",
+      "prerequisites": [
+        "Original Cluster identity, task generation, two bounded mode permissions and configuration revision are trusted.",
+        "An OPEN permission is consumed by report birth or revoked by closure in the same CONFIG transaction. BORN without its original report is loss, not permission to recreate. CLOSED or superseded sequences never reopen.",
+        "A new task identity never inherits a deleted task generation. History cleanup does not reset start counters; validation never resumes old execution.",
+        "Before the first canonical TS per-pair failure is written, retain and verify a compatible recovery build that reads both code forms from original reports. An unmodified legacy reader rejects canonical codes and is not a supported rollback reader after that write. Recovery preserves current CONFIG records and original publication fences; it never deletes reports or recreates runs to regain readability."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -4339,14 +4349,14 @@
     {
       "id": "mongo.config.validation_reports",
       "resourceVersion": 1,
-      "proposalVersion": 3,
+      "proposalVersion": 4,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "validation_reports"
       ],
-      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one. Report snapshots accept comparison formats 1 and 2. Per-pair failures are published to the original report and open epoch in the same CONFIG transaction.",
+      "responsibility": "Original validation report identity, publication epoch, known terminal mirror and retained bounded scope/diagnostic summaries. Only the exact OPEN task permission may create a report; publish never creates one. Report snapshots accept comparison formats 1 and 2. Per-pair failures are published to the original report and open epoch in the same CONFIG transaction. Stored per-pair diagnostic codes accept both legacy lowercase identifiers and canonical TS product codes with nonzero module and serial components. New product failures retain their canonical code; historical records are neither rewritten nor assigned guessed codes.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoValidationResultStore",
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
@@ -4355,7 +4365,7 @@
         "io.tapstate.adapters.mongostore.MongoValidationResultStore",
         "io.tapstate.adapters.mongostore.MongoValidationAdmissionStore"
       ],
-      "recovery": "validation-configuration",
+      "recovery": "validation-report-product-codes",
       "consistency": "validation-config-r3",
       "growth": "One bounded report per actual run, with pending-history mirrors counted in the same per-task/per-mode retention (default 10, range 1..100). Admission identity <=8 KiB per report. Actual total bytes and active/unknown records remain accounted; cleanup cannot reopen birth rights. At most one failure per mapping ordinal, up to 1024, with a bounded error code, side, and reason of at most 256 UTF-8 bytes. Failures count toward the existing header and report byte caps.",
       "evidence": [

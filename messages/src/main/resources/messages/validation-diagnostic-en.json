@@ -1,0 +1,78 @@
+{
+  "TS0300001": {
+    "message": "A validation cron schedule needs five fields; this expression has {count}.",
+    "solution": "Use minute, hour, day of month, month and day of week. Seconds and years are not supported."
+  },
+  "TS0300002": {
+    "message": "Validation schedule field {field} has an invalid value `{value}` at position {position}.",
+    "solution": "Check the field range and supported UNIX syntax, or choose an explicit IANA time zone. Technical details retain the parser cause."
+  },
+  "TS0300003": {
+    "message": "The validation schedule has no possible calendar date.",
+    "solution": "Check the selected months and days. Leap days are supported."
+  },
+  "TS0300004": {
+    "message": "Validation schedule calculation reached its {limit} limit.",
+    "solution": "This is a calculation limit, not proof of an invalid expression. Retry within the available calculation budget before enabling the schedule."
+  },
+  "TS0300005": {
+    "message": "Validation execution at node {node} was cancelled before completion.",
+    "solution": "A cancelled expansion is incomplete. Read the original run state before starting new work."
+  },
+  "TS0300006": {
+    "message": "Source field {field} conflicts with a generated output field at node {node}.",
+    "solution": "Inspect the source shape and declared expansion; do not overwrite the original field or treat the conflict as an empty result."
+  },
+  "TS0300007": {
+    "message": "Validation cannot interpret {rule} for field {field} at node {node}.",
+    "solution": "Use a supported validation rule; validation cannot execute production expressions as its reference."
+  },
+  "TS0300008": {
+    "message": "Validation field {field} is missing or invalid.",
+    "solution": "Correct the validation configuration or inspect the failed reader contract."
+  },
+  "TS0300009": {
+    "message": "A validation key exceeds its {limit} limit.",
+    "solution": "Use a supported bounded key; the validation cannot truncate identity values."
+  },
+  "TS0300010": {
+    "message": "Validation key component {component} has an incompatible logical domain or shape.",
+    "solution": "Confirm compatible source and destination key mappings and native ordering."
+  },
+  "TS0300011": {
+    "message": "Validation cannot move from {from} to {to} in {mode} mode.",
+    "solution": "Read the original run state before retrying the operation."
+  },
+  "TS0300012": {
+    "message": "Validation read facts exceed their {limit} budget.",
+    "solution": "Inspect the affected value or root size; validation cannot truncate facts to continue."
+  },
+  "TS0300013": {
+    "message": "Validation cannot safely carry a value of type {type}.",
+    "solution": "Use a connector codec that preserves this value in a supported portable form."
+  },
+  "TS0300014": {
+    "message": "The validation owner for Pipeline {pipeline} is no longer authorized.",
+    "solution": "The old validation run must end. Start a new run after the owner has been safely retired."
+  },
+  "TS0300015": {
+    "message": "The independent validation read of {table} failed.",
+    "solution": "Inspect the reader error and connection before starting another validation."
+  },
+  "TS0300016": {
+    "message": "The validation reader for {table} violated its result-delivery contract.",
+    "solution": "Check the connector's query implementation; incomplete data cannot be treated as EOF."
+  },
+  "TS0300017": {
+    "message": "The independent validation read of {table} was cancelled.",
+    "solution": "A cancelled read is incomplete; start a new validation when authorized."
+  },
+  "TS0300018": {
+    "message": "Connector {connector} failed to convert validation field {field}.",
+    "solution": "Inspect the codec failure; another codec cannot silently replace its result."
+  },
+  "TS0300019": {
+    "message": "Connector {connector} did not provide a usable validation value for field {field}.",
+    "solution": "Check the codec and logical type support. A missing result or raw driver value cannot establish equality."
+  }
+}

@@ -28,7 +28,7 @@ public record ValidationOperation(Context context,String pipeline,String task,UU
         public Status {
             if(original==null||outcome==null||drain==null||tables==null||tables.size()>ValidationTaskSpec.MAX_MAPPINGS)throw invalid("status");
             if(run!=null)name(run);if(state!=null)io.tapstate.core.validation.ValidationRunState.valueOf(state);
-            if(reason!=null&&!reason.matches("[a-z][a-z0-9.-]{0,127}"))throw invalid("reason");tables=List.copyOf(tables);
+            if(reason!=null&&!reason.matches("(?:[a-z][a-z0-9.-]{0,127}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})"))throw invalid("reason");tables=List.copyOf(tables);
         }
     }
     /** Request-scoped ownership of the bounded status and logical table projection through serialization. */

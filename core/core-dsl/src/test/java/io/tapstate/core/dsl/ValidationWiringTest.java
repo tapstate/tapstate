@@ -121,7 +121,7 @@ class ValidationWiringTest {
                   - { id: second, from: [first], type: union }
                 """);
         assertThatThrownBy(() -> inspect(cyclic, Map.of(), "first"))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.rule-unsupported");
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300007");
     }
 
     @Test
@@ -179,7 +179,7 @@ class ValidationWiringTest {
     private static void assertLimit(PipelineResource pipeline, Map<String, Resource> resources, FromClause selected,
             Wiring.InspectionLimits limits, String dimension) {
         assertThatThrownBy(() -> Wiring.inspect(pipeline, resources, selected, limits))
-                .isInstanceOf(TapstateException.class).hasMessageContaining("validation.value-limit-exceeded")
+                .isInstanceOf(TapstateException.class).hasMessageContaining("TS0300012")
                 .hasMessageContaining("validation.wiring." + dimension);
     }
     private static Wiring.Inspection inspect(PipelineResource pipeline, Map<String, Resource> resources, String selected) {
