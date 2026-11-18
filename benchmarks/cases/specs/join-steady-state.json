@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "join-facts",
+      "operator": "join"
+    }
+  ],
+  "inputs": {
+    "facts": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "trial_rows": 10000,
+      "join_key": "dimension_id"
+    },
+    "dimensions": {
+      "primary_key": "id",
+      "trial_rows": 1000,
+      "receives_changes": false
+    }
+  },
+  "parameters": {
+    "operations": [
+      "update existing keys only"
+    ],
+    "engine": "builtin",
+    "dimension_keys": "unique",
+    "match_percent": 90,
+    "steady_windows_minimum_trial": 3,
+    "trial_parameters": [
+      "window duration",
+      "arrival rate"
+    ],
+    "initial_state": "Build matched and unmatched facts and unique dimension rows once per repeat."
+  },
+  "expected": {
+    "readback": [
+      "Check fixed key and state cardinality alongside independently joined updated values.",
+      "Compare early, middle and late equal steady windows and report coverage and growth within the same sample scope."
+    ]
+  },
+  "completion": {
+    "target_unit": "joined target write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

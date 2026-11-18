@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "even-keys",
+      "operator": "filter"
+    }
+  ],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers"
+    }
+  },
+  "parameters": {
+    "predicate": "id is even",
+    "target_snapshot_selectivity_percent": 50
+  },
+  "expected": {
+    "readback": [
+      "Enumerate exactly the even keys and compare their values; assert odd keys are absent.",
+      "Check updates and removals of even rows; classify odd-key events as intended no-output and exclude them from acknowledgement samples."
+    ]
+  },
+  "completion": {
+    "target_unit": "retained target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

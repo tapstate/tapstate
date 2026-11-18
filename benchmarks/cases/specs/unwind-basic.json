@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "expand",
+      "operator": "unwind"
+    }
+  ],
+  "inputs": {
+    "parents": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "element_count": 4,
+      "element_key": "element_id",
+      "order_field": "element_index"
+    }
+  },
+  "parameters": {
+    "array_field": "items",
+    "width_includes_array": true
+  },
+  "expected": {
+    "readback": [
+      "Enumerate each expected parent and element identity, ordinal and value; a negative fixture replaces an element while preserving the count.",
+      "Check that changes and parent deletes propagate to the corresponding members. Qualify null and empty arrays separately."
+    ]
+  },
+  "completion": {
+    "target_unit": "expanded target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

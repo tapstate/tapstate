@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "graph": [],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers"
+    }
+  },
+  "parameters": {
+    "phase_order": [
+      "snapshot",
+      "cdc"
+    ],
+    "snapshot_protocol": "snapshot"
+  },
+  "expected": {
+    "readback": [
+      "Compare snapshot keys and values, then replay the expected CDC changes including a repeated key at the boundary.",
+      "Witness no lost or duplicate changes and report snapshot and CDC separately."
+    ]
+  },
+  "completion": {
+    "target_unit": "target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

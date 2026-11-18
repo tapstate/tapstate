@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "rewrite",
+      "operator": "js"
+    }
+  ],
+  "inputs": {
+    "records": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "required_fields": {
+        "id": "integer primary key",
+        "value": "integer",
+        "label": "string"
+      }
+    }
+  },
+  "parameters": {
+    "transform": {
+      "value": "value + 7",
+      "label": "prefix with js-"
+    },
+    "deterministic": true
+  },
+  "expected": {
+    "readback": [
+      "Independently compute the integer and text changes; compare original keys and untouched fields.",
+      "Check transformed CDC updates and deletes. Record script warm-up separately."
+    ]
+  },
+  "completion": {
+    "target_unit": "target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

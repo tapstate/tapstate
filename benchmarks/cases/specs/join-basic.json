@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "join-facts",
+      "operator": "join"
+    }
+  ],
+  "inputs": {
+    "facts": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "trial_rows": 10000,
+      "join_key": "dimension_id"
+    },
+    "dimensions": {
+      "primary_key": "id",
+      "trial_rows": 1000,
+      "receives_changes": false
+    }
+  },
+  "parameters": {
+    "engine": "builtin",
+    "match_percent": 90,
+    "dimension_distribution": "uniform",
+    "output_key": "fact id",
+    "dimension_keys": "unique",
+    "initial_state": "Load fact and dimension state through the normal pipeline before measured CDC."
+  },
+  "expected": {
+    "readback": [
+      "Compute an independent equality inner join with unique dimension keys; compare exact fact keys and projected fields.",
+      "Prove absence for unmatched facts and withdrawal after deletes. Prepare actual operator state before the measured change batch."
+    ]
+  },
+  "completion": {
+    "target_unit": "joined target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

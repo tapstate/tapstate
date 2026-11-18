@@ -1,0 +1,45 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "merge",
+      "operator": "union"
+    }
+  ],
+  "inputs": {
+    "left": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "lower disjoint range",
+      "share_percent": 50
+    },
+    "right": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "upper disjoint range",
+      "share_percent": 50
+    }
+  },
+  "parameters": {
+    "schema": "identical",
+    "stream_completion": "every stream independently"
+  },
+  "expected": {
+    "readback": [
+      "Compare the union of per-stream expected keys and values, including a tail batch on only one stream.",
+      "Verify each stream's event order and endpoint without assuming a global cross-stream order."
+    ]
+  },
+  "completion": {
+    "target_unit": "target row or write",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

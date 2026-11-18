@@ -1,0 +1,53 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "join-facts",
+      "operator": "join"
+    }
+  ],
+  "inputs": {
+    "facts": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "trial_rows": 10000,
+      "join_key": "dimension_id"
+    },
+    "dimensions": {
+      "primary_key": "id",
+      "trial_rows": 1000,
+      "receives_changes": false
+    }
+  },
+  "parameters": {
+    "same_jvm_cycles_per_repeat": 3,
+    "independent_repeats": "new OP JVM and equivalent initial state",
+    "phase_order": [
+      "snapshot",
+      "cdc"
+    ],
+    "engine": "builtin",
+    "dimension_keys": "unique",
+    "match_percent": 90,
+    "trial_parameters": [
+      "cycle run duration",
+      "stop timeout",
+      "idle window"
+    ]
+  },
+  "expected": {
+    "readback": [
+      "Each cycle must reach valid target acknowledgement and STOPPED, with no more target consumption after stop.",
+      "Check declared releasable queue and in-flight resources at matching idle windows; report durable state separately."
+    ]
+  },
+  "completion": {
+    "target_unit": "joined target write per cycle",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}

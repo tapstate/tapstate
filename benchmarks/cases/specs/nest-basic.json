@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "graph": [
+    {
+      "id": "build-documents",
+      "operator": "nest"
+    }
+  ],
+  "inputs": {
+    "roots": {
+      "primary_key": "id",
+      "trial_rows": 2000,
+      "children_per_root": 4,
+      "incremental_initial_rows_trial_target": 75000,
+      "receives_changes": false
+    },
+    "children": {
+      "rows": {
+        "snapshot": "profile snapshot target",
+        "incremental": "initial mutable-key target"
+      },
+      "primary_key": "id",
+      "receives_changes": true,
+      "key_space": "consecutive integers",
+      "foreign_key": "root_id",
+      "trial_rows": 8000
+    }
+  },
+  "parameters": {
+    "depth": 1,
+    "child_order": "ascending child key",
+    "initial_state": "Establish and verify root and child state through the normal pipeline before the measured child-only batch."
+  },
+  "expected": {
+    "readback": [
+      "Group children independently by root_id and compare root fields and complete child members in ascending child-key order.",
+      "Verify updated and removed members and unchanged roots; one merged target acknowledgement cannot count as multiple independent samples."
+    ]
+  },
+  "completion": {
+    "target_unit": "root document or acknowledged write group",
+    "evidence": "Actual acknowledgement for every expected target unit. A separate readback checks expected keys and values."
+  }
+}
