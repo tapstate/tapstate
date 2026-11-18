@@ -446,17 +446,20 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        boolean strict=planning||"transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY));
-        if(strict){if(runtime)structure.verifySrsRuntime();else structure.verifySrs();}
-        else if(runtime)structures.require(MongoStructureProof.Kind.SRS_RUNTIME,structure::verifySrsRuntime);
-        else structures.require(MongoStructureProof.Kind.SRS,structure::verifySrs);
+        boolean reuseStructure = runtime && !"transaction".equals(System.getProperty(MongoSrsLease.VALIDATION_PROPERTY));
+        if (reuseStructure) structures.require(MongoStructureProof.Kind.SRS_RUNTIME, structure::verifySrsRuntime);
+        else if (runtime) structure.verifySrsRuntime();
+        else structure.verifySrs();
         active.run();
-        Runnable physical = structures.check(MongoStructureProof.Kind.SRS,structure::verifySrs);
-        Runnable verifyStructure = planning ? () -> {} : strict ? structure::verifySrs : new MongoStructureProof.Check(){
-            public void run(){if(!runtime || !expected.equals(admittedCaptureStartup.get()))physical.run();}
-            public void invalidate(){structures.clear();}
-            public long remainingNanos(){return structures.remainingSrs();}
-        };
+        Runnable verifyStructure = planning ? () -> {} : structure::verifySrs;
+        if (reuseStructure) {
+            Runnable physical = structures.check(MongoStructureProof.Kind.SRS, structure::verifySrs);
+            verifyStructure = new MongoStructureProof.Check() {
+                public void run() { if (!expected.equals(admittedCaptureStartup.get())) physical.run(); }
+                public void invalidate() { structures.clear(); }
+                public long remainingNanos() { return structures.remainingSrs(); }
+            };
+        }
         var lease = MongoSrsLease.selected(verifyStructure);
         var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
         return new io.tapstate.spi.store.SrsStores(

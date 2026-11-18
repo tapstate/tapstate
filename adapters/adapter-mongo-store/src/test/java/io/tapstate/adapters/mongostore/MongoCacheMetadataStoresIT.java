@@ -69,10 +69,11 @@ class MongoCacheMetadataStoresIT {
     @Test void warmPhysicalProofsKeepLiveIdentityChecksAndExpireBeforeTenSecondsOfDrift() {
         withFixture(f->{
             for(var table:List.of(SystemCollections.SRS_CHAINS,SystemCollections.SRS_MODELS,SystemCollections.SRS_MODEL_CONTEXTS,
-                    SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)){
+                    SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,SystemCollections.SRS_CONSUMERS,
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_PIPELINE_STATE)){
                 table.prepareCollectionOn(f.database);for(var index:table.indexes())IndexEnsure.createIfAbsent(table.on(f.database),index);
             }
-            var stores=f.domain.srs(SCOPE,ACTIVE);assertThat(stores.chains().load("absent")).isEmpty();
+            var stores=f.domain.runtimeSrs(SCOPE,ACTIVE);assertThat(stores.chains().load("absent")).isEmpty();
             var commands=new ArrayList<String>();MongoCommandObservation.CURRENT.set(commands::add);
             try{assertThat(stores.chains().load("absent")).isEmpty();}
             finally{MongoCommandObservation.CURRENT.remove();}
