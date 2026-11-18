@@ -100,6 +100,7 @@ import org.springframework.context.ConfigurableApplicationContext;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
@@ -108,6 +109,8 @@ import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.web.client.RestClient;
 
 import org.springframework.web.method.HandlerMethod;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
 import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 
 import java.time.Clock;
@@ -119,6 +122,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -945,6 +949,149 @@ class AuthTest {
                 .header("Authorization", "Bearer " + machineToken(Scope.READ))
                 .exchange((request, response) -> response.getStatusCode());
         assertThat(authenticated).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void authenticatedOptionsOnClusterMembersReturnsAllowedMethods() {
+        client().options().uri("/api/cluster/members")
+                .headers(headers -> headers.setBearerAuth(machineToken(Scope.ADMIN)))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).as("OPTIONS /api/cluster/members").isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow())
+                            .containsExactlyInAnyOrder(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
+                    return null;
+                });
+    }
+
+    @Test
+    void optionsRequiresACredentialForAMappedRoute() {
+        for (String authorization : List.of("", "Bearer not-a-real-token")) {
+            ApiError body = client().options().uri("/api/cluster/members")
+                    .headers(headers -> {
+                        if (!authorization.isEmpty()) headers.set(HttpHeaders.AUTHORIZATION, authorization);
+                    })
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.UNAUTHORIZED);
+                        assertThat(response.getHeaders().getAllow()).isEmpty();
+                        return response.bodyTo(ApiError.class);
+                    });
+            assertThat(body.code()).isEqualTo("control.unauthenticated");
+        }
+    }
+
+    @Test
+    void optionsRequiresEveryScopeRepresentedInAllow() {
+        String read = machineToken(Scope.READ);
+        client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(read))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow())
+                            .containsExactlyInAnyOrder(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.OPTIONS);
+                    return null;
+                });
+
+        String draft = "/api/pipelines/orders/draft";
+        ApiError refused = client().options().uri(draft).headers(headers -> headers.setBearerAuth(read))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    assertThat(response.getHeaders().getAllow()).isEmpty();
+                    return response.bodyTo(ApiError.class);
+                });
+        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.params()).containsEntry("op", "pipeline-draft.create").containsEntry("required", "write");
+
+        client().options().uri(draft).headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getAllow()).containsExactlyInAnyOrder(
+                            HttpMethod.GET, HttpMethod.HEAD, HttpMethod.POST, HttpMethod.PUT, HttpMethod.DELETE, HttpMethod.OPTIONS);
+                    return null;
+                });
+    }
+
+    @Test
+    void optionsLeavesUnknownPathsAndCorsPreflightToMvc() {
+        client().options().uri("/api/runtime-image-smoke-missing").exchange((request, response) -> {
+            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+            return null;
+        });
+        client().options().uri("/api/cluster/members")
+                .header(HttpHeaders.ORIGIN, "https://other.example")
+                .header(HttpHeaders.ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .exchange((request, response) -> {
+                    assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                    assertThat(response.getHeaders().getFirst(HttpHeaders.ACCESS_CONTROL_ALLOW_ORIGIN)).isNull();
+                    return null;
+                });
+    }
+
+    @Test
+    void anExplicitOptionsHandlerRequiresItsOwnScope() throws NoSuchMethodException {
+        var mapping = context.getBean(RequestMappingHandlerMapping.class);
+        var explicit = RequestMappingInfo.paths("/api/cluster/members").methods(RequestMethod.OPTIONS)
+                .options(mapping.getBuilderConfiguration()).build();
+        var controller = new OptionsTestHandler();
+        mapping.registerMapping(explicit, controller, OptionsTestHandler.class.getDeclaredMethod("explicit"));
+        try {
+            client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(machineToken(Scope.READ)))
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                        assertThat(response.bodyTo(ApiError.class).params()).containsEntry("op", "pipeline-draft.replace");
+                        return null;
+                    });
+            assertThat(controller.invoked).isFalse();
+            client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))
+                    .exchange((request, response) -> {
+                        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+                        assertThat(response.getHeaders().getAllow()).containsExactly(HttpMethod.OPTIONS);
+                        return null;
+                    });
+            assertThat(controller.invoked).isTrue();
+        } finally {
+            mapping.unregisterMapping(explicit);
+        }
+    }
+
+    @Test
+    void optionsCannotDiscoverHandlersWithoutRegisteredVerbs() throws NoSuchMethodException {
+        var mapping = context.getBean(RequestMappingHandlerMapping.class);
+        var put = RequestMappingInfo.paths("/api/cluster/members").methods(RequestMethod.PUT)
+                .options(mapping.getBuilderConfiguration()).build();
+        var controller = new OptionsTestHandler();
+        String admin = machineToken(Scope.ADMIN);
+        for (String method : List.of("unannotated", "unregistered")) {
+            mapping.registerMapping(put, controller, OptionsTestHandler.class.getDeclaredMethod(method));
+            try {
+                client().options().uri("/api/cluster/members").headers(headers -> headers.setBearerAuth(admin))
+                        .exchange((request, response) -> {
+                            assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+                            assertThat(response.getHeaders().getAllow()).isEmpty();
+                            return null;
+                        });
+                assertThat(controller.invoked).isFalse();
+            } finally {
+                mapping.unregisterMapping(put);
+            }
+        }
+    }
+
+    static class OptionsTestHandler {
+        private final AtomicBoolean invoked = new AtomicBoolean();
+
+        @Verb("pipeline-draft.replace")
+        ResponseEntity<Void> explicit() {
+            invoked.set(true);
+            return ResponseEntity.ok().allow(HttpMethod.OPTIONS).build();
+        }
+
+        void unannotated() {
+            invoked.set(true);
+        }
+
+        @Verb("test.unregistered")
+        void unregistered() {
+            invoked.set(true);
+        }
     }
 
     // ---- the unauthenticated surface is a closed allow-list (root-exit convergence) ----
