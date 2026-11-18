@@ -30,7 +30,7 @@ class MongoValidationTaskStoreIT {
     @Container static final MongoDBContainer CACHE = new MongoDBContainer(DockerImageName.parse("mongo:7.0"));
     static final Duration TTL = Duration.ofSeconds(30);
 
-    @Test void aRetriedDiscoveryRechecksPhysicalStructureAfterATransientFailure() {
+    @Test void aRetriedDiscoveryKeepsItsProofWithoutCheckingPhysicalStructure() {
         try (var f = new Fixture()) {
             var injected = new java.util.concurrent.atomic.AtomicBoolean();
             var admin = f.configClient.getDatabase("admin");
@@ -44,7 +44,7 @@ class MongoValidationTaskStoreIT {
                 }
             });
             try {
-                assertThatThrownBy(() -> f.tasks.pipelines(null, 1)).isInstanceOf(TapstateException.class);
+                assertThat(f.tasks.pipelines(null, 1)).isEmpty();
                 assertThat(injected).isTrue();
             } finally {
                 MongoCommandObservation.COLLECTIONS.remove();
@@ -68,20 +68,23 @@ class MongoValidationTaskStoreIT {
         }
     }
 
-    @Test void definitionDiscoveryAuditsEachIndexOncePerOperationAndDetectsLaterDamage() {
+    @Test void definitionDiscoveryDefersCatalogDriftToInspection() {
         try (var f = new Fixture()) {
             var reads = new HashMap<String, Integer>();
             MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
-                if (command.equals("listIndexes")) reads.merge(collection, 1, Integer::sum);
+                if (command.equals("listIndexes") || command.equals("listCollections")) reads.merge(collection, 1, Integer::sum);
             });
             try {
                 assertThat(f.tasks.pipelines(null, 1)).isEmpty();
-                assertThat(reads.get(SystemCollections.VALIDATION_TASKS.collectionName())).isEqualTo(1);
-                assertThat(reads.get(SystemCollections.VALIDATION_REPORTS.collectionName())).isEqualTo(1);
-                assertThat(reads.get(SystemCollections.VALIDATION_DIFFERENCES.collectionName())).isEqualTo(1);
+                assertThat(reads).isEmpty();
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
             SystemCollections.VALIDATION_TASKS.on(f.configDb).dropIndex("validation_tasks_pipeline_task");
-            assertThatThrownBy(() -> f.tasks.pipelines(null, 1)).isInstanceOf(TapstateException.class);
+            assertThat(f.tasks.pipelines(null, 1)).isEmpty();
+            assertThat(f.configuration.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.index()).isEqualTo("validation_tasks_pipeline_task");
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                    });
         }
     }
 

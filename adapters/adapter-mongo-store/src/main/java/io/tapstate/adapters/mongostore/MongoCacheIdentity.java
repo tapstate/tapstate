@@ -99,6 +99,7 @@ final class MongoCacheIdentity {
             }
         });
         MongoValidationSchema.requireReady(database, false);
+        MongoValidationSchema.verify(database, MongoValidationSchema.CACHE);
     }
 
     /** The retained first transaction is also the continuation boundary after an interrupted upgrade. */

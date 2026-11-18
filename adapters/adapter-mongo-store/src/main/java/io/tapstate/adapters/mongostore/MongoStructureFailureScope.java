@@ -89,12 +89,19 @@ final class MongoStructureFailureScope {
 
     static void translated(MongoException failure, RuntimeException translated) {
         var scope = CURRENT.get();
-        if (scope != null && scope.failed != null && (failure == scope.failedDriver
-                || scope.failedDriver == null && (failure instanceof com.mongodb.MongoWriteException write
-                && write.getError().getCode() == scope.failedCode
+        if (scope != null && scope.failed != null && scope.matchesDriverFailure(failure)) scope.translated = translated;
+    }
+
+    private boolean matchesDriverFailure(MongoException failure) {
+        if (failure == failedDriver) return true;
+        // The find operation re-wraps the same command response as MongoQueryException.
+        if (failure instanceof com.mongodb.MongoQueryException query
+                && failedDriver instanceof com.mongodb.MongoCommandException original)
+            return query.getServerAddress().equals(original.getServerAddress()) && query.getResponse().equals(original.getResponse());
+        return failedDriver == null && (failure instanceof com.mongodb.MongoWriteException write
+                && write.getError().getCode() == failedCode
                 || failure instanceof com.mongodb.MongoBulkWriteException bulk
-                && bulk.getWriteErrors().stream().anyMatch(error -> error.getCode() == scope.failedCode))))
-            scope.translated = translated;
+                && bulk.getWriteErrors().stream().anyMatch(error -> error.getCode() == failedCode));
     }
 
     static CommandListener listener(Supplier<MongoClient> originalClient, Supplier<MongoDatabase> originalDatabase,

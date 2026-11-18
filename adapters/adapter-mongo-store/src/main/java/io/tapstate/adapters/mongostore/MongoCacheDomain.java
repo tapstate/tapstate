@@ -403,7 +403,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
 
     void verifyValidationReady(io.tapstate.spi.store.CachePreparation original, String operation) {
         verifyValidationMaintenance(original, operation, true);
-        StoreIo.run(() -> MongoValidationSchema.requireReady(database, false));
+        StoreIo.run(() -> {
+            MongoValidationSchema.requireReady(database, false);
+            MongoValidationSchema.verify(database, MongoValidationSchema.CACHE);
+        });
         businessActive();
     }
 

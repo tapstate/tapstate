@@ -69,7 +69,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     }
     @Override public Page<RootSummary> roots(Reference reference,Paging page){
         Objects.requireNonNull(reference);Objects.requireNonNull(page);admission.requirePipeline(reference.pipelineId());
-        return admission.transaction(this::requireDifferences,session->{
+        return admission.transaction(session->{
             var report=referenced(session,reference);if(report==null)return new Page<>(List.of(),0,page);
             var filter=new Document("_id.report",report.get("_id")).append("openVersion",reference.sequence());
             var specification=snapshot(report).specification();var items=new ArrayList<RootSummary>();
@@ -87,7 +87,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     @Override public java.util.Optional<RootDetail> root(Reference reference,String rootHash){
         Objects.requireNonNull(reference);admission.requirePipeline(reference.pipelineId());
         if(rootHash==null||!rootHash.matches("[a-f0-9]{64}"))throw invalid("report.rootHash");
-        return admission.transaction(this::requireDifferences,session->{
+        return admission.transaction(session->{
             var report=referenced(session,reference);if(report==null)return java.util.Optional.empty();
             var id=new Document("report",report.get("_id")).append("rootHash",new Binary(java.util.HexFormat.of().parseHex(rootHash)));
             var row=decodeBounded(differences.withDocumentClass(RawBsonDocument.class).find(session,new Document("_id",id).append("openVersion",reference.sequence())).batchSize(1).first(),
@@ -175,7 +175,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     @Override public Cleanup retain(Retention command){
         Objects.requireNonNull(command);if(!clusterId.equals(command.task().clusterId()))throw invalid("report.clusterId");
         admission.requirePipeline(command.task().pipelineId());
-        return admission.transaction(this::requireDifferences,session->{
+        return admission.transaction(session->{
             var current=admission.retentionTask(session,command.task());if(current==null)return new Cleanup(0,0,true);
             boolean countRetention = command.mode() == ValidationMode.FULL
                     && current.settings().full().method() == io.tapstate.core.validation.ValidationMethod.COUNT;
@@ -227,7 +227,7 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
                 .append("root", root).append("revision", write.check().observation().revision()).append("payload", payload).append("bytes", 0L);
         long bytes = encoded(next).length; if (bytes > MAX_ROOT_BYTES) throw MongoValidationObservationCodec.limit();
         next.put("bytes", bytes);
-        return admission.transaction(this::requireDifferences, session -> {
+        return admission.transaction( session -> {
             var report = report(session, write.report());
             if (report == null || report.getBoolean("closed")) return Publication.CLOSED_OR_EXPIRED;
             var start = MongoValidationAdmissionStore.decodeIdentity(report.get("admission", Document.class));
@@ -606,10 +606,6 @@ final class MongoValidationResultStore implements ValidationResultStore,Validati
     }
     private static Document original(Report report, Document row) {
         return new Document("_id", MongoValidationAdmissionStore.reportId(report.run())).append("openVersion", report.openVersion()).append("admission", row.get("admission"));
-    }
-    private void requireDifferences() {
-        var row = database.listCollections().filter(new Document("name", SystemCollections.VALIDATION_DIFFERENCES.collectionName())).first();
-        if (row == null || !"collection".equals(row.get("type"))) throw unreadable("validation-differences");
     }
     private void requireCluster(Report report) {
         if (!clusterId.equals(report.run().owner().clusterId())) throw new TapstateException(ValidationError.INVALID_CONTRACT, Map.of("field", "report.clusterId"), null);

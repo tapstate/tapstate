@@ -164,4 +164,27 @@ class MongoStructureInspectionIT {
         }
     }
 
+    @Test void aMissingExplicitHintIsDiagnosedOnlyAfterTheReadFails() {
+        String name = "inspection_missing_hint";
+        try (var admin = MongoClients.create(MONGO.getReplicaSetUrl());
+             var connection = MongoConnection.forConfiguration(
+                     new MongoConnectionSettings(MONGO.getReplicaSetUrl(name), null, Duration.ofSeconds(5)))) {
+            var database = admin.getDatabase(name);
+            try {
+                CAPTURE.prepareCollectionOn(database);
+                connection.verifyConnectivity();
+                var index = CAPTURE.indexes().getFirst().indexName();
+                try (var scope = io.tapstate.core.common.OperationErrorDiagnostics.open()) {
+                    org.assertj.core.api.Assertions.assertThatThrownBy(() -> new MongoReadBudget(Duration.ofSeconds(5))
+                            .transaction(connection.client(), session -> CAPTURE.on(connection.database())
+                                    .find(session, new Document()).hintString(index).first()))
+                            .isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                    assertThat(io.tapstate.core.common.OperationErrorDiagnostics.appendTo("original"))
+                            .contains(name + ".capture_preparations", "INDEX_MISSING", index)
+                            .doesNotContain("createIndex");
+                }
+            } finally { database.drop(); }
+        }
+    }
+
 }

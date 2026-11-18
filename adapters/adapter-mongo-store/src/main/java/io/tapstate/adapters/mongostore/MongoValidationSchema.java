@@ -19,9 +19,9 @@ final class MongoValidationSchema {
     static final List<SystemCollections> CONFIG = List.of(SystemCollections.VALIDATION_TASKS,
             SystemCollections.VALIDATION_REPORTS, SystemCollections.VALIDATION_DIFFERENCES);
     static final List<SystemCollections> CACHE = List.of(SystemCollections.VALIDATION_RUNS);
-    private static final ThreadLocal<IdentityHashMap<MongoDatabase, VerifiedStructure>> STARTUP = new ThreadLocal<>();
+    private static final ThreadLocal<IdentityHashMap<MongoDatabase, VerifiedSchema>> STARTUP = new ThreadLocal<>();
 
-    private record VerifiedStructure(boolean configuration, Document marker, Document identity) {}
+    private record VerifiedSchema(boolean configuration, Document marker, Document identity) {}
 
     private MongoValidationSchema() {}
 
@@ -36,7 +36,7 @@ final class MongoValidationSchema {
         }
     }
 
-    /** Definition operations never inherit a structure proof from an enclosing startup phase. */
+    /** Definition operations never inherit a schema marker proof from an enclosing startup phase. */
     static <T> T duringDefinitionOperation(java.util.function.Supplier<T> work) {
         var previous = STARTUP.get();
         STARTUP.set(new IdentityHashMap<>());
@@ -47,7 +47,7 @@ final class MongoValidationSchema {
         }
     }
 
-    static void refreshDefinitionStructure(MongoDatabase database) {
+    static void refreshDefinitionSchema(MongoDatabase database) {
         STARTUP.get().remove(database);
         requireReady(database, true);
     }
@@ -230,9 +230,8 @@ final class MongoValidationSchema {
             startup.remove(database);
             throw refused();
         }
-        if (configuration && previous == null && !configurationHasValidation(database, schema)) throw unreadable("version");
-        var marker = configuration ? requireConfiguration(schema, "READY") : requireVersionTwo(schema, "READY");
-        if (configuration && Integer.valueOf(2).equals(marker.get("formatVersion")) && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
+        if (configuration && !configurationDeclaresValidation(schema)) throw unreadable("version");
+        var marker = configuration ? readyConfiguration(schema) : requireVersionTwo(schema, "READY");
         var identity = (configuration ? SystemCollections.CONFIG_CLUSTER_IDENTITY : SystemCollections.CACHE_IDENTITY)
                 .on(database).find(new Document("_id", "cluster")).first();
         var original = scope(marker);
@@ -240,10 +239,7 @@ final class MongoValidationSchema {
                 || !MongoConfigurationDomain.LAYOUT.equals(identity.get("layoutId"))
                 || !configuration && (!Long.valueOf(original.bindingVersion()).equals(identity.get("bindingVersion"))
                 || !original.cacheIncarnation().equals(identity.get("cacheIncarnation")))) throw unreadable("identity");
-        if (startup == null) {
-            if (!configuration) verify(database, CACHE);
-            return;
-        }
+        if (startup == null) return;
         var scopeIdentity = new Document("clusterId", identity.get("clusterId"))
                 .append("layoutId", identity.get("layoutId")).append("bindingVersion", identity.get("bindingVersion"))
                 .append("cacheIncarnation", identity.get("cacheIncarnation"));
@@ -252,8 +248,7 @@ final class MongoValidationSchema {
             throw refused();
         }
         if (previous == null) {
-            if (!configuration) verify(database, CACHE);
-            startup.put(database, new VerifiedStructure(configuration, new Document(schema), scopeIdentity));
+            startup.put(database, new VerifiedSchema(configuration, new Document(schema), scopeIdentity));
         }
     }
 
