@@ -40,11 +40,16 @@ class NativeIdlePipelineCostIT {
             assertThat(complete).as("isolated native fixture completed").isTrue();assertThat(process.exitValue()).as(output).isZero();
         }finally{if(process.isAlive())process.destroyForcibly();}
     }
+    @Test
+    void warmNestObservationPublishesBatchedFactsAndAdvancesAfterCdc() throws Exception {
+        verifyNativeFixture(false);
+    }
+
     public static class Application {
         public static void main(String[] args)throws Exception{
             // Keep the fixture runnable against the baseline before this startup default existed.
             try{Bootstrap.class.getDeclaredMethod("configureWorkerParallelism").invoke(null);}catch(NoSuchMethodException baseline){ }
-            var fixture=new NativeIdlePipelineCostIT();fixture.work=Path.of(args[0]);fixture.verifyNativeFixture();
+            var fixture=new NativeIdlePipelineCostIT();fixture.work=Path.of(args[0]);fixture.verifyNativeFixture(true);
         }
     }
     private Path connectorDirectory() throws java.io.IOException {
@@ -55,7 +60,7 @@ class NativeIdlePipelineCostIT {
         Files.copy(publishedMongo, seeds.resolve(publishedMongo.getFileName()));
         return seeds;
     }
-    private void verifyNativeFixture()throws Exception{
+    private void verifyNativeFixture(boolean measure) throws Exception {
         try(var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
                 .withTmpFs(Map.of("/data/db","rw","/data/configdb","rw"))
                 .withCreateContainerCmdModifier(cmd->cmd.getHostConfig().withMemory(768L*1024*1024).withNanoCPUs(1_000_000_000L))
@@ -94,24 +99,12 @@ class NativeIdlePipelineCostIT {
                     request(http,base,token,"POST","/api/pipelines/idle-orders:start",Map.of(),200);
                     await().atMost(Duration.ofSeconds(90)).until(()->data.getCollection("idle_order_views").countDocuments()==5);
                     Files.writeString(work.resolve("ready.json"),JsonWriter.write(request(http,base,token,"GET","/api/pipelines/idle-orders/status",null,200)));
-                    Thread.sleep(30000);
-                    var admin=raw.getDatabase("admin");
-                    var results=new ArrayList<Map<String,Object>>();
-                    var bean=(com.sun.management.OperatingSystemMXBean)java.lang.management.ManagementFactory.getOperatingSystemMXBean();
-                    var threads=java.lang.management.ManagementFactory.getThreadMXBean();
-                    for(int window=1;window<=2;window++){
-                        var before=admin.runCommand(new Document("serverStatus",1));long started=System.nanoTime();
-                        long cpu=bean.getProcessCpuTime(),startedThreads=threads.getTotalStartedThreadCount();
-                        Thread.sleep(30000);var after=admin.runCommand(new Document("serverStatus",1));
-                        double seconds=(System.nanoTime()-started)/1e9;var row=new LinkedHashMap<String,Object>();row.put("window",window);row.put("seconds",seconds);
-                        row.put("processVcpu",(bean.getProcessCpuTime()-cpu)/1e9/seconds);row.put("newThreads",threads.getTotalStartedThreadCount()-startedThreads);
-                        for(String section:List.of("opcounters","transactions")){
-                            var low=before.get(section,Document.class);var high=after.get(section,Document.class);var delta=new TreeMap<String,Long>();
-                            high.forEach((key,value)->{if(value instanceof Number n&&low.get(key) instanceof Number old)delta.put(key,n.longValue()-old.longValue());});row.put(section,delta);
-                        }
-                        results.add(row);System.out.println("IDLE_MEASUREMENT "+JsonWriter.write(row));
+                    var results = new ArrayList<Map<String, Object>>();
+                    if (measure) {
+                        measureIdle(raw, results);
+                    } else {
+                        verifyWarmObservations(raw, storage);
                     }
-                    Files.writeString(work.resolve("windows.json"),JsonWriter.write(results));
                     var health=NativeAppStorage.business(app).getBean(PipelineAlertRuntime.class).health();
                     Files.writeString(work.resolve("health.txt"),health.toString());assertThat(health.closed()).isFalse();assertThat(health.degraded()).as(health.toString()).isFalse();
                     assertThat(data.getCollection("orders").countDocuments()).isEqualTo(5);
@@ -136,6 +129,56 @@ class NativeIdlePipelineCostIT {
             }
         }
     }
+    private void measureIdle(com.mongodb.client.MongoClient raw, List<Map<String, Object>> results) throws Exception {
+        Thread.sleep(30000);
+        var admin=raw.getDatabase("admin");
+        var bean=(com.sun.management.OperatingSystemMXBean)java.lang.management.ManagementFactory.getOperatingSystemMXBean();
+        var threads=java.lang.management.ManagementFactory.getThreadMXBean();
+        for(int window=1;window<=2;window++){
+            var before=admin.runCommand(new Document("serverStatus",1));long started=System.nanoTime();
+            long cpu=bean.getProcessCpuTime(),startedThreads=threads.getTotalStartedThreadCount();
+            Thread.sleep(30000);var after=admin.runCommand(new Document("serverStatus",1));
+            double seconds=(System.nanoTime()-started)/1e9;var row=new LinkedHashMap<String,Object>();row.put("window",window);row.put("seconds",seconds);
+            row.put("processVcpu",(bean.getProcessCpuTime()-cpu)/1e9/seconds);row.put("newThreads",threads.getTotalStartedThreadCount()-startedThreads);
+            for(String section:List.of("opcounters","transactions")){
+                var low=before.get(section,Document.class);var high=after.get(section,Document.class);var delta=new TreeMap<String,Long>();
+                high.forEach((key,value)->{if(value instanceof Number n&&low.get(key) instanceof Number old)delta.put(key,n.longValue()-old.longValue());});row.put(section,delta);
+            }
+            results.add(row);System.out.println("IDLE_MEASUREMENT "+JsonWriter.write(row));
+        }
+        Files.writeString(work.resolve("windows.json"),JsonWriter.write(results));
+    }
+
+    private static void verifyWarmObservations(com.mongodb.client.MongoClient raw, NativeAppStorage storage) {
+        var cache = raw.getDatabase(storage.cacheDatabase());
+        var observations = cache.getCollection("pipeline_observation");
+        var pipeline = new Document("pipelineId", "idle-orders").append("state", "RUNNING");
+        await().atMost(Duration.ofSeconds(30)).until(() -> observations.countDocuments(pipeline) == 1);
+        var original = observations.find(pipeline).first().getDate("observedAt");
+        var configuration = raw.getDatabase(storage.configurationDatabase());
+        configuration.runCommand(new Document("profile", 1)
+                .append("filter", new Document("command.aggregate", "configuration_version")));
+        try {
+            var profile = configuration.getCollection("system.profile");
+            await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+                assertThat(profile.countDocuments(new Document("command.aggregate", "configuration_version")))
+                        .as("warm observation CONFIG end checks").isGreaterThanOrEqualTo(2);
+                var observation = observations.find(pipeline).first();
+                assertThat(observation).isNotNull();
+                assertThat(observation.getDate("observedAt")).isAfter(original);
+                assertThat(observation.get("snapshot", Document.class)).hasSize(2)
+                        .allSatisfy((table, value) -> {
+                            assertThat(value).isInstanceOf(Document.class);
+                            var snapshot = (Document) value;
+                            assertThat(snapshot.getBoolean("landed")).isTrue();
+                            assertThat(snapshot.getLong("rowsDone")).isEqualTo(5L);
+                        });
+            });
+        } finally {
+            configuration.runCommand(new Document("profile", 0).append("filter", "unset"));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     static Map<String,Object> request(HttpClient http,String base,String token,String method,String path,Object body,int expected)throws Exception {
         var b=HttpRequest.newBuilder(URI.create(base+path)).timeout(Duration.ofSeconds(60)).header("Content-Type","application/json");
