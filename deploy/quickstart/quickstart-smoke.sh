@@ -526,14 +526,16 @@ PASTE
         RUN_REUSE="$demo" RUN_CWD="$start" run_phase_fakes ;;
     esac
     real="$(cd "$demo" && pwd -P)"
-    if ! printf '%s' "$RUN_OUT" | grep -q "$expect"; then
+    # Matches are counted, not tested with grep -q: under pipefail, a grep that stops at its first
+    # match can kill the stage still writing to it, and the check then fails on output that matched.
+    if [ "$(printf '%s' "$RUN_OUT" | grep -c "$expect")" -eq 0 ]; then
       failures="$failures
       $scenario: the run did not end the way it was driven to (rc=$RUN_RC): $RUN_OUT"
       continue
     fi
     if [ "$scenario" = success ]; then
-      if ! printf '%s\n' "$RUN_OUT" | awk '/^quickstart: pipeline started/ { seen = 1 } seen' \
-           | grep -qF -e "$demo" -e "$real"; then
+      if [ "$(printf '%s\n' "$RUN_OUT" | awk '/^quickstart: pipeline started/ { seen = 1 } seen' \
+              | grep -cF -e "$demo" -e "$real")" -eq 0 ]; then
         failures="$failures
       $scenario: the closing text says \"run in this directory\" and never names $demo, so it reads as the user's own"
       fi
