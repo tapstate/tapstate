@@ -41,7 +41,7 @@ import java.util.Map;
  */
 @Configuration
 @Import({RestApiConfiguration.class, RestApiSecurityConfiguration.class, ArtifactController.class, AlertController.class, ConnectionController.class,
-        ConnectorController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
+        ConnectorController.class, ConnectorCenterController.class, DataBrowserController.class, DataBrowserStreamConfiguration.class,
         PipelineController.class, PipelineObservationController.class, PipelineObservabilityController.class,
         PipelineLogsController.class,
         PipelinePositionController.class,

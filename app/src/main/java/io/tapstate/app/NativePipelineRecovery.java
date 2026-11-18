@@ -103,6 +103,7 @@ final class NativePipelineRecovery {
             var token=notes.open(new RequiredNoteOwner(auth.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,pass.scope().stateGeneration()));
             var origin=notes.origin(token);var source=entry.getValue();
             if(!origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),source.config())))throw fenced();
+            connectors.resolveRetained(notes, token, origin);
             String prior=hashes.putIfAbsent(source.connector(),origin.artifactHash());if(prior!=null && !prior.equals(origin.artifactHash()))throw fenced();
         }
         ConnectorProvisioner pinned=fixed(hashes);
@@ -166,8 +167,12 @@ final class NativePipelineRecovery {
         var configuredNotes=configuration.requiredNotes().guardedBy(() -> {requireAvailable();permission.requireActive();});
         for(var entry:inspected.privateContexts().entrySet()) {
             var token=configuredNotes.open(new RequiredNoteOwner(target.bindingVersion(),entry.getKey(),RequiredNoteOwner.Kind.PIPELINE,id,target.stateGeneration()));
-            var source=entry.getValue();var expected=ConnectorNoteOrigin.capture(source.connector(),fixed.resolve(source.connector()).contentHash(),source.config());
+            var source=entry.getValue();
+            var ref = fixed.resolve(source.connector());
+            var expected=ConnectorNoteOrigin.capture(source.connector(),ref.contentHash(),source.config());
+            connectors.retain(ref);
             configuredNotes.prepareOrigin(token,expected);
+            connectors.markBound(configuredNotes, token, expected);
         }
         var intent=configuration.intents().load(id).orElseThrow(NativePipelineRecovery::fenced);
         if(intent.deleted() || intent.intentRevision()!=inspected.intentRevision() || !intent.scope().equals(permission.recovery().targetScope()))throw fenced();

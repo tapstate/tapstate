@@ -52,6 +52,25 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
+    void localArtifactMarkerRemainsBoundToTheExactOriginalAndSurvivesClear() {
+        withNotes(f -> {
+            var scope = f.initialize(chain("retained-artifact"));
+            var original = f.notes.origin(scope);
+            assertThat(f.notes.localArtifactReady(scope, original)).isFalse();
+            assertThatThrownBy(() -> f.notes.markLocalArtifactReady(scope, origin("different-connection")))
+                    .satisfies(MongoRequiredNoteStoreIT::originMismatch);
+
+            f.notes.markLocalArtifactReady(scope, original);
+            f.notes.markLocalArtifactReady(scope, original);
+            var next = f.notes.clear(scope, false);
+            assertThat(f.notes.localArtifactReady(next, original)).isTrue();
+            assertThat(f.notes.origin(next)).isEqualTo(original);
+            assertThatThrownBy(() -> f.notes.localArtifactReady(scope, original))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+        });
+    }
+
+    @Test
     void keyDeletionRetainsTheRevisionAndNoOldPayloadOrEventArchive() {
         withNotes(f -> {
             RequiredNoteScope scope = f.initialize(global());
@@ -1074,6 +1093,18 @@ class MongoRequiredNoteStoreIT {
             assertThatThrownBy(() -> release.prepareOrigin(one,origin("new"))).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
             assertThatThrownBy(() -> release.clear(one,false)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
             assertThatThrownBy(() -> release.reclaimBefore(one)).satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            var exact = release.origin(one);
+            assertThat(release.localArtifactReady(one, exact)).isFalse();
+            assertThatThrownBy(() -> release.markLocalArtifactReady(two, exact))
+                    .satisfies(MongoRequiredNoteStoreIT::scopeUnavailable);
+            var scopesBefore = scopeMetadata(f, one).getLong("writeFence");
+            var operators = SystemCollections.OPERATOR_GENERATIONS.on(f.database);
+            var mapping = new Document("_id", "p1");
+            var ownerBefore = operators.find(mapping).first().getLong("noteWriteFence");
+            release.markLocalArtifactReady(one, exact);
+            assertThat(release.localArtifactReady(one, exact)).isTrue();
+            assertThat(scopeMetadata(f, one).getLong("writeFence")).isEqualTo(scopesBefore + 1);
+            assertThat(operators.find(mapping).first().getLong("noteWriteFence")).isEqualTo(ownerBefore + 1);
             assertThat(scopeMetadata(f,one).getLong("generation")).isEqualTo(1);
         });
     }

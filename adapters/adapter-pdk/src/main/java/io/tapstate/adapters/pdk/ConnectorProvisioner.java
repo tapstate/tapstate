@@ -1,5 +1,9 @@
 package io.tapstate.adapters.pdk;
 
+import io.tapstate.spi.store.RequiredNoteOrigin;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.spi.store.RequiredNoteStore;
+
 /**
  * Resolves a connector id to the {@link ConnectorRef} that says where to load it from. The capture and
  * sink ports are constructed with one; the resolution itself — the seed directory today, the connector
@@ -27,6 +31,17 @@ public interface ConnectorProvisioner {
         }
         return ref;
     }
+
+    /** Opens the original artifact authorized by this durable note origin. */
+    default ConnectorRef resolveRetained(RequiredNoteStore notes, RequiredNoteScope scope, RequiredNoteOrigin origin) {
+        return resolve(origin.connectorId(), origin.artifactHash());
+    }
+
+    /** Keeps a persistent copy before publishing a new durable binding. */
+    default void retain(ConnectorRef ref) {}
+
+    /** Records that the authorized binding can now recover from its local artifact. */
+    default void markBound(RequiredNoteStore notes, RequiredNoteScope scope, RequiredNoteOrigin origin) {}
 
     /** Resolves only the connector needed by the current Capture startup. */
     default ConnectorRef resolveCaptureStartup(String connectorId) { return resolve(connectorId); }

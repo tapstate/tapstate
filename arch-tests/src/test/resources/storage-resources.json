@@ -1130,6 +1130,37 @@
         "A complete registration includes spec, catalog, icon and the local node possession record in the current CACHE scope.",
         "A missing or unreadable record requires normal artifact verification before it can be rebuilt."
       ]
+    },
+    "connector-note-origin": {
+      "goal": "Retain the exact connector artifact and settings across recovery and record when an original binding can only use local bytes.",
+      "entry": "Verify the original note scope and generation; prepare or read the encrypted origin before connector execution.",
+      "prerequisites": [
+        "Original CONFIG binding, owner, generation, and connector ID and SHA-256.",
+        "While the marker is absent, the original legacy binding may import the exact JAR. After the local installation is registered and pinned, set the marker. A marked origin with unavailable local bytes preserves the binding and position and reports the missing artifact."
+      ]
+    },
+    "legacy-connector-gridfs": {
+      "goal": "Import the original JAR once per old binding before it relies on the persistent local copy.",
+      "entry": "Guarded legacy Pipeline or shared capture origin recovery at the original CACHE scope, only when the same JAR is unavailable locally and localArtifactReady is absent.",
+      "prerequisites": [
+        "Original scope, connector ID and exact SHA-256 from the saved CONFIG binding. Stream a published artifact by its hash and validate its identity, digest and host compatibility before installation.",
+        "Once localArtifactReady is recorded, missing local bytes do not consult GridFS. Historical records and chunks remain intact."
+      ]
+    },
+    "retired-connector-staging-cache": {
+      "goal": "Recognize historical staging bytes without trusting them as an installed connector.",
+      "entry": "The local installer validates an existing old cached JAR through normal installation or exact guarded migration before making it available.",
+      "prerequisites": [
+        "A SHA-256 match and valid connector identity, spec and host compatibility. Only registered local artifacts count as installed in the local-installation runtime."
+      ]
+    },
+    "persistent-connector-artifact": {
+      "goal": "Retain exact connector JAR bytes across process, image or application package replacement.",
+      "entry": "Reconcile the current executable bundle and the admitted local JARs with the install records and original CACHE scope.",
+      "prerequisites": [
+        "Original trusted SHA-256, connector ID, and compatible host. A valid installation record and local bytes allow offline CACHE rebuild.",
+        "Place and register a persistent copy of a bundled artifact before its first durable binding. An interrupted install resumes by exact hash."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1380,6 +1411,14 @@
     "connector-install-record": {
       "atomicDomain": "LOCAL",
       "fencing": "Serialize operations for the same hash. Publish PENDING before the verified JAR rename and COMPLETE after scoped CACHE registration. Each file replacement is atomic; CACHE and file operations commit separately."
+    },
+    "connector-note-origin": {
+      "atomicDomain": "CONFIG",
+      "fencing": "Verify the active scope and original origin by generation in the existing CONFIG transaction. Set localArtifactReady idempotently only after local installation succeeds. Carry the marker with the same origin on generation rollover. Files and CACHE do not share this transaction."
+    },
+    "persistent-connector-artifact": {
+      "atomicDomain": "LOCAL",
+      "fencing": "Serialize local operations by SHA-256, verify bytes and atomically move from a staging file on the same filesystem, publish CACHE metadata and possession before marking COMPLETE, and keep verified bytes in place for existing loaders."
     }
   },
   "resources": [
@@ -2425,24 +2464,24 @@
     },
     {
       "id": "mongo.config.pdk_note_origins",
-      "resourceVersion": 1,
-      "proposalVersion": 1,
+      "resourceVersion": 2,
+      "proposalVersion": 2,
       "kind": "COLLECTION",
       "layer": "CONFIG",
       "database": "CONFIG",
       "physicalNames": [
         "pdk_note_origins"
       ],
-      "responsibility": "Original encrypted connector context and exact artifact identity for note lifecycle.",
+      "responsibility": "Original encrypted connector context, exact artifact identity and the optional localArtifactReady flag for one physical Pipeline or shared capture origin. Missing flag identifies a legacy origin eligible for exact legacy import.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoRequiredNoteStore"
       ],
-      "recovery": "configuration-backup",
-      "consistency": "config",
-      "growth": "Scales with the resource population; retain necessary history/references, reject unsupported loss instead of discarding required facts for budget.",
+      "recovery": "connector-note-origin",
+      "consistency": "connector-note-origin",
+      "growth": "One optional boolean per existing retained origin; the marker adds no rows and bases recovery on the same connector identity and hash.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoRequiredNoteStoreIT.java"
       ]
@@ -3298,7 +3337,7 @@
     {
       "id": "mongo.cache.connector_artifacts",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "GRIDFS_BUCKET",
       "layer": "CACHE",
       "database": "CACHE",
@@ -3306,16 +3345,16 @@
         "connector_artifacts.files",
         "connector_artifacts.chunks"
       ],
-      "responsibility": "Content-addressed original connector artifact bytes.",
+      "responsibility": "Historical content-addressed connector bytes retained in their original GridFS format. The local-installation runtime reads it only during guarded legacy binding migration; new installs do not write the historical bucket.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistry"
       ],
       "readers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorRegistry"
       ],
-      "recovery": "derived-cache",
+      "recovery": "legacy-connector-gridfs",
       "consistency": "cache",
-      "growth": "Artifact bytes grow with retained hashes; originals must remain obtainable for rebuild.",
+      "growth": "Preserves historical files and chunks. New installs neither add bytes nor depend on this bucket.",
       "evidence": [
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheConnectorRegistryIT.java"
       ]
@@ -3692,21 +3731,21 @@
     {
       "id": "local.connector-cache",
       "resourceVersion": 1,
-      "proposalVersion": 1,
+      "proposalVersion": 2,
       "kind": "FILE_SET",
       "layer": "CACHE",
       "database": "LOCAL",
       "physicalNames": [
-        "${pluginCache}/${verifiedHash}.jar"
+        "Retired artifact staging layout for legacy registry compatibility"
       ],
-      "responsibility": "Verified local connector artifact bytes.",
+      "responsibility": "Historical staging cache format retained for older registry-based entry points. Local installation adopts valid historical bytes at the original path only after normal registration.",
       "writers": [
         "io.tapstate.adapters.pdk.RegistryConnectorProvisioner"
       ],
       "readers": [
         "io.tapstate.adapters.pdk.RegistryConnectorProvisioner"
       ],
-      "recovery": "artifact-cache",
+      "recovery": "retired-connector-staging-cache",
       "consistency": "file-cache",
       "growth": "Content-hash artifacts bounded by retained registrations and the existing local cache lifecycle.",
       "evidence": [
@@ -4522,6 +4561,30 @@
       "recovery": "connector-install-record",
       "consistency": "connector-install-record",
       "growth": "One small JSON record per retained persistent JAR hash. Cleanup removes the record with its artifact.",
+      "evidence": [
+        "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/ConnectorInstallRecordsTest.java"
+      ]
+    },
+    {
+      "id": "local.connector-installed-artifact",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "CONFIG",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${dataDir}/plugins/<sha256>.jar"
+      ],
+      "responsibility": "Persistent verified original connector JAR bytes for downloads, uploads, dropped artifacts, legacy import, and copies of bundled artifacts pinned for recovery.",
+      "writers": [
+        "io.tapstate.adapters.pdk.LocalConnectorArtifacts"
+      ],
+      "readers": [
+        "io.tapstate.adapters.pdk.LocalConnectorArtifacts"
+      ],
+      "recovery": "persistent-connector-artifact",
+      "consistency": "persistent-connector-artifact",
+      "growth": "At most one retained copy per SHA-256, bounded by retained versions and original binding references.",
       "evidence": [
         "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/ConnectorInstallRecordsTest.java"
       ]

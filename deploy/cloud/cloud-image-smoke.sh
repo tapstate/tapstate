@@ -87,13 +87,14 @@ for profile in cloud onprem; do
   new_container "export-$profile"
   docker create --name "$CURRENT" "${LABELS[@]}" "$image" >/dev/null
   docker cp "$CURRENT:/opt/tapstate/tapstate.jar" "$WORK/$profile.jar"
+  docker cp "$CURRENT:/opt/tapstate/release/connectors.lock.json" "$WORK/$profile-connectors.lock.json"
   docker image inspect "$image" >"$WORK/$profile-image.json"
 done
 PYTHONDONTWRITEBYTECODE=1 python3 "$ROOT/deploy/cloud/image-runtime-metadata.py" \
   --cloud-jar "$WORK/cloud.jar" --onprem-jar "$WORK/onprem.jar" \
   --cloud-image "$WORK/cloud-image.json" --onprem-image "$WORK/onprem-image.json" \
-  --lock "$ROOT/deploy/cloud/connectors.lock.json" \
-  --onprem-lock "$ROOT/deploy/docker/connectors.lock.json" --output "$WORK"
+  --lock "$WORK/cloud-connectors.lock.json" \
+  --onprem-lock "$WORK/onprem-connectors.lock.json" --output "$WORK"
 VERSION="$(node -e 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1])).version)' "$WORK/cloud.json")"
 
 docker network create "${LABELS[@]}" "$NETWORK" >/dev/null

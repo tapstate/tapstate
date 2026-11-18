@@ -26,6 +26,7 @@ final class ConnectorCatalogBackground implements AutoCloseable {
 
     private final ConnectorCatalogHttp http = new ConnectorCatalogHttp();
     private final ConnectorCatalogRefresh catalog;
+    private volatile boolean reachable;
     private final String engineVersion = RuntimeVersion.current();
     private final java.util.concurrent.ScheduledExecutorService executor =
             Executors.newSingleThreadScheduledExecutor(Thread.ofPlatform().daemon().name("connector-catalog").factory());
@@ -47,15 +48,32 @@ final class ConnectorCatalogBackground implements AutoCloseable {
                 .toList();
     }
 
-    void start() {
-        long interval = Duration.ofMinutes(30).toSeconds();
-        executor.scheduleWithFixedDelay(this::refresh, 0, interval, TimeUnit.SECONDS);
+    boolean permitsRole(String id, String role) {
+        var entry = catalog.current().support().entries().get(id);
+        return entry == null || entry.supportsRole(role);
     }
 
-    private void refresh() {
+    void start() {
+        long interval = Duration.ofMinutes(30).toSeconds();
+        executor.scheduleWithFixedDelay(this::refreshNow, 0, interval, TimeUnit.SECONDS);
+    }
+
+    ConnectorCatalogRefresh.Catalog current() { return catalog.current(); }
+
+    boolean reachable() { return reachable; }
+
+    synchronized void refreshNow() {
         try {
             catalog.refresh();
+            reachable = true;
         } catch (IOException unavailable) {
+            reachable = current().downloads().values().stream().findFirst().map(previous -> {
+                try {
+                    return http.available(previous.jar());
+                } catch (IOException offline) {
+                    return false;
+                }
+            }).orElse(false);
             LOG.debug("Could not refresh the connector catalog. Keeping the last successful catalog.", unavailable);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();

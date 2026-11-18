@@ -171,6 +171,7 @@ connector.discover-failed
 connector.instance-limit-reached
 connector.instances-busy
 connector.load-failed
+connector.local-artifact-unavailable
 connector.logminer-identifier-too-long
 connector.logminer-preflight-timeout
 connector.no-connector-class

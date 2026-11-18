@@ -47,6 +47,8 @@ class ControlOperationsTest {
                         "connector.list",
                         "connector.get",
                         "connector.icon",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
                         "data-browser.collections",
                         "data-browser.find",
                         "data-browser.stats",
@@ -130,6 +132,14 @@ class ControlOperationsTest {
         assertThat(registry.resolve("connector.list").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.get").scope()).isEqualTo(Scope.READ);
         assertThat(registry.resolve("connector.icon").scope()).isEqualTo(Scope.READ);
+        for (String id : List.of("connector-center.list", "connector-center.operation")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.READ);
+            assertThat(registry.resolve(id).audited()).isFalse();
+        }
+        for (String id : List.of("connector-center.refresh", "connector-center.download", "connector-center.upload")) {
+            assertThat(registry.resolve(id).scope()).isEqualTo(Scope.ADMIN);
+            assertThat(registry.resolve(id).audited()).isTrue();
+        }
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
@@ -230,7 +240,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(86);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
                 && !"system.pdk-version".equals(op.id())
-                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
+                && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.") && !op.id().startsWith("connector-center.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
                 assertThat(op.exposure()).containsOnlyKeys(Frontend.REST));
@@ -281,6 +291,8 @@ class ControlOperationsTest {
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
                         "system.pdk-version",
+                        "connector-center.list", "connector-center.refresh", "connector-center.download",
+                        "connector-center.operation", "connector-center.upload",
                         "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
                         "validation.start", "validation.progress", "validation.stop", "validation.history",
                         "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",

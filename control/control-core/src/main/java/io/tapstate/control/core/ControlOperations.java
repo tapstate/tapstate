@@ -198,6 +198,22 @@ public final class ControlOperations {
             "connector.icon", Scope.READ, false, null,
             "Read the registered connector icon asset.", CLI_ONLY);
 
+    public static final Operation CONNECTOR_CENTER_LIST = new Operation(
+            "connector-center.list", Scope.READ, false, null,
+            "Read supported connectors and their download and local installation availability.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_REFRESH = new Operation(
+            "connector-center.refresh", Scope.ADMIN, true, null,
+            "Refresh the official connector support and Maven download catalog.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_DOWNLOAD = new Operation(
+            "connector-center.download", Scope.ADMIN, true, null,
+            "Install the selected compatible connector release and report its progress.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_OPERATION = new Operation(
+            "connector-center.operation", Scope.READ, false, null,
+            "Read the transfer and installation progress of one connector operation.", REST_ONLY);
+    public static final Operation CONNECTOR_CENTER_UPLOAD = new Operation(
+            "connector-center.upload", Scope.ADMIN, true, null,
+            "Upload an on-prem connector JAR for verified local installation.", REST_ONLY);
+
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
     // and persist nothing, not even the result, so they are read-scoped and unaudited. That is what
@@ -468,6 +484,8 @@ public final class ControlOperations {
             CONNECTOR_LIST,
             CONNECTOR_GET,
             CONNECTOR_ICON,
+            CONNECTOR_CENTER_LIST, CONNECTOR_CENTER_REFRESH, CONNECTOR_CENTER_DOWNLOAD,
+            CONNECTOR_CENTER_OPERATION, CONNECTOR_CENTER_UPLOAD,
             DATA_BROWSER_COLLECTIONS,
             DATA_BROWSER_FIND,
             DATA_BROWSER_STATS,

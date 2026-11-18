@@ -100,6 +100,7 @@ class StageConnectorsTest(unittest.TestCase):
         manifest = (
             "Manifest-Version: 1.0\r\n"
             f"Implementation-Title: {title}\r\n"
+            "Implementation-Version: 2.5.0\r\n"
             f"Git-Commit-Id: {'a' * 40}\r\n"
             f"PDK-API-Version: {pdk_version}\r\n\r\n"
         )
@@ -176,8 +177,8 @@ class StageConnectorsTest(unittest.TestCase):
                  label_overrides: dict[str, str | None] | None = None,
                  runtime_users: dict[str, str | None] | None = None,
                  runtime_env: dict[str, list[str]] | None = None,
-                 duplicate_profile_label: bool = False) -> Path:
-        MODULE.stage(self.lock, self.jars, self.staged)
+                 duplicate_profile_label: bool = False, required_ids=None) -> Path:
+        MODULE.stage(self.lock, self.jars, self.staged, required_ids or MODULE.REQUIRED_IDS)
         layout = self.root / "oci"
         (layout / "blobs/sha256").mkdir(parents=True)
 
@@ -254,6 +255,33 @@ class StageConnectorsTest(unittest.TestCase):
         top_digest = add_json({"manifests": descriptors})
         (layout / "index.json").write_text(json.dumps({"manifests": [{"digest": top_digest}]}), encoding="utf-8")
         return layout
+
+    def published_lock(self, required_ids):
+        self.entries = [entry for entry in self.entries if entry["id"] in required_ids]
+        for path in self.jars.glob("*.jar"):
+            if path.stem.removesuffix("-connector") not in required_ids:
+                path.unlink()
+        for entry in self.entries:
+            entry.update(groupId="io.tapdata", artifactId=entry["id"] + "-connector", version="2.5.0")
+        if set(required_ids) == set(MODULE.CLOUD_IDS):
+            self.license_files = []
+        self.lock.write_text(json.dumps({"schemaVersion": 3, "connectors": self.entries,
+                                        "licenseFiles": self.license_files}))
+
+    def test_published_cloud_oci_carries_four_bootstrap_artifacts(self) -> None:
+        self.published_lock(MODULE.CLOUD_IDS)
+        layout = self.make_oci(required_ids=MODULE.CLOUD_IDS)
+        self.verify_image(layout)
+
+    def test_published_onprem_oci_carries_eight_artifacts_including_dummy(self) -> None:
+        self.published_lock(MODULE.PUBLISHED_ONPREM_IDS)
+        self.boot_jar = self.make_boot_jar(profile="onprem", console_url=None)
+        layout = self.make_oci(required_ids=MODULE.PUBLISHED_ONPREM_IDS,
+                label_overrides={"io.tapstate.distribution": "onprem", "io.tapstate.web.profile": "onprem",
+                                 "io.tapstate.web.cloud-console-url": None},
+                runtime_users={"amd64": "tapstate", "arm64": "tapstate"},
+                runtime_env={arch: ["TAPSTATE_CONNECTORS_SEED_DIR=/opt/tapstate/connectors"] for arch in ("amd64", "arm64")})
+        IMAGE.verify(layout, self.lock, web_profile="onprem", cloud_console_url=None)
 
     def test_stages_exact_verified_bytes_and_lock(self) -> None:
         MODULE.stage(self.lock, self.jars, self.staged)

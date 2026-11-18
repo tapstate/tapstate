@@ -44,7 +44,9 @@ final class PipelinePrivateNoteRetirement {
             }
             @Override public boolean privatePostgres(RequiredNoteRetirement retirement,CaptureConfig config,String clusterId,Runnable guard) {
                 var port=port(retirement,clusterId,guard);
-                if(!port.automaticallyClearsPrivatePostgres(retirement.origin().orElseThrow(PipelinePrivateNoteRetirement::unavailable)))return false;
+                var origin = retirement.origin().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
+                connectors.resolveRetained(retirement.notes().guardedBy(guard), retirement.scope(), origin);
+                if(!port.automaticallyClearsPrivatePostgres(origin))return false;
                 port.releasePrivatePostgresSlot(config).ifPresent(failure -> {throw failure;});
                 return true;
             }

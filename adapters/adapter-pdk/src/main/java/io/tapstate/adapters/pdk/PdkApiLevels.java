@@ -41,6 +41,45 @@ public final class PdkApiLevels {
             "2.0.9", 1,
             "2.0.11", 2);
 
+    /** The release generation normalizes the API version aliases used by Maven publications. */
+    public static java.util.OptionalInt generation(String version) {
+        if (version == null) return java.util.OptionalInt.empty();
+        var matcher = java.util.regex.Pattern.compile("2\\.(?:0\\.)?([0-9]+)").matcher(baseVersion(version));
+        if (!matcher.matches()) return java.util.OptionalInt.empty();
+        try {
+            return java.util.OptionalInt.of(Integer.parseInt(matcher.group(1)));
+        } catch (NumberFormatException invalid) {
+            return java.util.OptionalInt.empty();
+        }
+    }
+
+    /** Both the packaged host generation and its known ABI must cover the artifact. */
+    public static boolean allows(String host, String required) {
+        var hostGeneration = generation(host);
+        var artifactGeneration = generation(required);
+        if (hostGeneration.isEmpty() || artifactGeneration.isEmpty()
+                || artifactGeneration.getAsInt() > hostGeneration.getAsInt()) return false;
+        var hostLevel = levelOf("2.0." + hostGeneration.getAsInt());
+        var artifactLevel = levelOf("2.0." + artifactGeneration.getAsInt());
+        return hostLevel.isPresent() && artifactLevel.isPresent() && artifactLevel.getAsInt() <= hostLevel.getAsInt();
+    }
+
+    static int compareArtifactVersions(String left, String right) {
+        String[] a = baseVersion(left).split("\\.");
+        String[] b = baseVersion(right).split("\\.");
+        boolean numericLeft = baseVersion(left).matches("[0-9]+(\\.[0-9]+)*");
+        boolean numericRight = baseVersion(right).matches("[0-9]+(\\.[0-9]+)*");
+        if (numericLeft != numericRight) return Boolean.compare(numericLeft, numericRight);
+        if (!numericLeft) return left.compareTo(right);
+        for (int i = 0; i < Math.max(a.length, b.length); i++) {
+            var x = new java.math.BigInteger(i < a.length ? a[i] : "0");
+            var y = new java.math.BigInteger(i < b.length ? b[i] : "0");
+            int order = x.compareTo(y);
+            if (order != 0) return order;
+        }
+        return Boolean.compare(!left.contains("-SNAPSHOT"), !right.contains("-SNAPSHOT"));
+    }
+
     /** The frozen baseline the bridge compiles and runs against. */
     private static final String ENGINE_VERSION = "2.0.11";
 
@@ -65,7 +104,9 @@ public final class PdkApiLevels {
      * registry gap the load path turns into a coded refusal, never a bare crash on operator data.
      */
     public static OptionalInt levelOf(String version) {
-        Integer level = LEVELS.get(baseVersion(version));
+        var releaseGeneration = generation(version);
+        if (releaseGeneration.isEmpty()) return OptionalInt.empty();
+        Integer level = LEVELS.get("2.0." + releaseGeneration.getAsInt());
         return level == null ? OptionalInt.empty() : OptionalInt.of(level);
     }
 

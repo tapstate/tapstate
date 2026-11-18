@@ -833,7 +833,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                     var origin = releaseScopes.store().origin(scope);
                     connectorId = origin.connectorId();
                     settings = ConnectorNoteOrigin.settings(origin);
-                    reference = provisioner.resolve(connectorId, origin.artifactHash());
+                    reference = provisioner.resolveRetained(releaseScopes.store(), scope, origin);
                     connectorScopes = BoundConnectorNoteScopes.pin(releaseScopes, scope);
                 }
                 PdkConnector connector = PdkConnector.open(connectorId, reference, settings, config.node(), notes,

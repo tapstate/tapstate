@@ -409,6 +409,42 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public java.util.Optional<RequiredNoteOrigin> originIfPresent(RequiredNoteScope scope) {
+        requireOriginScope(scope);
+        return withOriginIndexes(() -> transaction(session -> java.util.Optional.ofNullable(
+                retainedOrigin(session, scope, verifyScope(session, scope, false)))));
+    }
+
+    @Override
+    public boolean localArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        requireOriginScope(scope);
+        return withOriginIndexes(() -> transaction(session -> readyMarker(session, scope, expected)));
+    }
+
+    @Override
+    public void markLocalArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        requireOriginScope(scope);
+        withOriginIndexes(() -> transaction(session -> {
+            if (readyMarker(session, scope, expected)) return null;
+            verifyScope(session, scope, true);
+            if (origins.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                    new Document("$set", new Document("localArtifactReady", true))).getMatchedCount() != 1)
+                throw unavailable();
+            return null;
+        }));
+    }
+
+    private boolean readyMarker(ClientSession session, RequiredNoteScope scope, RequiredNoteOrigin expected) {
+        var existing = retainedOrigin(session, scope, verifyScope(session, scope, false));
+        if (!expected.equals(existing)) throw originMismatch();
+        Document row = origins.find(session, byScope(scope.owner()).append("generation", scope.generation())).first();
+        if (row == null) throw unavailable();
+        if (!row.containsKey("localArtifactReady")) return false;
+        if (!Boolean.TRUE.equals(row.get("localArtifactReady"))) throw unreadable("localArtifactReady");
+        return true;
+    }
+
+    @Override
     public RequiredNoteScope clear(RequiredNoteScope scope, boolean blockEarlierValues) {
         requireOrdinary();
         return StoreIo.call(() -> transaction(session -> {
@@ -420,8 +456,12 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
                     : retainedOrigin(session, scope, metadata);
             if (scope.owner().kind() != RequiredNoteOwner.Kind.GLOBAL && origin == null) throw unavailable();
             RequiredNoteScope next = new RequiredNoteScope(scope.owner(), scope.generation() + 1);
-            if (origin != null && origins.replaceOne(session, byScope(scope.owner()).append("generation", scope.generation()),
-                    originDocument(next, origin, cipher)).getMatchedCount() != 1) throw unavailable();
+            if (origin != null) {
+                Document replacement = originDocument(next, origin, cipher);
+                if (readyMarker(session, scope, origin)) replacement.append("localArtifactReady", true);
+                if (origins.replaceOne(session, byScope(scope.owner()).append("generation", scope.generation()),
+                        replacement).getMatchedCount() != 1) throw unavailable();
+            }
             if (blockEarlierValues) block(session, scope.owner(), ALL_KEYS);
             long matched = scopes.updateOne(session, byScope(scope.owner()).append("generation", scope.generation()),
                     new Document("$inc", new Document("generation", 1L))

@@ -690,7 +690,7 @@ io.document-too-large:
   solution: "The store is healthy and retrying will not help. Reduce what is held under this one id."
 connector.not-official:
   message: "Runtime registration supports these connectors today: {official}. '{connector}' is not among them yet."
-  solution: "Register one of the connectors listed above. The supported set grows as connectors complete certification, so an artifact refused here is not necessarily faulty."
+  solution: "Register one of the listed connectors, refresh the support catalog, or update Tapstate before retrying offline."
 connector.not-registered:
   message: "No connector '{connector}' is registered."
   solution: "Register the connector's artifact — or place it in the connector seed directory — before using it."
@@ -706,6 +706,9 @@ connector.cloud-upload-disabled:
 connector.load-failed:
   message: "Connector '{connector}' could not be loaded."
   solution: "Check the connector jar and its dependencies are present and readable."
+connector.local-artifact-unavailable:
+  message: "Connector '{connector}' requires local artifact {hash}, which is missing or unreadable."
+  solution: "Restore the original connector JAR under that hash, then retry from the retained position."
 connector.class-not-found:
   message: "Connector '{connector}' entry class '{class}' was not found or is not a connector."
   solution: "Check the connector id resolves to a connector jar that declares this entry class."

@@ -174,7 +174,11 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                                 () ->
                                         new TapstateException(
                                                 IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null));
-        var artifact = connectors.resolve(source.connector(), origin.artifactHash());
+        var notes = stores.notes().guardedBy(() -> { active(); pass.requirePipeline(scope.pipelineId()); });
+        var chain = original.chainId();
+        var token = notes.open(new io.tapstate.spi.store.RequiredNoteOwner(scope.bindingVersion(),
+                "pdk.chain." + chain, io.tapstate.spi.store.RequiredNoteOwner.Kind.CHAIN, chain, 0));
+        var artifact = connectors.resolveRetained(notes, token, origin);
         if (!origin.artifactHash().equals(artifact.contentHash())
                 || !origin.equals(
                         io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(
@@ -1320,8 +1324,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     ? ConfiguredCaptureRun.prepareStartup(owner.origin, owner.config, stores.notes(), connectors, owner::require)
                     : ConfiguredCaptureRun.prepare(owner.origin, owner.config, stores.notes(), connectors, owner::require, recoveryPinned);
         } else {
-            stores.notes().guardedBy(owner::require).origin(configured.primary());
-            connectors.resolve(configured.connectorId(), configured.artifactHash());
+            var notes = stores.notes().guardedBy(owner::require);
+            connectors.resolveRetained(notes, configured.primary(), notes.origin(configured.primary()));
             owner.require();
         }
         if(owner.physical!=null){

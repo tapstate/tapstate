@@ -10,6 +10,7 @@ import io.tapstate.core.catalog.TapstateCatalog;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CapabilityDeriver;
 import io.tapstate.spi.store.ConnectorCapabilities;
+import io.tapstate.spi.store.ConnectorArtifactMetadata;
 import io.tapstate.spi.store.ConnectorCatalogStore;
 import io.tapstate.spi.store.ConnectorRegistration;
 import io.tapstate.spi.store.ConnectorRegistry;
@@ -406,6 +407,48 @@ class CloudConnectorSeedReadinessTest {
         refused(() -> gate.verifyRegistrations(outcomes), "spec-unavailable");
     }
 
+    @Test
+    void publishedCloudLockRequiresOnlyTheFourBootstrapArtifacts() throws Exception {
+        var bootstrap = Set.of("mongodb", "mysql", "postgres", "mongodb-atlas");
+        for (var row : entries) {
+            String id = (String) row.get("id");
+            if (!bootstrap.contains(id)) {
+                Files.delete(seeds.resolve(id + "-connector.jar"));
+            }
+        }
+        entries.removeIf(row -> !bootstrap.contains(row.get("id")));
+        for (var row : entries) {
+            String id = (String) row.get("id");
+            writeJar(id, id, VERSION, id + "-connector");
+            row.put("groupId", "io.tapdata");
+            row.put("artifactId", id + "-connector");
+            row.put("version", "2.5.0");
+        }
+        byte[] published = JSON.writeValueAsBytes(Map.of("schemaVersion", 3, "connectors", entries, "licenseFiles", List.of()));
+        Files.write(release.resolve("connectors.lock.json"), published);
+        var registry = org.mockito.Mockito.mock(ConnectorRegistry.class);
+        org.mockito.Mockito.when(registry.findAll(org.mockito.ArgumentMatchers.anyString()))
+                .thenThrow(new AssertionError("Published readiness must use exact artifact metadata"));
+        var catalog = org.mockito.Mockito.mock(ConnectorCatalogStore.class);
+        var installed = new ArrayList<SeedOutcome>();
+        for (var row : entries) {
+            String id = (String) row.get("id");
+            String hash = (String) row.get("sha256");
+            var metadata = new ConnectorArtifactMetadata(stores.rows.get(id), hash, "2.5.0", VERSION,
+                    ConnectorArtifactMetadata.Origin.BUNDLE, ((Number) row.get("bytes")).longValue(), Optional.empty());
+            org.mockito.Mockito.when(catalog.artifact(id, hash)).thenReturn(Optional.of(metadata));
+            org.mockito.Mockito.when(registry.hasArtifact(hash)).thenReturn(true);
+            installed.add(new SeedOutcome.Seeded(seeds.resolve(id + "-connector.jar"),
+                    new RegistrationOutcome(new ConnectorRegistration(id, hash, VERSION, RegistrationSource.SEED), false)));
+        }
+        var gate = new CloudConnectorSeedReadiness(seeds, published, registry, catalog, stores.specStore(),
+                id -> { throw new AssertionError("Complete metadata must avoid repeated capability derivation"); },
+                directoryEntries, bootstrap);
+        assertThat(gate.selectedFileNames()).containsExactlyInAnyOrder(
+                "mongodb-connector.jar", "mysql-connector.jar", "postgres-connector.jar", "mongodb-atlas-connector.jar");
+        gate.verifyRegistrations(installed);
+    }
+
     private CloudConnectorSeedReadiness gate() throws Exception {
         return gate(lockBytes());
     }
@@ -437,7 +480,7 @@ class CloudConnectorSeedReadinessTest {
         try (var output = new ZipOutputStream(Files.newOutputStream(seeds.resolve(id + "-connector.jar")))) {
             output.putNextEntry(new ZipEntry("META-INF/MANIFEST.MF"));
             output.write(("Manifest-Version: 1.0\r\nImplementation-Title: " + title + "\r\nGit-Commit-Id: "
-                    + REVISION + "\r\nPDK-API-Version: " + version + "\r\n\r\n").getBytes(StandardCharsets.UTF_8));
+                    + REVISION + "\r\nImplementation-Version: 2.5.0\r\nPDK-API-Version: " + version + "\r\n\r\n").getBytes(StandardCharsets.UTF_8));
             output.closeEntry();
             output.putNextEntry(new ZipEntry(id + "-spec.json"));
             output.write(specOverride == null ? spec(specId) : specOverride);

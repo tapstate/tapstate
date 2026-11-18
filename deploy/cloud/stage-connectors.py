@@ -28,6 +28,9 @@ ONPREM_IDS = (
     "mysql", "mongodb", "postgres", "oracle", "sqlserver", "mongodb-atlas", "aws-rds-mysql", "db2"
 )
 REQUIRED_LICENSE_FILES = ("MICROSOFT-MIT-LICENSE.txt", "ORACLE-FREE-USE-TERMS.txt")
+CLOUD_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas")
+PUBLISHED_ONPREM_IDS = ("mongodb", "mysql", "postgres", "mongodb-atlas", "oracle", "sqlserver", "aws-rds-mysql", "dummy")
+COORDINATE_KEYS = {"groupId", "artifactId", "version"}
 ENTRY_KEYS = {"id", "bytes", "sha256", "upstreamRevision", "pdkApiVersion", "specPath"}
 LICENSE_KEYS = {"name", "bytes", "sha256"}
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
@@ -56,14 +59,15 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> tuple
         raise StageError(f"cannot read connector lock: {exc}") from exc
     if not isinstance(lock, dict) or set(lock) != {"schemaVersion", "connectors", "licenseFiles"}:
         raise StageError("connector lock must have schemaVersion, connectors, and licenseFiles")
-    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] != 2:
-        raise StageError("connector lock schemaVersion must be 2")
+    if type(lock["schemaVersion"]) is not int or lock["schemaVersion"] not in (2, 3):
+        raise StageError("connector lock schemaVersion must be 2 or 3")
     entries = lock["connectors"]
     if not isinstance(entries, list) or len(entries) != len(required_ids):
         raise StageError(f"connector lock must contain exactly {len(required_ids)} entries")
     ids = []
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != ENTRY_KEYS:
+        expected_keys = ENTRY_KEYS | COORDINATE_KEYS if lock["schemaVersion"] == 3 else ENTRY_KEYS
+        if not isinstance(entry, dict) or set(entry) != expected_keys:
             raise StageError("connector entry has missing or unexpected fields")
         connector_id = entry["id"]
         if not isinstance(connector_id, str) or connector_id not in required_ids:
@@ -80,25 +84,32 @@ def read_lock(path: Path, required_ids: tuple[str, ...] = REQUIRED_IDS) -> tuple
             raise StageError(f"{connector_id}: invalid PDK API version")
         if not isinstance(entry["specPath"], str) or not SPEC_PATH.fullmatch(entry["specPath"]):
             raise StageError(f"{connector_id}: unsafe spec path")
+        if lock["schemaVersion"] == 3:
+            for key in COORDINATE_KEYS:
+                if not isinstance(entry[key], str) or not VERSION.fullmatch(entry[key]):
+                    raise StageError(f"{connector_id}: invalid Maven coordinate {key}")
+            if "SNAPSHOT" in entry["version"]:
+                raise StageError(f"{connector_id}: a published release is required")
         ids.append(connector_id)
     if sorted(ids) != sorted(required_ids):
         raise StageError("connector lock has a duplicate or missing id")
     license_files = lock["licenseFiles"]
-    if not isinstance(license_files, list) or len(license_files) != len(REQUIRED_LICENSE_FILES):
-        raise StageError("connector lock must contain both companion license files")
+    expected_licenses = () if lock["schemaVersion"] == 3 and set(required_ids) == set(CLOUD_IDS) else REQUIRED_LICENSE_FILES
+    if not isinstance(license_files, list) or len(license_files) != len(expected_licenses):
+        raise StageError("connector lock has missing or unexpected companion license files")
     names = []
     for entry in license_files:
         if not isinstance(entry, dict) or set(entry) != LICENSE_KEYS:
             raise StageError("companion license entry has missing or unexpected fields")
         name = entry["name"]
-        if not isinstance(name, str) or name not in REQUIRED_LICENSE_FILES:
+        if not isinstance(name, str) or name not in expected_licenses:
             raise StageError(f"unexpected companion license file: {name!r}")
         if type(entry["bytes"]) is not int or not 1 <= entry["bytes"] <= 1_000_000:
             raise StageError(f"{name}: invalid companion license length")
         if not isinstance(entry["sha256"], str) or not SHA256.fullmatch(entry["sha256"]):
             raise StageError(f"{name}: invalid companion license SHA-256")
         names.append(name)
-    if sorted(names) != sorted(REQUIRED_LICENSE_FILES):
+    if sorted(names) != sorted(expected_licenses):
         raise StageError("connector lock has a duplicate or missing companion license file")
     return entries, license_files
 
@@ -239,7 +250,11 @@ def main() -> int:
     parser.add_argument("--stage-dir", required=True, type=Path)
     parser.add_argument("--profile", choices=("cloud", "onprem"), default="cloud")
     args = parser.parse_args()
-    required_ids = ONPREM_IDS if args.profile == "onprem" else REQUIRED_IDS
+    version = json.loads(args.lock.read_text())["schemaVersion"]
+    if version == 3:
+        required_ids = PUBLISHED_ONPREM_IDS if args.profile == "onprem" else CLOUD_IDS
+    else:
+        required_ids = ONPREM_IDS if args.profile == "onprem" else REQUIRED_IDS
     try:
         stage(args.lock, args.jar_dir, args.stage_dir, required_ids)
     except StageError as exc:

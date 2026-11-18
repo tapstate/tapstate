@@ -63,14 +63,23 @@ record ConfiguredCaptureRun(ExecutionFence original, PipelineNode node, Required
                 : new RequiredNoteStore.CaptureScopes(fixed.open(owner), fixed.open(globalOwner));
         var primary = captured.primary();
         var global = captured.global();
-        var pinned=recoveryPinned?fixed.origin(fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),PipelineNode.Purpose.CAPTURE,scope.stateGeneration()))):null;
-        var artifact = startup ? provisioner.resolveCaptureStartup(config.connectorId())
-                : pinned == null ? provisioner.resolve(config.connectorId()) : provisioner.resolve(config.connectorId(), pinned.artifactHash());
+        var retainedScope = primary;
+        var pinned = fixed.originIfPresent(primary).orElse(null);
+        if (pinned == null && recoveryPinned) {
+            retainedScope = fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(), config.node(),
+                    PipelineNode.Purpose.CAPTURE, scope.stateGeneration()));
+            pinned = fixed.origin(retainedScope);
+        }
+        if (pinned != null && !pinned.equals(
+                ConnectorNoteOrigin.capture(config.connectorId(), pinned.artifactHash(), config.settings()))) throw unavailable();
+        var artifact = pinned != null ? provisioner.resolveRetained(fixed, retainedScope, pinned)
+                : startup ? provisioner.resolveCaptureStartup(config.connectorId()) : provisioner.resolve(config.connectorId());
         requireOriginalStart.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),artifact.contentHash(),config.settings());
-        if(pinned!=null && !pinned.equals(expected))throw unavailable();
+        if (pinned == null) provisioner.retain(artifact);
         var prepared = startup ? fixed.prepareSharedOrigin(primary, expected) : fixed.prepareOrigin(primary, expected);
         if (!expected.equals(prepared)) throw unavailable();
+        if (pinned == null || !retainedScope.equals(primary)) provisioner.markBound(fixed, primary, expected);
         requireOriginalStart.run();
         return new ConfiguredCaptureRun(original, config.node(), primary, global, config.connectorId(),
                 artifact.contentHash(), startup ? artifact : null);

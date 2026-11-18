@@ -214,6 +214,14 @@ final class ThreeLayerStorePort implements StorePort {
     @Override public PipelineDraftStore drafts() { active(); return configuration.drafts(); }
     @Override public SchemaStore schemas() { active(); return bound.cache().schemas(business(), this::active); }
     @Override public ConnectorRegistry connectors() { active(); return bound.cache().connectors(business(), this::active); }
+    io.tapstate.spi.store.ConnectorArtifactHoldings connectorHoldings() {
+        active();
+        return bound.cache().connectorArtifactHoldings(business(), this::active);
+    }
+    boolean copyLegacyConnectorArtifact(String hash, java.io.OutputStream output) throws java.io.IOException {
+        active();
+        return bound.cache().copyLegacyConnectorArtifact(business(), this::active, hash, output);
+    }
     @Override public ConnectorCatalogStore connectorCatalog() { active(); return bound.cache().connectorCatalog(business(), this::active); }
     @Override public ConnectorSpecStore connectorSpecs() { active(); return bound.cache().connectorSpecs(business(), this::active); }
     @Override public ConnectionTestResultStore connectionTestResults() { active(); return bound.cache().connectionTestResults(business(), this::active); }

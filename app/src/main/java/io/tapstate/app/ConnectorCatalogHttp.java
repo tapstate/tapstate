@@ -39,6 +39,27 @@ final class ConnectorCatalogHttp implements ConnectorReleaseCatalog.Fetch {
         }
     }
 
+    record Transfer(java.io.InputStream body, long length, HttpURLConnection connection) implements AutoCloseable {
+        @Override public void close() throws IOException {
+            try {
+                body.close();
+            } finally {
+                connection.disconnect();
+            }
+        }
+    }
+
+    Transfer transfer(URI uri) throws IOException {
+        var connection = open(uri);
+        try {
+            verify(connection.getResponseCode());
+            return new Transfer(connection.getInputStream(), connection.getContentLengthLong(), connection);
+        } catch (IOException failure) {
+            connection.disconnect();
+            throw failure;
+        }
+    }
+
     private static void verify(int status) throws IOException {
         if (status != 200) throw new IOException("Connector catalog request returned HTTP " + status);
     }

@@ -49,11 +49,15 @@ record ConfiguredSinkRun(ExecutionFence original,PipelineNode node,PipelineNode.
         var fixed=notes.guardedBy(requireActive);var scope=original.scope();
         var primary=fixed.open(RequiredNoteOwner.forNode(scope.bindingVersion(),config.node(),purpose,scope.stateGeneration()));
         var global=fixed.open(new RequiredNoteOwner(scope.bindingVersion(),"pdk.global-state",RequiredNoteOwner.Kind.GLOBAL,scope.clusterId(),0));
-        var pinned=recoveryPinned?fixed.origin(primary):null;
-        var ref=pinned==null?provisioner.resolve(config.connectorId()):provisioner.resolve(config.connectorId(),pinned.artifactHash());requireActive.run();
+        var pinned = recoveryPinned ? fixed.origin(primary) : fixed.originIfPresent(primary).orElse(null);
+        if (pinned != null && !pinned.equals(
+                ConnectorNoteOrigin.capture(config.connectorId(), pinned.artifactHash(), config.settings()))) throw unavailable();
+        var ref = pinned == null ? provisioner.resolve(config.connectorId()) : provisioner.resolveRetained(fixed, primary, pinned);
+        requireActive.run();
         var expected=ConnectorNoteOrigin.capture(config.connectorId(),ref.contentHash(),config.settings());
-        if(pinned!=null && !pinned.equals(expected))throw unavailable();
+        if (pinned == null) provisioner.retain(ref);
         if(!expected.equals(fixed.prepareOrigin(primary,expected)))throw unavailable();
+        if (pinned == null) provisioner.markBound(fixed, primary, expected);
         requireActive.run();return new ConfiguredSinkRun(original,config.node(),purpose,new Note(primary),new Note(global),ref.contentHash());
     }
 

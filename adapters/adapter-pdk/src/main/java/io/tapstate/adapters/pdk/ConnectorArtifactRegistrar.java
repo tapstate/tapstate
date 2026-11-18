@@ -209,7 +209,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         }
     }
 
-    private static Optional<BundledConnectorIcon> bundledIcon(Path artifact, String declaredPath) {
+    static Optional<BundledConnectorIcon> bundledIcon(Path artifact, String declaredPath) {
         if (declaredPath == null || declaredPath.isBlank()) return Optional.empty();
         String path = declaredPath.startsWith("/") ? declaredPath.substring(1) : declaredPath;
         try (JarFile jar = new JarFile(artifact.toFile())) {
@@ -317,7 +317,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     }
 
     /** Parses the spec text to its object tree, refusing coded when it is not valid JSON. */
-    private static Object parseSpecTree(IntrospectedConnector introspected, Path artifact) {
+    static Object parseSpecTree(IntrospectedConnector introspected, Path artifact) {
         try {
             return JsonReader.parse(introspected.spec());
         } catch (IllegalArgumentException e) {
@@ -326,7 +326,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     }
 
     /** The connector id the spec declares under {@code properties.id} — the registration identity. */
-    private static String declaredId(Object specTree, IntrospectedConnector introspected, Path artifact) {
+    static String declaredId(Object specTree, IntrospectedConnector introspected, Path artifact) {
         if (specTree instanceof Map<?, ?> root
                 && root.get("properties") instanceof Map<?, ?> properties
                 && properties.get("id") instanceof String id
@@ -384,7 +384,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         catalogStore.upsert(catalogRow(introspected, specTree, specHash, capabilities));
     }
 
-    private static ConnectorCatalogEntry catalogRow(IntrospectedConnector introspected, Object specTree,
+    static ConnectorCatalogEntry catalogRow(IntrospectedConnector introspected, Object specTree,
                                                     String specHash, ConnectorCapabilities capabilities) {
         NormalizedSpec normalized = SpecNormalizer.normalize(asSpecObject(specTree));
         return CatalogEntryAssembler.assemble(normalized, capabilities.capabilityIds(), OVERLAY,
@@ -406,7 +406,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
                 cause);
     }
 
-    private static String hashOf(Path artifact) {
+    static String hashOf(Path artifact) {
         try (var bytes = Files.newInputStream(artifact)) {
             return ContentHash.of(bytes);
         } catch (IOException failure) {
@@ -414,7 +414,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
         }
     }
 
-    private static TapstateException artifactUnreadable(Path artifact) {
+    static TapstateException artifactUnreadable(Path artifact) {
         return new TapstateException(ConnectorError.ARTIFACT_UNREADABLE,
                 Map.of("artifact", artifact.getFileName().toString()), null);
     }
