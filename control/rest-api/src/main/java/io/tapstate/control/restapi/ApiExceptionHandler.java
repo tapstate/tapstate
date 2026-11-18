@@ -257,8 +257,8 @@ class ApiExceptionHandler {
             Map.entry(PositionError.FIELD_NOT_EDITABLE.code(), HttpStatus.BAD_REQUEST),
             Map.entry(PositionError.NOTHING_TO_WRITE.code(), HttpStatus.BAD_REQUEST),
             Map.entry(ClusterError.MEMBERSHIP_UNREADABLE.code(), HttpStatus.SERVICE_UNAVAILABLE)));
-        // Explicit registration survives a change in wire identity. The domain fallback above serves
-        // only legacy codes that have not yet migrated; it must not classify new numeric identities.
+        // First-party DSL errors use registered product codes. The REST boundary also keeps
+        // external DSL validation failures client-attributable without registering their codes.
         for (DslError code : DslError.values()) statuses.put(code.code(), HttpStatus.BAD_REQUEST);
         return Map.copyOf(statuses);
     }

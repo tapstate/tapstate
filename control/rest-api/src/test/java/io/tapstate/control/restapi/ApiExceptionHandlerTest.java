@@ -95,8 +95,10 @@ class ApiExceptionHandlerTest {
                         .isEqualTo(HttpStatus.valueOf(fields[1]));
             }
         }
-        for (DslError code : DslError.values())
+        for (DslError code : DslError.values()) {
+            assertThat(code.code()).as(code.name()).matches("TS[0-9]{7}");
             assertThat(ApiExceptionHandler.statusFor(code)).as(code.name()).isEqualTo(HttpStatus.BAD_REQUEST);
+        }
     }
 
     @Test
