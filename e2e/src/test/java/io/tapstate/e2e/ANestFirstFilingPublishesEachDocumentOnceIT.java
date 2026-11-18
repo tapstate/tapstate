@@ -3,7 +3,13 @@ package io.tapstate.e2e;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ClassNotLoadedException;
+import com.sun.jdi.IncompatibleThreadStateException;
+import com.sun.jdi.InvalidTypeException;
+import com.sun.jdi.InvocationException;
 import com.sun.jdi.ObjectReference;
+import com.sun.jdi.StringReference;
+import com.sun.jdi.ThreadReference;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.request.EventRequest;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
@@ -14,8 +20,6 @@ import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -294,13 +298,15 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                 boolean held = false;
                 try {
                     for (var event : events) {
-                        if (event instanceof BreakpointEvent stopped && observedNoCompletion(stopped)) {
-                            requests.deleteEventRequests(List.copyOf(requests.breakpointRequests()));
-                            Await.until("the original Jet execution to complete while convergence is paused",
-                                    () -> jetCompleted(process, pipelineId), () -> process.output().toString());
-                            held = true;
-                            break;
-                        }
+                        if (!(event instanceof BreakpointEvent stopped)) continue;
+                        var run = originalRunAfterIncompleteRead(stopped, pipelineId);
+                        if (run == null) continue;
+                        requests.deleteEventRequests(List.copyOf(requests.breakpointRequests()));
+                        // Jet can log success before publishing its terminal job status.
+                        Await.until("the original Jet execution to report COMPLETED while convergence is paused",
+                                () -> jetCompleted(run, stopped.thread()), () -> process.output().toString());
+                        held = true;
+                        break;
                     }
                 } finally {
                     events.resume();
@@ -316,19 +322,28 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
         }
     }
 
-    private static boolean observedNoCompletion(BreakpointEvent stopped) throws Exception {
+    private static ObjectReference originalRunAfterIncompleteRead(BreakpointEvent stopped, String pipelineId)
+            throws Exception {
         var frame = stopped.thread().frame(0);
+        var observedPipeline = (StringReference) frame.getArgumentValues().getFirst();
+        if (!pipelineId.equals(observedPipeline.value())) return null;
         var completion = frame.visibleVariableByName("completion");
-        return completion != null && frame.getValue(completion) instanceof ObjectReference result
-                && result.getValue(result.referenceType().fieldByName("value")) == null;
+        if (completion == null || !(frame.getValue(completion) instanceof ObjectReference result)
+                || result.getValue(result.referenceType().fieldByName("value")) != null) return null;
+        var converger = frame.thisObject();
+        var actuator = (ObjectReference) converger.getValue(converger.referenceType().fieldByName("actuator"));
+        return (ObjectReference) actuator.getValue(actuator.referenceType().fieldByName("run"));
     }
 
-    private static boolean jetCompleted(RealProcessServer process, String pipelineId) {
-        try (var log = Files.lines(process.output())) {
-            return log.anyMatch(line -> line.contains("Execution of job '" + pipelineId + "'")
-                    && line.contains("completed successfully"));
-        } catch (IOException failure) {
-            throw new UncheckedIOException(failure);
+    private static boolean jetCompleted(ObjectReference run, ThreadReference thread) {
+        try {
+            var status = (ObjectReference) run.invokeMethod(thread, run.referenceType().methodsByName("status").getFirst(),
+                    List.of(), ObjectReference.INVOKE_SINGLE_THREADED);
+            var statusType = status.referenceType();
+            return status.equals(statusType.getValue(statusType.fieldByName("COMPLETED")));
+        } catch (InvalidTypeException | ClassNotLoadedException | IncompatibleThreadStateException
+                | InvocationException failure) {
+            throw new AssertionError("could not read the original Jet job status", failure);
         }
     }
 
