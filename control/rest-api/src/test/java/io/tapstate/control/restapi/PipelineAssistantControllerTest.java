@@ -681,7 +681,7 @@ class PipelineAssistantControllerTest {
         var invalidExpressionStreamOutput = new ByteArrayOutputStream();
         controller.assistant("orders", body, request, new org.springframework.mock.web.MockHttpServletResponse()).getBody().writeTo(invalidExpressionStreamOutput);
         String invalidExpressionStream = invalidExpressionStreamOutput.toString(StandardCharsets.UTF_8);
-        assertThat(invalidExpressionStream).contains("dsl.illegal-expression", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
+        assertThat(invalidExpressionStream).contains("TS0010010", "transforms[0].expr", "\"state\":\"needs-input\"", "\"finishReason\":\"stop\"")
                 .doesNotContain("data-proposal", "afterr.region");
         assertThat(invalidExpressionStream).doesNotContain("\"type\":\"error\"");
         assertThat(store.get("orders")).contains(base);
@@ -835,7 +835,7 @@ class PipelineAssistantControllerTest {
         List<?> expressionDiagnostics = (List<?>) expressionValidation.get("diagnostics");
         assertThat(expressionDiagnostics).hasSize(1);
         Map<String, Object> expressionDiagnostic = AssistantWizardJson.object(expressionDiagnostics.getFirst());
-        assertThat(expressionDiagnostic).containsEntry("code", "dsl.illegal-expression");
+        assertThat(expressionDiagnostic).containsEntry("code", "TS0010010");
         assertThat(AssistantWizardJson.object(expressionDiagnostic.get("params")))
                 .containsEntry("path", "transforms[0].expr")
                 .doesNotContainKeys("expr", "detail");

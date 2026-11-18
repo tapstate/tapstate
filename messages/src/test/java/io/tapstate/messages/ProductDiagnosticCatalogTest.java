@@ -96,6 +96,19 @@ class ProductDiagnosticCatalogTest {
     }
 
     @Test
+    void explicitLiteralEscapesDoNotBecomeParametersOrRewriteArgumentText() {
+        String resource = RESOURCE.replace("Correct the request.", "Use $\\\\{var:NAME:default\\\\} and \\\\{reason\\\\}.");
+        var catalog = ProductDiagnosticCatalog.load("021", List.of(DEFINITION), language -> resource);
+        var result = catalog.resolve(CODE, Map.of("reason", "literal \\{reason\\}"), List.of(), Locale.ENGLISH).orElseThrow();
+        assertThat(result.solution()).isEqualTo("Use ${var:NAME:default} and {reason}.");
+        assertThat(result.message()).isEqualTo("Invalid request: literal \\{reason\\}");
+        for (String invalid : List.of("bad \\\\q", "unclosed \\\\{literal}"))
+            assertThatThrownBy(() -> ProductDiagnosticCatalog.load("021", List.of(DEFINITION),
+                    language -> RESOURCE.replace("Correct the request.", invalid)))
+                    .isInstanceOf(IllegalStateException.class);
+    }
+
+    @Test
     void callerMutationCannotAlterRegisteredParameterContractsOrRewriteInsertedText() {
         var parameters = new HashSet<>(Set.of("reason"));
         var definition = new ProductDiagnosticCatalog.Definition(CODE, parameters);

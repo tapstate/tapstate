@@ -83,20 +83,37 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
     }
 
     private static void collectParameters(String template, Set<String> used) {
+        processTemplate(template, used, null);
+    }
+
+    /** Backslash escapes a literal brace or backslash; inserted argument text is never re-parsed. */
+    private static String processTemplate(String template, Set<String> used, Map<String, Object> args) {
+        StringBuilder rendered = new StringBuilder();
         for (int offset = 0; offset < template.length(); offset++) {
             char character = template.charAt(offset);
+            if (character == '\\') {
+                if (++offset == template.length() || "{}\\".indexOf(template.charAt(offset)) < 0)
+                    throw new IllegalStateException("invalid diagnostic template escape");
+                rendered.append(template.charAt(offset));
+                continue;
+            }
             if (character == '}')
                 throw new IllegalStateException("unmatched diagnostic parameter delimiter");
-            if (character != '{') continue;
+            if (character != '{') {
+                rendered.append(character);
+                continue;
+            }
             int close = template.indexOf('}', offset + 1);
             if (close < 0)
                 throw new IllegalStateException("unmatched diagnostic parameter delimiter");
             String name = template.substring(offset + 1, close);
             if (!NAME.matcher(name).matches())
                 throw new IllegalStateException("diagnostic templates require named parameters");
-            used.add(name);
+            if (used != null) used.add(name);
+            if (args != null) rendered.append(String.valueOf(args.get(name)));
             offset = close;
         }
+        return rendered.toString();
     }
 
     /** The registered identities, available for composition and independent completeness gates. */
@@ -109,8 +126,8 @@ public final class ProductDiagnosticCatalog implements DiagnosticDefinitionLooku
         if (definition == null || !positional.isEmpty() || !named.keySet().equals(definition.parameters()))
             return Optional.empty();
         var template = text.get(language(locale)).get(code);
-        return Optional.of(new Resolved(code, MessageCatalog.substitute(template.message(), named),
-                MessageCatalog.substitute(template.solution(), named)));
+        return Optional.of(new Resolved(code, processTemplate(template.message(), null, named),
+                processTemplate(template.solution(), null, named)));
     }
 
     static String language(Locale locale) {

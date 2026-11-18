@@ -732,7 +732,7 @@ class ApplyServiceTest {
         assertThat(result.valid()).isFalse();
         assertThat(result.outcomes()).isEmpty();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic -> {
-            assertThat(diagnostic.code()).isEqualTo("dsl.unknown-field");
+            assertThat(diagnostic.code()).isEqualTo("TS0010002");
             assertThat(diagnostic.params()).containsEntry("field", "bogus_field");
         });
         assertThat(store.saveCount).isZero();
@@ -1349,7 +1349,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).extracting(ValidationDiagnostic::code)
-                .containsExactly("dsl.unknown-field");
+                .containsExactly("TS0010002");
         assertThat(result.warnings()).as("a batch that was refused carries no advisory findings").isEmpty();
         assertThat(reviewed).as("the advisory pass is not reached at all").isEmpty();
     }

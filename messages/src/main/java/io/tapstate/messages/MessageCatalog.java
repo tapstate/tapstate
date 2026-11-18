@@ -10,6 +10,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
+import java.util.HashSet;
+import java.util.Set;
 
 /**
  * The error-code message catalog — the presentation-layer renderer. It turns a coded exception
@@ -73,6 +76,8 @@ public final class MessageCatalog {
     /** Localizes registered product codes; legacy text retains its original catalog language. */
     public Rendered render(String code, Map<String, Object> args, Locale locale) {
         var registered = RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -83,6 +88,28 @@ public final class MessageCatalog {
         }
         String solution = entry.solution() == null ? null : substitute(entry.solution(), args);
         return new Rendered(substitute(entry.message(), args), solution);
+    }
+
+    /** Renders an optional wire diagnostic only when its known parameter contract is complete. */
+    public Optional<Rendered> renderComplete(String code, Map<String, Object> args) {
+        var registered = RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH)
+                .or(() -> DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+        if (registered.isPresent()) {
+            var text = registered.orElseThrow();
+            return Optional.of(new Rendered(text.message(), text.solution()));
+        }
+        Entry entry = entries.get(code);
+        if (entry == null) return Optional.empty();
+        Set<String> required = new HashSet<>();
+        collectLegacyParameters(entry.message(), required);
+        collectLegacyParameters(entry.solution(), required);
+        return required.equals(args.keySet()) ? Optional.of(render(code, args)) : Optional.empty();
+    }
+
+    private static void collectLegacyParameters(String template, Set<String> required) {
+        if (template == null) return;
+        var matcher = java.util.regex.Pattern.compile("\\{([a-zA-Z0-9_]+)}").matcher(template);
+        while (matcher.find()) required.add(matcher.group(1));
     }
 
     /** Resolves an exact PDK test-item resource key, preserving unknown connector text. */

@@ -30,6 +30,31 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class McpOperationExecutorTest {
 
+    @Test
+    void artifactWarningsAreReadableWithoutTurningSuccessfulOperationsIntoErrors() throws Exception {
+        HttpServer server = server(exchange -> answer(exchange, 200, """
+                {"valid":true,"diagnostics":[],"outcomes":[{"id":"orders","change":"CREATED"}],
+                 "warnings":[{"code":"TS0010032","params":{"pipeline":"orders","setting":"parallelism","instead":"node.parallelism"}},
+                             {"code":"future.warning","params":{"detail":"keep"},"message":"Server explanation"}]}
+                """));
+        try (HttpControlClient client = new HttpControlClient()) {
+            var executor = new McpOperationExecutor(baseOf(server), "token", Map.of(), client);
+            for (String operation : List.of("artifact.validate", "artifact.apply")) {
+                var result = executor.execute(ControlOperations.registry().resolve(operation), Map.of());
+                assertThat(result.error()).isFalse();
+                assertThat(result.body()).containsEntry("valid", true).containsEntry("diagnostics", List.of())
+                        .containsEntry("outcomes", List.of(Map.of("id", "orders", "change", "CREATED")));
+                var warnings = (List<?>) result.body().get("warnings");
+                var known = (Map<?, ?>) warnings.getFirst();
+                assertThat(known.get("code")).isEqualTo("TS0010032");
+                assertThat(known.get("message")).isEqualTo("Pipeline orders sets parallelism, which no longer decides anything; nothing reads it.");
+                assertThat(known.get("solution").toString()).contains("node.parallelism");
+                assertThat(warnings.get(1)).isEqualTo(Map.of("code", "future.warning",
+                        "params", Map.of("detail", "keep"), "message", "Server explanation"));
+            }
+        } finally { server.stop(0); }
+    }
+
     @Test void storageToolsPostTheSameSharedBodyAndNeverPutSecretsInUrls() throws Exception {
         var paths = new ArrayList<String>(); var requests = new ArrayList<Object>();
         HttpServer server = server(exchange -> {

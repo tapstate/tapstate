@@ -624,7 +624,7 @@ class SourceApiTest {
 
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(missingDatabase),
-                HttpStatus.BAD_REQUEST, "dsl.config-required");
+                HttpStatus.BAD_REQUEST, "TS0010015");
         assertThat(context.getBean(InMemoryArtifactStore.class).get("missing-config")).isEmpty();
     }
 

@@ -7,7 +7,8 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 # Product error diagnostics
 
 This page describes an unshipped migration candidate. The first migrated request
-refusal is `TS0210001`. Other error families retain their existing contract until
+refusal is `TS0210001`. DSL errors use `TS0010001` through `TS0010031`, and
+execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
 product contract switches with a coordinated major release; this candidate does
 not establish a supported mixed-version deployment matrix.
@@ -24,6 +25,13 @@ The HTTP response remains 400. CLI diagnostic exit status and MCP `isError`
 remain unchanged. A new identity does not mean that a request was accepted or
 executed. Preserve typed refusal payloads, uncertain outcomes, cancellation and
 cleanup behavior when migrating other families.
+
+DSL definitions live in `DslErrorDefinitions`, with the existing `DslError` and
+`ExecutionAdvisoryError` enums retaining their typed APIs. Corpus rule symbols
+are separate from diagnostic identities: `unknown-field` remains the rule name
+while its diagnostic is `TS0010002`. Keep `DslException` source, path, line and
+column through copies and wrappers. Warnings remain successful validation/apply
+results; they do not become refusals merely because they carry a diagnostic code.
 
 ```java
 throw new TapstateException(ControlError.MALFORMED_REQUEST,
@@ -46,10 +54,19 @@ There is no runtime classpath scan or enum reconstruction.
 
 The request language resources are
 `messages/src/main/resources/messages/request-diagnostic-{en,zh-CN,zh-TW}.json`.
+DSL resources use the corresponding `dsl-diagnostic-` prefix and the explicit
+`DslDiagnosticCatalog` registration, without a parser dependency in the renderer.
 Each identity has nonempty `message` and `solution` fields. Their combined named
 placeholders must match the definition exactly. This public repository stores
 non-ASCII translations as JSON Unicode escapes. The native CLI includes both
 YAML and JSON message resources.
+
+Use a backslash to escape a literal brace or backslash in a template, with the
+additional JSON escaping required by the resource format. For example,
+`"Use $\\{var:NAME:default\\}."` renders `Use ${var:NAME:default}.` without
+declaring an extra parameter. Unescaped braces must form a valid named parameter;
+unknown escapes and unmatched delimiters fail validation. Inserted argument text
+is never parsed again as a template.
 
 ```java
 var definition = RequestErrorDefinitions.MALFORMED_REQUEST;
@@ -88,12 +105,14 @@ mvn -pl messages -am \
   -Dtest=JsonReaderTest,ProductDiagnosticCatalogTest,MessageCatalogTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 mvn -pl arch-tests -am \
-  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
+  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,DslDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 ```
 
 Positive cases include all three locales, exact named parameters, preserved
-unknown-code fallback and legacy text reads. Negative cases include duplicate
+unknown-code fallback, literal grammar examples and legacy text reads. The
+`product-code-migrations.tsv` test fixture records reviewed replacements against
+the frozen historical golden; it is not a runtime alias table. Negative cases include duplicate
 registration or JSON members, an unallocated module, serial zero, a missing
 locale entry, an extra/missing placeholder, positional `{0}` and malformed
 `{{reason}}` delimiters. These checks validate structure and frozen identity;

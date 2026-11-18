@@ -117,7 +117,7 @@ class StructuredPipelineSyncIdentityIT {
             Map<String, Object> collision = pipeline("sync_collision", List.of(
                     Map.of("source", "views"), Map.of("id", "sync_1", "source", "views")));
             assertThat(json(control.sourceRequest("POST", "/api/pipelines", collision, null, 400).body()))
-                    .containsEntry("code", "dsl.duplicate-id");
+                    .containsEntry("code", "TS0010012");
             control.sourceRequest("GET", "/api/pipelines/sync_collision", null, null, 404);
         }
     }

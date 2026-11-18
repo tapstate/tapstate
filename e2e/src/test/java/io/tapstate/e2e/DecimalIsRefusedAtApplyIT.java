@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class DecimalIsRefusedAtApplyIT {
 
     private static final String PIPELINE_ID = "decimal_pipeline";
-    private static final String TYPE_UNSUPPORTED = "dsl.row-expression-type-unsupported";
+    private static final String TYPE_UNSUPPORTED = "TS0010021";
 
     @BeforeAll
     static void requireDockerAndRealConnectors() {

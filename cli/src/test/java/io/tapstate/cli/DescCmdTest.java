@@ -191,7 +191,7 @@ class DescCmdTest {
         Run r = run("desc", "p1", "-w", ws.toString());
         // desc describes the resource regardless; validation is reported as invalid with the code
         assertThat(r.code()).isZero();
-        assertThat(r.out()).containsIgnoringCase("invalid").contains("dsl.missing-reference");
+        assertThat(r.out()).containsIgnoringCase("invalid").contains("TS0010005");
     }
 
     // ---- references: forward and reverse -----------------------------------------------
@@ -301,7 +301,7 @@ class DescCmdTest {
         assertThat(r.code()).isZero();
         assertThat(r.all()).containsIgnoringCase("unreadable");
         // its validation is the coded malformed-yaml — never a raw snakeyaml stack at the user boundary
-        assertThat(r.all()).contains("dsl.malformed-yaml");
+        assertThat(r.all()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 
@@ -318,7 +318,7 @@ class DescCmdTest {
         Run r = run("desc", "src_ok", "-w", ws.toString());
         // describing a readable resource must not crash on a malformed neighbour the validate run hits
         assertThat(r.code()).isZero();
-        assertThat(r.all()).contains("dsl.malformed-yaml");
+        assertThat(r.all()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 
@@ -330,7 +330,7 @@ class DescCmdTest {
         assertThat(r.code()).isZero();
         // the machine shape is honest: readable:false and NO summary key (which would claim a shape it lacks)
         assertThat(r.out()).contains("\"readable\": false").doesNotContain("\"summary\"");
-        assertThat(r.out()).contains("dsl.malformed-yaml");
+        assertThat(r.out()).contains("TS0010017");
     }
 
     @Test

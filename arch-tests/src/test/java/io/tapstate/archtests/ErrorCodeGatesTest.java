@@ -5,6 +5,9 @@ import com.tngtech.archunit.core.domain.JavaClasses;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.Domain;
 import io.tapstate.core.common.RequestErrorDefinitions;
+import io.tapstate.core.common.DslErrorDefinitions;
+import io.tapstate.core.common.ProductErrorDefinition;
+import io.tapstate.messages.DslDiagnosticCatalog;
 import io.tapstate.messages.RequestDiagnosticCatalog;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
@@ -63,6 +66,15 @@ class ErrorCodeGatesTest {
 
     /** Bundled en catalog: canonical code -> {message, [solution]} (the templates, not rendered). */
     private static Map<String, Map<String, String>> catalog;
+
+    private static Map<String, ProductErrorDefinition> productDefinitions() {
+        Map<String, ProductErrorDefinition> registered = new LinkedHashMap<>();
+        java.util.stream.Stream.concat(RequestErrorDefinitions.registered().stream(),
+                DslErrorDefinitions.registered().stream()).forEach(definition -> {
+            assertThat(registered.put(definition.code(), definition)).isNull();
+        });
+        return registered;
+    }
 
     @BeforeAll
     static void scanFirstPartyCodes() {
@@ -125,10 +137,11 @@ class ErrorCodeGatesTest {
     void everyCodeMatchesFormatAndRegisteredDomain() {
         for (TapstateErrorCode c : codes) {
             String code = c.code();
-            if (code.equals(RequestErrorDefinitions.MALFORMED_REQUEST.code())) {
-                assertThat(code).matches("TS021(?!0000)[0-9]{4}");
-                assertThat(c.placeholders()).isEqualTo(RequestErrorDefinitions.MALFORMED_REQUEST.parameters());
-                assertThat(c.severity()).isEqualTo(RequestErrorDefinitions.MALFORMED_REQUEST.severity());
+            if (productDefinitions().containsKey(code)) {
+                var definition = productDefinitions().get(code);
+                assertThat(code).matches("TS" + definition.module().number() + "(?!0000)[0-9]{4}");
+                assertThat(c.placeholders()).isEqualTo(definition.parameters());
+                assertThat(c.severity()).isEqualTo(definition.severity());
                 continue;
             }
             int dot = code.indexOf('.');
@@ -167,9 +180,11 @@ class ErrorCodeGatesTest {
                 .distinct()
                 .sorted()
                 .filter(code -> {
-                    if (code.equals(RequestErrorDefinitions.MALFORMED_REQUEST.code())) {
-                        return RequestDiagnosticCatalog.bundled().resolve(code, Map.of("reason", "fixture"),
-                                List.of(), java.util.Locale.ENGLISH).isEmpty();
+                    if (productDefinitions().containsKey(code)) {
+                        Map<String, Object> args = new LinkedHashMap<>();
+                        productDefinitions().get(code).parameters().forEach(name -> args.put(name, "fixture"));
+                        return RequestDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && DslDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();
@@ -182,7 +197,13 @@ class ErrorCodeGatesTest {
 
     @Test
     @DisplayName("D5-4: each catalog template's {names} match the code's declared placeholders()")
-    void catalogPlaceholdersMatchTheCodeContract() {
+    void catalogPlaceholdersMatchTheCodeContract() throws IOException {
+        Map<String, String> historical = new LinkedHashMap<>();
+        for (String line : Files.readAllLines(Path.of("src/test/resources/product-code-migrations.tsv"))) {
+            if (line.isBlank() || line.startsWith("#")) continue;
+            String[] pair = line.split("\t");
+            assertThat(historical.put(pair[0], pair[1])).isNull();
+        }
         Map<String, Set<String>> declared = new HashMap<>();
         for (TapstateErrorCode c : codes) {
             declared.put(c.code(), new TreeSet<>(c.placeholders()));
@@ -210,9 +231,9 @@ class ErrorCodeGatesTest {
                 continue;
             }
             // Retained historical text is readable, but no current producer owns the retired identity.
-            if (code.equals("control.malformed-request")) {
+            if (historical.containsKey(code)) {
                 assertThat(declared).doesNotContainKey(code);
-                assertThat(used).containsExactly("reason");
+                assertThat(used).isEqualTo(declared.get(historical.get(code)));
                 continue;
             }
             assertThat(declared)

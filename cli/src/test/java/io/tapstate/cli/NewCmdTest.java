@@ -202,7 +202,7 @@ class NewCmdTest {
                 "--connector", "mysql", "--mode", "stream", "--id", "src_my", "--out", dir.toString());
 
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("dsl.unsupported-mode");
+        assertThat(r.all()).contains("TS0010013");
         assertThat(dir.resolve("src_my.tap.yml")).doesNotExist();
     }
 

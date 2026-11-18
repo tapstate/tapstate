@@ -312,7 +312,7 @@ class CliTest {
         Run r = run("validate", resource("ws-invalid").toString());
         assertThat(r.code()).isEqualTo(1);
         // the dsl-domain error code surfaces, located at the offending file
-        assertThat(r.all()).contains("dsl.unknown-field");
+        assertThat(r.all()).contains("TS0010002");
         assertThat(r.all()).contains("src_typo.tap.yml");
     }
 
@@ -335,7 +335,7 @@ class CliTest {
         // the rendered, user-facing message — not only the bare dev string
         assertThat(r.all()).contains("Unknown field");
         // the canonical code stays visible as the stable, machine-referable identity
-        assertThat(r.all()).contains("dsl.unknown-field");
+        assertThat(r.all()).contains("TS0010002");
     }
 
     @Test
@@ -352,7 +352,7 @@ class CliTest {
         Run r = run("validate", "-o", "json", resource("ws-invalid").toString());
         assertThat(r.code()).isEqualTo(1);
         assertThat(r.out()).contains("\"status\": \"invalid\"")
-                .contains("\"code\": \"dsl.unknown-field\"")
+                .contains("\"code\": \"TS0010002\"")
                 .contains("\"severity\": \"ERROR\"")
                 .contains("\"source\": \"src_typo.tap.yml\"")
                 .contains("Unknown field");
@@ -403,12 +403,12 @@ class CliTest {
 
     @Test
     void validateRendersMalformedYamlAsACodedDiagnosticNotARawStack(@TempDir Path dir) throws Exception {
-        // a syntactically broken file must surface as a coded dsl.malformed-yaml, never a raw snakeyaml stack
+        // a syntactically broken file must surface as a coded TS0010017, never a raw snakeyaml stack
         Path artifact = dir.resolve("broken.tap.yml");
         Files.writeString(artifact, "[unterminated\n");
         Run r = run("validate", artifact.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.err()).contains("dsl.malformed-yaml");
+        assertThat(r.err()).contains("TS0010017");
         assertThat(r.all()).doesNotContain("org.yaml.snakeyaml");
     }
 

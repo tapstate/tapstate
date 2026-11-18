@@ -198,7 +198,7 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("dsl.unknown-field");
+        assertThat(body.code()).isEqualTo("TS0010002");
         // the message is rendered from the catalog with the named args substituted, not the bare code
         assertThat(body.message()).isEqualTo("Unknown field 'snapshot_mode' at options.snapshot_mode.");
         assertThat(body.params()).containsEntry("field", "snapshot_mode").containsEntry("path", "options.snapshot_mode");
@@ -410,7 +410,7 @@ class ApiExceptionHandlerTest {
         ApiError body = handler.handle(e).getBody();
 
         // the wire identity is the canonical code string (ApiError.code is a String); the enum never crosses
-        assertThat(body.code()).isEqualTo("dsl.malformed-yaml");
+        assertThat(body.code()).isEqualTo("TS0010017");
     }
 
     @Test

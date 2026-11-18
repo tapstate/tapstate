@@ -76,7 +76,7 @@ class FilePipelineLoaderTest {
                 .hasMessageContaining("broken.tap.yml does not parse")
                 // The product's own coded diagnostic must survive into the message, otherwise the
                 // author is told only that something, somewhere, is wrong.
-                .hasMessageContaining("dsl.unknown-field")
+                .hasMessageContaining("TS0010002")
                 .hasMessageContaining("nonsense");
     }
 

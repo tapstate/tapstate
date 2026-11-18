@@ -50,11 +50,19 @@ class RequestDiagnosticDefinitionGatesTest {
     }
 
     @Test
-    void onlyTheExplicitRequestMigrationDiffersFromTheIndependentLegacySnapshot() throws Exception {
+    void onlyExplicitMigrationsDifferFromTheIndependentLegacySnapshot() throws Exception {
         var baseline = readCodes("legacy-error-codes-before-request.golden");
         assertThat(baseline).hasSize(454).contains("control.malformed-request").doesNotContain("TS0210001");
-        baseline.remove("control.malformed-request");
-        baseline.add("TS0210001");
+        Set<String> replacements = new TreeSet<>();
+        for (String line : Files.readAllLines(Path.of("src/test/resources/product-code-migrations.tsv"))) {
+            if (line.isBlank() || line.startsWith("#")) continue;
+            String[] pair = line.split("\t");
+            assertThat(pair).hasSize(2);
+            assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
+            assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
+        }
+        assertThat(replacements).hasSize(34);
+        baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
     }
 

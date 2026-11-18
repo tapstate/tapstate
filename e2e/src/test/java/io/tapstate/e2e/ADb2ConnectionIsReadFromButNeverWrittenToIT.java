@@ -23,7 +23,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ADb2ConnectionIsReadFromButNeverWrittenToIT {
 
-    private static final String UNSUPPORTED_TARGET_CONNECTOR = "dsl.unsupported-target-connector";
+    private static final String UNSUPPORTED_TARGET_CONNECTOR = "TS0010026";
 
     private static final String DB2_SOURCE = """
             version: tapstate/v1

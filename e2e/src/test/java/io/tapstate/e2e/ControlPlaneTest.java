@@ -366,9 +366,9 @@ class ControlPlaneTest {
 
     @Test
     void readsAClientErrorAsTheRefusalItIs() {
-        assertThat(ControlPlane.interpretRefusal(400, coded("dsl.row-expression-type-unsupported"), "the batch"))
+        assertThat(ControlPlane.interpretRefusal(400, coded("TS0010021"), "the batch"))
                 .isEqualTo(new ControlPlane.Refusal(
-                        400, "dsl.row-expression-type-unsupported", Map.of("pipeline", PIPELINE)));
+                        400, "TS0010021", Map.of("pipeline", PIPELINE)));
     }
 
     /**

@@ -203,7 +203,7 @@ class ControlApiTest {
 
         assertThat(invalid.valid()).isFalse();
         assertThat(invalid.diagnostics()).singleElement()
-                .extracting("code").isEqualTo("dsl.unknown-field");
+                .extracting("code").isEqualTo("TS0010002");
         assertThat(context.getBean(ArtifactStore.class).list()).isEmpty();
         assertThat(context.getBean(RecordingAuditStore.class).records).isEmpty();
     }
@@ -626,7 +626,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("dsl.unknown-field");
+        assertThat(body.code()).isEqualTo("TS0010002");
         assertThat(body.message()).isEqualTo("Unknown field 'snapshot_mode' at options.snapshot_mode.");
         assertThat(body.params()).containsEntry("field", "snapshot_mode");
     }
@@ -1086,7 +1086,7 @@ class ControlApiTest {
 
     // ---- fixtures ----
 
-    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as dsl.unknown-field. */
+    /** A source draft carrying a field outside the tapstate/v1 schema — rejected as TS0010002. */
     private static final String UNKNOWN_FIELD_DRAFT = """
             version: tapstate/v1
             kind: source

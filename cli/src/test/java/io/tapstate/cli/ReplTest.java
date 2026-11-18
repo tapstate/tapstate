@@ -2811,7 +2811,7 @@ class ReplTest {
     void aRefusedApplyShowsTheRemedyAndNotOnlyWhatWentWrong(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.applyOutcome = new ApplyOutcome.Rejected("dsl.upsert-needs-key",
+        client.applyOutcome = new ApplyOutcome.Rejected("TS0010023",
                 "The sync at serve.sync upserts table `events` of source `mydb`, but that table declares "
                         + "no key, so no write can be matched to the row it belongs to.",
                 Map.of("table", "events", "source", "mydb", "path", "serve.sync"));
@@ -2821,7 +2821,7 @@ class ReplTest {
         h.repl().dispatch("apply");
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("dsl.upsert-needs-key").contains("declares no key");
+        assertThat(out).contains("TS0010023").contains("declares no key");
         assertThat(out)
                 .as("the catalog's solution for the code, with its parameters filled in")
                 .contains("Give `events` a primary key")
@@ -4278,7 +4278,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("apply")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("dsl.undefined-variable").contains("MONGO_URI").contains("tgt.tap.yml");
+        assertThat(out).contains("TS0010018").contains("MONGO_URI").contains("tgt.tap.yml");
         // nothing left the client: a reference that cannot be resolved is not the server's problem to
         // discover, and a literal ${...} on the wire would surface as a connector failure far from here
         assertThat(client.applyCalls).isEmpty();
@@ -4320,11 +4320,11 @@ class ReplTest {
     void applyRenderingAServerRejectionShowsTheCodeAndMessage(@TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.applyOutcome = new ApplyOutcome.Rejected("dsl.illegal-value", "Not a known kind.");
+        client.applyOutcome = new ApplyOutcome.Rejected("TS0010009", "Not a known kind.");
         Harness h = onlineSession(base, client);
         int mark = h.sink().toString().length();
         h.repl().dispatch("apply");
-        assertThat(h.sink().toString().substring(mark)).contains("dsl.illegal-value").contains("Not a known kind.");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0010009").contains("Not a known kind.");
     }
 
     @Test

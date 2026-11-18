@@ -58,10 +58,10 @@ class ValidationWiringTest {
     @Test
     void ambiguousAndMissingClosedTablesDoNotBecomeAllSourceRoutes() {
         assertThatThrownBy(() -> inspect(pipeline(""), sources("[orders]", "[orders]"), "orders"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.ambiguous-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010006");
         for (String missing : List.of("missing", "other.orders", "src_orders.missing", "src_orders.")) {
             assertThatThrownBy(() -> inspect(pipeline(""), sources("[orders]", "[archive]"), missing))
-                    .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                    .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
         }
     }
 
@@ -108,9 +108,9 @@ class ValidationWiringTest {
     @Test
     void selectedSourceMustHaveTheRightDeclarationKind() {
         assertThatThrownBy(() -> inspect(pipeline(""), Map.of(), "src_orders.orders"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
         assertThatThrownBy(() -> inspect(pipeline(""), Map.of("src_orders", pipeline("")), "src_orders.orders"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
     }
 
     @Test
@@ -151,7 +151,7 @@ class ValidationWiringTest {
         var resources = Map.of("src_orders", source("src_orders", "[orders]"),
                 "src_archive", source("src_archive", "[orders]"), "src_open", source("src_open", null));
         assertThatThrownBy(() -> inspect(pipeline, resources, "orders"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.ambiguous-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010006");
     }
 
     @Test

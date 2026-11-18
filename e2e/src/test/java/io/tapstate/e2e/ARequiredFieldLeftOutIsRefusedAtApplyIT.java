@@ -26,7 +26,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ARequiredFieldLeftOutIsRefusedAtApplyIT {
 
-    private static final String MISSING_FIELD = "dsl.missing-field";
+    private static final String MISSING_FIELD = "TS0010004";
 
     /** Complete but for the one field the join type requires; everything else is well formed. */
     private static final String JOIN_WITHOUT_SQL = """

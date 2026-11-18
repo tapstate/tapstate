@@ -89,11 +89,11 @@ class ValidationDeclarationsTest {
                 """);
         var resources = definitions();
         assertThatThrownBy(() -> inspect(pipeline, resources, ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference")
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005")
                 .hasMessageContaining("transforms.selected.use");
         resources.put("unavailable", source("unavailable"));
         assertThatThrownBy(() -> inspect(pipeline, resources, ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
     }
 
     @Test
@@ -119,7 +119,7 @@ class ValidationDeclarationsTest {
         assertThatThrownBy(() -> inspect(pipeline("""
                 serve: { from: src.orders, sync: [{ id: selected, source: target }] }
                 """), resources, ValidationDeclarations.OutputKind.SYNC, "selected"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
     }
 
     @Test
@@ -131,7 +131,7 @@ class ValidationDeclarationsTest {
                 new io.tapstate.core.model.ViewBlock.Inline("output", FromRef.literal("mapped"), "id", null),
                 null, null, null);
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.VIEW, "output"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.composition")
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010011")
                 .hasMessageContaining("transforms.mapped.from");
     }
 
@@ -145,9 +145,9 @@ class ValidationDeclarationsTest {
                     - { id: duplicate, source: target }
                 """);
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.SYNC, "missing"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.missing-reference");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010005");
         assertThatThrownBy(() -> inspect(pipeline, definitions(), ValidationDeclarations.OutputKind.SYNC, "duplicate"))
-                .isInstanceOf(DslException.class).hasMessageContaining("dsl.duplicate-id");
+                .isInstanceOf(DslException.class).hasMessageContaining("TS0010012");
     }
 
     @Test
