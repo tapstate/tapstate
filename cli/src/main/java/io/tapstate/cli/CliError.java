@@ -133,6 +133,15 @@ enum CliError implements TapstateErrorCode {
     /** A heavy online verb reached the server but no response arrived within its timeout window. */
     REQUEST_TIMED_OUT(CliErrorDefinitions.REQUEST_TIMED_OUT),
 
+    /** A transport failure left the request result unconfirmed. */
+    REQUEST_FAILED(CliErrorDefinitions.REQUEST_FAILED),
+
+    /** No cluster member answered after a connected session lost its transport. */
+    CONNECTION_LOST(CliErrorDefinitions.CONNECTION_LOST),
+
+    /** Repeated stream attachments ended without receiving a frame. */
+    STREAM_NO_FRAMES(CliErrorDefinitions.STREAM_NO_FRAMES),
+
     /** A verb that needs a live connection was run before the session connected; {@code verb} names it. */
     NOT_CONNECTED(CliErrorDefinitions.NOT_CONNECTED),
 

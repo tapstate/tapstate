@@ -171,7 +171,7 @@ class StorageHttpFaceBoundaryTest {
             assertThat(refused.statusCode()).as(refused.body()).isEqualTo(403);
             assertThat(calls.get()).isGreaterThanOrEqualTo(2);
             assertThat(refused.headers().firstValue("Allow")).isEmpty();
-            assertThat(((Map<?, ?>) JsonReader.parse(refused.body())).get("code")).isEqualTo("control.forbidden");
+            assertThat(((Map<?, ?>) JsonReader.parse(refused.body())).get("code")).isEqualTo("TS0210004");
             assertThat(invoked).isFalse();
         } finally {
             mapping.unregisterMapping(explicit);

@@ -2019,7 +2019,7 @@ class ReplTest {
 
         client.tokenListOutcome = new TokenListOutcome.Unreachable();
         assertThat(h.repl().dispatch("token list")).isTrue();
-        assertThat(h.sink().toString().substring(mark)).contains("request failed");
+        assertThat(h.sink().toString().substring(mark)).contains("TS0330061");
         assertThat(client.tokenCalls).containsExactly(
                 "list jwt-tok@http://node1:7900", "list jwt-tok@http://node1:7900");
     }
@@ -4149,7 +4149,7 @@ class ReplTest {
 
         assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(h.sink().toString().substring(mark)).contains("reconnected to node1:7900", "request failed");
+        assertThat(h.sink().toString().substring(mark)).contains("reconnected to node1:7900", "TS0330061");
         assertThat(h.repl().session().isConnected()).isTrue();
         assertThat(h.repl().session().landingNode()).isEqualTo(node);
     }
@@ -4172,7 +4172,8 @@ class ReplTest {
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(h.out().toString()).contains("reconnected to node2:7900");
         assertThat(h.err().toString().strip())
-                .isEqualTo("request failed: node1:7900 is unreachable");
+                .contains("TS0330061", "node1:7900", "Check the current resource state")
+                .doesNotContain("node2:7900");
     }
 
     @Test
@@ -6388,7 +6389,7 @@ class ReplTest {
 
         assertThat(client.watchCalls).hasSize(3);
         assertThat(h.sink().toString().substring(mark))
-                .contains("no cluster member is serving this stream");
+                .contains("TS0330063");
     }
 
     @Test
@@ -6415,7 +6416,7 @@ class ReplTest {
         assertThat(out)
                 .as("every attach was answered with the member's window, so a member is serving this "
                         + "follow; it only had nothing new to say")
-                .doesNotContain("no cluster member is serving this stream");
+                .doesNotContain("TS0330063");
         assertThat(client.followCalls)
                 .as("it carried on across every drop until the user stopped it")
                 .hasSize(7);
@@ -6441,7 +6442,7 @@ class ReplTest {
 
         assertThat(client.followCalls).hasSize(3);
         assertThat(h.sink().toString().substring(mark))
-                .contains("no cluster member is serving this stream");
+                .contains("TS0330063");
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
     }
 
@@ -6703,8 +6704,8 @@ class ReplTest {
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("get x")).isTrue();
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("connection lost");        // failover reported the loss
-        assertThat(out).doesNotContain("request failed");   // and it is not double-reported
+        assertThat(out).contains("TS0330062");              // failover reported the loss
+        assertThat(out).doesNotContain("TS0330061");         // and it is not double-reported
         assertThat(h.repl().session().isConnected()).isFalse();
     }
 

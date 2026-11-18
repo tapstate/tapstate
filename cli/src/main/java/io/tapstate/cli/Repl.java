@@ -4352,9 +4352,8 @@ final class Repl {
             }
             barren = frames.get() > before ? 0 : barren + 1;
             if (barren >= MAX_BARREN_ATTACHES) {
-                PrintWriter err = commandLine.getErr();
-                err.println("stopped: no cluster member is serving this stream");
-                err.flush();
+                printDiagnostic(commandLine.getErr(), CliError.STREAM_NO_FRAMES,
+                        Map.of("attempts", MAX_BARREN_ATTACHES));
                 return Cli.EXIT_DIAGNOSTIC;
             }
             if (!failover()) {
@@ -5756,16 +5755,14 @@ final class Repl {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
-        PrintWriter err = commandLine.getErr();
-        err.println("request failed: " + hostPort(requestTarget) + " is unreachable");
-        err.flush();
+        printDiagnostic(commandLine.getErr(), CliError.REQUEST_FAILED,
+                Map.of(SERVER_PARAM, hostPort(requestTarget)));
         return Cli.EXIT_DIAGNOSTIC;
     }
 
     /**
-     * Reports that a request reached the landing node but the server did not answer within the verb's
-     * timeout window — a distinct, coded outcome from {@link #reportRequestFailed()}, since the server is
-     * busy rather than gone and a heavy verb (a large register) may even have completed there already.
+     * Reports that no response arrived within the verb's timeout window. The deadline alone does not
+     * establish whether the server received or completed the operation.
      */
     private int reportRequestTimedOut() {
         if (!session.isConnected()) {
@@ -6060,10 +6057,8 @@ final class Repl {
                 return true;
             }
         }
+        printDiagnostic(commandLine.getErr(), CliError.CONNECTION_LOST, Map.of());
         session.disconnect();
-        PrintWriter err = commandLine.getErr();
-        err.println("connection lost: no reachable cluster member");
-        err.flush();
         return false;
     }
 

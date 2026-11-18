@@ -975,7 +975,7 @@ class AuthTest {
                         assertThat(response.getHeaders().getAllow()).isEmpty();
                         return response.bodyTo(ApiError.class);
                     });
-            assertThat(body.code()).isEqualTo("control.unauthenticated");
+            assertThat(body.code()).isEqualTo("TS0210003");
         }
     }
 
@@ -997,7 +997,7 @@ class AuthTest {
                     assertThat(response.getHeaders().getAllow()).isEmpty();
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(refused.code()).isEqualTo("control.forbidden");
+        assertThat(refused.code()).isEqualTo("TS0210004");
         assertThat(refused.params()).containsEntry("op", "pipeline-draft.create").containsEntry("required", "write");
 
         client().options().uri(draft).headers(headers -> headers.setBearerAuth(machineToken(Scope.WRITE)))

@@ -128,6 +128,14 @@ public final class CliErrorDefinitions {
     public static final ProductErrorDefinition VERSION_MISMATCH =
             DEFINITIONS.define(60, Severity.WARNING, Set.of("cli", "server"));
 
+    public static final ProductErrorDefinition REQUEST_FAILED =
+            DEFINITIONS.define(61, Severity.ERROR, Set.of("server"));
+    public static final ProductErrorDefinition CONNECTION_LOST =
+            DEFINITIONS.define(62, Severity.ERROR, Set.of());
+
+    public static final ProductErrorDefinition STREAM_NO_FRAMES =
+            DEFINITIONS.define(63, Severity.ERROR, Set.of("attempts"));
+
     private CliErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {

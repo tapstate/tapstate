@@ -238,5 +238,17 @@
   "TS0330060": {
     "message": "This CLI is {cli} and the server it connected to is {server}.",
     "solution": "Install the CLI that matches the server, or connect to a server on {cli}; where the two disagree, the server decides."
+  },
+  "TS0330061": {
+    "message": "The result of the request to {server} could not be confirmed.",
+    "solution": "Check the current resource state before retrying a write. Restore connectivity if needed; the server may have completed the request."
+  },
+  "TS0330062": {
+    "message": "Connection lost: no reachable cluster member.",
+    "solution": "Restore connectivity, then reconnect. The last request result may be unconfirmed; check the current resource state before retrying a write."
+  },
+  "TS0330063": {
+    "message": "The stream stopped after {attempts} consecutive attachments ended without a frame.",
+    "solution": "Check the stream endpoint and network path, then reconnect. This does not establish whether the pipeline is running or failed."
   }
 }
