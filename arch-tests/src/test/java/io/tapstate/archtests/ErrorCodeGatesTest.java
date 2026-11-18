@@ -80,7 +80,8 @@ class ErrorCodeGatesTest {
                 io.tapstate.core.common.StartCheckDefinitions.registered(),
                 io.tapstate.core.common.ValidationErrorDefinitions.registered(),
                 io.tapstate.core.common.BootErrorDefinitions.registered(),
-                io.tapstate.core.common.RoleErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+                io.tapstate.core.common.RoleErrorDefinitions.registered(),
+                io.tapstate.core.common.CliErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
         return registered;
@@ -203,7 +204,8 @@ class ErrorCodeGatesTest {
                                 && io.tapstate.messages.StartCheckDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.ValidationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.BootDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
-                                && io.tapstate.messages.RoleDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                                && io.tapstate.messages.RoleDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.CliDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();

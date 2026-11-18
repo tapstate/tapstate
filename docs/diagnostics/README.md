@@ -23,6 +23,20 @@ uses `TS0290001` through `TS0290012`. A report's behavior determines whether to
 pass, warn, ask or block; its text definition's warning severity does not authorize
 a start. Render declared text parameters separately from the complete finding
 metadata, and preserve decisions, definition changes and unknown outcomes.
+Validation uses module `030`, startup configuration uses `031`, role selection
+uses `032`, and CLI command/session diagnostics use `033`. Validation report
+readers accept both stored historical identities and current identities, preserving
+the report's original transaction, ownership and bounded payload. Verify a compatible
+recovery artifact before the first new-code write; an old reader that rejects the
+new identity is not a safe rollback target. Never delete reports to make it readable.
+
+CLI `TS0330030` (start checks were not run) and `TS0330060` (version mismatch)
+remain warnings. They do not turn a successful operation into a refusal. A timed-out
+batch upload retains its attempted server even when a later upload disconnects the
+session. The nested error keeps its code/message shape; remote refusals retain their
+original code and text. Authentication-file permission degradation still depends on
+the typed error and a proven persistence outcome, not a code prefix.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

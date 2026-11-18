@@ -191,7 +191,7 @@ class StartFlowTest {
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(prompter.offered).isEmpty();
         assertThat(server.startsSent()).containsExactly("start pl1 []");
-        assertThat(err.toString()).contains("cli.start-needs-an-answer")
+        assertThat(err.toString()).contains("TS0330028")
                 .contains("2 start check question(s) need an answer")
                 // one command per answer, written for the whole check because both questions offer it
                 .contains("tapstate start pl1 --decide target-not-empty=clear | "
@@ -256,7 +256,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(server.startsSent()).isEmpty();
-        assertThat(err.toString()).contains("cli.decide-not-offered")
+        assertThat(err.toString()).contains("TS0330032")
                 .contains("target-not-empty/warehouse/customers");
     }
 
@@ -297,7 +297,7 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(server.startsSent()).isEmpty();
-        assertThat(err.toString()).contains("cli.decide-on-a-refusal");
+        assertThat(err.toString()).contains("TS0330033");
         // the refusal says what it needs, so it is on the screen with the answer that cannot change it
         assertThat(out.toString()).contains("orders on warehouse already holds 5 rows, and on_full_load is fail.");
     }
@@ -312,7 +312,7 @@ class StartFlowTest {
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         // the server would take the start and drop the answer, and the rows would stay with nobody told
         assertThat(server.calls).containsExactly("checks start pl1");
-        assertThat(err.toString()).contains("cli.start-checks-unsupported").contains("--decide");
+        assertThat(err.toString()).contains("TS0330029").contains("--decide");
     }
 
     @Test
@@ -450,7 +450,7 @@ class StartFlowTest {
         StartFlow.Result result = flow(true, new ScriptedPrompter()).checksOnly("pl1", OutputFormat.TEXT);
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(err.toString()).contains("cli.start-checks-unsupported").contains("--checks-only");
+        assertThat(err.toString()).contains("TS0330029").contains("--checks-only");
     }
 
     // ---- what the server changed ----------------------------------------------------------------------
@@ -478,7 +478,7 @@ class StartFlowTest {
         StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1", asked());
 
         assertThat(result.exitCode()).isZero();
-        assertThat(err.toString()).contains("cli.start-checks-not-run");
+        assertThat(err.toString()).contains("TS0330030");
     }
 
     // ---- restart --rerun ------------------------------------------------------------------------------
@@ -555,7 +555,7 @@ class StartFlowTest {
                 .isInstanceOf(StartFlow.RerunPlan.Unchecked.class);
         assertThat(rerunFlow(false, new ScriptedPrompter()).planRerun("pl1",
                 deciding(false, "target-not-empty=clear"))).isInstanceOf(StartFlow.RerunPlan.Stop.class);
-        assertThat(err.toString()).contains("cli.start-checks-unsupported");
+        assertThat(err.toString()).contains("TS0330029");
     }
 
     @ParameterizedTest

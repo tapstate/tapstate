@@ -61,7 +61,7 @@ class ARefusedSignInRegistersNoServerIT {
             assertThat(up.exitCode()).as(report(up)).isEqualTo(1);
             assertThat(up.stderr())
                     .as("the run stopped on the sign-in and not on something else")
-                    .contains("cli.auth-login-rejected");
+                    .contains("TS0330044");
             assertThat(registry(home))
                     .as("a server nobody ever signed in to is not one this machine knows about")
                     .doesNotContain(server.baseUrl().toString());

@@ -92,7 +92,7 @@ class NewCmdTest {
 
         // a coded domain diagnostic (exit 1), not a usage error, with the established --force remedy
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.artifact-exists");
+        assertThat(r.all()).contains("TS0330001");
         // the refusal is non-destructive — the existing file is left exactly as it was
         assertThat(Files.readString(artifact)).isEqualTo("pre-existing\n");
     }
@@ -159,7 +159,7 @@ class NewCmdTest {
         assertThat(r.code()).isEqualTo(1);
         // the coded refusal travels as a structured diagnostic on stdout, mirroring validate
         assertThat(r.out()).contains("\"status\": \"error\"")
-                .contains("\"code\": \"cli.artifact-exists\"")
+                .contains("\"code\": \"TS0330001\"")
                 .contains("\"severity\": \"ERROR\"")
                 .contains("\"message\":");
     }
@@ -170,7 +170,7 @@ class NewCmdTest {
                 "--connector", "not-a-real-connector", "--id", "src_x", "--out", dir.toString());
 
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.unknown-connector");
+        assertThat(r.all()).contains("TS0330013");
         // an unknown connector aborts before writing anything
         assertThat(dir.resolve("src_x.tap.yml")).doesNotExist();
     }

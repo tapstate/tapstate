@@ -113,22 +113,22 @@ class AuthFileStoreTest {
         ownerOnlyDirectory(authDir);
         Path authFile = authDir.resolve(AUTH_REF + ".json");
 
-        assertRejectedAndUnchanged(store, authFile, "{\"version\":", "cli.auth-cache-invalid");
+        assertRejectedAndUnchanged(store, authFile, "{\"version\":", "TS0330038");
         assertRejectedAndUnchanged(store, authFile,
                 "{\"version\":1,\"version\":1,\"authRef\":\"" + AUTH_REF + "\"}",
-                "cli.auth-cache-invalid");
+                "TS0330038");
         assertRejectedAndUnchanged(store, authFile, validJson().replace("\"version\":1", "\"version\":99"),
-                "cli.auth-cache-version");
+                "TS0330039");
         assertRejectedAndUnchanged(store, authFile, validJson().replace("\"version\":1", "\"version\":1.5"),
-                "cli.auth-cache-invalid");
+                "TS0330038");
         assertRejectedAndUnchanged(store, authFile, validJson().replace("\"version\":1", "\"version\":1e0"),
-                "cli.auth-cache-invalid");
+                "TS0330038");
         assertRejectedAndUnchanged(store, authFile, validJson().replace(CONTEXT_ID.toString(),
-                "118f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), "cli.auth-cache-invalid");
+                "118f0d7a-7b2e-7e30-a8dd-6f78fc0d8ff2"), "TS0330038");
 
         String withAccessToken = validJson().replace("\"createdAt\"",
                 "\"accessToken\":\"jwt-access-token\",\"createdAt\"");
-        assertRejectedAndUnchanged(store, authFile, withAccessToken, "cli.auth-cache-invalid");
+        assertRejectedAndUnchanged(store, authFile, withAccessToken, "TS0330038");
     }
 
     @Test
@@ -185,7 +185,7 @@ class AuthFileStoreTest {
         StringWriter stackTrace = new StringWriter();
         error.printStackTrace(new PrintWriter(stackTrace));
 
-        assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+        assertThat(error.code().code()).isEqualTo("TS0330038");
         assertThat(error.getMessage()).contains("schema validation failed");
         assertThat(error).hasNoCause();
         assertThat(List.of(error.getMessage(), rendered.toString(), stackTrace.toString()))
@@ -209,7 +209,7 @@ class AuthFileStoreTest {
                     PosixFilePermission.GROUP_READ));
             assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
                     .isInstanceOfSatisfying(TapstateException.class,
-                            error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions"));
+                            error -> assertThat(error.code().code()).isEqualTo("TS0330040"));
             ownerOnlyFile(authFile);
         }
 
@@ -218,7 +218,7 @@ class AuthFileStoreTest {
             Files.createLink(hardLink, authFile);
             assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
                     .isInstanceOfSatisfying(TapstateException.class,
-                            error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid"));
+                            error -> assertThat(error.code().code()).isEqualTo("TS0330038"));
         } catch (UnsupportedOperationException unsupported) {
             // This filesystem cannot seed the hard-link case.
         }
@@ -229,10 +229,10 @@ class AuthFileStoreTest {
         Files.createSymbolicLink(authFile, outside);
         assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330038"));
         assertThatThrownBy(() -> store.save(RECORD, false))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330038"));
         assertThat(Files.readString(outside)).isEqualTo(validJson());
     }
 
@@ -254,7 +254,7 @@ class AuthFileStoreTest {
 
         assertThatThrownBy(() -> store.load(AUTH_REF, CONTEXT_ID))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330040"));
     }
 
     @Test
@@ -276,7 +276,7 @@ class AuthFileStoreTest {
         Throwable thrown = catchThrowable(() -> store.load(AUTH_REF, CONTEXT_ID));
 
         assertThat(thrown).isInstanceOfSatisfying(TapstateException.class, error -> {
-            assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+            assertThat(error.code().code()).isEqualTo("TS0330038");
             assertThat(error.args()).containsEntry("reason", "file changed while it was being opened");
             assertThat(error.getMessage()).doesNotContain("tss_s99.outside-secret");
         });
@@ -305,7 +305,7 @@ class AuthFileStoreTest {
         Throwable thrown = catchThrowable(() -> store.load(AUTH_REF, CONTEXT_ID));
 
         assertThat(thrown).isInstanceOfSatisfying(TapstateException.class, error -> {
-            assertThat(error.code().code()).isEqualTo("cli.auth-cache-invalid");
+            assertThat(error.code().code()).isEqualTo("TS0330038");
             assertThat(error.args()).containsEntry("reason", "file identity cannot be verified");
             assertThat(error.getMessage()).doesNotContain("tss_s99.session-secret");
         });
@@ -327,7 +327,7 @@ class AuthFileStoreTest {
 
         assertThatThrownBy(() -> store.save(RECORD, false))
                 .isInstanceOfSatisfying(TapstateException.class, error -> {
-                    assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions");
+                    assertThat(error.code().code()).isEqualTo("TS0330040");
                     assertThat(error.args()).containsEntry("reason", "file identity cannot be verified");
                 });
         assertThat(home.resolve(".tapstate/auth").resolve(AUTH_REF + ".json")).doesNotExist();
@@ -349,7 +349,7 @@ class AuthFileStoreTest {
         assertThat(store.save(RECORD, true)).isEqualTo(AuthFileStore.SaveResult.MEMORY_ONLY);
         assertThatThrownBy(() -> store.save(RECORD, false))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330040"));
     }
 
     @Test
@@ -394,7 +394,7 @@ class AuthFileStoreTest {
 
         assertThatThrownBy(() -> store.save(RECORD, true))
                 .isInstanceOfSatisfying(TapstateException.class,
-                        error -> assertThat(error.code().code()).isEqualTo("cli.auth-cache-permissions"));
+                        error -> assertThat(error.code().code()).isEqualTo("TS0330040"));
         assertThat(authDir.resolve(AUTH_REF + ".json")).doesNotExist();
     }
 

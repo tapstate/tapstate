@@ -18,7 +18,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * workspace validation status, and the reference relationships in both directions (what it references
  * and who references it). This suite drives the one-shot surface and the REPL session wiring: the
  * per-kind summaries, the {@code valid} / {@code invalid} validation status, the forward / reverse
- * references, the {@code -o json|yaml} envelope, the {@code cli.resource-not-found} coded miss, and
+ * references, the {@code -o json|yaml} envelope, the {@code TS0330017} coded miss, and
  * that {@code desc} is registered as an offline verb.
  */
 class DescCmdTest {
@@ -270,7 +270,7 @@ class DescCmdTest {
         scaffoldReuseAssembly(ws);
         Run r = run("desc", "nope", "-w", ws.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.resource-not-found").contains("nope");
+        assertThat(r.all()).contains("TS0330017").contains("nope");
     }
 
     @Test
@@ -278,7 +278,7 @@ class DescCmdTest {
         scaffoldReuseAssembly(ws);
         Run r = run("desc", "nope", "-o", "json", "-w", ws.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.out()).contains("\"code\": \"cli.resource-not-found\"");
+        assertThat(r.out()).contains("\"code\": \"TS0330017\"");
         // the failure envelope carries the top-level status discriminator, like new / validate
         assertThat(r.out()).contains("\"status\": \"error\"");
     }
@@ -287,7 +287,7 @@ class DescCmdTest {
     void descInEmptyWorkspaceIsResourceNotFound(@TempDir Path empty) {
         Run r = run("desc", "anything", "-w", empty.toString());
         assertThat(r.code()).isEqualTo(1);
-        assertThat(r.all()).contains("cli.resource-not-found");
+        assertThat(r.all()).contains("TS0330017");
     }
 
     // ---- honesty: unreadable / malformed ------------------------------------------------
@@ -348,7 +348,7 @@ class DescCmdTest {
         // no source-only fields nor a summary leak under the pipeline discriminator
         assertThat(r.out()).doesNotContain("connector").doesNotContain("\"summary\"");
         // and validation surfaces the same conflict as a coded kind-dir mismatch
-        assertThat(r.out()).contains("cli.kind-dir-mismatch");
+        assertThat(r.out()).contains("TS0330016");
     }
 
     @Test

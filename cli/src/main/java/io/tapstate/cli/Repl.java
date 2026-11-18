@@ -2872,7 +2872,8 @@ final class Repl {
             ConnectorRegisterOutcome outcome = withFailover(
                     () -> controlPlane.register(session.landingNode(), session.credential(), artifact),
                     o -> o instanceof ConnectorRegisterOutcome.Unreachable);
-            outcomes.add(new BatchEntry.Attempted(name, outcome));
+            outcomes.add(new BatchEntry.Attempted(name, outcome,
+                    outcome instanceof ConnectorRegisterOutcome.TimedOut ? hostPort(session.landingNode()) : null));
             if (outcome instanceof ConnectorRegisterOutcome.Unreachable) {
                 break;   // failover found no healthy member; the server is gone, so stop uploading the rest
             }
@@ -2890,7 +2891,7 @@ final class Repl {
     private sealed interface BatchEntry {
         String artifact();
 
-        record Attempted(String artifact, ConnectorRegisterOutcome outcome) implements BatchEntry {
+        record Attempted(String artifact, ConnectorRegisterOutcome outcome, String timeoutServer) implements BatchEntry {
         }
 
         record Unreadable(String artifact, String message) implements BatchEntry {
@@ -3051,7 +3052,8 @@ final class Repl {
                         row.put("newlyRegistered", connector.newlyRegistered());
                     }
                     case ConnectorRegisterOutcome.Rejected rejected -> row.put("error", errorObject(rejected.code(), rejected.message()));
-                    case ConnectorRegisterOutcome.TimedOut ignored -> row.put("error", errorObject("cli.request-timed-out", "the request timed out before the server answered"));
+                    case ConnectorRegisterOutcome.TimedOut ignored -> row.put("error", errorObject(CliError.REQUEST_TIMED_OUT.code(), MessageCatalog.bundled().render(
+                            CliError.REQUEST_TIMED_OUT, Map.of(SERVER_PARAM, attempted.timeoutServer())).message()));
                     case ConnectorRegisterOutcome.Unreachable ignored -> row.put("error", errorObject(null, "the server is unreachable"));
                 }
             }

@@ -103,8 +103,8 @@ class CliMainFreshProcessTest {
         Files.setPosixFilePermissions(configDirectory, Set.of(PosixFilePermission.OWNER_READ,
                 PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
         ProcessResult ownerOnly = runCli(home, home, Map.of(), "apply", "--help");
-        assertThat(ownerOnly.stderr()).contains("error: cli.context-required")
-                .doesNotContain("cli.context-config-permissions");
+        assertThat(ownerOnly.stderr()).contains("error: TS0330054")
+                .doesNotContain("TS0330037");
         assertThat(installed.stderr())
                 .withFailMessage("apply --help must accept the installer-created directory (mode %s): %s",
                         installedMode, installed.stderr())
@@ -348,7 +348,7 @@ class CliMainFreshProcessTest {
 
         assertThat(result.stderr())
                 .withFailMessage("the line was not refused, so this is not the reported run: %s", result.stderr())
-                .contains("error: cli.context-required");
+                .contains("error: TS0330054");
         assertThat(result.exitCode())
                 .withFailMessage("a refused line left the session exiting %s: stdout=%s stderr=%s",
                         result.exitCode(), result.stdout(), result.stderr())

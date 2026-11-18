@@ -670,7 +670,7 @@ fi
 # fails 30 seconds later on "did not reach the target (0 of 5 rows)", which sends the reader to the server
 # log to investigate a pipeline that was never started. The discriminating part is that the run below
 # delivers its rows: a check that merely required a non-zero exit would pass on the row count alone.
-for auth_code in control.auth-failed TS0210002; do
+for auth_code in control.auth-failed TS0210002 cli.not-authenticated TS0330021; do
   for auth_status in 0 1; do
     FAKE_CLI_OUT="error: $auth_code" FAKE_CLI_STATUS="$auth_status" run_phase_fakes
     unset FAKE_CLI_OUT FAKE_CLI_STATUS

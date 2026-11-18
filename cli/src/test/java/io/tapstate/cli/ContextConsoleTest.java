@@ -22,7 +22,7 @@ class ContextConsoleTest {
         int code = new ContextConsole(manager(home), null, workspace, output.out, output.err).run();
 
         assertThat(code).isEqualTo(Cli.EXIT_USAGE);
-        assertThat(output.errText()).contains("cli.context-usage");
+        assertThat(output.errText()).contains("TS0330049");
     }
 
     @Test
@@ -104,22 +104,22 @@ class ContextConsoleTest {
         Output missing = new Output();
         assertThat(run(manager, workspace, missing, "Choose a context", "missing"))
                 .isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(missing.errText()).contains("cli.context-required");
+        assertThat(missing.errText()).contains("TS0330054");
 
         Output badSeed = new Output();
         assertThat(run(manager, workspace, badSeed, "Create a context", "dev", "http://["))
                 .isEqualTo(Cli.EXIT_USAGE);
-        assertThat(badSeed.errText()).contains("cli.context-usage");
+        assertThat(badSeed.errText()).contains("TS0330049");
 
         Output unknown = new Output();
         assertThat(run(manager, workspace, unknown, "not an action")).isEqualTo(Cli.EXIT_USAGE);
-        assertThat(unknown.errText()).contains("cli.context-usage");
+        assertThat(unknown.errText()).contains("TS0330049");
 
         manager.create("dev", List.of(URI.create("https://dev.example.com")), true);
         Output duplicate = new Output();
         assertThat(run(manager, workspace, duplicate, "Create a context", "dev",
                 "https://other.example.com")).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(duplicate.errText()).contains("cli.context-already-exists");
+        assertThat(duplicate.errText()).contains("TS0330052");
     }
 
     @Test
