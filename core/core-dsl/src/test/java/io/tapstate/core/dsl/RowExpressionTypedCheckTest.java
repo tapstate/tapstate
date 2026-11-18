@@ -109,11 +109,11 @@ class RowExpressionTypedCheckTest {
             assertThat(RowExpressions.typedPredicateError("25 " + op + " after.amount", columns())).isNull();
             assertThat(RowExpressions.typedPredicateError("after.amount " + op + " 25.5", columns())).isNull();
             assertThat(RowExpressions.typedPredicateError("25.5 " + op + " after.amount", columns())).isNull();
-            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.target", columns())).isNull();
-            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.limit", columns())).isNull();
-            assertThat(RowExpressions.typedPredicateError("after.limit " + op + " after.amount", columns())).isNull();
-            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.ratio", columns())).isNull();
-            assertThat(RowExpressions.typedPredicateError("after.ratio " + op + " after.amount", columns())).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.target", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.limit", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.limit " + op + " after.amount", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.amount " + op + " after.ratio", columns)).isNull();
+            assertThat(RowExpressions.typedPredicateError("after.ratio " + op + " after.amount", columns)).isNull();
         }
     }
 

@@ -42,6 +42,29 @@ class DecimalComparisonFunctionsTest {
         }
     }
 
+    @Test
+    void temporalEqualityUsesCelSemantics() {
+        for (String type : new String[] {"duration", "timestamp"}) {
+            String first = type.equals("duration") ? "1s" : "2024-01-01T00:00:00Z";
+            String second = type.equals("duration") ? "2s" : "2024-01-02T00:00:00Z";
+            String a = type + "('" + first + "')";
+            String b = type + "('" + second + "')";
+            assertThat(eval(a + " == " + a, Map.of())).isTrue();
+            assertThat(eval(a + " != " + a, Map.of())).isFalse();
+            assertThat(eval(a + " == " + b, Map.of())).isFalse();
+            assertThat(eval(a + " != " + b, Map.of())).isTrue();
+        }
+    }
+
+    @Test
+    void decimalComparedWithInexactDoubleUsesItsBinaryValue() {
+        Map<String, Object> vars = Map.of("dec1", new BigDecimal("0.1"), "d", 0.1);
+        assertThat(eval("dec1 < d", vars)).isTrue();
+        assertThat(eval("d > dec1", vars)).isTrue();
+        assertThat(eval("dec1 != d", vars)).isTrue();
+        assertThat(eval("d != dec1", vars)).isTrue();
+    }
+
     // ---- Decimal vs Decimal ----------------------------------------------------------------
 
     @Test

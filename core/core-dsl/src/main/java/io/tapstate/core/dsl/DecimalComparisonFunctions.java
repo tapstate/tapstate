@@ -5,6 +5,8 @@ import com.google.common.primitives.UnsignedLong;
 import dev.cel.common.CelFunctionDecl;
 import dev.cel.common.CelOptions;
 import dev.cel.common.CelOverloadDecl;
+import dev.cel.common.internal.DefaultMessageFactory;
+import dev.cel.common.internal.DynamicProto;
 import dev.cel.common.types.CelType;
 import dev.cel.common.types.OpaqueType;
 import dev.cel.common.types.SimpleType;
@@ -13,7 +15,7 @@ import dev.cel.runtime.CelFunctionBinding;
 import dev.cel.runtime.CelRuntimeBuilder;
 import dev.cel.runtime.CelStandardFunctions;
 import dev.cel.runtime.RuntimeEquality;
-import dev.cel.runtime.RuntimeHelpers;
+import dev.cel.runtime.ProtoMessageRuntimeEquality;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -47,7 +49,7 @@ public final class DecimalComparisonFunctions {
     }
 
     private static final RuntimeEquality DEFAULT_EQUALITY =
-            RuntimeEquality.create(RuntimeHelpers.create(), CelOptions.DEFAULT);
+            ProtoMessageRuntimeEquality.create(DynamicProto.create(DefaultMessageFactory.INSTANCE), CelOptions.DEFAULT);
 
     private static final ImmutableList<CelFunctionDecl> ORDERING_DECLARATIONS = buildOrderingDeclarations();
     private static final ImmutableList<CelFunctionDecl> CROSS_TYPE_EQUALITY_DECLARATIONS = buildCrossTypeEqualityDeclarations();
