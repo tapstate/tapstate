@@ -4126,6 +4126,27 @@ class ReplTest {
     }
 
     @Test
+    void applyReportsTheOriginalTargetAfterFailoverToAnotherNode(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI first = URI.create("http://node1:7900");
+        URI second = URI.create("http://node2:7900");
+        FakeControlPlane client = new FakeControlPlane(second);
+        SplitHarness h = splitStreamHarness(base, client);
+        h.repl().session().connect(List.of(first, second), first);
+        h.repl().session().authenticate("jwt-tok", "alice", null, List.of(first, second));
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(client.probed).containsExactly(first, second);
+        assertThat(h.repl().session().landingNode()).isEqualTo(second);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.out().toString()).contains("reconnected to node2:7900");
+        assertThat(h.err().toString().strip())
+                .isEqualTo("request failed: node1:7900 is unreachable");
+    }
+
+    @Test
     void applyRendersTheServerWarningsOnStderrAndStillSucceeds(@TempDir Path base) throws Exception {
         // Any catalogued code serves as the stand-in: what is under test is that the CLI renders a
         // server-sent code from its own bundled catalog, message and solution alike, and that the note
