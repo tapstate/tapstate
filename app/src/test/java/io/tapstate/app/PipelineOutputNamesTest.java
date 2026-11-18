@@ -524,7 +524,7 @@ class PipelineOutputNamesTest {
     }
 
     @Test
-    void aMaterializedAssemblyKeepsRootAndLookupInputMeasurements() {
+    void aMaterializedAssemblyKeepsRootAndLookupInputLineage() {
         for (String transform : List.of("""
                 transforms:
                   - id: assembled
@@ -553,12 +553,78 @@ class PipelineOutputNamesTest {
             var output = description.names().outputs().getFirst();
             assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
                     new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
-            lag(store, Map.of("orders", 1L, "customers", 900L, "unrelated", 9999L));
+            lag(store, Map.of("assembled", 900L, "orders", 1L, "customers", 900L, "unrelated", 9999L));
             var status = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status();
             assertThat(status.state()).isEqualTo("fresh");assertThat(status.eventAgeSeconds()).isEqualTo(901);
             lag(store, Map.of("orders", 1L));
             assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status().reason()).isEqualTo("measurement-unavailable");
         }
+    }
+
+    @Test
+    void aNestViewUsesItsConfirmedOutputEventInsteadOfSiblingTableMetrics() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [assembled, customers]
+                  sync: [{id: sink, source: target, rename: {prefix: out_}}]
+                """);
+        var clock = Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC);
+        var query = catalog(store, clock);
+
+        lag(store, Map.of("assembled", 5L, "customers", 900L));
+        assertThat(query.list()).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_orders");
+            assertThat(row.status().state()).isEqualTo("fresh");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+            assertThat(row.status().aggregation()).isNull();
+        }).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_customers");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+            assertThat(row.status().aggregation()).isEqualTo("max-input-table-event-age");
+        });
+
+        lag(store, Map.of("customers", 900L, "orders", 1L));
+        assertThat(query.list()).anySatisfy(row -> {
+            assertThat(row.location().collection()).isEqualTo("out_orders");
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
+    @Test
+    void viewsSharingANestStreamRequireEvidenceForTheirOwnTarget() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                serve:
+                  from: [assembled, customers]
+                  sync:
+                    - {id: first, source: target, rename: {prefix: first_}}
+                    - {id: second, source: target, rename: {prefix: second_}}
+                """);
+        lag(store, Map.of("assembled", 5L, "orders", 10L, "customers", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+        assertThat(rows.stream().filter(row -> row.location().collection().endsWith("_orders")).toList())
+                .hasSize(2).allSatisfy(row -> {
+                    assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                    assertThat(row.status().eventAgeSeconds()).isNull();
+                });
     }
 
     @Test
