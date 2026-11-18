@@ -31,12 +31,17 @@
   "parameters": {
     "allow_manual_mix_override": true,
     "schema": "identical",
-    "stream_completion": "every stream independently"
+    "stream_completion": "every stream independently",
+    "target_tables": [
+      "left",
+      "right"
+    ]
   },
   "expected": {
     "readback": [
       "Compare the union of per-stream expected keys and values, including a tail batch on only one stream.",
-      "Verify each stream's event order and endpoint without assuming a global cross-stream order."
+      "Verify each stream's event order and endpoint without assuming a global cross-stream order.",
+      "Compare the union across the two destination collections and verify each row retains its original table identity."
     ]
   },
   "completion": {

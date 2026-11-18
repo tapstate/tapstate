@@ -89,3 +89,29 @@ python3 -B benchmarks/runner.py run --manifest /tmp/perf-manifest.json --batch 0
 
 The manifest binds the exact checkout, definitions and effective load. A missing
 estimate or case that does not fit is recorded in the allocation and blocks replay.
+
+## Operator cases
+
+List the operator definitions with readiness and blockers in structured output.
+
+```sh
+python3 -B benchmarks/runner.py list --suite operators --format json
+python3 -B benchmarks/runner.py run --id map.snapshot.basic.standard \
+  --connectors /tmp/perf-connectors --output /tmp/perf-map
+```
+
+Each run saves the applied graph and compares the MongoDB target with an independent
+expectation over the source rows. Union validates each destination collection and
+the full disjoint key set. Unwind compares parent and element identities. Join and
+Nest validate complete joined or assembled rows. CDC results record captured changes
+for each input and settled target evidence separately.
+
+The row option controls bounded fixture sizing. Union divides the input across its
+two streams. Nest takes a child count that is divisible by four. The paired Join
+case uses the row option for dimensions and seeds ten times as many facts. Both
+paired cases report selected hotspot keys against a separately seeded uniform arm.
+
+The operator suite retains blocked cases. Scripts with the mixed-type payload need
+MongoDB Decimal128 metadata at the target, and the Union branch case needs separate
+output bindings. Catalog JSON exposes these reasons and execution checks them
+before starting a selected batch.

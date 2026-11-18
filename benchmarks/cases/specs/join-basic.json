@@ -16,12 +16,18 @@
       "receives_changes": true,
       "key_space": "consecutive integers",
       "trial_rows": 10000,
-      "join_key": "dimension_id"
+      "join_key": "dimension_id",
+      "required_fields": {
+        "payload": "string"
+      }
     },
     "dimensions": {
       "primary_key": "id",
       "trial_rows": 1000,
-      "receives_changes": false
+      "receives_changes": false,
+      "required_fields": {
+        "score": "integer"
+      }
     }
   },
   "parameters": {

@@ -14,11 +14,20 @@ import catalog as definitions
 
 
 ROOT = definitions.BENCHMARKS.parent
-RUNNABLE = {
+BASE_CASES = {
     "copy.snapshot.dummy-baseline.standard",
     "copy.snapshot.basic.standard",
     "copy.live.basic.standard",
     "copy.backlog.fixed-iud.standard",
+}
+OPERATOR_SPECS = {
+    "map-basic", "filter-basic", "js-basic", "unwind-basic", "union-basic", "join-basic", "nest-basic",
+    "mixed-double-map", "mixed-map-nest", "mixed-union-branches", "join-hot-update", "nest-child-update",
+}
+BLOCKED_SPECS = {
+    "js-basic": "MongoDB target cannot land preserved decimal fields after the script",
+    "mixed-double-map": "MongoDB target cannot land preserved decimal fields after the script",
+    "mixed-union-branches": "The shared serve source cannot assign individual branches to sync targets",
 }
 DIMENSIONS = {
     "group", "operators", "phase", "mode", "profile", "source", "target",
@@ -50,7 +59,8 @@ def select(cases, explicit, where, suite, *, allow_empty=False):
     result = [
         case for case in cases
         if (not requested or case["id"] in requested)
-        and (suite != "basic" or case["id"] in RUNNABLE)
+        and (suite != "basic" or case["id"] in BASE_CASES)
+        and (suite != "operators" or operator_scope(case))
         and (suite != "memory" or "memory-regression" in case["tags"])
         and all(wanted.intersection(values(case[name])) for name, wanted in filters.items())
     ]
@@ -63,8 +73,27 @@ def values(value):
     return value if isinstance(value, list) else [value]
 
 
+def specification(case):
+    return Path(case["spec"] or "").stem
+
+
+def operator_scope(case):
+    if case["id"] in BASE_CASES or case["id"] == "join.live.hot-update.wide":
+        return False
+    return specification(case) in OPERATOR_SPECS or (
+        case["group"] == "copy" and case["mode"] == "snapshot" and specification(case) == "copy-basic"
+    ) or case["id"] == "copy.live.handoff.standard"
+
+
+def implemented(case):
+    return case["id"] in BASE_CASES or (operator_scope(case) and specification(case) not in BLOCKED_SPECS)
+
+
 def case_listing(case):
-    status = "qualification-ready" if case["id"] in RUNNABLE else "definition-only"
+    blocker = BLOCKED_SPECS.get(specification(case))
+    if blocker:
+        return {**case, "execution_status": "blocked", "execution_blocker": blocker}
+    status = "qualification-ready" if implemented(case) else "definition-only"
     return {**case, "execution_status": status}
 
 
@@ -128,8 +157,9 @@ def checked_entries(entries):
         raise ValueError("Execution requires at least one selected case")
     for entry in entries:
         case = entry["case"]
-        if case["id"] not in RUNNABLE:
-            raise ValueError(f"Execution is pending for {case['id']}")
+        if not implemented(case):
+            reason = BLOCKED_SPECS.get(specification(case), "execution is pending")
+            raise ValueError(f"{case['id']}: {reason}")
         if entry["mix"] is not None:
             source = case["workload_spec"].get("incremental", {})
             if not source.get("allow_manual_mix_override", False):
@@ -282,7 +312,7 @@ def mix(value):
 def add_selection(parser):
     parser.add_argument("--id", action="append", default=[], help="Exact case ID, optionally with @version.")
     parser.add_argument("--where", action="append", default=[], help="Repeat field=value filters.")
-    parser.add_argument("--suite", choices=("all", "basic", "memory"), default="all")
+    parser.add_argument("--suite", choices=("all", "basic", "operators", "memory"), default="all")
 
 
 def add_load(parser):
