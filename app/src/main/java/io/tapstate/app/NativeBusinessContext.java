@@ -87,7 +87,8 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 WorkloadClaimType.NODE_SESSION, execution.owner().nodeId()))
                 .filter(reading -> reading.leased() && reading.claim().owner().equals(execution.owner())
                         && reading.claim().claimGeneration() == execution.generation()).isPresent(),
-        result -> result.items().stream().anyMatch(item -> io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())),
+        result -> result.items().stream().anyMatch(item -> (io.tapstate.adapters.pdk.ConnectorError.TEST_TIMEOUT.code().equals(item.connectorErrorCode())
+                || "connector.test-timeout".equals(item.connectorErrorCode()))),
         Duration.ofSeconds(60)));
         var overrides = new LinkedHashMap<String,Object>();
         if (diagnosticCandidate != null) overrides.put("connectionTestResultStore", resultStore);

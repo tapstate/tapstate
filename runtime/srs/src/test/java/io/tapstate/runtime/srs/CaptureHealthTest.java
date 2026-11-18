@@ -34,7 +34,7 @@ class CaptureHealthTest {
     private static final TapstateErrorCode ACKNOWLEDGE_FAILED = new TapstateErrorCode() {
         @Override
         public String code() {
-            return "connector.acknowledge-failed";
+            return "TS0060039";
         }
 
         @Override
@@ -146,7 +146,7 @@ class CaptureHealthTest {
         listener.onAcknowledgeFailed(refused);
 
         assertThat(health.consecutiveAcknowledgeFailures()).isEqualTo(2);
-        assertThat(health.lastAcknowledgeFailureCode()).contains("connector.acknowledge-failed");
+        assertThat(health.lastAcknowledgeFailureCode()).contains("TS0060039");
         assertThat(health.failure()).as("a release that is only late fails nothing").isEmpty();
         assertThat(handedOn).as("handed on to the wrapped listener").containsExactly(refused, refused);
 
@@ -184,7 +184,7 @@ class CaptureHealthTest {
                 .hasValueSatisfying(at -> assertThat(at).isBetween(before, after));
         assertThat(health.lastAcknowledgeFailureCode())
                 .as("what the last failure was is still there to read")
-                .contains("connector.acknowledge-failed");
+                .contains("TS0060039");
         assertThat(health.failure()).isEmpty();
         assertThat(handedOn).as("handed on to the wrapped listener").containsExactly(released);
     }

@@ -114,7 +114,7 @@ from it.
 - A pipeline that only loads its source (`read_mode: snapshot_only`) does not create a replication slot.
   If an earlier Tapstate version left one behind, drop it by hand as below once nothing is using it.
 - If the source cannot be reached at that moment, or does not answer within ten seconds, the clearing still
-  completes, and the server logs a warning, `connector.release-failed`, naming the source and the slot.
+  completes, and the server logs a warning, `TS0060040`, naming the source and the slot.
   The same applies when the session that read through the slot has not ended yet: PostgreSQL drops only a
   slot nobody holds, and the server logs, before every release, which slot it asked to drop. Drop a slot left
   behind on the source once nothing is using it:

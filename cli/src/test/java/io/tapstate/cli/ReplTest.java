@@ -3012,14 +3012,14 @@ class ReplTest {
         var diagnostic = Map.<String, Object>of("cause", Map.of("message", "Peer reset"));
         var params = Map.<String, Object>of("connector", "mongodb");
         client.testOutcome = new ConnectionTestOutcome.Rejected(
-                "connector.test-failed", "Unable to run the test", params, diagnostic);
+                "TS0060001", "Unable to run the test", params, diagnostic);
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
         h.repl().dispatch("test my-mongo -o json");
 
         assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
-                .isEqualTo(Map.of("code", "connector.test-failed", "message", "Unable to run the test",
+                .isEqualTo(Map.of("code", "TS0060001", "message", "Unable to run the test",
                         "params", params, "diagnostic", diagnostic));
     }
 
@@ -3588,13 +3588,13 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.registration-conflict", "A different artifact already holds that id.");
+                "TS0060006", "A different artifact already holds that id.");
         Harness h = onlineSession(workdir, client);
 
         h.repl().dispatch("register orders.jar");
 
         assertThat(h.sink().toString())
-                .contains("connector.registration-conflict").contains("A different artifact already holds that id.");
+                .contains("TS0060006").contains("A different artifact already holds that id.");
     }
 
     @Test
@@ -3602,7 +3602,7 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.registration-conflict", "A different artifact already holds that id.");
+                "TS0060006", "A different artifact already holds that id.");
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3610,7 +3610,7 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("\"error\"")
-                .contains("\"code\"").contains("connector.registration-conflict")
+                .contains("\"code\"").contains("TS0060006")
                 .contains("\"message\"").contains("A different artifact already holds that id.");
     }
 
@@ -3619,14 +3619,14 @@ class ReplTest {
         Files.write(workdir.resolve("orders.jar"), new byte[] {1, 2, 3, 4});
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.registerOutcome = new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "The artifact spec is not valid JSON.");
+                "TS0060017", "The artifact spec is not valid JSON.");
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("register orders.jar -o yaml")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("error:").contains("code:").contains("connector.spec-invalid")
+        assertThat(out).contains("error:").contains("code:").contains("TS0060017")
                 .contains("message:").contains("The artifact spec is not valid JSON.");
     }
 
@@ -3643,7 +3643,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(2, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("billing", "h2", "1.0", false)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "The artifact spec is not valid JSON."));
+                "TS0060017", "The artifact spec is not valid JSON."));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3652,7 +3652,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("orders").contains("billing")
                 .contains("already registered")
-                .contains("connector.spec-invalid")
+                .contains("TS0060017")
                 .contains("3 artifacts");
         // only the three jars were uploaded; the .txt was skipped
         assertThat(client.registerCalls).hasSize(3);
@@ -3667,7 +3667,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(1, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("orders", "h1", "1.0", true)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "bad spec"));
+                "TS0060017", "bad spec"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3677,7 +3677,7 @@ class ReplTest {
         assertThat(out).contains("\"artifacts\"").contains("\"summary\"")
                 .contains("\"artifact\"").contains("orders.jar").contains("broken.jar")
                 .contains("\"connectorId\"").contains("orders")
-                .contains("\"error\"").contains("connector.spec-invalid")
+                .contains("\"error\"").contains("TS0060017")
                 .contains("\"total\"");
     }
 
@@ -3763,7 +3763,7 @@ class ReplTest {
         client.registerOutcomeByLength.put(1, new ConnectorRegisterOutcome.Registered(
                 new RegisteredConnector("orders", "h1", "1.0", true)));
         client.registerOutcomeByLength.put(3, new ConnectorRegisterOutcome.Rejected(
-                "connector.spec-invalid", "bad spec"));
+                "TS0060017", "bad spec"));
         Harness h = onlineSession(workdir, client);
         int mark = h.sink().toString().length();
 
@@ -3773,7 +3773,7 @@ class ReplTest {
         assertThat(out).contains("artifacts:").contains("summary:")
                 .contains("artifact:").contains("orders.jar").contains("broken.jar")
                 .contains("connectorId:").contains("orders")
-                .contains("error:").contains("connector.spec-invalid")
+                .contains("error:").contains("TS0060017")
                 .contains("total:");
     }
 

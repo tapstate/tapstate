@@ -154,7 +154,7 @@ exception class. So what the connector says about it is written into that pipeli
 ```
 tapstate(admin@127.0.0.1:8080)> logs order_pipeline
 2026-09-15T08:21:04.318Z  ERROR  password authentication failed for user "orders_reader"
-2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [connector.capture-failed]: its data-plane job died
+2026-09-15T08:21:04.502Z  WARN   Pipeline order_pipeline entered FAILED [TS0060024]: its data-plane job died
 ```
 
 The first line is the connector's; the second is the server's own account of the same event. You want

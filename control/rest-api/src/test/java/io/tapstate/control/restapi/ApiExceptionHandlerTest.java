@@ -124,9 +124,9 @@ class ApiExceptionHandlerTest {
     }
 
     @Test void defaultSourceTimeoutAndBusyAreExplicitRetryDiagnostics() {
-        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.test-timeout"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
-        assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.instances-busy"))).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
-        var busy = new TapstateException(new StubCode("connector.instances-busy"), Map.of("connector", "mongodb", "timeout", "0s"), null);
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("TS0060025"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("TS0060032"))).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        var busy = new TapstateException(new StubCode("TS0060032"), Map.of("connector", "mongodb", "timeout", "0s"), null);
         assertThat(handler.handle(new UnavailableCodedException(busy)).getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
     }
 
@@ -375,17 +375,17 @@ class ApiExceptionHandlerTest {
         // keeps every connector.* at 500; the register verb, which knows the uploaded artifact is the
         // client's, opts specific failures into a 400 via BadRequestCodedException instead of the code table.
         for (String code : List.of(
-                "connector.load-failed",
-                "connector.no-connector-class",
-                "connector.ambiguous-connector-class",
-                "connector.spec-not-found",
-                "connector.spec-invalid",
-                "connector.registration-conflict",
-                "connector.not-registered",
-                "connector.ambiguous-registration",
+                "TS0060009",
+                "TS0060014",
+                "TS0060015",
+                "TS0060016",
+                "TS0060017",
+                "TS0060006",
+                "TS0060004",
+                "TS0060005",
                 // Attributed to the caller by the read face, which knows the source was theirs to name;
                 // here it must stay server-side, or the same code on a resolve path would be miscalled.
-                "connector.capability-missing")) {
+                "TS0060031")) {
             assertThat(ApiExceptionHandler.statusFor(new StubCode(code))).as(code)
                     .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
         }
@@ -420,14 +420,14 @@ class ApiExceptionHandlerTest {
         // A verb boundary that knows a domain code is the client's fault in its context wraps it as a
         // BadRequestCodedException: a 400 that still renders the underlying coded body (here a connector
         // artifact refused at register), even though the code defaults to 500 globally.
-        TapstateException connectorFailure = new TapstateException(new StubCode("connector.spec-invalid"),
+        TapstateException connectorFailure = new TapstateException(new StubCode("TS0060017"),
                 Map.of("artifact", "bad.jar", "spec", "spec.json", "detail", "the spec is not valid JSON"), null);
 
         ResponseEntity<ApiError> response = handler.handle(new BadRequestCodedException(connectorFailure));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
-        assertThat(response.getBody().code()).isEqualTo("connector.spec-invalid");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("connector.spec-invalid");
+        assertThat(response.getBody().code()).isEqualTo("TS0060017");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0060017");
         assertThat(response.getBody().params()).containsEntry("artifact", "bad.jar");
     }
 

@@ -89,6 +89,15 @@ original refusal and recovery boundaries. Restarting a Pipeline does not change
 a process-fixed memory budget; changing a state database still requires stopping
 all writers and preserving or explicitly rebuilding the original state.
 
+Connector bridge diagnostics use module `006`. The existing connection-test
+identity `TS0060001` and its three-language text are retained under the same
+shared definition. First-party typed connector refusals still produce failed
+default-source reports after resource exit; interruption, cleanup uncertainty
+and programmer defects keep their existing paths. Connector registration and
+data browsing retain their context-specific HTTP status, and busy CLI polling
+accepts current and historical replies. Upstream connector-authored identities
+remain source-bound; a product module number never grants an upstream identity.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

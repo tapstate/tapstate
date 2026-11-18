@@ -516,7 +516,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.capability-missing");
+        assertThat(body.code()).isEqualTo("TS0060031");
         assertThat(body.params()).containsEntry("capability", "executeQuery");
     }
 
@@ -909,7 +909,7 @@ class DataBrowserApiTest {
     private record StubConnectorCode() implements TapstateErrorCode {
         @Override
         public String code() {
-            return "connector.capability-missing";
+            return "TS0060031";
         }
 
         @Override

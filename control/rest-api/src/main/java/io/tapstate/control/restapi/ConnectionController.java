@@ -56,7 +56,8 @@ class ConnectionController {
         MalformedRequest.requireText(body.connectorId(), "a `connectorId` is required");
         try { return testService.test(body.id(), body.connectorId(), body.settings(), AuthenticatedCaller.subject()); }
         catch (io.tapstate.core.common.TapstateException failure) {
-            if ("connector.instances-busy".equals(failure.code().code())) throw new UnavailableCodedException(failure);
+            if (io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCES_BUSY.code().equals(failure.code().code())
+                    || "connector.instances-busy".equals(failure.code().code())) throw new UnavailableCodedException(failure);
             throw failure;
         }
     }

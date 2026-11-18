@@ -115,7 +115,7 @@ suitable for the rows and key comparisons used by the pipeline. This check does
 not require `$indexStats` or the `indexStats` privilege.
 
 If index querying is unavailable, fails or returns malformed metadata, START is
-blocked with `connector.target-identity-check-failed`. A required logical index
+blocked with `TS0060003`. A required logical index
 may be prepared for a new or empty collection, or when the existing full-load
 policy explicitly clears the collection. Preparation is followed by another
 index query before writes begin. A populated collection without the matching

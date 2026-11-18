@@ -668,7 +668,7 @@ class PdkCapturePortTest {
         }).isInstanceOf(TapstateException.class)
                 .satisfies(error -> {
                     TapstateException refusal = (TapstateException) error;
-                    assertThat(refusal.code().code()).isEqualTo("connector.logminer-identifier-too-long");
+                    assertThat(refusal.code().code()).isEqualTo("TS0060019");
                     assertThat(refusal.args())
                             .containsEntry("connector", "oracle")
                             .containsEntry("kind", "schema")

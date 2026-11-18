@@ -540,7 +540,7 @@ class ConnectorApiTest {
     @Test
     void aCodedConnectorFailureFromRegisterIsABadRequestCarryingTheConnectorCode() {
         context.getBean(FakeConnectorRegistrar.class).fails(new TapstateException(
-                new ConnectorCode("connector.spec-invalid", Set.of("artifact", "spec", "detail")),
+                new ConnectorCode("TS0060017", Set.of("artifact", "spec", "detail")),
                 Map.of("artifact", "bad.jar", "spec", "spec.json", "detail", "the spec is not valid JSON"),
                 null));
 
@@ -553,7 +553,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.spec-invalid");
+        assertThat(body.code()).isEqualTo("TS0060017");
         assertThat(body.params()).containsEntry("artifact", "bad.jar");
     }
 

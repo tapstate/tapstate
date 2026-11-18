@@ -34,7 +34,7 @@ class OracleLogMinerIdentifierPreflightIT {
     private static final String TARGET = "tgt_file";
     private static final String TABLE = "orders";
     private static final String LONG_SCHEMA = "S".repeat(63);
-    private static final String FAILURE_CODE = "connector.logminer-identifier-too-long";
+    private static final String FAILURE_CODE = "TS0060019";
     private static final Duration TIMEOUT = Duration.ofSeconds(90);
 
     @BeforeAll

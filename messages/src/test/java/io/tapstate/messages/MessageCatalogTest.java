@@ -41,6 +41,22 @@ class MessageCatalogTest {
     }
 
     @Test
+    void currentConnectionIdentityRetainsTheSourceBoundProjection() {
+        var definition = io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED;
+        var current = new TapstateErrorCode() {
+            @Override public String code() { return definition.code(); }
+            @Override public Severity severity() { return definition.severity(); }
+            @Override public Set<String> placeholders() { return definition.parameters(); }
+        };
+        var params = Map.<String, Object>of("connector", "fixture", "detail", "driver detail");
+        for (var locale : java.util.List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+            assertThat(ConnectionDiagnosticCatalog.bundled().snapshot(new TapstateException(current, params, null), locale))
+                    .containsEntry("code", definition.code()).containsEntry("codeSource", "tapstate-standard")
+                    .containsEntry("params", params).containsKeys("message", "solution");
+        }
+    }
+
+    @Test
     void connectionDefinitionsRenderThreeLanguagesWithTheSameStableIdentity() {
         var testFailed = new TapstateErrorCode() {
             @Override public String code() { return "connector.test-failed"; }
@@ -70,14 +86,10 @@ class MessageCatalogTest {
         assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path -> "{}"))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("incomplete");
         assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path ->
-                """
-                {"TS0060001":{"message":" ","solution":"Check {connector} because {detail}."}}
-                """))
+                MessageCatalog.read(path).replaceFirst("\"message\": \"[^\"]*\"", "\"message\": \" \"")))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("invalid language entry");
         assertThatThrownBy(() -> ConnectionDiagnosticCatalog.load(path ->
-                """
-                {"TS0060001":{"message":"Cannot test {connector}.","solution":"Check {extra}."}}
-                """))
+                MessageCatalog.read(path).replaceFirst("\\{detail\\}", "{extra}")))
                 .isInstanceOf(IllegalStateException.class).hasMessageContaining("incorrect diagnostic parameters");
     }
 

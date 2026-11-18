@@ -220,6 +220,7 @@ class ApiExceptionHandler {
             Map.entry(ArtifactError.RECLAIM_INCOMPLETE.code(), HttpStatus.INTERNAL_SERVER_ERROR),
             Map.entry(ConnectorCatalogError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
             Map.entry("connector.test-timeout", HttpStatus.GATEWAY_TIMEOUT),
+            Map.entry(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_TIMEOUT.code(), HttpStatus.GATEWAY_TIMEOUT),
             Map.entry(PipelineError.NOT_FOUND.code(), HttpStatus.NOT_FOUND),
             Map.entry(PipelineError.ALREADY_EXISTS.code(), HttpStatus.CONFLICT),
             Map.entry(PipelineError.ID_MISMATCH.code(), HttpStatus.BAD_REQUEST),

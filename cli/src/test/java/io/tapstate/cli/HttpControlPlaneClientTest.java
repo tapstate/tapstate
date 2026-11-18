@@ -1048,17 +1048,18 @@ class HttpControlPlaneClientTest {
         }
     }
 
-    @Test
-    void registerReturnsRejectedWithTheServerCodeAndMessageOnACodedError() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"connector.registration-conflict", "TS0060006"})
+    void registerReturnsRejectedWithTheServerCodeAndMessageOnACodedError(String code) throws Exception {
         HttpServer server = apiServer("/api/connectors:register", 400,
-                "{\"code\":\"connector.registration-conflict\",\"params\":{},"
+                "{\"code\":\"" + code + "\",\"params\":{},"
                         + "\"message\":\"A different artifact already holds that id.\"}",
                 new AtomicReference<>());
         try {
             ConnectorRegisterOutcome outcome =
                     new HttpControlPlaneClient().register(baseOf(server), "tok", new byte[] {9});
             assertThat(outcome).isEqualTo(new ConnectorRegisterOutcome.Rejected(
-                    "connector.registration-conflict", "A different artifact already holds that id."));
+                    code, "A different artifact already holds that id."));
         } finally {
             server.stop(0);
         }
@@ -1583,7 +1584,7 @@ class HttpControlPlaneClientTest {
     @Test
     void preservesTheDiagnosticOfARefusedConnectionRequestInBothPaths() throws Exception {
         HttpServer server = apiServer("/api/connections", 500, """
-                {"code":"connector.test-failed","message":"Unable to run the test",
+                {"code":"TS0060001","message":"Unable to run the test",
                  "params":{"connector":"postgres"},
                  "diagnostic":{"causes":[{"code":"DRIVER"}],"truncated":true}}
                 """, new AtomicReference<>());
@@ -1594,10 +1595,10 @@ class HttpControlPlaneClientTest {
                     "causes", List.of(Map.of("code", "DRIVER")), "truncated", true);
             assertThat(client.test(baseOf(server), "tok", "orders", "postgres", Map.of()))
                     .isEqualTo(new ConnectionTestOutcome.Rejected(
-                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+                            "TS0060001", "Unable to run the test", params, diagnostic));
             assertThat(client.testResult(baseOf(server), "tok", "orders"))
                     .isEqualTo(new ConnectionTestResultOutcome.Rejected(
-                            "connector.test-failed", "Unable to run the test", params, diagnostic));
+                            "TS0060001", "Unable to run the test", params, diagnostic));
         } finally {
             server.stop(0);
         }

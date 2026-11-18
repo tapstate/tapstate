@@ -166,7 +166,9 @@ final class Repl {
     private static final String LEGACY_INCOMPATIBLE_REVISION = "lifecycle.incompatible-revision";
 
     private static final Set<String> BUSY_CODES =
-            Set.of("connector.instances-busy", "connector.instance-limit-reached");
+            Set.of("connector.instances-busy", "connector.instance-limit-reached",
+                    io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCES_BUSY.code(),
+                    io.tapstate.core.common.ConnectorErrorDefinitions.INSTANCE_LIMIT_REACHED.code());
 
     /** The word that keeps everything, and the words that only say "do not ask me". */
     private static final String KEEP_STATE = "--keep-state";
@@ -4626,13 +4628,13 @@ final class Repl {
      * is applied, because the server would refuse the same way later — after the sources were written.
      * Carried as the canonical code string, the way every server code reaches this ring.
      */
-    private static final String CONNECTOR_NOT_REGISTERED = "connector.not-registered";
+    private static final String CONNECTOR_NOT_REGISTERED = io.tapstate.core.common.ConnectorErrorDefinitions.NOT_REGISTERED.code();
     /**
      * The server's code for a connector that could not complete its connection test, carried as a
      * string for the same reason: it is the server's word, and a preflight that reports a check the
      * connector failed without a code of its own reports it under the code the server would have used.
      */
-    private static final String CONNECTOR_TEST_FAILED = "connector.test-failed";
+    private static final String CONNECTOR_TEST_FAILED = io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED.code();
 
     /** The pipeline state under which there is nothing left to start, as the server spells it. */
     private static final String RUNNING = "RUNNING";

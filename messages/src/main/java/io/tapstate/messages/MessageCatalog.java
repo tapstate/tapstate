@@ -130,6 +130,8 @@ public final class MessageCatalog {
             registered = IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isEmpty())
             registered = NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -171,7 +173,8 @@ public final class MessageCatalog {
                 .or(() -> NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> StoreDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+                .or(() -> NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
         if (registered.isPresent()) {
             var text = registered.orElseThrow();
             return Optional.of(new Rendered(text.message(), text.solution()));

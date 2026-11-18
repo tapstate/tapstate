@@ -55,7 +55,7 @@ class MySqlUnwindIdentityIT {
                             .hasRootCauseInstanceOf(io.tapstate.core.common.TapstateException.class)
                             .rootCause().satisfies(error -> {
                                 var coded = (io.tapstate.core.common.TapstateException) error;
-                                assertThat(coded.code().code()).isEqualTo("connector.target-identity-conflict");
+                                assertThat(coded.code().code()).isEqualTo("TS0060002");
                                 assertThat(coded.args()).containsEntry("reason", "key-representation-unsupported");
                             });
                     try (var count = sql.executeQuery("SELECT COUNT(*) FROM expanded")) {

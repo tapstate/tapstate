@@ -52,7 +52,7 @@ Which end refuses depends on the source, and the two read differently:
 
 | what happens | when | what you see |
 |---|---|---|
-| the connector refuses to start | the server itself is configured without before images - `binlog_row_image=MINIMAL` on MySQL, for one | `connector.capture-failed`, carrying the connector's own sentence naming the setting to change |
+| the connector refuses to start | the server itself is configured without before images - `binlog_row_image=MINIMAL` on MySQL, for one | `TS0060024`, carrying the connector's own sentence naming the setting to change |
 | the tree refuses the update | the source starts and streams, but an individual update arrives carrying no earlier row | `TS0490026`, naming the stream and the table |
 
 On MySQL it is the first: the connector checks `binlog_row_image` as it starts and stops

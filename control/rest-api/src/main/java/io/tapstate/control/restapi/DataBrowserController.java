@@ -48,7 +48,8 @@ class DataBrowserController {
      * Compared as a string because the ring that owns this code is not on this module's classpath, and a
      * read face has no business depending on the connector ring to name one refusal.
      */
-    private static final String CAPABILITY_MISSING = "connector.capability-missing";
+    private static final String CAPABILITY_MISSING =
+            io.tapstate.core.common.ConnectorErrorDefinitions.CAPABILITY_MISSING.code();
 
     private final DataBrowserService browser;
 
@@ -100,7 +101,7 @@ class DataBrowserController {
         try {
             return read.get();
         } catch (TapstateException e) {
-            if (CAPABILITY_MISSING.equals(e.code().code())) {
+            if (CAPABILITY_MISSING.equals(e.code().code()) || "connector.capability-missing".equals(e.code().code())) {
                 throw new BadRequestCodedException(e);
             }
             throw e;

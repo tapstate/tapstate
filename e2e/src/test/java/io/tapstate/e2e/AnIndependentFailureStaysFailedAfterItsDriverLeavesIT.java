@@ -56,7 +56,7 @@ class AnIndependentFailureStaysFailedAfterItsDriverLeavesIT {
                 assertThat(control.failureCode(PIPELINE)).isPresent();
                 String driver = control.pipelineControllerOf(PIPELINE).orElseThrow();
                 assertThat(Files.readString(cluster.processCarrying(driver).output()))
-                        .contains("connector.write-failed");
+                        .contains("TS0060027");
                 long failedExecution = control.executionGenerationOf(PIPELINE).orElseThrow();
                 String newHolder = TwoMemberCluster.NODE_A.equals(driver)
                         ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;

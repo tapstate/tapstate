@@ -66,7 +66,7 @@ class AChangedConnectorCacheIsRefusedIT {
                 HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
                 assertThat(response.statusCode()).isEqualTo(500);
                 assertThat(JsonReader.parse(response.body())).isEqualTo(Map.of(
-                        "code", "connector.load-failed",
+                        "code", "TS0060009",
                         "params", Map.of("connector", E2eConnectorJar.CONNECTOR_ID),
                         "message", "Connector 'e2e_file' could not be loaded."));
                 assertThat(response.body()).doesNotContain(directory.toString(), hash, "cause", "stackTrace");

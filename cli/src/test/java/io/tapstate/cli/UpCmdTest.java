@@ -289,7 +289,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: connector.not-registered")
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0060004")
                 .contains("mysql")
                 .containsIgnoringCase("register");
         assertThat(client.calls).containsExactly("isHealthy", "connectorList");
@@ -307,7 +307,7 @@ class UpCmdTest {
         Run r = up(home, client, "up", "-w", ws.toString());
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
-        assertThat(r.err()).contains("up: preflight failed on orders_src: connector.not-registered")
+        assertThat(r.err()).contains("up: preflight failed on orders_src: TS0060004")
                 .contains("mysql");
         assertThat(client.calls).containsExactly("isHealthy", "connectorList");
     }
@@ -393,7 +393,7 @@ class UpCmdTest {
 
         assertThat(r.code()).as(r.all()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         assertThat(r.out())
-                .contains("\"code\": \"connector.not-registered\"")
+                .contains("\"code\": \"TS0060004\"")
                 .contains("\"stage\": \"preflight\"")
                 .contains("\"on\": \"orders_src\"")
                 .doesNotContain("Next:");

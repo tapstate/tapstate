@@ -18,21 +18,19 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     private static final String SOLUTION = "solution";
 
     public enum Definition {
-        TEST_EXECUTION_FAILED("TS0060001", "connector.test-failed", Set.of("connector", "detail"));
+        TEST_EXECUTION_FAILED(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED, "connector.test-failed");
 
-        private final String code;
+        private final io.tapstate.core.common.ProductErrorDefinition definition;
         private final String legacy;
-        private final Set<String> parameters;
 
-        Definition(String code, String legacy, Set<String> parameters) {
-            this.code = code;
+        Definition(io.tapstate.core.common.ProductErrorDefinition definition, String legacy) {
+            this.definition = definition;
             this.legacy = legacy;
-            this.parameters = parameters;
         }
 
-        public String code() { return code; }
+        public String code() { return definition.code(); }
         public String legacy() { return legacy; }
-        public Set<String> parameters() { return parameters; }
+        public Set<String> parameters() { return definition.parameters(); }
     }
 
     private final Map<String, Definition> byLegacy;
@@ -63,8 +61,7 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
         Definition definition = byLegacy.get(code);
-        return definition == null ? Optional.empty()
-                : catalog.resolve(definition.code(), named, positional, locale);
+        return catalog.resolve(definition == null ? code : definition.code(), named, positional, locale);
     }
 
     static String language(Locale locale) {
@@ -78,11 +75,11 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
                 throw new IllegalStateException("invalid or repeated connection diagnostic definition " + definition.code());
             }
         }
-        var registered = java.util.Arrays.stream(Definition.values())
+        var registered = io.tapstate.core.common.ConnectorErrorDefinitions.registered().stream()
                 .map(definition -> new ProductDiagnosticCatalog.Definition(definition.code(), definition.parameters()))
                 .toList();
         var catalog = ProductDiagnosticCatalog.load("006", registered,
-                language -> readResource.apply("/messages/connection-diagnostic-" + language + ".json"));
+                language -> readResource.apply("/messages/connector-diagnostic-" + language + ".json"));
         return new ConnectionDiagnosticCatalog(Map.copyOf(byLegacy), catalog);
     }
 }
