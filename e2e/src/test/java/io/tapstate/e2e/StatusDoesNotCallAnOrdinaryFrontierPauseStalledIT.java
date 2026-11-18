@@ -50,7 +50,7 @@ class StatusDoesNotCallAnOrdinaryFrontierPauseStalledIT {
                 InProcessServer server = InProcessServer.startPrepared(storage)) {
             var running = RunningPipeline.started(server, directory, storage);
             String pipeline = running.pipelineId();
-            assertThat(server.stopPublishingObservations()).isEqualTo(1);
+            assertThat(server.stopPublishingObservationsAndAwaitWorkers()).isEqualTo(1);
             publishObservedPause(storage, pipeline);
 
             CliOnce.Run status = CliOnce.runWithPassword(PASSWORD,
