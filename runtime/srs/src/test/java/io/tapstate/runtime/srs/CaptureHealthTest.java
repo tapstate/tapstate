@@ -48,6 +48,20 @@ class CaptureHealthTest {
         }
     };
 
+    @Test void theFirstCauseAndAttachmentAreOneFactEvenWhenTheThrowableIsReused() {
+        var health = new CaptureHealth();
+        var failure = new IllegalStateException("original");
+        var listener = health.recording((events, position) -> {});
+        var safe = new io.tapstate.core.common.FailureFact.PublicFailure("code", Map.of("detail", "[redacted]"));
+            listener.onFailure(new io.tapstate.core.common.FailureFact(failure, Map.of("message", "source-a"), safe));
+        listener.onError(failure, Map.of("message", "source-b"));
+        assertThat(health.failureFact()).hasValueSatisfying(fact -> {
+            assertThat(fact.cause()).isSameAs(failure);
+                assertThat(fact.publicFailure()).isSameAs(safe);
+            assertThat(fact.diagnostic()).containsEntry("message", "source-a");
+        });
+    }
+
     @Test
     void isEmptyUntilAFailureIsRecorded() {
         assertThat(new CaptureHealth().failure()).isEmpty();

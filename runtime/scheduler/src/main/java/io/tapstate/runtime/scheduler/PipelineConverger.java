@@ -197,7 +197,7 @@ public final class PipelineConverger {
         // A pipeline believed running whose job has died converges to the observable FAILED state,
         // rather than reporting RUNNING over a dead job. The failure cause rides out on the result so
         // the driver can surface it. A converge-side transition, never a user verb.
-        Optional<Throwable> failure = actuator.failure(pipelineId);
+        var failure = actuator.failureFact(pipelineId);
         if (failure.isPresent()) {
             ConvergeResult driven = driveTo(pipelineId, PipelineState.FAILED, false, current, false);
             return driven.checkpoint()

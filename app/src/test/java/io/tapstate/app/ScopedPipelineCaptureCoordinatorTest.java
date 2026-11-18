@@ -21,6 +21,12 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    private static CaptureRun healthyCaptureRun() {
+        var run = mock(CaptureRun.class);
+        when(run.health()).thenReturn(new io.tapstate.runtime.srs.CaptureHealth());
+        return run;
+    }
+
     @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
@@ -256,7 +262,7 @@ class ScopedPipelineCaptureCoordinatorTest {
     @Test void anOldCallbackResumedAfterReleaseCannotRecreateItsHandoff() throws Exception {
         try(var f=new Fixture()) {
             var output=new AtomicReference<CaptureHandoff>();
-            doAnswer(call -> { output.set(call.getArgument(3));return mock(CaptureRun.class); }).when(f.runtime).beginSnapshotOnly(any(),anyLong(),any(),any(),any());
+            doAnswer(call -> { output.set(call.getArgument(3));return healthyCaptureRun(); }).when(f.runtime).beginSnapshotOnly(any(),anyLong(),any(),any(),any());
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL); run.startCapture("flow",f.snapshot(),f.models());
             var bindings=run.captureBindings(); var entered=new CountDownLatch(1); var resume=new CountDownLatch(1);
             when(f.authorization.requireCapture(any(),any())).thenAnswer(call -> {
@@ -772,7 +778,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             doAnswer(call -> {
                 Runnable guard=call.getArgument(5);guard.run();
                 java.util.function.Consumer<SrsFreshFullReceipt> callback=call.getArgument(8);callback.accept(receipt);
-                return mock(CaptureRun.class);
+                return healthyCaptureRun();
             }).when(f.runtime).beginSnapshot(any(),any(),eq(2L),any(),any(),any(),eq(full),any(),any());
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
             var binding=run.captureBindings().logged().get("input");
@@ -1023,7 +1029,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                 java.util.function.Function<SrsSnapshotPreparation, CapturePort> ports = call.getArgument(3);
                 ports.apply(preparation);
                 CaptureHandoff output = call.getArgument(4); output.loaded("orders");
-                return mock(CaptureRun.class);
+                return healthyCaptureRun();
             }).when(runtime).beginSnapshot(any(), any(), anyLong(), any(), any(), any());
         }
 

@@ -45,6 +45,11 @@ public interface LifecycleActuator {
      */
     Optional<Throwable> failure(String pipelineId);
 
+    /** Reads the cause and safe attachment atomically from the same run owner. */
+    default Optional<io.tapstate.core.common.FailureFact> failureFact(String pipelineId) {
+        return failure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
+    }
+
     /** A terminal Jet execution that was rejected by its original lease fence. */
     record LeaseLoss(long executionGeneration, Throwable cause) {}
 

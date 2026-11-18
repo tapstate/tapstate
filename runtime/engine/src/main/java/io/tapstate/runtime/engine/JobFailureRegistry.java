@@ -1,6 +1,7 @@
 package io.tapstate.runtime.engine;
 
 import com.hazelcast.core.HazelcastInstance;
+import io.tapstate.core.common.FailureFact;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
@@ -37,17 +38,21 @@ public final class JobFailureRegistry {
     }
 
     /** Legacy-only recording never overwrites a scope-aware run's slot. */
-    public void record(String pipelineId, Throwable cause) {
+    public void record(String pipelineId, Throwable cause) { record(pipelineId, new FailureFact(cause)); }
+
+    private void record(String pipelineId, FailureFact fact) {
         failures.compute(pipelineId, (id, before) -> {
             if (before != null && before.identity != null) return before;
             Slot slot = before == null ? new Slot(pipelineId, 0, null) : before;
-            slot.record(cause); return slot;
+            slot.record(fact); return slot;
         });
     }
 
-    public Optional<Throwable> get(String pipelineId) {
+    public Optional<Throwable> get(String pipelineId) { return fact(pipelineId).map(FailureFact::cause); }
+
+    public Optional<FailureFact> fact(String pipelineId) {
         Slot slot = failures.get(pipelineId);
-        return slot != null && slot.identity == null ? slot.get() : Optional.empty();
+        return slot != null && slot.identity == null ? slot.fact() : Optional.empty();
     }
 
     public void clear(String pipelineId) {
@@ -92,7 +97,7 @@ public final class JobFailureRegistry {
         return slot == null ? Optional.empty() : slot.retained(identity);
     }
 
-    record RetainedFailure(Throwable cause) {}
+    record RetainedFailure(Throwable cause, Map<String, Object> diagnostic) {}
 
     Recorder existing(String pipelineId, long jobId, java.io.Serializable identity) {
         Slot slot = failures.get(pipelineId);
@@ -142,6 +147,16 @@ public final class JobFailureRegistry {
             if (slot != null) slot.record(failure);
             else if (registry != null) registry.record(pipelineId, failure);
         }
+        public void record(Throwable failure, Map<String, Object> diagnostic) {
+            record(new FailureFact(failure, diagnostic));
+        }
+        public void record(FailureFact fact) {
+            if (slot != null) slot.record(fact);
+            else if (registry != null) registry.record(pipelineId, fact);
+        }
+        Optional<FailureFact> fact() {
+            return slot != null ? slot.fact() : registry == null ? Optional.empty() : registry.fact(pipelineId);
+        }
         Optional<Throwable> get() {
             return slot != null ? slot.get() : registry == null ? Optional.empty() : registry.get(pipelineId);
         }
@@ -155,7 +170,7 @@ public final class JobFailureRegistry {
         final String pipelineId;
         final long jobId;
         final java.io.Serializable identity;
-        private Throwable cause;
+        private FailureFact failure;
         private boolean retired;
         Slot(String pipelineId, long jobId, java.io.Serializable identity) {
             this.pipelineId = pipelineId; this.jobId = jobId; this.identity = identity;
@@ -165,10 +180,12 @@ public final class JobFailureRegistry {
         }
         synchronized Optional<RetainedFailure> retained(java.io.Serializable expectedIdentity) {
             return !retired && jobId != 0 && identity != null && identity.equals(expectedIdentity)
-                    ? Optional.of(new RetainedFailure(cause)) : Optional.empty();
+                    ? Optional.of(new RetainedFailure(failure == null ? null : failure.cause(), failure == null ? Map.of() : failure.diagnostic())) : Optional.empty();
         }
-        synchronized void record(Throwable failure) { if (!retired) cause = java.util.Objects.requireNonNull(failure, "failure"); }
-        synchronized Optional<Throwable> get() { return retired ? Optional.empty() : Optional.ofNullable(cause); }
-        synchronized void retire() { retired = true; cause = null; }
+        synchronized void record(Throwable cause) { record(new FailureFact(cause)); }
+        synchronized void record(FailureFact next) { if (!retired) failure = next; }
+        synchronized Optional<FailureFact> fact() { return retired ? Optional.empty() : Optional.ofNullable(failure); }
+        synchronized Optional<Throwable> get() { return fact().map(FailureFact::cause); }
+        synchronized void retire() { retired = true; failure = null; }
     }
 }

@@ -96,6 +96,10 @@ interface PipelineCaptureCoordinator {
         return Optional.empty();
     }
 
+    default Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
+        return captureFailure(pipelineId).map(io.tapstate.core.common.FailureFact::new);
+    }
+
     /**
      * Whether every table this pipeline reads has had its initial load confirmed at this pipeline's target.
      *

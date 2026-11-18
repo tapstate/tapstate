@@ -131,7 +131,7 @@ class PipelineObservationApiTest {
     private static final Observation PL_DEAD = new Observation("pl3", PipelineState.FAILED,
             Map.of("errorCount", 1L), Map.of(), Map.of(),
             new ObservationFailure("TS0440008",
-                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
+                    Map.of("pipeline", "pl3", "cause", "the sink rejected the batch"), Map.of("rawMessage", "safe captured cause")));
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
 
@@ -265,6 +265,7 @@ class PipelineObservationApiTest {
         assertThat(body.get("state")).isEqualTo("FAILED");
         Map<?, ?> failure = (Map<?, ?>) body.get("failure");
         assertThat(failure.get("code")).isEqualTo("TS0440008");
+        assertThat(failure.get("diagnostic")).isEqualTo(Map.of("rawMessage", "safe captured cause"));
         assertThat((String) failure.get("message")).contains("the sink rejected the batch");
         assertThat((Map<String, Object>) failure.get("params"))
                 .containsEntry("cause", "the sink rejected the batch");
@@ -437,6 +438,19 @@ class PipelineObservationApiTest {
 
         assertThat(body.pipelineId()).isEqualTo("pl1");
         assertThat(body.snapshot()).containsEntry("orders", new TableSnapshot(10, 100L, 10));
+    }
+
+    @Test
+    void explanationCarriesTheSameCapturedDiagnosticAsStatus() {
+        Map<String, Object> body = client().get().uri("/api/pipelines/pl3/explain")
+                .header("Authorization", "Bearer " + machineToken(Scope.READ))
+                .retrieve().body(new ParameterizedTypeReference<Map<String, Object>>() {});
+        var evidence = (List<Map<String, Object>>) body.get("evidence");
+        assertThat(evidence).anySatisfy(item -> {
+            assertThat(item.get("field")).isEqualTo("failure");
+            assertThat(((Map<?, ?>) item.get("value")).get("diagnostic"))
+                    .isEqualTo(Map.of("rawMessage", "safe captured cause"));
+        });
     }
 
     @Test

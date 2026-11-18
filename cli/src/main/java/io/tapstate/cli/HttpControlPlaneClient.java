@@ -1787,7 +1787,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             // The message is the server's rendering of that code; when it is absent the code still names
             // the diagnosis, so it stands in rather than the whole read degrading to unreachable.
             String message = failure.get("message") instanceof String rendered ? rendered : code;
-            return new StatusOutcome.Found(id, state, code, message, ageMillis);
+            var params = new LinkedHashMap<String, Object>();
+            if (failure.get("params") instanceof Map<?, ?> supplied) {
+                supplied.forEach((key, value) -> { if (key instanceof String name) params.put(name, value); });
+            }
+            return new StatusOutcome.Found(id, state, code, message, ageMillis, params,
+                    io.tapstate.core.common.RuntimeDiagnosticProjection.read(failure.get("diagnostic")));
         }
         return null;
     }

@@ -257,17 +257,18 @@ public final class Engine {
             if (!isLost() && !job.getStatus().isTerminal()) job.cancel();
             JobFailureRegistry.of(member).retireRun(pipelineId, job.getId(), identity);
         }
-        public Optional<Throwable> failure() {
+        public Optional<Throwable> failure() { return failureFact().map(io.tapstate.core.common.FailureFact::cause); }
+        public Optional<io.tapstate.core.common.FailureFact> failureFact() {
             var lost = Engine.this.lost(pipelineId);
-            if (lost.isPresent()) return failures().get().filter(cause -> !ranOutOfMemory(cause)).or(() -> lost.map(Throwable.class::cast));
+            if (lost.isPresent()) return failures().fact().filter(fact -> !ranOutOfMemory(fact.cause())).or(() -> lost.map(io.tapstate.core.common.FailureFact::new));
             if (job.getStatus() != JobStatus.FAILED) return Optional.empty();
-            var recorded = failures().get();
+            var recorded = failures().fact();
             if (recorded.isPresent()) return recorded;
             try { job.getFuture().join(); return Optional.empty(); }
             catch (CancellationException cancelled) { return Optional.empty(); }
             catch (CompletionException failed) {
                 Throwable cause = failed.getCause() == null ? failed : failed.getCause();
-                return cause instanceof CancellationException ? Optional.empty() : Optional.of(cause);
+                return cause instanceof CancellationException ? Optional.empty() : Optional.of(new io.tapstate.core.common.FailureFact(cause));
             }
         }
         public boolean awaitTerminal(Duration budget) { return !isLost() && awaitJob(job, budget); }
@@ -487,18 +488,20 @@ public final class Engine {
      * the cause that names what an operator has to change. A recorded cause that is itself the heap running out,
      * anywhere down its chain, is the loss as a processor caught it, and is answered as the loss.
      */
-    public Optional<Throwable> failureOf(String pipelineId) {
+    public Optional<Throwable> failureOf(String pipelineId) { return failureFactOf(pipelineId).map(io.tapstate.core.common.FailureFact::cause); }
+
+    public Optional<io.tapstate.core.common.FailureFact> failureFactOf(String pipelineId) {
         Optional<TapstateException> lost = lost(pipelineId);
         if (lost.isPresent()) {
-            Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId)
-                    .filter(cause -> !ranOutOfMemory(cause));
-            return recorded.isPresent() ? recorded : lost.map(Throwable.class::cast);
+            Optional<io.tapstate.core.common.FailureFact> recorded = JobFailureRegistry.of(member).fact(pipelineId)
+                    .filter(fact -> !ranOutOfMemory(fact.cause()));
+            return recorded.isPresent() ? recorded : lost.map(io.tapstate.core.common.FailureFact::new);
         }
         Job job = jobNamed(pipelineId);
         if (job == null || job.getStatus() != JobStatus.FAILED) {
             return Optional.empty();
         }
-        Optional<Throwable> recorded = JobFailureRegistry.of(member).get(pipelineId);
+        Optional<io.tapstate.core.common.FailureFact> recorded = JobFailureRegistry.of(member).fact(pipelineId);
         if (recorded.isPresent()) {
             return recorded;
         }
@@ -509,7 +512,7 @@ public final class Engine {
             return Optional.empty();
         } catch (CompletionException failed) {
             Throwable cause = failed.getCause() != null ? failed.getCause() : failed;
-            return cause instanceof CancellationException ? Optional.empty() : Optional.of(cause);
+            return cause instanceof CancellationException ? Optional.empty() : Optional.of(new io.tapstate.core.common.FailureFact(cause));
         }
     }
 

@@ -32,7 +32,8 @@ record PipelineExplanationResponse(
             @JsonInclude(JsonInclude.Include.ALWAYS) Object value) {
     }
 
-    record Failure(String code, Map<String, String> params, String message) {
+    record Failure(String code, Map<String, String> params, String message,
+            @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Object> diagnostic) {
     }
 
     record Next(String action, String message) {
@@ -67,7 +68,7 @@ record PipelineExplanationResponse(
 
     private static Object evidenceValue(Object value) {
         if (value instanceof PipelineExplanation.Failure failure) {
-            return new Failure(failure.code(), new TreeMap<>(failure.params()), failure.message());
+            return new Failure(failure.code(), new TreeMap<>(failure.params()), failure.message(), failure.diagnostic());
         }
         return value;
     }

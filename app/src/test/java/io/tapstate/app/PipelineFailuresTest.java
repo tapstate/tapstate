@@ -20,6 +20,17 @@ import static org.assertj.core.api.Assertions.entry;
  */
 class PipelineFailuresTest {
 
+    @Test void ownerRedactionSurvivesMissingAttachmentWithoutReadingRawValues() {
+        var raw = new Object() { public String toString() { throw new AssertionError("raw value accessed"); } };
+        var coded = new TapstateException(EngineError.NO_SUCH_JOB, Map.of("pipeline", raw), null);
+        var safe = new io.tapstate.core.common.FailureFact.PublicFailure(coded.code().code(), Map.of("pipeline", "[redacted]"));
+        assertThat(PipelineFailures.of("orders", coded, Map.of("truncated", true), safe).params())
+                .containsOnly(entry("pipeline", "[redacted]"));
+        var unavailable = io.tapstate.core.common.FailureFact.unavailable(coded);
+        assertThat(PipelineFailures.of("orders", coded, unavailable.diagnostic(), unavailable.publicFailure()).params())
+                .containsOnly(entry("pipeline", "[diagnostic unavailable]"));
+    }
+
     @Test
     void aCodedCauseKeepsItsOwnCodeAndArguments() {
         TapstateException coded = new TapstateException(

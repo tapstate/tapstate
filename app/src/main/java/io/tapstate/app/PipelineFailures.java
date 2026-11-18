@@ -56,6 +56,25 @@ final class PipelineFailures {
                 Map.of("pipeline", pipelineId, "cause", describe(failure)));
     }
 
+    static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic) {
+        return of(pipelineId, failure, diagnostic, null);
+    }
+
+    static ObservationFailure of(String pipelineId, Throwable failure, Map<String, Object> diagnostic,
+            io.tapstate.core.common.FailureFact.PublicFailure publicFailure) {
+        if (publicFailure == null) {
+            var primary = of(pipelineId, failure);
+            return new ObservationFailure(primary.code(), primary.params(), diagnostic);
+        }
+        var coded = codedCause(failure);
+        String code = coded == null ? EngineError.JOB_FAILED.code() : coded.code().code();
+        var keys = coded == null ? java.util.Set.of("pipeline", "cause") : coded.args().keySet();
+        Map<String, String> safe = new LinkedHashMap<>();
+        keys.forEach(key -> safe.put(key, code.equals(publicFailure.code())
+                ? publicFailure.params().getOrDefault(key, "[diagnostic unavailable]") : "[diagnostic unavailable]"));
+        return new ObservationFailure(code, safe, diagnostic);
+    }
+
     /** Recognizes the coded sink failure before Jet can reduce it to a generic wrapper. */
     static boolean isSinkWriteFailure(String pipelineId, Throwable failure) {
         return failure != null

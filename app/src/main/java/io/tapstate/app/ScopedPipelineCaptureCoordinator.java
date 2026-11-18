@@ -328,13 +328,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         }
         @Override public boolean isCapturing(String pipeline) { requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) { return sessions.containsKey(original); } }
         @Override public Optional<Throwable> captureFailure(String pipeline) {
+            return captureFailureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
+        }
+        @Override public Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipeline) {
             requireId(pipeline); synchronized(ScopedPipelineCaptureCoordinator.this) {
                 var held=sessions.get(original); if(held==null)return Optional.empty();
-                if(held.failure.get()!=null)return Optional.of(held.failure.get());
+                if(held.failure.get()!=null)return Optional.of(new io.tapstate.core.common.FailureFact(held.failure.get()));
                 for(var source:held.sources.values())if(source.owner!=null && source.owner.physical!=null) {
-                    var failure=source.owner.physical.tail.health().failure();if(failure.isPresent())return failure;
+                    var failure=source.owner.physical.tail.health().failureFact();if(failure.isPresent())return failure;
                 }
-                return held.sources.values().stream().filter(source -> source.run!=null).map(source -> source.run.failure()).flatMap(Optional::stream).findFirst();
+                return held.sources.values().stream().filter(source -> source.run!=null).map(source -> source.run.health().failureFact()).flatMap(Optional::stream).findFirst();
             }
         }
         @Override public boolean loadDelivered(String pipeline) { requireId(pipeline); var held=current(); if(held==null || !held.snapshot || held.sources.isEmpty())return true;

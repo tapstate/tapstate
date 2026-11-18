@@ -1609,6 +1609,11 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
 
     @Override
     public synchronized Optional<Throwable> captureFailure(String pipelineId) {
+        return captureFailureFact(pipelineId).map(io.tapstate.core.common.FailureFact::cause);
+    }
+
+    @Override
+    public synchronized Optional<io.tapstate.core.common.FailureFact> captureFailureFact(String pipelineId) {
         List<PipelineRun> runs = runsByPipeline.get(pipelineId);
         if (runs == null) {
             return Optional.empty();
@@ -1617,12 +1622,12 @@ final class StoreBackedPipelineCaptureCoordinator implements PipelineCaptureCoor
         // snapshot-only capture has no shared tail; its owner's load failure belongs to that owner alone.
         return runs.stream()
                 .map(run -> {
-                    Optional<Throwable> ownFailure = run.run.failure();
+                    var ownFailure = run.run.health().failureFact();
                     if (ownFailure.isPresent()) {
                         return ownFailure;
                     }
                     OwnedCapture shared = run.sharedTail ? ownedCaptures.get(run.captureId) : null;
-                    return shared == null ? Optional.<Throwable>empty() : shared.run.failure();
+                    return shared == null ? Optional.<io.tapstate.core.common.FailureFact>empty() : shared.run.health().failureFact();
                 })
                 .filter(Optional::isPresent)
                 .map(Optional::get)

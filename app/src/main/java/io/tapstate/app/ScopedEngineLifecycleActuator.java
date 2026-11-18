@@ -259,12 +259,15 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
 
     @Override public synchronized Optional<Throwable> failure(String pipeline) {
+        return failureFact(pipeline).map(io.tapstate.core.common.FailureFact::cause);
+    }
+    @Override public synchronized Optional<io.tapstate.core.common.FailureFact> failureFact(String pipeline) {
         requireId(pipeline);
-        if (engine.isLost()) { var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost; }
-        Optional<Throwable> failure = run != null && isCurrentRun() ? run.failure() : Optional.empty(); require();
+        if (engine.isLost()) { var lost = engine.lost(id()).map(io.tapstate.core.common.FailureFact::new); require(); return lost; }
+        Optional<io.tapstate.core.common.FailureFact> failure = run != null && isCurrentRun() ? run.failureFact() : Optional.empty(); require();
         // An earlier capture stays bound for cleanup, not for the current run's failure diagnosis.
         if (failure.isPresent() || capture == null || !isCurrentRun()) return failure;
-        var captured = capture.captureFailure(id()); require(); return captured;
+        var captured = capture.captureFailureFact(id()); require(); return captured;
     }
     @Override public synchronized Optional<Throwable> lost(String pipeline) {
         requireId(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost;

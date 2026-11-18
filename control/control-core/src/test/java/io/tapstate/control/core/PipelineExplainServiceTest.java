@@ -59,7 +59,7 @@ class PipelineExplainServiceTest {
     @Test
     void codedFailurePreservesItsCodeParamsAndSharedRenderedMessage() {
         Observation observation = new Observation(ID, PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new ObservationFailure("TS0440008", Map.of("pipeline", ID)), NOW.minusSeconds(2));
+                new ObservationFailure("TS0440008", Map.of("pipeline", ID), Map.of("rawMessage", "captured cause")), NOW.minusSeconds(2));
 
         PipelineExplanation answer = service(observation).explain(ID);
 
@@ -68,7 +68,7 @@ class PipelineExplainServiceTest {
             assertThat(evidence.source()).isEqualTo(Source.STATUS);
             assertThat(evidence.field()).isEqualTo("failure");
             assertThat(evidence.value()).isEqualTo(
-                    new Failure("TS0440008", Map.of("pipeline", ID), "rendered failure"));
+                    new Failure("TS0440008", Map.of("pipeline", ID), "rendered failure", Map.of("rawMessage", "captured cause")));
         });
         assertThat(answer.next().action()).isEqualTo(NextAction.OPEN_PIPELINE_LOGS);
     }

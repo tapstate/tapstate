@@ -713,7 +713,14 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
                 // exact cause (see JobFailureRegistry), so the last point this processor still holds the
                 // real, unwrapped cause is the only reliable place to keep it.
                 if (failureRegistry != null) {
-                    failureRegistry.record(failure);
+                    io.tapstate.core.common.FailureFact fact;
+                    try {
+                        fact = writer.failureFact(failure);
+                        if (fact.cause() != failure) throw new IllegalArgumentException("failure owner changed the cause");
+                    } catch (RuntimeException | LinkageError unavailable) {
+                        fact = io.tapstate.core.common.FailureFact.unavailable(failure);
+                    }
+                    failureRegistry.record(fact);
                 }
                 throw failure;
             }

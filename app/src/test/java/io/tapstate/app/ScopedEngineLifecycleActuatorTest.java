@@ -281,11 +281,13 @@ class ScopedEngineLifecycleActuatorTest {
         doThrow(new RingNotOpenYet(new io.tapstate.runtime.srs.CaptureId("capture"))).when(fixedCapture)
                 .startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
         var currentFailure = new TapstateException(EngineError.EXECUTION_NOT_AUTHORIZED, Map.of("pipeline", "p"), null);
-        when(fixedCapture.captureFailure("p")).thenReturn(Optional.of(currentFailure));
+        when(fixedCapture.captureFailureFact("p")).thenReturn(Optional.of(new io.tapstate.core.common.FailureFact(currentFailure, Map.of("message", "current capture"))));
         var actor = actuator();
         actor.start("p");
 
         assertThat(actor.failure("p")).containsSame(currentFailure);
+        assertThat(actor.failureFact("p")).hasValueSatisfying(fact ->
+                assertThat(fact.diagnostic()).containsEntry("message", "current capture"));
         verify(previous, never()).failure();
         verify(engine, never()).submitRun(anyString(), any(), anyMap(), any(), any(OperatorRunManifest.class));
     }

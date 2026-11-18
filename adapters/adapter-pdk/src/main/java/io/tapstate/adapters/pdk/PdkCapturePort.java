@@ -1323,7 +1323,7 @@ public final class PdkCapturePort implements CapturePort, SnapshotSession.Prepar
                 return;
             }
             LOG.warn("cdc stream for connector {} stopped on a failure", connector.connectorId(), t);
-            listener.onError(reported);
+            listener.onFailure(connector.failureFact(reported));
         }
     }
 

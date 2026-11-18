@@ -1828,9 +1828,27 @@ class HttpControlPlaneClientTest {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok-abc", "pl1");
 
             assertThat(outcome).isEqualTo(new StatusOutcome.Found("pl1", "FAILED", code,
-                    "Pipeline pl1 stopped because its job failed: sink refused."));
+                    "Pipeline pl1 stopped because its job failed: sink refused.", null,
+                    Map.of("cause", "sink refused"), Map.of()));
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    void statusRetainsTheCapturedAttachmentAndDoesNotLoseFailureOnInvalidExtension() throws Exception {
+        for (String attachment : List.of("{\"cause\":{\"rawMessage\":\"safe cause\"}}", "{\"unexpected\":true}")) {
+            HttpServer server = apiServer("/api/pipelines/pl1/status", 200,
+                    "{\"pipelineId\":\"pl1\",\"state\":\"FAILED\",\"failure\":{\"code\":\"TS0060027\","
+                            + "\"params\":{\"detail\":\"refused\"},\"message\":\"write refused\",\"diagnostic\":" + attachment + "}}",
+                    new AtomicReference<>());
+            try {
+                var found = (StatusOutcome.Found) new HttpControlPlaneClient().status(baseOf(server), "token", "pl1");
+                assertThat(found.failureCode()).isEqualTo("TS0060027");
+                assertThat(found.failureParams()).containsEntry("detail", "refused");
+                if (attachment.contains("unexpected")) assertThat(found.diagnostic()).isEmpty();
+                else assertThat(found.diagnostic()).containsEntry("cause", Map.of("rawMessage", "safe cause"));
+            } finally { server.stop(0); }
         }
     }
 

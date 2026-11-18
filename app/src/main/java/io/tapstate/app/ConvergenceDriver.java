@@ -203,7 +203,7 @@ final class ConvergenceDriver {
                     // observation, so a read face can say why, and into the log with its code and stack.
                     // Every later pass while the checkpoint stays FAILED publishes null and the publisher
                     // carries the stored reason forward — durably, so it survives a process restart too.
-                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null));
+                    failure = PipelineFailures.of(pipelineId, result.failure().orElse(null), result.diagnostic(), result.publicFailure());
                     LOG.warn("Pipeline {} entered FAILED [{}]: its data-plane job died", pipelineId,
                             failure.code(), result.failure().orElse(null));
                 }
