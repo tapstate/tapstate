@@ -26,7 +26,10 @@ public enum ProductErrorModule {
     MONITOR("040"),
     POSITION("041"),
     MIGRATION("042"),
-    ROW_VALUE("043");
+    ROW_VALUE("043"),
+    ENGINE("044"),
+    TRANSFORM("045"),
+    NEST_SIZING("046");
 
     private final String number;
 

@@ -34,14 +34,14 @@ class StreamFramesTest {
         // A watcher must be able to tell why a pipeline died from the same frame that reports it dead --
         // otherwise the one frame that matters is reasonless and no later frame repeats it (the state
         // does not change again on its own).
-        ObservationFailure failure = new ObservationFailure("engine.job-failed",
+        ObservationFailure failure = new ObservationFailure("TS0440008",
                 Map.of("pipeline", "orders", "cause", "sink refused the batch"));
         String frame = StreamFrames.status(new PipelineStatus("orders", PipelineState.FAILED, failure), CATALOG);
 
         assertThat(frame).contains("\"pipelineId\":\"orders\"");
         assertThat(frame).contains("\"state\":\"FAILED\"");
         assertThat(frame).contains("\"failure\":{");
-        assertThat(frame).contains("\"code\":\"engine.job-failed\"");
+        assertThat(frame).contains("\"code\":\"TS0440008\"");
         assertThat(frame).contains("\"cause\":\"sink refused the batch\"");
         assertThat(frame).contains("\"message\":");
     }

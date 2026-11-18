@@ -126,7 +126,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
         assertThat(result.valid()).as("over budget is a cost, not a reason to refuse").isTrue();
         assertThat(result.diagnostics()).as("nothing was refused, so nothing is a refusal reason").isEmpty();
         ValidationDiagnostic warning =
-                withCode(result.warnings(), "nest.state-far-exceeds-memory-budget");
+                withCode(result.warnings(), "TS0460001");
         assertThat(warning).as("the oversized level is reported").isNotNull();
         assertThat(warning.params())
                 .containsEntry("pipeline", "orders_doc")
@@ -143,7 +143,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
 
         List<ValidationDiagnostic> warnings = service.validate(batch()).warnings();
 
-        ValidationDiagnostic warning = withCode(warnings, "nest.state-far-exceeds-memory-budget");
+        ValidationDiagnostic warning = withCode(warnings, "TS0460001");
         assertThat(warning).isNotNull();
         assertThat(warning.params()).containsEntry("embedPath", "orders");
     }
@@ -167,10 +167,10 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
 
         List<ValidationDiagnostic> warnings = service.validate(batch()).warnings();
 
-        ValidationDiagnostic gap = withCode(warnings, "nest.capacity-estimate-incomplete");
+        ValidationDiagnostic gap = withCode(warnings, "TS0460002");
         assertThat(gap).as("a level nobody could size says so").isNotNull();
         assertThat(gap.params()).containsEntry("embedPath", "$root").containsEntry("counted", 0L);
-        assertThat(withCode(warnings, "nest.state-far-exceeds-memory-budget"))
+        assertThat(withCode(warnings, "TS0460001"))
                 .as("an uncounted table is never reported as fitting").isNull();
     }
 
@@ -180,7 +180,7 @@ class ANestIsSizedAgainstItsMemoryWhenItIsAppliedTest {
 
         ApplyResult applied = service.apply("tester", batch());
 
-        assertThat(withCode(applied.warnings(), "nest.state-far-exceeds-memory-budget"))
+        assertThat(withCode(applied.warnings(), "TS0460001"))
                 .as("apply carries what validate would have said").isNotNull();
         assertThat(applied.outcomes()).as("and the batch was still written").hasSize(3);
     }

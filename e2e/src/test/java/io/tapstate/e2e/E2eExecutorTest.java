@@ -232,9 +232,9 @@ class E2eExecutorTest {
     void awaitsTheFailureCodeOfThePipelineResolvedFromTheEnvelope() {
         // A dead pipeline is already assertable as a state and a count; neither says what killed it, and a
         // regression that swaps the reason for another would pass both. The code is the assertable identity.
-        binding.failureCodesUnobservedThen("engine.job-failed");
+        binding.failureCodesUnobservedThen("TS0440008");
 
-        execute(minimal("steps:\n  - await: { failure_code: engine.job-failed }\n"));
+        execute(minimal("steps:\n  - await: { failure_code: TS0440008 }\n"));
 
         assertThat(binding.failureCodedPipelineIds).containsOnly(PIPELINE_ID);
     }

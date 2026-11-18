@@ -129,7 +129,7 @@ class PipelineObservationQueryServiceTest {
     void aProvedReadDiagnosisNeverRewritesTheStoredStateTimeOrMeasurements() {
         var original = runningWithFacts();
         var store = storeWith(original);
-        var diagnosis = new ObservationFailure("engine.out-of-memory", Map.of("pipeline", "orders_sync"));
+        var diagnosis = new ObservationFailure("TS0440009", Map.of("pipeline", "orders_sync"));
         var calls = new java.util.concurrent.atomic.AtomicInteger();
         var query = new PipelineObservationQueryService(artifactsWith("orders_sync"), store,
                 ExecutionPlans.NONE, List::of, (pipeline, observed) -> { calls.incrementAndGet(); return Optional.of(diagnosis); });
@@ -237,7 +237,7 @@ class PipelineObservationQueryServiceTest {
         // FAILED on its own tells the user something broke but not what: the reason is published with the
         // state, so the status face answers it from the store rather than sending the user to the logs.
         Observation dead = new Observation("orders_sync", PipelineState.FAILED, Map.of("errorCount", 1L),
-                Map.of(), Map.of(), new ObservationFailure("engine.job-failed",
+                Map.of(), Map.of(), new ObservationFailure("TS0440008",
                         Map.of("pipeline", "orders_sync", "cause", "sink refused the batch")));
         var service = new PipelineObservationQueryService(artifactsWith("orders_sync"), storeWith(dead));
 
@@ -245,7 +245,7 @@ class PipelineObservationQueryServiceTest {
 
         assertThat(status.state()).isEqualTo(PipelineState.FAILED);
         assertThat(status.failure()).isNotNull();
-        assertThat(status.failure().code()).isEqualTo("engine.job-failed");
+        assertThat(status.failure().code()).isEqualTo("TS0440008");
         assertThat(status.failure().params()).containsEntry("cause", "sink refused the batch");
     }
 

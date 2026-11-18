@@ -118,6 +118,12 @@ public final class MessageCatalog {
             registered = MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isEmpty())
             registered = RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -153,7 +159,10 @@ public final class MessageCatalog {
                 .or(() -> MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+                .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
         if (registered.isPresent()) {
             var text = registered.orElseThrow();
             return Optional.of(new Rendered(text.message(), text.solution()));

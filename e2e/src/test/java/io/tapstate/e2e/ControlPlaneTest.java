@@ -210,7 +210,7 @@ class ControlPlaneTest {
         // failed two ways -- which is the ordinary case for anything that fails more than once.
         String body = JsonWriter.write(Map.of("pipelineId", PIPELINE, "metrics", Map.of(
                 "errors.connector.write-failed", 2L,
-                "errors.engine.job-failed", 1L,
+                "errors.TS0440008", 1L,
                 "recordCount", 500L)));
 
         assertThat(ControlPlane.interpretErrorCount(200, body, PIPELINE)).contains(3L);

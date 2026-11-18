@@ -324,7 +324,7 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
     }
 
@@ -349,13 +349,13 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
         // One death is one count, driven through the real converger rather than asserted against a
         // publisher fed by hand: the cause arrives on one pass and the three after it carry none, so a
         // count taken from the state instead of from the witness would read four here.
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
     }
 
     @Test
@@ -373,7 +373,7 @@ class ConvergenceDriverTest {
         actuator.failWith(new IllegalStateException("sink write failed"));
         driver.reconcile(); // orders -> FAILED, one failure counted
         assertThat(observations.read("orders").orElseThrow().metrics())
-                .containsOnly(entry("errors.engine.job-failed", 1L));
+                .containsOnly(entry("errors.TS0440008", 1L));
 
         // Deleted: its intent is removed, which is the only thing that takes a pipeline out of the set the
         // pass reads. A stopped pipeline would still be in it and would keep its counts.
@@ -443,7 +443,7 @@ class ConvergenceDriverTest {
 
         ObservationFailure failure = observations.read("orders").orElseThrow().failure();
         assertThat(failure).isNotNull();
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params()).containsEntry("cause", "sink write failed");
     }
 

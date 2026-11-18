@@ -140,7 +140,7 @@ tapstate -w work                       # then, in the session:
 
 > **Discover before the second apply.** A nest sizes its levels from the row counts of the tables
 > feeding them. Applied before discovery, those counts are unknown and you get
-> `nest.capacity-estimate-incomplete` telling you the estimate is a floor. Discover both sources, apply
+> `TS0460002` telling you the estimate is a floor. Discover both sources, apply
 > once more, and the warning goes away.
 
 > **`start` returning `running` is not proof it runs.** A pipeline whose configuration is wrong can

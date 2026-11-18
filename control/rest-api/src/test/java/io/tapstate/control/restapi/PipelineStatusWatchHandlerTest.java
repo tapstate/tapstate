@@ -257,7 +257,7 @@ class PipelineStatusWatchHandlerTest {
         // reasonless the watcher never learns why, no matter how long it keeps watching.
         Observation dead = new Observation("orders", PipelineState.FAILED, Map.of("errorCount", 1L),
                 Map.of(), Map.of(), new io.tapstate.core.lifecycle.ObservationFailure(
-                        "engine.job-failed", Map.of("pipeline", "orders", "cause", "sink refused the batch")));
+                        "TS0440008", Map.of("pipeline", "orders", "cause", "sink refused the batch")));
         ObservationStore store = new ObservationStore() {
             @Override
             public void delete(String pipelineId) {
@@ -281,7 +281,7 @@ class PipelineStatusWatchHandlerTest {
 
         assertThat(session.sent).hasSize(1);
         String frame = ((org.springframework.web.socket.TextMessage) session.sent.get(0)).getPayload();
-        assertThat(frame).contains("\"code\":\"engine.job-failed\"");
+        assertThat(frame).contains("\"code\":\"TS0440008\"");
         assertThat(frame).contains("\"cause\":\"sink refused the batch\"");
     }
 

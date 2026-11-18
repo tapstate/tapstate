@@ -56,6 +56,27 @@ class MongoCachePipelineStoresIT {
     private static final Runnable ACTIVE = () -> {};
     private static final Instant AT = Instant.parse("2026-10-18T00:00:00Z");
 
+    @Test void exhaustedLeaseRecoveryProjectsTheCurrentEngineIdentityWithoutWritingAnObservation() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var collection = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            for (int attempts : List.of(2, 3)) {
+                collection.updateOne(new Document("_id", "orders"), new Document("$set", new Document("leaseRecovery",
+                        new Document("intentRevision", 1L).append("failedExecution", 1L)
+                                .append("attempts", attempts).append("retryAfter", AT.toEpochMilli()))));
+                var observed = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).read("orders").orElseThrow();
+                assertThat(observed.state()).isEqualTo(PipelineState.FAILED);
+                if (attempts < 3) assertThat(observed.failure()).isNull();
+                else {
+                    assertThat(observed.failure().code()).isEqualTo("TS0440003");
+                    assertThat(observed.failure().params()).containsExactly(Map.entry("pipeline", "orders"));
+                }
+                assertThat(SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).countDocuments()).isZero();
+            }
+        });
+    }
+
     @Test void initialLoadDisplayRoundTripsAndNewRunReplacesOnlyItsOwnCurrentFacts() {
         withFixture(f -> {
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
@@ -463,7 +484,7 @@ class MongoCachePipelineStoresIT {
             var fact = io.tapstate.core.lifecycle.MetricFact.single("recordCount", io.tapstate.core.lifecycle.MetricType.GAUGE, "{record}", point);
             var expected = new Observation("orders", PipelineState.FAILED, Map.of("rows", 2L),
                     Map.of("table-a", new io.tapstate.core.lifecycle.TableSnapshot(2L, 2L, 100, true)), Map.of("table-a", "position-a"),
-                    new io.tapstate.core.lifecycle.ObservationFailure("engine.job-failed", Map.of("pipeline", "orders")), AT, List.of(fact));
+                    new io.tapstate.core.lifecycle.ObservationFailure("TS0440008", Map.of("pipeline", "orders")), AT, List.of(fact));
             var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
             assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
             writer.save(expected, 1);

@@ -42,7 +42,7 @@ class PipelineExplainServiceTest {
                 Map.of("reconcileFailuresInARow", 7L, "recordCount", 0L,
                         "frontierStalledMillis.orders", 96_000L),
                 Map.of("orders", new TableSnapshot(0, null, null)), Map.of(),
-                new ObservationFailure("engine.job-failed", Map.of()), NOW.minusSeconds(45));
+                new ObservationFailure("TS0440008", Map.of()), NOW.minusSeconds(45));
 
         PipelineExplanation answer = service(observation).explain(ID);
 
@@ -59,7 +59,7 @@ class PipelineExplainServiceTest {
     @Test
     void codedFailurePreservesItsCodeParamsAndSharedRenderedMessage() {
         Observation observation = new Observation(ID, PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
-                new ObservationFailure("engine.job-failed", Map.of("pipeline", ID)), NOW.minusSeconds(2));
+                new ObservationFailure("TS0440008", Map.of("pipeline", ID)), NOW.minusSeconds(2));
 
         PipelineExplanation answer = service(observation).explain(ID);
 
@@ -68,7 +68,7 @@ class PipelineExplainServiceTest {
             assertThat(evidence.source()).isEqualTo(Source.STATUS);
             assertThat(evidence.field()).isEqualTo("failure");
             assertThat(evidence.value()).isEqualTo(
-                    new Failure("engine.job-failed", Map.of("pipeline", ID), "rendered failure"));
+                    new Failure("TS0440008", Map.of("pipeline", ID), "rendered failure"));
         });
         assertThat(answer.next().action()).isEqualTo(NextAction.OPEN_PIPELINE_LOGS);
     }
@@ -313,7 +313,7 @@ class PipelineExplainServiceTest {
 
     private static PipelineExplainService serviceWithArtifacts(ObservationStore observations, String... ids) {
         ExplanationMessages messages = (key, args) ->
-                "engine.job-failed".equals(key) ? "rendered failure" : key;
+                "TS0440008".equals(key) ? "rendered failure" : key;
         return new PipelineExplainService(artifacts(ids), observations,
                 Clock.fixed(NOW, ZoneOffset.UTC), messages);
     }

@@ -133,7 +133,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> port.transform(new Envelope(Op.DELETE, 1L, "orders",
                 Map.of("region", "east", "items", List.of(Map.of("sku", "a"))), null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
     }
 
     /**

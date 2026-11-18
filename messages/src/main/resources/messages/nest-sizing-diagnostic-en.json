@@ -1,0 +1,10 @@
+{
+  "TS0460001": {
+    "message": "Nest level {embedPath} of pipeline {pipeline} is estimated to hold {estimatedEntries} entries, {multiple} times the {budget} it keeps in memory, so nearly every read of its state would come from storage.",
+    "solution": "Raise this pipeline's entries_in_memory so more of that level stays resident, or accept the round trips if the throughput they allow is enough."
+  },
+  "TS0460002": {
+    "message": "Nest level {embedPath} of pipeline {pipeline} could be sized from {counted} of the {total} inputs feeding it; the rest report no row count, so what was estimated is a floor.",
+    "solution": "Discover the sources feeding that level so their tables report row counts, then apply again to have it sized on all of them."
+  }
+}

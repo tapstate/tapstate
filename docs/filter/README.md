@@ -57,5 +57,5 @@ ALTER TABLE shipments REPLICA IDENTITY FULL;
 ```
 
 If predicate evaluation reads a missing before-image field, it reports the
-existing `transform.expression-failed` diagnostic. The filter does not fetch
+existing `TS0450001` diagnostic. The filter does not fetch
 old rows from the source or reconstruct missing values.

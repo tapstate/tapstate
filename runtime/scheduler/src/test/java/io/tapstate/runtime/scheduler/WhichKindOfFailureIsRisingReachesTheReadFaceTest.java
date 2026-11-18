@@ -42,7 +42,7 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
     private static final ObservationFailure WRITE_FAILED =
             new ObservationFailure("connector.write-failed", Map.of());
     private static final ObservationFailure JOB_FAILED =
-            new ObservationFailure("engine.job-failed", Map.of());
+            new ObservationFailure("TS0440008", Map.of());
 
     private final InMemoryStateStore state = new InMemoryStateStore();
     private final SavedObservations observations = new SavedObservations();
@@ -99,7 +99,7 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
                 .extracting(point -> point.attributes().get("code"), point -> point.value())
                 .containsExactlyInAnyOrder(
                         org.assertj.core.groups.Tuple.tuple("connector.write-failed", 2L),
-                        org.assertj.core.groups.Tuple.tuple("engine.job-failed", 1L));
+                        org.assertj.core.groups.Tuple.tuple("TS0440008", 1L));
     }
 
     @Test
@@ -133,7 +133,7 @@ class WhichKindOfFailureIsRisingReachesTheReadFaceTest {
         // so dropping them would leave them measured and readable nowhere.
         assertThat(published)
                 .containsEntry("errors.connector.write-failed", 1L)
-                .containsEntry("errors.engine.job-failed", 1L);
+                .containsEntry("errors.TS0440008", 1L);
     }
 
     @Test

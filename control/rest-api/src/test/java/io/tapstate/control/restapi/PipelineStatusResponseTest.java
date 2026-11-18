@@ -29,7 +29,7 @@ class PipelineStatusResponseTest {
 
     @Test
     void aCurrentDiagnosisKeepsTheLastStoredStateAndAgeExplicit() {
-        var failure = new io.tapstate.core.lifecycle.ObservationFailure("engine.out-of-memory", java.util.Map.of("pipeline", "orders"));
+        var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0440009", java.util.Map.of("pipeline", "orders"));
         var status = new PipelineStatus("orders", PipelineState.RUNNING, null, OBSERVED_AT).diagnosed(failure);
         var response = PipelineStatusResponse.of(status, catalog, Clock.fixed(OBSERVED_AT.plusSeconds(90), ZoneOffset.UTC));
         assertThat(response.state()).isEqualTo(PipelineState.FAILED);

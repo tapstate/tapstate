@@ -209,7 +209,7 @@ class StoreBackedDagSourceTest {
             assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(
                     io.tapstate.core.event.Op.DELETE, 1L, stream, Map.of(key, 1L), null, null)))
                     .isInstanceOf(TapstateException.class)
-                    .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                    .hasMessageContaining("TS0450007");
             var output = port.transform(event);
             assertThat(output).as("%s via %s", stream, from)
                     .extracting(io.tapstate.core.event.Envelope::op)
@@ -242,7 +242,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
                 Map.of("id", 1L), op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
         assertThat(port.transform(new io.tapstate.core.event.Envelope(op, 1L, "orders",
                 Map.of("id", 1L, "customer", "ada"),
                 op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L, "customer", "ada") : null,
@@ -290,7 +290,7 @@ class StoreBackedDagSourceTest {
                 op, 1L, "orders", Map.of("id", 1L),
                 op == io.tapstate.core.event.Op.UPDATE ? Map.of("id", 1L) : null, null)))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("transform.unwind-needs-a-complete-before-image");
+                .hasMessageContaining("TS0450007");
         Step.Inline mixed = Step.inline("add", FromClause.list(FromRef.literal("drop"), FromRef.literal("orders")),
                 add.body(), null);
         PipelineResource mixedPipeline = new PipelineResource("mixed", null,

@@ -27,7 +27,7 @@ class PipelineFailuresTest {
 
         ObservationFailure failure = PipelineFailures.of("orders", coded);
 
-        assertThat(failure.code()).isEqualTo("engine.no-such-job");
+        assertThat(failure.code()).isEqualTo("TS0440001");
         assertThat(failure.params()).containsOnly(entry("pipeline", "orders"));
     }
 
@@ -40,14 +40,14 @@ class PipelineFailuresTest {
                 EngineError.NO_SUCH_JOB, Map.of("pipeline", "orders"), null);
         Throwable wrapped = new IllegalStateException("job execution failed", new RuntimeException(coded));
 
-        assertThat(PipelineFailures.of("orders", wrapped).code()).isEqualTo("engine.no-such-job");
+        assertThat(PipelineFailures.of("orders", wrapped).code()).isEqualTo("TS0440001");
     }
 
     @Test
     void anUncodedCauseBecomesTheGenericEngineFailureCarryingItsMessage() {
         ObservationFailure failure = PipelineFailures.of("orders", new IllegalStateException("ring buffer closed"));
 
-        assertThat(failure.code()).isEqualTo("engine.job-failed");
+        assertThat(failure.code()).isEqualTo("TS0440008");
         assertThat(failure.params())
                 .containsOnly(entry("pipeline", "orders"), entry("cause", "ring buffer closed"));
     }

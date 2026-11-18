@@ -100,7 +100,9 @@ final class MongoCachePipelineObservationStore implements ObservationStore {
     private static io.tapstate.core.lifecycle.ObservationFailure leaseRecoveryFailure(Reading reading, PipelineState actual) {
         var recovery = actual == PipelineState.FAILED ? MongoStateStore.leaseRecovery(reading.state()) : null;
         return recovery == null || recovery.attempts() < 3 ? null
-                : new io.tapstate.core.lifecycle.ObservationFailure("engine.execution-not-authorized", Map.of("pipeline", reading.pipeline()));
+                : new io.tapstate.core.lifecycle.ObservationFailure(
+                        io.tapstate.core.common.EngineErrorDefinitions.EXECUTION_NOT_AUTHORIZED.code(),
+                        Map.of("pipeline", reading.pipeline()));
     }
 
     /** A previous RUNNING observation can witness progress, without serving its stale payload. */

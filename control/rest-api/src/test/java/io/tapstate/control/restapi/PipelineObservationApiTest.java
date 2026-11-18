@@ -130,7 +130,7 @@ class PipelineObservationApiTest {
     /** One pipeline whose job died, to exercise the coded reason the status face carries. */
     private static final Observation PL_DEAD = new Observation("pl3", PipelineState.FAILED,
             Map.of("errorCount", 1L), Map.of(), Map.of(),
-            new ObservationFailure("engine.job-failed",
+            new ObservationFailure("TS0440008",
                     Map.of("pipeline", "pl3", "cause", "the sink rejected the batch")));
 
     private static final Instant COUNTING_SINCE = Instant.parse("2026-07-12T11:00:00Z");
@@ -264,7 +264,7 @@ class PipelineObservationApiTest {
 
         assertThat(body.get("state")).isEqualTo("FAILED");
         Map<?, ?> failure = (Map<?, ?>) body.get("failure");
-        assertThat(failure.get("code")).isEqualTo("engine.job-failed");
+        assertThat(failure.get("code")).isEqualTo("TS0440008");
         assertThat((String) failure.get("message")).contains("the sink rejected the batch");
         assertThat((Map<String, Object>) failure.get("params"))
                 .containsEntry("cause", "the sink rejected the batch");

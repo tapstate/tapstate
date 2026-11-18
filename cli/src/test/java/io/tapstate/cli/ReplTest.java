@@ -4638,7 +4638,7 @@ class ReplTest {
     @Test
     void restartOnAFailedPipelineCarriesOnFromWhereItGotTo() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
@@ -4918,7 +4918,7 @@ class ReplTest {
     void aRestartOfAFailedPipelineAnswersItsStartChecksWhenToldNotToAsk(String flag) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         asksAboutOrders(client);
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "STOPPED", "rev-abc");
         Harness h = onlineSession(Path.of("tap-work"), client, new ScriptedPrompter());
         h.repl().terminalCheck(() -> false);
@@ -5055,7 +5055,7 @@ class ReplTest {
 
     private static ExplainOutcome.Found codedFailure(String id, String message) {
         Map<String, Object> failure = new java.util.LinkedHashMap<>();
-        failure.put("code", "engine.job-failed");
+        failure.put("code", "TS0440008");
         failure.put("params", Map.of("pipeline", id, "cause", "the sink rejected the batch"));
         failure.put("message", message);
         return new ExplainOutcome.Found(id, "FAILED", "CODED_FAILURE",
@@ -5505,7 +5505,7 @@ class ReplTest {
         // A bare "failed" sends the user hunting through logs. The reason arrives coded with its arguments,
         // so the CLI renders it from the bundled catalog the same way it renders every other coded message.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         client.explainOutcome = codedFailure(
                 "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
@@ -5517,7 +5517,7 @@ class ReplTest {
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("failed");
         // Assert the code, not the prose: the code is the stable identity, and only this path can emit it.
-        assertThat(out).contains("engine.job-failed");
+        assertThat(out).contains("TS0440008");
         assertThat(out).contains("the sink rejected the batch");
     }
 
@@ -5527,7 +5527,7 @@ class ReplTest {
         // state line above it. A caller separating the streams (status pl1 > out.txt 2> err.txt) must see
         // both in out.txt; the merged single-sink harness the other status tests use cannot tell this apart.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed",
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008",
                 "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
         client.explainOutcome = codedFailure(
                 "pl1", "Pipeline pl1 stopped because its job failed: the sink rejected the batch.");
@@ -5539,7 +5539,7 @@ class ReplTest {
 
         String stdout = h.out().toString().substring(outMark);
         String stderr = h.err().toString().substring(errMark);
-        assertThat(stdout).contains("failed").contains("engine.job-failed").contains("the sink rejected the batch");
+        assertThat(stdout).contains("failed").contains("TS0440008").contains("the sink rejected the batch");
         assertThat(stderr).isEmpty();
     }
 
@@ -5769,13 +5769,13 @@ class ReplTest {
     void metricsWhileAuthenticatedPrintsEachStat() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.metricsOutcome = new MetricsOutcome.Found(
-                "pl1", Map.of("recordCount", 42L, "errors.engine.job-failed", 2L));
+                "pl1", Map.of("recordCount", 42L, "errors.TS0440008", 2L));
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
         assertThat(h.repl().dispatch("metrics pl1")).isTrue();
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("recordCount").contains("42")
-                .contains("errors.engine.job-failed");
+                .contains("errors.TS0440008");
         assertThat(client.metricsCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
     }
 
@@ -6401,7 +6401,7 @@ class ReplTest {
         // the watcher must render it right there rather than needing a separate poll.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.watchStates = List.of("FAILED");
-        client.watchFailureCode = "engine.job-failed";
+        client.watchFailureCode = "TS0440008";
         client.watchFailureMessage = "Pipeline pl1 stopped because its job failed: the sink rejected the batch.";
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
@@ -6410,7 +6410,7 @@ class ReplTest {
 
         String out = h.sink().toString().substring(mark);
         assertThat(out).contains("failed");
-        assertThat(out).contains("engine.job-failed");
+        assertThat(out).contains("TS0440008");
         assertThat(out).contains("the sink rejected the batch");
     }
 
@@ -6418,7 +6418,7 @@ class ReplTest {
     void statusWatchPrintsTheFailureReasonToStdoutNotStderr() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.watchStates = List.of("FAILED");
-        client.watchFailureCode = "engine.job-failed";
+        client.watchFailureCode = "TS0440008";
         client.watchFailureMessage = "Pipeline pl1 stopped because its job failed: the sink rejected the batch.";
         SplitHarness h = onlineSplitStreamSession(Path.of("tap-work"), client);
         int outMark = h.out().toString().length();
@@ -6428,7 +6428,7 @@ class ReplTest {
 
         String stdout = h.out().toString().substring(outMark);
         String stderr = h.err().toString().substring(errMark);
-        assertThat(stdout).contains("failed").contains("engine.job-failed").contains("the sink rejected the batch");
+        assertThat(stdout).contains("failed").contains("TS0440008").contains("the sink rejected the batch");
         assertThat(stderr).isEmpty();
     }
 
@@ -8122,7 +8122,7 @@ class ReplTest {
     @Test
     void theVerbsThatClearNothingAskNothing() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "engine.job-failed", "its job died");
+        client.statusOutcome = new StatusOutcome.Found("pl1", "FAILED", "TS0440008", "its job died");
         client.lifecycleOutcome = new LifecycleOutcome.Accepted("pl1", "RUNNING", "rev-abc");
         ScriptedPrompter prompter = new ScriptedPrompter();
         Harness h = onlineSession(Path.of("tap-work"), client, prompter);

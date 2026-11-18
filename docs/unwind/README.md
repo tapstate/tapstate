@@ -199,14 +199,14 @@ or removal of an element from the middle of an indexed array.
 The source must provide a complete previous image for updates and deletes. The
 runtime requires every parent key column and at least one other column. A missing,
 empty or key-only previous image stops with
-`transform.unwind-needs-a-complete-before-image`. For MySQL CDC, configure full
+`TS0450007`. For MySQL CDC, configure full
 binlog row images. For MongoDB CDC, enable source collection pre-images.
 A full document without the optional array field is allowed when it has another
 non-key field. A document consisting only of its key cannot be distinguished from
 a partial image and is refused.
 
 Duplicate element keys still emit all rows. The log reports
-`transform.unwind-rows-share-a-key` at WARNING severity, and the target may keep
+`TS0450008` at WARNING severity, and the target may keep
 only the last row for that key. The warning is not an `error_count` increment.
 Choose element keys unique within each parent.
 

@@ -61,6 +61,13 @@ reply during migration and must reject unrelated 404 and authorization failures.
 Store migrations preserve transaction and version checks. Verification that launches
 an actual older binary continues to expect that binary's historical refusal code.
 
+Engine, transform and Nest sizing diagnostics use modules `044`, `045` and `046`.
+Frontier pinning, displaced join dimension rows, duplicate expanded-row keys and
+both Nest capacity advisories remain warnings. Lease loss and renewal uncertainty
+still stop the unauthorized run; a new code cannot grant execution or replay a
+write. Runtime exception types, original causes, closing suppression and bare
+programmer-error branches retain their existing contracts.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
