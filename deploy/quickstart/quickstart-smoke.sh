@@ -455,8 +455,15 @@ running_rerun_case() {
 # project the way compose does: the file -f names, else one in --project-directory, else one in the
 # working directory, and otherwise the error a reader actually gets. A run that succeeds is held to the
 # same in prose: its closing text says what to run "in this directory", so it has to name the directory.
+#
+# Reaching the stack is not all a printed command owes. It is pasted into that shell, which stays open
+# for whatever comes next -- the installer run again, which the login refusal asks for in so many words.
+# A printed `cd <demo directory> && ...` leaves the shell inside the demo directory, where the next run
+# finds the compose file, runs in place, and takes the directory for the user's own: it stops offering
+# to remove it. So each command is also run the way a paste runs it, in one shell, and that shell has to
+# end where it began.
 piped_hints_case() {
-  local scratch start demo real scenario expect cmd ran got n=0 failures=""
+  local scratch start start_real demo real scenario expect cmd ran got left n=0 failures=""
   scratch="$(mktemp -d)"
   mkdir -p "$scratch/compose" "$scratch/nap"
   cat > "$scratch/compose/docker" <<'DOCK'
@@ -489,6 +496,13 @@ DOCK
   # moment instead of a minute, and the hint it gives up with is the same.
   printf '#!/bin/sh\nexit 0\n' > "$scratch/nap/sleep"
   chmod +x "$scratch/compose/docker" "$scratch/nap/sleep"
+  # A paste: the command runs in the shell it is typed into rather than in a child of it, so a cd in it
+  # moves that shell, as it moves the reader's. The pwd after it reads where the shell was left.
+  cat > "$scratch/paste" <<'PASTE'
+eval "$1"; rc=$?
+pwd -P > "$2"
+exit "$rc"
+PASTE
 
   for scenario in installation-never-ready login-refused nothing-assembled success; do
     # Every other start directory holds a space and a single quote, so the printed cd has to be quoted
@@ -530,12 +544,13 @@ DOCK
       fi
       continue
     fi
+    start_real="$(cd "$start" && pwd -P)"
     ran=0
     while IFS= read -r cmd; do
       ran=$((ran + 1))
-      rm -f "$scratch/resolved"
-      if (cd "$start" && PATH="$scratch/compose:$PATH" RESOLVED_TO="$scratch/resolved" sh -c "$cmd") \
-           > "$scratch/said" 2>&1; then
+      rm -f "$scratch/resolved" "$scratch/left"
+      if (cd "$start" && PATH="$scratch/compose:$PATH" RESOLVED_TO="$scratch/resolved" \
+            sh "$scratch/paste" "$cmd" "$scratch/left") > "$scratch/said" 2>&1; then
         got="$(cat "$scratch/resolved" 2>/dev/null)"
         [ "$got" = "$real" ] || failures="$failures
       $scenario: \`$cmd\`, run as printed from $start, reaches ${got:-no project} instead of $real"
@@ -543,15 +558,18 @@ DOCK
         failures="$failures
       $scenario: \`$cmd\`, run as printed from $start, answers: $(tr '\n' ' ' < "$scratch/said")"
       fi
+      left="$(cat "$scratch/left" 2>/dev/null)"
+      [ "$left" = "$start_real" ] || failures="$failures
+      $scenario: \`$cmd\`, pasted in $start, leaves that shell in ${left:-an unknown directory}, where the installer run again runs in place and no longer offers to remove the directory it made"
     done < <(printf '%s\n' "$RUN_OUT" | grep -oE '\(?(cd [^&;|()]+ && )?docker compose[^;,()&|]*\)?')
     [ "$ran" -gt 0 ] || failures="$failures
       $scenario: the failure printed no command to run at all: $RUN_OUT"
   done
   rm -rf "$scratch"
   if [ -z "$failures" ]; then
-    ok "piped, every compose command a failure prints works from where the user started, and the closing text names the directory"
+    ok "piped, every compose command a failure prints works from where the user started and leaves the shell there, and the closing text names the directory"
   else
-    bad "piped, the printed commands do not say where they must run:$failures"
+    bad "piped, the printed commands do not work as pasted where the user started:$failures"
   fi
 }
 
