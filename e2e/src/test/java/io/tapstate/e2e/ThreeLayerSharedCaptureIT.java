@@ -96,8 +96,16 @@ class ThreeLayerSharedCaptureIT {
                 control.stop(id,false);Await.until(id+" to stop across the original members",BOUND,
                         () -> control.state(id).filter(PipelineState.STOPPED::equals).isPresent(),() -> control.failureCode(id).toString());
             }
-            var remoteClaim=cache.getCollection("workload_claims").find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId","reader_a")
+            var claims = cache.getCollection("workload_claims");
+            var remoteClaim=claims.find(new Document("resourceType","PIPELINE_ACTUATION").append("resourceId","reader_a")
                     .append("$expr",new Document("$gt",List.of("$leaseUntil","$$NOW")))).first();assertThat(remoteClaim).isNotNull();
+            List<Document> originalClaims = List.of();
+            if (stopAfterRecovery) {
+                var readerBClaim = claims.find(new Document("resourceType", "PIPELINE_ACTUATION")
+                        .append("resourceId", "reader_b")).first();
+                assertThat(readerBClaim).as("original claim for reader_b").isNotNull();
+                originalClaims = List.of(remoteClaim, readerBClaim);
+            }
             String originalOwner=remoteClaim.getString("ownerNodeId");assertThat(nodes).contains(originalOwner);
             String requester=nodes.stream().filter(node -> !node.equals(originalOwner)).findFirst().orElseThrow();
             var recovery=cluster.member(requester);assertThat(requester).isNotEqualTo(originalOwner);
@@ -136,11 +144,14 @@ class ThreeLayerSharedCaptureIT {
             assertThat(cache.getCollection("srs_chains").find(new Document("_id",canonical)).first().get("recoveryControl",Document.class))
                     .containsEntry("operationId",preview.get("operationId")).containsEntry("phase","RETIRED").containsEntry("replacementChain",physical);
             if(stopAfterRecovery) {
-                Await.until("the stopped reader to reacquire its tenure after shared recovery COMPLETE",BOUND,() -> {
-                    var claim=cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))).first();
-                    return claim!=null && claim.getLong("claimGeneration")>remoteClaim.getLong("claimGeneration");
-                },() -> String.valueOf(cache.getCollection("workload_claims").find(new Document("_id",remoteClaim.get("_id"))).first()));
-                for(String id:List.of("reader_a","reader_b")) {
+                for (var originalClaim : originalClaims) {
+                    String id = originalClaim.getString("resourceId");
+                    var claimId = new Document("_id", originalClaim.get("_id"));
+                    long originalGeneration = originalClaim.getLong("claimGeneration");
+                    Await.until(id + " to acquire a claim after generation " + originalGeneration, BOUND, () -> {
+                        var claim = claims.find(claimId).first();
+                        return claim != null && claim.getLong("claimGeneration") > originalGeneration;
+                    }, () -> String.valueOf(claims.find(claimId).first()));
                     var observed=Await.answered(id+" to publish its state after the shared recovery handoff",BOUND,() -> {
                         var response=control.sourceResponse("GET","/api/pipelines/"+id+"/status",null,null);
                         System.err.println("SHARED_RECOVERY_STOPPED_READER "+new Document("pipelineId",id)
