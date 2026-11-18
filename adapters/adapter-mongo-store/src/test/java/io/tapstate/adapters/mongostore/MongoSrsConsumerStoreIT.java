@@ -70,6 +70,63 @@ class MongoSrsConsumerStoreIT {
             assertThat(membership(f,A)).isEqualTo(row);
         });
     }
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings={"fence","logical","orphan","pin-chain","pin-cache","bad-fence","scope"})
+    void sharedControlProofsKeepCurrentRowsAndFullClosure(String change){
+        withBusiness(f->{
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id","cluster"),new Document("$set",new Document("claimAdmissionFence",0L)));
+            var refs=publishSnapshotModels(f,Set.of("orders"));
+            f.chains().requestTables(CHAIN,Set.of("orders"),f.captureFence());f.chains().publishServingTables(CHAIN,1,Set.of("orders"),f.captureFence());
+            var checkpoint=new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1),"control"),
+                    Map.of("orders",new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"),-1)));
+            f.chains().checkpoint(CHAIN,0,checkpoint,f.captureFence());
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().pinSnapshot(A,1,0,new SrsSnapshotPin(1,"control",refs),f.fenceA());
+            var db=f.database();var binding=new io.tapstate.spi.store.StorageBinding.Connection(io.tapstate.spi.store.StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl(db.getName()),db.getName(),null);
+            try(var domain=MongoCacheDomain.connect(binding,Duration.ofSeconds(5),"control-proof")){
+                var oldActive=new java.util.concurrent.atomic.AtomicBoolean(true);
+                var first=domain.srs(SCOPE,()->{if(!oldActive.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}).consumers();
+                var expected=first.controlSnapshot(CHAIN).orElseThrow();oldActive.set(false);
+                var current=domain.srs(SCOPE,()->{}).consumers();
+                var commands=new java.util.ArrayList<String>();MongoCommandObservation.COLLECTIONS.set((command,collection)->commands.add(command+":"+collection));
+                try{assertThat(current.controlSnapshot(CHAIN)).contains(expected);}finally{MongoCommandObservation.COLLECTIONS.remove();}
+                assertThat(commands).doesNotContain("find:srs_models","find:srs_model_contexts","find:srs_log_bounds");
+                assertThatThrownBy(()->first.controlSnapshot(CHAIN)).isInstanceOf(TapstateException.class);
+                current.controlSnapshot(CHAIN).orElseThrow();
+                if(change.equals("fence")){
+                    SystemCollections.SRS_CHAINS.on(db).updateOne(new Document("_id",CHAIN),new Document("$inc",new Document("modelWriteFence",1L)));
+                    commands.clear();MongoCommandObservation.COLLECTIONS.set((command,collection)->commands.add(command+":"+collection));
+                    try{assertThat(current.controlSnapshot(CHAIN)).contains(expected);}finally{MongoCommandObservation.COLLECTIONS.remove();}
+                    assertThat(commands).doesNotContain("find:srs_models","find:srs_model_contexts","find:srs_log_bounds");return;
+                }
+                if(change.equals("logical")){
+                    SystemCollections.SRS_CHAINS.on(db).updateOne(new Document("_id",CHAIN),new Document("$set",new Document("servingTables",List.of())));
+                    assertThat(current.controlSnapshot(CHAIN).orElseThrow().chain().servingTables()).isEmpty();return;
+                }
+                if(change.equals("orphan")){
+                    var row=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).find().first();var id=new Document(row.get("_id",Document.class));id.put("consumer","orphan");
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).insertOne(new Document(row).append("_id",id));
+                }else if(change.equals("bad-fence"))SystemCollections.SRS_CHAINS.on(db).updateOne(new Document("_id",CHAIN),new Document("$set",new Document("modelWriteFence","invalid")));
+                else if(change.equals("scope"))SystemCollections.CACHE_IDENTITY.on(db).updateOne(new Document("_id","cluster"),new Document("$set",new Document("cacheIncarnation","foreign-cache")));
+                else{
+                    var records=new MongoSrsConsumerRecords(SCOPE);var row=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).find().first();
+                    var member=records.membership(SystemCollections.SRS_CONSUMERS.on(db).find().first());var held=records.cursor(member,row);
+                    var key=held.snapshot().models().get("orders");
+                    var changed=new SrsModelKey(change.equals("pin-chain")?"foreign-chain":key.miningChainId(),key.table(),
+                            change.equals("pin-cache")?"foreign-cache":key.cacheIncarnation(),key.captureEpoch(),key.modelVersion());
+                    // Corrupt persisted scope while retaining a valid checksum; the public value rejects a foreign chain.
+                    var replacement=Document.parse(row.toJson());
+                    var model=replacement.get("snapshot",Document.class).getList("models",Document.class).getFirst().get("model",Document.class);
+                    model.clear();model.putAll(MongoSrsModelStore.key(changed));replacement.remove("contentHash");
+                    replacement.append("contentHash",io.tapstate.core.model.canonical.CanonicalHash.ofText(replacement.toJson()));
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).replaceOne(new Document("_id",row.get("_id")),replacement);
+                }
+                assertThatThrownBy(()->current.controlSnapshot(CHAIN)).isInstanceOf(TapstateException.class);
+            }
+        });
+    }
+
     @Test void validationMembershipReadsOnlyItsOriginalRelationAndRejectsOversizedMetadata(){
         withBusiness(f->{
             var a=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();

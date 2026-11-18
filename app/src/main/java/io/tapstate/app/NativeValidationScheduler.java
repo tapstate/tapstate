@@ -28,7 +28,9 @@ final class NativeValidationScheduler implements AutoCloseable {
     private final Map<Key,Entry> entries=new LinkedHashMap<>();private final AtomicBoolean discovering=new AtomicBoolean();
     private ScheduledFuture<?> polling;private ValidationMemberResources.Unbound allocation;private ThreadPoolExecutor starts;
     private NativeValidationStartCoordinator coordinator;private MemoryValidationSchedules.Writer writer;private ValidationScheduleObservations.Origin origin;
-    private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private long nextDiscovery;
+    private String pipeline,afterPipeline,afterTask;private volatile boolean closed;private boolean started;private Instant highWater;private volatile long nextDiscovery;
+    private Long scanRevision, completedRevision;
+    private boolean scanFailed;
     NativeValidationScheduler(MongoConfigurationDomain configuration,ValidationMemberResources.Member resources,ValidationMemberResources process,
             Supplier<NativeValidationStartCoordinator> coordinators,MemoryValidationSchedules observations,Clock clock,ValidationSchedule.Calculator calculator,Runnable active){
         this.configuration=Objects.requireNonNull(configuration);this.resources=Objects.requireNonNull(resources);this.process=Objects.requireNonNull(process);
@@ -43,14 +45,29 @@ final class NativeValidationScheduler implements AutoCloseable {
         final ValidationMemberResources.Control work;
         try{work=resources.admitMaintenanceControl();}
         catch(TapstateException unavailable){discovering.set(false);return;}
-        try{work.execute(()->{try{scan();}catch(TapstateException unavailable){/* Unknown or unprepared storage grants no schedule. */}
-            finally{discovering.set(false);}});}
+        try{work.execute(()->{try{discover();}finally{discovering.set(false);}});}
         catch(RejectedExecutionException|TapstateException unavailable){work.close();discovering.set(false);}
+    }
+    private void discover(){
+        try{scan();}catch(TapstateException unavailable){scanFailed=true;}
     }
     /** One identity per pass avoids ambient definition enumeration and starvation behind a damaged task. */
     private void scan(){
-        require();var tasks=configuration.validationTasks(this::require);
-        if(pipeline==null){var found=tasks.pipelines(afterPipeline,1);if(found.isEmpty()){afterPipeline=null;return;}pipeline=found.getFirst();afterTask=null;}
+        require();
+        if(scanRevision==null){
+            long revision=configuration.configurationRevision();require();
+            if(Objects.equals(completedRevision,revision)){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);return;}
+            scanRevision=revision;scanFailed=false;
+        }
+        final ValidationTaskStore tasks;
+        try{tasks=configuration.pollingValidationTasks(this::require);}
+        catch(TapstateException unavailable){nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(1);throw unavailable;}
+        if(pipeline==null){var found=tasks.pipelines(afterPipeline,1);if(found.isEmpty()){
+            long revision=configuration.configurationRevision();require();
+            completedRevision=!scanFailed&&Objects.equals(scanRevision,revision)?revision:null;
+            scanRevision=null;afterPipeline=null;afterTask=null;
+            nextDiscovery=System.nanoTime()+TimeUnit.SECONDS.toNanos(completedRevision==null?0:1);return;
+        }pipeline=found.getFirst();afterTask=null;}
         var current=pipeline;List<String> ids;
         try{ids=tasks.taskIds(current,afterTask,1);}catch(TapstateException failed){afterPipeline=pipeline;pipeline=null;afterTask=null;throw failed;}
         if(ids.isEmpty()){afterPipeline=pipeline;pipeline=null;afterTask=null;return;}

@@ -17,7 +17,7 @@ final class MongoBindingReadFacts {
     private static final String VALUE = "value";
     private static final int INLINE_BYTES = 64 * 1024;
 
-    record Facts(Document identity, Document setup, Document global, boolean conflictingResource) {}
+    record Facts(Document identity, Document setup, Document global, boolean conflictingResource, Document version) {}
 
     private MongoBindingReadFacts() {}
 
@@ -31,11 +31,18 @@ final class MongoBindingReadFacts {
     static Facts read(ClientSession session, Document binding, MongoCollection<Document> identity,
             MongoCollection<Document> setup, MongoCollection<Document> notes,
             List<MongoCollection<Document>> resources) {
+        return read(session, binding, identity, setup, notes, resources, null);
+    }
+
+    static Facts read(ClientSession session, Document binding, MongoCollection<Document> identity,
+            MongoCollection<Document> setup, MongoCollection<Document> notes, List<MongoCollection<Document>> resources,
+            MongoCollection<Document> versions) {
         var pipeline = new ArrayList<Document>();
         pipeline.add(new Document("$match", new Document("_id", SINGLETON_ID)));
         pipeline.add(new Document("$limit", 1));
         pipeline.add(captured());
         pipeline.add(probe(setup, "setup", 2, captured()));
+        if (versions != null) pipeline.add(probe(versions, "version", 2, captured()));
         boolean bound = binding != null && binding.get("defaultSourceId") instanceof String
                 && binding.get(BINDING_VERSION) instanceof Long;
         if (bound) {
@@ -43,7 +50,7 @@ final class MongoBindingReadFacts {
             for (int i = 0; i < resources.size(); i++) pipeline.add(probe(resources.get(i), "resource" + i, 1, presence()));
         }
         Document row = identity.aggregate(session, pipeline).first();
-        if (row == null) return new Facts(null, null, null, false);
+        if (row == null) return new Facts(null, null, null, false, null);
         Document cluster = unpack(session, row, identity, SINGLETON_ID);
         Document stage = singleton(session, row.getList("setup", Document.class), setup, SINGLETON_ID);
         Document global = null;
@@ -62,7 +69,30 @@ final class MongoBindingReadFacts {
                 }
             }
         }
-        return new Facts(cluster, stage, global, conflict);
+        Document version = versions == null ? null : singleton(session,
+                row.getList("version", Document.class), versions, ConfigurationVersion.ID);
+        return new Facts(cluster, stage, global, conflict, version);
+    }
+
+    record AlertHost(Document identity,Document setup,Document binding,Document schema,Document version,Document recovery,Document key) { }
+    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database){
+        var identity=SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
+        var setup=SystemCollections.STORAGE_SETUP.on(database);var binding=SystemCollections.STORAGE_BINDING.on(database);
+        var schema=SystemCollections.SCHEMA_MIGRATIONS.on(database);var version=SystemCollections.CONFIGURATION_VERSION.on(database);
+        var recovery=SystemCollections.STORAGE_RECOVERY.on(database);var key=SystemCollections.CLUSTER_KEYS.on(database);
+        var pipeline=List.of(new Document("$match",new Document("_id",SINGLETON_ID)),new Document("$limit",1),captured(),
+                probe(setup,"setup",2,captured()),probe(binding,"binding",2,captured()),
+                probe(schema,"schema",2,captured()),probe(version,"version",2,captured()),
+                probe(recovery,"recovery",2,captured()),probe(key,"key",2,captured()));
+        var row=identity.aggregate(session,pipeline).first();
+        if(row==null)return new AlertHost(null,null,null,null,null,null,null);
+        return new AlertHost(unpack(session,row,identity,SINGLETON_ID),
+                singleton(session,row.getList("setup",Document.class),setup,SINGLETON_ID),
+                singleton(session,row.getList("binding",Document.class),binding,SINGLETON_ID),
+                singleton(session,row.getList("schema",Document.class),schema,"config"),
+                singleton(session,row.getList("version",Document.class),version,ConfigurationVersion.ID),
+                unambiguous(row.getList("recovery",Document.class),"cluster"),
+                singleton(session,row.getList("key",Document.class),key,SINGLETON_ID));
     }
 
     private static Document probe(MongoCollection<Document> table, String field, int limit, Document projection) {
@@ -83,6 +113,12 @@ final class MongoBindingReadFacts {
                 .append(VALUE, new Document("$cond", new Document("if",
                         new Document("$lte", List.of(new Document("$bsonSize", ROOT_DOCUMENT), INLINE_BYTES)))
                         .append("then", ROOT_DOCUMENT).append("else", null))));
+    }
+
+    private static Document unambiguous(List<Document> rows, String id) {
+        if (rows.size() != 1 || Boolean.TRUE.equals(rows.getFirst().get(LARGE))) return null;
+        var value = rows.getFirst().get(VALUE, Document.class);
+        return id.equals(value.get("_id")) ? value : null;
     }
 
     private static Document singleton(ClientSession session, List<Document> rows,

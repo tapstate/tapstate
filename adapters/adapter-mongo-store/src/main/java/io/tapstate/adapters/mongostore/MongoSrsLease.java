@@ -27,11 +27,21 @@ final class MongoSrsLease {
         private Lease(long deadlineNanos) { this.deadlineNanos = deadlineNanos; }
     }
 
+    private final java.util.function.LongSupplier structuralRemaining;
     private final boolean leased;
     private final long maximumNanos;
     private final AtomicReference<Lease> current = new AtomicReference<>(ended());
 
-    private MongoSrsLease(boolean leased, long maximumNanos) { this.leased = leased; this.maximumNanos = maximumNanos; }
+    private MongoSrsLease(boolean leased, long maximumNanos) { this(leased,maximumNanos,()->Long.MAX_VALUE); }
+    private MongoSrsLease(boolean leased,long maximumNanos,java.util.function.LongSupplier remaining){
+        this.leased=leased;this.maximumNanos=maximumNanos;this.structuralRemaining=remaining;
+    }
+    static MongoSrsLease selected(Runnable structure){
+        var selected=selected();
+        return new MongoSrsLease(selected.leased,selected.maximumNanos,
+                structure instanceof MongoStructureProof.Check proof?proof::remainingNanos:()->Long.MAX_VALUE);
+    }
+    MongoSrsLease fork(){return new MongoSrsLease(leased,maximumNanos,structuralRemaining);}
 
     /** The mode and bound the system properties select, read when a capture's stores are assembled. */
     static MongoSrsLease selected() {
@@ -48,7 +58,7 @@ final class MongoSrsLease {
 
     boolean enabled() { return leased; }
 
-    boolean stands(Lease lease) { return leased && current.get() == lease && System.nanoTime() - lease.deadlineNanos < 0; }
+    boolean stands(Lease lease) { return leased && current.get() == lease && System.nanoTime() - lease.deadlineNanos < 0 && structuralRemaining.getAsLong()>0; }
 
     /**
      * Publishes the lease a proof established: it began at {@code startedNanos} while {@code before} stood, and
@@ -59,7 +69,7 @@ final class MongoSrsLease {
      */
     Lease proved(Lease before, long startedNanos, long claimRemainingMillis) {
         if (!leased) return null;
-        long held = Math.min(maximumNanos, TimeUnit.MILLISECONDS.toNanos(Math.max(0L, claimRemainingMillis)));
+        long held = Math.min(Math.min(maximumNanos,structuralRemaining.getAsLong()), TimeUnit.MILLISECONDS.toNanos(Math.max(0L, claimRemainingMillis)));
         var lease = new Lease(startedNanos + held);
         if (System.nanoTime() - lease.deadlineNanos >= 0 || !current.compareAndSet(before, lease)) return null;
         LEASE_OPENS.incrementAndGet();

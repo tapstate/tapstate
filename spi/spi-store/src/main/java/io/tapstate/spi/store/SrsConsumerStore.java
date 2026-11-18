@@ -27,6 +27,13 @@ public interface SrsConsumerStore {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
     }
 
+    record ControlSnapshot(SrsConsumerTopology topology,SrsChainState chain,java.util.List<ConsumerOffset> cursors){
+        public ControlSnapshot{cursors=java.util.List.copyOf(cursors);}
+    }
+    default boolean supportsControlSnapshot(){return false;}
+    /** Complete topology, checkpoint and current progress from one original storage snapshot. */
+    default Optional<ControlSnapshot> controlSnapshot(String chain){throw new UnsupportedOperationException();}
+
     record StartupArrivals(SrsConsumerProgress progress, Optional<Map<String, SrsLogBounds>> bounds) {}
 
     /** Reads original progress and the boundaries for its missing rings from one snapshot. */

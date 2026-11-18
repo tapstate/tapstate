@@ -224,14 +224,17 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 contexts.requireAnchor(session, chain, previous); requirePublishedHead(session, previous);
                 if (!previous.ring().equals(model.ringName()) || previous.key().captureEpoch() >= model.key().captureEpoch()) throw unavailable(model.key());
             }
+            if(previous==null){MongoStructureProof.invalidate(requireStructure);requireStructure.run();}
             SrsLogBounds observed = requireRing(session, model, previous == null);
             if (model.ddlSequence() <= observed.largestSequence()) throw unavailable(model.key());
             var initial = contexts.initial(model, fence, captured.getString("contentHash"));
             if (previous != null) contexts.replace(session, previous, contexts.close(previous, initial));
+            MongoStructureProof.invalidate(requireStructure);requireStructure.run();
             contexts.insert(session, initial);
             contexts.setHead(session, chain, initial);
         }
         requireBudget(session,model,captured);
+        MongoStructureProof.invalidate(requireStructure);requireStructure.run();
         models.insertOne(session, captured);
         return model;
     }
@@ -546,7 +549,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
         var key = control.key();
         return new SrsModelKey(key.miningChainId(), key.table(), key.cacheIncarnation(), key.captureEpoch(), version);
     }
-    private void requirePublished(MongoSrsModelContexts.Context control, SrsModel model) {
+    void requirePublished(MongoSrsModelContexts.Context control, SrsModel model) {
         if (!MongoSrsModelContexts.contextId(model.key()).equals(control.id()) || !model.ringName().equals(control.ring())
                 || model.key().modelVersion() > control.publishedVersion() || model.ddlSequence() < control.firstSequence()
                 || (model.key().modelVersion() == 0 && model.ddlSequence() != control.firstSequence())
@@ -827,7 +830,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 .append("ringName", model.ringName()).append("ddlSequence", model.ddlSequence()).append("schema", table);
         return row.append("contentHash", CanonicalHash.ofText(row.toJson()));
     }
-    private SrsModel decode(Document row) {
+    SrsModel decode(Document row) {
         try {
             if (!row.keySet().equals(Set.of("_id", "formatVersion", "cacheIncarnation", "ringName", "ddlSequence", "schema", "contentHash"))
                     || !Integer.valueOf(1).equals(row.get("formatVersion")) || !(row.get("ddlSequence") instanceof Long sequence)) throw unreadable();
@@ -866,7 +869,7 @@ public final class MongoSrsModelStore implements SrsModelStore {
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> { requireActive.run(); requireStructure.run(); requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
                 }
-            } catch (RuntimeException failure) { requireActive.run(); throw failure; }
+            } catch (RuntimeException failure) { MongoStructureProof.invalidate(requireStructure); requireActive.run(); throw failure; }
         });
     }
     private static TapstateException unavailable(SrsModelKey key) { return modelError(IoError.SRS_MODEL_UNAVAILABLE, key); }

@@ -265,6 +265,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return budget.transaction(connection.client(), session -> { requireOpen(); T value = action.apply(session); requireOpen(); return value; });
     }
 
+    <T> T alertPollingRead(MongoReadBudget budget, Function<ClientSession, T> read) {
+        requireOpen();
+        return StoreIo.call(() -> {
+            if (!MongoReadBudget.supportsSnapshotReads(connection.client())) return alertTransaction(budget, read);
+            try (var session = connection.client().startSession(com.mongodb.ClientSessionOptions.builder().snapshot(true).build())) {
+                budget.requireRemaining();
+                T result = read.apply(session);
+                budget.requireRemaining();
+                requireOpen();
+                return result;
+            }
+        });
+    }
+
     /** Load-only progress. Absence does not authorize a normal access path to create identities. */
     public java.util.Optional<io.tapstate.spi.store.SourceIdentityPreparation> sourceIdentityPreparation() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5)); requireOpen();
@@ -1119,6 +1133,46 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return bindings;
     }
 
+    public record ObservationConfiguration(io.tapstate.core.model.PipelineResource pipeline,
+            Map<String, io.tapstate.core.model.SourceResource> sources,
+            Map<String, io.tapstate.spi.store.CapturePreparation> captures) {
+        public ObservationConfiguration { sources = Map.copyOf(sources); captures = Map.copyOf(captures); }
+    }
+
+    public record ObservationCheck(boolean changed, Optional<ObservationConfiguration> configuration) {
+        static ObservationCheck fallback() { return new ObservationCheck(false, Optional.empty()); }
+        static ObservationCheck superseded() { return new ObservationCheck(true, Optional.empty()); }
+    }
+
+    private final MongoStructureProof observationStructures = new MongoStructureProof();
+    private volatile boolean observationCollations;
+    public ObservationCheck observationConfiguration(io.tapstate.spi.store.PipelineIntentStore.ActuationReading before,
+            String defaultSource, Map<String, String> sources) {
+        requireOpen();
+        if (before.configurationRevision().isEmpty() || sources.isEmpty() || sources.size() > 4
+                || !MongoReadBudget.supportsSnapshotReads(connection.client())) return ObservationCheck.fallback();
+        try {
+            observationStructures.require(MongoStructureProof.Kind.OBSERVATION, () -> {
+                observationCollations = MongoCacheMetadataStructure.simpleCollations(connection.database(), MongoPipelineObservationConfig.COLLECTIONS);
+                if (observationCollations) {
+                    bindings.verifyObservationIndex();
+                    MongoCapturePreparationFacts.verify(connection.database());
+                }
+            });
+            if (!observationCollations) return ObservationCheck.fallback();
+            var facts = new MongoPipelineObservationConfig(connection.client(), connection.database(), bindings, artifacts)
+                    .read(before, defaultSource, sources);
+            requireOpen();
+            return facts;
+        } catch (RuntimeException failure) {
+            observationStructures.clear();
+            requireOpen();
+            if (failure instanceof TapstateException coded && coded.code() == IoError.DOCUMENT_TOO_LARGE)
+                return ObservationCheck.fallback();
+            throw failure;
+        }
+    }
+
     public io.tapstate.spi.store.PipelineIntentStore intents() {
         requireOpen();
         return new MongoPipelineIntentStore(connection.client(), connection.database(), clusterId, bindings).guardedBy(this::requireOpen);
@@ -1163,6 +1217,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public Optional<BoundValidationInputs> boundValidationInputs(io.tapstate.spi.store.ValidationReportAdmission.Task task,
             long revision, Runnable local) {
         return validationTaskDefinitions(local).boundInputs(task, revision, bindings);
+    }
+
+    private final MongoStructureProof unpreparedValidation = new MongoStructureProof();
+
+    public io.tapstate.spi.store.ValidationTaskStore pollingValidationTasks(Runnable local) {
+        requireOpen();
+        Objects.requireNonNull(local).run();
+        StoreIo.run(() -> MongoValidationSchema.requireReady(connection.database(), true, unpreparedValidation));
+        return MongoValidationAdmissionStore.nativeTaskDefinitions(connection.client(), connection.database(), clusterId,
+                () -> { requireOpen(); local.run(); }, artifacts);
     }
 
     private MongoValidationAdmissionStore.Definitions validationTaskDefinitions(Runnable local) {
@@ -1484,6 +1548,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", id, "field", field), null);
     }
 
+    String alertReadKeyId(Document row) {
+        requireOpen();
+        return configurationKey.requireCurrent(row).activeKeyId();
+    }
+
+    String alertReadKeyId(ClientSession session){requireOpen();return configurationKey.readCurrent(session).activeKeyId();}
+
     /** One persistent key, with no node-session ACK, rotation state or cache access. */
     private static final class PersistentKey implements SourceConfigCipherProvider {
         private final MongoCollection<Document> keys;
@@ -1499,6 +1570,16 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         @Override
         public SourceConfigCipher current() {
             return cipher;
+        }
+
+        SourceConfigCipher readCurrent(ClientSession session){
+            return requireCurrent(keys.find(session,new Document("_id","cluster")).first());
+        }
+
+        SourceConfigCipher requireCurrent(Document row) {
+            SourceConfigCipher observed = decode(row);
+            if (!cipher.activeKeyId().equals(observed.activeKeyId())) throw invalidKey();
+            return observed;
         }
 
         /** The same-session fence below verifies this original immutable key before any write commits. */
