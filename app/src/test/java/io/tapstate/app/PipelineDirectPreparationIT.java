@@ -1539,11 +1539,28 @@ class PipelineDirectPreparationIT {
                 var business = committed.preparation().businessScope(); cache.prepareFirstAuth(committed.firstCreation().orElseThrow()); cache.prepareInitialBusiness(committed.preparation(),ACTIVE);
                 configuration.artifacts().create(source("input","x",null)); configuration.artifacts().create(pipeline("input",false,ReadMode.CDC_ONLY,"latest",null));
                 var scope = new PipelineIntentScope(business.clusterId(),business.bindingVersion(),business.cacheIncarnation(),"flow",1);
-                var node = WorkloadClaimFence.from(cache.workloadClaims(business).acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,1,TTL).claim());
-                scenario.run(new Fixture(configuration,cache,configDb,cacheDb,cacheConnection,scope,node));
+                var claims = (DeadlineWorkloadClaimStore) cache.workloadClaims(business);
+                var node = WorkloadClaimFence.from(claims.acquire(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,OWNER.nodeId()),OWNER,1,TTL).claim());
+                try (var claimDrain = (AutoCloseable) () -> closeCacheClaims(cache, claims)) {
+                    scenario.run(new Fixture(configuration,cache,configDb,cacheDb,cacheConnection,scope,node));
+                }
             } finally { configDb.drop(); cacheDb.drop(); }
         } catch (RuntimeException | Error failure) { throw failure; }
         catch (Exception failure) { throw new AssertionError(failure); }
+    }
+    static void closeCacheClaims(MongoCacheDomain cache, DeadlineWorkloadClaimStore claims) {
+        try { cache.close(); }
+        catch (TapstateException busy) {
+            if (busy.code() != IoError.WORKLOAD_CLAIM_FENCED) throw busy;
+            // The refused close stops new admission; original I/O and transaction cleanup must finish.
+            try {
+                claims.awaitQuiescence(System.nanoTime() + Duration.ofSeconds(5).toNanos());
+                cache.close();
+            } catch (RuntimeException | Error unresolved) {
+                if (unresolved != busy) unresolved.addSuppressed(busy);
+                throw unresolved;
+            }
+        }
     }
     private record Fixture(MongoConfigurationDomain configuration,MongoCacheDomain cache,MongoDatabase configDatabase,MongoDatabase cacheDatabase,
             StorageBinding.Connection cacheConnection,PipelineIntentScope scope,WorkloadClaimFence node) {

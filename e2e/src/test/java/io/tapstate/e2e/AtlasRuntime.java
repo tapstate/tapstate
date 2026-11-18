@@ -51,6 +51,7 @@ final class AtlasRuntime implements AutoCloseable {
     private final AtomicInteger requests = new AtomicInteger();
     private final AtomicInteger exchanges = new AtomicInteger();
     private String cookie;
+    private final Map<ServerHandle, InProcessServer> inProcessServers = new ConcurrentHashMap<>();
 
     AtlasRuntime(Mode mode, String storeUri) throws IOException, GeneralSecurityException {
         this(mode, storeUri, null);
@@ -122,19 +123,29 @@ final class AtlasRuntime implements AutoCloseable {
                         : RealProcessServer.startPrepared(storeUri, "127.0.0.1", port -> arguments);
         try {
             if (server instanceof RealProcessServer process) process.awaitReady();
-            return new ServerHandle() {
+            ServerHandle handle = new ServerHandle() {
                 @Override public java.net.URI baseUrl() { return server.baseUrl(); }
                 @Override public void close() {
+                    inProcessServers.remove(this);
                     server.close();
                     if (server instanceof RealProcessServer process) {
                         assertThat(process.isAlive()).as("the replaced JVM has actually exited").isFalse();
                     }
                 }
             };
+            if (server instanceof InProcessServer local) inProcessServers.put(handle, local);
+            return handle;
         } catch (RuntimeException | Error failure) {
             server.close();
             throw failure;
         }
+    }
+
+    AutoCloseable observeManagedAuthorization(ServerHandle server, java.util.function.Consumer<String> before,
+            java.util.function.BiConsumer<String, Map<String, Object>> after) {
+        var local = inProcessServers.get(server);
+        if (local == null) throw new IllegalArgumentException("an owned in-process server is required");
+        return local.observeManagedAuthorization(before, after);
     }
 
     ControlPlane control(ServerHandle server, boolean firstBoot) {

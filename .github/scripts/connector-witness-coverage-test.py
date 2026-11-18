@@ -18,6 +18,31 @@ EXTERNAL_ATLAS = {
 
 
 class ConnectorWitnessCoverageTest(unittest.TestCase):
+    def test_selected_dummy_witness_receives_the_published_jar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan_path = Path(directory) / 'plan.json'
+            subprocess.run(
+                [str(ROOT / '.github/scripts/connector-witnesses.sh'), 'plan',
+                 '--root', str(ROOT), '--input-mode', 'upstream', '--output', str(plan_path)],
+                check=True, capture_output=True, text=True,
+            )
+            plan = json.loads(plan_path.read_text())
+        self.assertIn('io.tapstate.e2e.RealDummyPipelineIT',
+                      {test['class'] for test in plan['expected']})
+
+        workflow = (ROOT / '.github/workflows/real-connectors.yml').read_text()
+        job = re.search(r'^  connector-witnesses:\n(.*?)(?=^  [\w-]+:|\Z)',
+                        workflow, re.M | re.S).group(1)
+        steps = re.split(r'^      - ', job, flags=re.M)[1:]
+        execution = next(step for step in steps
+                         if re.search(r'^        run: .*connector-witnesses\.sh run\b', step, re.M))
+        arguments = re.search(r'^          MAVEN_ARGS: (.+)$', execution, re.M).group(1)
+        self.assertRegex(
+            arguments, r'(?:^|\s)-Dtapstate\.dummy\.jar=\S+',
+            'RealDummyPipelineIT is selected, but no -Dtapstate.dummy.jar: '
+            'the published Dummy bytes were not supplied; all seven invocations will skip',
+        )
+
     def assert_coverage(self, gated, planned, deferred):
         self.assertLessEqual(deferred, EXTERNAL_ATLAS, 'Only the four external Atlas witnesses may be deferred')
         self.assertLessEqual(deferred, gated, 'Deferred witnesses must still exist in the source inventory')

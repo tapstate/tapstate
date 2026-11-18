@@ -65,9 +65,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  snapshot-lock:
+    # Resolve mutable dependencies once, before any independent producer starts.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+          cache: maven
+      - name: Verify exact Java build
+        run: java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
+      - name: Resolve the reactor's snapshot inputs
+        run: |
+          .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
+          mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install
+          python3 .github/scripts/ci-snapshot-lock.py capture "$RUNNER_TEMP/snapshot-m2" "$RUNNER_TEMP/ci-snapshot-lock"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-snapshot-lock
+          overwrite: true
+          path: ${{ runner.temp }}/ci-snapshot-lock/
+          if-no-files-found: error
+          retention-days: 7
+
   test-shards:
     name: test-shards (${{ matrix.shard }})
-    needs: shard-plan
+    needs: [shard-plan, snapshot-lock]
     # Queue each PR's corresponding worker. It stops only its own obsolete work;
     # a delayed old arrival must never cancel a newer head's worker.
     concurrency:
@@ -108,6 +136,14 @@ jobs:
       # install outputs live in its temporary repository and never enter that cache.
       - name: Seed an isolated dependency repository
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock
+      - name: Restore frozen snapshot inputs
+        run: |
+          python3 .github/scripts/ci-snapshot-lock.py restore "$RUNNER_TEMP/ci-snapshot-lock" "$RUNNER_TEMP/m2"
+          echo 'MAVEN_ARGS=-nsu' >> "$GITHUB_ENV"
       - name: Build the reactor without running tests
         env:
           GH_TOKEN: ${{ github.token }}
@@ -168,6 +204,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$RUNNER_TEMP/test-tmp"
+          export MAVEN_ARGS="$MAVEN_ARGS -nsu"
           case "$SHARD" in
             app-1|app-2|rest)
               export MAVEN_ARGS="$MAVEN_ARGS -DforkCount=2"
@@ -334,6 +371,14 @@ jobs:
         run: .github/scripts/ci-maven-cache.sh seed "$HOME/.m2/repository" "$RUNNER_TEMP/m2"
       - uses: actions/download-artifact@v4
         with:
+          name: ci-snapshot-lock
+          path: ${{ runner.temp }}/ci-snapshot-lock
+      - name: Restore frozen snapshot inputs
+        run: |
+          python3 .github/scripts/ci-snapshot-lock.py restore "$RUNNER_TEMP/ci-snapshot-lock" "$RUNNER_TEMP/m2"
+          echo 'MAVEN_ARGS=-nsu' >> "$GITHUB_ENV"
+      - uses: actions/download-artifact@v4
+        with:
           name: ci-shard-plan
           path: ${{ runner.temp }}
       - uses: actions/download-artifact@v4
@@ -440,6 +485,7 @@ jobs:
       # (that is exactly the gate-red case worth commenting on); continue-on-error keeps a comment
       # glitch from ever flipping a green job to red - the analyze step is the sole gate authority.
       - name: Comment quality gate on PR
+        id: sonar-comment
         if: always() && steps.guard.outputs.run == 'true' && steps.analyze.outcome != 'skipped' && steps.analyze.outcome != '' && github.event_name == 'pull_request'
         continue-on-error: true
         env:
@@ -449,7 +495,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          set -uo pipefail
+          set -euo pipefail
           # An old analysis remains bound to its own run. It must not replace a
           # current-head decoration after the pull request advances.
           current_head="$(gh api --method GET "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}" --jq .head.sha 2>/dev/null)" || current_head=""
@@ -467,22 +513,40 @@ jobs:
           ps="$(curl -s -u "$SONAR_TOKEN:" "$host/api/qualitygates/project_status?projectKey=tapstate&pullRequest=${PR_NUMBER}" || true)"
           status="$(printf '%s' "$ps" | jq -r '.projectStatus.status // "UNKNOWN"' 2>/dev/null || echo UNKNOWN)"
           details="$(printf '%s' "$ps" | jq -r '.projectStatus.conditions[]? | select(.status=="ERROR") | "- `\(.metricKey)`: \(.actualValue) (fails \(.comparator) \(.errorThreshold))"' 2>/dev/null || true)"
-          issue_details=""
+          scratch="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-$PWD}}/sonar-pr-comment.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          entries="$scratch/findings.jsonl"
+          : > "$entries"
+          retrieved=0
+          total=""
+          complete=false
           page=1
+          # Keep one JSON string per finding so multiline messages stay intact.
           while :; do
-            issues="$(curl -s -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&ps=100&p=${page}" || true)"
-            page_details="$(printf '%s' "$issues" | jq -r '.issues[]? | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)"' 2>/dev/null || true)"
-            if [ -n "$page_details" ]; then
-              if [ -n "$issue_details" ]; then
-                issue_details="${issue_details}"$'\n'
-              fi
-              issue_details="${issue_details}${page_details}"
-            fi
-            next_page="$(printf '%s' "$issues" | jq -r '.paging | select((.pageIndex * .pageSize) < .total) | (.pageIndex + 1)' 2>/dev/null || true)"
-            if ! [[ "$next_page" =~ ^[0-9]+$ ]] || [ "$next_page" -le "$page" ]; then
+            if ! curl -fsS -u "$SONAR_TOKEN:" "$host/api/issues/search?componentKeys=tapstate&pullRequest=${PR_NUMBER}&resolved=false&ps=100&p=${page}" |
+              jq -ces --argjson page "$page" --argjson retrieved "$retrieved" '
+                select(length == 1) | .[0]
+                | select(.paging.pageIndex == $page and .paging.pageSize == 100)
+                | select(.paging.total | type == "number" and . >= 0 and . == floor)
+                | select(.issues | type == "array")
+                | select((.issues | length) == ([100, .paging.total - $retrieved] | min))
+                | .paging.total,
+                  (.issues[] | "- `\(.rule)` [\(.severity)]: `\(.component | sub("^tapstate:"; "")):\(.line // "?")` — \(.message)")
+              ' > "$scratch/page.jsonl"; then
               break
             fi
-            page="$next_page"
+            page_total="$(head -n 1 "$scratch/page.jsonl")"
+            if ! [[ "$page_total" =~ ^[0-9]+$ ]] || [[ -n "$total" && "$page_total" != "$total" ]]; then
+              break
+            fi
+            total="$page_total"
+            tail -n +2 "$scratch/page.jsonl" >> "$entries"
+            retrieved=$((retrieved + $(wc -l < "$scratch/page.jsonl") - 1))
+            if [ "$retrieved" = "$total" ]; then
+              complete=true
+              break
+            fi
+            page=$((page + 1))
           done
 
           case "$status" in
@@ -503,12 +567,54 @@ jobs:
             if [ -n "${details:-}" ]; then
               printf 'Failing conditions:\n%s\n\n' "$details"
             fi
-            if [ -n "${issue_details:-}" ]; then
-              printf 'Open unresolved issues:\n%s\n\n' "$issue_details"
+            if [ "$complete" = false ]; then
+              printf 'SonarQube results are incomplete. Retrieved %s unresolved issues before pagination stopped.\n\n' "$retrieved"
+            fi
+            if [ "$retrieved" -gt 0 ]; then
+              printf 'Open unresolved issues:\n'
+            fi
+          } > "$scratch/header"
+          {
+            if [ "$retrieved" -gt 0 ]; then
+              printf '\n'
             fi
             printf '[Open the pull-request dashboard](%s)\n\n' "$dashboard"
             printf '_Posted by CI from the SonarQube pull-request quality gate._\n'
-          } > comment.md
+          } > "$scratch/footer"
+
+          # Budget the entire UTF-8 body, including the links and omission notice.
+          comment_limit=61440
+          artifact_name="sonar-pr-findings-attempt-${GITHUB_RUN_ATTEMPT}"
+          omission_notice() {
+            printf '\nShowing %s of %s retrieved unresolved issues (%s omitted from this comment).\n\n' "$1" "$retrieved" "$((retrieved - $1))"
+            # shellcheck disable=SC2016
+            printf 'Look for `%s` in the [workflow run artifacts](https://github.com/%s/actions/runs/%s).\n\n' "$artifact_name" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+          }
+          jq -r '.' "$entries" > "$scratch/findings.md"
+          base_bytes=$(($(wc -c < "$scratch/header") + $(wc -c < "$scratch/footer")))
+          overflow=false
+          cat "$scratch/header" > "$scratch/comment.md"
+          if (( base_bytes + $(wc -c < "$scratch/findings.md") <= comment_limit )); then
+            cat "$scratch/findings.md" >> "$scratch/comment.md"
+          else
+            overflow=true
+            # Reserving two full-width counts covers any shown/omitted split.
+            notice_bytes="$(omission_notice 0 | wc -c)"
+            budget=$((comment_limit - base_bytes - notice_bytes - ${#retrieved} + 1))
+            jq -nc --argjson budget "$budget" '
+              foreach inputs as $entry (0; . + ($entry | utf8bytelength) + 1;
+                if . <= $budget then $entry else empty end)
+            ' "$entries" > "$scratch/preview.jsonl"
+            shown=$(( $(wc -l < "$scratch/preview.jsonl") ))
+            jq -r '.' "$scratch/preview.jsonl" >> "$scratch/comment.md"
+            omission_notice "$shown" >> "$scratch/comment.md"
+          fi
+          cat "$scratch/footer" >> "$scratch/comment.md"
+          if (( $(wc -c < "$scratch/comment.md") > comment_limit )); then
+            echo '::warning::SonarQube quality gate summary exceeds the PR comment budget.'
+            exit 1
+          fi
+          jq -n --rawfile body "$scratch/comment.md" '{body: $body}' > "$scratch/request.json"
 
           existing="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
             --jq '.[] | select(.body | contains("<!-- sonarqube-gate -->")) | .id' 2>/dev/null | head -n1 || true)"
@@ -517,12 +623,27 @@ jobs:
             echo '::notice::PR head changed during decoration; preserving the current decoration.'
             exit 0
           fi
+          if [ "$overflow" = true ]; then
+            report="${RUNNER_TEMP:-$PWD}/sonar-pr-findings.md"
+            cat "$scratch/header" "$scratch/findings.md" > "$report"
+            printf 'findings_path=%s\nfindings_name=%s\n' "$report" "$artifact_name" >> "${GITHUB_OUTPUT:-/dev/null}"
+          fi
           if [ -n "$existing" ]; then
-            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" -f body="$(cat comment.md)" >/dev/null
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing}" --input "$scratch/request.json" >/dev/null
           else
-            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" -f body="$(cat comment.md)" >/dev/null
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --input "$scratch/request.json" >/dev/null
           fi
           echo "Posted quality gate comment (status=${status})."
+
+      - name: Upload SonarQube PR findings report
+        if: always() && steps.sonar-comment.outputs.findings_path != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.sonar-comment.outputs.findings_name }}
+          path: ${{ steps.sonar-comment.outputs.findings_path }}
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Preserve downloaded dependencies
         if: always()
@@ -727,8 +848,10 @@ jobs:
           bash .github/scripts/ci-aggregate-smoke.sh
           bash .github/scripts/ci-shape-smoke.sh
           bash .github/scripts/ci-maven-cache-smoke.sh
+          python3 .github/scripts/ci-snapshot-lock-smoke.py
           bash .github/scripts/sonar-inputs-smoke.sh
           bash .github/scripts/sonar-workflow-smoke.sh
+          python3 .github/scripts/sonar-pr-comment-size-test.py SonarPrCommentSizeTest.test_large_issue_list_delivers_a_comment_within_the_limit
           python3 .github/scripts/_ci-pr-work-smoke.py
           python3 .github/scripts/sonar-main-gate-timeout-test.py
           bash .github/scripts/sonar-cache-smoke.sh

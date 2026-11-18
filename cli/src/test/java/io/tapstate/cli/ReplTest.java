@@ -3016,6 +3016,24 @@ class ReplTest {
     }
 
     @Test
+    void aRefusedConnectionTestKeepsTheDiagnosticAndLegacyParametersInJson() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.getOutcome = storedConnection();
+        var diagnostic = Map.<String, Object>of("cause", Map.of("message", "Peer reset"));
+        var params = Map.<String, Object>of("connector", "mongodb");
+        client.testOutcome = new ConnectionTestOutcome.Rejected(
+                "connector.test-failed", "Unable to run the test", params, diagnostic);
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("test my-mongo -o json");
+
+        assertThat(io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark)))
+                .isEqualTo(Map.of("code", "connector.test-failed", "message", "Unable to run the test",
+                        "params", params, "diagnostic", diagnostic));
+    }
+
+    @Test
     void testOfflineReportsThatAConnectionIsRequired() {
         Harness h = harness(Path.of("tap-work"));
 
@@ -3066,6 +3084,42 @@ class ReplTest {
         assertThat(out).contains("\"connectionId\"").contains("\"my-mongo\"")
                 .contains("\"outcome\"").contains("\"FAILED\"").contains("\"Login\"")
                 .contains("\"connectorErrorCode\"").contains("\"11000\"");
+    }
+
+    @Test
+    void testResultShowsSiblingCausesWithoutChangingTheRecordedOutcome() {
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        Map<String, Object> diagnostic = Map.of(
+                "code", "TS0060001",
+                "causes", List.of(
+                        Map.of("code", "PDK43001", "message", "Credentials refused", "references",
+                                List.of(Map.of("type", "connection", "id", "my-mongo"))),
+                        Map.of("message", "TLS was not accepted",
+                                "cause", Map.of("message", "Peer closed the connection"), "truncated", true)));
+        client.testResultOutcome = new ConnectionTestResultOutcome.Found(new ConnectionReport(
+                "my-mongo", "mongodb", "FAILED",
+                List.of(new ConnectionReport.Check("Login", "FAILED", "auth failed", null, null,
+                        null, diagnostic)), 1752000000000L));
+        Harness h = onlineSession(Path.of("tap-work"), client);
+        int mark = h.sink().toString().length();
+
+        h.repl().dispatch("test-result my-mongo");
+        String output = h.sink().toString().substring(mark);
+        assertThat(output.lines().toList()).containsSubsequence(
+                "          TS0060001",
+                "            PDK43001 Credentials refused",
+                "            connection: my-mongo",
+                "            TLS was not accepted",
+                "              Peer closed the connection",
+                "            [Diagnostic truncated]");
+        assertThat(output).contains("FAILED", "auth failed");
+
+        mark = h.sink().toString().length();
+        h.repl().dispatch("test-result my-mongo -o json");
+        var report = (Map<?, ?>) io.tapstate.core.common.JsonReader.parse(h.sink().toString().substring(mark));
+        var check = (Map<?, ?>) ((List<?>) report.get("checks")).getFirst();
+        assertThat(check.get("diagnostic")).isEqualTo(diagnostic);
+        assertThat(client.testCalls).isEmpty();
     }
 
     @Test
@@ -4065,6 +4119,45 @@ class ReplTest {
         // one apply call carrying the three ws-valid drafts to the landing node with the credential
         assertThat(client.applyCalls).hasSize(1);
         assertThat(client.applyCalls.get(0)).startsWith("jwt-tok@http://node1:7900 x3");
+    }
+
+    @Test
+    void applyDoesNotRetryAnAmbiguousWriteAfterFailover(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI node = URI.create("http://node1:7900");
+        FakeControlPlane client = new FakeControlPlane(node);
+        client.applyOutcome = new ApplyOutcome.Unreachable();
+        Harness h = onlineSession(base, client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark)).contains("reconnected to node1:7900", "request failed");
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(h.repl().session().landingNode()).isEqualTo(node);
+    }
+
+    @Test
+    void applyReportsTheOriginalTargetAfterFailoverToAnotherNode(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI first = URI.create("http://node1:7900");
+        URI second = URI.create("http://node2:7900");
+        FakeControlPlane client = new FakeControlPlane(second);
+        SplitHarness h = splitStreamHarness(base, client);
+        h.repl().session().connect(List.of(first, second), first);
+        h.repl().session().authenticate("jwt-tok", "alice", null, List.of(first, second));
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(client.probed).containsExactly(first, second);
+        assertThat(h.repl().session().landingNode()).isEqualTo(second);
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.out().toString()).contains("reconnected to node2:7900");
+        assertThat(h.err().toString().strip())
+                .isEqualTo("request failed: node1:7900 is unreachable");
     }
 
     @Test

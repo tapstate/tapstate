@@ -1,5 +1,7 @@
 package io.tapstate.control.restapi;
 
+import com.fasterxml.jackson.annotation.JsonInclude;
+
 import java.util.Map;
 
 /**
@@ -9,5 +11,13 @@ import java.util.Map;
  * A record so the shape is explicit and can grow (e.g. a solution hint) without changing the fields a
  * client already reads.
  */
-public record ApiError(String code, Map<String, Object> params, String message) {
+public record ApiError(String code, Map<String, Object> params, String message,
+        @JsonInclude(JsonInclude.Include.NON_EMPTY) Map<String, Object> diagnostic) {
+    public ApiError {
+        diagnostic = diagnostic == null ? Map.of() : Map.copyOf(diagnostic);
+    }
+
+    public ApiError(String code, Map<String, Object> params, String message) {
+        this(code, params, message, Map.of());
+    }
 }

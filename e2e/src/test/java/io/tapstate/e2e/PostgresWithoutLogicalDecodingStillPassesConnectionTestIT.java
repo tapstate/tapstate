@@ -1,6 +1,7 @@
 package io.tapstate.e2e;
 
 import io.tapstate.testsupport.DockerGate;
+import io.tapstate.core.common.JsonReader;
 
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -8,6 +9,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.utility.DockerImageName;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -53,11 +55,15 @@ class PostgresWithoutLogicalDecodingStillPassesConnectionTestIT {
                 new PostgreSQLContainer<>(DockerImageName.parse("postgres:16"))) {
             postgres.start();
 
+            String catalogArtifact = System.getProperty("tapstate.e2e.pg-catalog-artifact");
             try (PreparedNativeStore storage = PreparedNativeStore.create();
-                    ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+                    ServerHandle server = catalogArtifact == null ? Tiers.IN_PROCESS.launch(storage)
+                            : InProcessServer.startWithConnectionDiagnostics(storage)) {
                 ControlPlane control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
-                control.registerConnector("postgres", ConnectorJars.bytesFor("postgres"));
+                byte[] connector = catalogArtifact == null ? ConnectorJars.bytesFor("postgres")
+                        : java.nio.file.Files.readAllBytes(java.nio.file.Path.of(catalogArtifact));
+                control.registerConnector("postgres", connector);
 
                 ControlPlane.ConnectionTest report =
                         control.testConnection("pg_unprepared", "postgres", settings(postgres));
@@ -71,6 +77,24 @@ class PostgresWithoutLogicalDecodingStillPassesConnectionTestIT {
                         .as("and the change-stream probe is where it said otherwise, as a warning that "
                                 + "does not reach the outcome: %s", report.statusByCheck())
                         .containsEntry(READ_LOG_CHECK, "WARNING");
+                if (catalogArtifact != null) {
+                    var wire = control.sourceRequest("GET", "/api/connections/pg_unprepared/test-result", null, null, 200);
+                    var snapshot = (Map<?, ?>) JsonReader.parse(wire.body());
+                    assertThat((List<?>) snapshot.get("checks")).anySatisfy(value -> {
+                        var check = (Map<?, ?>) value;
+                        assertThat(check.get("name")).isEqualTo(READ_LOG_CHECK);
+                        assertThat(check.get("status")).isEqualTo("WARNING");
+                        var diagnostic = (Map<?, ?>) check.get("diagnostic");
+                        assertThat(check.get("connectorErrorCode")).isEqualTo("410003");
+                        assertThat(diagnostic.get("code")).isEqualTo("PG410003");
+                        assertThat(diagnostic.containsKey("definitionStatus")).isFalse();
+                        assertThat(diagnostic.get("message").toString())
+                                .contains("must be superuser or replication role");
+                        assertThat(diagnostic.get("solution").toString()).contains("ALTER USER username REPLICATION");
+                        assertThat((List<?>) diagnostic.get("arguments")).singleElement()
+                                .asString().contains("SELECT pg_create_logical_replication_slot");
+                    });
+                }
             }
         }
     }
