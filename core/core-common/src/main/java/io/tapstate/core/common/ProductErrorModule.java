@@ -16,7 +16,9 @@ public enum ProductErrorModule {
     VALIDATION("030"),
     BOOT("031"),
     ROLE("032"),
-    CLI("033");
+    CLI("033"),
+    ALERT("034"),
+    CAPTURE("035");
 
     private final String number;
 

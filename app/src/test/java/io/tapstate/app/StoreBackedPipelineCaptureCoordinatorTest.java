@@ -259,7 +259,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
                     .isInstanceOf(TapstateException.class)
                     .satisfies(e -> {
                         TapstateException refused = (TapstateException) e;
-                        assertThat(refused.code().code()).isEqualTo("capture.start-from-unparsable");
+                        assertThat(refused.code().code()).isEqualTo("TS0350010");
                         assertThat(refused.args()).containsEntry("value", binlogCoordinate);
                     });
         }
@@ -791,7 +791,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, exception -> {
-                    assertThat(exception.code().code()).isEqualTo("capture.event-table-not-selected");
+                    assertThat(exception.code().code()).isEqualTo("TS0350012");
                     assertThat(exception.args()).containsEntry("table", "customers");
                 });
         assertThat(coordinator.isCapturing("p")).isFalse();

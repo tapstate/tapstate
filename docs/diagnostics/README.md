@@ -37,6 +37,14 @@ session. The nested error keeps its code/message shape; remote refusals retain t
 original code and text. Authentication-file permission degradation still depends on
 the typed error and a proven persistence outcome, not a code prefix.
 
+Alert diagnostics use module `034`, and capture diagnostics use `035`. Capture
+observer failures remain warnings isolated from source processing. Loss of capture
+ownership, incomplete shutdown and missing recovery history retain their original
+fences and cleanup handles. A new identity never permits skipping a missing interval.
+Latest Pipeline observations keep their existing code-string and parameter fields;
+old and new identities read through the same codec without rewriting stored rows.
+A later recovery clears the current failure under the original observation epoch.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

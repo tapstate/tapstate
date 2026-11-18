@@ -471,6 +471,44 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void legacyAndProductFailureIdentitiesUseTheSameLatestObservationContract() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var params = Map.of("captureId", "capture-a");
+            var legacy = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("capture.claim-lost", params), AT, List.of());
+            writer.save(legacy, 1);
+            var oldBytes = collection.find().first();
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(legacy);
+            assertThat(collection.find().first()).isEqualTo(oldBytes);
+
+            var current = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure(
+                            io.tapstate.core.common.CaptureErrorDefinitions.CLAIM_LOST.code(), params),
+                    AT.plusSeconds(1), List.of());
+            writer.save(current, 1);
+            writer.save(legacy, 1);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(current);
+            var row = collection.find().first();
+            assertThat(row.keySet()).isEqualTo(oldBytes.keySet());
+            assertThat(row.get("failure", Document.class).keySet())
+                    .isEqualTo(oldBytes.get("failure", Document.class).keySet());
+            assertThat(row.get("failure", Document.class).getString("code")).isEqualTo("TS0350003");
+            assertThat(collection.find().first()).isEqualTo(row);
+
+            assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT.plusSeconds(2)))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            var recovered = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(),
+                    null, AT.plusSeconds(2), List.of());
+            writer.save(recovered, 2);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(recovered);
+        });
+    }
+
     @Test void losingOnlyTheProjectionCollectionDoesNotDisableCheckpointAccess() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
