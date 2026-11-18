@@ -2108,7 +2108,8 @@ final class Repl {
             LocalDraft only = drafts.get(0);
             drafts = List.of(new LocalDraft(only.source(), only.content(), ifMatch));
         }
-        ApplyOutcome outcome = applyDrafts(drafts);
+        URI requestTarget = session.landingNode();
+        ApplyOutcome outcome = applyDrafts(requestTarget, drafts);
         PrintWriter out = commandLine.getOut();
         return switch (outcome) {
             case ApplyOutcome.Applied applied -> {
@@ -2121,7 +2122,7 @@ final class Repl {
             }
             case ApplyOutcome.Rejected rejected ->
                     renderRejection(rejected.code(), rejected.message(), rejected.params());
-            case ApplyOutcome.Unreachable ignored -> reportRequestFailed();
+            case ApplyOutcome.Unreachable ignored -> reportRequestFailed(requestTarget);
         };
     }
 
@@ -5051,7 +5052,7 @@ final class Repl {
                 return Cli.EXIT_OK;
             }
             List<String> ids = subjects.stream().map(UpDraft::id).toList();
-            switch (applyDrafts(batch.stream().map(UpDraft::draft).toList())) {
+            switch (applyDrafts(session.landingNode(), batch.stream().map(UpDraft::draft).toList())) {
                 case ApplyOutcome.Applied applied -> {
                     for (ApplyOutcome.Item item : applied.items()) {
                         // A resource an earlier stage already applied keeps that stage's verdict: it is
@@ -5306,10 +5307,14 @@ final class Repl {
     // composite verb chains them. There is one way to apply, discover, start or read a pipeline from
     // here, whichever verb asked.
 
-    /** Applies one batch of drafts. */
-    private ApplyOutcome applyDrafts(List<LocalDraft> drafts) {
-        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts),
-                o -> o instanceof ApplyOutcome.Unreachable);
+    /** Applies one batch without replaying a write whose result is unknown. */
+    private ApplyOutcome applyDrafts(URI requestTarget, List<LocalDraft> drafts) {
+        ApplyOutcome outcome = controlPlane.apply(requestTarget, session.credential(), drafts);
+        if (outcome instanceof ApplyOutcome.Unreachable) {
+            // Restore the session for subsequent calls; the server may have committed this write.
+            failover();
+        }
+        return outcome;
     }
 
     /** Runs a schema discovery for a connection with the connector and settings it declares. */
@@ -5701,17 +5706,21 @@ final class Repl {
         out.flush();
     }
 
-    /**
-     * Reports that a request could not be completed after failover. Only reached when the retry itself was
-     * unreachable while a landing node is still held; a total loss of the cluster has already been reported
-     * by {@link #failover} (which then took the session offline), so this stays silent in that case.
-     */
     private int reportRequestFailed() {
+        return reportRequestFailed(session.landingNode());
+    }
+
+    /**
+     * Reports that a request could not be completed while a landing node is still held. A total loss of
+     * the cluster has already been reported by {@link #failover} (which then took the session offline),
+     * so this stays silent in that case.
+     */
+    private int reportRequestFailed(URI requestTarget) {
         if (!session.isConnected()) {
             return Cli.EXIT_DIAGNOSTIC;   // failover already reported the connection loss and went offline
         }
         PrintWriter err = commandLine.getErr();
-        err.println("request failed: " + hostPort(session.landingNode()) + " is unreachable");
+        err.println("request failed: " + hostPort(requestTarget) + " is unreachable");
         err.flush();
         return Cli.EXIT_DIAGNOSTIC;
     }
