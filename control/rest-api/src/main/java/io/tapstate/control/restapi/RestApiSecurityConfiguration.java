@@ -5,6 +5,8 @@ import io.tapstate.control.core.AuthenticationMode;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.messages.MessageCatalog;
 import jakarta.servlet.DispatcherType;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -24,7 +26,9 @@ import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 import org.springframework.security.web.util.matcher.DispatcherTypeRequestMatcher;
 import org.springframework.security.web.util.matcher.NegatedRequestMatcher;
+import org.springframework.web.servlet.HandlerInterceptor;
 import org.springframework.web.servlet.handler.HandlerMappingIntrospector;
+import org.springframework.web.servlet.handler.MappedInterceptor;
 import tools.jackson.databind.ObjectMapper;
 
 import java.util.List;
@@ -38,6 +42,17 @@ import java.util.List;
  */
 @Configuration
 class RestApiSecurityConfiguration {
+
+    @Bean
+    MappedInterceptor authorizedOptionsDispatch() {
+        return new MappedInterceptor(new String[]{"/api/**"}, new HandlerInterceptor() {
+            @Override
+            public boolean preHandle(HttpServletRequest request, HttpServletResponse response, Object handler) {
+                OperationRequestMappingHandlerMapping.requireAuthorizedDispatch(request, handler);
+                return true;
+            }
+        });
+    }
 
     @Bean
     ApiSecurityErrorWriter apiSecurityErrorWriter(MessageCatalog catalog, ObjectMapper json) {
