@@ -104,7 +104,7 @@ EOF
 
 printf '\033[1mquickstart smoke — %s\033[0m\n' "$QUICKSTART_SH"
 
-if [ "${1:-}" != --running-rerun ]; then
+if [ "${1:-}" != --running-rerun ] && [ "${1:-}" != --piped-hints ]; then
 # --- platform gate: unsupported platforms fail before any fetch, demo dir left pristine --------------
 # The gate reuses install.sh --print-platform. A refusal must exit non-zero, point the user elsewhere,
 # and leave the demo directory holding nothing but the quickstart.sh they downloaded -- zero side effects.
@@ -442,9 +442,120 @@ running_rerun_case() {
   fi
 }
 
+# Piped, the quickstart works inside a tapstate-demo/ of its own while the shell the one-liner was typed
+# into stays one level up -- and that shell is where every command printed afterwards gets pasted. Run
+# there, a bare `docker compose logs server` answers "no configuration file provided" and shows nothing,
+# and a bare `docker compose down -v` deletes nothing, so the clean start it was offered for never
+# begins. The one line naming the directory is the first line of the run, long scrolled away by the
+# time a failure is printed.
+#
+# So each failure that ends in a compose command is driven from a directory holding neither quickstart.sh
+# nor a compose file -- all the script reads to tell that it was piped -- and every compose command the
+# run printed is then run, as printed, from that same directory. The docker it meets there finds its
+# project the way compose does: the file -f names, else one in --project-directory, else one in the
+# working directory, and otherwise the error a reader actually gets. A run that succeeds is held to the
+# same in prose: its closing text says what to run "in this directory", so it has to name the directory.
+piped_hints_case() {
+  local scratch start demo real scenario expect cmd ran got n=0 failures=""
+  scratch="$(mktemp -d)"
+  mkdir -p "$scratch/compose" "$scratch/nap"
+  cat > "$scratch/compose/docker" <<'DOCK'
+#!/bin/sh
+[ "${1:-}" = compose ] && shift
+file=""; dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -f|--file) file="$2"; shift 2 ;;
+    --file=*) file="${1#*=}"; shift ;;
+    --project-directory) dir="$2"; shift 2 ;;
+    --project-directory=*) dir="${1#*=}"; shift ;;
+    -p|--project-name) shift 2 ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+if [ -z "$file" ]; then
+  for name in compose.yaml compose.yml docker-compose.yaml docker-compose.yml; do
+    if [ -f "${dir:-.}/$name" ]; then file="${dir:-.}/$name"; break; fi
+  done
+fi
+if [ -z "$file" ] || [ ! -f "$file" ]; then
+  echo 'no configuration file provided: not found' >&2
+  exit 1
+fi
+cd "$(dirname "$file")" && pwd -P > "$RESOLVED_TO"
+DOCK
+  # The wait for rows that never arrive sleeps between its reads. Answered at once, it gives up in a
+  # moment instead of a minute, and the hint it gives up with is the same.
+  printf '#!/bin/sh\nexit 0\n' > "$scratch/nap/sleep"
+  chmod +x "$scratch/compose/docker" "$scratch/nap/sleep"
+
+  for scenario in installation-never-ready login-refused nothing-assembled success; do
+    n=$((n + 1)); start="$scratch/user$n"; demo="$start/tapstate-demo"
+    mkdir -p "$demo"; cp "$QUICKSTART_SH" "$demo/quickstart.sh"
+    case "$scenario" in
+      installation-never-ready)
+        expect='did not reach'
+        FAKE_INITIAL_ENTRY=UNAVAILABLE RUN_REUSE="$demo" RUN_CWD="$start" run_phase_fakes ;;
+      login-refused)
+        # An earlier run created the administrator, and this one was handed other credentials.
+        expect='could not log in'
+        FAKE_INITIAL_ENTRY=LOGIN FAKE_CLI_OUT='error: control.auth-failed' \
+          RUN_REUSE="$demo" RUN_CWD="$start" run_phase_fakes ;;
+      nothing-assembled)
+        expect='were not assembled'
+        PATH="$scratch/nap:$PATH" RUN_REUSE="$demo" RUN_CWD="$start" run_phase_fakes 0 ;;
+      success)
+        expect='quickstart: pipeline started'
+        RUN_REUSE="$demo" RUN_CWD="$start" run_phase_fakes ;;
+    esac
+    real="$(cd "$demo" && pwd -P)"
+    if ! printf '%s' "$RUN_OUT" | grep -q "$expect"; then
+      failures="$failures
+      $scenario: the run did not end the way it was driven to (rc=$RUN_RC): $RUN_OUT"
+      continue
+    fi
+    if [ "$scenario" = success ]; then
+      if ! printf '%s\n' "$RUN_OUT" | awk '/^quickstart: pipeline started/ { seen = 1 } seen' \
+           | grep -qF -e "$demo" -e "$real"; then
+        failures="$failures
+      $scenario: the closing text says \"run in this directory\" and never names $demo, so it reads as the user's own"
+      fi
+      continue
+    fi
+    ran=0
+    while IFS= read -r cmd; do
+      ran=$((ran + 1))
+      rm -f "$scratch/resolved"
+      if (cd "$start" && PATH="$scratch/compose:$PATH" RESOLVED_TO="$scratch/resolved" sh -c "$cmd") \
+           > "$scratch/said" 2>&1; then
+        got="$(cat "$scratch/resolved" 2>/dev/null)"
+        [ "$got" = "$real" ] || failures="$failures
+      $scenario: \`$cmd\`, run as printed from $start, reaches ${got:-no project} instead of $real"
+      else
+        failures="$failures
+      $scenario: \`$cmd\`, run as printed from $start, answers: $(tr '\n' ' ' < "$scratch/said")"
+      fi
+    done < <(printf '%s\n' "$RUN_OUT" | grep -oE '(cd [^&;|()]+ && )?docker compose[^;,()&|]*')
+    [ "$ran" -gt 0 ] || failures="$failures
+      $scenario: the failure printed no command to run at all: $RUN_OUT"
+  done
+  rm -rf "$scratch"
+  if [ -z "$failures" ]; then
+    ok "piped, every compose command a failure prints works from where the user started, and the closing text names the directory"
+  else
+    bad "piped, the printed commands do not say where they must run:$failures"
+  fi
+}
+
 # Run only this regression, sharing the suite's local assets and run-phase fakes.
 if [ "${1:-}" = --running-rerun ]; then
   running_rerun_case
+  [ "$FAIL" -eq 0 ]
+  exit $?
+fi
+if [ "${1:-}" = --piped-hints ]; then
+  piped_hints_case
   [ "$FAIL" -eq 0 ]
   exit $?
 fi
@@ -892,6 +1003,8 @@ if [ "$RUN_RC" -eq 0 ] \
 else
   bad "a delivering run was rejected (rc=$RUN_RC): $RUN_OUT"
 fi
+
+piped_hints_case
 
 # --- what the release serves: one pinned version, and a stack that pulls rather than builds ----------
 # The demo directory a user lands in is not a checkout. Two things follow, and neither can be left as a

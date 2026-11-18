@@ -44,6 +44,17 @@ die() {
     exit 1
 }
 
+# $1 as one shell word that pastes back as itself: bare when every character is one no shell treats
+# specially, otherwise single-quoted, with each single quote inside closed, escaped and reopened. The
+# demo directory's path goes into commands printed to be copied, and a path holding a space or a quote
+# would otherwise split into several words, or open a quote that never closes.
+shell_quote() {
+    case "$1" in
+        *[!A-Za-z0-9_./-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 # Download $1 to the file $2 with whichever of curl / wget is present.
 #
 # The transfer lands in $2.part and is moved into place only once it has completed, so an interrupted
@@ -384,6 +395,14 @@ print_next_steps() {
         agent_lines="    Not set up: $agent_note"
     fi
     uri="mongodb://mongo:27017/views?directConnection=true"
+    # Piped, the reader's shell is still where the one-liner was typed, and every command below runs in
+    # the directory this run made. Said once, at the top, with the cd that gets there; in place there is
+    # nothing to say, and the line stays empty.
+    go_there=""
+    [ -z "$demo_cd" ] || go_there="
+The commands below run in $this_dir, which this run made; your shell is still where you started:
+  $demo_cd
+"
     # How long a pasted wait keeps trying. Taken for the slowest healthy machine, not the fastest: a
     # single change crosses in about a second here, so a minute is not a guess at the duration but a
     # ceiling far above it - small enough that nobody sits in front of a hung terminal, large enough
@@ -391,7 +410,7 @@ print_next_steps() {
     cdc_wait_seconds=60
     cat <<EOF
 quickstart: pipeline started. The stack is running.
-
+$go_there
 What you have: one object per order, assembled out of two different databases. The orders are in
 MySQL, their shipments are in PostgreSQL, and neither engine can see the other's table -- so this is
 not a view and not a join. Tapstate keeps it fresh from both sides at once.
@@ -459,10 +478,10 @@ Reach the store from your own machine (optional -- the reads above go through th
   meaning something only inside the container, so a URI carrying replicaSet=rs0 makes the driver
   discover that name and dial an address on your own machine where nothing is listening.
 
-Stop, and pick it up later (run in this directory):
+Stop, and pick it up later (run in $this_dir):
   docker compose stop        stop the stack and keep its data (docker compose start resumes it)
 
-Tear down -- this one is not reversible (run in this directory):
+Tear down -- this one is not reversible (run in $this_dir):
   docker compose down -v     stop the stack and delete its data (a re-run re-registers the connectors)
 $removal_line
 The pulled images remain; remove them with:  docker image rm <image>
@@ -556,7 +575,7 @@ await_entry() {
         i=$((i + 1))
         sleep "$poll"
     done
-    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: docker compose logs server"
+    die "the installation did not reach $* (last state: ${entry:-unavailable}); inspect it with: ${run_here}docker compose logs server"
 }
 
 setup_post() {
@@ -603,10 +622,20 @@ main() {
     # supported form -- a saved script run where it sits -- and there the directory is the user's, with
     # their files in it.
     demo_dir_is_ours=no
+    # Where every command printed from here on has to run, said in the command itself. In place, the
+    # reader's shell is already in this directory and the commands stay bare. Piped from elsewhere, the
+    # script works in a directory the reader's shell is not in -- and no child process can move the
+    # shell that started it -- so each printed command opens with the cd that gets there, and the prose
+    # names the directory rather than calling it "this directory". The `working in` line below is no
+    # substitute: it is the first line of the run, long scrolled away by the time a failure is printed.
+    this_dir="this directory"; demo_cd=""; run_here=""
     if [ ! -f ./quickstart.sh ] && [ ! -f ./docker-compose.yml ]; then
         mkdir -p tapstate-demo
         cd tapstate-demo
         demo_dir_is_ours=yes
+        this_dir="$PWD"
+        demo_cd="cd $(shell_quote "$PWD")"
+        run_here="$demo_cd && "
         printf 'quickstart: working in %s\n' "$PWD"
     fi
 
@@ -722,7 +751,7 @@ main() {
     fi
 
     grep -q 'TAPSTATE_INSTALLATION_DIRECTORY:' docker-compose.yml \
-        || die "this directory has an older demo Compose file. Run the installer from a new directory."
+        || die "$this_dir has an older demo Compose file. Run the installer from a new directory."
 
     require_admin_credentials_source
     docker compose run --rm --no-deps -T --entrypoint sh server -ec '
@@ -772,7 +801,7 @@ main() {
     printf '%s\n' "$repl_out"
     case "$repl_out" in
         *control.auth-failed*|*cli.not-authenticated*)
-            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: docker compose down -v (in this directory; it deletes the demo's data), then run the installer again." ;;
+            die "the CLI could not log in with those administrator credentials. Re-run with the ones you chose on the first run; if you no longer have them, start over with: ${run_here}docker compose down -v (it deletes the demo's data), then run the installer again." ;;
     esac
     # Check both the session status and its diagnostics: a refusal now leaves the
     # REPL running but makes it exit 1, while older CLIs can still exit zero.
@@ -841,7 +870,7 @@ main() {
     # only evidence the script has that a pipeline is moving data. The stack is left standing rather
     # than torn down -- the server log is the next thing to read, and a teardown would take it along.
     { [ "$orders" -ge "$seeded_orders" ] && [ "$shipments" -ge "$seeded_shipments" ]; } \
-        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: docker compose logs server"
+        || die "the two engines were not assembled (orders $orders of $seeded_orders, embedded shipments $shipments of $seeded_shipments); inspect it with: ${run_here}docker compose logs server"
     printf 'quickstart: %s orders from MySQL, each carrying its shipments from PostgreSQL -- %s of them, in one object per order\n' \
         "$orders" "$shipments"
 
