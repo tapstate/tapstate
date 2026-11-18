@@ -97,6 +97,7 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
                 || Integer.valueOf(2).equals(schema.get("installedVersion")) && (!openedWithAiOnlySchema || schema.containsKey("validation")))
             throw new TapstateException(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED,
                     Map.of("required", "2"), null);
+        if (MongoValidationSchema.isAiOnlyVersion(schema)) MongoValidationSchema.requireAiOnlyIdentity(schema);
         if (Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))) {
             var validation = MongoValidationSchema.readyConfiguration(schema);
             if (!cluster.equals(MongoValidationSchema.scope(validation).clusterId())) throw invalid("identity");

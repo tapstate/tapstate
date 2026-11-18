@@ -27,6 +27,7 @@ class MongoValidationAiSchemaCompositionIT {
             f.configuration.aiProviderSettings().put(OWNER,SETTING);var row=SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first();
             var original=f.configuration.bindings().cachePreparation().orElseThrow();
             var receipt=f.configuration.prepareInitialValidationSchema(original,f.cache,()->{});assertThat(receipt.ready()).isTrue();
+            assertThat(f.configSchema()).doesNotContainKey("aiOnly");
             assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(3);assertThat(f.cacheSchema().getInteger("installedVersion")).isEqualTo(2);
             assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(row);
             try(var reopened=MongoConfigurationDomain.open(f.settings,"cluster")){
@@ -64,8 +65,14 @@ class MongoValidationAiSchemaCompositionIT {
     @Test void residualValidationStructuresInAiVersionTwoPreventOpeningAndPreparation(){
         try(var f=new MongoValidationSchemaIT.Fixture(0,StorageBinding.Mode.CLOUD,true)){
             var before=f.configSchema();var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
+            SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                    new Document("$unset", new Document("aiOnly", "")));
+            before = f.configSchema();
             f.configDb.createCollection("validation_tasks");
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> MongoConfigurationDomain.prepareConfigComponentIdentity(f.settings, "cluster"))
+                    .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(StoreError.CONFIG_COMPONENT_IDENTITY_UNVERIFIED));
             assertThatThrownBy(()->f.configuration.prepareInitialValidationSchema(f.configuration.bindings().cachePreparation().orElseThrow(),f.cache,()->{})).isInstanceOf(TapstateException.class);
             assertThat(f.configSchema()).isEqualTo(before);assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports","validation_differences");

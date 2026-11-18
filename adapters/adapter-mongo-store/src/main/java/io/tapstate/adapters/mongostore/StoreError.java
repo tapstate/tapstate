@@ -42,6 +42,10 @@ public enum StoreError implements TapstateErrorCode {
     /** This initialized CONFIG schema does not support provider settings. */
     AI_PROVIDER_SCHEMA_UNSUPPORTED("store.ai-provider-schema-unsupported", Set.of("required")),
 
+    CONFIG_COMPONENT_IDENTITY_REQUIRED("store.config-component-identity-required", Set.of()),
+
+    CONFIG_COMPONENT_IDENTITY_UNVERIFIED("store.config-component-identity-unverified", Set.of()),
+
     /** The metadata-backed Source config keyring is absent, malformed, or internally inconsistent. */
     SOURCE_CONFIG_KEYRING_INVALID("store.source-config-keyring-invalid", Set.of()),
 

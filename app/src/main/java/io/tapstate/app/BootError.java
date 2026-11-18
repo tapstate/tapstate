@@ -18,6 +18,8 @@ import java.util.Set;
  */
 enum BootError implements TapstateErrorCode {
 
+    MIGRATION_MODE_CONFLICT("boot.migration-mode-conflict", Set.of()),
+
     /** The embedded Hazelcast member could not be started (e.g. its loopback port is in use). */
     HAZELCAST_UNAVAILABLE("boot.hazelcast-unavailable", Set.of()),
 

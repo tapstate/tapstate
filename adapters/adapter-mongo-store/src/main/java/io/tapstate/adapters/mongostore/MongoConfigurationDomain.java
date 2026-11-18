@@ -89,8 +89,8 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
-        this.openedWithAiOnlySchema = installed == 2 && !schema.containsKey("validation");
-        if (openedWithAiOnlySchema) StoreIo.run(() -> MongoValidationSchema.requireAiOnlyIdentity(database));
+        this.openedWithAiOnlySchema = MongoValidationSchema.isAiOnlyVersion(schema);
+        if (openedWithAiOnlySchema) MongoValidationSchema.requireAiOnlyIdentity(schema);
         if (MongoValidationSchema.configurationDeclaresValidation(schema))
             StoreIo.run(() -> MongoValidationSchema.requireReady(database, true));
         Document version = facts.version();
@@ -123,11 +123,59 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     record OpeningFacts(Document identity, Document schema, Document version, Document key) { }
 
     static OpeningFacts openingFacts(com.mongodb.client.MongoClient client, MongoDatabase database) {
-        return new MongoReadBudget(java.time.Duration.ofSeconds(5)).transaction(client, session -> new OpeningFacts(
+        return openingFacts(client, database, new MongoReadBudget(java.time.Duration.ofSeconds(5)));
+    }
+
+    private static OpeningFacts openingFacts(com.mongodb.client.MongoClient client, MongoDatabase database, MongoReadBudget budget) {
+        return budget.transaction(client, session -> new OpeningFacts(
                 SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first(),
                 SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first(),
                 SystemCollections.CONFIGURATION_VERSION.on(database).find(session, new Document("_id", ConfigurationVersion.ID)).first(),
                 SystemCollections.CLUSTER_KEYS.on(database).find(session, new Document("_id", "cluster")).first()));
+    }
+
+    /**
+     * Explicit maintenance with other CONFIG writers stopped. An absent marker is never inferred during open.
+     * The catalog is observed outside the transaction; publication rechecks the original CONFIG preimage.
+     */
+    public static boolean prepareConfigComponentIdentity(MongoConnectionSettings settings, String expectedClusterId) {
+        try (var connection = MongoConnection.forConfiguration(settings)) {
+            connection.verifyConnectivity();
+            return prepareConfigComponentIdentity(connection, expectedClusterId, new MongoReadBudget(settings.serverSelectionTimeout()));
+        }
+    }
+
+    static boolean prepareConfigComponentIdentity(MongoConnection connection, String expectedClusterId, MongoReadBudget budget) {
+        var original = openingFacts(connection.client(), connection.database(), budget);
+        var schema = original.schema();
+        var identity = original.identity();
+        if (identity == null || !(identity.get("clusterId") instanceof String cluster) || cluster.isBlank()
+                || !LAYOUT.equals(identity.get("layoutId")) || !(identity.get("bindingVersion") instanceof Long binding) || binding < 0
+                || expectedClusterId != null && !expectedClusterId.equals(cluster)
+                || schema == null || !(schema.get("installedVersion") instanceof Integer version) || version < 1 || version > SCHEMA_VERSION)
+            throw MongoValidationSchema.componentIdentityUnverified();
+        if (!MongoValidationSchema.isAiOnlyVersion(schema)) {
+            MongoValidationSchema.configurationDeclaresValidation(schema);
+            return false;
+        }
+        if (schema.containsKey(MongoValidationSchema.AI_ONLY)) {
+            MongoValidationSchema.requireAiOnlyIdentity(schema);
+            return false;
+        }
+        StoreIo.run(() -> MongoValidationSchema.verifyLegacyAiOnlyCatalog(connection.database(), budget));
+        return budget.transaction(connection.client(), session -> {
+            var database = connection.database();
+            var currentIdentity = SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database)
+                    .find(session, new Document("_id", "cluster")).first();
+            if (!identity.equals(currentIdentity)) throw MongoValidationSchema.componentIdentityUnverified();
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(database);
+            var current = schemas.find(session, new Document("_id", "config")).first();
+            if (new Document(schema).append(MongoValidationSchema.AI_ONLY, true).equals(current)) return false;
+            if (!schema.equals(current) || schemas.updateOne(session, schema,
+                    new Document("$set", new Document(MongoValidationSchema.AI_ONLY, true))).getMatchedCount() != 1)
+                throw MongoValidationSchema.componentIdentityUnverified();
+            return true;
+        });
     }
 
     /** The caller supplies the trusted Cluster identity from its deployment or installation context. */
@@ -441,7 +489,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     var marker = MongoValidationSchema.configurationMarker(operation.toString(), "PREPARING", 0, scope);
                     if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row))
-                            .append("validation", marker))).getMatchedCount() != 1)
+                            .append("validation", marker)).append("$unset", new Document(MongoValidationSchema.AI_ONLY, ""))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return marker;
                 }
@@ -523,7 +571,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     MongoValidationSchema.requireAbsent(database, MongoValidationSchema.CONFIG);
                     MongoValidationSchema.create(session, database, MongoValidationSchema.CONFIG);
                     var marker = MongoValidationSchema.configurationMarker(operation.toString(), "READY", 0, scope);
-                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row)).append("validation", marker))).getMatchedCount() != 1)
+                    if (schemas.updateOne(session, row, new Document("$set", new Document("installedVersion", MongoValidationSchema.preparedConfigurationVersion(row)).append("validation", marker)).append("$unset", new Document(MongoValidationSchema.AI_ONLY, ""))).getMatchedCount() != 1)
                         throw MongoValidationSchema.refused();
                     return status(marker);
                 }

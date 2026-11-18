@@ -11,6 +11,7 @@ import java.util.*;
 /** Structure checks shared by explicit preparation and load-only validation access. */
 final class MongoValidationSchema {
     static final int VERSION = 2;
+    static final String AI_ONLY = "aiOnly";
     static final int COMPOSED_CONFIGURATION_VERSION = 3;
     static final String QUERY_INDEX_VERSION = "queryIndexVersion";
     static final int CURRENT_QUERY_INDEX_VERSION = 1;
@@ -195,13 +196,27 @@ final class MongoValidationSchema {
     }
 
     /** Only unclassified version two needs namespace evidence to distinguish the existing feature formats. */
-    static void requireAiOnlyIdentity(MongoDatabase database) {
+    static void verifyLegacyAiOnlyCatalog(MongoDatabase database, MongoReadBudget budget) {
         var expected = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.collectionName();
         var candidates = new ArrayList<>(CONFIG.stream().map(SystemCollections::collectionName).toList());
         candidates.add(expected);
-        var found = MongoCollectionMetadata.matching(database, candidates);
+        var found = MongoCollectionMetadata.matching(budget.database(database), candidates, true);
         if (found.size() != 1 || !expected.equals(found.getFirst().getString("name"))
-                || !"collection".equals(found.getFirst().getString("type"))) throw unreadable("version");
+                || !"collection".equals(found.getFirst().getString("type"))) throw componentIdentityUnverified();
+    }
+
+    static boolean isAiOnlyVersion(Document schema) {
+        return Integer.valueOf(VERSION).equals(schema.get("installedVersion")) && !schema.containsKey("validation");
+    }
+
+    static void requireAiOnlyIdentity(Document schema) {
+        if (!schema.containsKey(AI_ONLY))
+            throw new TapstateException(StoreError.CONFIG_COMPONENT_IDENTITY_REQUIRED, Map.of(), null);
+        if (!Boolean.TRUE.equals(schema.get(AI_ONLY))) throw componentIdentityUnverified();
+    }
+
+    static TapstateException componentIdentityUnverified() {
+        return new TapstateException(StoreError.CONFIG_COMPONENT_IDENTITY_UNVERIFIED, Map.of(), null);
     }
 
     static Document configurationMarker(Document schema) {

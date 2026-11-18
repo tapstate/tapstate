@@ -113,19 +113,102 @@ class MongoConfigurationAiProviderSettingsIT {
             }
         });
     }
-    @Test void ambiguousVersionTwoOpenChecksOneNamespaceListAndNoIndexes() {
+    @Test void legacyVersionTwoBackfillsOnceAndReopensWithoutCatalogQueries() {
         fixture((uri, config, raw) -> {
-            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).createIndex(new Document("model", 1));
-            try (var diagnostics = MongoHttpDiagnosticsScope.open();
-                 var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
-                assertThat(reopened.aiProviderSettings().get(OWNER)).isEmpty();
-                var groups = (List<?>) diagnostics.snapshot().get("mongo_groups");
-                assertThat(groups).noneSatisfy(group ->
-                        assertThat(((java.util.Map<?, ?>) group).get("command")).isEqualTo("listIndexes"));
-                assertThat(groups).filteredOn(group -> "listCollections".equals(((java.util.Map<?, ?>) group).get("command")))
-                        .singleElement().satisfies(group ->
-                                assertThat(((java.util.Map<?, ?>) group).get("started")).isEqualTo(1L));
+            config.aiProviderSettings().put(OWNER, setting());
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(raw);
+            var key = new Document("_id", "config");
+            schemas.updateOne(key, new Document("$unset", new Document("aiOnly", "")));
+            var legacy = schemas.find(key).first();
+            var revision = SystemCollections.CONFIGURATION_VERSION.on(raw).find().first();
+            var settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThatThrownBy(() -> MongoConfigurationDomain.open(settings, CLUSTER))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.code()).isEqualTo(StoreError.CONFIG_COMPONENT_IDENTITY_REQUIRED));
+                assertThat(catalogCommands(diagnostics)).isEmpty();
             }
+            assertThat(schemas.find(key).first()).isEqualTo(legacy);
+
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThat(MongoConfigurationDomain.prepareConfigComponentIdentity(settings, CLUSTER)).isTrue();
+                assertThat(catalogCommands(diagnostics)).containsExactly("listCollections");
+            }
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThat(MongoConfigurationDomain.prepareConfigComponentIdentity(settings, CLUSTER)).isFalse();
+                assertThat(catalogCommands(diagnostics)).isEmpty();
+            }
+            assertThat(schemas.find(key).first()).isEqualTo(new Document(legacy).append("aiOnly", true));
+            assertThat(SystemCollections.CONFIGURATION_VERSION.on(raw).find().first()).isEqualTo(revision);
+            try (var diagnostics = MongoHttpDiagnosticsScope.open();
+                 var reopened = MongoConfigurationDomain.open(settings, CLUSTER)) {
+                assertThat(catalogCommands(diagnostics)).isEmpty();
+                var mongo = (Map<?, ?>) diagnostics.snapshot().get("mongo");
+                System.out.println("CONFIG_COMPONENT_OPEN mongoCommands=" + mongo.get("started") + " catalogCommands=0");
+                assertThat(reopened.aiProviderSettings().get(OWNER)).contains(setting());
+                assertThat(catalogCommands(diagnostics)).isEmpty();
+            }
+
+            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).drop();
+            try (var diagnostics = MongoHttpDiagnosticsScope.open();
+                 var reopened = MongoConfigurationDomain.openExisting(settings)) {
+                assertThat(catalogCommands(diagnostics)).isEmpty();
+                var mongo = (Map<?, ?>) diagnostics.snapshot().get("mongo");
+                System.out.println("CONFIG_COMPONENT_OPEN_EXISTING mongoCommands=" + mongo.get("started") + " catalogCommands=0");
+                assertThat(reopened.aiProviderSettings().get(OWNER)).isEmpty();
+                assertThat(catalogCommands(diagnostics)).isEmpty();
+            }
+        });
+    }
+
+    private static List<String> catalogCommands(MongoHttpDiagnosticsScope diagnostics) {
+        var snapshot = diagnostics.snapshot();
+        assertThat(snapshot).containsEntry("complete", true);
+        return ((List<?>) snapshot.get("mongo_groups")).stream()
+                .map(group -> (String) ((Map<?, ?>) group).get("command"))
+                .filter(name -> name.equals("listCollections") || name.equals("listIndexes") || name.equals("getMore"))
+                .toList();
+    }
+
+    @Test void markerChangedDuringCatalogReadRefusesBackfill() {
+        fixture((uri, config, raw) -> {
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(raw);
+            var key = new Document("_id", "config");
+            schemas.updateOne(key, new Document("$unset", new Document("aiOnly", "")));
+            var legacy = schemas.find(key).first();
+            var changed = new java.util.concurrent.atomic.AtomicBoolean();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                if (command.equals("listCollections") && changed.compareAndSet(false, true)) {
+                    schemas.updateOne(key, new Document("$set", new Document("fixtureConcurrentChange", true)));
+                }
+            });
+            try {
+                var settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+                assertThatThrownBy(() -> MongoConfigurationDomain.prepareConfigComponentIdentity(settings, CLUSTER))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                            assertThat(error.code()).isEqualTo(StoreError.CONFIG_COMPONENT_IDENTITY_UNVERIFIED));
+            } finally {
+                MongoCommandObservation.COLLECTIONS.remove();
+            }
+            assertThat(changed).isTrue();
+            assertThat(schemas.find(key).first()).isEqualTo(new Document(legacy).append("fixtureConcurrentChange", true));
+        });
+    }
+
+    @Test void absentLegacyAiNamespaceRequiresManualReviewWithoutPublishingIdentity() {
+        fixture((uri, config, raw) -> {
+            var schemas = SystemCollections.SCHEMA_MIGRATIONS.on(raw);
+            var key = new Document("_id", "config");
+            schemas.updateOne(key, new Document("$unset", new Document("aiOnly", "")));
+            var legacy = schemas.find(key).first();
+            SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).drop();
+            var settings = new MongoConnectionSettings(uri, null, Duration.ofSeconds(5));
+            assertThatThrownBy(() -> MongoConfigurationDomain.prepareConfigComponentIdentity(settings, CLUSTER))
+                    .isInstanceOfSatisfying(TapstateException.class, error ->
+                        assertThat(error.code()).isEqualTo(StoreError.CONFIG_COMPONENT_IDENTITY_UNVERIFIED));
+            assertThat(schemas.find(key).first()).isEqualTo(legacy);
+            assertThat(raw.listCollectionNames()).doesNotContain("ai_provider_settings");
         });
     }
 
