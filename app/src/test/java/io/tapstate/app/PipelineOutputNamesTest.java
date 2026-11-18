@@ -13,6 +13,8 @@ import java.time.ZoneOffset;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.dsl.PipelineInputs;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -523,9 +525,11 @@ class PipelineOutputNamesTest {
         assertThat(rows.stream().filter(row -> row.location().collection().equals("out_customers")).findFirst().orElseThrow().status().eventAgeSeconds()).isEqualTo(901);
     }
 
-    @Test
-    void aMaterializedAssemblyKeepsRootAndLookupInputLineage() {
-        for (String transform : List.of("""
+    @ParameterizedTest
+    @ValueSource(strings = {"nest", "join"})
+    void aMaterializedAssemblyKeepsRootAndLookupInputLineage(String assembly) {
+        boolean nest = assembly.equals("nest");
+        String transform = nest ? """
                 transforms:
                   - id: assembled
                     type: nest
@@ -534,31 +538,35 @@ class PipelineOutputNamesTest {
                       from: o
                       key: [id]
                       embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
-                """, """
+                """ : """
                 transforms:
                   - id: assembled
                     type: join
                     from: {o: orders, c: customers}
                     engine: builtin
                     sql: SELECT o.id FROM o LEFT JOIN c ON o.customer_id = c.id
-                """)) {
-            var store = sources();
-            var pipeline = pipeline(store, transform + """
-                    serve:
-                      from: assembled
-                      sync: [{id: sink, source: target, rename: {prefix: shaped_}}]
-                    """);
-            var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
-            var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
-            var output = description.names().outputs().getFirst();
-            assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
-                    new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
-            lag(store, Map.of("assembled", 900L, "orders", 1L, "customers", 900L, "unrelated", 9999L));
-            var status = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status();
-            assertThat(status.state()).isEqualTo("fresh");assertThat(status.eventAgeSeconds()).isEqualTo(901);
-            lag(store, Map.of("orders", 1L));
-            assertThat(catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list().getFirst().status().reason()).isEqualTo("measurement-unavailable");
-        }
+                """;
+        var store = sources();
+        var pipeline = pipeline(store, transform + """
+                serve:
+                  from: assembled
+                  sync: [{id: sink, source: target, rename: {prefix: shaped_}}]
+                """);
+        var resources = store.artifacts().list().stream().collect(java.util.stream.Collectors.toMap(io.tapstate.core.model.Resource::id, value -> value));
+        var description = new StoreBackedPipelineOutputNames(store, false).describe(pipeline, resources);
+        var output = description.names().outputs().getFirst();
+        assertThat(description.inputs().get(output.identity())).containsExactlyInAnyOrder(
+                new PipelineInputs.Input("src", "orders"), new PipelineInputs.Input("src", "customers"));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+
+        lag(store, Map.of("assembled", 5L, "orders", 1L, "customers", 900L, "unrelated", 9999L));
+        var status = query.list().getFirst().status();
+        assertThat(status.state()).isEqualTo("fresh");
+        assertThat(status.eventAgeSeconds()).isEqualTo(nest ? 6L : 901L);
+        assertThat(status.aggregation()).isEqualTo(nest ? null : "max-input-table-event-age");
+
+        lag(store, nest ? Map.of("orders", 1L, "customers", 900L) : Map.of("assembled", 5L, "orders", 1L));
+        assertThat(query.list().getFirst().status().reason()).isEqualTo("measurement-unavailable");
     }
 
     @Test
@@ -625,6 +633,54 @@ class PipelineOutputNamesTest {
                     assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
                     assertThat(row.status().eventAgeSeconds()).isNull();
                 });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"managed", "target"})
+    void aNestViewRequiresExclusiveWritesToItsStoreAndCollection(String syncStore) {
+        var store = sources();
+        store.artifacts().save(new DslParser().parse("""
+                version: tapstate/v1
+                kind: source
+                id: managed
+                metadata: {labels: {store: "true"}}
+                connector: mongodb
+                config: {uri: "mongodb://localhost/views"}
+                """));
+        pipeline(store, """
+                transforms:
+                  - id: assembled
+                    type: nest
+                    from: {o: orders, c: customers}
+                    root:
+                      from: o
+                      key: [id]
+                      embed: [{from: c, on: {id: customer_id}, as: object, path: customer}]
+                view: {id: combined, from: assembled, primary_key: id}
+                serve:
+                  from: customers
+                  sync: [{id: sink, source: %s, rename: {map: {customers: combined}}}]
+                """.formatted(syncStore));
+        lag(store, Map.of("assembled", 5L, "orders", 1L, "customers", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+
+        assertThat(rows).hasSize(2).allSatisfy(row ->
+                assertThat(row.location().collection()).isEqualTo("combined"));
+        assertThat(rows).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:combined");
+            assertThat(row.location().storeId()).isEqualTo("managed");
+            if (syncStore.equals("managed")) {
+                assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+                assertThat(row.status().eventAgeSeconds()).isNull();
+            } else {
+                assertThat(row.status().reason()).isEqualTo("observed");
+                assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+            }
+        }).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:sink:customers");
+            assertThat(row.location().storeId()).isEqualTo(syncStore);
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(901);
+        });
     }
 
     @Test

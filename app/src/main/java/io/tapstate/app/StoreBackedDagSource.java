@@ -3904,7 +3904,7 @@ final class StoreBackedDagSource implements DagSource {
                 if (sync) outputs.addAll(syncOutputNames(pipeline, partial, resources != null, inputs, outputStreams));
                 if (resources != null) {
                     qualifiedTables = qualifiedTables(pipeline, partial);
-                    nestMeasurements = nestMeasurements(pipeline, partial, inputs, outputStreams);
+                    nestMeasurements = nestMeasurements(pipeline, partial, inputs, outputs, outputStreams);
                 }
             } catch (TapstateException unavailable) {
                 unresolved.add(outputProblem(pipeline, unavailable));
@@ -3915,25 +3915,34 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private static Map<String, PipelineOutputNames.NestMeasurement> nestMeasurements(PipelineResource pipeline, PartialOutputStreams partial,
-            Map<String, Set<PipelineInputs.Input>> inputs, Map<String, Set<String>> outputStreams) {
-        Map<String, Integer> consumers = new HashMap<>();
-        outputStreams.values().forEach(streams -> streams.forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
+            Map<String, Set<PipelineInputs.Input>> inputs, List<PipelineOutputNames.Output> outputs,
+            Map<String, Set<String>> outputStreams) {
         Set<String> nestSteps = partial.assemblies.stream()
                 .filter(stream -> stepOf(pipeline, stream) instanceof Step.Inline step
                         && step.body() instanceof TransformBody.Nest)
                 .collect(java.util.stream.Collectors.toUnmodifiableSet());
+        if (nestSteps.isEmpty()) return Map.of();
+
+        Map<String, Integer> consumers = new HashMap<>();
+        outputStreams.values().forEach(streams -> streams.forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
+        record Target(String store, String collection) { }
+        Map<Target, Integer> writers = new HashMap<>();
+        outputs.forEach(output -> writers.merge(new Target(output.connection(), output.table()), 1, Integer::sum));
         Set<String> sourceStreams = partial.vertices.values().stream().map(SourceVertex::stream)
                 .collect(java.util.stream.Collectors.toUnmodifiableSet());
         Map<String, PipelineOutputNames.NestMeasurement> result = new LinkedHashMap<>();
-        outputStreams.forEach((identity, streams) -> {
-            if (java.util.Collections.disjoint(streams, nestSteps)) return;
+        for (var output : outputs) {
+            String identity = output.identity();
+            Set<String> streams = outputStreams.getOrDefault(identity, Set.of());
+            if (java.util.Collections.disjoint(streams, nestSteps)) continue;
             // A stream-keyed sample cannot separate sinks or cover another stream in the same collection.
-            String key = streams.size() == 1 && !inputs.getOrDefault(identity, Set.of()).isEmpty()
+            var target = new Target(output.connection(), output.table());
+            String key = writers.get(target) == 1 && streams.size() == 1 && !inputs.getOrDefault(identity, Set.of()).isEmpty()
                     ? streams.stream().filter(stream -> consumers.get(stream) == 1 && !sourceStreams.contains(stream))
                             .findFirst().orElse(null)
                     : null;
             result.put(identity, new PipelineOutputNames.NestMeasurement(key));
-        });
+        }
         return result;
     }
 
