@@ -63,6 +63,11 @@ def values(value):
     return value if isinstance(value, list) else [value]
 
 
+def case_listing(case):
+    status = "qualification-ready" if case["id"] in RUNNABLE else "definition-only"
+    return {**case, "execution_status": status}
+
+
 def identity(catalog):
     return {key: catalog[key] for key in ("code_sha", "catalog_sha256", "schema_version", "source_dirty")}
 
@@ -327,7 +332,7 @@ def main():
         binding = identity(catalog)
         if args.command == "describe":
             selected = select(catalog["cases"], [args.id], [], "all")[0]
-            print(json.dumps({"identity": binding, "case": selected}, indent=2)
+            print(json.dumps({"identity": binding, "case": case_listing(selected)}, indent=2)
                   if args.format == "json" else definitions.render_markdown(catalog, selected))
             return 0
         if args.command == "run" and args.manifest:
@@ -340,7 +345,8 @@ def main():
             if args.offset < 0:
                 raise ValueError("Offset must be nonnegative")
             page = cases[args.offset:args.offset + args.limit]
-            result = {"identity": binding, "total": len(cases), "offset": args.offset, "cases": page}
+            result = {"identity": binding, "total": len(cases), "offset": args.offset,
+                      "cases": [case_listing(case) for case in page]}
             print(json.dumps(result, indent=2) if args.format == "json" else format_page(catalog, page, result))
             return 0
         entries = make_entries(cases, args)

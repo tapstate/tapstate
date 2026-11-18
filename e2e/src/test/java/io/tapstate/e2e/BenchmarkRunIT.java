@@ -286,11 +286,10 @@ class BenchmarkRunIT {
         int initial = number(entry, "rows");
         long prepareState = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
-        waitFor(entry, "snapshot state at the target", () -> target.countDocuments() == initial
-                && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
+        waitFor(entry, "settled snapshot state at the target", () -> target.countDocuments() == initial
+                && settled(control) == initial && control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
         verifySame(source, target);
         // Updating an existing key establishes a normal runtime frontier before either CDC measurement.
-        long beforeAnchor = settled(control);
         String preAnchorToken = control.resumePoint(PIPELINE).get("token");
         var key = new BsonDocument("_id", new BsonInt64(1));
         source.updateOne(key, new BsonDocument("$set", new BsonDocument("s0", new BsonString("perf-anchor"))));
@@ -298,7 +297,7 @@ class BenchmarkRunIT {
             var row = target.find(key).first();
             String current = control.resumePoint(PIPELINE).get("token");
             return row != null && new BsonString("perf-anchor").equals(row.get("s0"))
-                    && settled(control) == beforeAnchor + 1 && current != null && !current.equals(preAnchorToken);
+                    && settled(control) == initial + 1 && current != null && !current.equals(preAnchorToken);
         });
         verifySame(source, target);
         evidence.phase("initial_state", prepareState);
