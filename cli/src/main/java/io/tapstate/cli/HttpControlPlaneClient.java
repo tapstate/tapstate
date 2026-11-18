@@ -509,7 +509,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     @Override
     public ApplyOutcome apply(URI baseUrl, String credential, List<LocalDraft> drafts) {
         try {
-            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential)
+            HttpRequest request = authed(baseUrl, "/api/artifacts:apply", credential, heavyTimeout)
                     .header("Content-Type", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(applyBody(drafts), StandardCharsets.UTF_8))
                     .build();
