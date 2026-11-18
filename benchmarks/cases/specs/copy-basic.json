@@ -13,6 +13,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "preparation": "Preload a single deterministic source collection.",
     "backlog_boundary_witness": "Use distinct resume positions for insert, update and delete sharing a timestamp, and exclude an earlier event from the same collection. Verify the sequence and readback independently."
   },

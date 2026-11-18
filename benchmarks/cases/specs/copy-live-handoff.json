@@ -13,6 +13,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "phase_order": [
       "snapshot",
       "cdc"

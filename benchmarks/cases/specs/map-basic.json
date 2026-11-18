@@ -24,6 +24,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "projection": {
       "keep": [
         "id",

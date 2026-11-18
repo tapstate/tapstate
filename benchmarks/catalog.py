@@ -55,7 +55,13 @@ def resolve_case(case, contracts, spec):
             incremental = contracts["incremental"].copy()
             operations = spec["parameters"].get("operations")
             if operations:
-                incremental = {"operations": operations, "mongo_source": incremental["mongo_source"]}
+                incremental = {
+                    "operations": operations,
+                    "mongo_source": incremental["mongo_source"],
+                    "update_mutable_fields_percent": incremental["update_mutable_fields_percent"],
+                }
+            else:
+                incremental["allow_manual_mix_override"] &= spec["parameters"].get("allow_manual_mix_override", False)
             definition["incremental"] = incremental
     if case["phase"] == "snapshot-to-cdc":
         definition["measurements"].update(

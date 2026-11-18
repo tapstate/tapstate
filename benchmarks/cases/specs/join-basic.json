@@ -25,6 +25,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "engine": "builtin",
     "match_percent": 90,
     "dimension_distribution": "uniform",

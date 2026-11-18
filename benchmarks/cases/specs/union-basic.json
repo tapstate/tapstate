@@ -29,6 +29,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "schema": "identical",
     "stream_completion": "every stream independently"
   },

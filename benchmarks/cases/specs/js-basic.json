@@ -23,6 +23,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "transform": {
       "value": "value + 7",
       "label": "prefix with js-"

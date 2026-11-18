@@ -16,11 +16,13 @@
       "receives_changes": true,
       "key_space": "consecutive integers",
       "element_count": 4,
-      "element_key": "element_id",
-      "order_field": "element_index"
+      "element_key": "k",
+      "order_field": "p",
+      "element_value": "v"
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "array_field": "items",
     "width_includes_array": true
   },

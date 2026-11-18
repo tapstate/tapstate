@@ -25,3 +25,27 @@ Run the offline catalog and annotation checks with:
 ```sh
 python3 -B -m unittest discover -s benchmarks/src/test
 ```
+
+## MongoDB source workload
+
+The e2e test harness contains the MongoDB source generator. Pass one catalog row to
+`WorkloadRecipe.fromCatalog`, together with the resolved row count per input and an
+optional Nest fanout for a paired arm. The recipe maps the logical primary key to
+MongoDB's `_id`. It keeps each input's key range disjoint.
+
+Use `MongoWorkloadGenerator.calibrateStringLengths()` for a calibration candidate,
+then pass the chosen lengths to `prepare()` so subsequent runs use the same lengths.
+The caller supplies an isolated source database and owns its cleanup. Preparation
+returns the stored BSON statistics and the time spent writing and reading back.
+
+Each preparation supports one change workload. After establishing reader state, use
+`prewrite()` for a fixed backlog or `inject()` for paced warm-up and measurement
+windows. The source reports contain separate per-stream resume boundaries, operation
+counts, and ordering digests. Retain reports from incomplete phases and inspect their
+submitted, acknowledged and observed counts before using them for measurement.
+
+Run the bounded replica-set witness from the repository root:
+
+```sh
+mvn -pl e2e -am -Dtest=MongoWorkloadGeneratorIT -Dsurefire.failIfNoSpecifiedTests=false test
+```

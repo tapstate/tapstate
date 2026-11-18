@@ -18,6 +18,7 @@
     }
   },
   "parameters": {
+    "allow_manual_mix_override": true,
     "predicate": "id is even",
     "target_snapshot_selectivity_percent": 50
   },
