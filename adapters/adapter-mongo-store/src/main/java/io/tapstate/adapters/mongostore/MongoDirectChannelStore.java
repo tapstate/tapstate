@@ -8,7 +8,6 @@ import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.SourceOrder;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
-import java.time.Duration;
 import java.util.*;
 import java.util.function.BiFunction;
 
@@ -18,24 +17,22 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
     private final MongoDatabase database;
     private final CacheBusinessScope scope;
     private final Runnable requireActive;
-    private final Duration retention;
 
-    MongoDirectChannelStore(MongoClient client,MongoDatabase database,CacheBusinessScope scope,Runnable requireActive,Duration retention) {
+    MongoDirectChannelStore(MongoClient client,MongoDatabase database,CacheBusinessScope scope,Runnable requireActive) {
         this.client = Objects.requireNonNull(client,"client"); this.database = Objects.requireNonNull(database,"database");
         this.scope = Objects.requireNonNull(scope,"scope"); this.requireActive = Objects.requireNonNull(requireActive,"requireActive");
-        this.retention = MongoCacheMetadataStructure.requireRetention(retention);
     }
     @Override public DirectChannelStore guardedBy(Runnable additional) {
         Objects.requireNonNull(additional,"requireActive");
-        return new MongoDirectChannelStore(client,database,scope,() -> { requireActive.run(); additional.run(); },retention);
+        return new MongoDirectChannelStore(client,database,scope,() -> { requireActive.run(); additional.run(); });
     }
     @Override public DirectChannelProgress load(DirectChannelContext context) { return transaction(context,null,(session,held) -> held.value()); }
     @Override public Optional<Control> control(DirectChannelContext context,String table){
         Objects.requireNonNull(context);if(table==null||table.isBlank()||table.length()>512)throw unavailable(context);
         if(!scope.equals(new CacheBusinessScope(context.scope().clusterId(),context.scope().bindingVersion(),context.scope().cacheIncarnation())))throw fenced();
-        var access=new MongoCachePipelineAccess(client,database,context.scope(),null,requireActive,retention);
-        return access.validationControlTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS,session->{
-            new MongoCacheMetadataStructure(database,retention).verifyDirect();MongoPipelineSourcePreparations.requireDirectTable(session,database,context,table);
+        var access=new MongoCachePipelineAccess(client,database,context.scope(),null,requireActive);
+        return access.validationControlTransaction(session -> {
+            MongoPipelineSourcePreparations.requireDirectTable(session,database,context,table);
             var projection=new Document("formatVersion",1).append("revision",1).append("current.epoch",1).append("current.captureFence",1).append("current.pipelineFence",1)
                     .append("currentType",new Document("$type","$current")).append("tablesType",new Document("$type","$tables"))
                     .append("selected",new Document("$in",List.of(new Document("$literal",table),new Document("$ifNull",List.of("$tables",List.of())))));
@@ -229,11 +226,8 @@ public final class MongoDirectChannelStore implements DirectChannelStore {
     private <T> T transaction(DirectChannelContext context,WorkloadClaimFence pipeline,BiFunction<ClientSession,Held,T> action) {
         Objects.requireNonNull(context,"context");
         if (!scope.equals(new CacheBusinessScope(context.scope().clusterId(),context.scope().bindingVersion(),context.scope().cacheIncarnation()))) throw fenced();
-        var access = new MongoCachePipelineAccess(client,database,context.scope(),pipeline,requireActive,retention);
-        return access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS,pipeline != null,session -> {
-            new MongoCacheMetadataStructure(database,retention).verifyDirect();
-            return action.apply(session,held(session,context));
-        });
+        var access = new MongoCachePipelineAccess(client,database,context.scope(),pipeline,requireActive);
+        return access.stateTransaction(pipeline != null, session -> action.apply(session, held(session, context)));
     }
     private static DirectCaptureWindow original(DirectChannelProgress progress,long epoch,WorkloadClaimFence capture,WorkloadClaimFence pipeline) {
         var current = progress.current(); if (current == null || current.epoch() != epoch) return null;

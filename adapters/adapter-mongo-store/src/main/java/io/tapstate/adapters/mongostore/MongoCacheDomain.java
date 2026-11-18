@@ -488,8 +488,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     @Override public io.tapstate.spi.store.DirectChannelStore directChannels(CacheBusinessScope expected,Runnable requireActive) {
         Objects.requireNonNull(requireActive,"requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
-        active.run(); loadBusinessScope(expected); new MongoCacheMetadataStructure(database,rateRetention).verifyDirect();
-        return new MongoDirectChannelStore(client,database,expected,active,rateRetention);
+        active.run(); loadBusinessScope(expected);
+        return new MongoDirectChannelStore(client,database,expected,active);
     }
 
     public io.tapstate.spi.store.SchemaStore schemas(CacheBusinessScope expected, Runnable requireActive) {
@@ -657,7 +657,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
     /** Only the original prepared control header, without positions or operator state materialization. */
     public io.tapstate.core.lifecycle.CheckpointDoc validationPipelineState(io.tapstate.spi.store.PipelineIntentScope scope,Runnable local){
-        return pipelineAccess(scope,null,Objects.requireNonNull(local)).validationControlTransaction(SystemCollections.CACHE_PIPELINE_STATE,
+        return pipelineAccess(scope,null,Objects.requireNonNull(local)).validationControlTransaction(
                 (session,state)->MongoStateStore.toCheckpoint(state));
     }
 

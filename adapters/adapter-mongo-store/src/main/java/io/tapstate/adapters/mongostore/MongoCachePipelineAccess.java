@@ -84,6 +84,17 @@ final class MongoCachePipelineAccess {
 
     <T> T transaction(Function<ClientSession, T> action) { return transaction(TRANSACTION, action); }
 
+    <T> T stateTransaction(boolean mutation, Function<ClientSession, T> action) {
+        return transaction(session -> {
+            var current = state(session, true);
+            if (mutation) {
+                proveClaim(session, true);
+                updateState(session, current, new Document(), false);
+            }
+            return action.apply(session);
+        });
+    }
+
     private <T> T transaction(TransactionOptions options, Function<ClientSession, T> action) {
         return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
@@ -220,10 +231,10 @@ final class MongoCachePipelineAccess {
         });
     }
     /** Read-only control header access; never materializes Pipeline positions or operator bodies. */
-    <T> T validationControlTransaction(SystemCollections table,Function<ClientSession,T> action){
-        return validationControlTransaction(table,(session,state)->action.apply(session));
+    <T> T validationControlTransaction(Function<ClientSession,T> action){
+        return validationControlTransaction((session,state)->action.apply(session));
     }
-    <T> T validationControlTransaction(SystemCollections table,java.util.function.BiFunction<ClientSession,Document,T> action){
+    <T> T validationControlTransaction(java.util.function.BiFunction<ClientSession,Document,T> action){
         return transaction(session->{
             var state=MongoValidationMetadata.read(session,SystemCollections.CACHE_PIPELINE_STATE.on(database),new Document("_id",scope.pipelineId()),
                     new Document("scope",1).append("epoch",1).append("runtimeWriteFence",1).append("stateJson",1).append("touchMillis",1),64*1024);
@@ -231,11 +242,10 @@ final class MongoCachePipelineAccess {
             if(!(state.get("epoch") instanceof Long epoch)||epoch<0||epoch==Long.MAX_VALUE
                     ||!(state.get("runtimeWriteFence") instanceof Long revision)||revision<1||revision==Long.MAX_VALUE
                     ||!(state.get("stateJson") instanceof String)||!(state.get("touchMillis") instanceof Long))throw unreadable("checkpoint");
-            MongoCacheWorkloadClaimStore.requireCollection(database);
             var key=new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,scope.pipelineId());
             var claim=MongoValidationMetadata.read(session,SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database),new Document("_id",MongoWorkloadClaimStore.id(key)),
                     MongoValidationMetadata.claimProjection("pipelineScope","pipelinePreparation"),64*1024);
-            requirePreparedClaim(session,claim);new MongoCacheMetadataStructure(database,rateRetention).verifyFacet(table);return action.apply(session,state);
+            requirePreparedClaim(session,claim);return action.apply(session,state);
         });
     }
 

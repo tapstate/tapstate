@@ -491,7 +491,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         new MongoCacheMetadataStructure(database, retention).verifyDirect();
                         var pipeline = originals.get(direct.original().context().scope());
                         if (pipeline == null) throw fenced();
-                        new MongoDirectChannelStore(client, database, scope, requireActive, retention)
+                        new MongoDirectChannelStore(client, database, scope, requireActive)
                                 .editPosition(session, direct.original(), direct.token(), at, direct.capture(), pipeline);
                     }
                 }
