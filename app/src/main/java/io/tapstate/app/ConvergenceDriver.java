@@ -208,6 +208,18 @@ final class ConvergenceDriver {
                     var logDiagnostic = original == null ? failure.diagnostic()
                             : io.tapstate.core.logging.FailureLogSnapshot.of(new io.tapstate.core.common.FailureFact(
                                     original, failure.diagnostic(), result.publicFailure()));
+                    if (PipelineFailures.isCoded(original) && !logDiagnostic.containsKey("code")) {
+                        // The current coded primary is an observed fact, even when no connector was opened.
+                        var fields = new java.util.LinkedHashMap<String, Object>(logDiagnostic);
+                        fields.put("code", failure.code());
+                        fields.put("codeSource", io.tapstate.core.common.DiagnosticCodeSource.TAPSTATE_STANDARD);
+                        fields.put("params", failure.params());
+                        var rendered = io.tapstate.messages.MessageCatalog.bundled().render(failure.code(),
+                                new java.util.LinkedHashMap<String, Object>(failure.params()));
+                        fields.put("message", rendered.message());
+                        if (rendered.solution() != null && !rendered.solution().isBlank()) fields.put("solution", rendered.solution());
+                        logDiagnostic = io.tapstate.core.logging.LogDiagnosticProjection.fit(fields);
+                    }
                     var logParams = PipelineFailures.isCoded(original) ? failure.params()
                             : Map.of("pipeline", pipelineId, "cause", original == null ? "unknown" : original.getClass().getName());
                     LOG.atWarn().addKeyValue("diagnostic", logDiagnostic)

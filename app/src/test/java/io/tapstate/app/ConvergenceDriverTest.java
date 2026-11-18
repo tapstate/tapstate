@@ -303,7 +303,33 @@ class ConvergenceDriverTest {
         }
 
         assertThat(sink.tail("orders")).extracting(LogLine::level).contains("WARN");
+        assertThat(sink.tail("orders")).allSatisfy(line -> assertThat(line.diagnostic()).doesNotContainKey("code"));
         assertThat(state.read("orders").orElseThrow().stateJson()).isEqualTo(StateJson.of(FAILED));
+    }
+
+    @Test
+    void aFirstPartyFailureWithoutConnectorContextKeepsItsStructuredLogCode() {
+        var logger = (Logger) LoggerFactory.getLogger(ConvergenceDriver.class);
+        var captured = new ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent>();
+        captured.start(); logger.addAppender(captured);
+        var actuator = new FailingActuator();
+        var current = new PipelineConverger(desired, state, actuator, Clock.fixed(T0, ZoneOffset.UTC));
+        var driver = new ConvergenceDriver(current, desired, new ObservationPublisher(state, observations));
+        var code = ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED;
+        try {
+            desired.save(new DesiredState("orders", RUNNING, "rev-1")); driver.reconcile();
+            actuator.fact = new io.tapstate.core.common.FailureFact(new io.tapstate.core.common.TapstateException(
+                    code, Map.of("source", "original_source"), null));
+            driver.reconcile();
+        } finally { logger.detachAppender(captured); captured.stop(); }
+        assertThat(captured.list).singleElement().satisfies(event -> {
+            var diagnostic = PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor());
+            assertThat(diagnostic).containsEntry("code", code.code()).containsEntry("codeSource", "tapstate-standard")
+                    .containsEntry("params", Map.of("source", "original_source"));
+            assertThat(diagnostic.get("message")).asString().contains("original_source");
+            assertThat(diagnostic.get("stackTrace")).asString().contains("TapstateException");
+        });
+        assertThat(observations.read("orders").orElseThrow().failure().code()).isEqualTo(code.code());
     }
 
     @Test
@@ -318,7 +344,7 @@ class ConvergenceDriverTest {
         var raw = new io.tapstate.core.common.TapstateException(code,
                 Map.of("connector", "fixture", "detail", "log-secret"), new IllegalStateException("log-secret"));
         var safe = Map.of("connector", "fixture", "detail", "access denied");
-        var diagnostic = Map.<String, Object>of("code", code.code(), "codeSource", "tapstate-standard", "params", safe);
+        var diagnostic = Map.<String, Object>of("code", code.code(), "codeSource", "tapstate-standard", "params", safe, "message", "captured connector message");
         try {
             desired.save(new DesiredState("orders", RUNNING, "rev-1")); driver.reconcile();
             actuator.fact = new io.tapstate.core.common.FailureFact(raw, diagnostic,
@@ -326,6 +352,8 @@ class ConvergenceDriverTest {
             driver.reconcile();
         } finally { logger.detachAppender(captured); captured.stop(); }
         assertThat(captured.list).singleElement().satisfies(event -> {
+            assertThat(PipelineLogAppender.diagnostic(event, new io.tapstate.core.logging.SecretRedactor()))
+                    .containsAllEntriesOf(diagnostic);
             assertThat(event.getThrowableProxy()).isNull();
             assertThat(event.getFormattedMessage()).contains(code.code(), "access denied").doesNotContain("log-secret");
         });
