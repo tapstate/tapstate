@@ -683,6 +683,52 @@ class PipelineOutputNamesTest {
         });
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"orders", "forwarded"})
+    void aPassthroughNestUsesTheStreamItsSinkConfirms(String root) {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - {id: forwarded, type: nest, from: {o: orders}, root: {from: o, key: [id]}}
+                  - {id: materialized, type: nest, from: {o: %s}, root: {from: o, key: [id]}}
+                view: {id: combined, from: materialized, primary_key: id}
+                """.formatted(root));
+        var query = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC));
+
+        lag(store, Map.of("orders", 5L, "materialized", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().reason()).isEqualTo("observed");
+            assertThat(row.status().eventAgeSeconds()).isEqualTo(6);
+        });
+
+        lag(store, Map.of("materialized", 900L));
+        assertThat(query.list()).singleElement().satisfies(row -> {
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
+    @Test
+    void aPassthroughNestRequiresAnExclusiveSinkForItsRootStream() {
+        var store = sources();
+        pipeline(store, """
+                transforms:
+                  - {id: forwarded, type: nest, from: {o: orders}, root: {from: o, key: [id]}}
+                view: {id: combined, from: forwarded, primary_key: id}
+                serve:
+                  from: orders
+                  sync: [{id: sink, source: target}]
+                """);
+        lag(store, Map.of("orders", 5L, "forwarded", 900L));
+        var rows = catalog(store, Clock.fixed(LAG_AT.plusSeconds(1), ZoneOffset.UTC)).list();
+
+        assertThat(rows).anySatisfy(row -> {
+            assertThat(row.id()).isEqualTo("p:combined");
+            assertThat(row.status().reason()).isEqualTo("measurement-unavailable");
+            assertThat(row.status().eventAgeSeconds()).isNull();
+        });
+    }
+
     @Test
     void sameNamedTablesInDifferentSourcesRequireTheirOriginalQualifiedMeasurement() {
         var store = sources();

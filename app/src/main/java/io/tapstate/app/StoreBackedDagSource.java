@@ -2911,15 +2911,18 @@ final class StoreBackedDagSource implements DagSource {
             Set<String> stepIds) {
         Map<String, Set<String>> passedOn = new LinkedHashMap<>();
         for (Step step : pipeline.transforms() == null ? List.<Step>of() : pipeline.transforms()) {
-            if (step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
-                    && (nest.root().embed() == null || nest.root().embed().isEmpty())
-                    && inline.from() instanceof FromClause.Aliases aliases
-                    && aliases.aliases().get(nest.root().from()) != null) {
-                passedOn.put(step.id(), streamsReaching(pipeline, aliases.aliases().get(nest.root().from()),
+            FromRef root = passthroughNestRoot(step);
+            if (root != null) {
+                passedOn.put(step.id(), streamsReaching(pipeline, root,
                         sourceKeyByTable, sourceKeysById, sourceVertices, stepIds));
             }
         }
         return passedOn;
+    }
+
+    private static FromRef passthroughNestRoot(Step step) {
+        return step instanceof Step.Inline inline && inline.body() instanceof TransformBody.Nest nest
+                && (nest.root().embed() == null || nest.root().embed().isEmpty()) ? assemblyRoot(step) : null;
     }
 
     /**
@@ -3924,12 +3927,11 @@ final class StoreBackedDagSource implements DagSource {
         if (nestSteps.isEmpty()) return Map.of();
 
         Map<String, Integer> consumers = new HashMap<>();
-        outputStreams.values().forEach(streams -> streams.forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
+        outputStreams.values().forEach(streams -> streams.stream().map(partial::arrivingStream).distinct()
+                .forEach(stream -> consumers.merge(stream, 1, Integer::sum)));
         record Target(String store, String collection) { }
         Map<Target, Integer> writers = new HashMap<>();
         outputs.forEach(output -> writers.merge(new Target(output.connection(), output.table()), 1, Integer::sum));
-        Set<String> sourceStreams = partial.vertices.values().stream().map(SourceVertex::stream)
-                .collect(java.util.stream.Collectors.toUnmodifiableSet());
         Map<String, PipelineOutputNames.NestMeasurement> result = new LinkedHashMap<>();
         for (var output : outputs) {
             String identity = output.identity();
@@ -3938,7 +3940,8 @@ final class StoreBackedDagSource implements DagSource {
             // A stream-keyed sample cannot separate sinks or cover another stream in the same collection.
             var target = new Target(output.connection(), output.table());
             String key = writers.get(target) == 1 && streams.size() == 1 && !inputs.getOrDefault(identity, Set.of()).isEmpty()
-                    ? streams.stream().filter(stream -> consumers.get(stream) == 1 && !sourceStreams.contains(stream))
+                    ? streams.stream().map(partial::arrivingStream).filter(stream -> consumers.get(stream) == 1
+                            && !(partial.sourceStreams.contains(stream) && partial.assemblies.contains(stream)))
                             .findFirst().orElse(null)
                     : null;
             result.put(identity, new PipelineOutputNames.NestMeasurement(key));
@@ -4021,13 +4024,17 @@ final class StoreBackedDagSource implements DagSource {
         private final Map<String, String> keys;
         private final Map<String, List<String>> sources;
         private final Set<String> steps;
+        private final Set<String> sourceStreams;
         private final Set<String> assemblies = new HashSet<>();
+        private final Map<String, String> forwardedStreams = new HashMap<>();
         private final Map<String, List<String>> resolvedSteps = new LinkedHashMap<>();
 
         private PartialOutputStreams(PipelineResource pipeline, List<PipelineOutputNames.Unresolved> unresolved) {
             this.pipeline = pipeline;
             this.unresolved = unresolved;
             vertices = sourceVertices(pipeline, false, failures);
+            sourceStreams = vertices.values().stream().map(SourceVertex::stream)
+                    .collect(java.util.stream.Collectors.toUnmodifiableSet());
             keys = sourceKeyByTable(vertices);
             sources = sourceKeysById(vertices);
             pipeline.sourceIds().forEach(id -> sources.putIfAbsent(id, List.of()));
@@ -4086,10 +4093,17 @@ final class StoreBackedDagSource implements DagSource {
                 if (roots.size() != 1) return;
                 requireStableAssemblyName(step, roots);
                 assemblies.add(step.id());
+                if (passthroughNestRoot(step) != null) {
+                    forwardedStreams.put(step.id(), arrivingStream(roots.iterator().next()));
+                }
                 streams.add(step.id());
             } else {
                 for (FromRef upstream : refsOf(step.from())) collect(upstream, streams, visiting);
             }
+        }
+
+        private String arrivingStream(String stream) {
+            return sourceStreams.contains(stream) ? stream : forwardedStreams.getOrDefault(stream, stream);
         }
 
         private void requireStableAssemblyName(Step step, Set<String> roots) {
