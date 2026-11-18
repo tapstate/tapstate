@@ -66,6 +66,8 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     private final Duration probeTimeout;
     private final Duration heavyTimeout;
     private final RequestBudget connectionBudget;
+    private final Duration streamPingInterval;
+    private final Duration streamPongTimeout;
     private HttpClient httpClient;
     private final HttpControlClient sharedClient;
 
@@ -83,6 +85,19 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget) {
+        this(probeTimeout, heavyTimeout, connectionBudget, Duration.ofSeconds(5), Duration.ofSeconds(15));
+    }
+
+    HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, Duration pingInterval, Duration pongTimeout) {
+        this(probeTimeout, heavyTimeout, RequestBudget.HEAVY, pingInterval, pongTimeout);
+    }
+
+    private HttpControlPlaneClient(Duration probeTimeout, Duration heavyTimeout, RequestBudget connectionBudget,
+            Duration pingInterval, Duration pongTimeout) {
+        if (pingInterval.isNegative() || pingInterval.isZero() || pongTimeout.isNegative() || pongTimeout.isZero())
+            throw new IllegalArgumentException("stream liveness budgets must be positive");
+        this.streamPingInterval = pingInterval;
+        this.streamPongTimeout = pongTimeout;
         this.probeTimeout = probeTimeout;
         this.heavyTimeout = heavyTimeout;
         this.connectionBudget = connectionBudget;
@@ -2125,11 +2140,12 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         }
         CountDownLatch closed = new CountDownLatch(1);
         AtomicReference<String> refusal = new AtomicReference<>();
+        var liveness = new StreamLiveness(streamPingInterval, streamPongTimeout, closed);
         WebSocket ws;
         try {
             ws = client().newWebSocketBuilder()
                     .header("Authorization", "Bearer " + credential)
-                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal))
+                    .buildAsync(wsUri, new StreamListener(onFrame, closed, refusal, liveness))
                     .join();
         } catch (RuntimeException handshakeFailed) {
             // join() wraps a refused (401/403) or unreachable handshake in a CompletionException (a
@@ -2137,7 +2153,7 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
             sleepUnlessStopped(RECONNECT_BACKOFF, stop);
             return null;
         }
-        awaitClosedOrStop(closed, stop);
+        awaitClosedOrStop(closed, stop, ws, liveness);
         ws.abort();
         if (refusal.get() != null) {
             return refusal.get();
@@ -2166,9 +2182,10 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
     }
 
     /** Waits until the connection closes or {@code stop} is signalled, whichever comes first. */
-    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop) {
+    private static void awaitClosedOrStop(CountDownLatch closed, BooleanSupplier stop, WebSocket socket, StreamLiveness liveness) {
         try {
             while (!stop.getAsBoolean()) {
+                liveness.tick(socket, System.nanoTime());
                 if (closed.await(STOP_POLL.toMillis(), TimeUnit.MILLISECONDS)) {
                     return;
                 }
@@ -2203,11 +2220,20 @@ final class HttpControlPlaneClient implements ControlPlaneClient {
         private final CountDownLatch closed;
         private final AtomicReference<String> refusal;
         private final StringBuilder partial = new StringBuilder();
+        private final StreamLiveness liveness;
 
-        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal) {
+        StreamListener(Consumer<String> onFrame, CountDownLatch closed, AtomicReference<String> refusal, StreamLiveness liveness) {
             this.onFrame = onFrame;
             this.closed = closed;
             this.refusal = refusal;
+            this.liveness = liveness;
+        }
+
+        @Override
+        public CompletionStage<?> onPong(WebSocket socket, java.nio.ByteBuffer payload) {
+            liveness.pong(payload, System.nanoTime());
+            socket.request(1);
+            return null;
         }
 
         @Override
