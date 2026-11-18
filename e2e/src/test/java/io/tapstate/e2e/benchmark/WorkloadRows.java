@@ -131,8 +131,11 @@ final class WorkloadRows {
         int count = Math.max(1, Math.toIntExact(((long) mutable.size() * recipe.updatePercent + 50) / 100));
         var available = new ArrayList<>(mutable);
         var selected = new ArrayList<String>(count);
-        if (available.remove("value")) {
-            selected.add("value");
+        for (String visible : List.of("value", "payload", "score")) {
+            if (input.required().containsKey(visible) && available.remove(visible)) {
+                selected.add(visible);
+                break;
+            }
         }
         while (selected.size() < count) {
             selected.add(available.remove(random.nextInt(available.size())));
