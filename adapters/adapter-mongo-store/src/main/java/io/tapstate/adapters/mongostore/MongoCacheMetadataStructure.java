@@ -123,12 +123,6 @@ final class MongoCacheMetadataStructure {
         }
     }
 
-    void verifySrsRuntime() {
-        var tables = new java.util.ArrayList<>(SRS_TABLES);
-        tables.add(SystemCollections.CACHE_PIPELINE_STATE);
-        verify(tables);
-    }
-
     void verifyDirect() {
         verify(List.of(SystemCollections.CACHE_WORKLOAD_CLAIMS,SystemCollections.DIRECT_CHANNEL_OFFSETS,SystemCollections.DIRECT_BATCHES));
     }

@@ -29,7 +29,7 @@ final class MongoStructureFailureScope {
     private int failedCode;
     private RuntimeException translated;
     private Throwable failedDriver;
-    private record Target(MongoDatabase database, MongoStructureInspection.Namespace namespace) {}
+    private record Target(MongoDatabase database, SystemCollections.Database domain, String physicalName) {}
 
     private MongoStructureFailureScope(MongoClient client, MongoReadBudget budget) {
         this.client = client; this.budget = budget;
@@ -62,7 +62,12 @@ final class MongoStructureFailureScope {
         try {
             var allowance = budget == null ? new MongoReadBudget(Duration.ofSeconds(5)) : budget;
             allowance.remainingMillis();
-            var differences = MongoTargetedStructureInspection.inspect(failed.database(), failed.namespace(), allowance);
+            var descriptors = Arrays.stream(SystemCollections.values())
+                    .filter(table -> table.database() == failed.domain() && table.physicalNames().contains(failed.physicalName())).toList();
+            if (descriptors.size() != 1 || descriptors.getFirst() == SystemCollections.CACHE_PIPELINE_RATE_HISTORY) return original;
+            var namespaces = MongoStructureInspection.namespaces(descriptors, descriptors, Duration.ofDays(15));
+            var namespace = namespaces.stream().filter(item -> item.physicalName().equals(failed.physicalName())).findFirst().orElseThrow();
+            var differences = MongoTargetedStructureInspection.inspect(failed.database(), namespace, allowance);
             if (differences.isEmpty()) return original;
             String description = differences.stream().limit(3).map(MongoStructureInspection.Difference::description)
                     .collect(java.util.stream.Collectors.joining("; "));
@@ -103,13 +108,7 @@ final class MongoStructureFailureScope {
                 if (database == null || !database.getName().equals(event.getDatabaseName())) return;
                 var target = event.getCommand().get(event.getCommandName());
                 if (target == null || !target.isString()) return;
-                String name = target.asString().getValue();
-                var descriptors = Arrays.stream(SystemCollections.values())
-                        .filter(table -> table.database() == domain && table.physicalNames().contains(name)).toList();
-                if (descriptors.size() != 1 || descriptors.getFirst() == SystemCollections.CACHE_PIPELINE_RATE_HISTORY) return;
-                var namespaces = MongoStructureInspection.namespaces(descriptors, descriptors, Duration.ofDays(15));
-                var namespace = namespaces.stream().filter(item -> item.physicalName().equals(name)).findFirst().orElseThrow();
-                scope.pending = new Target(database, namespace);
+                scope.pending = new Target(database, domain, target.asString().getValue());
                 scope.requestId = event.getRequestId();
             }
             @Override public void commandFailed(CommandFailedEvent event) {

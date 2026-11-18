@@ -295,6 +295,39 @@ class MongoCacheSrsStoresIT {
         });
     }
 
+    @Test void nativeRuntimeKeepsModelAndLogWritesWithoutCatalogQueries() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            f.domain.verifyBusinessReady(f.scope);
+            var index = SystemCollections.SRS_MODELS.indexes().getFirst();
+            SystemCollections.SRS_MODELS.on(f.database).dropIndex(index.indexName());
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                var stores = f.domain.runtimeSrs(f.scope, ACTIVE);
+                var model = f.model();
+                stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+                assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+                assertThat(stores.models().publish(model, f.capture)).isEqualTo(model);
+                assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+                var event = new SrsLogRecord("token", Op.INSERT, 1, null, Map.of("id", 1), 0, f.capture, 1);
+                stores.log().store(RING, 0, event);
+                assertThat(stores.log().load(RING, 0)).contains(event);
+                var context = new SrsConsumerContext(f.consumer(), 1);
+                var member = stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+                assertThat(stores.consumers().pinSnapshot(context, member.revision(), 0,
+                        new SrsSnapshotPin(1, "seam", Map.of("orders", model.key())), prepared.fence())).isTrue();
+                var snapshot = diagnostics.snapshot();
+                assertThat(snapshot).containsEntry("complete", true);
+                assertThat((List<?>) snapshot.get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+            assertThat(f.domain.inspectStructure(f.auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.index()).isEqualTo(index.indexName());
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                    });
+        });
+    }
+
     @Test void actualModelPublicationAndLogReadsSurviveReopeningOnlyTheCacheOwner() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope,ACTIVE); var model = f.model();

@@ -391,17 +391,18 @@ public final class MongoSrsChainStore implements SrsChainStore {
     private static List<String> sorted(Set<String> tables) { return new ArrayList<>(new TreeSet<>(tables)); }
     private static void requireName(String chain) { if (chain == null || chain.isBlank()) throw new IllegalArgumentException("blank mining chain"); }
     private <T> T transaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
+                        MongoStructureFailureScope.beginCallback();
                         requireActive.run(); requireStructure.run(); requireActive.run(); new MongoCacheBusinessIdentity(database, scope).requireReady(session);
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
-        });
+        }));
     }
     private static TapstateException unproven(String chain) { return new TapstateException(IoError.SRS_CHECKPOINT_UNPROVEN, Map.of("chain", chain), null); }
     private static TapstateException unreadable() { return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-chain", "field", "chain-control"), null); }

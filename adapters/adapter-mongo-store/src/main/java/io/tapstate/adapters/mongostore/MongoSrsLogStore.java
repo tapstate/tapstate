@@ -506,47 +506,50 @@ public final class MongoSrsLogStore implements SrsLogStore {
     private <T> T transaction(WorkloadClaimFence fence, boolean leasable, java.util.function.Predicate<MongoSrsLease.Lease> covers,
             java.util.function.BiFunction<ClientSession, Boolean, T> action,
             java.util.function.BiConsumer<MongoSrsLease.Lease, MongoSrsLease.Lease> proved) {
-        boolean leased = leasable && fence != null && models != null && lease.enabled();
-        MongoSrsLease.Lease before = leased ? lease.observe() : null;
-        long startedNanos = System.nanoTime();
-        try {
-            return StoreIo.call(() -> {
-                try {
-                    if (models != null) models.beforeSession();
-                    try (var session = client.startSession()) {
-                        long[] claimRemaining = {0L};
-                        boolean[] validated = {false};
-                        T result = session.withTransaction(() -> {
-                            if (models != null) {
-                                if (leased) models.checkActive();
-                                else models.beforeAttempt(session);
-                            }
-                            if (fence != null) {
-                                if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
-                                    throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> {
+            boolean leased = leasable && fence != null && models != null && lease.enabled();
+            MongoSrsLease.Lease before = leased ? lease.observe() : null;
+            long startedNanos = System.nanoTime();
+            try {
+                return StoreIo.call(() -> {
+                    try {
+                        if (models != null) models.beforeSession();
+                        try (var session = client.startSession()) {
+                            long[] claimRemaining = {0L};
+                            boolean[] validated = {false};
+                            T result = session.withTransaction(() -> {
+                                MongoStructureFailureScope.beginCallback();
+                                if (models != null) {
+                                    if (leased) models.checkActive();
+                                    else models.beforeAttempt(session);
                                 }
-                            }
-                            // A retry or an intervening model publication must not use an invalidated proof.
-                            boolean proving = !leased || !lease.stands(before) || !covers.test(before);
-                            validated[0] = proving;
-                            if (leased && proving) models.beforeAttempt(session);
-                            if (leased && proving) claimRemaining[0] = MongoSrsLease.remainingMillis(workloadClaims, session, fence);
-                            T value = action.apply(session, proving);
-                            if (models != null) {
-                                if (proving) models.checkDomain(session);
-                                else models.checkActive();
-                            }
-                            return value;
-                        }, DURABLE_APPEND);
-                        if (leased && validated[0]) proved.accept(before, lease.proved(before, startedNanos, claimRemaining[0]));
-                        return result;
-                    }
-                } catch (RuntimeException failure) { if (models != null) models.checkActive(); throw failure; }
-            });
-        } catch (RuntimeException failure) {
-            if (leased) lease.drop();
-            throw failure;
-        }
+                                if (fence != null) {
+                                    if (workloadClaims.updateOne(session, WorkloadClaimDocuments.live(fence), PROVE_THE_CLAIM).getMatchedCount() != 1) {
+                                        throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                                    }
+                                }
+                                // A retry or an intervening model publication must not use an invalidated proof.
+                                boolean proving = !leased || !lease.stands(before) || !covers.test(before);
+                                validated[0] = proving;
+                                if (leased && proving) models.beforeAttempt(session);
+                                if (leased && proving) claimRemaining[0] = MongoSrsLease.remainingMillis(workloadClaims, session, fence);
+                                T value = action.apply(session, proving);
+                                if (models != null) {
+                                    if (proving) models.checkDomain(session);
+                                    else models.checkActive();
+                                }
+                                return value;
+                            }, DURABLE_APPEND);
+                            if (leased && validated[0]) proved.accept(before, lease.proved(before, startedNanos, claimRemaining[0]));
+                            return result;
+                        }
+                    } catch (RuntimeException failure) { if (models != null) models.checkActive(); throw failure; }
+                });
+            } catch (RuntimeException failure) {
+                if (leased) lease.drop();
+                throw failure;
+            }
+        });
     }
     private static TapstateException unreadableSplit(String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "srs-log", "field", field), null);

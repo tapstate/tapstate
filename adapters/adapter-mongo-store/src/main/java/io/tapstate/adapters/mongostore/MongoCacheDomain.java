@@ -458,19 +458,6 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return srs(expected, requireActive, true, false);
     }
 
-    private final ThreadLocal<CacheBusinessScope> admittedCaptureStartup = new ThreadLocal<>();
-
-    public <T> T withCaptureStartup(CacheBusinessScope expected, java.util.function.Supplier<T> step) {
-        businessActive();
-        var previous = admittedCaptureStartup.get();
-        admittedCaptureStartup.set(Objects.requireNonNull(expected));
-        try { return step.get(); }
-        finally {
-            if (previous == null) admittedCaptureStartup.remove();
-            else admittedCaptureStartup.set(previous);
-        }
-    }
-
     public io.tapstate.spi.store.SrsStores runtimeSrs(CacheBusinessScope expected, Runnable requireActive) {
         return srs(expected, requireActive, false, true);
     }
@@ -480,11 +467,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
         var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        if (runtime) structure.verifySrsRuntime(); else structure.verifySrs();
+        if (!runtime) structure.verifySrs();
         active.run();
-        Runnable verifyStructure = planning ? () -> {} : () -> {
-            if (!runtime || !expected.equals(admittedCaptureStartup.get())) structure.verifySrs();
-        };
+        Runnable verifyStructure = planning || runtime ? () -> {} : structure::verifySrs;
         var lease = MongoSrsLease.selected();
         var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
         return new io.tapstate.spi.store.SrsStores(

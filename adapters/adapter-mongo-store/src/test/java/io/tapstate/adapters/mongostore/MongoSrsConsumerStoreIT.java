@@ -1785,9 +1785,7 @@ class MongoSrsConsumerStoreIT {
     }
 
     private static MongoSrsConsumerStore runtimeConsumer(MongoClient client, MongoDatabase database) {
-        var structure = new MongoCacheMetadataStructure(database, Duration.ofHours(1));
-        structure.verifySrsRuntime();
-        return MongoSrsConsumerStore.admittedRuntime(client, database, SCOPE, () -> {}, structure::verifySrs);
+        return MongoSrsConsumerStore.admittedRuntime(client, database, SCOPE, () -> {}, () -> {});
     }
 
     @Test void fusedReadKeepsTheHistoricalModelAndItsExactEffectiveRange() {

@@ -968,7 +968,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         // Freeze caller-owned collections before a transaction callback can be retried.
         var requested = new SrsConsumerWriterRun(membershipRevision,fence,runId,expected,Map.of());
         return transaction(session -> {
-            proveProgress(session,context,fence,false); var own = requireOwn(session,context);
+            proveProgress(session,context,fence,runtimeStructure); var own = requireOwn(session,context);
             if (!bound(own.member(),membershipRevision,fence)) return false;
             if (!own.member().tables().equals(requested.expected().keySet())) throw unavailable(context.key().miningChainId());
             var held = own.cursor(); var before = held.writerRun();
@@ -1197,7 +1197,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         }));
     }
     private boolean pinTransaction(MongoCachePipelineAccess pipeline, Function<ClientSession, Boolean> action) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             requireActive.run();
             var attempts = new AtomicInteger();
             try (var session = client.startSession()) {
@@ -1207,9 +1207,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     // retries the commit itself, so it does not repeat the reservation.
                     if (attempt > 0) waitForPinRetry(attempt);
                     requireActive.run();
-                    requireStructure.run();
-                    pipeline.verifyStateStructure();
-                    MongoCacheWorkloadClaimStore.requireCollection(database);
+                    MongoStructureFailureScope.beginCallback();
+                    if (!runtimeStructure) {
+                        requireStructure.run();
+                        pipeline.verifyStateStructure();
+                        MongoCacheWorkloadClaimStore.requireCollection(database);
+                    }
                     requireActive.run();
                     boolean result = action.apply(session);
                     requireActive.run();
@@ -1222,7 +1225,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 requireActive.run();
                 throw failure;
             }
-        });
+        }));
     }
 
     private static void waitForPinRetry(int attempt) {
@@ -1297,7 +1300,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 if (row != null && row.containsKey("pipelineRebuild")) {
                     var access = new MongoCachePipelineAccess(client, database, physical, fence, requireActive);
                     MongoCachePipelineRebuilds.requirePriorMarker(row, physical,
-                            row.get("pipelinePreparation", Document.class).getString("preparationId"), access.state(session));
+                            row.get("pipelinePreparation", Document.class).getString("preparationId"), access.state(session, runtimeStructure));
                     // Only the original explicit rebuild/retirement paths may discard this full's fixed pin.
                     throw fullUnproven(context.key().miningChainId());
                 }
@@ -1517,7 +1520,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         return new View(root, state, members, cursors,membershipRows,cursorRows);
     }
     private void prove(ClientSession session,SrsConsumerContext context,WorkloadClaimFence fence) {
-        prove(session, context, fence, false);
+        prove(session, context, fence, runtimeStructure);
     }
     private void prove(ClientSession session, SrsConsumerContext context, WorkloadClaimFence fence, boolean structureChecked) {
         var pipeline = pipelineAccess(context, fence);
@@ -1573,11 +1576,12 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private <T> T inTransaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     return session.withTransaction(() -> {
+                        MongoStructureFailureScope.beginCallback();
                         requireActive.run();
                         T result = action.apply(session); requireActive.run(); return result;
                     }, TRANSACTION);
@@ -1589,7 +1593,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 }
                 throw failure;
             }
-        });
+        }));
     }
     private void verifyConsumerStructure() {
         var tables = List.of(SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,

@@ -1004,14 +1004,14 @@ public final class MongoSrsModelStore implements SrsModelStore {
         if (!scope.cacheIncarnation().equals(Objects.requireNonNull(key, "key").cacheIncarnation())) throw businessFenced();
     }
     private <T> T transaction(Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 beforeSession();
                 try (var session = client.startSession()) {
-                    return session.withTransaction(() -> { requireActive.run(); requireStructure.run(); requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
+                    return session.withTransaction(() -> { MongoStructureFailureScope.beginCallback(); requireActive.run(); requireStructure.run(); requireActive.run(); T result = action.apply(session); requireActive.run(); return result; }, TRANSACTION);
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
-        });
+        }));
     }
     private static TapstateException unavailable(SrsModelKey key) { return modelError(IoError.SRS_MODEL_UNAVAILABLE, key); }
     private static TapstateException conflict(SrsModelKey key) { return modelError(IoError.SRS_MODEL_CONFLICT, key); }
