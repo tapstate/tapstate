@@ -84,6 +84,8 @@ public final class MessageCatalog {
             registered = MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isEmpty())
             registered = McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -102,7 +104,8 @@ public final class MessageCatalog {
                 .or(() -> DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> SourceDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+                .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
         if (registered.isPresent()) {
             var text = registered.orElseThrow();
             return Optional.of(new Rendered(text.message(), text.solution()));

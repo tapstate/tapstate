@@ -10,6 +10,21 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class McpResultTest {
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0270001", "schema.column-name-reads-as-a-path"})
+    void documentKeyAdvisoriesRetainSuccessfulApplyAndColumnAttribution(String code) {
+        var params = Map.of("pipeline", "orders", "source", "input", "table", "sales",
+                "column", "price.usd", "target", "output");
+        var result = McpResult.success(Map.of("applied", true,
+                "warnings", List.of(Map.of("code", code, "params", params)))).withWarningText();
+        assertThat(result.error()).isFalse();
+        assertThat(result.body()).containsEntry("applied", true);
+        var warning = (Map<?, ?>) ((List<?>) result.body().get("warnings")).getFirst();
+        assertThat(warning.get("params")).isEqualTo(params);
+        assertThat(warning.get("message")).asString().contains("orders", "sales", "price.usd", "output");
+        assertThat(warning.get("solution")).asString().contains("input", "escaped", "no index");
+    }
+
     @Test
     void warningEnrichmentPreservesUnknownMalformedServerTextAndRejections() {
         var unknown = Map.of("code", "future.warning", "params", Map.of("name", "x"));

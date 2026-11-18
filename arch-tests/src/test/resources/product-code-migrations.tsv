@@ -94,3 +94,4 @@ mcp.connector-spec-unavailable	TS0260001
 mcp.environment-missing	TS0260002
 mcp.invalid-server-response	TS0260003
 mcp.server-rejected	TS0260004
+schema.column-name-reads-as-a-path	TS0270001

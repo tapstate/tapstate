@@ -4140,6 +4140,22 @@ class ReplTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0270001", "schema.column-name-reads-as-a-path"})
+    void documentKeyWarningKeepsAppliedArtifactsAndSuccessfulExit(String code, @TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
+        client.applyOutcome = new ApplyOutcome.Applied(
+                List.of(new ApplyOutcome.Item("src_kfk", "source", "CREATED")),
+                List.of(new ApplyOutcome.Warning(code, Map.of("pipeline", "orders", "source", "input",
+                        "table", "sales", "column", "price.usd", "target", "output"))));
+        SplitHarness h = onlineSplitStreamSession(base, client);
+        assertThat(h.repl().dispatch("apply")).isTrue();
+        assertThat(h.out().toString()).contains("created", "src_kfk").doesNotContain("warning:");
+        assertThat(h.err().toString()).contains("warning:", code, "price.usd", "sales", "output", "escaped", "no index");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0210016", "control.schema-derivation-incomplete"})
     void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(String code, @TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
