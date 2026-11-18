@@ -85,6 +85,10 @@ public final class DecimalComparisonFunctions {
 
     /**
      * Configures the CEL runtime builder with decimal comparison bindings and exact equality.
+     *
+     * <p>Equality fallback for non-decimal operands defaults to {@link CelOptions#DEFAULT} and
+     * standard protobuf message equality. Callers configuring runtime builders with non-default
+     * options should note that non-decimal equality fallback uses default CEL equality behavior.
      */
     public static CelRuntimeBuilder configureRuntime(CelRuntimeBuilder builder) {
         return builder
@@ -164,27 +168,30 @@ public final class DecimalComparisonFunctions {
         if (y instanceof BigDecimal b) {
             return decimalEquals(b, x);
         }
+        if (x instanceof java.math.BigInteger a) {
+            return decimalEquals(new BigDecimal(a), y);
+        }
+        if (y instanceof java.math.BigInteger b) {
+            return decimalEquals(new BigDecimal(b), x);
+        }
         return DEFAULT_EQUALITY.objectEquals(x, y);
     }
 
     private static boolean decimalEquals(BigDecimal dec, Object other) {
         if (other instanceof BigDecimal b) {
-            return dec.compareTo(b) == 0;
+            return compareDecimalDecimal(dec, b, ComparisonOp.EQ);
         }
-        if (other instanceof Long b) {
-            return dec.compareTo(BigDecimal.valueOf(b)) == 0;
+        if (other instanceof java.math.BigInteger b) {
+            return compareDecimalDecimal(dec, new BigDecimal(b), ComparisonOp.EQ);
         }
-        if (other instanceof Integer b) {
-            return dec.compareTo(BigDecimal.valueOf(b)) == 0;
-        }
-        if (other instanceof Double b) {
-            return compareDecimalDouble(dec, b, ComparisonOp.EQ);
-        }
-        if (other instanceof Float b) {
-            return compareDecimalDouble(dec, b.doubleValue(), ComparisonOp.EQ);
+        if (other instanceof Double || other instanceof Float) {
+            return compareDecimalDouble(dec, ((Number) other).doubleValue(), ComparisonOp.EQ);
         }
         if (other instanceof UnsignedLong b) {
             return compareDecimalUint64(dec, b, ComparisonOp.EQ);
+        }
+        if (other instanceof Number n) {
+            return compareDecimalInt64(dec, n.longValue(), ComparisonOp.EQ);
         }
         return DEFAULT_EQUALITY.objectEquals(dec, other);
     }
@@ -234,8 +241,7 @@ public final class DecimalComparisonFunctions {
     }
 
     private static boolean compareInt64Decimal(Long a, BigDecimal b, ComparisonOp op) {
-        int cmp = BigDecimal.valueOf(a).compareTo(b);
-        return evaluateResult(cmp, op);
+        return compareDecimalInt64(b, a, mirror(op));
     }
 
     private static boolean compareDecimalUint64(BigDecimal a, UnsignedLong b, ComparisonOp op) {
@@ -244,11 +250,9 @@ public final class DecimalComparisonFunctions {
     }
 
     private static boolean compareUint64Decimal(UnsignedLong a, BigDecimal b, ComparisonOp op) {
-        int cmp = new BigDecimal(a.bigIntegerValue()).compareTo(b);
-        return evaluateResult(cmp, op);
+        return compareDecimalUint64(b, a, mirror(op));
     }
 
-    @SuppressWarnings("java:S2111")
     private static boolean compareDecimalDouble(BigDecimal decimal, Double d, ComparisonOp op) {
         if (d.isNaN()) {
             return op == ComparisonOp.NE;
@@ -266,30 +270,23 @@ public final class DecimalComparisonFunctions {
                 };
             }
         }
-        int cmp = decimal.compareTo(new BigDecimal(d));
+        int cmp = decimal.compareTo(BigDecimal.valueOf(d));
         return evaluateResult(cmp, op);
     }
 
-    @SuppressWarnings("java:S2111")
     private static boolean compareDoubleDecimal(Double d, BigDecimal decimal, ComparisonOp op) {
-        if (d.isNaN()) {
-            return op == ComparisonOp.NE;
-        }
-        if (Double.isInfinite(d)) {
-            if (d > 0) {
-                return switch (op) {
-                    case GT, GE, NE -> true;
-                    case LT, LE, EQ -> false;
-                };
-            } else {
-                return switch (op) {
-                    case LT, LE, NE -> true;
-                    case GT, GE, EQ -> false;
-                };
-            }
-        }
-        int cmp = new BigDecimal(d).compareTo(decimal);
-        return evaluateResult(cmp, op);
+        return compareDecimalDouble(decimal, d, mirror(op));
+    }
+
+    private static ComparisonOp mirror(ComparisonOp op) {
+        return switch (op) {
+            case LT -> ComparisonOp.GT;
+            case LE -> ComparisonOp.GE;
+            case GT -> ComparisonOp.LT;
+            case GE -> ComparisonOp.LE;
+            case EQ -> ComparisonOp.EQ;
+            case NE -> ComparisonOp.NE;
+        };
     }
 
     private static boolean evaluateResult(int cmp, ComparisonOp op) {

@@ -114,6 +114,44 @@ class FilterTransformTest {
     }
 
     @Test
+    @DisplayName("decimal column compared with fractional double literal behaves exactly")
+    void filtersDecimalColumnWithFractionalLiteral() {
+        TransformPort filterGe = StatelessTransforms.filter("after.amount >= 25.1");
+        TransformPort filterEq = StatelessTransforms.filter("after.amount == 25.1");
+        TransformPort filterGt = StatelessTransforms.filter("after.amount > 25.1");
+
+        Envelope exact = Envelope.insert(1L, "orders", Map.of("id", 1, "amount", new java.math.BigDecimal("25.1000")), null);
+        Envelope slightlyAbove = Envelope.insert(2L, "orders", Map.of("id", 2, "amount", new java.math.BigDecimal("25.1001")), null);
+        Envelope slightlyBelow = Envelope.insert(3L, "orders", Map.of("id", 3, "amount", new java.math.BigDecimal("25.0999")), null);
+
+        assertThat(filterGe.transform(exact)).containsExactly(exact);
+        assertThat(filterEq.transform(exact)).containsExactly(exact);
+        assertThat(filterGt.transform(exact)).isEmpty();
+
+        assertThat(filterGe.transform(slightlyAbove)).containsExactly(slightlyAbove);
+        assertThat(filterEq.transform(slightlyAbove)).isEmpty();
+        assertThat(filterGt.transform(slightlyAbove)).containsExactly(slightlyAbove);
+
+        assertThat(filterGe.transform(slightlyBelow)).isEmpty();
+        assertThat(filterEq.transform(slightlyBelow)).isEmpty();
+        assertThat(filterGt.transform(slightlyBelow)).isEmpty();
+    }
+
+    @Test
+    @DisplayName("decimal filter supports BigInteger column values")
+    void filtersDecimalColumnWithBigIntegerRepresentation() {
+        TransformPort filterGt = StatelessTransforms.filter("after.amount > 24");
+        TransformPort filterEq = StatelessTransforms.filter("after.amount == 25");
+        TransformPort filterLt = StatelessTransforms.filter("after.amount < 25");
+
+        Envelope row = Envelope.insert(1L, "orders", Map.of("id", 1, "amount", new java.math.BigInteger("25")), null);
+
+        assertThat(filterGt.transform(row)).containsExactly(row);
+        assertThat(filterEq.transform(row)).containsExactly(row);
+        assertThat(filterLt.transform(row)).isEmpty();
+    }
+
+    @Test
     @DisplayName("removes a previously matching shipment from the view when its status changes")
     void emitsADeleteWhenAShipmentStopsMatchingTheViewFilter() {
         TransformPort filter = StatelessTransforms.filter("after.status == 'in_transit'");

@@ -57,12 +57,48 @@ class DecimalComparisonFunctionsTest {
     }
 
     @Test
-    void decimalComparedWithInexactDoubleUsesItsBinaryValue() {
-        Map<String, Object> vars = Map.of("dec1", new BigDecimal("0.1"), "d", 0.1);
-        assertThat(eval("dec1 < d", vars)).isTrue();
-        assertThat(eval("d > dec1", vars)).isTrue();
-        assertThat(eval("dec1 != d", vars)).isTrue();
-        assertThat(eval("d != dec1", vars)).isTrue();
+    @DisplayName("decimal vs fractional double literal compares exactly without binary float drift")
+    void decimalVsFractionalDoubleLiteral() {
+        Map<String, Object> vars = Map.of("dec1", new BigDecimal("25.1000"), "d", 25.1);
+        assertThat(eval("dec1 == d", vars)).isTrue();
+        assertThat(eval("d == dec1", vars)).isTrue();
+        assertThat(eval("dec1 >= d", vars)).isTrue();
+        assertThat(eval("d >= dec1", vars)).isTrue();
+        assertThat(eval("dec1 <= d", vars)).isTrue();
+        assertThat(eval("d <= dec1", vars)).isTrue();
+        assertThat(eval("dec1 > d", vars)).isFalse();
+        assertThat(eval("d > dec1", vars)).isFalse();
+        assertThat(eval("dec1 < d", vars)).isFalse();
+        assertThat(eval("d < dec1", vars)).isFalse();
+        assertThat(eval("dec1 != d", vars)).isFalse();
+        assertThat(eval("d != dec1", vars)).isFalse();
+
+        Map<String, Object> pointOne = Map.of("dec1", new BigDecimal("0.1"), "d", 0.1);
+        assertThat(eval("dec1 == d", pointOne)).isTrue();
+        assertThat(eval("d == dec1", pointOne)).isTrue();
+        assertThat(eval("dec1 != d", pointOne)).isFalse();
+        assertThat(eval("d != dec1", pointOne)).isFalse();
+
+        Map<String, Object> slightlyAbove = Map.of("dec1", new BigDecimal("25.100000000000001421"), "d", 25.1);
+        assertThat(eval("dec1 > d", slightlyAbove)).isTrue();
+        assertThat(eval("d < dec1", slightlyAbove)).isTrue();
+        assertThat(eval("dec1 >= d", slightlyAbove)).isTrue();
+        assertThat(eval("dec1 == d", slightlyAbove)).isFalse();
+    }
+
+    @Test
+    @DisplayName("decimal equality supports BigInteger and generic Number instances")
+    void decimalEqualitySupportsBigIntegerAndGenericNumbers() {
+        java.math.BigInteger big25 = new java.math.BigInteger("25");
+        Map<String, Object> varsBigInt = Map.of("dec1", new BigDecimal("25.000"), "dec2", big25);
+        assertThat(eval("dec1 == dec2", varsBigInt)).isTrue();
+        assertThat(eval("dec1 != dec2", varsBigInt)).isFalse();
+        assertThat(eval("dec2 == dec1", varsBigInt)).isTrue();
+        assertThat(eval("dec2 != dec1", varsBigInt)).isFalse();
+
+        Map<String, Object> varsDiff = Map.of("dec1", new BigDecimal("25.0001"), "dec2", big25);
+        assertThat(eval("dec1 == dec2", varsDiff)).isFalse();
+        assertThat(eval("dec1 != dec2", varsDiff)).isTrue();
     }
 
     // ---- Decimal vs Decimal ----------------------------------------------------------------

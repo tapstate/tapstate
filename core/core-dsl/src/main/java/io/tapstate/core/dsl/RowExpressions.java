@@ -60,9 +60,12 @@ import java.util.Set;
  *
  * <p>A tapstate type becomes a CEL type only where CEL represents it exactly. Everything else — an
  * exact fixed-point number, the temporal shapes, a value that is only known to be JSON — becomes a
- * named opaque type instead, which carries the value through unchanged but matches no operator
- * overload, so computing on it is refused and the diagnostic names the type. Guessing an
- * approximation here is exactly the silent conversion the typed check exists to prevent.
+ * named opaque type instead, which carries the value through unchanged without guessing an
+ * approximation. For exact fixed-point numbers ({@link TapstateType#DECIMAL}), safe exact
+ * comparisons (ordering and equality across decimals, integers, unsigned integers, and floating-point
+ * values) are declared, while arithmetic and computed decimal results without declared bounds remain
+ * refused. Other opaque types (temporal shapes, JSON, and unknown) match no operator overloads, so
+ * computing on them is refused and the diagnostic names the type.
  *
  * <p>A column the source model does not carry stays {@code dyn} and compiles. For a source whose
  * model comes from sampling, a column missing from the model is a normal state rather than an error,
@@ -263,6 +266,13 @@ public final class RowExpressions {
         }
         StructType row = StructType.create(ROW_TYPE, ImmutableSet.copyOf(fields.keySet()),
                 name -> Optional.ofNullable(fields.get(name)));
+        // Cross-type equality declarations (==, != between decimal and int/uint/double) are added only
+        // to this validate-time typed environment, never to base(). In base(), ordering declarations
+        // are included so the runtime AST resolves ordering overloads, but cross-type equality is
+        // dispatched at runtime via the catch-all equals(Object, Object) binding (objectEquals).
+        // Adding cross-type equality declarations to base() would cause the untyped compiler to emit
+        // both equals and concrete equals_decimal_* overload candidates, throwing "Ambiguous overloads
+        // for function '_=='" at runtime.
         return envelope(row).addFunctionDeclarations(DecimalComparisonFunctions.crossTypeEqualityDeclarations());
     }
 
@@ -302,7 +312,8 @@ public final class RowExpressions {
             // No exact counterpart: an exact fixed-point number loses its scale in any binary
             // floating point type, a temporal value without a zone cannot become an instant without
             // assuming one, and a JSON value is not known to be any single shape. Each stays a named
-            // opaque type that carries through but matches no overload.
+            // opaque type. DECIMAL provides exact comparison overloads while refusing arithmetic;
+            // temporal, JSON and unknown shapes match no operator overloads.
             case DECIMAL, DATE, TIME, DATETIME, YEAR, JSON, UNKNOWN -> opaqueTypeOf(type);
         };
     }

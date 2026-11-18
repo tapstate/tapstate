@@ -118,6 +118,11 @@ final class RowExpressionProgram {
         if (value instanceof ConvertedValue carried) {
             return bound(carried.value());
         }
+        // BigInteger is classified as DECIMAL in the value model. CEL functions bind tapstate.decimal
+        // to BigDecimal, so adapt BigInteger to BigDecimal so operator overloads match at runtime.
+        if (value instanceof java.math.BigInteger number) {
+            return new java.math.BigDecimal(number);
+        }
         if (value == null) {
             return NullValue.NULL_VALUE;
         }
