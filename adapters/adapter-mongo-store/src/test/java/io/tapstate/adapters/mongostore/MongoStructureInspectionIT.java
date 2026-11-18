@@ -134,4 +134,34 @@ class MongoStructureInspectionIT {
             } finally { database.drop(); }
         }
     }
+    @Test void rejectsARealValidatorWriteAndInspectsItsExactCollectionAfterAbort() {
+        String name = "inspection_validator_" + java.util.UUID.randomUUID().toString().replace("-", "");
+        String uri = MONGO.getReplicaSetUrl(name);
+        try (var admin = com.mongodb.client.MongoClients.create(uri);
+             var connection = MongoConnection.forConfiguration(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)))) {
+            var database = admin.getDatabase(name);
+            try {
+                CAPTURE.prepareCollectionOn(database);
+                database.runCommand(new Document("collMod", CAPTURE.collectionName()).append("validator",
+                        new Document("fixture_required", new Document("$exists", true))));
+                connection.verifyConnectivity();
+                try (var scope = io.tapstate.core.common.OperationErrorDiagnostics.open();
+                     var measurement = MongoHttpDiagnosticsScope.open()) {
+                    org.assertj.core.api.Assertions.assertThatThrownBy(() -> new MongoReadBudget(Duration.ofSeconds(5))
+                            .transaction(connection.client(), session -> {
+                                CAPTURE.on(connection.database()).insertOne(session, new Document("_id", "fixture"));
+                                return null;
+                            })).isInstanceOf(io.tapstate.core.common.TapstateException.class);
+                    assertThat(io.tapstate.core.common.OperationErrorDiagnostics.appendTo("original"))
+                            .contains(name + ".capture_preparations", "COLLECTION_OPTIONS", "custom validator")
+                            .doesNotContain("fixture_required", "createIndex");
+                    var groups = (List<?>) measurement.snapshot().get("mongo_groups");
+                    assertThat(groups.stream().map(row -> (String) ((java.util.Map<?, ?>) row).get("command")))
+                            .containsExactly("insert", "abortTransaction", "listCollections", "listIndexes");
+                }
+                assertThat(CAPTURE.on(database).countDocuments()).isZero();
+            } finally { database.drop(); }
+        }
+    }
+
 }

@@ -207,6 +207,13 @@ final class MongoValidationSchema {
         return marker;
     }
 
+    static Document readyConfiguration(Document schema) {
+        var marker = requireConfiguration(schema, "READY");
+        if (Integer.valueOf(2).equals(marker.get("formatVersion"))
+                && !"READY".equals(marker.get("scheduledAdmission", Document.class).get("phase"))) throw refused();
+        return marker;
+    }
+
     static int preparedConfigurationVersion(Document original) {
         if (Integer.valueOf(1).equals(original.get("installedVersion"))) return VERSION;
         if (Integer.valueOf(VERSION).equals(original.get("installedVersion")) && !original.containsKey("validation"))

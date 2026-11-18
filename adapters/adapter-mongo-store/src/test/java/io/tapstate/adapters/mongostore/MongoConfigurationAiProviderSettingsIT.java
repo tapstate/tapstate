@@ -85,15 +85,32 @@ class MongoConfigurationAiProviderSettingsIT {
             assertThat(rows.find().first()).isEqualTo(saved);
         });
     }
-    @Test void missingStructureAndUnexpectedTtlNeverTriggerLazyCreation() {
+    @Test void ordinarySettingsOperationsLeaveCatalogDamageToInspection() {
         fixture((uri, config, raw) -> {
-            var store = config.aiProviderSettings(); var rows = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw);
-            rows.createIndex(new Document("model", 1), new com.mongodb.client.model.IndexOptions().expireAfter(1L, java.util.concurrent.TimeUnit.SECONDS));
-            assertThatThrownBy(() -> store.get(OWNER)).isInstanceOf(TapstateException.class);
+            var store = config.aiProviderSettings();
+            var rows = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw);
+            rows.createIndex(new Document("model", 1), new com.mongodb.client.model.IndexOptions()
+                    .name("extra_expiry").expireAfter(1L, java.util.concurrent.TimeUnit.SECONDS));
+            store.put(OWNER, setting());
+            assertThat(store.get(OWNER)).contains(setting());
+            assertThat(config.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.index()).isEqualTo("extra_expiry");
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.UNEXPECTED_CONSTRAINT);
+                    });
             rows.drop();
-            assertThatThrownBy(() -> store.get(OWNER)).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(() -> store.put(OWNER, setting())).isInstanceOf(TapstateException.class);
-            assertThat(raw.listCollectionNames().into(new java.util.ArrayList<>())).doesNotContain("ai_provider_settings");
+            assertThat(store.get(OWNER)).isEmpty();
+            assertThat(config.inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.collection()).isEqualTo(rows.getNamespace().getCollectionName());
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+                    });
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                store.put(OWNER, setting());
+                assertThat(store.get(OWNER)).contains(setting());
+                assertThat((List<?>) diagnostics.snapshot().get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((java.util.Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
         });
     }
     @Test void oldSchemaKeepsSourceConfigurationButRefusesProviderAccess() {

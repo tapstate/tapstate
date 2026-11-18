@@ -60,6 +60,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     private final PersistentKey configurationKey;
     private final String clusterId;
     private final int installedSchemaVersion;
+    private final boolean openedWithAiOnlySchema;
     private MongoValidationPreparations validationPreparations;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private record VerifiedAlertSchema(Document marker, long verifiedAt) {}
@@ -88,6 +89,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                     Map.of("installed", String.valueOf(installed), "supported", String.valueOf(SCHEMA_VERSION)), null);
         }
         this.installedSchemaVersion = installed;
+        this.openedWithAiOnlySchema = installed == 2 && !schema.containsKey("validation");
         if (StoreIo.call(() -> MongoValidationSchema.configurationHasValidation(database, schema)))
             StoreIo.run(() -> MongoValidationSchema.requireReady(database, true));
         Document version = facts.version();
@@ -174,6 +176,10 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 .find(new Document("_id", "config")).first());
         var skipped = java.util.EnumSet.noneOf(SystemCollections.class);
         if (schema != null) {
+            var installed = schema.get("installedVersion");
+            if (Integer.valueOf(2).equals(installed) && !schema.containsKey("validation")
+                    || Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(installed))
+                required.add(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS);
             if (schema.get("validation") instanceof Document marker && "READY".equals(marker.getString("phase")))
                 required.addAll(MongoValidationSchema.CONFIG);
             else skipped.addAll(MongoValidationSchema.CONFIG);
@@ -640,7 +646,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     public io.tapstate.spi.store.AiProviderSettingsStore aiProviderSettings() {
         requireOpen();
         return new MongoConfigurationAiProviderSettingsStore(connection.client(), connection.database(), clusterId,
-                configurationKey, this::requireOpen);
+                configurationKey, this::requireOpen, openedWithAiOnlySchema);
     }
 
     public ArtifactStore artifacts() {

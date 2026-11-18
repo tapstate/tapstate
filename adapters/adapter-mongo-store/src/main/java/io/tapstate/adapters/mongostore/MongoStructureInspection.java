@@ -105,8 +105,10 @@ public final class MongoStructureInspection {
         String observed = null;
         if (Boolean.TRUE.equals(options.get("capped"))) observed = "capped";
         else if (options.containsKey("timeseries")) observed = "time series";
-        else if (namespace.descriptor() == SystemCollections.CAPTURE_PREPARATIONS && options.containsKey("collation"))
-            observed = "custom collation";
+        else if (options.containsKey("validator") && !new Document().equals(options.get("validator")))
+            observed = "custom validator";
+        else if (options.containsKey("collation")) observed = "custom collation";
+        else if (options.containsKey("clusteredIndex")) observed = "clustered index";
         return observed == null ? null : difference(database, namespace, null, Problem.COLLECTION_OPTIONS,
                 "supported collection options", observed, null);
     }
@@ -118,8 +120,7 @@ public final class MongoStructureInspection {
         for (var expected : namespace.indexes()) {
             var index = actual.remove(expected.indexName());
             var specification = expectedOptions(expected);
-            boolean ordinaryAlertIndex = MongoAlertStorageSchema.COLLECTIONS.contains(namespace.descriptor());
-            if (ordinaryAlertIndex) specification.append("customCollation", false);
+            specification.append("customCollation", false);
             var definition = new Document("key", expected.keyDocument()).append("options", specification).toJson();
             if (index == null) {
                 boolean equivalent = indexes.stream().anyMatch(row -> sameKey(expected.keyDocument(), row.get("key")));
@@ -129,7 +130,7 @@ public final class MongoStructureInspection {
                 continue;
             }
             var observed = observedOptions(index, expected);
-            if (ordinaryAlertIndex) observed.append("customCollation", index.containsKey("collation"));
+            observed.append("customCollation", index.containsKey("collation"));
             if (!sameKey(expected.keyDocument(), index.get("key")) || !specification.equals(observed)) {
                 differences.add(difference(database, namespace, expected.indexName(), Problem.INDEX_DEFINITION,
                         definition, "key " + observedKey(index.get("key")) + " options " + observed.toJson(), null));

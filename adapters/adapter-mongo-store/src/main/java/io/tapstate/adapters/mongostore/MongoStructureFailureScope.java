@@ -29,7 +29,9 @@ final class MongoStructureFailureScope {
     private int failedCode;
     private RuntimeException translated;
     private Throwable failedDriver;
-    private record Target(MongoDatabase database, SystemCollections.Database domain, String physicalName) {}
+    private record Target(MongoDatabase database, SystemCollections.Database domain, String physicalName, boolean hinted) {
+        boolean structural(int code) { return STRUCTURE_ERRORS.contains(code) || hinted && code == 2; }
+    }
 
     private MongoStructureFailureScope(MongoClient client, MongoReadBudget budget) {
         this.client = client; this.budget = budget;
@@ -108,22 +110,22 @@ final class MongoStructureFailureScope {
                 if (database == null || !database.getName().equals(event.getDatabaseName())) return;
                 var target = event.getCommand().get(event.getCommandName());
                 if (target == null || !target.isString()) return;
-                scope.pending = new Target(database, domain, target.asString().getValue());
+                scope.pending = new Target(database, domain, target.asString().getValue(), event.getCommand().containsKey("hint"));
                 scope.requestId = event.getRequestId();
             }
             @Override public void commandFailed(CommandFailedEvent event) {
                 var scope = CURRENT.get();
                 if (scope != null && scope.client == originalClient.get() && scope.requestId == event.getRequestId()
-                        && event.getThrowable() instanceof MongoException failure && STRUCTURE_ERRORS.contains(failure.getCode()))
+                        && scope.pending != null && event.getThrowable() instanceof MongoException failure && scope.pending.structural(failure.getCode()))
                     { scope.failed = scope.pending; scope.failedCode = failure.getCode(); scope.failedDriver = failure; }
             }
             @Override public void commandSucceeded(CommandSucceededEvent event) {
                 var scope = CURRENT.get();
-                if (scope == null || scope.client != originalClient.get() || scope.requestId != event.getRequestId()) return;
+                if (scope == null || scope.client != originalClient.get() || scope.pending == null || scope.requestId != event.getRequestId()) return;
                 var errors = event.getResponse().getArray("writeErrors", null);
                 if (errors != null) for (var value : errors) {
                     if (value.isDocument() && value.asDocument().get("code") instanceof org.bson.BsonNumber number
-                            && STRUCTURE_ERRORS.contains(number.intValue())) {
+                            && scope.pending.structural(number.intValue())) {
                         scope.failed = scope.pending; scope.failedCode = number.intValue(); break;
                     }
                 }

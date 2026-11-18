@@ -36,7 +36,7 @@ class MongoValidationAiSchemaCompositionIT {
             }
             var before=f.configSchema();SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).drop();
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(()->f.configuration.aiProviderSettings().get(OWNER)).isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.aiProviderSettings().get(OWNER)).isEmpty();
             assertThat(f.configSchema()).isEqualTo(before);assertThat(f.configDb.listCollectionNames()).doesNotContain("ai_provider_settings");
         }
     }
@@ -45,7 +45,13 @@ class MongoValidationAiSchemaCompositionIT {
         try(var f=new MongoValidationSchemaIT.Fixture(1)){
             f.upgrade();assertThat(f.configSchema().getInteger("installedVersion")).isEqualTo(2);
             assertThatThrownBy(()->f.configuration.aiProviderSettings().get(OWNER)).isInstanceOfSatisfying(TapstateException.class,error->assertThat(error.code()).isEqualTo(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED));
-            SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id","config"),new Document("$unset",new Document("validation","")));
+            try (var active = MongoConfigurationDomain.open(f.settings, "cluster")) {
+                SystemCollections.SCHEMA_MIGRATIONS.on(f.configDb).updateOne(new Document("_id", "config"),
+                        new Document("$unset", new Document("validation", "")));
+                assertThatThrownBy(() -> active.aiProviderSettings().put(OWNER, SETTING))
+                        .isInstanceOfSatisfying(TapstateException.class, error ->
+                                assertThat(error.code()).isEqualTo(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED));
+            }
             var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
@@ -91,7 +97,7 @@ class MongoValidationAiSchemaCompositionIT {
             assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(f.configDb).find().first()).isEqualTo(row);
             SystemCollections.VALIDATION_REPORTS.on(f.configDb).drop();var version=SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first();
             assertThatThrownBy(()->MongoConfigurationDomain.open(f.settings,"cluster")).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(()->f.configuration.aiProviderSettings().get(OWNER)).isInstanceOf(TapstateException.class);
+            assertThat(f.configuration.aiProviderSettings().get(OWNER)).contains(SETTING);
             assertThat(SystemCollections.CONFIGURATION_VERSION.on(f.configDb).find().first()).isEqualTo(version);
             assertThat(f.configDb.listCollectionNames()).doesNotContain("validation_reports");
         }

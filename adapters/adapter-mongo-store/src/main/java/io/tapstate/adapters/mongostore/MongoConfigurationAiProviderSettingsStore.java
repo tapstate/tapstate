@@ -34,10 +34,12 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
     private final String cluster;
     private final SourceConfigCipherProvider keys;
     private final Runnable active;
+    private final boolean openedWithAiOnlySchema;
 
     MongoConfigurationAiProviderSettingsStore(MongoClient client, MongoDatabase database, String cluster,
-            SourceConfigCipherProvider keys, Runnable active) {
+            SourceConfigCipherProvider keys, Runnable active, boolean openedWithAiOnlySchema) {
         this.client = client; this.database = database; this.cluster = cluster; this.keys = keys; this.active = active;
+        this.openedWithAiOnlySchema = openedWithAiOnlySchema;
     }
 
     @Override public Optional<Settings> get(String owner) {
@@ -92,24 +94,19 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
         var schema = SystemCollections.SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "config")).first();
         if (schema == null || !Integer.valueOf(2).equals(schema.get("installedVersion"))
                 && !Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))
-                || Integer.valueOf(2).equals(schema.get("installedVersion")) && schema.containsKey("validation"))
+                || Integer.valueOf(2).equals(schema.get("installedVersion")) && (!openedWithAiOnlySchema || schema.containsKey("validation")))
             throw new TapstateException(StoreError.AI_PROVIDER_SCHEMA_UNSUPPORTED,
                     Map.of("required", "2"), null);
-        if (Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion")))
-            MongoValidationSchema.requireReady(database, true);
-        else MongoValidationSchema.configurationHasValidation(database, schema);
+        if (Integer.valueOf(MongoValidationSchema.COMPOSED_CONFIGURATION_VERSION).equals(schema.get("installedVersion"))) {
+            var validation = MongoValidationSchema.readyConfiguration(schema);
+            if (!cluster.equals(MongoValidationSchema.scope(validation).clusterId())) throw invalid("identity");
+        }
         ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(database));
-        structure();
         var found = SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(database).find(session).limit(2).into(new ArrayList<>());
-        structure();
         if (found.size() > 1) throw invalid("owner");
         if (found.isEmpty()) return Optional.empty();
         decode(found.getFirst(), owner, cipher);
         return Optional.of(found.getFirst());
-    }
-
-    private void structure() {
-        verifyStructure(database);
     }
 
     static void verifyStructure(MongoDatabase database) {
@@ -152,13 +149,13 @@ final class MongoConfigurationAiProviderSettingsStore implements AiProviderSetti
             throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", "ai-provider-settings"), null);
     }
     private <T> T transaction(Function<ClientSession,T> operation) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             active.run();
             try (var session = client.startSession()) {
-                T result = session.withTransaction(() -> { active.run(); T value = operation.apply(session); active.run(); return value; }, TX);
+                T result = session.withTransaction(() -> { MongoStructureFailureScope.beginCallback(); active.run(); T value = operation.apply(session); active.run(); return value; }, TX);
                 active.run(); return result;
             }
-        });
+        }));
     }
     private static TapstateException invalid(String field) {
         return new TapstateException(IoError.DOCUMENT_UNREADABLE, Map.of("id", "ai-provider-settings", "field", field), null);
