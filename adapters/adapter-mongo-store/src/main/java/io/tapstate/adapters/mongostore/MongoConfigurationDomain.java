@@ -168,7 +168,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var required = java.util.EnumSet.of(SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP,
                 SystemCollections.STORAGE_BINDING, SystemCollections.CLUSTER_KEYS, SystemCollections.SCHEMA_MIGRATIONS,
                 SystemCollections.CONFIGURATION_VERSION, SystemCollections.CAPTURE_PREPARATIONS, SystemCollections.SOURCES,
-                SystemCollections.PDK_NOTE_SCOPES);
+                SystemCollections.PDK_NOTE_SCOPES, SystemCollections.CONFIGURATION_IMPORTS);
         var schema = StoreIo.call(() -> SystemCollections.SCHEMA_MIGRATIONS.on(budget.database(database))
                 .find(new Document("_id", "config")).first());
         var skipped = java.util.EnumSet.noneOf(SystemCollections.class);

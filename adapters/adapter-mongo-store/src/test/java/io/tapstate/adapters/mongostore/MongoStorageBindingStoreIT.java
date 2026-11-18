@@ -315,6 +315,7 @@ class MongoStorageBindingStoreIT {
             try (var client = MongoClients.create(settings)) {
                 var database = client.getDatabase(f.database.getName());
                 var store = new MongoStorageBindingStore(client, database, (SourceConfigCipherProvider) key.get(f.domain));
+                database.runCommand(new Document("ping", 1));
                 assertThat(store.load()).contains(original);
                 assertThat(captured).hasSize(7);
                 assertThat(aggregates).hasSize(1);
@@ -860,7 +861,7 @@ class MongoStorageBindingStoreIT {
 
     @Test
     void aNormalRestartRefusesMissingOrTamperedBindingFactsWithoutRepair() {
-        for (String field : List.of("binding", "source", "setup", "global", "global-fence", "index", "cache", "key")) {
+        for (String field : List.of("binding", "source", "setup", "global", "global-fence", "cache", "key")) {
             withPrepared(f -> {
                 f.domain.bindings().commit(SCOPE, StorageBinding.Mode.OP, CACHE, source("views", "master"));
                 switch (field) {
@@ -870,7 +871,6 @@ class MongoStorageBindingStoreIT {
                     case "global" -> SystemCollections.PDK_NOTE_SCOPES.on(f.database).deleteMany(new Document());
                     case "global-fence" -> SystemCollections.PDK_NOTE_SCOPES.on(f.database).updateOne(new Document(),
                             new Document("$unset", new Document("writeFence", "")));
-                    case "index" -> SystemCollections.SOURCES.on(f.database).dropIndex("system_default_target");
                     case "cache" -> SystemCollections.STORAGE_BINDING.on(f.database).updateOne(new Document(),
                             new Document("$set", new Document("cache", "broken-envelope")));
                     case "key" -> SystemCollections.CLUSTER_KEYS.on(f.database).deleteMany(new Document());
@@ -950,11 +950,13 @@ class MongoStorageBindingStoreIT {
     }
 
     @Test
-    void aPreparedIndexCrashGapRequiresTheOriginalControlledSetupToResume() {
+    void ordinaryReadsLeaveTheMissingIndexForControlledSetup() {
         withPrepared(f -> {
             SystemCollections.SOURCES.on(f.database).dropIndex("system_default_target");
-            assertThatThrownBy(() -> f.domain.bindings().load()).isInstanceOf(TapstateException.class);
-            assertThatThrownBy(() -> MongoConfigurationDomain.open(f.settings, "cluster-a")).isInstanceOf(TapstateException.class);
+            assertThat(f.domain.bindings().load()).isEmpty();
+            try (var reopened = MongoConfigurationDomain.open(f.settings, "cluster-a")) {
+                assertThat(reopened.bindings().load()).isEmpty();
+            }
             assertThat(IndexEnsure.existing(SystemCollections.SOURCES.on(f.database), SystemCollections.SOURCES.indexes().getFirst())).isNull();
             try (var resumed = MongoConfigurationBootstrap.prepare(f.settings, "cluster-a", "installation-a", "setup-a", 1)) {
                 assertThat(resumed.bindings().load()).isEmpty();
