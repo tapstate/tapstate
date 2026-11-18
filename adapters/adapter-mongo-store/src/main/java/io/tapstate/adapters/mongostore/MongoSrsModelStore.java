@@ -83,12 +83,13 @@ public final class MongoSrsModelStore implements SrsModelStore {
             // Checkpoints take the same claim before the chain; retain that write order during cleanup.
             if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).updateOne(session,WorkloadClaimDocuments.live(fence),PROVE_CAPTURE).getMatchedCount()!=1)throw claimFenced();
             var consumers=new MongoSrsConsumerStore(client,database,scope,requireActive,requireStructure);
-            var pinned=consumers.retainedModels(session,chainId);
-            var chain=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",chainId)).first();
-            if(chain==null || !scope.cacheIncarnation().equals(chain.get("cacheIncarnation")) || !fence.key().resourceId().equals(chain.get("captureId")))throw claimFenced();
-            var state=MongoSrsChainStore.decode(chain,scope,contexts);
-            var checkpoint=state.checkpoint();
-            var protectedKeys=new java.util.HashSet<>(pinned);
+            var retained = consumers.fenceRetainedModels(session, chainId);
+            // The chain write changes only its fence. Its decoded topology is still the one held by this transaction.
+            var chain = retained.chain();
+            if (!fence.key().resourceId().equals(chain.get("captureId"))) throw claimFenced();
+            var state = retained.state();
+            var checkpoint = state.checkpoint();
+            var protectedKeys = new java.util.HashSet<>(retained.pinned());
             if(state.pendingFreshFull()!=null)protectedKeys.addAll(state.pendingFreshFull().models().values());
             if(checkpoint!=null)checkpoint.tables().values().forEach(value -> protectedKeys.add(value.model()));
             long deleted=0;
@@ -464,9 +465,14 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     /** Snapshot pins need exact structural bodies and bounds, without adopting newer models or event ranges. */
     void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys) {
+        requireSnapshotReferences(session, keys, null);
+    }
+
+    void requireSnapshotReferences(ClientSession session, Set<SrsModelKey> keys, Document verifiedChain) {
         if (keys.size() < 2) { for (var key : keys) requireSnapshotReference(session, key); return; }
         var first = keys.iterator().next();
-        var current = currentReferences(session, requireChain(session, first), keys);
+        var chain = verifiedChain == null ? requireChain(session, first) : verifiedChain;
+        var current = currentReferences(session, chain, keys, verifiedChain != null);
         if (current.isEmpty()) { for (var key : keys) requireSnapshotReference(session, key); return; }
         var byId = current.orElseThrow().values().stream().collect(java.util.stream.Collectors.toMap(
                 reference -> MongoSrsLogStore.boundsId(reference.model().ringName()), reference -> reference.model().key()));

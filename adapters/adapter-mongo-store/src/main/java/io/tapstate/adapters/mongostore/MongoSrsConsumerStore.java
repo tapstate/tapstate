@@ -611,16 +611,22 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         requireActive.run(); return safe;
     }
 
-    /** Serializes model reclamation with attach, detach and exact snapshot-pin publication. */
-    Set<io.tapstate.spi.store.SrsModelKey> retainedModels(ClientSession session,String chain) {
-        var held=view(session,chain);var result=new java.util.HashSet<io.tapstate.spi.store.SrsModelKey>();
-        for(var member:held.members().values()) {
-            if(member.detached())continue;
-            var snapshot=held.cursors().get(member.context().key().consumerId()).snapshot();
-            validateSnapshot(session,member.context(),snapshot);
-            if(snapshot!=null)result.addAll(snapshot.models().values());
+    record RetainedModels(Document chain, SrsChainState state, Set<SrsModelKey> pinned) {}
+
+    /** Called only after reclaim has checked business identity and fenced its capture in this transaction. */
+    RetainedModels fenceRetainedModels(ClientSession session, String chain) {
+        if (!session.hasActiveTransaction()) throw new IllegalStateException("model reclamation requires the original transaction");
+        var root = chains.requireRoot(session, chain);
+        var held = relations(session, chain, root, chains.state(session, root, true));
+        var result = new java.util.HashSet<SrsModelKey>();
+        for (var member : held.members().values()) {
+            if (member.detached()) continue;
+            var snapshot = held.cursors().get(member.context().key().consumerId()).snapshot();
+            validateSnapshot(session, member.context(), snapshot, root);
+            if (snapshot != null) result.addAll(snapshot.models().values());
         }
-        chains.replace(session,held.root(),new Document(held.root()));return Set.copyOf(result);
+        chains.replace(session, root, new Document(root));
+        return new RetainedModels(root, held.state(), Set.copyOf(result));
     }
 
     /**
@@ -1125,6 +1131,10 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
     }
 
     private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot) {
+        validateSnapshot(session, context, snapshot, null);
+    }
+
+    private void validateSnapshot(ClientSession session, SrsConsumerContext context, SrsSnapshotPin snapshot, Document verifiedChain) {
         if (snapshot == null) return;
         var models = new MongoSrsModelStore(client, database, scope, requireActive, requireStructure);
         for (var key : snapshot.models().values()) {
@@ -1132,7 +1142,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                 throw unavailable(context.key().miningChainId());
             }
         }
-        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()));
+        models.requireSnapshotReferences(session, Set.copyOf(snapshot.models().values()), verifiedChain);
     }
     @Override public Optional<SrsConsumerMembership> attach(SrsConsumerContext context, long expectedRevision, Set<String> tables, WorkloadClaimFence fence) {
         Objects.requireNonNull(context, "context"); requireRevision(expectedRevision); Set<String> selected = Set.copyOf(Objects.requireNonNull(tables, "tables"));
