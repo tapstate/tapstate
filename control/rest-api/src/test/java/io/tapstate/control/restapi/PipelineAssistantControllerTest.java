@@ -52,11 +52,35 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.*;
 
 class PipelineAssistantControllerTest {
-    @Test void onPremStreamStopsPublishingWhenTheOriginalAuthenticationRetires() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void onPremStreamPublishesOnlyWhileTheOriginalAuthenticationIsActive(boolean retire) throws Exception {
         var drafts = new PipelineApiTest.FakePipelineDraftStore();
-        drafts.create(draft());
+        var base = draft();
+        drafts.create(base);
+        var artifacts = new PipelineApiTest.FakeArtifactStore();
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: src\nconnector: mysql\nmode: cdc\nconfig: {}\n");
+        artifacts.seed("version: tapstate/v1\nkind: source\nid: dst\nconnector: mongodb\nconfig: {}\n");
+        var schema = new DiscoveredSourceModel("src", "mysql", 1,
+                new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("orders",
+                        List.of(new io.tapstate.spi.store.SourceField("id", "integer")), List.of("id"), List.of()))));
+        SchemaStore schemaStore = new SchemaStore() {
+            public void save(DiscoveredSourceModel ignored) { throw new AssertionError("must not write schema"); }
+            public Optional<DiscoveredSourceModel> get(String id) {
+                return "src".equals(id) ? Optional.of(schema) : Optional.empty();
+            }
+        };
+        var audit = new AuditGate(new PipelineApiTest.RecordingAuditStore(), Clock.systemUTC());
+        var apply = new ApplyService(TapstateCatalog::load, artifacts, audit, schemaStore,
+                PlanAdvisories.none(), SchemaDerivation.none());
+        var mapper = JsonMapper.builder().build();
+        var candidate = AssistantWizardJson.view(
+                AssistantWizardJson.object(PipelineDraftJson.write(mapper, base).get("wizard")));
+        candidate.put("destinationTable", "customer_orders");
         var beans = new DefaultListableBeanFactory();
-        beans.registerSingleton("drafts", new PipelineDraftService(drafts));
+        beans.registerSingleton("drafts", new PipelineDraftService(drafts,
+                new PipelineApiTest.TestApp().artifactQueryService(artifacts), audit, apply));
+        beans.registerSingleton("schemas", new io.tapstate.control.core.SourceSchemaQueryService(artifacts, schemaStore));
         beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
         var providerService = org.mockito.Mockito.mock(AiProviderService.class);
         org.mockito.Mockito.when(providerService.require("[\"on-prem\"]"))
@@ -69,9 +93,9 @@ class PipelineAssistantControllerTest {
 
             public Optional<Map<String, Object>> propose(AiProviderSettings settings, List<Map<String, String>> messages,
                     Map<String, Object> context, java.util.function.Consumer<String> text) {
-                active.set(false);
-                text.accept("Output after authentication retired");
-                return Optional.empty();
+                if (retire) active.set(false);
+                text.accept("Provider output");
+                return Optional.of(candidate);
             }
         };
         var providers = new AiProviderController(beans.getBeanProvider(AiProviderService.class), null,
@@ -79,7 +103,7 @@ class PipelineAssistantControllerTest {
         var assistant = new PipelineAssistantController(beans.getBeanProvider(PipelineDraftService.class),
                 beans.getBeanProvider(SourceProjectionService.class),
                 beans.getBeanProvider(io.tapstate.control.core.SourceSchemaQueryService.class), providers, client,
-                JsonMapper.builder().build());
+                mapper);
         var token = new VerifiedToken("operator", Scope.WRITE);
         var original = new CredentialAuthentication(token, Optional.empty(), Optional.empty(), () -> {
             if (!active.get()) throw AiProviderService.error(ControlError.UNAUTHENTICATED);
@@ -95,10 +119,13 @@ class PipelineAssistantControllerTest {
         }
         var output = new ByteArrayOutputStream();
         stream.writeTo(output);
-        assertThat(active.get()).isFalse();
-        assertThat(output.toString(StandardCharsets.UTF_8))
-                .contains(ControlError.UNAUTHENTICATED.code(), "[DONE]")
-                .doesNotContain("Output after authentication retired", "data-proposal");
+        String events = output.toString(StandardCharsets.UTF_8);
+        if (retire) {
+            assertThat(events).contains(ControlError.UNAUTHENTICATED.code(), "[DONE]")
+                    .doesNotContain("Provider output", "data-proposal");
+        } else {
+            assertThat(events).contains("Provider output", "data-proposal", "customer_orders", "[DONE]");
+        }
     }
 
     @Test void malformedMessageEntryIsRejectedWithCodedRequestErrorBeforeStreaming() {
