@@ -86,9 +86,9 @@ class MongoSrsConsumerStoreIT {
                     MONGO.getReplicaSetUrl(db.getName()),db.getName(),null);
             try(var domain=MongoCacheDomain.connect(binding,Duration.ofSeconds(5),"control-proof")){
                 var oldActive=new java.util.concurrent.atomic.AtomicBoolean(true);
-                var first=domain.srs(SCOPE,()->{if(!oldActive.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}).consumers();
+                var first=domain.runtimeSrs(SCOPE,()->{if(!oldActive.get())throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}).consumers();
                 var expected=first.controlSnapshot(CHAIN).orElseThrow();oldActive.set(false);
-                var current=domain.srs(SCOPE,()->{}).consumers();
+                var current=domain.runtimeSrs(SCOPE,()->{}).consumers();
                 var commands=new java.util.ArrayList<String>();MongoCommandObservation.COLLECTIONS.set((command,collection)->commands.add(command+":"+collection));
                 try{assertThat(current.controlSnapshot(CHAIN)).contains(expected);}finally{MongoCommandObservation.COLLECTIONS.remove();}
                 assertThat(commands).doesNotContain("find:srs_models","find:srs_model_contexts","find:srs_log_bounds");
