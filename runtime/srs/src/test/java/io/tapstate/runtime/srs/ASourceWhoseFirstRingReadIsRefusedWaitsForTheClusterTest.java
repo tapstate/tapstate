@@ -27,8 +27,6 @@ import io.tapstate.spi.capture.SourcePosition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
-import java.net.InetAddress;
-import java.net.ServerSocket;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -72,9 +70,9 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
 
     @Test
     void aSourceRefusedItsFirstReadWaitsForTheClusterInsteadOfEndingTheRun() throws Exception {
-        int[] ports = twoFreePorts();
-        first = Hazelcast.newHazelcastInstance(member(ports[0], ports));
-        second = Hazelcast.newHazelcastInstance(member(ports[1], ports));
+        first = Hazelcast.newHazelcastInstance(member(List.of()));
+        var seed = List.of("127.0.0.1:" + first.getCluster().getLocalMember().getAddress().getPort());
+        second = Hazelcast.newHazelcastInstance(member(seed));
         awaitMembers(first, 2, Duration.ofSeconds(10));
         awaitMinimumSize(PROTECTION, first, second);
         awaitClusterSafe(first, Duration.ofSeconds(10));
@@ -109,7 +107,7 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
                 .as("and it really was refused -- nothing was read while the cluster said no")
                 .isEmpty();
 
-        second = Hazelcast.newHazelcastInstance(member(ports[1], ports));
+        second = Hazelcast.newHazelcastInstance(member(seed));
         awaitMinimumSize(PROTECTION, first, second);
 
         awaitSize(first, CHANGES);
@@ -121,17 +119,16 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
     }
 
     /** A member of a cluster whose change rings are only readable while both members are present. */
-    private Config member(int port, int[] ports) {
+    private Config member(List<String> seeds) {
         Config config = new Config();
         config.setClusterName(cluster);
         config.setProperty("hazelcast.phone.home.enabled", "false");
         config.setProperty("hazelcast.shutdownhook.enabled", "false");
-        config.getNetworkConfig().setPort(port).setPortAutoIncrement(false);
+        config.getNetworkConfig().setPort(0).setPortAutoIncrement(false);
         config.getNetworkConfig().getInterfaces().setEnabled(true).addInterface("127.0.0.1");
         config.getNetworkConfig().getJoin().getAutoDetectionConfig().setEnabled(false);
         config.getNetworkConfig().getJoin().getMulticastConfig().setEnabled(false);
-        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).setMembers(List.of(
-                "127.0.0.1:" + ports[0], "127.0.0.1:" + ports[1]));
+        config.getNetworkConfig().getJoin().getTcpIpConfig().setEnabled(true).setMembers(seeds);
         config.getJetConfig().setEnabled(true).setCooperativeThreadCount(2);
         config.addSplitBrainProtectionConfig(new SplitBrainProtectionConfig(PROTECTION, true)
                 .setProtectOn(SplitBrainProtectionOn.READ_WRITE)
@@ -147,14 +144,6 @@ class ASourceWhoseFirstRingReadIsRefusedWaitsForTheClusterTest {
         config.getSerializationConfig().addSerializerConfig(
                 new SerializerConfig().setImplementation(new SrsItemSerializer()).setTypeClass(SrsItem.class));
         return config;
-    }
-
-    private static int[] twoFreePorts() throws Exception {
-        InetAddress loopback = InetAddress.getByName("127.0.0.1");
-        try (ServerSocket first = new ServerSocket(0, 0, loopback);
-                ServerSocket second = new ServerSocket(0, 0, loopback)) {
-            return new int[] {first.getLocalPort(), second.getLocalPort()};
-        }
     }
 
     /**
