@@ -530,6 +530,61 @@ class MongoCachePipelineStoresIT {
         });
     }
 
+    @Test void runtimeDiagnosticSurvivesIndependentReaderAndPreservesLatestFailure() {
+        withFixture(f -> {
+            var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
+            assertThat(states.compareAndSwap("orders", 0, "FAILED", AT)).isInstanceOf(CasOutcome.Applied.class);
+            var writer = f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE);
+            var failure = new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                    Map.of("connector", "fixture", "detail", "refused"), Map.of("message", "safe cause"));
+            var expected = new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    failure, AT.plusSeconds(1), List.of());
+            writer.save(expected, 1);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            var before = collection.find().first();
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(expected);
+            String readerClasspath = System.getProperty("runtime.recovery.classpath", System.getProperty("java.class.path"));
+            var process = new ProcessBuilder(System.getProperty("java.home") + "/bin/java", "-cp", readerClasspath,
+                    RuntimeObservationReaderProcess.class.getName(), MONGO.getReplicaSetUrl(), f.database().getName(), "read")
+                    .redirectErrorStream(true).start();
+            String output = readerOutput(process);
+            assertThat(output).contains("RUNTIME_DIAGNOSTIC_RECOVERED");
+            String oldClasspath = System.getProperty("runtime.legacy.classpath");
+            if (oldClasspath != null) {
+                var oldReader = new ProcessBuilder(System.getProperty("java.home") + "/bin/java", "-cp", oldClasspath,
+                        RuntimeObservationReaderProcess.class.getName(), MONGO.getReplicaSetUrl(), f.database().getName(), "unreadable")
+                        .redirectErrorStream(true).start();
+                String oldOutput = readerOutput(oldReader);
+                assertThat(oldOutput).contains("OLD_RUNTIME_READER_REFUSED_EXTENSION");
+                assertThat(collection.find().first()).isEqualTo(before);
+            }
+            writer.save(new Observation("orders", PipelineState.FAILED, Map.of(), Map.of(), Map.of(),
+                    new io.tapstate.core.lifecycle.ObservationFailure("connector.write-failed", Map.of()), AT, List.of()), 1);
+            assertThat(collection.find().first()).isEqualTo(before);
+            assertThat(collection.countDocuments()).isEqualTo(1);
+            assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT.plusSeconds(2))).isInstanceOf(CasOutcome.Applied.class);
+            var recovered = new Observation("orders", PipelineState.RUNNING, Map.of(), Map.of(), Map.of(), null,
+                    AT.plusSeconds(2), List.of());
+            writer.save(recovered, 2);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).contains(recovered);
+        });
+    }
+
+    @Test void unknownRuntimeDiagnosticVersionIsRefusedWithoutRepair() {
+        withFixture(f -> {
+            assertThat(f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE).compareAndSwap("orders", 0, "FAILED", AT))
+                    .isInstanceOf(CasOutcome.Applied.class);
+            f.domain().pipelineObservations(SCOPE, f.fence(), ACTIVE).save(new Observation("orders", PipelineState.FAILED,
+                    Map.of(), Map.of(), Map.of(), new io.tapstate.core.lifecycle.ObservationFailure("TS0060027",
+                    Map.of("connector", "fixture", "detail", "refused"), Map.of("message", "safe cause")), AT, List.of()), 1);
+            var collection = SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database());
+            collection.updateOne(new Document(), new Document("$set", new Document("failure.diagnostic.formatVersion", 99)));
+            var damaged = collection.find().first();
+            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(collection.find().first()).isEqualTo(damaged);
+        });
+    }
+
     @Test void losingOnlyTheProjectionCollectionDoesNotDisableCheckpointAccess() {
         withFixture(f -> {
             var states = f.domain().pipelineStates(SCOPE, f.fence(), ACTIVE);
@@ -540,6 +595,20 @@ class MongoCachePipelineStoresIT {
             assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
+    }
+
+    private static String readerOutput(Process process) throws Exception {
+        try {
+            assertThat(process.waitFor(20, TimeUnit.SECONDS)).isTrue();
+            String output = new String(process.getInputStream().readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            assertThat(process.exitValue()).as(output).isZero();
+            return output;
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly();
+                process.waitFor(5, TimeUnit.SECONDS);
+            }
+        }
     }
 
     private static Observation observation(PipelineState state) {
