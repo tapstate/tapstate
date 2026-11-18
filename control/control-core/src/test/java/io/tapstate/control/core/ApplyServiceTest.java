@@ -1554,7 +1554,7 @@ class ApplyServiceTest {
 
         assertThat(result.valid()).isFalse();
         assertThat(result.diagnostics()).singleElement().satisfies(diagnostic ->
-                assertThat(diagnostic.code()).isEqualTo("artifact.version-conflict"));
+                assertThat(diagnostic.code()).isEqualTo("TS0240003"));
     }
 
     // ---- fixtures ----

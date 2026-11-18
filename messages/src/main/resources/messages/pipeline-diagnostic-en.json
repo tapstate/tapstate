@@ -1,0 +1,9 @@
+{
+  "TS0230001": {"message": "A Pipeline with id '{id}' already exists.", "solution": "Choose a different Pipeline id, or edit the existing Pipeline."},
+  "TS0230002": {"message": "No Pipeline with id '{id}' exists.", "solution": "List Pipelines to find an existing id."},
+  "TS0230003": {"message": "Pipeline id '{bodyId}' in the request body does not match path id '{pathId}'.", "solution": "Use the same immutable Pipeline id in the request path and body."},
+  "TS0230004": {"message": "Pipeline '{id}' requires its current ETag for this operation.", "solution": "Read the Pipeline, then retry with its ETag in If-Match."},
+  "TS0230005": {"message": "Pipeline '{id}' changed after it was read.", "solution": "Read the current Pipeline and retry the operation with its new ETag."},
+  "TS0230006": {"message": "The selected start change did not change Pipeline '{id}'. Nothing was started.", "solution": "Check the offered action and the Pipeline definition, then retry with a change that can be applied."},
+  "TS0230007": {"message": "Pipeline '{id}' cannot be changed together with its draft by this store. Nothing was started.", "solution": "Use a store that supports atomic definition and draft updates, or edit and publish the draft before starting."}
+}

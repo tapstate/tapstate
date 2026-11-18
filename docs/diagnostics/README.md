@@ -10,7 +10,8 @@ This page describes an unshipped migration candidate. The first migrated request
 refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
 through `TS0210005`, respectively. Source mutation errors use `TS0220001`
-through `TS0220007`. DSL errors use `TS0010001` through `TS0010031`, and
+through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
+`023`, `024` and `025`. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
 product contract switches with a coordinated major release; this candidate does
@@ -55,6 +56,16 @@ Source while retaining the identities already removed. Historical server replies
 remain readable during this migration; local browser preflight errors retain
 their existing protocol shape.
 
+`PipelineErrorDefinitions`, `ArtifactErrorDefinitions` and
+`PipelineDraftErrorDefinitions` retain the existing typed enums and their
+conditional-write semantics. A refused deletion means nothing was removed;
+`TS0240006` means removal stands and bookkeeping remains incomplete. Keep its
+residue and reason, and never suggest retrying that removal. A running Pipeline
+must stop before its remaining state can be cleared. Start conflicts trigger
+the existing interactive re-read; an unanswered start is never replayed.
+Missing Pipeline and missing draft remain different outcomes, and draft
+revision, immutable mode and artifact publication fences remain intact.
+
 ```java
 throw new TapstateException(ControlError.MALFORMED_REQUEST,
         Map.of("reason", "history requires both --from and --to"), null);
@@ -79,6 +90,8 @@ The request language resources are
 DSL resources use the corresponding `dsl-diagnostic-` prefix and the explicit
 `DslDiagnosticCatalog` registration, without a parser dependency in the renderer.
 Source resources use `source-diagnostic-` and `SourceDiagnosticCatalog`.
+`MutationDiagnosticCatalog` explicitly loads the `pipeline-diagnostic-`,
+`artifact-diagnostic-` and `pipeline-draft-diagnostic-` resource families.
 Each identity has nonempty `message` and `solution` fields. Their combined named
 placeholders must match the definition exactly. This public repository stores
 non-ASCII translations as JSON Unicode escapes. The native CLI includes both
@@ -128,7 +141,7 @@ mvn -pl messages -am \
   -Dtest=JsonReaderTest,ProductDiagnosticCatalogTest,MessageCatalogTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 mvn -pl arch-tests -am \
-  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,DslDiagnosticDefinitionGatesTest,SourceDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
+  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,DslDiagnosticDefinitionGatesTest,SourceDiagnosticDefinitionGatesTest,MutationDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 ```
 

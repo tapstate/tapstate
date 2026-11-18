@@ -131,7 +131,7 @@ class SourceConfigClientTransportsIT {
             Document edited = fixture.document(id);
             CliReply stale = cli(fixture, flavor, token, "apply", file(partial).toString(),
                     "--if-match", displayed.contentHash());
-            refusal(stale, "artifact.version-conflict");
+            refusal(stale, "TS0240003");
             assertThat(fixture.document(id)).isEqualTo(edited);
 
             Map<String, Object> replacement = Map.of("uri", uri(REPLACEMENT));
@@ -169,7 +169,7 @@ class SourceConfigClientTransportsIT {
             assertChange(mcp.success("artifact_apply", drafts(partial, hash)), id, "UPDATED");
             encrypted(fixture, id, original);
             Document edited = fixture.document(id);
-            mcp.refused("artifact_apply", drafts(partial, hash), "artifact.version-conflict");
+            mcp.refused("artifact_apply", drafts(partial, hash), "TS0240003");
             assertThat(fixture.document(id)).isEqualTo(edited);
 
             List<Document> beforeRejectedBatch = fixture.snapshot();
@@ -177,7 +177,7 @@ class SourceConfigClientTransportsIT {
             Map<String, Object> validNew = Map.of("content", source(
                     "rejected_batch_source", "mongodb-atlas", config("mongodb-atlas", REPLACEMENT)));
             Map<String, Object> staleEdit = Map.of("content", partial, "expectedContentHash", hash);
-            mcp.refused("artifact_apply", Map.of("drafts", List.of(validNew, staleEdit)), "artifact.version-conflict");
+            mcp.refused("artifact_apply", Map.of("drafts", List.of(validNew, staleEdit)), "TS0240003");
             mcp.refused("artifact_apply", drafts(envelope(id, "mysql"), null), "TS0210001");
             mcp.refused("artifact_apply", drafts(source(id, "mongodb-atlas", Map.of("uri", "<redacted>")), null),
                     "TS0210001");

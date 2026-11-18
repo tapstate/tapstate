@@ -2205,7 +2205,7 @@ class ReplTest {
         assertThat(h.repl().dispatch("delete nope -o json")).isTrue();
 
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("\"code\": \"artifact.not-found\"").contains("nope");
+        assertThat(out).contains("\"code\": \"TS0240001\"").contains("nope");
         assertThat(client.deleteCalls).isEmpty();
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
     }
@@ -2366,14 +2366,15 @@ class ReplTest {
         assertThat(out).doesNotContain("stop null");
     }
 
-    @Test
-    void aPartlyExecutedRemovalSaysTheResourceIsGoneAndNamesTheResidueInsteadOfInvitingARetry() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0240006", "artifact.reclaim-incomplete"})
+    void aPartlyExecutedRemovalSaysTheResourceIsGoneAndNamesTheResidueInsteadOfInvitingARetry(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         // The one failure on this verb that is not a refusal: the artifact is destroyed and some of its
         // bookkeeping is not. Rendered like the refusals above, the operator retries — which can only
         // answer artifact.not-found — and the residue that does need clearing is never mentioned.
         client.deleteOutcome = new DeleteOutcome.Rejected(
-                "artifact.reclaim-incomplete", "Artifact 'kfk2my' was removed, but bookkeeping was left.",
+                code, "Artifact 'kfk2my' was removed, but bookkeeping was left.",
                 Map.of("id", "kfk2my", "reason", "step-failed",
                         "residue", List.of("desired", "mining-chain-consumer")));
         Harness h = onlineSession(Path.of("tap-work"), client);
@@ -2386,14 +2387,15 @@ class ReplTest {
         assertThat(out).contains("desired").contains("mining-chain-consumer");
     }
 
-    @Test
-    void aRemovalThatStoppedBecauseThePipelineCameBackUpSaysToStopItBeforeClearingAnything() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0240006", "artifact.reclaim-incomplete"})
+    void aRemovalThatStoppedBecauseThePipelineCameBackUpSaysToStopItBeforeClearingAnything(String code) {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         // The other way a removal ends incomplete: nothing was cleared, deliberately, because the
         // pipeline was started while the removal ran. "Clear the listed records by hand" is the wrong
         // next step here — deleting the checkpoint of a running job discards its fencing epoch.
         client.deleteOutcome = new DeleteOutcome.Rejected(
-                "artifact.reclaim-incomplete", "Artifact 'kfk2my' was removed, but bookkeeping was left.",
+                code, "Artifact 'kfk2my' was removed, but bookkeeping was left.",
                 Map.of("id", "kfk2my", "reason", "pipeline-live",
                         "residue", List.of("mining-chain-consumer", "desired", "state", "observation")));
         Harness h = onlineSession(Path.of("tap-work"), client);

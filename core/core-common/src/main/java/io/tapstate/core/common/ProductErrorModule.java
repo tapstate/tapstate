@@ -5,7 +5,10 @@ public enum ProductErrorModule {
     DSL("001"),
     CONNECTOR("006"),
     CONTROL("021"),
-    SOURCE("022");
+    SOURCE("022"),
+    PIPELINE("023"),
+    ARTIFACT("024"),
+    PIPELINE_DRAFT("025");
 
     private final String number;
 

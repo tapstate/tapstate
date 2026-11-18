@@ -44,7 +44,7 @@ class ArtifactDeleteRefusalIT {
 
     private static final String SOURCE_ID = "referenced_source";
     private static final String PIPELINE_ID = "referring_pipeline";
-    private static final String IN_USE = "artifact.in-use";
+    private static final String IN_USE = "TS0240004";
 
     @BeforeAll
     static void requireDocker() {

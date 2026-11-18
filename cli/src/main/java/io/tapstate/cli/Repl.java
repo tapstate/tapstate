@@ -2234,7 +2234,7 @@ final class Repl {
                 }
                 case GetOutcome.Absent ignored -> {
                     if (format != OutputFormat.TEXT) {
-                        return renderDeleteErrorDocument(format, "artifact.not-found",
+                        return renderDeleteErrorDocument(format, io.tapstate.core.common.ArtifactErrorDefinitions.NOT_FOUND.code(),
                                 "no artifact with id '" + target + "' is stored");
                     }
                     err.println("not found: " + target);
@@ -2362,14 +2362,14 @@ final class Repl {
         int status = renderRejection(rejected.code(), rejected.message(), rejected.params());
         PrintWriter err = commandLine.getErr();
         switch (rejected.code()) {
-            case "artifact.in-use" -> {
+            case "TS0240004", "artifact.in-use" -> {
                 Object referrers = rejected.params().get("referrers");
                 if (referrers != null) {
                     err.println("  still referenced by: " + renderReferrers(referrers));
                     err.println("  remove those first, or keep this resource.");
                 }
             }
-            case "artifact.pipeline-not-stopped" -> {
+            case "TS0240005", "artifact.pipeline-not-stopped" -> {
                 Object actual = rejected.params().get("actual");
                 Object desired = rejected.params().get("desired");
                 if (actual != null || desired != null) {
@@ -2381,9 +2381,9 @@ final class Repl {
                             + "` and wait for it to settle.");
                 }
             }
-            case "artifact.version-conflict" ->
+            case "TS0240003", "artifact.version-conflict" ->
                     err.println("  it changed since you read it; read it again and redo the removal.");
-            case "artifact.reclaim-incomplete" -> {
+            case "TS0240006", "artifact.reclaim-incomplete" -> {
                 // Not a refusal: the resource is gone. Saying "retry" here — the next step every other
                 // branch implies — sends the operator at a removal that can now only answer not-found,
                 // and the residue that does need clearing goes unmentioned.

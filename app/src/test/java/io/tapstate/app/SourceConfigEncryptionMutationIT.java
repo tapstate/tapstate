@@ -187,7 +187,7 @@ class SourceConfigEncryptionMutationIT {
                     draft(source("batch_valid_sibling", Map.of("uri", uri(ALPHA_SECRET)), "valid"), null),
                     draft(sourceWithOnlyConfig(existing, Map.of("uri", uri(BETA_SECRET))), "0".repeat(64)))));
             assertThat(stale.status()).isEqualTo(412);
-            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("artifact.version-conflict");
+            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("TS0240003");
             assertThat(fixture.artifacts.countDocuments(new Document("_id", "batch_valid_sibling"))).isZero();
             sameDocument(fixture, existing, originalDocument);
 

@@ -61,7 +61,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(45);
+        assertThat(replacements).hasSize(65);
         baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
     }

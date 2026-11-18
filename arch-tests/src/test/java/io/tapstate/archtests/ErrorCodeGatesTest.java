@@ -70,7 +70,10 @@ class ErrorCodeGatesTest {
     private static Map<String, ProductErrorDefinition> productDefinitions() {
         Map<String, ProductErrorDefinition> registered = new LinkedHashMap<>();
         java.util.stream.Stream.of(RequestErrorDefinitions.registered(), DslErrorDefinitions.registered(),
-                io.tapstate.core.common.SourceErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+                io.tapstate.core.common.SourceErrorDefinitions.registered(),
+                io.tapstate.core.common.PipelineErrorDefinitions.registered(),
+                io.tapstate.core.common.ArtifactErrorDefinitions.registered(),
+                io.tapstate.core.common.PipelineDraftErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
         return registered;
@@ -185,7 +188,8 @@ class ErrorCodeGatesTest {
                         productDefinitions().get(code).parameters().forEach(name -> args.put(name, "fixture"));
                         return RequestDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && DslDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
-                                && io.tapstate.messages.SourceDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                                && io.tapstate.messages.SourceDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MutationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();

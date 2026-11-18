@@ -710,12 +710,13 @@ class McpOperationExecutorTest {
         }
     }
 
-    @Test
-    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt() throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0240003", "artifact.version-conflict"})
+    void aRefusedArtifactDeleteIsStillReportedAsTheServerStatedIt(String code) throws Exception {
         // The body added above must not swallow a refusal into a success: a delete the server rejected
         // reported as {"removed": true} is worse than the empty body it replaced.
         HttpServer server = server(exchange -> answer(exchange, 409,
-                "{\"code\":\"artifact.version-conflict\",\"message\":\"it changed\"}"));
+                JsonWriter.write(Map.of("code", code, "message", "it changed"))));
         try (HttpControlClient client = new HttpControlClient(Duration.ofSeconds(10), Duration.ofSeconds(30))) {
             McpOperationExecutor executor = new McpOperationExecutor(
                     baseOf(server), "token", Map.of(), client);
@@ -724,7 +725,7 @@ class McpOperationExecutorTest {
                     Map.of("id", "orders", "expectedContentHash", "a".repeat(64)));
 
             assertThat(result.error()).isTrue();
-            assertThat(JsonWriter.write(result.body())).contains("artifact.version-conflict");
+            assertThat(JsonWriter.write(result.body())).contains(code);
             // Asserted non-empty first: "does not contain" is satisfied by a body that carries nothing
             // at all, which is the outcome this whole test exists to rule out.
             assertThat(result.body()).isNotEmpty().doesNotContainKey("removed");

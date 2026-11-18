@@ -84,7 +84,7 @@ class StructuredPipelineSyncIdentityIT {
                 assertThat(assertIdentity(control.sourceRequest("GET", path, null, null, 200),
                         id, identities.get(index))).isEqualTo(updatedEtag);
                 assertThat(json(control.sourceRequest("PUT", path, input, etag, 412).body()))
-                        .containsEntry("code", "pipeline.version-conflict");
+                        .containsEntry("code", "TS0230005");
 
                 Document key = new Document("_id", id);
                 Document stored = pipelines.find(key).first();

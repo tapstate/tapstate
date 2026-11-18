@@ -407,7 +407,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_FAILED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(stale.code()).isEqualTo("pipeline-draft.revision-conflict");
+        assertThat(stale.code()).isEqualTo("TS0250004");
 
         ResponseEntity<Map> published = client().post().uri("/api/pipelines/draft-p1/draft:publish")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
@@ -495,9 +495,9 @@ class PipelineApiTest {
         ApiError malformed = deleteWebPipeline(hash, "1x", Scope.WRITE, HttpStatus.PRECONDITION_REQUIRED);
         ApiError overflow = deleteWebPipeline(hash, "9".repeat(20), Scope.WRITE, HttpStatus.PRECONDITION_REQUIRED);
 
-        assertThat(missing.code()).isEqualTo("pipeline-draft.precondition-required");
-        assertThat(malformed.code()).isEqualTo("pipeline-draft.precondition-required");
-        assertThat(overflow.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(missing.code()).isEqualTo("TS0250003");
+        assertThat(malformed.code()).isEqualTo("TS0250003");
+        assertThat(overflow.code()).isEqualTo("TS0250003");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
     }
@@ -514,7 +514,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(refusal.code()).isEqualTo("pipeline.not-found");
+        assertThat(refusal.code()).isEqualTo("TS0230002");
         assertThat(context.getBean(FakeArtifactStore.class).get("src_x")).isPresent();
     }
 
@@ -544,7 +544,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(refusal.code()).isEqualTo("artifact.pipeline-not-stopped");
+        assertThat(refusal.code()).isEqualTo("TS0240005");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(RecordingAuditStore.class).records)
@@ -560,7 +560,7 @@ class PipelineApiTest {
 
         ApiError refusal = deleteWebPipeline(staleHash, "1", Scope.WRITE, HttpStatus.PRECONDITION_FAILED);
 
-        assertThat(refusal.code()).isEqualTo("artifact.version-conflict");
+        assertThat(refusal.code()).isEqualTo("TS0240003");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).hasValueSatisfying(
                 draft -> assertThat(draft.revision()).isEqualTo(1));
@@ -578,7 +578,7 @@ class PipelineApiTest {
 
         ApiError refusal = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.CONFLICT);
 
-        assertThat(refusal.code()).isEqualTo("artifact.in-use");
+        assertThat(refusal.code()).isEqualTo("TS0240004");
         assertThat(refusal.params().get("referrers").toString()).contains("downstream");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
@@ -594,7 +594,7 @@ class PipelineApiTest {
         ApiError forbidden = deleteWebPipeline(hash, "1", Scope.READ, HttpStatus.FORBIDDEN);
         assertThat(forbidden.code()).isEqualTo("TS0210004");
         ApiError stale = deleteWebPipeline(hash, "2", Scope.WRITE, HttpStatus.PRECONDITION_FAILED);
-        assertThat(stale.code()).isEqualTo("pipeline-draft.revision-conflict");
+        assertThat(stale.code()).isEqualTo("TS0250004");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isPresent();
         assertThat(context.getBean(FakePipelineDraftStore.class).get("pl1")).isPresent();
     }
@@ -612,7 +612,7 @@ class PipelineApiTest {
 
         ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
 
-        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.code()).isEqualTo("TS0240006");
         assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
                 .contains("pipeline-draft:pl1");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
@@ -638,7 +638,7 @@ class PipelineApiTest {
 
         ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
 
-        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.code()).isEqualTo("TS0240006");
         assertThat(partial.params().get("reason")).isEqualTo("step-failed");
         assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
                 .contains("state");
@@ -662,7 +662,7 @@ class PipelineApiTest {
 
         ApiError partial = deleteWebPipeline(hash, "1", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
 
-        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.code()).isEqualTo("TS0240006");
         assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
                 .contains("state", "pipeline-draft:pl1");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
@@ -677,7 +677,7 @@ class PipelineApiTest {
 
         ApiError partial = deleteWebPipeline(hash, "none", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
 
-        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.code()).isEqualTo("TS0240006");
         assertThat(partial.params().get("reason")).isEqualTo("pipeline-live");
         assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
                 .contains("desired").doesNotContain("pipeline-draft:pl1");
@@ -700,7 +700,7 @@ class PipelineApiTest {
 
         ApiError partial = deleteWebPipeline(hash, "none", Scope.WRITE, HttpStatus.INTERNAL_SERVER_ERROR);
 
-        assertThat(partial.code()).isEqualTo("artifact.reclaim-incomplete");
+        assertThat(partial.code()).isEqualTo("TS0240006");
         assertThat(((List<?>) partial.params().get("residue")).stream().map(String::valueOf).toList())
                 .contains("pipeline-draft:pl1", "desired");
         assertThat(context.getBean(FakeArtifactStore.class).get("pl1")).isEmpty();
@@ -796,7 +796,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(overflowEtag.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(overflowEtag.code()).isEqualTo("TS0250003");
     }
 
     @Test
@@ -918,7 +918,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(missingEtag.code()).isEqualTo("pipeline-draft.precondition-required");
+        assertThat(missingEtag.code()).isEqualTo("TS0250003");
 
         ApiError invalidHash = client().post().uri("/api/pipelines/rebase-draft/draft:rebase")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
@@ -1028,7 +1028,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(error.code()).isEqualTo("pipeline-draft.invalid");
+        assertThat(error.code()).isEqualTo("TS0250005");
         assertThat(error.params()).containsEntry("id", "invalid-preview");
     }
 
@@ -1282,7 +1282,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(missing.code()).isEqualTo("pipeline.not-found");
+        assertThat(missing.code()).isEqualTo("TS0230002");
         assertThat(missing.params()).containsEntry("id", "ghost");
     }
 
@@ -1373,7 +1373,7 @@ class PipelineApiTest {
                     assertThat(response.getStatusCode()).isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(error.code()).isEqualTo("pipeline.precondition-required");
+        assertThat(error.code()).isEqualTo("TS0230004");
     }
 
     @Test
@@ -2085,7 +2085,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("pipeline.precondition-required");
+        assertThat(body.code()).isEqualTo("TS0230004");
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();
     }
 
@@ -2101,7 +2101,7 @@ class PipelineApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("pipeline.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0230005");
         assertThat(CanonicalHash.of(context.getBean(FakeArtifactStore.class).get("pl1").orElseThrow()))
                 .isEqualTo(revisionOf(PIPELINE_V1));
         assertThat(context.getBean(FakeDesiredStore.class).read("pl1")).isEmpty();

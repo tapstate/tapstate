@@ -349,7 +349,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         // Not merely "an error came back": the refusal has to precede the write, so the stored bytes are
         // the ones from before the call. An implementation that upserts then checks would pass a test
         // that only looked at the status.
@@ -372,7 +372,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.not-found");
+        assertThat(body.code()).isEqualTo("TS0240001");
     }
 
     @Test
@@ -539,7 +539,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.precondition-required");
+        assertThat(body.code()).isEqualTo("TS0240002");
         assertThat(body.params()).containsEntry("id", "tgt_mg");
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -561,7 +561,7 @@ class ControlApiTest {
                                 .isEqualTo(HttpStatus.PRECONDITION_REQUIRED);
                         return response.bodyTo(ApiError.class);
                     });
-            assertThat(body.code()).as(malformed).isEqualTo("artifact.precondition-required");
+            assertThat(body.code()).as(malformed).isEqualTo("TS0240002");
         }
         assertThat(context.getBean(ArtifactStore.class).get("tgt_mg")).isPresent();
     }
@@ -579,7 +579,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.version-conflict");
+        assertThat(body.code()).isEqualTo("TS0240003");
         assertThat(canonicalOf("tgt_mg")).isEqualTo(before);
     }
 
@@ -599,7 +599,7 @@ class ControlApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("artifact.in-use");
+        assertThat(body.code()).isEqualTo("TS0240004");
         // The caller is told who to deal with, so it needs no second query to act on the refusal.
         assertThat(body.params().get("referrers").toString()).contains("ora2my_ods");
         // Nothing cascaded and nothing was removed first: all three are still stored.

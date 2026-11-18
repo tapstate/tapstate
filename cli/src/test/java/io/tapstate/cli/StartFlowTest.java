@@ -157,12 +157,13 @@ class StartFlowTest {
         assertThat(out.toString()).contains("start: cancelled; pl1 was left as it is");
     }
 
-    @Test
-    void aDefinitionChangedWhileAnsweringIsReadAgainAndAskedAgain() throws IOException {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0230005", "pipeline.version-conflict"})
+    void aDefinitionChangedWhileAnsweringIsReadAgainAndAskedAgain(String code) throws IOException {
         Map<String, Object> first = report("NEEDS_CONFIRMATION", notEmpty("orders"));
         Map<String, Object> second = withHash(report("NEEDS_CONFIRMATION", notEmpty("orders")), "2" + HASH.substring(1));
         server.starts.add(stoppedBy(first));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of()));
         server.starts.add(started(second, List.of(), List.of()));
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(second));
@@ -526,11 +527,12 @@ class StartFlowTest {
                 "start pl1 [target-not-empty/warehouse/orders=clear] if-match " + HASH);
     }
 
-    @Test
-    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhereThatLeftThePipeline() {
+    @ParameterizedTest
+    @ValueSource(strings = {"TS0230005", "pipeline.version-conflict"})
+    void aRerunWhoseStartIsRefusedAfterTheStopSaysWhereThatLeftThePipeline(String code) {
         Map<String, Object> report = withIntent(report("NEEDS_CONFIRMATION", notEmpty("orders")), "RERUN");
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(report));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of()));
         StartFlow flow = rerunFlow(false, new ScriptedPrompter());
 
@@ -539,7 +541,8 @@ class StartFlowTest {
         StartFlow.Result result = flow.startAfterRerunStop("pl1", plan, deciding(false, "target-not-empty=keep"));
 
         assertThat(result.exitCode()).isNotZero();
-        assertThat(reported).containsExactly("pipeline.version-conflict");
+        assertThat(reported).containsExactly(code);
+        assertThat(server.startsSent()).hasSize(1);
         assertThat(err.toString()).contains("restart: pl1 was stopped and its state cleared, but it has not been "
                 + "started").contains("Start it with: tapstate start pl1 --decide target-not-empty=<answer> (or -y)");
     }
@@ -556,10 +559,11 @@ class StartFlowTest {
     }
 
     @ParameterizedTest
-    @EnumSource(value = OutputFormat.class, names = {"JSON", "YAML"})
-    void aRefusalAfterApplyingChangesIsOneStructuredDocument(OutputFormat format) {
+    @org.junit.jupiter.params.provider.CsvSource({"JSON,TS0230005", "JSON,pipeline.version-conflict",
+            "YAML,TS0230005", "YAML,pipeline.version-conflict"})
+    void aRefusalAfterApplyingChangesIsOneStructuredDocument(OutputFormat format, String code) {
         server.checks = new StartChecksOutcome.Found(StartChecks.parse(report("NEEDS_CONFIRMATION", notEmpty("orders"))));
-        server.starts.add(new StartAttempt.Rejected("pipeline.version-conflict", Map.of("id", "pl1"),
+        server.starts.add(new StartAttempt.Rejected(code, Map.of("id", "pl1"),
                 "pl1 changed", List.of(applied("orders"))));
 
         StartFlow.Result result = flow(false, new ScriptedPrompter()).start("pl1",
@@ -567,7 +571,8 @@ class StartFlowTest {
 
         assertThat(result.exitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
         Map<?, ?> document = structured(format);
-        assertThat(document.get("code")).isEqualTo("pipeline.version-conflict");
+        assertThat(document.get("code")).isEqualTo(code);
+        assertThat(server.startsSent()).hasSize(1);
         assertThat(document.get("decisionsApplied")).isInstanceOf(List.class);
         assertThat(out.toString()).doesNotContain("Updated pl1:", "still says");
     }
