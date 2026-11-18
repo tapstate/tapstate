@@ -187,7 +187,10 @@ final class ValidationOwnerLease implements AutoCloseable {
                 if (!active) return;
                 if (scheduled) throw new IllegalStateException("validation lease maintenance already registered");
                 scheduled = true;
-                renewalTask = renewals.scheduleWithFixedDelay(this::renew, renewalNanos,
+                // Acquisition and execution advancement have already spent part of this proof.
+                long proofAge = nanoTime.getAsLong() - (provenUntil - ttlNanos);
+                long firstRenewalDelay = Math.max(0L, renewalNanos - proofAge);
+                renewalTask = renewals.scheduleWithFixedDelay(this::renew, firstRenewalDelay,
                         renewalNanos, TimeUnit.NANOSECONDS);
                 deadlineTask = deadlines.scheduleWithFixedDelay(this::checkDeadline, deadlineNanos,
                         deadlineNanos, TimeUnit.NANOSECONDS);

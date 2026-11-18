@@ -195,3 +195,60 @@ The original one-parent/two-child and one-waiting-child seed sizes, default 60-s
 IN_PROCESS applicability are retained. The legacy cross-installation inheritance and hand-copy
 rollback expectations are no longer acceptance criteria for this witness. Runtime storage formats,
 recovery protocols, error codes, and resource declarations remain unchanged.
+
+Issue 1123: report visibility and local metadata settlement are separate events.
+Refs #1123
+
+Source: GitHub Actions run 44069470645, test-shards (app-2), commit a902bae6fd20d12bdfaa778c809b5148d9f4c8cd.
+Case: NativeValidationFullJobIT#aQueuedRootPublicationReleasedAfterStopRemainsCancellationWithoutAnExecutionFault.
+The shard executed 310 integration cases with one failure, no errors and five skips.
+At NativeValidationFullJobIT.java:94, metadataFrames was 1; the assertion expected 0.
+The preceding STOPPED, null failure and empty process reservation assertions passed.
+After the workflow completed, build failed because app-2 had no successful shard
+result manifest. The sonarqube wrapper then failed with BUILD_RESULT=failure and
+SONAR_OUTCOME=skipped; no independent analysis failure was reported in that run.
+
+Golden runtime sample, using the same real MongoDB fixture, original Jet execution,
+queued publication, stop sequence and production report query:
+  blocked_after_terminal_mirror:
+    closed: true
+    terminal: STOPPED
+    failure: null
+    drained: true
+    processReservedEmpty: true
+    metadataFrames: 1
+  after_original_retention_and_settlement:
+    metadataFrames: 0
+
+The diagnostic only held the fixture's existing local guard in
+NativeValidationOwnerReservations.Reservation.retainedTask, called by
+NativeValidationRuns.Actor.mirror after reports.mirror returned. It released that
+barrier and observed the original cleanup reach zero without changing product code.
+The original unmodified failing method also passed one local targeted execution
+with one case, zero failures, zero errors and zero skips; that pass does not erase
+the CI failure or prove the immediate assertion is valid for every interleaving.
+
+Relevant ordering:
+  NativeValidationRuns.Actor.mirror writes the terminal mirror, reads the retained
+  task, applies report retention, then calls settleReport.
+  NativeValidationOwnerReservations.Reservation.reportSettled clears the retained
+  metadata only after completion and actual allocation release.
+  MongoValidationResultStore.mirror commits terminalMetadata in CONFIG independently
+  of the later retention transaction and local metadata settlement.
+  NativeValidationFullJobIT.queuedPublicationAfterStop waits for a closed report,
+  then immediately asserts zero metadata frames. A closed report, including one
+  whose terminal mirror is visible, does not establish that the actor settled.
+
+The PR's existing diff changes only ControlPlane.java and ThreeLayerSharedCaptureIT.java
+under e2e/src/test/java/io/tapstate/e2e. Neither changes this app lifecycle ordering.
+Cancellation classification and eventual cleanup succeeded in the controlled sample;
+there is no evidence here of a persistent metadata leak or an execution fault.
+A frame remaining after original retention and settlement would invalidate this diagnosis.
+
+No product implementation, report schema, error code, gate or test assertion is
+changed in this round. Making report visibility imply immediate local settlement
+would add a synchronization contract; returning metadata before retained work exits
+would violate resource accounting. Changing the test to await actual settlement
+requires an explicit exception to this repair's prohibition on editing the case.
+The earlier human decision covered shared-recovery observedState checks only and
+does not authorize changing this independent validation-resource assertion.
