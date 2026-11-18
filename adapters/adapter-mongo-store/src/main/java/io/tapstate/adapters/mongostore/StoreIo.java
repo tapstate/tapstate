@@ -66,7 +66,9 @@ final class StoreIo {
             if (DOCUMENT_TOO_LARGE_CODES.contains(errorCode(e))) {
                 throw new TapstateException(IoError.DOCUMENT_TOO_LARGE, Map.of("id", id), null);
             }
-            throw coded(e);
+            var translated = coded(e);
+            MongoStructureFailureScope.translated(e, translated);
+            throw translated;
         }
     }
 

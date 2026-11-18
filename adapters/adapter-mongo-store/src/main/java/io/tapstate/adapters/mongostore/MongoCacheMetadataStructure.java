@@ -24,7 +24,7 @@ final class MongoCacheMetadataStructure {
             SystemCollections.CACHE_CONNECTOR_CATALOG, SystemCollections.CACHE_CONNECTOR_SPECS,
             SystemCollections.CACHE_CONNECTION_TEST_RESULTS, SystemCollections.CACHE_CONNECTOR_ARTIFACTS,
             SystemCollections.CACHE_DERIVED_SCHEMAS, SystemCollections.CACHE_PIPELINE_RATE_HISTORY);
-    private static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
+    static final List<SystemCollections> BUSINESS_TABLES = java.util.stream.Stream.concat(TABLES.stream(), java.util.stream.Stream.of(
             SystemCollections.CACHE_WORKLOAD_CLAIMS, SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_PIPELINE_OBSERVATION,
             SystemCollections.SRS_EVENTS, SystemCollections.SRS_LOG_BOUNDS, SystemCollections.SRS_CHAINS, SystemCollections.SRS_MODELS,
             SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,

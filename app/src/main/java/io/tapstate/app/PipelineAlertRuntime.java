@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.core.alerting.*;
+import io.tapstate.adapters.mongostore.MongoStructureInspection;
+import io.tapstate.adapters.mongostore.SystemCollections;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.spi.store.*;
@@ -358,6 +360,43 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             Runnable originalGuard,AlertInput input) {
         resourceInput(resource,typeId,sourceRevision,producer,originalGuard,active,input,()->{},true);
     }
+    /** Read-only inspection evidence uses the original cluster binding and never an external delivery route. */
+    void structureInspection(AlarmKey.Resource resource, Runnable originalGuard, Instant observedAt,
+            SystemCollections.Database domain, List<MongoStructureInspection.Difference> differences, boolean complete) {
+        String type = switch (domain) {
+            case CONFIG -> "cluster.config-structure-drift";
+            case CACHE -> "cluster.cache-structure-drift";
+            default -> throw new IllegalArgumentException("unsupported structure inspection domain");
+        };
+        var input = structureInspectionInput(observedAt, domain, differences, complete);
+        resourceInput(resource, type, 0, "cluster-structure-inspection", originalGuard, input);
+    }
+    static AlertInput.Conditions structureInspectionInput(Instant observedAt, SystemCollections.Database domain,
+            List<MongoStructureInspection.Difference> differences, boolean complete) {
+        var findings = List.copyOf(differences);
+        if(findings.stream().anyMatch(d -> d.domain()!=domain))throw new IllegalArgumentException("foreign inspection domain");
+        // Partial observations cannot establish recovery, but confirmed differences remain actionable.
+        var condition = !findings.isEmpty() ? AlertSignal.Condition.BAD
+                : complete ? AlertSignal.Condition.GOOD : AlertSignal.Condition.UNKNOWN;
+        AlarmDiagnostics.SafeTrace trace = null;
+        if(!findings.isEmpty()) {
+            StringBuilder text = new StringBuilder("Managed ").append(domain).append(" structure inspection:\n");
+            String command = complete && findings.size()==1 ? findings.getFirst().repairCommand() : null;
+            // Put the only eligible command before bounded details so trace truncation cannot cut it.
+            if(command!=null && command.getBytes(java.nio.charset.StandardCharsets.UTF_8).length<=512
+                    && command.codePoints().noneMatch(Character::isISOControl))
+                text.append("Manual repair: ").append(command).append('\n');
+            else text.append("No safe manual repair command is available. Contact support.\n");
+            int count = Math.min(findings.size(), 16);
+            for(int i=0;i<count;i++)text.append(findings.get(i).description()).append('\n');
+            if(findings.size()>count)text.append("Additional differences omitted.\n");
+            String safe = text.toString().codePoints().collect(StringBuilder::new,
+                    (out, cp) -> out.appendCodePoint(Character.isISOControl(cp) && cp!='\n' ? ' ' : cp),
+                    StringBuilder::append).toString();
+            trace = new AlarmDiagnostics.SafeTrace(safe, 1, false, findings.size()>count);
+        }
+        return new AlertInput.Conditions(observedAt, condition, trace);
+    }
     void cacheInput(AlarmKey.Resource resource, String producer, Runnable guard, AlertInput.Operational input) {
         if(!inputAdmission.enter())return;
         try {
@@ -379,8 +418,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             slot=resourceSlots.computeIfAbsent(resource,ignored->new ResourceSlot());
         }
         var captured=rules.get().definitions();
-        int inputSize=512+(input instanceof AlertInput.Operational op&&op.trace()!=null
-                ?op.trace().text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length:0);
+        var trace = input instanceof AlertInput.Operational op ? op.trace()
+                : input instanceof AlertInput.Conditions conditions ? conditions.trace() : null;
+        int inputSize=512+(trace==null?0:trace.text().getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
         submitResourceAdmitted(slot,inputSize,()->{try{
             if(resourceSlots.get(resource)!=slot)throw refused("retired-resource");
             active.run();originalGuard.run();var resolved=services.get();
@@ -392,6 +432,9 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
                 var binding=new AlertEvaluationHost.Binding(rule,resource,producer,sourceRevision,()->{active.run();localProof.run();},domain);
                 var before=resolved.store().state(binding.key(),new AlertStore.ReadAccess(true,Set.of(),active));
                 if(before.isEmpty() && input instanceof AlertInput.Operational op && op.domainToken()!=null && op.succeeded())continue;
+                if (before.isEmpty() && AlertEvaluationHost.structureInspection(typeId)
+                        && input instanceof AlertInput.Conditions conditions
+                        && AlertConditionGroup.evaluate(conditions.operator(), conditions.values()) != AlertSignal.Condition.BAD) continue;
                 synchronized(objectAdmission) {
                     if(closed.get() || resourceSlots.get(resource)!=slot)throw refused("retired-resource");
                     if(!slot.bindings.containsKey(binding.key())) {

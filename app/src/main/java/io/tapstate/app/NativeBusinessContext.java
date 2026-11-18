@@ -44,6 +44,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private ThreeLayerStorePort port;
     private NativeMemberStorage memberStorage;
     private RetiredPipelinePayloadCleanup payloadCleanup;
+    private ManagedStorageInspection storageInspection;
     private final java.util.concurrent.atomic.AtomicReference<PipelineAlertRuntime> alertRuntime = new java.util.concurrent.atomic.AtomicReference<>();
     private final ShutdownAwait shutdown = new ShutdownAwait();
     private List<HandlerMapping> handlers = List.of();
@@ -118,7 +119,40 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         AnnotationAwareOrderComparator.sort(ordered); handlers = List.copyOf(ordered);
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
+        startStorageInspection();
+    }
 
+    private void startStorageInspection() {
+        var member = context.getBean(HazelcastInstance.class);
+        var membership = context.getBean(ClusterMembershipGate.class);
+        var auth = original.preparation().authScope();
+        var setup = original.binding().setup();
+        var resource = new io.tapstate.core.alerting.AlarmKey.Resource("cluster", setup.clusterId(), setup.installationId());
+        var cache = original.cache();
+        storageInspection = new ManagedStorageInspection(context.getBean(Clock.class),
+                () -> inspectionOwner(member, membership),
+                List.of(new ManagedStorageInspection.Domain(io.tapstate.adapters.mongostore.SystemCollections.Database.CONFIG,
+                                configuration::inspectStructure),
+                        new ManagedStorageInspection.Domain(io.tapstate.adapters.mongostore.SystemCollections.Database.CACHE,
+                                budget -> cache.inspectStructure(auth, budget))),
+                observation -> alertRuntime.get().structureInspection(resource, this::requireAlertHost, observation.observedAt(),
+                        observation.domain(), observation.differences(), observation.complete()));
+        storageInspection.start();
+    }
+
+    private boolean inspectionOwner(HazelcastInstance member, ClusterMembershipGate membership) {
+        try {
+            if (!active.get() || !member.getLifecycleService().isRunning() || !membership.businessEligible()) return false;
+            var committed = membership.committed();
+            if (committed == null) return false;
+            var local = context.getBean(NodeSessionLease.class).currentFence();
+            var members = ClusterMembershipGate.dataMembersIfReadable(member);
+            return members.stream().filter(committed.activeNodeIds()::contains).findFirst()
+                    .filter(id -> local.filter(fence -> fence.owner().nodeId().equals(id)).isPresent()).isPresent();
+        } catch (RuntimeException changing) {
+            if (!HazelcastLivePipelineRuns.theClusterIsChanging(changing)) throw changing;
+            return false;
+        }
     }
 
     @Override public void afterInitialReady() {
@@ -282,6 +316,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         if(driver instanceof ConvergenceDriver convergence)convergence.stopForShutdown();
         Object ownership=context==null?null:context.getBeanFactory().getSingleton("pipelineActuationOwnership");
         if(ownership instanceof PipelineActuationOwnership pipelines)pipelines.stopForShutdown();
+        if (storageInspection != null) {
+            storageInspection.close();
+            storageInspection.awaitStopped(deadline);
+        }
         var alerts = alertRuntime.get();
         if (alerts != null) { alerts.close();alerts.awaitStopped(deadline); }
         if(driver instanceof ConvergenceDriver convergence)convergence.awaitStopped(deadline);

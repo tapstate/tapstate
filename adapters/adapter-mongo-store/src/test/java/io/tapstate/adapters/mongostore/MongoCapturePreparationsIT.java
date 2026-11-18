@@ -486,6 +486,60 @@ class MongoCapturePreparationsIT {
             assertThat(f.controls().listIndexes().into(new ArrayList<>())).isEqualTo(indexes);assertThat(f.controls().countDocuments()).isZero();
         });
     }
+    @Test void sharedFirstCreationReturnsItsVerifiedWritesWithoutRepeatingStructureAudit() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var grant = f.issue(f.request);
+            var commands = new ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var client = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(CACHE.getReplicaSetUrl()))
+                    .addCommandListener(listener).build())) {
+                client.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var preparation = new MongoCaptureCachePreparations(client, client.getDatabase(f.cache.getName()),
+                        f.scope, MongoStorageBindingStore.targetFingerprint(f.connection), ACTIVE, f.domain.rateRetention());
+                var created = preparation.createFirst(grant);
+                assertThat(commands).hasSize(36);
+                assertThat(commands.stream().filter("listIndexes"::equals)).hasSize(9);
+                assertThat(commands).doesNotContain("abortTransaction");
+                assertThat(commands.getLast()).isEqualTo("commitTransaction");
+                assertThat(f.preparations().load(created.preparation())).isEqualTo(created);
+                assertThat(f.captureRows()).hasSize(1);
+                assertCode(() -> preparation.createFirst(grant), IoError.PIPELINE_INTENT_FENCED);
+            }
+        });
+    }
+
+    @Test void admittedSpecLookupLeavesCatalogInspectionToTheScheduledWorkerButWritesStillRefuseLoss() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var bytes = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            var hash = ContentHash.of(bytes);
+            f.domain.connectorSpecs(f.scope, ACTIVE).put(hash, bytes);
+            f.domain.verifyBusinessReady(f.scope);
+            try (var strict = MongoCacheDomain.connect(f.connection, Duration.ofSeconds(5), "inspect-strict-control");
+                 var measurement = MongoHttpDiagnosticsScope.open()) {
+                assertThat(strict.connectorSpecs(f.scope, ACTIVE).get(hash)).contains(bytes);
+                assertThat(((Map<?, ?>) measurement.snapshot().get("mongo")).get("started")).isEqualTo(7L);
+            }
+            try (var measurement = MongoHttpDiagnosticsScope.open()) {
+                assertThat(f.domain.connectorSpecs(f.scope, ACTIVE).get(hash)).contains(bytes);
+                assertThat(measurement.snapshot()).containsEntry("complete", true);
+                var commandSummary = (Map<?, ?>) measurement.snapshot().get("mongo");
+                assertThat(commandSummary.get("started")).isEqualTo(3L);
+                assertThat((List<?>) measurement.snapshot().get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+
+            SystemCollections.CACHE_CONNECTOR_SPECS.on(f.cache).drop();
+            assertThat(f.domain.connectorSpecs(f.scope, ACTIVE).get(hash)).isEmpty();
+            assertCode(() -> f.domain.connectorSpecs(f.scope, ACTIVE).put(hash, bytes), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.cache.listCollectionNames().into(new ArrayList<>()))
+                    .doesNotContain(SystemCollections.CACHE_CONNECTOR_SPECS.collectionName());
+        });
+    }
+
     private static void assertCode(Runnable action,TapstateErrorCode expected){assertThatThrownBy(action::run).isInstanceOfSatisfying(TapstateException.class,e -> assertThat(e.code()).isEqualTo(expected));}
     private static TapstateException fenced(){return new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);}
     private static void withFixture(CapturePreparation.Mode mode,Scenario scenario) {

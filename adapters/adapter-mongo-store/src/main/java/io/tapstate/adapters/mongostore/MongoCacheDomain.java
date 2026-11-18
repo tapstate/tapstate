@@ -259,6 +259,28 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
+    /** Catalog-only inspection for the active business owner. Optional features use their preparation markers. */
+    public List<MongoStructureInspection.Difference> inspectStructure(CacheAuthScope auth, MongoReadBudget budget) {
+        businessActive();
+        var required = java.util.EnumSet.copyOf(MongoCacheMetadataStructure.BUSINESS_TABLES);
+        required.add(SystemCollections.CACHE_IDENTITY);
+        required.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
+        if (auth.mode() == StorageBinding.Mode.OP) {
+            required.add(SystemCollections.OP_SESSIONS);
+        } else {
+            required.add(SystemCollections.CLOUD_SESSIONS);
+            required.add(SystemCollections.CLOUD_REVOCATIONS);
+        }
+        var business = StoreIo.call(() -> SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(budget.database(database))
+                .find(new Document("_id", "business")).first());
+        if (business != null && business.get("validation") instanceof Document validation
+                && "READY".equals(validation.getString("phase"))) required.addAll(MongoValidationSchema.CACHE);
+        var result = MongoStructureInspection.inspect(database,
+                MongoStructureInspection.namespaces(required, required, rateRetention), budget);
+        businessActive();
+        return result;
+    }
+
     /** Admission validates retained business structures and configured indexes without repairing them. */
     public void verifyBusinessReady(CacheBusinessScope expected) {
         readAdmission = null;
@@ -516,7 +538,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Objects.requireNonNull(requireActive, "requireActive");
         var access = new MongoCacheMetadataAccess(client, database, expected, table,
                 () -> { businessActive(); requireActive.run(); }, false);
-        access.verify(); return access;
+        // The admitted catalog and spec reads are derived lookups. Their writes still verify structure.
+        boolean admittedLookup = expected.equals(readAdmission) && (table == SystemCollections.CACHE_CONNECTOR_SPECS
+                || table == SystemCollections.CACHE_CONNECTOR_CATALOG);
+        if (!admittedLookup) access.verify();
+        return access;
     }
 
     /** Controlled first preparation retains this exact cache domain and caller lifecycle. */

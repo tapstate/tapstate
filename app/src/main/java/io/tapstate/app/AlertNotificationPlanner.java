@@ -259,6 +259,7 @@ final class AlertNotificationPlanner {
     }
     private static TapstateException unavailableRule(){return new TapstateException(io.tapstate.spi.store.IoError.DOCUMENT_UNREADABLE,Map.of("id","alert-planning","field","rule-capability"),null);}
     private List<Destination> destinations(AlertStore.Planning view,AlertStateRecord.Head head) {
+        if(head!=null && AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId()))return List.of();
         var host=view.host();var result=new ArrayList<Destination>();
         if(host.deployment()==AlertChannelPolicy.Deployment.CLOUD_MANAGED){
             if(host.managedRoute()==null||host.managedTarget()==null||cloudOrigin==null)throw invalid("managed-planning-binding");
@@ -286,7 +287,8 @@ final class AlertNotificationPlanner {
                 .filter(Objects::nonNull).anyMatch(v->v.value().state().summary()==DeliveryEvidence.Outcome.ACCEPTED&&v.value().frozen().members().stream().anyMatch(m->m.episodeMember().equals(member.episodeMember())));
     }
     private static boolean bindingCurrent(AlertStore.Planning view,AlertIntent.Member member){return view.definitions().stream().filter(d->d instanceof AlertConfiguration.Rule).map(d->(AlertConfiguration.Rule)d).anyMatch(r->r.header().identity().equals(member.ruleIdentity())&&r.evaluationRevision()==member.evaluation().revision()&&r.matches(member.evaluation().key()));}
-    private boolean matches(Destination d,AlertStateRecord.Head head){return d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity());}
+    private boolean matches(Destination d,AlertStateRecord.Head head){return !AlertEvaluationHost.structureInspection(head.snapshot().rule().key().typeId())
+            && (d.subscription()==null||d.subscription().matches(head.snapshot().rule().key(),head.episode().value().severity()));}
     private boolean muted(AlertStore.Planning view,Destination d,AlertStateRecord.Head head,Instant now){
         for(var def:view.definitions())if(def instanceof AlertConfiguration.Silence silence&&silence.matches(head.snapshot().rule().key(),now))return true;
         if(d.subscription()!=null){var policy=new AlertInhibitionPolicy(view.host().scope(),d.subscription().inhibition());

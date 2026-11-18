@@ -53,6 +53,7 @@ class RestApiSecurityConfiguration {
                     var installation = installations.getIfAvailable();
                     return installation != null && installation.isManagementRequest(request);
                 })
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .csrf(AbstractHttpConfigurer::disable).formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable).logout(AbstractHttpConfigurer::disable)
                 .requestCache(AbstractHttpConfigurer::disable)
@@ -85,6 +86,7 @@ class RestApiSecurityConfiguration {
 
         http
                 .securityMatcher(PathPatternRequestMatcher.pathPattern("/api/**"))
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
@@ -124,6 +126,7 @@ class RestApiSecurityConfiguration {
         CodedAuthenticationEntryPoint entryPoint = new CodedAuthenticationEntryPoint(errors);
         http
                 .securityMatcher(new NegatedRequestMatcher(PathPatternRequestMatcher.pathPattern("/api/**")))
+                .addFilterAfter(new OperationErrorDiagnosticsFilter(), org.springframework.security.web.access.intercept.AuthorizationFilter.class)
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)

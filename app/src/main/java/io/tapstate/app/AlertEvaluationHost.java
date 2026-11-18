@@ -273,7 +273,12 @@ final class AlertEvaluationHost {
                 || !before.binding().ruleIdentity().equals(r.header().identity())
                 || before.binding().sourceBindingRevision()!=b.sourceBindingRevision())) generation = Math.incrementExact(generation);
         return new AlertRule(b.key(), r.evaluationRevision(), generation, b.producer(),
-                seconds(r, "trigger-for", 0), seconds(r, "resolve-for", 0), Duration.ofSeconds(15), Duration.ofSeconds(5));
+                seconds(r, "trigger-for", 0), seconds(r, "resolve-for", 0),
+                structureInspection(r.typeId()) ? Duration.ofMinutes(65) : Duration.ofSeconds(15),
+                structureInspection(r.typeId()) ? Duration.ofMinutes(65) : Duration.ofSeconds(5));
+    }
+    static boolean structureInspection(String typeId) {
+        return typeId.equals("cluster.config-structure-drift") || typeId.equals("cluster.cache-structure-drift");
     }
     static Duration seconds(AlertConfiguration.Rule r, String name, int fallback) {
         return Duration.ofSeconds(r.parameters().getOrDefault(name, java.math.BigDecimal.valueOf(fallback)).longValueExact());
