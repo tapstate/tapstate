@@ -154,7 +154,10 @@ class SrsSourceProcessorTest {
             later = hz.getJet().newJob(graph, new com.hazelcast.jet.config.JobConfig().setName("arrival-later"));
             awaitSize(hz.getList("out-arrival-later"), 2);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15);
-            while (later.getMetrics().get("sourceRowsIn.i.orders").isEmpty() && System.nanoTime() < deadline) Thread.sleep(50);
+            while ((first.getMetrics().get("sourceRowsIn.i.orders").stream()
+                    .mapToLong(value -> value.value()).sum() != 3
+                    || later.getMetrics().get("sourceRowsIn.i.orders").isEmpty())
+                    && System.nanoTime() < deadline) Thread.sleep(50);
             assertThat(first.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isEqualTo(3);
             assertThat(later.getMetrics().get("sourceRowsIn.i.orders").stream().mapToLong(value -> value.value()).sum()).isOne();
             assertThat(later.getMetrics().get("sourceRowsIn.r.orders").stream().mapToLong(value -> value.value()).sum()).isOne();

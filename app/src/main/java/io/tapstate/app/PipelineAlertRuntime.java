@@ -87,6 +87,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     private final AtomicReference<java.util.function.Consumer<AlarmKey.Resource>> resourceRetired=new AtomicReference<>(r->{});
     void resourceRetired(java.util.function.Consumer<AlarmKey.Resource> listener){resourceRetired.set(listener);}
     private final AtomicReference<Services> services=new AtomicReference<>();
+    private final CountDownLatch servicesReady = new CountDownLatch(1);
     private final Set<Services> ownedServices=ConcurrentHashMap.newKeySet();
     private final Set<Services> stoppedServices=ConcurrentHashMap.newKeySet();
     private final ShutdownAwait shutdown=new ShutdownAwait();
@@ -253,6 +254,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
         active.run(); synchronized(this){
             if(closed.get()){stop(resolved);return;}
             if(services.get()==null&&resolved.planner()!=null)resolved.planner().start(); if(services.get()==null&&resolved.delivery()!=null)resolved.delivery().start(); if(services.get()==null&&resolved.maintenance()!=null){resolved.maintenance().evaluation(this::health);resolved.maintenance().start();} services.set(resolved); rules.set(List.copyOf(all));
+            servicesReady.countDown();
         }
         observerTick.get().run();
         if(reconciliationCursor.get()==null)legacyBindingsInScan=false;
@@ -614,7 +616,20 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
             LOG.warn("Alert collection is degraded [{}]", refusal.code().code());
         }
     }
-    synchronized Services managementServices() {
+    Services managementServices() {
+        active.run();
+        // Management can arrive before the background rule snapshot publishes its services.
+        if (!closed.get() && services.get() == null) {
+            try {
+                if (!servicesReady.await(5, TimeUnit.SECONDS)) {
+                    throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+                }
+            }
+            catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
+            }
+        }
         active.run();
         if (closed.get() || services.get() == null) throw new TapstateException(io.tapstate.control.core.ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         return services.get();
@@ -660,6 +675,7 @@ final class PipelineAlertRuntime implements PipelineAlertFeed, AutoCloseable {
     @Override public void close() { requestStop(); }
     private CompletableFuture<Void> requestStop() {
         closed.set(true);inputAdmission.stop();
+        servicesReady.countDown();
         var proposed=new CompletableFuture<Void>();
         var existing=stopping.compareAndExchange(null,proposed);
         if(existing!=null)return existing;
