@@ -133,7 +133,7 @@ class BenchmarkRunIT {
             try (var peaks = new BenchmarkResources(server.pid())) {
                 var src = dummyConfig(rows);
                 var tgt = dummyConfig(1);
-                var workspace = new LinkedHashMap<>(Map.of("source.tap.yml", resource("src_perf", "dummy", src, null),
+                var workspace = new LinkedHashMap<>(Map.of("source.tap.yml", resource("src_perf", "dummy", src, DUMMY),
                         "target.tap.yml", resource("tgt_perf", "dummy", tgt, null)));
                 control.apply(workspace);
                 discover(control, "src_perf", "dummy", src);
