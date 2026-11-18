@@ -2056,7 +2056,7 @@ class MongoSrsConsumerStoreIT {
                     new WorkloadOwner("node-edit", "boot-edit"), 1, Duration.ofSeconds(30)).claim();
             SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(), new Document("$set", new Document("claimAdmissionFence", 0L)));
             var readers = Map.of(positionScope(A), f.fenceA(), positionScope(B), f.fenceB());
-            var edit = f.consumers().positions(WorkloadClaimFence.from(node), java.time.Duration.ofDays(7));
+            var edit = f.consumers().positions(WorkloadClaimFence.from(node));
             assertThatThrownBy(() -> edit.rewrite(List.of(positionMove(f, "unknown", f.captureFence())), readers, java.time.Instant.now()))
                     .isInstanceOfSatisfying(TapstateException.class,
                             error -> assertThat(error.code()).isEqualTo(IoError.SRS_POSITION_MODEL_UNPROVEN));
@@ -2087,7 +2087,7 @@ class MongoSrsConsumerStoreIT {
                     new WorkloadOwner("node-edit", "boot-edit"), 1, Duration.ofSeconds(30)).claim();
             SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(), new Document("$set", new Document("claimAdmissionFence", 0L)));
             var readers = Map.of(positionScope(A), f.fenceA(), positionScope(B), f.fenceB());
-            var edit = f.consumers().positions(WorkloadClaimFence.from(node), java.time.Duration.ofDays(7));
+            var edit = f.consumers().positions(WorkloadClaimFence.from(node));
             edit.rewrite(List.of(positionMove(f, "requested", f.captureFence())), readers, java.time.Instant.now());
             var changed = f.chains().load(CHAIN).orElseThrow();
             assertThat(changed.checkpoint()).isEqualTo(checkpoint); assertThat(changed.checkpointRevision()).isOne();

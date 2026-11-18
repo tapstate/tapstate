@@ -245,11 +245,14 @@ class MongoCacheDerivedSchemaStoreIT {
             var writer = f.writer();
             record(writer, "text");
             writer.pin("orders", "source.orders", 0);
+            var catalogCommands = new java.util.concurrent.atomic.AtomicInteger();
             var historyReads = new java.util.concurrent.atomic.AtomicInteger();
             var historyWrites = new java.util.concurrent.atomic.AtomicInteger();
             var listener = new CommandListener() {
                 @Override public void commandStarted(CommandStartedEvent event) {
                     if (!event.getDatabaseName().equals(f.database.getName())) return;
+                    if (event.getCommandName().equals("listCollections") || event.getCommandName().equals("listIndexes"))
+                        catalogCommands.incrementAndGet();
                     var table = event.getCommand().get(event.getCommandName());
                     if (table == null || !table.isString()
                             || !table.asString().getValue().equals(SystemCollections.CACHE_DERIVED_SCHEMAS.collectionName())) return;
@@ -269,6 +272,7 @@ class MongoCacheDerivedSchemaStoreIT {
                         new DerivedSchemaStore.Change("source.customers", new io.tapstate.spi.store.DerivedSchema(
                                 0, columns("text"), "new", "source", "v1"))));
             }
+            assertThat(catalogCommands).hasValue(0);
             assertThat(historyReads).hasValue(1);
             assertThat(historyWrites).hasValue(1);
             assertThat(writer.pinned("orders", "source.orders").orElseThrow().derivedBy()).isEqualTo("v2");
@@ -439,7 +443,7 @@ class MongoCacheDerivedSchemaStoreIT {
             other.get("scope", Document.class).put("stateGeneration", 2L); f.rows().insertOne(other);
             f.writer().delete("orders"); assertThat(f.rows().countDocuments()).isEqualTo(1);
             assertThat(f.rows().find().first().getString("_id")).isEqualTo("orders.other");
-            f.rows().drop(); assertCode(() -> f.writer().latest("orders", "source.orders"), IoError.DOCUMENT_UNREADABLE);
+            f.rows().drop(); assertThat(f.writer().latest("orders", "source.orders")).isEmpty();
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("derived_schemas");
         });
     }

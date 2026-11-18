@@ -35,6 +35,7 @@ import java.util.function.Function;
 
 /** Configuration-only note CAS, clear generations and persistent shared-carry barriers. */
 public final class MongoRequiredNoteStore implements RequiredNoteStore {
+    private static final com.mongodb.client.model.Collation EXACT_NAMES = com.mongodb.client.model.Collation.builder().locale("simple").build();
     private static final TransactionOptions TRANSACTION = TransactionOptions.builder()
             .readConcern(ReadConcern.SNAPSHOT).writeConcern(WriteConcern.MAJORITY.withJournal(true)).build();
     private static final String ALL_KEYS = "cleared";
@@ -178,10 +179,7 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     void reservePublication(ClientSession session, Document cluster, Document operator, RequiredNoteOwner global,
             List<RequiredNoteOwner> known, List<RequiredNoteOwner> added) {
         requireOrdinary();
-        var description = database.listCollections()
-                .filter(new Document("name", SystemCollections.PDK_NOTE_SCOPES.collectionName())).first();
-        var options = description == null ? null : description.get("options", Document.class);
-        if (known.size() + added.size() > 128 || options != null && options.containsKey("collation")) {
+        if (known.size() + added.size() > 128) {
             open(session, global);
             for (var owner : known) reserveAuthoring(session, owner, true);
             for (var owner : added) reserveAuthoring(session, owner, false);
@@ -193,7 +191,8 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
         for (var owner : known) owners.put(scopeId(owner), owner);
         for (var owner : added) owners.putIfAbsent(scopeId(owner), owner);
         var rows = new java.util.HashMap<Document, Document>();
-        for (var row : scopes.find(session, new Document("_id", new Document("$in", List.copyOf(owners.keySet()))))) {
+        for (var row : scopes.find(session, new Document("_id", new Document("$in", List.copyOf(owners.keySet()))))
+                .collation(EXACT_NAMES)) {
             if (!(row.get("_id") instanceof Document key) || !owners.containsKey(key) || rows.put(key, row) != null)
                 throw unavailable();
         }

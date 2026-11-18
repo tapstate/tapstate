@@ -14,7 +14,7 @@ import java.util.UUID;
 
 /** A target's operator identity and schema are independent of the default cache's runtime authority. */
 final class MongoCacheOperatorDatabases {
-    private static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_IDENTITY,
+    static final List<SystemCollections> TABLES = List.of(SystemCollections.CACHE_IDENTITY,
             SystemCollections.CACHE_SCHEMA_MIGRATIONS, SystemCollections.CACHE_NEST_STATE, SystemCollections.CACHE_NEST_SHAPES);
     private MongoCacheOperatorDatabases() {}
 

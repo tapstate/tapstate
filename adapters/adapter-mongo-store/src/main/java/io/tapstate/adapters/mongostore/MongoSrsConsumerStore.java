@@ -435,7 +435,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
         }
     }
 
-    SourcePositionEdits positions(WorkloadClaimFence node, java.time.Duration retention) {
+    SourcePositionEdits positions(WorkloadClaimFence node) {
         Objects.requireNonNull(node, "originalNode");
         return (moves, readers, editedAt) -> {
             var fixed = List.copyOf(moves); var originals = Map.copyOf(readers);
@@ -448,7 +448,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                     var physical = reader.getKey();
                     if (!scope.equals(new CacheBusinessScope(physical.clusterId(), physical.bindingVersion(), physical.cacheIncarnation()))) throw fenced();
                     var access = new MongoCachePipelineAccess(client, database, physical, reader.getValue(), requireActive);
-                    access.verifyStateStructure(); var state = access.state(session);
+                    var state = access.state(session, true);
                     access.proveConsumerClaim(session); access.updateState(session, state, new Document(), false);
                 }
                 var selected = new java.util.HashSet<String>();
@@ -475,7 +475,7 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                             var physical = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), context.key().pipelineId(), context.stateGeneration());
                             var claim = originals.get(physical);
                             if (!before.equals(logged.consumers().get(context)) || claim == null || !MongoPositionFences.retained(member.commandFence(), claim)) throw unavailable(chain);
-                            attached.add(context); prove(session, context, claim); validateSnapshot(session, context, cursor.snapshot());
+                            attached.add(context); prove(session, context, claim, true); validateSnapshot(session, context, cursor.snapshot());
                             var old = cursor.value();
                             var cleared = new ConsumerOffset(old.pipelineId(), old.perTableSeq(), null, old.snapshotCompletedTables(),
                                     old.cdcStartPosition(), old.snapshotEpoch(), Map.of(), old.progressKind());
@@ -488,7 +488,6 @@ public final class MongoSrsConsumerStore implements SrsConsumerStore {
                         changed = true;
                         String channel = direct.original().context().channelId();
                         if (!selected.add(channel)) throw fenced();
-                        new MongoCacheMetadataStructure(database, retention).verifyDirect();
                         var pipeline = originals.get(direct.original().context().scope());
                         if (pipeline == null) throw fenced();
                         new MongoDirectChannelStore(client, database, scope, requireActive)

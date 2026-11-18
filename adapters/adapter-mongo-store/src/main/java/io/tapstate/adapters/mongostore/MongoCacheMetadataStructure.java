@@ -100,13 +100,6 @@ final class MongoCacheMetadataStructure {
 
     void verifySrs() { verify(SRS_TABLES); }
 
-    /** Admitted readers keep namespace checks live; full index audits belong to admission and strict operations. */
-    void verifySrsNamespaces() { verifyNamespaces(SRS_TABLES); }
-
-    private void verifyNamespaces(List<SystemCollections> tables) {
-        StoreIo.run(() -> requireNamespaces(names(tables), collections(names(tables))));
-    }
-
     private static void requireNamespaces(Set<String> required, Map<String, Document> existing) {
         if (!existing.keySet().equals(required)) throw unreadable("collections");
         for (var description : existing.values()) {

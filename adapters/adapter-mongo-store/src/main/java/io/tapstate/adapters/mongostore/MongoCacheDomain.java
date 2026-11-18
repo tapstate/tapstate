@@ -30,7 +30,6 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final String targetFingerprint;
     private final java.util.concurrent.atomic.AtomicBoolean closed = new java.util.concurrent.atomic.AtomicBoolean();
     private boolean connectionClosed;
-    private volatile CacheBusinessScope readAdmission;
 
     private MongoCacheDomain(MongoConnection connection, Duration rateRetention, String targetFingerprint,
                              io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases) {
@@ -273,19 +272,28 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
                 .find(new Document("_id", "business")).first());
         if (business != null && business.get("validation") instanceof Document validation
                 && "READY".equals(validation.getString("phase"))) required.addAll(MongoValidationSchema.CACHE);
-        var result = MongoStructureInspection.inspect(database,
-                MongoStructureInspection.namespaces(required, required, rateRetention), budget);
+        var result = new ArrayList<>(MongoStructureInspection.inspect(database,
+                MongoStructureInspection.namespaces(required, required, rateRetention), budget));
+        var scope = new CacheBusinessScope(auth.clusterId(), auth.bindingVersion(), auth.cacheIncarnation());
+        if (operatorDatabases != null && operatorDatabases.scope().equals(scope)) {
+            var namespaces = MongoStructureInspection.namespaces(MongoCacheOperatorDatabases.TABLES,
+                    MongoCacheOperatorDatabases.TABLES, rateRetention);
+            for (var name : budget.transaction(client, session -> MongoOperatorInventory.registeredDatabases(session, database, scope))) {
+                MongoStorePort.requireOperatorStateDatabase(name, database.getName());
+                MongoStorePort.requireOperatorStateDatabase(name, operatorDatabases.configurationDatabase());
+                MongoStorePort.requireOperatorStateDatabase(name, operatorDatabases.masterDatabase());
+                result.addAll(MongoStructureInspection.inspect(client.getDatabase(name), namespaces, budget));
+            }
+        }
         businessActive();
-        return result;
+        return List.copyOf(result);
     }
 
     /** Admission validates retained business structures and configured indexes without repairing them. */
     public void verifyBusinessReady(CacheBusinessScope expected) {
-        readAdmission = null;
         loadBusinessScope(expected);
         new MongoCacheMetadataStructure(database, rateRetention).verifyBusiness();
         loadBusinessScope(expected);
-        readAdmission = expected;
     }
 
     /** Controlled continuation requires the original operation and already retained authentication facts. */
@@ -432,46 +440,38 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             io.tapstate.spi.store.WorkloadClaimFence node, Runnable requireActive) {
         Objects.requireNonNull(requireActive); Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
-        var structure = new MongoCacheMetadataStructure(database, rateRetention); structure.verifySrs();
-        return new MongoSrsConsumerStore(client, database, expected, active, structure::verifySrs).positions(node, rateRetention);
+        return new MongoSrsConsumerStore(client, database, expected, active, () -> {}).positions(node);
     }
 
     /** SRS facets retain one CACHE client, complete business scope and original caller lifecycle. */
     @Override public io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive) {
-        return srs(expected, requireActive, false, false);
+        return srs(expected, requireActive, false);
     }
 
-    /** Reads an original consumer cursor with admission and structure checks in the same operation. */
+    /** Reads an original consumer cursor in its own CACHE admission snapshot. */
     public java.util.Optional<io.tapstate.spi.store.ConsumerOffset> observationCursor(CacheBusinessScope expected,
             io.tapstate.spi.store.SrsConsumerContext context, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
-        var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        Runnable verify = () -> {
-            if (expected.equals(readAdmission)) structure.verifySrsNamespaces();
-            else structure.verifySrs();
-        };
-        return new MongoSrsConsumerStore(client, database, expected, active, verify)
+        return new MongoSrsConsumerStore(client, database, expected, active, () -> {})
                 .admittedObservationCursor(context);
     }
 
     /** One validated view for the synchronous reads of a start plan. */
     public io.tapstate.spi.store.SrsStores startPlanningSrs(CacheBusinessScope expected, Runnable requireActive) {
-        return srs(expected, requireActive, true, false);
+        return srs(expected, requireActive);
     }
 
     public io.tapstate.spi.store.SrsStores runtimeSrs(CacheBusinessScope expected, Runnable requireActive) {
-        return srs(expected, requireActive, false, true);
+        return srs(expected, requireActive, true);
     }
 
-    private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean planning, boolean runtime) {
+    private io.tapstate.spi.store.SrsStores srs(CacheBusinessScope expected, Runnable requireActive, boolean runtime) {
         Objects.requireNonNull(requireActive, "requireActive");
         Runnable active = () -> { businessActive(); requireActive.run(); };
         active.run(); loadBusinessScope(expected);
-        var structure = new MongoCacheMetadataStructure(database, rateRetention);
-        if (!runtime) structure.verifySrs();
         active.run();
-        Runnable verifyStructure = planning || runtime ? () -> {} : structure::verifySrs;
+        Runnable verifyStructure = () -> {};
         var lease = MongoSrsLease.selected();
         var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
         return new io.tapstate.spi.store.SrsStores(
@@ -592,7 +592,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         var target = access.operatorDatabase(targetDatabase, io.tapstate.spi.store.OperatorPlacement.Resource.NEST_STATE);
         if (target.getName().equals(database.getName())) {
             access.metadataTransaction(SystemCollections.CACHE_NEST_STATE, true, session -> {
-                new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(SystemCollections.CACHE_NEST_SHAPES);
+                var structure = new MongoCacheMetadataStructure(database, rateRetention);
+                structure.verifyFacet(SystemCollections.CACHE_NEST_STATE);
+                structure.verifyFacet(SystemCollections.CACHE_NEST_SHAPES);
                 return null;
             });
             return;

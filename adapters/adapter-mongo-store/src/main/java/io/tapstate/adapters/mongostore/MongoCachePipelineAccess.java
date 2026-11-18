@@ -209,14 +209,13 @@ final class MongoCachePipelineAccess {
     <T> T publicationModelsTransaction(Function<ClientSession, T> action) {
         if (!unpreparedModels || authoringModels == null)
             return metadataTransaction(SystemCollections.CACHE_DERIVED_SCHEMAS, true, action);
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try (var session = client.startSession()) {
                 T result = session.withTransaction(() -> {
+                    MongoStructureFailureScope.beginCallback();
                     requireActive.run();
                     authoringModels.requirePublicationActive();
-                    verifyStateStructure();
                     requireUnpreparedModels(session);
-                    new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(SystemCollections.CACHE_DERIVED_SCHEMAS);
                     if (originalNode == null) throw fenced();
                     var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
                     new MongoCacheBusinessIdentity(database, business).admitMetadataWrite(session);
@@ -228,7 +227,7 @@ final class MongoCachePipelineAccess {
                 requireActive.run();
                 return result;
             }
-        });
+        }));
     }
     /** Read-only control header access; never materializes Pipeline positions or operator bodies. */
     <T> T validationControlTransaction(Function<ClientSession,T> action){
@@ -255,7 +254,6 @@ final class MongoCachePipelineAccess {
             if (unpreparedModels) {
                 if (table != SystemCollections.CACHE_DERIVED_SCHEMAS || !database.getName().equals(target.getName())) throw fenced();
                 requireUnpreparedModels(session);
-                new MongoCacheMetadataStructure(database, rateRetention).verifyFacet(table);
                 if (mutation) {
                     if (originalNode == null) throw fenced();
                     var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
@@ -264,13 +262,13 @@ final class MongoCachePipelineAccess {
                 }
                 return action.apply(session);
             }
-            Document current = state(session);
+            Document current = state(session, true);
             if (!database.getName().equals(target.getName())) {
                 String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
                 MongoOperatorInventory.requireDatabase(MongoOperatorInventory.require(session, database, scope), target.getName(), preparation, scope);
+                new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
             }
-            new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
-            if (mutation) { proveClaim(session); updateState(session, current, new Document(), false); }
+            if (mutation) { proveClaim(session, true); updateState(session, current, new Document(), false); }
             return action.apply(session);
         });
         if(authoringModels!=null)authoringModels.requireActive();

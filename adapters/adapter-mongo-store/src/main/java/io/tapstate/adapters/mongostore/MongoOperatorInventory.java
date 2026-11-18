@@ -185,6 +185,27 @@ final class MongoOperatorInventory {
                         .append("placements", root.get("placements")).append("retirement", marker)));
     }
 
+    static Set<String> registeredDatabases(ClientSession session, MongoDatabase database,
+            io.tapstate.spi.store.CacheBusinessScope scope) {
+        var filter = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())
+                .append("_id.cacheIncarnation", scope.cacheIncarnation()).append("databases.0", new Document("$exists", true));
+        var registered = new java.util.TreeMap<String, String>();
+        try (var rows = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, filter).batchSize(64).iterator()) {
+            while (rows.hasNext()) {
+                var row = rows.next();
+                var owner = MongoPipelinePreparationFacts.scope(row.get("_id", Document.class));
+                decode(session, database, owner, row, !row.containsKey("retirement"), false);
+                for (var entry : row.getList("databases", Document.class)) {
+                    var name = entry.getString("database");
+                    var operation = entry.getString("operationId");
+                    var previous = registered.putIfAbsent(name, operation);
+                    if (previous != null && !previous.equals(operation)) throw unreadable(owner);
+                }
+            }
+        }
+        return java.util.Collections.unmodifiableSet(registered.navigableKeySet());
+    }
+
     /** Historical identity facts do not borrow another Pipeline's current execution authority. */
     static java.util.Optional<String> databaseHistory(ClientSession session, MongoDatabase database, io.tapstate.spi.store.CacheBusinessScope scope, String target) {
         var filter = new Document("_id.clusterId", scope.clusterId()).append("_id.bindingVersion", scope.bindingVersion())

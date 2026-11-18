@@ -60,7 +60,7 @@ class MongoCacheSrsStoresIT {
                 commands.clear();
                 assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
                 assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
-                assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).hasSize(1);
+                assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).isEmpty();
                 assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
         });
@@ -158,7 +158,7 @@ class MongoCacheSrsStoresIT {
                     .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
             code(() -> f.domain.verifyBusinessReady(f.scope), IoError.DOCUMENT_UNREADABLE);
             assertThat(states.read("pipeline").orElseThrow().epoch()).isEqualTo(checkpoint.epoch() + 1);
-            code(() -> f.domain.observationCursor(f.scope, context, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
         });
     }
 
@@ -187,7 +187,7 @@ class MongoCacheSrsStoresIT {
         });
     }
 
-    @Test void retentionFloorsDoNotReopenAnAuditedTransactionForEachSubscriber() {
+    @Test void retentionFloorsUseOneSnapshotWithoutCatalogQueries() {
         withFixture(f -> {
             var prepared = f.pipeline();
             var stores = f.domain.srs(f.scope, ACTIVE);
@@ -208,8 +208,7 @@ class MongoCacheSrsStoresIT {
                 assertThat(stores.consumers().retentionFloors(CHAIN, stores.chains())).hasValue(Map.of("orders", 4L));
                 assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
                         .as("topology and every confirmed floor share the original native snapshot").hasSize(1);
-                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
-                        .as("all eight physical facets are audited once, not once per subscriber").hasSize(8);
+                assertThat(commands).noneMatch(value -> value.startsWith("listCollections:") || value.startsWith("listIndexes:"));
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
         });
     }
@@ -223,15 +222,12 @@ class MongoCacheSrsStoresIT {
             code(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()), IoError.SRS_CHECKPOINT_UNPROVEN);
             SystemCollections.SRS_CHAINS.on(f.database).insertOne(root);
             SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
-            var original = catchThrowable(() -> stores.consumers().attached(CHAIN));
-            assertThat(original).isInstanceOf(TapstateException.class);
-            assertThat(((TapstateException) original).code()).isNotEqualTo(IoError.SRS_CHECKPOINT_UNPROVEN);
-            assertThatThrownBy(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()))
-                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(((TapstateException) original).code()));
+            var original = stores.consumers().attached(CHAIN);
+            assertThat(stores.consumers().retentionSnapshot(CHAIN, stores.chains()).topology()).isEqualTo(original);
         });
     }
 
-    @Test void admittedObservationChecksOneStructureAndOneTransaction() {
+    @Test void admittedObservationChecksAuthorityInOneTransactionWithoutCatalog() {
         withFixture(f -> {
             var prepared = f.pipeline();
             var stores = f.domain.srs(f.scope, ACTIVE);
@@ -243,14 +239,13 @@ class MongoCacheSrsStoresIT {
                 assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
                 assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
                         .as("admission and cursor proof belong to one snapshot").hasSize(1);
-                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
-                        .as("the cursor does not reopen the same eight physical facets").hasSize(8);
+                assertThat(commands).noneMatch(value -> value.startsWith("listCollections:") || value.startsWith("listIndexes:"));
             } finally { MongoCommandObservation.COLLECTIONS.remove(); }
         });
     }
 
-    @ParameterizedTest @ValueSource(strings = {"admission", "retired", "index", "guard"})
-    void combinedObservationKeepsFreshAdmissionStructureAndCallerChecks(String damage) {
+    @ParameterizedTest @ValueSource(strings = {"admission", "retired", "guard"})
+    void combinedObservationKeepsFreshAdmissionAndCallerChecks(String damage) {
         withFixture(f -> {
             var prepared = f.pipeline();
             var stores = f.domain.srs(f.scope, ACTIVE);
@@ -270,10 +265,7 @@ class MongoCacheSrsStoresIT {
                             new Document("$set", new Document("businessPhase", "RETIRED")));
                     yield IoError.CACHE_BUSINESS_FENCED;
                 }
-                case "index" -> {
-                    SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
-                    yield IoError.DOCUMENT_UNREADABLE;
-                }
+
                 default -> { active.set(false); yield IoError.WORKLOAD_CLAIM_FENCED; }
             };
             code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
@@ -467,18 +459,22 @@ class MongoCacheSrsStoresIT {
     }
 
     @ParameterizedTest @ValueSource(strings={"srs_chains","srs_models","srs_model_contexts","srs_events","srs_log_bounds","srs_consumers","srs_consumer_offsets","workload_claims"})
-    void losingAnyRequiredCollectionRefusesBothExistingViewsAndOpeningWithoutRecreatingIt(String table) {
+    void ordinaryViewsOpenWhileInspectionReportsMissingSrsCollections(String table) {
         withFixture(f -> {
-            var stores = f.domain.srs(f.scope,ACTIVE); f.database.getCollection(table).drop();
-            var before = f.snapshot(); refuseReads(f,stores,IoError.DOCUMENT_UNREADABLE);
-            code(() -> f.domain.srs(f.scope,ACTIVE),IoError.DOCUMENT_UNREADABLE);
-            code(() -> stores.chains().prepare(CHAIN,"retention",f.capture),IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.database.listCollectionNames()).doesNotContain(table); assertThat(f.snapshot()).isEqualTo(before);
+            f.database.getCollection(table).drop();
+            var before = f.snapshot();
+            assertThat(f.domain.srs(f.scope, ACTIVE)).isNotNull();
+            assertThat(f.domain.inspectStructure(f.auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.collection()).isEqualTo(table);
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.COLLECTION_MISSING);
+                    });
+            assertThat(f.snapshot()).isEqualTo(before);
         });
     }
 
     @ParameterizedTest @ValueSource(strings={"missing","hidden","ttl","keys"})
-    void changedIndexesRemainLoadOnlyFailures(String fault) {
+    void changedIndexesAreReportedWithoutBlockingOrdinarySrsReads(String fault) {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope,ACTIVE); var table = SystemCollections.SRS_MODELS.on(f.database);
             var declared = SystemCollections.SRS_MODELS.indexes().getFirst(); table.dropIndex(declared.indexName());
@@ -491,7 +487,10 @@ class MongoCacheSrsStoresIT {
                 table.createIndex(keys,options);
             }
             var before = table.listIndexes().into(new ArrayList<>());
-            refuseReads(f,stores,IoError.DOCUMENT_UNREADABLE); code(() -> f.domain.srs(f.scope,ACTIVE),IoError.DOCUMENT_UNREADABLE);
+            assertThat(stores.chains().load(CHAIN)).isPresent();
+            assertThat(f.domain.srs(f.scope, ACTIVE)).isNotNull();
+            assertThat(f.domain.inspectStructure(f.auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> assertThat(issue.index()).isEqualTo(declared.indexName()));
             assertThat(table.listIndexes().into(new ArrayList<>())).isEqualTo(before);
         });
     }
