@@ -185,6 +185,26 @@ class MongoAlertStorageSchemaIT {
         });
     }
 
+    @Test void ordinaryAlertAuthorityRefreshDefersCatalogDriftToInspection() {
+        withConfiguration(false, fixture -> {
+            SystemCollections.ALERT_EPISODES.on(fixture.database()).dropIndex("alert_cleanup");
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThat(fixture.domain().alertAuthorityVersion(new MongoReadBudget(Duration.ofSeconds(5))))
+                        .isEqualTo(MongoAlertStorageSchema.VERSION);
+                var snapshot = diagnostics.snapshot();
+                assertThat(snapshot).containsEntry("complete", true);
+                assertThat((List<?>) snapshot.get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((java.util.Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+            assertThat(fixture.domain().inspectStructure(new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.collection()).isEqualTo(SystemCollections.ALERT_EPISODES.collectionName());
+                        assertThat(issue.index()).isEqualTo("alert_cleanup");
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                    });
+        });
+    }
+
     @Test void missingUsedCollectionIsRefusedByReopenAndByPreparationWithoutRecreatingIt() {
         withConfiguration(false, fixture -> {
             SystemCollections.ALERT_EPISODES.on(fixture.database()).drop();

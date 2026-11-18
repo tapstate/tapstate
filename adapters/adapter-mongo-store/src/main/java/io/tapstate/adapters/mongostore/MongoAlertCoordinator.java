@@ -73,7 +73,7 @@ final class MongoAlertCoordinator implements AlertStore {
         this.notifications=new MongoAlertNotificationStore(db,host.scope(),host.deployment(),host.locallyActive(),clock);
         this.nodes=new MongoAlertNodeLifecycleStore(domain,db,keys,bindings,host.scope(),host.setup(),host.locallyActive());
         this.maintenance=new MongoAlertMaintenance(c->c.on(db),host.scope(),clock,new MongoAlertMaintenance.Transactions(){
-            public void verify(Duration remaining){host.locallyActive().run();try{if(domain.alertSchemaVersion(new MongoReadBudget(remaining).withoutCallbackRetries())!=MongoAlertStorageSchema.VERSION)throw unreadable("schema-capability");}
+            public void verify(Duration remaining){host.locallyActive().run();try{if(domain.alertAuthorityVersion(new MongoReadBudget(remaining).withoutCallbackRetries())!=MongoAlertStorageSchema.VERSION)throw unreadable("schema-capability");}
                 catch(MongoReadBudget.MaintenanceConflict conflict){throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);}}
             public <T>T run(boolean write,Duration remaining,Function<ClientSession,T> action){try{return maintenanceTx(write,remaining,action);}
                 catch(MongoReadBudget.MaintenanceConflict conflict){if(write)throw conflict;throw new TapstateException(IoError.STORE_UNAVAILABLE,Map.of("detail","maintenance-contention"),null);}}

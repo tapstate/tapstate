@@ -65,6 +65,10 @@ final class MongoAlertStorageSchema {
         return marker == null ? 0 : marker.getInteger("installedVersion");
     }
 
+    Document loadAuthorityMarker(MongoReadBudget budget) {
+        return budget.transaction(client, session -> marker(session, budget));
+    }
+
     Document loadVerifiedMarker(MongoReadBudget budget) {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {

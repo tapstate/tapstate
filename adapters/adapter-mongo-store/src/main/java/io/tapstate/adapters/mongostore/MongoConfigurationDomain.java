@@ -214,10 +214,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         currentAlertSchema();
     }
 
+    int alertAuthorityVersion(MongoReadBudget budget) {
+        var marker = loadAlertAuthority(budget);
+        return marker == null ? 0 : marker.getInteger("installedVersion");
+    }
+
+    private Document loadAlertAuthority(MongoReadBudget budget) {
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadAuthorityMarker(budget);
+    }
+
     private void verifyAlertSchema() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
-        Document marker = new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadVerifiedMarker(budget);
+        Document marker = loadAlertAuthority(budget);
         if (marker == null || marker.getInteger("installedVersion") != MongoAlertStorageSchema.VERSION)
             throw unreadable("alert-store", "schema-capability");
         verifiedAlertSchema = new VerifiedAlertSchema(marker, System.nanoTime());
@@ -267,7 +277,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     MongoAlertConfigurationStore alertDefinitions(io.tapstate.core.alerting.AlarmKey.Scope scope,
             io.tapstate.core.alerting.AlarmTypeCatalog catalog) {
         if (!clusterId.equals(scope.clusterId())) { throw unreadable("alert-configuration", "scope"); }
-        if (alertSchemaVersion() != MongoAlertStorageSchema.VERSION) { throw unreadable("alert-configuration", "schema-not-prepared"); }
+        if (alertAuthorityVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5))) != MongoAlertStorageSchema.VERSION) {
+            throw unreadable("alert-configuration", "schema-not-prepared");
+        }
         return new MongoAlertConfigurationStore(connection.database(), scope, catalog, this::requireOpen, configurationKey);
     }
 
