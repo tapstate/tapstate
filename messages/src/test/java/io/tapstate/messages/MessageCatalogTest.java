@@ -77,9 +77,9 @@ class MessageCatalogTest {
         }
         assertThat(simplified.get("message")).isNotEqualTo(english.get("message")).isNotEqualTo(traditional.get("message"));
         assertThat(catalog.snapshot(new TapstateException(testFailed, Map.of("connector", "fixture"), null), Locale.ENGLISH))
-                .isEqualTo(Map.of("code", testFailed.code(), "codeSource", "tapstate-legacy"));
+                .isEqualTo(Map.of("code", testFailed.code(), "codeSource", "tapstate-standard"));
         assertThat(catalog.snapshot(new TapstateException(DslError.UNKNOWN_FIELD, params, null), Locale.ENGLISH))
-                .isEqualTo(Map.of("code", DslError.UNKNOWN_FIELD.code(), "codeSource", "tapstate-legacy"));
+                .isEqualTo(Map.of("code", DslError.UNKNOWN_FIELD.code(), "codeSource", "tapstate-standard"));
     }
 
     @Test

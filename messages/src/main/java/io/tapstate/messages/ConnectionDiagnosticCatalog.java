@@ -2,6 +2,7 @@ package io.tapstate.messages;
 
 import io.tapstate.core.common.DiagnosticCodeSource;
 import io.tapstate.core.common.DiagnosticDefinitionLookup;
+import io.tapstate.core.common.ProductErrorModule;
 import io.tapstate.core.common.TapstateException;
 
 import java.util.List;
@@ -17,18 +18,15 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     private static final String SOLUTION = "solution";
 
     public enum Definition {
-        TEST_EXECUTION_FAILED(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED, "connector.test-failed");
+        TEST_EXECUTION_FAILED(io.tapstate.core.common.ConnectorErrorDefinitions.TEST_FAILED);
 
         private final io.tapstate.core.common.ProductErrorDefinition definition;
-        private final String legacy;
 
-        Definition(io.tapstate.core.common.ProductErrorDefinition definition, String legacy) {
+        Definition(io.tapstate.core.common.ProductErrorDefinition definition) {
             this.definition = definition;
-            this.legacy = legacy;
         }
 
         public String code() { return definition.code(); }
-        public String legacy() { return legacy; }
         public Set<String> parameters() { return definition.parameters(); }
     }
 
@@ -47,12 +45,13 @@ public final class ConnectionDiagnosticCatalog implements DiagnosticDefinitionLo
     }
 
     public Map<String, Object> snapshot(TapstateException failure, Locale locale) {
-        String legacy = failure.code().code();
-        return resolve(legacy, failure.args(), List.of(), locale)
+        String code = failure.code().code();
+        return resolve(code, failure.args(), List.of(), locale)
                 .<Map<String, Object>>map(rendered -> Map.of("code", rendered.code(), "params", failure.args(),
                         DiagnosticCodeSource.FIELD, DiagnosticCodeSource.TAPSTATE_STANDARD,
                         MESSAGE, rendered.message(), SOLUTION, rendered.solution()))
-                .orElseGet(() -> Map.of("code", legacy, DiagnosticCodeSource.FIELD, DiagnosticCodeSource.TAPSTATE_LEGACY));
+                .orElseGet(() -> Map.of("code", code, DiagnosticCodeSource.FIELD, ProductErrorModule.isRegistered(code)
+                        ? DiagnosticCodeSource.TAPSTATE_STANDARD : DiagnosticCodeSource.TAPSTATE_LEGACY));
     }
 
     @Override public Optional<Resolved> resolve(String code, Map<String, Object> named, List<String> positional, Locale locale) {
