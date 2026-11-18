@@ -28,7 +28,7 @@ class PipelineDraftJsonTest {
                                 "relation", Map.of(
                                         "on", List.of(Map.of("childField", "order_id", "parentField", "id")),
                                         "shape", "rollup", "key", List.of(), "arrayKey", List.of("item_id"),
-                                        "rollup", rollup),
+                                        "rollup", rollup, "trackKeyChanges", false),
                                 "preTransforms", List.of())),
                         "transforms", List.of()));
 
@@ -38,10 +38,12 @@ class PipelineDraftJsonTest {
         assertThat(relation.shape()).isEqualTo(PipelineDraft.Shape.ROLLUP);
         assertThat(relation.path()).isNull();
         assertThat(relation.rollup()).isEqualTo(rollup);
+        assertThat(relation.trackKeyChanges()).isFalse();
 
         Map<?, ?> wire = (Map<?, ?>) PipelineDraftJson.write(json, draft).get("wizard");
         Map<?, ?> wireRelation = (Map<?, ?>) ((Map<?, ?>) ((List<?>) wire.get("related")).getFirst()).get("relation");
         assertThat(wireRelation.get("shape")).isEqualTo("rollup");
         assertThat(wireRelation.get("rollup")).isEqualTo(rollup);
+        assertThat(wireRelation.get("trackKeyChanges")).isEqualTo(false);
     }
 }

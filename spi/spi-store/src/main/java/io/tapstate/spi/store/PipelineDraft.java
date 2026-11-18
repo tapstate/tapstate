@@ -125,9 +125,11 @@ public record PipelineDraft(
      * How a related table joins its parent. {@code rollup} holds the relation's rollup fields as authored:
      * field name to one function and its options, in the spelling of a nest embed's {@code rollup:}. It is
      * kept as written and judged when the draft is compiled, because a draft may be saved half-finished.
+     * {@code trackKeyChanges} says whether a related row may move to another parent or element; absent
+     * means the default for the shape, which is on for array and rollup relations.
      */
     public record Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
-            List<String> arrayKey, Map<String, Object> rollup) {
+            List<String> arrayKey, Map<String, Object> rollup, Boolean trackKeyChanges) {
         public Relation(List<FieldPair> on, Shape shape, String path, List<String> arrayKey) {
             this(on, shape, path, List.of(), arrayKey);
         }
@@ -136,6 +138,17 @@ public record PipelineDraft(
         public Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
                 List<String> arrayKey) {
             this(on, shape, path, key, arrayKey, null);
+        }
+
+        /** A relation that leaves key-change tracking at the default for its shape. */
+        public Relation(List<FieldPair> on, Shape shape, String path, List<String> key,
+                List<String> arrayKey, Map<String, Object> rollup) {
+            this(on, shape, path, key, arrayKey, rollup, null);
+        }
+
+        /** Whether a related row may move: as written, else on exactly when the relation keeps its rows. */
+        public boolean tracksKeyChanges() {
+            return trackKeyChanges == null ? shape.holdsRows() : trackKeyChanges;
         }
 
         public Relation {

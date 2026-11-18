@@ -488,6 +488,9 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
         if (relation.rollup() != null) {
             relationDocument.append("rollup", new Document(relation.rollup()));
         }
+        if (relation.trackKeyChanges() != null) {
+            relationDocument.append("trackKeyChanges", relation.trackKeyChanges());
+        }
         return new Document("id", related.id()).append("parentId", related.parentId())
                 .append("sourceId", related.sourceId()).append("table", related.table())
                 .append("relation", relationDocument)
@@ -565,7 +568,8 @@ public final class MongoPipelineDraftStore implements PipelineDraftStore {
                         relation.getString("path"), strings(relation.get("key")),
                         strings(relation.get("arrayKey")),
                         relation.get("rollup") instanceof Document rollup
-                                ? MongoCatalogStore.normalizeMap(rollup) : null),
+                                ? MongoCatalogStore.normalizeMap(rollup) : null,
+                        relation.get("trackKeyChanges") instanceof Boolean track ? track : null),
                 transforms(document.get("preTransforms")));
     }
 
