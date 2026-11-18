@@ -60,7 +60,7 @@ public final class MessageCatalog {
 
     /** Renders the code's message and solution, substituting named placeholders from the args. */
     public Rendered render(TapstateErrorCode code, Map<String, Object> args) {
-        return render(code.code(), args);
+        return registered(code.code(), args, Locale.ENGLISH).orElseGet(() -> new Rendered(code.code(), null));
     }
 
     /**
@@ -75,67 +75,8 @@ public final class MessageCatalog {
 
     /** Localizes registered product codes; legacy text retains its original catalog language. */
     public Rendered render(String code, Map<String, Object> args, Locale locale) {
-        var registered = RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = SourceDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = BootDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = RoleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = CliDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = ClusterDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = DataBrowserDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = StoreDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isEmpty())
-            registered = ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
-        if (registered.isPresent()) {
-            var resolved = registered.orElseThrow();
-            return new Rendered(resolved.message(), resolved.solution());
-        }
+        var current = registered(code, args, locale);
+        if (current.isPresent()) return current.orElseThrow();
         Entry entry = entries.get(code);
         if (entry == null) {
             return new Rendered(code, null);
@@ -146,45 +87,47 @@ public final class MessageCatalog {
 
     /** Renders an optional wire diagnostic only when its known parameter contract is complete. */
     public Optional<Rendered> renderComplete(String code, Map<String, Object> args) {
-        var registered = RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH)
-                .or(() -> DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> SourceDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> BootDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> RoleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> CliDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> ClusterDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> DataBrowserDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> StoreDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
-        if (registered.isPresent()) {
-            var text = registered.orElseThrow();
-            return Optional.of(new Rendered(text.message(), text.solution()));
-        }
+        var current = registered(code, args, Locale.ENGLISH);
+        if (current.isPresent()) return current;
         Entry entry = entries.get(code);
         if (entry == null) return Optional.empty();
         Set<String> required = new HashSet<>();
         collectLegacyParameters(entry.message(), required);
         collectLegacyParameters(entry.solution(), required);
         return required.equals(args.keySet()) ? Optional.of(render(code, args)) : Optional.empty();
+    }
+
+    private static Optional<Rendered> registered(String code, Map<String, Object> args, Locale locale) {
+        return RequestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale)
+                .or(() -> DslDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> SourceDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MutationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> McpDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> SchemaDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> LifecycleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> StartCheckDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ValidationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> BootDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> RoleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> CliDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ClusterDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> DataBrowserDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MonitorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> PositionDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> MigrationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> RowValueDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> EngineDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> TransformDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> NestSizingDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> StoreDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> IoDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> NestDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .or(() -> ConnectorDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale))
+                .map(text -> new Rendered(text.message(), text.solution()));
     }
 
     private static void collectLegacyParameters(String template, Set<String> required) {

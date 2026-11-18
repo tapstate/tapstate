@@ -182,11 +182,11 @@ class MessageCatalogTest {
     }
 
     @Test
-    void unknownCodeFallsBackToTheBareCanonicalCode() {
+    void typedErrorsUseOnlyRegisteredDefinitionsWhileHistoricalTextRemainsReadable() {
         TapstateErrorCode absent = new TapstateErrorCode() {
             @Override
             public String code() {
-                return "cli.not-in-catalog-test";
+                return "control.malformed-request";
             }
 
             @Override
@@ -199,9 +199,11 @@ class MessageCatalogTest {
                 return Set.of();
             }
         };
-        MessageCatalog.Rendered r = EN.render(absent, Map.of());
-        assertThat(r.message()).isEqualTo("cli.not-in-catalog-test");
+        var args = Map.<String, Object>of("reason", "missing id");
+        MessageCatalog.Rendered r = EN.render(absent, args);
+        assertThat(r.message()).isEqualTo("control.malformed-request");
         assertThat(r.solution()).isNull();
+        assertThat(EN.render(absent.code(), args).message()).contains("missing id");
     }
 
     @Test
