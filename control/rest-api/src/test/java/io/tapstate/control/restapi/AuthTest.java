@@ -104,7 +104,10 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.header.HeaderWriterFilter;
 import org.springframework.web.client.RestClient;
 
 import org.springframework.web.method.HandlerMethod;
@@ -385,6 +388,18 @@ class AuthTest {
                     .contentType(MediaType.APPLICATION_JSON).body("{}")
                     .exchange((request, response) -> response.getStatusCode().value())).isEqualTo(401);
         }
+    }
+
+    @Test
+    void apiSecurityHeadersArePresentBeforeTheHandlerCanStartStreaming() throws Exception {
+        var api = context.getBean("apiSecurityFilterChain", SecurityFilterChain.class);
+        var headers = api.getFilters().stream().filter(HeaderWriterFilter.class::isInstance).findFirst().orElseThrow();
+        var request = new MockHttpServletRequest("POST", "/api/pipelines/orders/draft:assistant");
+        var response = new MockHttpServletResponse();
+        headers.doFilter(request, response, (req, res) -> {
+            assertThat(response.getHeader("X-Content-Type-Options")).isEqualTo("nosniff");
+            assertThat(response.isCommitted()).isFalse();
+        });
     }
 
     // ---- an unauthenticated caller cannot reach a verb ----

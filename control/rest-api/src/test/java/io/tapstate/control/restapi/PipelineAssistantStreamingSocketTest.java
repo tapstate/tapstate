@@ -111,6 +111,9 @@ class PipelineAssistantStreamingSocketTest {
                 var received = response.get(5, TimeUnit.SECONDS);
                 assertThat(received.statusCode()).isEqualTo(200);
                 assertThat(received.headers().firstValue("Content-Type").orElseThrow()).startsWith("text/event-stream");
+                assertThat(received.headers().allValues("Cache-Control")).containsExactly("no-store");
+                assertThat(received.headers().firstValue("Pragma")).contains("no-cache");
+                assertThat(received.headers().firstValue("Expires")).contains("0");
                 var lines = new BufferedReader(new InputStreamReader(received.body(), StandardCharsets.UTF_8));
                 for (String line; (line = lines.readLine()) != null;) {
                     if (line.contains("text-delta") && line.contains("early text")) return lines;
@@ -178,6 +181,7 @@ class PipelineAssistantStreamingSocketTest {
         }
         @Bean SecurityFilterChain testSecurity(HttpSecurity http) throws Exception {
             return http.csrf(AbstractHttpConfigurer::disable)
+                    .headers(RestApiSecurityConfiguration::writeApiHeadersEagerly)
                     .authorizeHttpRequests(rules -> rules.anyRequest().permitAll()).build();
         }
     }
