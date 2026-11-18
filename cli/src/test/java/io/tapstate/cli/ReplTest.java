@@ -4108,6 +4108,24 @@ class ReplTest {
     }
 
     @Test
+    void applyDoesNotRetryAnAmbiguousWriteAfterFailover(@TempDir Path base) throws Exception {
+        copyWorkspace("/ws-valid", base);
+        URI node = URI.create("http://node1:7900");
+        FakeControlPlane client = new FakeControlPlane(node);
+        client.applyOutcome = new ApplyOutcome.Unreachable();
+        Harness h = onlineSession(base, client);
+        int mark = h.sink().toString().length();
+
+        assertThat(h.repl().dispatch("apply")).isTrue();
+
+        assertThat(client.applyCalls).containsExactly("jwt-tok@http://node1:7900 x3");
+        assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_DIAGNOSTIC);
+        assertThat(h.sink().toString().substring(mark)).contains("reconnected to node1:7900", "request failed");
+        assertThat(h.repl().session().isConnected()).isTrue();
+        assertThat(h.repl().session().landingNode()).isEqualTo(node);
+    }
+
+    @Test
     void applyRendersTheServerWarningsOnStderrAndStillSucceeds(@TempDir Path base) throws Exception {
         // Any catalogued code serves as the stand-in: what is under test is that the CLI renders a
         // server-sent code from its own bundled catalog, message and solution alike, and that the note

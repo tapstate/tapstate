@@ -5306,10 +5306,14 @@ final class Repl {
     // composite verb chains them. There is one way to apply, discover, start or read a pipeline from
     // here, whichever verb asked.
 
-    /** Applies one batch of drafts. */
+    /** Applies one batch without replaying a write whose result is unknown. */
     private ApplyOutcome applyDrafts(List<LocalDraft> drafts) {
-        return withFailover(() -> controlPlane.apply(session.landingNode(), session.credential(), drafts),
-                o -> o instanceof ApplyOutcome.Unreachable);
+        ApplyOutcome outcome = controlPlane.apply(session.landingNode(), session.credential(), drafts);
+        if (outcome instanceof ApplyOutcome.Unreachable) {
+            // Restore the session for subsequent calls; the server may have committed this write.
+            failover();
+        }
+        return outcome;
     }
 
     /** Runs a schema discovery for a connection with the connector and settings it declares. */
@@ -5702,9 +5706,9 @@ final class Repl {
     }
 
     /**
-     * Reports that a request could not be completed after failover. Only reached when the retry itself was
-     * unreachable while a landing node is still held; a total loss of the cluster has already been reported
-     * by {@link #failover} (which then took the session offline), so this stays silent in that case.
+     * Reports that a request could not be completed while a landing node is still held. A total loss of
+     * the cluster has already been reported by {@link #failover} (which then took the session offline),
+     * so this stays silent in that case.
      */
     private int reportRequestFailed() {
         if (!session.isConnected()) {
