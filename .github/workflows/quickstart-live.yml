@@ -273,6 +273,30 @@ jobs:
             || { echo "the store '$STORE_DB' is not registered; ls said:" >&2; cat ls.log >&2; exit 1; }
           echo "the store is registered and listed: $STORE_DB"
 
+      - name: Browser login through the local demo entry
+        if: matrix.server == 'from-source'
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/tapstate-demo"
+          body="$(jq -nc --arg username "$TAPSTATE_ADMIN_USER" --arg password "$TAPSTATE_ADMIN_PASSWORD" '{username:$username,password:$password}')"
+          code="$(curl --silent --show-error --cookie-jar "$RUNNER_TEMP/browser.cookies" --output /dev/null --write-out '%{http_code}' \
+            -H 'Origin: http://127.0.0.1:8080' -H 'X-Tapstate-Browser-Request: 1' \
+            -H 'Content-Type: application/json' --data "$body" http://127.0.0.1:8080/auth/browser/login)"
+          test "$code" = 200
+          code="$(curl --silent --show-error --cookie "$RUNNER_TEMP/browser.cookies" --output /dev/null --write-out '%{http_code}' \
+            -H 'Origin: http://127.0.0.1:8080' -H 'X-Tapstate-Browser-Request: 1' \
+            -X POST http://127.0.0.1:8080/auth/browser/session)"
+          test "$code" = 200
+          # A peer on the Compose network must not gain the loopback exception via the gateway.
+          docker compose exec -T mongo mongosh --nodb --quiet --eval '
+            const http = require("http");
+            const req = http.get({host:"server",port:18080,path:"/healthz",headers:{Host:"127.0.0.1:8080"}}, res => {
+              res.resume(); process.exit(res.statusCode === 403 ? 0 : 1);
+            });
+            req.on("error", () => process.exit(1));
+            req.setTimeout(10000, () => { req.destroy(); process.exit(1); });
+          '
+
       - name: The server came from where this leg says it did
         # Containerd can attach a repository digest to a local build tagged with a repository name.
         # Check the running image ID against the build receipt on the source leg.

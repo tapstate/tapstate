@@ -70,6 +70,17 @@ class SecretRedactorTest {
     }
 
     @Test
+    void hidesCompleteCredentialsThatContainAnExistingMarkerSpelling() {
+        var values = List.of("fixture<redacted>-account", "fixture********-password", "redacted");
+        String text = "account fixture<redacted>-account, password fixture********-password, existing <redacted>";
+
+        var safe = SecretRedactor.redactConnectionDiagnostic(text, values);
+
+        assertThat(safe).isEqualTo("account <redacted>, password <redacted>, existing <redacted>");
+        assertThat(SecretRedactor.redactConnectionDiagnostic(safe, values)).isEqualTo(safe);
+    }
+
+    @Test
     void publishesCompleteSnapshotsToConcurrentReaders() throws Exception {
         SecretRedactor redactor = new SecretRedactor();
         CountDownLatch start = new CountDownLatch(1);

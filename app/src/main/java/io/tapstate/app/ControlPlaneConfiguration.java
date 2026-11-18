@@ -121,6 +121,7 @@ import io.tapstate.spi.store.DataBrowser;
 import io.tapstate.core.lifecycle.CheckpointDoc;
 import io.tapstate.messages.ExplanationCatalog;
 import io.tapstate.messages.MessageCatalog;
+import io.tapstate.messages.ConnectionDiagnosticCatalog;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.ConnectionTestResultStore;
 import io.tapstate.spi.store.ConnectionTester;
@@ -628,11 +629,16 @@ class ControlPlaneConfiguration {
     @Bean
     ConnectionTester connectionTester(ConnectorProvisioner provisioner, Clock clock,
             org.springframework.beans.factory.ObjectProvider<DefaultSourceVerification> verification,
-            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots) {
+            org.springframework.beans.factory.ObjectProvider<PdkConnectionTester.DefaultSourceSlot> slots,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         java.util.function.Predicate<io.tapstate.spi.store.ConnectionConfig> managed = config -> {
             var current = verification.getIfAvailable(); return current != null && current.manages(config);
         };
         var slot = slots.getIfAvailable();
+        if (diagnostics.getIfAvailable() != null) {
+            return new PdkConnectionTester(provisioner, clock, managed, java.util.Objects.requireNonNull(slot),
+                    org.springframework.context.i18n.LocaleContextHolder::getLocale);
+        }
         return slot == null ? new PdkConnectionTester(provisioner, clock, managed) : new PdkConnectionTester(provisioner, clock, managed, slot);
     }
 
@@ -650,7 +656,8 @@ class ControlPlaneConfiguration {
     ConnectionTestService connectionTestService(
             ConnectionProbe probe, ConnectionTestResultStore resultStore, AuditGate auditGate,
             ConnectorConfigValidator configValidator, SourceConnectionResolver sourceConnections,
-            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester) {
+            org.springframework.beans.factory.ObjectProvider<ConnectionTestService.Observer> observers, ConnectionTester tester,
+            org.springframework.beans.factory.ObjectProvider<IsolatedConnectionDiagnostics.Active> diagnostics) {
         var observer = observers.getIfAvailable(() -> ignored -> ConnectionTestService.Attempt.NONE);
         var guarded = new ConnectionTestService.Observer() {
             @Override public boolean manages(io.tapstate.spi.store.ConnectionConfig config) { return observer.manages(config); }
@@ -661,7 +668,15 @@ class ControlPlaneConfiguration {
                 return observer.begin(config);
             }
         };
-        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections, guarded);
+        var catalog = MessageCatalog.bundled();
+        boolean candidate = diagnostics.getIfAvailable() != null;
+        java.util.function.UnaryOperator<String> testText = candidate
+                ? text -> catalog.renderConnectorTestText(text, org.springframework.context.i18n.LocaleContextHolder.getLocale())
+                : catalog::renderConnectorTestText;
+        return new ConnectionTestService(probe, resultStore, auditGate, configValidator, sourceConnections,
+                guarded, testText, !candidate ? ignored -> java.util.Map.of()
+                        : failure -> ConnectionDiagnosticCatalog.bundled().snapshot(failure,
+                                org.springframework.context.i18n.LocaleContextHolder.getLocale()));
     }
 
     @Bean
