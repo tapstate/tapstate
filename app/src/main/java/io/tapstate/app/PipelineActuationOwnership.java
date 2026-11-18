@@ -478,8 +478,6 @@ final class PipelineActuationOwnership {
             if (nodeSession != null) return membership.businessEligible() || membership.singleControlEligible(state.claim)
                     ? new Permit(true, state.claim) : Permit.denied();
             var lease = state.scopedLease.get();
-            if (lease != null && !lease.retry() && now - lease.due() >= 0) renewScoped(state, now);
-            lease = state.scopedLease.get();
             if (lease == null || lease.lost() || now - lease.deadline() >= 0 && !lease.inFlight()) {
                 if (lease != null) state.renewalFailure = new RenewalFailure(lease.expected(),
                         lease.lost() ? lease.loss() : RenewalOutcome.UNCONFIRMED);
@@ -808,13 +806,19 @@ final class PipelineActuationOwnership {
         if (nodeSession != null) return;
         if (businessScope != null) {
             long now = nanoTime.getAsLong();
-            held.values().stream().filter(state -> {
+            var due = held.values().stream().filter(state -> {
                 var lease = state.scopedLease.get();
                 return lease != null && !lease.lost() && now - lease.due() >= 0;
             }).sorted(Comparator.comparingLong(state -> {
                 var lease = state.scopedLease.get();
                 return lease == null ? Long.MAX_VALUE : lease.deadline();
-            })).toList().forEach(state -> renewScoped(state, nanoTime.getAsLong()));
+            })).toList();
+            for (Held state : due) {
+                long dispatch = nanoTime.getAsLong();
+                var lease = state.scopedLease.get();
+                if (lease != null && !lease.retry() && earlierRecoveryNeedsTurn(lease, dispatch)) return;
+                renewScoped(state, dispatch);
+            }
             return;
         }
         // A finite pass lets previously renewed claims compete again even under continuous arrivals.
@@ -824,6 +828,21 @@ final class PipelineActuationOwnership {
             long queued = nanoTime.getAsLong();
             admittedCall(() -> { renewIfDue(state, queued);return null; }, () -> null);
         }
+    }
+
+    /** A retry with an earlier cutoff may become due while this batch is executing. */
+    private boolean earlierRecoveryNeedsTurn(ScopedLease ordinary, long now) {
+        for (Held other : held.values()) {
+            var recovery = other.scopedLease.get();
+            if (recovery != null && recovery.retry() && !recovery.inFlight() && !recovery.lost()
+                    && recovery.deadline() - now > 0 && recovery.deadline() - ordinary.deadline() < 0
+                    && recovery.due() - now <= RENEW_RETRY_NANOS && stillHeld(other, recovery)) return true;
+        }
+        return false;
+    }
+
+    private long retryDue(ScopedLease lease, long now) {
+        return Math.min(lease.deadline(), now + Math.min(renewIntervalNanos, RENEW_RETRY_NANOS));
     }
 
     private void renewScoped(Held state, long now) {
@@ -872,6 +891,13 @@ final class PipelineActuationOwnership {
                     }
                 } else renewed = renewOriginal(lease, budget);
             } catch (RuntimeException failure) {
+                if (failure instanceof WorkloadClaimRenewalException renewal
+                        && renewal.reason() == WorkloadClaimRenewalException.Reason.NOT_STARTED) {
+                    long after = nanoTime.getAsLong();
+                    state.scopedLease.compareAndSet(pending, new ScopedLease(lease.expected(), lease.deadline(),
+                            retryDue(lease, after), lease.retries(), false, lease.confirm(), null));
+                    return;
+                }
                 failed = true;
                 retry = retryableRenewal(failure);
                 confirm = confirm || claimIoTimedOut(failure) || failure instanceof WorkloadClaimRenewalException renewal
@@ -907,7 +933,7 @@ final class PipelineActuationOwnership {
                         "Pipeline renewal reached its last confirmed deadline {0}, claim={1}, execution={2}, attempts={3}, leaseUntil={4}",
                         lease.expected().key().resourceId(), lease.expected().claimGeneration(),
                         lease.expected().executionGeneration(), lease.retries() + 1, lease.expected().leaseUntil());
-                long due = retryable ? Math.min(lease.deadline(), after + Math.min(renewIntervalNanos, RENEW_RETRY_NANOS)) : after;
+                long due = retryable ? retryDue(lease, after) : after;
                 var outcome = !eligible ? RenewalOutcome.MEMBERSHIP_CHANGED
                         : !failed && renewed.isEmpty() ? RenewalOutcome.REFUSED : RenewalOutcome.UNCONFIRMED;
                 state.scopedLease.compareAndSet(pending, new ScopedLease(lease.expected(), lease.deadline(),

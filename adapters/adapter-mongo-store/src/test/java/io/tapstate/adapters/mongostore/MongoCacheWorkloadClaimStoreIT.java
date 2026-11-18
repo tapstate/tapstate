@@ -199,6 +199,108 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
+    @org.junit.jupiter.api.RepeatedTest(3)
+    void anActiveTimedOutRenewalRefusesAnotherAttemptBeforeItQueues() {
+        withBusiness(f -> {
+            var original = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var block = new AtomicBoolean(true);
+            var nextEntered = new AtomicBoolean();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                    if (event.getCommandName().equals("findAndModify")
+                            && Thread.currentThread().getName().equals("mongo-pipeline-renewal-io")
+                            && block.compareAndSet(true, false)) {
+                        entered.countDown();
+                        await(release);
+                    }
+                }
+            };
+            try (var observed = client(listener); var callers = Executors.newSingleThreadExecutor()) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var ownership = new MongoClaimOperations(observed);
+                var claims = new MongoCacheWorkloadClaimStore(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, ACTIVE, null, ownership);
+                var timedOut = callers.submit(() -> claims.withRenewalDeadline(
+                        System.nanoTime()+Duration.ofMillis(400).toNanos(), ACTIVE,
+                        () -> claims.renew(original, TTL)));
+                try {
+                    assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                    assertThatThrownBy(() -> timedOut.get(2, TimeUnit.SECONDS))
+                            .hasCauseInstanceOf(TapstateException.class);
+                    assertThat(claims.withDeadline(deadline(), () -> claims.readPipeline(PIPELINE))
+                            .orElseThrow().claim()).isEqualTo(original);
+                    int before = commands.size();
+                    long started = System.nanoTime();
+                    var failure = org.assertj.core.api.Assertions.catchThrowable(() -> claims.withRenewalDeadline(
+                            started+Duration.ofSeconds(2).toNanos(), ACTIVE, () -> {
+                                nextEntered.set(true);
+                                return claims.renew(original, TTL);
+                            }));
+                    long elapsed = TimeUnit.NANOSECONDS.toMillis(System.nanoTime()-started);
+                    System.out.printf("RENEWAL_BUSY elapsed_ms=%d next_entered=%b commands=%d error=%s%n",
+                            elapsed, nextEntered.get(), commands.size()-before, failure.getClass().getSimpleName());
+                    assertThat(nextEntered).isFalse();
+                    assertThat(commands).hasSize(before);
+                    assertThat(failure).isInstanceOfSatisfying(io.tapstate.spi.store.WorkloadClaimRenewalException.class,
+                            ex -> assertThat(ex.reason()).isEqualTo(io.tapstate.spi.store.WorkloadClaimRenewalException.Reason.NOT_STARTED));
+                    assertThat(elapsed).isLessThan(500);
+                } finally {
+                    release.countDown();
+                    claims.awaitQuiescence(deadline());
+                }
+                assertThat(f.domain().workloadClaims(SCOPE).readPipeline(PIPELINE).orElseThrow().claim())
+                        .isEqualTo(original);
+                var renewed = claims.withRenewalDeadline(deadline(), ACTIVE, () -> claims.renew(original, TTL)).orElseThrow();
+                assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(original));
+                assertThat(renewed.leaseUntil()).isAfter(original.leaseUntil());
+                claims.awaitQuiescence(deadline());
+                ownership.closeIfIdle();
+            }
+        });
+    }
+
+    @Test void renewalAdmissionReleasesItsSlotAfterAnExpiredDeadlineOrGuardFailure() {
+        withBusiness(f -> {
+            var original = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var callback = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var ownership = new MongoClaimOperations(observed);
+                var claims = new MongoCacheWorkloadClaimStore(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, ACTIVE, null, ownership);
+                assertThatThrownBy(() -> claims.withRenewalDeadline(System.nanoTime()-1, ACTIVE,
+                        callback::incrementAndGet)).isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThatThrownBy(() -> claims.withRenewalDeadline(deadline(), () -> {
+                    throw MongoCacheWorkloadClaimStore.claimFenced();
+                }, callback::incrementAndGet)).isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                claims.awaitQuiescence(deadline());
+                assertThat(callback).hasValue(0);
+                assertThat(commands).isEmpty();
+                var renewed = claims.withRenewalDeadline(deadline(), ACTIVE, () -> claims.renew(original, TTL)).orElseThrow();
+                assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(original));
+                assertThat(renewed.leaseUntil()).isAfter(original.leaseUntil());
+                claims.awaitQuiescence(deadline());
+                ownership.closeIfIdle();
+                int before = commands.size();
+                assertThatThrownBy(() -> claims.withRenewalDeadline(deadline(), ACTIVE,
+                        callback::incrementAndGet)).isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(callback).hasValue(0);
+                assertThat(commands).hasSize(before);
+            }
+        });
+    }
+
     @Test void aPipelineProofReadsItsDependentFactsInOneSnapshot() {
         withBusiness(f -> {
             var expected = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();

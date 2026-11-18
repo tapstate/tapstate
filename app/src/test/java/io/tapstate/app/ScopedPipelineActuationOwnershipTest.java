@@ -230,10 +230,11 @@ class ScopedPipelineActuationOwnershipTest {
         }).when(store).renew(any(),any());
         nanos.addAndGet(RENEW.toNanos());
         try(var executor=java.util.concurrent.Executors.newSingleThreadExecutor()) {
-            var result=executor.submit(()->owner.permit(FIRST));
+            var result=executor.submit(owner::renewDue);
             try {assertThat(entered.await(3,java.util.concurrent.TimeUnit.SECONDS)).isTrue();membership.canCommit(Set.of("node-a"));}
             finally {release.countDown();}
-            assertThat(result.get(3,java.util.concurrent.TimeUnit.SECONDS).granted()).isFalse();
+            result.get(3,java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(owner.permit(FIRST).granted()).isFalse();
             membership.canCommit(Set.of("node-a","node-b"));
             assertThat(owner.permit(FIRST).granted()).isFalse();
         }finally {release.countDown();owner.stopForShutdown();}
@@ -933,7 +934,7 @@ class ScopedPipelineActuationOwnershipTest {
         membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
         membership.canCommit(Set.of("node-a","node-b"));
         raw.acquire(KEY, OWNER, 8, TTL);
-        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
+        raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
         assertThat(owner.permit(FIRST).granted()).isFalse();
         raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
         var reacquired = owner.permit(FIRST);
@@ -1071,7 +1072,8 @@ class ScopedPipelineActuationOwnershipTest {
                 membership.install(new ClusterMembership("cluster-a",8,Set.of("node-a","node-b","node-c")));
                 membership.canCommit(Set.of("node-a","node-b"));
                 raw.acquire(KEY, OWNER, 8, TTL);
-                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); assertThat(owner.permit(FIRST).granted()).isFalse();
+                raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos()); owner.renewDue();
+                assertThat(owner.permit(FIRST).granted()).isFalse();
                 raw.elapse(RENEW); nanos.addAndGet(RENEW.toNanos());
                 assertThat(owner.permit(FIRST).claim().topologyRevision()).isEqualTo(8);
             }

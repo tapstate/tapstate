@@ -47,6 +47,7 @@ final class MongoClaimOperations {
     private final ThreadLocal<Runnable> active = new ThreadLocal<>();
     private final ThreadLocal<WorkloadClaimKey> renewalKey = new ThreadLocal<>();
     private final ThreadLocal<Boolean> renewalLane = new ThreadLocal<>();
+    private boolean renewalRunning;
     private boolean closed;
     private boolean stopping;
     private volatile boolean replicaSet;
@@ -133,10 +134,16 @@ final class MongoClaimOperations {
     private synchronized <T> Call<T> submit(long deadline,Runnable guard,Supplier<T> action,boolean cleanup,ThreadPoolExecutor lane) {
         if (closed || stopping&&!cleanup) throw MongoCacheWorkloadClaimStore.claimFenced();
         remaining(deadline);
-        var call = new Call<T>(deadline,guard, action);
+        boolean renewal = lane == renewals;
+        if (renewal && renewalRunning) {
+            throw new WorkloadClaimRenewalException(WorkloadClaimRenewalException.Reason.NOT_STARTED,
+                    "the Pipeline renewal worker is still completing its original attempt");
+        }
+        var call = new Call<T>(deadline,guard, action, renewal);
+        if (renewal) renewalRunning = true;
         calls.add(call);
         try { lane.execute(call); }
-        catch (RuntimeException rejected) { calls.remove(call); notifyAll(); throw rejected; }
+        catch (RuntimeException rejected) { call.finished(); throw rejected; }
         return call;
     }
 
@@ -175,13 +182,16 @@ final class MongoClaimOperations {
         private final long deadline;
         private final Supplier<T> action;
         private final Runnable guard;
+        private final boolean renewal;
         private final AtomicInteger state = new AtomicInteger();
         private final CompletableFuture<T> result = new CompletableFuture<>();
         private final long diagnosticId = DIAGNOSTICS.isDebugEnabled() ? NEXT_DIAGNOSTIC.incrementAndGet() : 0;
         private final long submittedAt = diagnosticId == 0 ? 0 : System.nanoTime();
         private final long callerThread = diagnosticId == 0 ? 0 : Thread.currentThread().threadId();
 
-        private Call(long deadline,Runnable guard, Supplier<T> action) { this.deadline = deadline;this.guard=guard;this.action = action; }
+        private Call(long deadline,Runnable guard, Supplier<T> action, boolean renewal) {
+            this.deadline = deadline;this.guard=guard;this.action = action;this.renewal=renewal;
+        }
 
         void cancelPending() {
             if (state.compareAndSet(0, 2)) {
@@ -193,17 +203,21 @@ final class MongoClaimOperations {
         }
 
         private void finished() {
-            calls.remove(this);
-            synchronized (MongoClaimOperations.this) { MongoClaimOperations.this.notifyAll(); }
+            synchronized (MongoClaimOperations.this) {
+                calls.remove(this);
+                if (renewal) renewalRunning = false;
+                MongoClaimOperations.this.notifyAll();
+            }
         }
 
         @Override public void run() {
             if (!state.compareAndSet(0, 1)) return;
             long startedAt = diagnosticId == 0 ? 0 : System.nanoTime();
-            var diagnostics = diagnosticId == 0 ? null : MongoHttpDiagnosticsScope.open();
+            MongoHttpDiagnosticsScope diagnostics = null;
             java.util.Map<String, Object> measured = null;
             T value=null;Throwable failure=null;
             try {
+                if (diagnosticId != 0) diagnostics = MongoHttpDiagnosticsScope.open();
                 current.set(MongoReadBudget.until(deadline));
                 active.set(guard);check();
                 value=action.get();check();
@@ -211,7 +225,10 @@ final class MongoClaimOperations {
             finally {
                 current.remove();active.remove();
                 try { if (diagnostics != null) measured = diagnostics.snapshot(); }
-                finally { if (diagnostics != null) diagnostics.close(); state.set(2); finished(); }
+                finally {
+                    try { if (diagnostics != null) diagnostics.close(); }
+                    finally { state.set(2); finished(); }
+                }
             }
             if(failure==null)result.complete(value);else result.completeExceptionally(failure);
             if (measured != null) {
