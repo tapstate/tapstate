@@ -108,6 +108,85 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void compilesARollupOnlyRelationIntoAPathlessRollupEmbed() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        Map<String, Object> rollup = new java.util.LinkedHashMap<>();
+        rollup.put("item_count", Map.of("count", true));
+        rollup.put("total", Map.of("sum", "$amount", "default", 0));
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"), rollup), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        PipelineResource compiled = compiler.compile(draft);
+        Embed embed = nestRoot(compiled).embed().getFirst();
+        String canonical = new CanonicalWriter().write(compiled);
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.ROLLUP);
+        assertThat(embed.path()).isNull();
+        assertThat(embed.arrayKey()).containsExactly("id");
+        assertThat(embed.rollup()).containsOnlyKeys("item_count", "total");
+        assertThat(embed.rollup().get("item_count").count()).isEqualTo(true);
+        assertThat(embed.rollup().get("total").sum()).isEqualTo("$amount");
+        assertThat(new CanonicalWriter().write(new DslParser().parse(canonical))).isEqualTo(canonical);
+    }
+
+    @Test
+    void compilesRollupFieldsBesideAnArrayRelation() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ARRAY, "items", List.of(), List.of("id"),
+                        Map.of("latest", Map.of("last", Map.of("value", "$sku", "by", "$created_at")))),
+                List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        Embed embed = nestRoot(compiler.compile(draft)).embed().getFirst();
+
+        assertThat(embed.as()).isEqualTo(EmbedAs.ARRAY);
+        assertThat(embed.path()).isEqualTo("items");
+        assertThat(embed.rollup()).containsOnlyKeys("latest");
+        assertThat(embed.rollup().get("latest").last().value()).isEqualTo("$sku");
+    }
+
+    @Test
+    void rejectsARollupOnlyRelationWithoutFields() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"), null), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        assertThatThrownBy(() -> compiler.compile(draft)).hasMessageContaining("rollup");
+    }
+
+    @Test
+    void rejectsAMalformedRollupFieldWhenCompiling() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft.Related items = new PipelineDraft.Related("items", "orders", "crm", "items",
+                new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
+                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"),
+                        Map.of("bad", Map.of("median", "amount"))), List.of());
+        PipelineDraft draft = withWizard(template, wizard.root(), List.of(items), List.of(), wizard.output());
+
+        assertThatThrownBy(() -> compiler.compile(draft)).isInstanceOf(RuntimeException.class);
+    }
+
+    private static io.tapstate.core.model.NestRoot nestRoot(PipelineResource compiled) {
+        Step.Inline nest = compiled.transforms().stream()
+                .filter(Step.Inline.class::isInstance)
+                .map(Step.Inline.class::cast)
+                .filter(step -> step.body() instanceof TransformBody.Nest)
+                .findFirst()
+                .orElseThrow();
+        return ((TransformBody.Nest) nest.body()).root();
+    }
+
+    @Test
     void rejectsDuplicateChildFieldsInOneAssociation() {
         PipelineDraft template = wizardDraft();
         PipelineDraft.Wizard wizard = template.wizard();
