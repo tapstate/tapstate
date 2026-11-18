@@ -46,6 +46,22 @@ expect() { # expect <name> <mode> <want code> <want text>
   fi
 }
 
+tracked_coordinator_history_case() {
+  if ! fresh_repo ||
+    ! printf '%s\n' 'Historical CI run diagnoses and per-issue coordination notes.' > .issue-loop-contract-golden ||
+    ! git add -f -- .issue-loop-contract-golden; then
+    printf '%s\n' 'Could not prepare the tracked repair-coordinator history fixture.' >&2
+    return 2
+  fi
+  expect "tracked repair-coordinator history at the root is refused" files 1 "./.issue-loop-contract-golden"
+}
+
+if [ "${1:-}" = tracked-coordinator-history ]; then
+  tracked_coordinator_history_case || exit $?
+  [ "$failed" -eq 0 ]
+  exit $?
+fi
+
 echo "-- mode: files"
 fresh_repo
 expect "a clean tree passes"                       files 0 "clean:"
@@ -70,6 +86,16 @@ echo "personal notes" > CLAUDE.md          # never added: git considers the tree
 expect "an ignored CLAUDE.md is not carried by the repository" files 0 "clean:"
 git add -f CLAUDE.md && git commit -qm forced
 expect "but the same file tracked is still refused"          files 1 "agent instruction file"
+tracked_coordinator_history_case || exit $?
+fresh_repo || exit $?
+printf '%s\n' 'Local coordination notes.' > .issue-loop-contract-golden
+mkdir -p fixtures
+printf '%s\n' '{"example":true}' > fixtures/.issue-loop-contract-golden.json
+git add -- fixtures/.issue-loop-contract-golden.json || exit $?
+expect "untracked coordinator history and a similarly named tracked fixture pass" files 0 "clean:"
+mv .issue-loop-contract-golden fixtures/.issue-loop-contract-golden
+git add -f -- fixtures/.issue-loop-contract-golden || exit $?
+expect "tracked repair-coordinator history in a subdirectory is refused" files 1 "./fixtures/.issue-loop-contract-golden"
 
 echo "-- mode: dir"
 fresh_repo

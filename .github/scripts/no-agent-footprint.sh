@@ -4,16 +4,13 @@
 # of it here would leak that structure and invite edits nothing upstream would see.
 #
 # Modes, one per decision, so a test can call each on its own and a red says which:
-#   files      agent instruction files at any depth (CLAUDE.md / AGENTS.md / GEMINI.md /
-#              CODEX.md / COPILOT.md). Human-facing README.md and CONTRIBUTING.md are
-#              not matched -- they are documentation, not instructions to a tool.
+#   files      agent instruction files and repair-coordinator history at any depth.
+#              Human-facing README.md and CONTRIBUTING.md are not matched.
 #   dir        a .claude/ directory at any depth.
 #   messages   agent-generated footers in the pushed commit messages, and in the pull
 #              request body. Reads EVENT_NAME, BASE_REF, EVENT_BEFORE, EVENT_SHA, PR_BODY.
 #
-# Extracted verbatim from .github/workflows/no-agent-footprint.yml: the three decisions
-# are unchanged, including the way `messages` builds its range. What changed is that
-# they now live somewhere a test can reach them.
+# Called by .github/workflows/no-agent-footprint.yml and its smoke tests.
 set -euo pipefail
 
 MODE="${1:-}"
@@ -35,19 +32,22 @@ pattern='Generated with \[?Claude Code|🤖 Generated with|Co-[Aa]uthored-[Bb]y:
 # grep exiting 1 means "no match", which is the good news; git failing means nothing was
 # listed, which must be loud. `|| [ $? = 1 ]` keeps only the first quiet, so a grep that
 # errors (2) still propagates.
-list_tracked() { # <root>
-  local tracked
-  if ! tracked="$(git -C "$1" ls-files)"; then
-    echo "::error::cannot list the tracked files under $1, so nothing was scanned." >&2
+list_tracked() { # <root> [<pathspec>...]
+  local root="$1" tracked
+  shift
+  if ! tracked="$(git -C "$root" ls-files -- "$@")"; then
+    echo "::error::cannot list the tracked files under $root, so nothing was scanned." >&2
     return 2
   fi
   printf '%s\n' "$tracked"
 }
 
-find_instruction_files() { # <root>
+find_agent_files() { # <root>
   list_tracked "$1" \
-    | { grep -Ei '(^|/)(CLAUDE|AGENTS|GEMINI|CODEX|COPILOT)\.md$' || [ $? = 1 ]; } \
-    | sed 's|^|./|'
+    ':(glob,icase)**/CLAUDE.md' ':(glob,icase)**/AGENTS.md' ':(glob,icase)**/GEMINI.md' \
+    ':(glob,icase)**/CODEX.md' ':(glob,icase)**/COPILOT.md' \
+    ':(glob)**/.issue-loop-contract-golden' \
+    | sed '/^$/d; s|^|./|'
 }
 
 # Git tracks files, not directories, so a .claude directory exists exactly when something
@@ -93,10 +93,11 @@ control_repo() { # <dir> <path>... -- a repo with those paths tracked
 
 detector_alive_files() {
   local d hit; d="$(mktemp -d)"
-  control_repo "$d" CLAUDE.md README.md
-  hit="$(find_instruction_files "$d")"
+  control_repo "$d" CLAUDE.md .issue-loop-contract-golden README.md
+  hit="$(find_agent_files "$d")"
   rm -rf "$d"
   case "$hit" in *CLAUDE.md*) : ;; *) die_detector "the instruction-file detector did not match a control CLAUDE.md." ;; esac
+  case "$hit" in *./.issue-loop-contract-golden*) : ;; *) die_detector "the coordinator history detector did not match a control .issue-loop-contract-golden." ;; esac
   case "$hit" in *README.md*) die_detector "the instruction-file detector matched a control README.md, so it matches more than it should." ;; esac
 }
 
@@ -120,13 +121,13 @@ detector_alive_messages() {
 case "$MODE" in
   files)
     detector_alive_files
-    hits="$(find_instruction_files .)"
+    hits="$(find_agent_files .)"
     if [ -n "$hits" ]; then
-      echo "::error::agent instruction file(s) found in a zero-footprint repo:"
+      echo "::error::agent instruction file(s) or repair-coordinator history found in a zero-footprint repo:"
       echo "$hits"
       exit 1
     fi
-    echo "clean: no agent instruction files."
+    echo "clean: no agent instruction files or repair-coordinator history."
     ;;
 
   dir)
