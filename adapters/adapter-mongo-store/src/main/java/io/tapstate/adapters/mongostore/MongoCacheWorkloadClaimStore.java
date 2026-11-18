@@ -147,31 +147,17 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
             if (MongoBindingReadFacts.supported(client)) {
                 // Refuse a retired or mismatched identity before accessing dependent namespaces.
                 var originalIdentity = identity.readReadyIdentity(session);
-                boolean joinable;
-                try {
-                    // Audit the namespaces before joining their rows.
-                    var claims = claimCollection(budget == null ? database : budget.database(database));
-                    joinable = access.verifyStateStructureForProof(budget) && MongoPipelineProofFacts.hasSimpleCollation(claims);
-                } catch (TapstateException refusal) {
-                    // Keep the admission diagnostic first if both the scope and catalog are invalid.
-                    identity.requireAdmissionState(session, originalIdentity);
-                    throw refusal;
+                var facts = MongoPipelineProofFacts.read(session, database, original, key);
+                if (facts != null) {
+                    MongoCacheBusinessIdentity.requireObservedAdmission(originalIdentity, facts.schema(), scope);
+                    access.validateState(facts.checkpoint());
+                    access.requirePreparedClaim(session, facts.claim());
+                    return Optional.of(store.reading(facts.claim()));
                 }
-                if (joinable) {
-                    var facts = MongoPipelineProofFacts.read(session, database, original, key);
-                    if (facts != null) {
-                        MongoCacheBusinessIdentity.requireObservedAdmission(originalIdentity, facts.schema(), scope);
-                        access.validateState(facts.checkpoint());
-                        access.requirePreparedClaim(session, facts.claim());
-                        return Optional.of(store.reading(facts.claim()));
-                    }
-                }
-                // A miss, custom collation or oversized row keeps collection-local semantics.
+                // A miss or oversized row can still be resolved by the original collection-local reads.
                 identity.requireAdmissionState(session, originalIdentity);
             } else {
                 identity.requireAdmissionState(session);
-                requireCollection(budget == null ? database : budget.database(database));
-                access.verifyStateStructure(budget);
             }
             access.stateRow(session);
             var row = store.readWithRemainingLease(key);
@@ -334,12 +320,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private void fenceProgress(ClientSession session, PipelineIntentScope retained) {
         var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
-        access.updateState(session, access.state(session), new Document(), false);
+        access.updateState(session, access.state(session, true), new Document(), false);
     }
 
     private void validateState(ClientSession session, PipelineIntentScope retained) {
         var access = new MongoCachePipelineAccess(client, database, retained, null, requireActive);
-        access.verifyStateStructure(operations.budget()); access.state(session);
+        access.state(session, true);
     }
 
     private PipelineIntentScope storedScope(ClientSession session, WorkloadClaimKey key) {
@@ -400,12 +386,12 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
     private <T> T transaction(boolean admission, PipelineIntentScope pipeline,
             BiFunction<MongoWorkloadClaimStore, ClientSession, T> operation, boolean renewalFirst,
             java.util.function.Consumer<T> verifyCommitted) {
-        return transaction((session, budget) -> attempt(session, admission, pipeline, operation, renewalFirst, budget), verifyCommitted);
+        return transaction((session, budget) -> attempt(session, admission, pipeline, operation, renewalFirst), verifyCommitted);
     }
 
     private <T> T transaction(BiFunction<ClientSession, MongoReadBudget, T> callback,
             java.util.function.Consumer<T> verifyCommitted) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, operations.budget(), () -> StoreIo.call(() -> {
             try {
                 if(operations.budget()==null)operations.requireAdmission();
                 requireActive.run();
@@ -436,21 +422,18 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
                 requireActive.run();
                 throw failed;
             }
-        });
+        }));
     }
 
     private <T> T attempt(ClientSession session, boolean admission, PipelineIntentScope pipeline,
-            BiFunction<MongoWorkloadClaimStore,ClientSession,T> operation, boolean renewalFirst, MongoReadBudget budget) {
+            BiFunction<MongoWorkloadClaimStore,ClientSession,T> operation, boolean renewalFirst) {
         var identity = new MongoCacheBusinessIdentity(database, scope);
         if (!renewalFirst) {
             if (admission) identity.admitClaim(session); else identity.requireAdmissionState(session);
         }
-        requireCollection(budget==null?database:budget.database(database));
         var store = raw.inStrictSession(session);
         if (pipeline != null) {
             var access = new MongoCachePipelineAccess(client, database, pipeline, null, requireActive);
-            access.verifyStateStructure(budget);
-            // The namespace was checked above in this callback; state still validates the prepared claim.
             var current = access.state(session, true);
             // A real per-Pipeline write serializes admission with controlled state replacement.
             if (admission) access.updateState(session, current, new Document(), false);
@@ -463,6 +446,7 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
 
     private <T> T checkedAttempt(ClientSession session, MongoReadBudget budget,
             BiFunction<ClientSession, MongoReadBudget, T> callback) {
+        MongoStructureFailureScope.beginCallback();
         if (budget != null) operations.check();
         requireActive.run();
         T result = callback.apply(session, budget);
@@ -578,13 +562,10 @@ final class MongoCacheWorkloadClaimStore implements io.tapstate.spi.store.Deadli
         if (validation != null) { validation.require(false); MongoValidationSchema.requireReady(database, false); }
     }
 
-    static void requireCollection(MongoDatabase database) { claimCollection(database); }
-
-    private static Document claimCollection(MongoDatabase database) {
+    static void requireCollection(MongoDatabase database) {
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS;
         Document found = database.listCollections().filter(new Document("name", table.collectionName())).first();
         if (found == null || !"collection".equals(found.get("type"))) throw new TapstateException(IoError.DOCUMENT_UNREADABLE,
                 Map.of("id", "cache-business", "field", "workload-claims"), null);
-        return found;
     }
 }

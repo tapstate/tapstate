@@ -411,7 +411,6 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public WorkloadClaimStore workloadClaims(CacheBusinessScope expected) {
         claimOperations.requireAdmission();
         loadBusinessScope(expected);
-        StoreIo.run(() -> MongoCacheWorkloadClaimStore.requireCollection(database));
         return new MongoCacheWorkloadClaimStore(client, database, expected, this::businessActive,null,claimOperations);
     }
 

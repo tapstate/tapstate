@@ -214,9 +214,7 @@ class MongoCacheWorkloadClaimStoreIT {
                 commands.clear();
                 var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(expected);
-                assertThat(commands).as("one bounded data query with all original catalog checks")
-                        .containsExactly("find:cache_identity", "listCollections:-", "listCollections:-", "listIndexes:pipeline_state",
-                                "aggregate:schema_migrations", "commitTransaction:-");
+                assertThat(commands).containsExactly("find:cache_identity", "aggregate:schema_migrations", "commitTransaction:-");
             }
         });
     }
@@ -239,7 +237,7 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
-    @Test void oversizedOrCollatedCheckpointsKeepTheCollectionLocalRead() {
+    @Test void oversizedCheckpointsFallBackAndCollatedCheckpointsUseExactProof() {
         withBusiness(f -> {
             var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
             var joinReads = new AtomicInteger();
@@ -270,8 +268,13 @@ class MongoCacheWorkloadClaimStoreIT {
                                 .locale("en").collationStrength(com.mongodb.client.model.CollationStrength.PRIMARY).build()));
                 state.insertOne(original);
                 assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
-                assertThat(joinReads).hasValue(1);
-                assertThat(scalarReads).hasValue(2);
+                assertThat(joinReads).hasValue(2);
+                assertThat(scalarReads).hasValue(1);
+
+                state.deleteOne(new Document("_id", "orders"));
+                state.insertOne(new Document(original).append("_id", "ORDERS"));
+                assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
             }
         });
     }
@@ -581,7 +584,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var claims = f.domain().workloadClaims(SCOPE);
             SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).drop();
             assertThatThrownBy(() -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).isInstanceOfSatisfying(TapstateException.class,
-                    error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+                    error -> assertThat(error.code()).isEqualTo(IoError.PIPELINE_STATE_REBUILD_REQUIRED));
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("workload_claims");
             assertThat(identity(f.database()).getLong("claimAdmissionFence")).isZero();
             f.domain().close();
@@ -616,7 +619,7 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
-    @ParameterizedTest @ValueSource(strings={"findAndModify","commitTransaction","listCollections"})
+    @ParameterizedTest @ValueSource(strings={"findAndModify","commitTransaction","update"})
     void boundedCallerRetainsTheCacheOwnerUntilItsActualTransactionCanBeCleaned(String blockedCommand) {
         withBusiness(f -> {
             var claims=(io.tapstate.spi.store.DeadlineWorkloadClaimStore)f.domain().workloadClaims(SCOPE);
@@ -1169,8 +1172,7 @@ class MongoCacheWorkloadClaimStoreIT {
             var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL);
             assertThat(claim.acquired()).isTrue();
             assertThat(f.domain().pipelineStates(PIPELINE).read("orders")).isPresent();
-            assertThatThrownBy(() -> f.domain().pipelineObservations(PIPELINE).read("orders"))
-                    .isInstanceOfSatisfying(TapstateException.class, error -> assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(f.domain().pipelineObservations(PIPELINE).read("orders")).isEmpty();
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
     }

@@ -53,9 +53,4 @@ record MongoPipelineProofFacts(Document schema, Document checkpoint, Document cl
         var entries = captured.getList(path, Document.class);
         return entries.isEmpty() ? null : entries.getFirst().get(ROW, Document.class);
     }
-
-    static boolean hasSimpleCollation(Document collection) {
-        if (!(collection.get("options") instanceof Document options) || !options.containsKey("collation")) return true;
-        return options.get("collation") instanceof Document collation && "simple".equals(collation.get("locale"));
-    }
 }

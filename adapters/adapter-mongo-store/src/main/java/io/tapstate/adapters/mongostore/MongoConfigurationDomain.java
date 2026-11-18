@@ -115,7 +115,6 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 SystemCollections.CONFIGURATION_VERSION.on(database));
         this.drafts = new MongoConfigurationDraftStore(connection.client(), database, key, artifacts);
         drafts.verify();
-        new MongoRequiredDeadLetterStore(connection.client(), database, clusterId).verify();
     }
 
     record OpeningFacts(Document identity, Document schema, Document version, Document key) { }
@@ -168,7 +167,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         var required = java.util.EnumSet.of(SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP,
                 SystemCollections.STORAGE_BINDING, SystemCollections.CLUSTER_KEYS, SystemCollections.SCHEMA_MIGRATIONS,
                 SystemCollections.CONFIGURATION_VERSION, SystemCollections.CAPTURE_PREPARATIONS, SystemCollections.SOURCES,
-                SystemCollections.PDK_NOTE_SCOPES, SystemCollections.CONFIGURATION_IMPORTS);
+                SystemCollections.PDK_NOTE_SCOPES, SystemCollections.PDK_NOTE_CARRIES, SystemCollections.PDK_NOTE_ORIGINS,
+                SystemCollections.CONFIGURATION_IMPORTS,
+                SystemCollections.CONFIG_PIPELINE_DRAFTS, SystemCollections.CONFIG_NEST_DEAD_LETTERS);
         var schema = StoreIo.call(() -> SystemCollections.SCHEMA_MIGRATIONS.on(budget.database(database))
                 .find(new Document("_id", "config")).first());
         var skipped = java.util.EnumSet.noneOf(SystemCollections.class);

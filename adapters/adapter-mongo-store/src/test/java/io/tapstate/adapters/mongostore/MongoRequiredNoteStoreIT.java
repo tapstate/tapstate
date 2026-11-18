@@ -665,11 +665,15 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
-    void missingCarryIndexesRefuseReadOnlyOpenAndDoNotRecreateThem() {
+    void missingCarryIndexesDoNotPreventOrdinaryReads() {
         withNotes(f -> {
-            var shared = f.initialize(chain("c1"));
             SystemCollections.PDK_NOTE_CARRIES.on(f.database).dropIndex("pdk_note_carry_target");
-            assertThatThrownBy(() -> f.notes.carries(shared)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                var shared = f.notes.initialize(chain("c1"));
+                assertThat(f.notes.carries(shared)).isEmpty();
+                assertThat((List<?>) diagnostics.snapshot().get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((java.util.Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
             assertThat(IndexEnsure.existing(SystemCollections.PDK_NOTE_CARRIES.on(f.database),
                     SystemCollections.PDK_NOTE_CARRIES.indexes().getFirst())).isNull();
         });
@@ -896,13 +900,15 @@ class MongoRequiredNoteStoreIT {
     }
 
     @Test
-    void originIndexLossRefusesLoadingAndDoesNotRepairIt() {
+    void missingOriginIndexDoesNotPreventOrdinaryReads() {
         withNotes(f -> {
             f.pipelineGeneration("p1", 1);
-            var scope = f.initialize(pipeline("p1", 1));
             var origins = SystemCollections.PDK_NOTE_ORIGINS.on(f.database);
             origins.dropIndex("pdk_note_origin_scope");
-            assertThatThrownBy(() -> f.notes.origin(scope)).satisfies(MongoRequiredNoteStoreIT::unreadable);
+            var scope = f.notes.initialize(pipeline("p1", 1));
+            var original = origin("database-x");
+            assertThat(f.notes.prepareOrigin(scope, original)).isEqualTo(original);
+            assertThat(f.notes.origin(scope)).isEqualTo(original);
             assertThat(IndexEnsure.existing(origins, SystemCollections.PDK_NOTE_ORIGINS.indexes().getFirst())).isNull();
         });
     }

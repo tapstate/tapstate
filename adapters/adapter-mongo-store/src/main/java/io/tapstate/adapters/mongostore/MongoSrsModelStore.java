@@ -445,7 +445,6 @@ public final class MongoSrsModelStore implements SrsModelStore {
 
     Optional<Map<String, SrsModel>> startupModels(ClientSession session, Document chain, Map<String, String> tableRings,
             SrsCaptureCheckpoint checkpoint, MongoSrsReadFacts facts) {
-        requireSnapshotResources();
         return publishedForNewSnapshot(session, chain, snapshotRings(tableRings), checkpoint, facts);
     }
 

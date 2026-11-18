@@ -7,6 +7,7 @@ import io.tapstate.core.model.canonical.SourceCaptureIdentity;
 import io.tapstate.spi.store.*;
 import org.bson.Document;
 import java.util.*;
+import java.util.function.Function;
 
 /** Fixed-scope snapshot facts use the same original CACHE claim transaction as the protected checkpoint. */
 final class MongoSnapshotStateStore implements SnapshotStateStore {
@@ -14,11 +15,11 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
     MongoSnapshotStateStore(MongoCachePipelineAccess access) { this.access = Objects.requireNonNull(access,"access"); }
 
     @Override public long order() {
-        return access.metadataTransaction(SystemCollections.CACHE_SNAPSHOT_ORDERS,false,session -> { access.verifyOriginalClaim(session); return order(session,access.database,access.scope).getLong("order"); });
+        return transaction(false,session -> { access.verifyOriginalClaim(session, true); return order(session,access.database,access.scope).getLong("order"); });
     }
     @Override public long advanceOrder(long expected,long floor,Map<String,CaptureCacheState> originals) {
         counter(expected); counter(floor); var captures = Map.copyOf(originals);
-        return access.metadataTransaction(SystemCollections.CACHE_SNAPSHOT_ORDERS,true,session -> {
+        return transaction(true,session -> {
             var row = order(session,access.database,access.scope);
             var selected = MongoPipelineSourcePreparations.retained(session,access.database,access.scope).selectedTables();
             var required = new TreeSet<String>(); selected.forEach((source,tables) -> { if (!tables.isEmpty()) required.add(source); });
@@ -52,7 +53,7 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
     }
     @Override public void recordCount(String source,String table,long epoch,long rows) {
         if (epoch<1 || epoch==Long.MAX_VALUE || rows<0) throw new IllegalArgumentException("invalid snapshot measurement");
-        access.metadataTransaction(SystemCollections.CACHE_SNAPSHOT_COUNTS,true,session -> {
+        transaction(true,session -> {
             requireTable(session,source,table); var key = countId(access.scope,source,table);
             var collection = SystemCollections.CACHE_SNAPSHOT_COUNTS.on(access.database); var prior = collection.find(session,new Document("_id",key)).first();
             if (prior!=null) { requireCount(prior,key); if (prior.getLong("snapshotEpoch")>epoch) throw fenced(); }
@@ -64,14 +65,25 @@ final class MongoSnapshotStateStore implements SnapshotStateStore {
     }
     @Override public OptionalLong count(String source,String table,long epoch) {
         if (epoch<1 || epoch==Long.MAX_VALUE) throw new IllegalArgumentException("invalid snapshot epoch");
-        return access.metadataTransaction(SystemCollections.CACHE_SNAPSHOT_COUNTS,false,session -> {
-            access.verifyOriginalClaim(session);
+        return transaction(false,session -> {
+            access.verifyOriginalClaim(session, true);
             requireTable(session,source,table); var key = countId(access.scope,source,table);
             var row = SystemCollections.CACHE_SNAPSHOT_COUNTS.on(access.database).find(session,new Document("_id",key)).first();
             if (row==null) return OptionalLong.empty(); requireCount(row,key);
             return row.getLong("snapshotEpoch")==epoch?OptionalLong.of(row.getLong("rows")):OptionalLong.empty();
         });
     }
+    private <T> T transaction(boolean mutation, Function<ClientSession, T> action) {
+        return access.transaction(session -> {
+            var current = access.state(session, true);
+            if (mutation) {
+                access.proveClaim(session, true);
+                access.updateState(session, current, new Document(), false);
+            }
+            return action.apply(session);
+        });
+    }
+
     private void requireTable(ClientSession session,String source,String table) {
         var tables = MongoPipelineSourcePreparations.retained(session,access.database,access.scope).selectedTables().get(source);
         if (tables==null || !tables.contains(table)) throw fenced();
