@@ -5,12 +5,14 @@ import java.util.Set;
 
 /** Shared diagnostic identities retain their owners' existing behavioral contracts. */
 public final class RowValueErrorDefinitions {
+    private static final ProductErrorDefinitionSet DEFINITIONS = new ProductErrorDefinitionSet(ProductErrorModule.ROW_VALUE);
+
     public static final ProductErrorDefinition NON_STRING_MAP_KEY =
-            new ProductErrorDefinition(ProductErrorModule.ROW_VALUE, 1, Severity.ERROR, Set.of("path", "keyType"));
+            DEFINITIONS.define(1, Severity.ERROR, Set.of("path", "keyType"));
 
     private RowValueErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
-        return List.of(NON_STRING_MAP_KEY);
+        return DEFINITIONS.registered();
     }
 }

@@ -192,7 +192,10 @@ positional parameters.
 `ProductErrorModule` explicitly allocates product module numbers; `006` remains
 reserved for the existing connector diagnostic. A module allocation is not an
 upstream-code classifier. Register definitions through the owning contract's
-`registered()` list. `RequestDiagnosticCatalog` projects that list into
+module-local `DEFINITIONS.define(...)` collection. Each declaration registers itself;
+there is no second per-code list to update. The owner class initializes all constants
+before `registered()` seals an immutable snapshot. New modules still need explicit
+module and catalog wiring. `RequestDiagnosticCatalog` projects that snapshot into
 `ProductDiagnosticCatalog`, which implements `DiagnosticDefinitionLookup`.
 There is no runtime classpath scan or enum reconstruction.
 
@@ -233,7 +236,7 @@ facade retains its existing source-bound legacy adaptation separately.
 ## Maintaining and checking the contract
 
 For a new definition, reserve its module/serial, declare its parameter contract,
-register it, add all three language entries and migrate the actual producers and
+add it through the owning definition collection, add all three language entries and migrate the actual producers and
 consumers in the same batch. Review HTTP/CLI/MCP outcomes independently from the
 code's spelling. Extend the current golden only after comparing the independently
 retained historical baseline. Never regenerate the historical baseline to make a
@@ -268,3 +271,72 @@ they cannot prove the business meaning or safety of arbitrary argument values.
 Rebuild the actual native CLI after changing resources and exercise both a
 migrated refusal and an unmigrated diagnostic. JVM tests alone do not prove that
 the native binary includes dynamically addressed language resources.
+
+
+### Query, export and independent history
+
+Use JDK 21 (`JAVA_HOME`) and Python 3. The maintenance tool compiles the zero-dependency
+core definitions into a disposable directory and inspects those compiled classes.
+This is build-time inspection, not runtime scanning or source generation. The JSON
+export comes from the same authoritative constants used by typed producers:
+
+```sh
+python3 tools/error-contract/error-contract.py query --code TS0210001
+python3 tools/error-contract/error-contract.py export --output /tmp/tapstate-error-contract.json
+base=$(git rev-parse origin/main)
+python3 tools/error-contract/error-contract.py check --base "$base"
+# Published v0.7.0 and v0.8.0, pinned independently from the target branch.
+python3 tools/error-contract/error-contract.py check --base d2cc4b96b244722f3f0c1832c05b14772ae2cff7
+python3 tools/error-contract/error-contract.py check --base 90e2be3fc296d7ad309a33102f12251423d51151
+python3 -m unittest discover -s tools/error-contract -p 'test_*.py'
+```
+
+Fetch the target branch before selecting the base and record its complete SHA.
+CI selects the pull request's target SHA or the push event's previous SHA; its
+history check also compares the separately pinned published v0.7.0 and v0.8.0 sources and is part of the prerequisite shard-plan job, so a refusal prevents
+the aggregate build gate from succeeding. An unavailable commit is a failure,
+not an empty contract. The pre-cutover code fixture is also compared with its immutable Git tree;
+changing a working-tree golden cannot rewrite that history. Historical wording
+changes are reported for review instead of blocking editorial improvements. After cutover, base definitions are compiled independently
+and compared for identity, owner, severity, parameter names and deprecation.
+New identities may be added; existing identities cannot silently change or vanish.
+
+For the initial major cutover, the tool independently compiles the old typed enums
+from the selected Git tree and compares their owner/constant, severity and named
+parameters with the current typed producers through the migration correspondence.
+Changing that correspondence cannot silently swap the typed owners. An empty or
+unavailable typed baseline fails. Behavior tests still establish actual usage.
+This proves the historical structural input, not the semantic correctness of a replacement. Reviewers must still assess wording,
+business meaning, branch coverage and the approved compatibility window. Editing
+this checker or its workflow is itself a reviewed mechanism change, not a way to
+approve a contract break. These checks do not claim to resist a malicious change
+to all verification code.
+
+### Deprecating a product identity
+
+Mark the authoritative public definition field `@Deprecated` and document its
+replacement and the supported caller transition in its Javadoc. Mark any typed
+enum constant deprecated as well when callers should stop producing it. Keep the
+constant, module/serial, parameter contract and all three language resources:
+deprecation is not permission to recycle the identity or rewrite an old event.
+The export reports `deprecated`; the independent history check rejects later
+reactivation, removal, ownership, severity or parameter changes. A semantic or
+breaking change gets a new identity and an explicitly reviewed release boundary.
+Do not edit the historical fixtures to retire an identity.
+
+For a maintenance exercise, work in a disposable checkout: add a temporary constant
+through `DEFINITIONS.define`, its typed enum and three resource entries; query,
+validate and export it, then mark it deprecated and export again. Verify missing
+translations, duplicate serials, omitted catalog wiring and changed historical
+parameters fail. Never publish the exercise definition or its golden changes.
+
+### Evidence in everyday changes
+
+Each feature or repair identifies affected producers, storage and consumers, the
+business branches exercised and their outcomes. A shared diagnostic change needs
+consumer regressions; a typed-code assertion alone does not prove cancellation,
+cleanup, HTTP/CLI/MCP semantics or recovery. Reproducible defects include a failing
+baseline and a passing repair. Compilation failures and skipped checks are not
+behavior evidence. Static gates cover deterministic violations; reviewers own
+meaning, safety of parameter values, cause attribution and completeness of the
+scenario evidence.

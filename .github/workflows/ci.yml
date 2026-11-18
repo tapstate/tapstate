@@ -39,6 +39,26 @@ jobs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - name: Compare error contracts with independent history
+        env:
+          ERROR_CONTRACT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          base="$ERROR_CONTRACT_BASE"
+          if [[ -z "$base" || "$base" == 0000000000000000000000000000000000000000 ]]; then
+            base="$(git merge-base HEAD origin/main)"
+          fi
+          python3 tools/error-contract/error-contract.py check --base "$base"
+          # Supported published source contracts are pinned independently of the PR's target.
+          python3 tools/error-contract/error-contract.py check --base d2cc4b96b244722f3f0c1832c05b14772ae2cff7
+          python3 tools/error-contract/error-contract.py check --base 90e2be3fc296d7ad309a33102f12251423d51151
+          python3 -m unittest discover -s tools/error-contract -p 'test_*.py'
       - name: Record the original event and actual checkout identities
         run: .github/scripts/ci-receipt.sh event-inputs --root . --output "$RUNNER_TEMP/ci-event-inputs.json"
       - name: Derive every test from the current reactor

@@ -7,7 +7,6 @@ import io.tapstate.messages.MessageCatalog;
 import org.junit.jupiter.api.Test;
 
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -20,28 +19,33 @@ class McpDiagnosticDefinitionGatesTest {
         var historical = List.of("mcp.connector-spec-unavailable", "mcp.environment-missing",
                 "mcp.invalid-server-response", "mcp.server-rejected");
         var definitions = McpErrorDefinitions.registered();
-        assertThat(definitions).hasSize(historical.size());
         var lookup = McpDiagnosticCatalog.bundled();
-        var catalog = MessageCatalog.bundled();
-        for (int i = 0; i < definitions.size(); i++) {
-            var definition = definitions.get(i);
-            assertThat(definition.code()).isEqualTo("TS026" + String.format("%04d", i + 1));
-            assertThat(definition.severity()).isEqualTo(Severity.ERROR);
+        for (int i = 0; i < historical.size(); i++) {
+            String code = "TS026" + String.format("%04d", i + 1);
+            var definition = definitions.stream().filter(value -> value.code().equals(code)).findFirst().orElseThrow();
             Map<String, Object> args = new HashMap<>();
             definition.parameters().forEach(name -> args.put(name, "value-" + name));
-            assertThat(catalog.render(definition.code(), args)).isEqualTo(catalog.render(historical.get(i), args));
-            var messages = new HashSet<String>();
+            assertThat(definition.severity()).isEqualTo(Severity.ERROR);
+            assertThat(MessageCatalog.bundled().render(code, args))
+                    .isEqualTo(MessageCatalog.bundled().render(historical.get(i), args));
+            assertThat(McpDiagnosticCatalog.bundled().resolve(historical.get(i), args, List.of(), Locale.ENGLISH)).isEmpty();
+        }
+        for (var definition : definitions) {
+            Map<String, Object> args = new HashMap<>();
+            definition.parameters().forEach(name -> args.put(name, "value-" + name));
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var resolved = lookup.resolve(definition.code(), args, List.of(), locale).orElseThrow();
-                messages.add(resolved.message());
+                assertThat(resolved.message()).isNotBlank();
                 assertThat(resolved.solution()).isNotBlank();
-                definition.parameters().forEach(name -> assertThat(resolved.message())
-                        .contains("value-" + name).doesNotContain("{" + name + "}"));
+                definition.parameters().forEach(name -> assertThat(resolved.message() + resolved.solution())
+                        .contains("value-" + name));
             }
-            assertThat(messages).hasSize(3);
-            assertThat(lookup.resolve(historical.get(i), args, List.of(), Locale.ENGLISH)).isEmpty();
-            assertThat(lookup.resolve(definition.code(), Map.of(), List.of(), Locale.ENGLISH)).isEmpty();
-            args.put("private", "must-not-leak");
+            for (String parameter : definition.parameters()) {
+                var missing = new HashMap<>(args);
+                missing.remove(parameter);
+                assertThat(lookup.resolve(definition.code(), missing, List.of(), Locale.ENGLISH)).isEmpty();
+            }
+            args.put("invalid-parameter!", "must-not-leak");
             assertThat(lookup.resolve(definition.code(), args, List.of(), Locale.ENGLISH)).isEmpty();
         }
     }

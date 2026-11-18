@@ -5,6 +5,8 @@ import java.util.Set;
 
 /** Product definitions shared by the parser and the independent presentation layer. */
 public final class DslErrorDefinitions {
+    private static final ProductErrorDefinitionSet DEFINITIONS = new ProductErrorDefinitionSet(ProductErrorModule.DSL);
+
     public static final ProductErrorDefinition UNSUPPORTED_VERSION = error(1, "got", "supported");
     public static final ProductErrorDefinition UNKNOWN_FIELD = error(2, "field", "path");
     public static final ProductErrorDefinition FORBIDDEN_FIELD = error(3, "field", "path");
@@ -37,25 +39,17 @@ public final class DslErrorDefinitions {
     public static final ProductErrorDefinition JOIN_INPUT_NOT_A_TABLE = error(30, "step", "alias", "ref", "path");
     public static final ProductErrorDefinition JOIN_INPUT_IS_A_PATTERN = error(31, "step", "alias", "pattern", "path");
     public static final ProductErrorDefinition SETTING_HAS_NO_EFFECT =
-            new ProductErrorDefinition(ProductErrorModule.DSL, 32, Severity.WARNING, Set.of("pipeline", "setting", "instead"));
+            DEFINITIONS.define(32, Severity.WARNING, Set.of("pipeline", "setting", "instead"));
     public static final ProductErrorDefinition SOURCE_READ_NOT_SPLIT =
-            new ProductErrorDefinition(ProductErrorModule.DSL, 33, Severity.WARNING, Set.of("source", "requested"));
+            DEFINITIONS.define(33, Severity.WARNING, Set.of("source", "requested"));
 
     private DslErrorDefinitions() {}
 
     private static ProductErrorDefinition error(int serial, String... parameters) {
-        return new ProductErrorDefinition(ProductErrorModule.DSL, serial, Severity.ERROR, Set.of(parameters));
+        return DEFINITIONS.define(serial, Severity.ERROR, Set.of(parameters));
     }
 
     public static List<ProductErrorDefinition> registered() {
-        return List.of(UNSUPPORTED_VERSION, UNKNOWN_FIELD, FORBIDDEN_FIELD, MISSING_FIELD,
-                MISSING_REFERENCE, AMBIGUOUS_REFERENCE, MODE_MISMATCH, MODE_REQUIRED_FOR_READ,
-                ILLEGAL_VALUE, ILLEGAL_EXPRESSION, COMPOSITION, DUPLICATE_ID, UNSUPPORTED_MODE,
-                CONFIG_TYPE_MISMATCH, CONFIG_REQUIRED, INVALID_CONFIG_VALUE, MALFORMED_YAML,
-                UNDEFINED_VARIABLE, MALFORMED_INTERPOLATION, ROW_EXPRESSION_NEEDS_DISCOVERY,
-                ROW_EXPRESSION_TYPE_UNSUPPORTED, ROW_EXPRESSION_TYPE_UNKNOWN, UPSERT_NEEDS_KEY,
-                UNWIND_NEEDS_AN_ELEMENT_KEY, UNWIND_NEEDS_AN_UPSERT_TARGET, UNSUPPORTED_TARGET_CONNECTOR,
-                UNWIND_COLUMN_ALREADY_EXISTS, JOIN_SQL_NOT_PARSABLE, JOIN_SQL_UNSUPPORTED,
-                JOIN_INPUT_NOT_A_TABLE, JOIN_INPUT_IS_A_PATTERN, SETTING_HAS_NO_EFFECT, SOURCE_READ_NOT_SPLIT);
+        return DEFINITIONS.registered();
     }
 }

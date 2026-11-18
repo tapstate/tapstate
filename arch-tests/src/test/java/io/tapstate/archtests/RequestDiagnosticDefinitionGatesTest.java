@@ -25,7 +25,10 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(java.util.Arrays.stream(ProductErrorModule.values()).map(ProductErrorModule::number).toList())
                 .doesNotHaveDuplicates().allMatch(number -> number.matches("(?!000)[0-9]{3}"));
         var request = RequestErrorDefinitions.MALFORMED_REQUEST;
-        assertThat(RequestErrorDefinitions.registered()).hasSize(31).contains(request);
+        assertThat(RequestErrorDefinitions.registered()).contains(request);
+        assertThat(RequestErrorDefinitions.registered().stream().map(definition -> definition.code()).toList())
+                .containsExactlyInAnyOrderElementsOf(java.util.Arrays.stream(ControlError.values())
+                        .map(ControlError::code).toList());
         assertThat(request.code()).isEqualTo("TS0210001");
         assertThat(request.parameters()).isEqualTo(Set.of("reason"));
         assertThat(request.severity()).isEqualTo(Severity.ERROR);
@@ -63,7 +66,8 @@ class RequestDiagnosticDefinitionGatesTest {
         }
         assertThat(replacements).hasSize(454);
         baseline.addAll(replacements);
-        assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
+        // Existing migrated contracts stay present; new product identities are append-only.
+        assertThat(readCodes("error-codes.golden")).containsAll(baseline);
     }
 
     @Test

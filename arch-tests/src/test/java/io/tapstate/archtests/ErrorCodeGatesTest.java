@@ -118,6 +118,28 @@ class ErrorCodeGatesTest {
         codes = found;
     }
 
+    @Test
+    void independentlyDiscoveredDefinitionFieldsMatchTheRegisteredAndTypedContracts() throws Exception {
+        Map<String, ProductErrorDefinition> declared = new LinkedHashMap<>();
+        for (JavaClass owner : ProductionClassImports.packages("io.tapstate")) {
+            for (var field : owner.getFields()) {
+                if (!field.getRawType().isEquivalentTo(ProductErrorDefinition.class)) continue;
+                var reflected = field.reflect();
+                if (!java.lang.reflect.Modifier.isStatic(reflected.getModifiers())) continue;
+                assertThat(java.lang.reflect.Modifier.isPublic(reflected.getModifiers()))
+                        .as("definition field must be a public contract: %s", field.getFullName()).isTrue();
+                assertThat(java.lang.reflect.Modifier.isFinal(reflected.getModifiers())).isTrue();
+                var definition = (ProductErrorDefinition) reflected.get(null);
+                assertThat(definition).isNotNull();
+                assertThat(declared.put(definition.code(), definition))
+                        .as("duplicate definition field for %s", definition.code()).isNull();
+            }
+        }
+        assertThat(declared).isNotEmpty().isEqualTo(productDefinitions());
+        assertThat(codes.stream().map(TapstateErrorCode::code).collect(java.util.stream.Collectors.toSet()))
+                .containsExactlyInAnyOrderElementsOf(declared.keySet());
+    }
+
     @BeforeAll
     static void loadBundledCatalog() {
         try (InputStream in = ErrorCodeGatesTest.class.getResourceAsStream(CATALOG_RESOURCE)) {
