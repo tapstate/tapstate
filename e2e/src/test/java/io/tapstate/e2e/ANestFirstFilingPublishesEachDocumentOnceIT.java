@@ -2,6 +2,10 @@ package io.tapstate.e2e;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ObjectReference;
+import com.sun.jdi.event.BreakpointEvent;
+import com.sun.jdi.request.EventRequest;
 import io.tapstate.adapters.mongostore.MongoCacheDomain;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.mongostore.MongoConnectionSettings;
@@ -10,6 +14,8 @@ import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.core.lifecycle.LifecycleVerb;
 import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.testsupport.DockerGate;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
@@ -20,8 +26,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import org.bson.Document;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
@@ -171,9 +179,17 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                 () -> String.valueOf(mongo.fetch(target, ORDERS, Map.of("id", 1))));
     }
 
-    @ParameterizedTest
-    @EnumSource(Tiers.class)
-    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain(Tiers tier) throws Exception {
+    @Test
+    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgain() throws Exception {
+        checkFirstFilingWrites(Tiers.IN_PROCESS);
+    }
+
+    @Test
+    void aFiledCustomerAlreadyReadByItsOrderDoesNotPublishThatOrderAgainInTheBootJar() throws Exception {
+        checkFirstFilingWrites(Tiers.REAL_PROCESS);
+    }
+
+    private void checkFirstFilingWrites(Tiers tier) throws Exception {
         String suffix = tier.name().toLowerCase(Locale.ROOT);
         Map<String, Object> mysql = SharedMySql.settings("nest_first_filing_" + suffix);
         seed(mysql);
@@ -183,7 +199,7 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
         Path witness = directory.resolve("writes-" + suffix + ".tsv");
 
         try (PreparedNativeStore storage = PreparedNativeStore.create();
-                ServerHandle server = tier.launch(storage);
+                ServerHandle server = launchFirstFiling(tier, storage);
                 MongoEndpoints mongo = new MongoEndpoints()) {
             ControlPlane control = new ControlPlane(server.baseUrl());
             storage.loginAndAwaitBusiness(control);
@@ -199,7 +215,11 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             control.apply(resources);
             control.discoverSchema("src_orders", "mysql", mysql);
             control.discoverSchema("src_customers", "mysql", mysql);
-            control.lifecycle(pipelineId, LifecycleVerb.START);
+            if (server instanceof RealProcessServer process) {
+                finishJetBetweenStatusReads(process, control, pipelineId);
+            } else {
+                control.lifecycle(pipelineId, LifecycleVerb.START);
+            }
 
             EndpointAddress target = EndpointAddress.uri(targetUri);
             Await.until("every completed order to reach the target",
@@ -208,13 +228,107 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
             assertCompleted(mongo, target, 1);
             assertCompleted(mongo, target, ROWS);
 
+            var liveMetrics = tier == Tiers.REAL_PROCESS ? control.metricsNamed(pipelineId, "") : Map.of();
             Await.until("the bounded nest run to complete before its write ledger is read",
                     () -> control.state(pipelineId).filter(PipelineState.COMPLETED::equals).isPresent(),
                     () -> String.valueOf(control.state(pipelineId)));
 
-            assertThat(recordsWritten(witness))
+            WriteLedger ledger = readWriteLedger(witness);
+            if (server instanceof RealProcessServer process) {
+                var metrics = control.metricsNamed(pipelineId, "");
+                try (var log = Files.lines(process.output())) {
+                    var executions = log.filter(line -> line.contains("Execution plan for jobId=")
+                                    && line.contains("jobName='" + pipelineId + "'"))
+                            .map(line -> line.substring(line.indexOf("Execution plan for jobId=")))
+                            .toList();
+                    System.out.printf("Mongo write callbacks=%d, records offered=%d, sink items=%s/%s, "
+                                    + "sink records delivered=%s/%s (at target count / at completion), executions=%s%n",
+                            ledger.calls(), ledger.records(), liveMetrics.get("recordCount"), metrics.get("recordCount"),
+                            liveMetrics.get("records.out"), metrics.get("records.out"), executions);
+                }
+            }
+            assertThat(ledger.records())
                     .as("physical Mongo records written for %d independently completed orders", ROWS)
                     .isEqualTo(ROWS);
+        }
+    }
+
+    private static ServerHandle launchFirstFiling(Tiers tier, PreparedNativeStore storage) {
+        if (tier == Tiers.IN_PROCESS) return tier.launch(storage);
+        return RealProcessServer.startPreparedInJvm(storage.configurationUri(),
+                List.of("-Xmx768m", "-XX:ActiveProcessorCount=2",
+                        "-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=127.0.0.1:0"),
+                port -> List.of("--tapstate.cluster.id=" + storage.clusterId(),
+                        "--tapstate.hz.member-port=0", "--tapstate.hz.jet.cooperative-thread-count=2"));
+    }
+
+    private static void finishJetBetweenStatusReads(RealProcessServer process, ControlPlane control, String pipelineId)
+            throws Exception {
+        String listener = "Listening for transport dt_socket at address: ";
+        String port = Files.readAllLines(process.output()).stream().filter(line -> line.startsWith(listener))
+                .findFirst().orElseThrow().substring(listener.length());
+        var connector = Bootstrap.virtualMachineManager().attachingConnectors().stream()
+                .filter(candidate -> candidate.name().equals("com.sun.jdi.SocketAttach")).findFirst().orElseThrow();
+        var arguments = connector.defaultArguments();
+        arguments.get("hostname").setValue("127.0.0.1");
+        arguments.get("port").setValue(port);
+        var vm = connector.attach(arguments);
+        try {
+            var converger = vm.classesByName("io.tapstate.runtime.scheduler.PipelineConverger").getFirst();
+            var running = converger.methodsByName("convergeRunning").getFirst();
+            var requests = vm.eventRequestManager();
+            for (var location : running.allLineLocations()) {
+                var breakpoint = requests.createBreakpointRequest(location);
+                breakpoint.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
+                breakpoint.enable();
+            }
+            var started = CompletableFuture.runAsync(() -> control.lifecycle(pipelineId, LifecycleVerb.START));
+
+            // Hold the convergence thread after it reads an unfinished job. Jet and the real sink
+            // can finish the original execution before the same pass asks if a live job remains.
+            long deadline = System.nanoTime() + Duration.ofSeconds(60).toNanos();
+            while (System.nanoTime() < deadline) {
+                if (started.isCompletedExceptionally()) started.join();
+                var events = vm.eventQueue().remove(250);
+                if (events == null) continue;
+                boolean held = false;
+                try {
+                    for (var event : events) {
+                        if (event instanceof BreakpointEvent stopped && observedNoCompletion(stopped)) {
+                            requests.deleteEventRequests(List.copyOf(requests.breakpointRequests()));
+                            Await.until("the original Jet execution to complete while convergence is paused",
+                                    () -> jetCompleted(process, pipelineId), () -> process.output().toString());
+                            held = true;
+                            break;
+                        }
+                    }
+                } finally {
+                    events.resume();
+                }
+                if (held) {
+                    started.join();
+                    return;
+                }
+            }
+            throw new AssertionError("convergence did not observe the original job before it completed");
+        } finally {
+            vm.dispose();
+        }
+    }
+
+    private static boolean observedNoCompletion(BreakpointEvent stopped) throws Exception {
+        var frame = stopped.thread().frame(0);
+        var completion = frame.visibleVariableByName("completion");
+        return completion != null && frame.getValue(completion) instanceof ObjectReference result
+                && result.getValue(result.referenceType().fieldByName("value")) == null;
+    }
+
+    private static boolean jetCompleted(RealProcessServer process, String pipelineId) {
+        try (var log = Files.lines(process.output())) {
+            return log.anyMatch(line -> line.contains("Execution of job '" + pipelineId + "'")
+                    && line.contains("completed successfully"));
+        } catch (IOException failure) {
+            throw new UncheckedIOException(failure);
         }
     }
 
@@ -227,17 +341,20 @@ class ANestFirstFilingPublishesEachDocumentOnceIT {
                         .containsEntry("name", "customer-" + id));
     }
 
-    private static long recordsWritten(Path witness) throws Exception {
+    private static WriteLedger readWriteLedger(Path witness) throws Exception {
         assertThat(witness).as("the real Mongo connector's write ledger").isRegularFile();
+        List<String> calls = Files.readAllLines(witness);
         long records = 0;
-        for (String call : Files.readAllLines(witness)) {
+        for (String call : calls) {
             String[] fields = call.split("\\t", -1);
             assertThat(fields).as("one observed Mongo write callback").hasSize(3);
             assertThat(fields[0]).as("the table handed to the Mongo connector").isEqualTo(ORDERS);
             records += Long.parseLong(fields[1]);
         }
-        return records;
+        return new WriteLedger(calls.size(), records);
     }
+
+    private record WriteLedger(int calls, long records) {}
 
     private static void seed(Map<String, Object> settings) throws Exception {
         try (Connection connection = SharedMySql.connect(settings)) {
