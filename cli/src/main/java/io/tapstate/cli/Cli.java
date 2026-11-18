@@ -494,7 +494,34 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
+        if (launch.isOneShot()) {
+            Integer helpExit = executeUsageHelp(launch.command());
+            if (helpExit != null) {
+                System.exit(helpExit);
+                return;
+            }
+        }
         System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+    }
+
+    private static Integer executeUsageHelp(List<String> words) {
+        if (words.stream().noneMatch(word -> word.equals("-h") || word.equals("--help"))) {
+            return null;
+        }
+        CommandLine commandLine = newCommandLine();
+        CommandLine verb = commandLine.getSubcommands().get(words.getFirst());
+        if (verb != null && verb.getCommand() instanceof ConnectedVerb) {
+            ConnectedVerb.recognizeValueOptionsForHelp(verb);
+        }
+        CommandLine.ParseResult parsed;
+        try {
+            parsed = commandLine.parseArgs(words.toArray(new String[0]));
+        } catch (CommandLine.ParameterException ignored) {
+            // The session still owns validation and dispatch for ordinary online commands.
+            return null;
+        }
+        return parsed.asCommandLineList().stream().anyMatch(CommandLine::isUsageHelpRequested)
+                ? CommandLine.executeHelpRequest(parsed) : null;
     }
 
     /**
