@@ -18,9 +18,9 @@ jobs:
       - name: Allocate the two qualification batches
         run: |
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
-          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"map.snapshot.basic.small": 20, "filter.live.basic.standard": 45, "map.backlog.basic.standard": 45, "unwind.snapshot.basic.standard": 25, "unwind.backlog.basic.standard": 50, "union.live.basic.standard": 45, "join.snapshot.basic.small": 25, "join.backlog.basic.standard": 60, "nest.snapshot.basic.standard": 30, "nest.backlog.basic.standard": 65, "mixed.snapshot.map-nest.standard": 30, "join.live.hot-update.standard": 100, "nest.live.child-update.standard": 100}}
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"nest.backlog.basic.standard": 65, "join.backlog.basic.standard": 60, "union.live.basic.standard": 45, "join.live.hot-update.standard": 100, "nest.live.child-update.standard": 100}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id map.snapshot.basic.small --id filter.live.basic.standard --id map.backlog.basic.standard --id unwind.snapshot.basic.standard --id unwind.backlog.basic.standard --id union.live.basic.standard --id join.snapshot.basic.small --id join.backlog.basic.standard --id nest.snapshot.basic.standard --id nest.backlog.basic.standard --id mixed.snapshot.map-nest.standard --id join.live.hot-update.standard --id nest.live.child-update.standard --repeats 1 --rows 128 --slots 2 --batch-seconds 600 --deadline-seconds 900 --reserve-seconds 120 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id nest.backlog.basic.standard --id join.backlog.basic.standard --id union.live.basic.standard --id join.live.hot-update.standard --id nest.live.child-update.standard --repeats 1 --rows 128 --slots 2 --batch-seconds 600 --deadline-seconds 900 --reserve-seconds 120 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: operator-qualification-manifest
