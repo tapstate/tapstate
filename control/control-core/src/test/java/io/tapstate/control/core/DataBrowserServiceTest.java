@@ -162,7 +162,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("absent"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test
@@ -176,7 +176,7 @@ class DataBrowserServiceTest {
         assertThatThrownBy(() -> service.collections("orders"))
                 .isInstanceOf(TapstateException.class)
                 .extracting(failure -> ((TapstateException) failure).code().code())
-                .isEqualTo("source.not-found");
+                .isEqualTo("TS0220001");
     }
 
     @Test

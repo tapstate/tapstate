@@ -463,21 +463,21 @@ class SourceApiTest {
         String etag = create("orders", "before").getHeaders().getETag();
 
         assertError(request("writer").delete().uri("/api/sources/orders"),
-                HttpStatus.PRECONDITION_REQUIRED, "source.precondition-required");
+                HttpStatus.PRECONDITION_REQUIRED, "TS0220004");
 
         for (String malformed : List.of("", etag.substring(1, etag.length() - 1), "W/" + etag,
                 "*", etag + ", " + etag, "\"short\"")) {
             ApiError error = put("orders", sourceJson("orders", "after"), malformed);
-            assertThat(error.code()).isEqualTo("source.precondition-required");
+            assertThat(error.code()).isEqualTo("TS0220004");
         }
 
         ApiError stale = put("orders", sourceJson("orders", "after"), "\"" + "0".repeat(64) + "\"");
-        assertThat(stale.code()).isEqualTo("source.version-conflict");
+        assertThat(stale.code()).isEqualTo("TS0220005");
 
         assertError(request("writer").put().uri("/api/sources/missing")
                         .header(HttpHeaders.IF_MATCH, "\"" + "0".repeat(64) + "\"")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("missing", "after")),
-                HttpStatus.NOT_FOUND, "source.not-found");
+                HttpStatus.NOT_FOUND, "TS0220001");
 
         ResponseEntity<String> replaced = request("writer").put().uri("/api/sources/orders")
                 .header(HttpHeaders.IF_MATCH, etag).contentType(MediaType.APPLICATION_JSON)
@@ -491,7 +491,7 @@ class SourceApiTest {
                 .header(HttpHeaders.IF_MATCH, replaced.getHeaders().getETag())
                 .exchange((req, res) -> res.getStatusCode());
         assertThat(deleted).isEqualTo(HttpStatus.NO_CONTENT);
-        assertError(request("reader").get().uri("/api/sources/orders"), HttpStatus.NOT_FOUND, "source.not-found");
+        assertError(request("reader").get().uri("/api/sources/orders"), HttpStatus.NOT_FOUND, "TS0220001");
     }
 
     @Test
@@ -512,7 +512,7 @@ class SourceApiTest {
             assertThat(outcomes).extracting(RaceResult::status)
                     .containsExactlyInAnyOrder(HttpStatus.OK, HttpStatus.PRECONDITION_FAILED);
             assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.PRECONDITION_FAILED)
-                    .singleElement().extracting(RaceResult::code).isEqualTo("source.version-conflict");
+                    .singleElement().extracting(RaceResult::code).isEqualTo("TS0220005");
             String winner = outcomes.stream()
                     .filter(result -> result.status() == HttpStatus.OK)
                     .findFirst().orElseThrow().description();
@@ -541,7 +541,7 @@ class SourceApiTest {
             assertThat(outcomes).extracting(RaceResult::status)
                     .containsExactlyInAnyOrder(HttpStatus.CREATED, HttpStatus.CONFLICT);
             assertThat(outcomes).filteredOn(result -> result.status() == HttpStatus.CONFLICT)
-                    .singleElement().extracting(RaceResult::code).isEqualTo("source.already-exists");
+                    .singleElement().extracting(RaceResult::code).isEqualTo("TS0220002");
             String winner = outcomes.stream()
                     .filter(result -> result.status() == HttpStatus.CREATED)
                     .findFirst().orElseThrow().description();
@@ -557,12 +557,12 @@ class SourceApiTest {
         ResponseEntity<String> created = create("orders", "before");
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "again")),
-                HttpStatus.CONFLICT, "source.already-exists");
+                HttpStatus.CONFLICT, "TS0220002");
 
         assertError(request("writer").put().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag())
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("other", "after")),
-                HttpStatus.BAD_REQUEST, "source.id-mismatch");
+                HttpStatus.BAD_REQUEST, "TS0220003");
 
         for (String field : List.of("configuredSecrets", "contentHash", "unknownField")) {
             String body = sourceJson("bad", "bad").replaceFirst("\\}$", ",\"" + field + "\":[]}");
@@ -578,7 +578,7 @@ class SourceApiTest {
                 new PipelineResource("pipeline", null, List.of(SourceRef.bare("orders")), null, null, null, null, null));
         assertError(request("writer").delete().uri("/api/sources/orders")
                         .header(HttpHeaders.IF_MATCH, created.getHeaders().getETag()),
-                HttpStatus.CONFLICT, "source.in-use");
+                HttpStatus.CONFLICT, "TS0220006");
     }
 
     @Test

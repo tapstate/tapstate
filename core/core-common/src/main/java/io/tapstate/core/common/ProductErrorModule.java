@@ -4,7 +4,8 @@ package io.tapstate.core.common;
 public enum ProductErrorModule {
     DSL("001"),
     CONNECTOR("006"),
-    CONTROL("021");
+    CONTROL("021"),
+    SOURCE("022");
 
     private final String number;
 

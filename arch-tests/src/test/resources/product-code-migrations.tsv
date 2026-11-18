@@ -37,3 +37,10 @@ control.auth-failed	TS0210002
 control.unauthenticated	TS0210003
 control.forbidden	TS0210004
 control.unreachable	TS0210005
+source.not-found	TS0220001
+source.already-exists	TS0220002
+source.id-mismatch	TS0220003
+source.precondition-required	TS0220004
+source.version-conflict	TS0220005
+source.in-use	TS0220006
+source.srs-change-while-running	TS0220007

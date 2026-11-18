@@ -78,7 +78,7 @@ class ArtifactDeleteRefusalIT {
 
             var sourceRoute = deleteRoute(server, control, "sources", SOURCE_ID, before.contentHash());
             assertThat(sourceRoute.status()).isEqualTo(409);
-            assertThat(sourceRoute.code()).isEqualTo("source.in-use");
+            assertThat(sourceRoute.code()).isEqualTo("TS0220006");
             assertThat(sourceRoute.params()).isEqualTo(Map.of("id", SOURCE_ID, "referrers", List.of(PIPELINE_ID)));
 
             assertThat(control.artifact(SOURCE_ID))

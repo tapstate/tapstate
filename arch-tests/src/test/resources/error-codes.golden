@@ -41,6 +41,13 @@ TS0210002
 TS0210003
 TS0210004
 TS0210005
+TS0220001
+TS0220002
+TS0220003
+TS0220004
+TS0220005
+TS0220006
+TS0220007
 actuation.connector-differs-across-members
 actuation.connector-unavailable-on-member
 actuation.from-regex-empty
@@ -393,13 +400,6 @@ position.nothing-to-write
 position.write-back-while-live
 role.unsupported
 schema.column-name-reads-as-a-path
-source.already-exists
-source.id-mismatch
-source.in-use
-source.not-found
-source.precondition-required
-source.srs-change-while-running
-source.version-conflict
 start-check.clear-before-full-load
 start-check.keep-existing-rows
 start-check.target-empty

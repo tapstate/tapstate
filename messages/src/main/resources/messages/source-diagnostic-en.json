@@ -1,0 +1,30 @@
+{
+  "TS0220001": {
+    "message": "No Source with id '{id}' exists.",
+    "solution": "List Sources to find an existing id."
+  },
+  "TS0220002": {
+    "message": "A Source with id '{id}' already exists.",
+    "solution": "Choose a different id, or replace the existing Source with its current ETag."
+  },
+  "TS0220003": {
+    "message": "Source id '{bodyId}' in the request body does not match path id '{pathId}'.",
+    "solution": "Use the same immutable Source id in the request path and body."
+  },
+  "TS0220004": {
+    "message": "Source '{id}' requires its current ETag for this operation.",
+    "solution": "Read the Source, then retry with its ETag in If-Match."
+  },
+  "TS0220005": {
+    "message": "Source '{id}' changed after it was read.",
+    "solution": "Read the current Source and retry the operation with its new ETag."
+  },
+  "TS0220006": {
+    "message": "Source '{id}' is still referenced by: {referrers}.",
+    "solution": "Remove those references before deleting the Source."
+  },
+  "TS0220007": {
+    "message": "Source '{id}' cannot change srs.enabled while these pipelines are still reading it: {pipelines}.",
+    "solution": "Stop those pipelines, then change srs.enabled. Pausing is not enough: a paused pipeline has only suspended its engine, and its capture is still reading the source."
+  }
+}

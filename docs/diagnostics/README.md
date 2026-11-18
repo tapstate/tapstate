@@ -9,7 +9,8 @@ target: https://tapstate.dev/docs/reference/error-diagnostics
 This page describes an unshipped migration candidate. The first migrated request
 refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
-through `TS0210005`, respectively. DSL errors use `TS0010001` through `TS0010031`, and
+through `TS0210005`, respectively. Source mutation errors use `TS0220001`
+through `TS0220007`. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete
 product contract switches with a coordinated major release; this candidate does
@@ -44,6 +45,16 @@ while its diagnostic is `TS0010002`. Keep `DslException` source, path, line and
 column through copies and wrappers. Warnings remain successful validation/apply
 results; they do not become refusals merely because they carry a diagnostic code.
 
+`SourceErrorDefinitions` owns module `SOURCE` (`022`). The existing `SourceError`
+enum retains not-found, duplicate identity, path/body mismatch, missing ETag,
+version conflict, references blocking deletion and active-capture SRS restrictions.
+Their HTTP statuses and required parameters are unchanged. Consumers must keep
+unsaved input and the existing ETag refresh choices after a conflict, distinguish
+a missing Source from a missing test result, and stop batch deletion at a refused
+Source while retaining the identities already removed. Historical server replies
+remain readable during this migration; local browser preflight errors retain
+their existing protocol shape.
+
 ```java
 throw new TapstateException(ControlError.MALFORMED_REQUEST,
         Map.of("reason", "history requires both --from and --to"), null);
@@ -67,6 +78,7 @@ The request language resources are
 `messages/src/main/resources/messages/request-diagnostic-{en,zh-CN,zh-TW}.json`.
 DSL resources use the corresponding `dsl-diagnostic-` prefix and the explicit
 `DslDiagnosticCatalog` registration, without a parser dependency in the renderer.
+Source resources use `source-diagnostic-` and `SourceDiagnosticCatalog`.
 Each identity has nonempty `message` and `solution` fields. Their combined named
 placeholders must match the definition exactly. This public repository stores
 non-ASCII translations as JSON Unicode escapes. The native CLI includes both
@@ -116,7 +128,7 @@ mvn -pl messages -am \
   -Dtest=JsonReaderTest,ProductDiagnosticCatalogTest,MessageCatalogTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 mvn -pl arch-tests -am \
-  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,DslDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
+  -Dtest=ErrorCodeGatesTest,RequestDiagnosticDefinitionGatesTest,DslDiagnosticDefinitionGatesTest,SourceDiagnosticDefinitionGatesTest,ConnectionDiagnosticDefinitionGatesTest,RingDependencyRulesTest \
   -Dsurefire.failIfNoSpecifiedTests=false test
 ```
 

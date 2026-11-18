@@ -546,7 +546,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("source.not-found");
+        assertThat(body.code()).isEqualTo("TS0220001");
     }
 
     // ---- the three verbs are guarded like every other ----

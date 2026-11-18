@@ -148,7 +148,7 @@ class SourceConfigEncryptionMutationIT {
             assertThat(replies).extracting(Reply::status).containsExactlyInAnyOrder(200, 412);
             Reply success = replies.stream().filter(reply -> reply.status() == 200).findFirst().orElseThrow();
             Reply conflict = replies.stream().filter(reply -> reply.status() == 412).findFirst().orElseThrow();
-            assertThat(JSON.readTree(conflict.body()).path("code").asText()).isEqualTo("source.version-conflict");
+            assertThat(JSON.readTree(conflict.body()).path("code").asText()).isEqualTo("TS0220005");
             SourceView winner = JSON.readValue(success.body(), SourceView.class);
             String winningSecret = switch (winner.metadata().description()) {
                 case "alpha" -> ALPHA_SECRET;
@@ -166,7 +166,7 @@ class SourceConfigEncryptionMutationIT {
             Reply stale = put(fixture.client, "/api/sources/" + id, created.etag(),
                     typedReplacement(initialView, atlasConfig(OLD_SECRET), "stale"));
             assertThat(stale.status()).isEqualTo(412);
-            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("source.version-conflict");
+            assertThat(JSON.readTree(stale.body()).path("code").asText()).isEqualTo("TS0220005");
             sameDocument(fixture, id, winningDocument);
         }
     }
