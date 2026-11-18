@@ -65,6 +65,9 @@ public final class ControlOperations {
             "Preview five future full validation occurrences in the selected time zone.", REST_ONLY);
 
     // system domain
+    public static final Operation SYSTEM_PDK_VERSION = new Operation(
+            "system.pdk-version", Scope.READ, false, null, "Read the packaged host PDK versions and checksums.", REST_ONLY);
+
     public static final Operation SYSTEM_VERSION = new Operation(
             "system.version", Scope.READ, false, ControlApiSchema.ref("system.version"),
             "Report which version of Tapstate this server is, plus the authoring grammar versions it "
@@ -437,7 +440,7 @@ public final class ControlOperations {
             AI_PROVIDER_MODELS,
             PIPELINE_DRAFT_ASSISTANT,
             PIPELINE_DRAFT_ASSISTANT_VALIDATE,
-            SYSTEM_VERSION,
+            SYSTEM_VERSION, SYSTEM_PDK_VERSION,
             ARTIFACT_APPLY,
             ARTIFACT_VALIDATE,
             ARTIFACT_GET,

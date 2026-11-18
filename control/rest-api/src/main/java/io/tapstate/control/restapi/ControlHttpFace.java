@@ -46,7 +46,7 @@ import java.util.Map;
         PipelineLogsController.class,
         PipelinePositionController.class,
         PipelineStreamConfiguration.class, ClusterController.class, HealthController.class,
-        VersionController.class, BrowserAuthController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
+        VersionController.class, PdkVersionController.class, BrowserAuthController.class, AuthController.class, CloudAuthController.class, CurrentUserController.class,
         ClusterContextController.class,
         IssuerDiscoveryController.class, TokenController.class,
         SourceController.class,

@@ -22,7 +22,7 @@ class ControlOperationsTest {
                         "configuration.export", "configuration.import.preflight", "configuration.import.commit", "configuration.import.status",
                         "ai-provider.get", "ai-provider.replace", "ai-provider.delete", "ai-provider.check", "ai-provider.models",
                         "pipeline-draft.assistant", "pipeline-draft.assistant-validate",
-                        "system.version",
+                        "system.version", "system.pdk-version",
                         "artifact.apply",
                         "artifact.validate",
                         "artifact.get",
@@ -229,6 +229,7 @@ class ControlOperationsTest {
         // dedicated authorizer exists.
         assertThat(registry.exposedOn(Frontend.CLI)).hasSize(86);
         assertThat(registry.all()).filteredOn(op -> !"source.reveal-config".equals(op.id())
+                && !"system.pdk-version".equals(op.id())
                 && !"cluster.context".equals(op.id()) && !"pipeline.delete".equals(op.id()) && !op.id().startsWith("validation.") && !op.id().startsWith("alert.")).allSatisfy(op ->
                 assertThat(op.exposure()).as(op.id()).containsEntry(Frontend.CLI, Maturity.CURRENT));
         assertThat(registry.all()).filteredOn(op -> op.id().startsWith("alert.")).hasSize(15).allSatisfy(op ->
@@ -279,6 +280,7 @@ class ControlOperationsTest {
         assertThat(registry.exposedOn(Frontend.REST, Maturity.GA))
                 .extracting(Operation::id)
                 .containsExactlyInAnyOrder(
+                        "system.pdk-version",
                         "validation.evaluate", "validation.save", "validation.get", "validation.schedule-preview",
                         "validation.start", "validation.progress", "validation.stop", "validation.history",
                         "validation.report", "validation.roots", "validation.root", "validation.schedule-disable",
