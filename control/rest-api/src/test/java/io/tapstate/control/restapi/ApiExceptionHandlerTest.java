@@ -5,6 +5,14 @@ import io.tapstate.control.core.ClusterError;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CloudAuthenticationObserver;
 import io.tapstate.control.core.MonitorError;
+import io.tapstate.control.core.ConnectorCatalogError;
+import io.tapstate.control.core.DataBrowserError;
+import io.tapstate.control.core.PipelineDraftError;
+import io.tapstate.control.core.PipelineError;
+import io.tapstate.control.core.PositionError;
+import io.tapstate.control.core.SourceError;
+import io.tapstate.core.alerting.AlertError;
+import io.tapstate.core.lifecycle.LifecycleError;
 import io.tapstate.core.common.TapstateErrorCode;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.common.Severity;
@@ -25,6 +33,10 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -37,6 +49,51 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ApiExceptionHandlerTest {
 
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
+
+    @Test
+    void publishedHttpStatusesFollowTheirDefinitionsAcrossIdentityChanges() throws Exception {
+        Map<String, TapstateErrorCode> definitions = new HashMap<>();
+        for (Class<? extends Enum<?>> owner : List.of(AlertError.class, ControlError.class,
+                ArtifactError.class, ClusterError.class, ConnectorCatalogError.class, DataBrowserError.class,
+                MonitorError.class, PipelineDraftError.class, PipelineError.class, PositionError.class,
+                SourceError.class, LifecycleError.class)) {
+            for (Enum<?> value : owner.getEnumConstants())
+                definitions.put(owner.getSimpleName() + "." + value.name(), (TapstateErrorCode) value);
+        }
+        try (var input = getClass().getResourceAsStream("/http-error-status-baseline.tsv")) {
+            assertThat(input).isNotNull();
+            var rows = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))
+                    .lines().filter(line -> !line.startsWith("#") && !line.isBlank()).toList();
+            assertThat(rows).hasSize(91);
+            for (String row : rows) {
+                String[] fields = row.split("\t");
+                TapstateErrorCode code = fields[0].startsWith("literal:")
+                        ? new StubCode(fields[0].substring("literal:".length())) : definitions.get(fields[0]);
+                assertThat(code).as(fields[0]).isNotNull();
+                assertThat(ApiExceptionHandler.statusFor(code)).as(fields[0])
+                        .isEqualTo(HttpStatus.valueOf(fields[1]));
+            }
+        }
+        for (DslError code : DslError.values())
+            assertThat(ApiExceptionHandler.statusFor(code)).as(code.name()).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void unknownIdentitiesKeepServerFailureUnlessTheVerbAttributesTheRefusal() {
+        var failure = new TapstateException(new StubCode("TS9999999"), Map.of("detail", "safe detail"), null);
+        assertThat(handler.handle(failure).getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
+        var request = handler.handle(new BadRequestCodedException(failure));
+        var unavailable = handler.handle(new UnavailableCodedException(failure));
+        assertThat(request.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(unavailable.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        for (var response : List.of(request, unavailable)) {
+            assertThat(response.getBody().code()).isEqualTo("TS9999999");
+            assertThat(response.getBody().params()).containsEntry("detail", "safe detail");
+            assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
+        }
+        assertThat(ApiExceptionHandler.statusFor(new StubCode("dsl.external-validation")))
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
 
     @Test void defaultSourceTimeoutAndBusyAreExplicitRetryDiagnostics() {
         assertThat(ApiExceptionHandler.statusFor(new StubCode("connector.test-timeout"))).isEqualTo(HttpStatus.GATEWAY_TIMEOUT);

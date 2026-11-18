@@ -7,6 +7,7 @@ import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.core.model.canonical.CanonicalWriter;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslException;
+import io.tapstate.core.dsl.DslError;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.spi.store.PipelineDraft;
 import io.tapstate.spi.store.PipelineDraftMutation;
@@ -328,7 +329,7 @@ public final class PipelineDraftService {
         if (path instanceof String value && !value.isBlank()) {
             reason.append(" at ").append(value);
         }
-        if ("dsl.upsert-needs-key".equals(diagnostic.code())) {
+        if (DslError.UPSERT_NEEDS_KEY.code().equals(diagnostic.code())) {
             Object source = diagnostic.params().get("source");
             Object table = diagnostic.params().get("table");
             if (source instanceof String sourceId && table instanceof String tableName) {
