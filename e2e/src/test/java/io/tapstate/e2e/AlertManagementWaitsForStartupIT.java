@@ -8,11 +8,12 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.MongoDBContainer;
@@ -20,7 +21,6 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** The specification vocabulary cannot hold the initial alert-rule read across an HTTP request. */
 @RequiresDocker
@@ -44,7 +44,7 @@ class AlertManagementWaitsForStartupIT {
                             .append("namespace", storage.configurationDatabase() + "."
                                     + SystemCollections.ALERT_RULES.collectionName())
                             .append("errorCode", 2))).get("count")).longValue();
-            try (ServerHandle server = Tiers.IN_PROCESS.launch(storage)) {
+            try (var server = InProcessServer.startPrepared(storage)) {
                 var control = new ControlPlane(server.baseUrl());
                 storage.loginAndAwaitBusiness(control);
                 admin.runCommand(new Document("waitForFailPoint", "failCommand")
@@ -57,10 +57,15 @@ class AlertManagementWaitsForStartupIT {
                         .header("Content-Type", "application/json")
                         .POST(HttpRequest.BodyPublishers.ofString("{}")).build(), HttpResponse.BodyHandlers.ofString());
                 try {
-                    assertThatThrownBy(() -> {
-                        var early = pending.get(1, TimeUnit.SECONDS);
-                        throw new AssertionError("request completed before initialization: " + early.statusCode() + " " + early.body());
-                    }).isInstanceOf(TimeoutException.class);
+                    Await.until("the catalog handler to wait for the initial alert rules", Duration.ofSeconds(10), () -> {
+                        boolean waiting = catalogHandlerIsWaiting();
+                        if (pending.isDone()) {
+                            var early = pending.join();
+                            throw new AssertionError("catalog completed before the readiness wait was observed: "
+                                    + early.statusCode() + " " + early.body());
+                        }
+                        return waiting;
+                    }, () -> "no catalog handler observed in the readiness wait");
                 } finally {
                     admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
                 }
@@ -75,5 +80,24 @@ class AlertManagementWaitsForStartupIT {
                 admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
             }
         }
+    }
+
+    private static boolean catalogHandlerIsWaiting() {
+        // The same server stack must show the catalog handler inside the alert runtime's latch wait.
+        for (var stack : Thread.getAllStackTraces().values()) {
+            if (Arrays.stream(stack).noneMatch(frame ->
+                    isFrame(frame, "io.tapstate.control.restapi.AlertController", "catalog"))) continue;
+            for (int i = 1; i < stack.length; i++) {
+                if (isFrame(stack[i - 1], CountDownLatch.class.getName(), "await")
+                        && isFrame(stack[i], "io.tapstate.app.PipelineAlertRuntime", "managementServices")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean isFrame(StackTraceElement frame, String className, String methodName) {
+        return frame.getClassName().equals(className) && frame.getMethodName().equals(methodName);
     }
 }
