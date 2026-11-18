@@ -94,6 +94,10 @@ mkdir -p fixtures
 printf '%s\n' '{"example":true}' > fixtures/.issue-loop-contract-golden.json
 git add -- fixtures/.issue-loop-contract-golden.json || exit $?
 expect "untracked coordinator history and a similarly named tracked fixture pass" files 0 "clean:"
+printf '%s\n' '.issue-loop-contract-golden' > "$scratch/global-ignore" || exit $?
+git config --file "$scratch/gitconfig" core.excludesFile "$scratch/global-ignore" || exit $?
+GIT_CONFIG_GLOBAL="$scratch/gitconfig" \
+  expect "globally ignored coordinator history passes the liveness and index checks" files 0 "clean:"
 mv .issue-loop-contract-golden fixtures/.issue-loop-contract-golden
 git add -f -- fixtures/.issue-loop-contract-golden || exit $?
 expect "tracked repair-coordinator history in a subdirectory is refused" files 1 "./fixtures/.issue-loop-contract-golden" -qFx

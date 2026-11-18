@@ -86,7 +86,7 @@ control_repo() { # <dir> <path>... -- a repo with those paths tracked
   { git -C "$d" init -q -b main . \
     && git -C "$d" config user.email control@example.invalid \
     && git -C "$d" config user.name control \
-    && git -C "$d" add -A \
+    && git -C "$d" add -f -- "$@" \
     && git -C "$d" -c commit.gpgsign=false commit -qm control; } >/dev/null 2>&1 \
     || die_detector "could not build the control repository, so the detector was never checked (is git working?)."
 }
