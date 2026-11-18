@@ -35,8 +35,8 @@ import org.junit.jupiter.api.Test;
  * real one's tail carries only what changed after it began.
  *
  * <p>START is sent through the member away from the capture. Either member can prepare the intent.
- * A candidate qualifies for the remote load and change checks when its live claim and reported
- * controller agree that it is driven away from the original capture holder.
+ * The first candidate is driven by the capture holder and skipped. The same loop retries until a
+ * candidate's live claim and reported controller agree that it is driven away from the original holder.
  */
 class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
 
@@ -55,19 +55,6 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
 
     @Test
     void thePipelineDrivenAwayFromTheCaptureGetsTheRowsAlreadyThereAndTheChangesAfter() {
-        runSnapshotWitness(false);
-    }
-
-    @Test
-    void startingTheSnapshotWitnessOnTheOtherMemberPlacesItsDriverThere() {
-        runSnapshotWitness(true);
-        runSnapshotWitness(false);
-    }
-
-    private void runSnapshotWitness(boolean proveLocalRejection) {
-        // Keep the second member serving requests while the first member sees the deferred START first.
-        List<String> secondMemberArguments = proveLocalRejection
-                ? List.of("--tapstate.converge.interval-ms=300000") : List.of();
         String run = UUID.randomUUID().toString().replace("-", "");
         String sourceUri = SharedMongo.replicaSetUrl("e2e_shared_src_" + run);
         Duration storeTimeout = Duration.ofSeconds(5);
@@ -76,8 +63,12 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
             EndpointAddress source = EndpointAddress.uri(sourceUri);
             mongo.seed(source, TABLE, SeedRows.generated(SEEDED_ROWS));
 
+            // Delay the request member's convergence so the capture holder prepares the first candidate.
+            // Restoring its default cadence before the retry gives it a head start on later candidates.
             try (PreparedNativeStore storage = PreparedNativeStore.create();
-                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage, secondMemberArguments);
+                    TwoMemberCluster cluster = TwoMemberCluster.startPreparedSequentially(storage,
+                            List.of("--tapstate.converge.interval-ms=5000"),
+                            List.of("--tapstate.converge.interval-ms=300000"));
                     var configuration = MongoConfigurationDomain.openExisting(
                             new MongoConnectionSettings(storage.configurationUri(), null, storeTimeout));
                     var cache = MongoCacheDomain.connect(configuration.bindings().load().orElseThrow().cache(),
@@ -97,12 +88,12 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                 Map<String, String> capture = Await.answered("the cluster to name the capture and its holder",
                         () -> Optional.of(control.captureOwnersOf(first)).filter(owners -> !owners.isEmpty()));
                 String holder = capture.values().iterator().next();
+                assertThat(holder).as("the controlled capture holder").isEqualTo(TwoMemberCluster.NODE_A);
                 assertThat(control.pipelineControllerOf(first)).as("the first pipeline established the capture locally")
                         .contains(holder);
-                ControlPlane remote = cluster.memberOtherThan(holder);
+                String remoteMember = TwoMemberCluster.NODE_B;
+                ControlPlane remote = cluster.second();
                 remote.registerConnector(CONNECTOR, ConnectorJars.bytesFor(CONNECTOR));
-                String remoteMember = holder.equals(TwoMemberCluster.NODE_A)
-                        ? TwoMemberCluster.NODE_B : TwoMemberCluster.NODE_A;
 
                 List<String> placements = new ArrayList<>();
                 for (int n = 2; n <= MOST_PIPELINES; n++) {
@@ -114,19 +105,19 @@ class ASecondPipelineOverATailedSourceLoadsWhereverItLandsIT {
                     placements.add(trace);
                     String driver = placement.controller().orElseThrow();
                     boolean remoteCandidate = isRemoteCandidate(driver, holder, remoteMember, trace);
-                    if (proveLocalRejection) {
+                    if (n == 2) {
                         var claim = placement.claim().orElseThrow().claim();
-                        assertThat(holder).as("the controlled capture holder, %s", trace).isEqualTo(TwoMemberCluster.NODE_A);
-                        assertThat(remoteMember).as("the controlled START member, %s", trace).isEqualTo(TwoMemberCluster.NODE_B);
                         assertThat(claim.claimGeneration()).as("the initial actuation claim, %s", trace).isEqualTo(1);
                         assertThat(placement.preparation().orElseThrow().issuerNode().owner())
                                 .as("the first preparation issued the observed claim, %s", trace).isEqualTo(claim.owner());
                         assertThat(remoteCandidate).as("the local candidate is excluded, %s", trace).isFalse();
-                        System.out.println("Excluded local snapshot candidate: " + trace);
-                        return;
                     }
                     if (!remoteCandidate) {
                         System.out.println("Excluded local snapshot candidate: " + trace);
+                        if (n == 2) {
+                            // Restore normal convergence on the request member while the holder keeps tailing.
+                            remote = cluster.restartSecond();
+                        }
                         continue;
                     }
                     Await.until(pipeline + ", driven by " + driver + " while " + holder + " holds the capture, "

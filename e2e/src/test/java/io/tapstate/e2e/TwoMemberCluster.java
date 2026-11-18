@@ -44,9 +44,9 @@ final class TwoMemberCluster implements AutoCloseable {
     private static final Duration JOIN_BUDGET = Duration.ofSeconds(90);
 
     private final RealProcessServer first;
-    private final RealProcessServer second;
+    private RealProcessServer second;
     private final ControlPlane a;
-    private final ControlPlane b;
+    private ControlPlane b;
     private final String storeUri;
     private final String clusterId;
     private final String bindAddress;
@@ -82,12 +82,13 @@ final class TwoMemberCluster implements AutoCloseable {
 
     /** Retains the sequential launch contract for lifecycle ordering witnesses. */
     static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage) {
-        return startPreparedSequentially(storage, List.of());
+        return startPreparedSequentially(storage, List.of(), List.of());
     }
 
-    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage, List<String> secondMemberArguments) {
+    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage,
+            List<String> firstMemberArguments, List<String> secondMemberArguments) {
         return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage,
-                secondMemberArguments);
+                firstMemberArguments, secondMemberArguments);
     }
 
     /**
@@ -153,12 +154,12 @@ final class TwoMemberCluster implements AutoCloseable {
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
         return start(storeUri, clusterId, nodeSessionTtl, concurrent, existingAdministrator, stagingByNode, preparedStore,
-                List.of());
+                List.of(), List.of());
     }
 
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode,
-            PreparedNativeStore preparedStore, List<String> secondMemberArguments) {
+            PreparedNativeStore preparedStore, List<String> firstMemberArguments, List<String> secondMemberArguments) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
@@ -172,8 +173,12 @@ final class TwoMemberCluster implements AutoCloseable {
             int memberPortB = RealProcessServer.reservePort();
             memberPorts.put(NODE_B, memberPortB);
             seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
-            java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
-                    clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
+            java.util.function.IntFunction<List<String>> firstArguments = httpPort -> {
+                var settings = new ArrayList<>(arguments(
+                        clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl));
+                settings.addAll(firstMemberArguments);
+                return settings;
+            };
             java.util.function.IntFunction<List<String>> secondArguments = httpPort -> {
                 var settings = new ArrayList<>(arguments(
                         clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
@@ -258,6 +263,21 @@ final class TwoMemberCluster implements AutoCloseable {
 
     /** The control plane of the member carrying {@link #NODE_B}. */
     ControlPlane second() {
+        return b;
+    }
+
+    /** Replaces the second process with default member settings while the first remains running. */
+    ControlPlane restartSecond() {
+        second.close();
+        Await.until(NODE_B + " to leave the cluster", JOIN_BUDGET,
+                () -> a.clusterMemberNodeIdsIfAnswered().filter(nodes -> !nodes.contains(NODE_B)).isPresent(),
+                () -> "members = " + a.clusterMemberNodeIdsIfAnswered());
+        second = launching(NODE_B);
+        second.awaitReady();
+        b = signedInAt(second);
+        Await.until(NODE_B + " to rejoin the cluster", JOIN_BUDGET,
+                () -> a.clusterMemberNodeIdsIfAnswered().filter(nodes -> nodes.contains(NODE_B)).isPresent(),
+                () -> "members = " + a.clusterMemberNodeIdsIfAnswered());
         return b;
     }
 
