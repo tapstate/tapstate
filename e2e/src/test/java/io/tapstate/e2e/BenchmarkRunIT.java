@@ -146,9 +146,7 @@ class BenchmarkRunIT {
                 long measurement = System.nanoTime();
                 control.lifecycle(PIPELINE, LifecycleVerb.START);
                 waitFor(entry, "Dummy snapshot completion",
-                        () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent()
-                                && control.snapshotRowsRead(PIPELINE).getOrDefault(DUMMY, 0L) == rows
-                                && settled(control) == rows);
+                        () -> snapshotLanded(control, DUMMY, rows));
                 if (diagnostic) {
                     verifyDummy(witness, rows);
                     evidence.result.put("content_witness", Map.of("rows", rows, "file", witness.getFileName().toString(),
@@ -156,6 +154,7 @@ class BenchmarkRunIT {
                     evidence.phase("content_witness", startup);
                 } else {
                     evidence.measure(measurement, rows, rows);
+                    evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
                     evidence.result.put("runtime_metrics", control.metrics(PIPELINE));
                     evidence.result.put("op_rss_peak_kib", peaks.peakKiB());
                 }
@@ -274,10 +273,16 @@ class BenchmarkRunIT {
         long start = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
         waitFor(entry, "the MongoDB snapshot and settled writes",
-                () -> control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent()
-                        && control.snapshotRowsRead(PIPELINE).getOrDefault(RECORDS, 0L) == rows
-                        && settled(control) == rows);
+                () -> snapshotLanded(control, RECORDS, rows));
         evidence.measure(start, rows, rows);
+        evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
+    }
+
+    private static boolean snapshotLanded(ControlPlane control, String table, int rows) {
+        return control.state(PIPELINE).filter(PipelineState.COMPLETED::equals).isPresent()
+                && control.snapshotRowsRead(PIPELINE).getOrDefault(table, 0L) == rows
+                && control.initialLoad(PIPELINE).filter(load -> "COMPLETED".equals(load.get("phase"))
+                        && load.get("landedTables") instanceof Number landed && landed.longValue() == 1).isPresent();
     }
 
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
