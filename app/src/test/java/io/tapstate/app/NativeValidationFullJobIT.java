@@ -91,6 +91,7 @@ class NativeValidationFullJobIT {
             assertThat(report.terminal()).isEqualTo(ValidationRunState.STOPPED);
             if(cleanup==null)assertThat(report.failure()).isNull();
             else assertThat(report.failure()).isNotNull().satisfies(failure->{assertThat(failure.technical()).contains("original publication payload cleanup failed");assertThat(failure.fatal()).isEqualTo(cleanup instanceof Error);});
+            await(()->f.resources.snapshot().metadataFrames()==0);
             assertThat(f.resources.snapshot().processReserved().isEmpty()).isTrue();assertThat(f.resources.snapshot().metadataFrames()).isZero();
         }finally{checkRelease.countDown();controlsRelease.forEach(java.util.concurrent.CountDownLatch::countDown);}
     }
