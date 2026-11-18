@@ -224,7 +224,7 @@ jobs:
       - name: Run this exact connector witness shard
         # Docker 29 requires a newer API than the pinned testcontainers default.
         env:
-          MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors
+          MAVEN_ARGS: -Dapi.version=1.44 -Dtapstate.e2e.connectors-dir=${{ runner.temp }}/connectors -Dtapstate.dummy.jar=${{ runner.temp }}/cloud-test-release/connectors/dummy-connector.jar
         run: .github/scripts/connector-witnesses.sh run --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --repo-local "$RUNNER_TEMP/m2"
       - name: Admit reports and the sweep's witness ledger
         run: .github/scripts/connector-witnesses.sh pack --input-mode "$CONNECTOR_INPUT_MODE" --inputs "$RUNNER_TEMP/connectors/connector-inputs.json" --plan "$RUNNER_TEMP/connector-shards.json" --shard "$SHARD" --output "$RUNNER_TEMP/connector-results/$SHARD"
