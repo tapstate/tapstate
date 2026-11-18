@@ -16,6 +16,39 @@ import static org.mockito.Mockito.*;
 
 class NativePipelineDeletionTest {
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"none", "operation", "owner", "intent"})
+    void onlyTheConfirmedPurgeSuccessorCanBeSelectedForDeletion(String change) {
+        var configuration = mock(MongoConfigurationDomain.class, RETURNS_DEEP_STUBS);
+        var cache = mock(MongoCacheDomain.class, RETURNS_DEEP_STUBS);
+        var original = new PipelineResource("pipeline", null, List.of(), null, null, null, null, null);
+        var hash = CanonicalHash.of(original);
+        var old = new PipelineIntentScope("cluster", 1, "cache", "pipeline", 1);
+        var purge = new PipelineIntentSnapshot(old, 7, new io.tapstate.core.lifecycle.DesiredState(
+                "pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED, hash, true, hash, false, null));
+        var target = new PipelineIntentScope("cluster", 1, "cache", "pipeline", 2);
+        var stopped = new PipelineIntentSnapshot(target, change.equals("intent") ? 9 : 8,
+                new io.tapstate.core.lifecycle.DesiredState("pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED, hash));
+        var originalNode = mock(WorkloadClaimFence.class);
+        @SuppressWarnings("unchecked")
+        java.util.function.Supplier<WorkloadClaimFence> owner = mock(java.util.function.Supplier.class);
+        when(owner.get()).thenReturn(originalNode, change.equals("owner") ? mock(WorkloadClaimFence.class) : originalNode);
+        when(configuration.artifacts().get("pipeline")).thenReturn(Optional.of(original));
+        when(configuration.preparations().read("pipeline")).thenReturn(Optional.of(
+                new PipelinePreparation("pipeline", 2, PipelinePreparation.Phase.UNASSIGNED, null, null, null)));
+        when(configuration.intents().load("pipeline")).thenReturn(Optional.of(purge), Optional.of(stopped));
+        when(configuration.pipelineStates().read("pipeline")).thenReturn(
+                Optional.of(new PipelineStateMapping("pipeline", 1, PipelineStateMapping.Phase.REBUILDING, PipelineRebuildCoordinator.operationId(purge))),
+                Optional.of(new PipelineStateMapping("pipeline", 2, PipelineStateMapping.Phase.ACTIVE, change.equals("operation") ? "another-operation" : PipelineRebuildCoordinator.operationId(purge))));
+        var ownership = mock(PipelineActuationOwnership.class);
+        var deletion = new NativePipelineDeletion(configuration, cache, new CacheBusinessScope("cluster", 1, "cache"),
+                ownership, owner, () -> {}, mock(Engine.class), mock(EngineLifecycleActuator.class),
+                mock(HazelcastOperatorReadiness.class), mock(HazelcastExecutionPlans.class), mock(ConnectorProvisioner.class));
+        if (change.equals("none")) assertThat(deletion.prepare(original, hash)).isNotNull();
+        else assertThatThrownBy(() -> deletion.prepare(original, hash)).isInstanceOf(TapstateException.class);
+        verifyNoInteractions(ownership);
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.ValueSource(booleans={false,true})
     void anUnpreparedDeletionDoesNotProbeForACacheReceiptThatCannotExist(boolean resume) {
         var configuration=mock(MongoConfigurationDomain.class); var cache=mock(MongoCacheDomain.class);

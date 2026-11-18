@@ -734,6 +734,11 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 .requireRetiredPredecessor(current,earlier);
     }
 
+    public void requireCompletedStopPurge(io.tapstate.spi.store.PipelineIntentSnapshot purge,
+            String operation, io.tapstate.spi.store.WorkloadClaimFence node) {
+        ((MongoPipelineStateRebuilds) rebuilds()).requireCompletedStopPurge(purge, operation, node);
+    }
+
     public io.tapstate.spi.store.CaptureStatePreparations capturePreparations() {
         requireOpen();return new MongoCaptureStatePreparations(connection.client(),connection.database(),clusterId,bindings,artifacts,this::requireOpen);
     }

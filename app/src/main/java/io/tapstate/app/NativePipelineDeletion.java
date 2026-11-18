@@ -19,6 +19,7 @@ import java.util.function.Supplier;
 /** Original lifecycle retirement behind the common artifact API, including a pending operation after restart. */
 final class NativePipelineDeletion implements ArtifactMutationService.PipelineDeletion {
     private static final Duration LOCAL_PASS_WAIT = Duration.ofSeconds(5);
+    private static final Duration PURGE_HANDOFF_WAIT = Duration.ofSeconds(12);
     private final MongoConfigurationDomain configuration;
     private final MongoCacheDomain cache;
     private final CacheBusinessScope business;
@@ -46,7 +47,14 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
     }
 
     @Override public Runnable prepare(PipelineResource original, String expectedHash) {
-        active.run(); var mapping=mapping(original.id()); var scope=scope(mapping);
+        active.run();
+        var initial = mapping(original.id());
+        var purge = initial.phase() == PipelineStateMapping.Phase.RETIRING ? null
+                : configuration.intents().load(original.id()).filter(intent -> !intent.deleted()
+                        && intent.desired().purgeState() && intent.desired().targetState() == PipelineState.STOPPED).orElse(null);
+        var handoff = purge == null ? null : new PurgeHandoff(purge, node.get());
+        var mapping = handoff == null ? initial : awaitPurge(initial, handoff, expectedHash);
+        var scope = scope(mapping);
         if (mapping.phase()==PipelineStateMapping.Phase.RETIRING) {
             var pending=lifecycle.pending(scope,mapping.operationId()).orElseThrow(NativePipelineDeletion::fenced);
             if (!pending.request().definitionHash().equals(CanonicalHash.of(original))) throw fenced();
@@ -55,19 +63,53 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
             requireRest(scope);
         }
         String operation=mapping.phase()==PipelineStateMapping.Phase.RETIRING?mapping.operationId():UUID.randomUUID().toString();
-        return () -> delete(original,expectedHash,scope,operation);
+        return () -> delete(original,expectedHash,scope,operation,handoff);
     }
 
-    private void delete(PipelineResource original, String expectedHash, PipelineIntentScope scope, String operation) {
+    private record PurgeHandoff(PipelineIntentSnapshot intent, WorkloadClaimFence node) {}
+
+    private PipelineStateMapping awaitPurge(PipelineStateMapping initial, PurgeHandoff handoff, String hash) {
+        var purge = handoff.intent();
+        if (!scope(initial).equals(purge.scope())) throw fenced();
+        String operation = PipelineRebuildCoordinator.operationId(purge);
+        var mapping = initial;
+        long started = System.nanoTime();
+        while (scope(mapping).equals(purge.scope())) {
+            if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE
+                    && !(mapping.phase() == PipelineStateMapping.Phase.REBUILDING && operation.equals(mapping.operationId()))) throw fenced();
+            if (System.nanoTime() - started >= PURGE_HANDOFF_WAIT.toNanos() || Thread.currentThread().isInterrupted()) throw fenced();
+            java.util.concurrent.locks.LockSupport.parkNanos(Duration.ofMillis(50).toNanos());
+            mapping = mapping(initial.pipelineId());
+        }
+        if (mapping.phase() != PipelineStateMapping.Phase.ACTIVE || !operation.equals(mapping.operationId())
+                || mapping.stateGeneration() != initial.stateGeneration() + 1) throw fenced();
+        requireHash(initial.pipelineId(), hash);
+        configuration.requireCompletedStopPurge(purge, operation, handoff.node());
+        requirePurgeSuccessor(scope(mapping), handoff);
+        return mapping;
+    }
+
+    private void requirePurgeSuccessor(PipelineIntentScope target, PurgeHandoff handoff) {
+        if (handoff == null) return;
+        if (!handoff.node().equals(node.get())) throw fenced();
+        var purge = handoff.intent();
+        var current = configuration.intents().load(target.pipelineId()).orElseThrow(NativePipelineDeletion::fenced);
+        if (current.deleted() || !current.scope().equals(target) || current.intentRevision() != purge.intentRevision() + 1
+                || current.desired().purgeState() || current.desired().targetState() != PipelineState.STOPPED) throw fenced();
+    }
+
+    private void delete(PipelineResource original, String expectedHash, PipelineIntentScope scope, String operation, PurgeHandoff handoff) {
         active.run(); var mapping=mapping(original.id());
         if (!scope.equals(scope(mapping)) || mapping.phase()==PipelineStateMapping.Phase.RETIRING && !operation.equals(mapping.operationId())) throw fenced();
         requireHash(original.id(),expectedHash);
         var pending=mapping.phase()==PipelineStateMapping.Phase.RETIRING
                 ? lifecycle.pending(scope,mapping.operationId()) : Optional.<PipelineRetirementPreparation>empty();
         if (mapping.phase()!=PipelineStateMapping.Phase.ACTIVE && pending.isEmpty()) throw fenced();
+        if (handoff != null && !PipelineRebuildCoordinator.operationId(handoff.intent()).equals(mapping.operationId())) throw fenced();
         if (pending.isPresent() && !pending.orElseThrow().request().definitionHash().equals(expectedHash)) throw conflict(original.id());
         var preparation=configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced);
         if (preparation.phase()==PipelinePreparation.Phase.ISSUED) throw fenced();
+        if (handoff != null && (preparation.phase() != PipelinePreparation.Phase.COMPLETE || !scope.equals(preparation.scope()))) throw fenced();
         boolean alreadyRetired=pending.isPresent() && pending.orElseThrow().request().cache().isPresent()
                 && retirement.completed(pending.orElseThrow(),node.get()).isPresent();
         boolean unprepared = alreadyRetired || preparation.phase()==PipelinePreparation.Phase.UNASSIGNED;
@@ -75,6 +117,7 @@ final class NativePipelineDeletion implements ArtifactMutationService.PipelineDe
             control.requireHeld(); active.run();
             // Waiting never adopts a successor scope, definition, preparation or newly running intent.
             if (!mapping.equals(mapping(original.id()))) throw fenced();
+            requirePurgeSuccessor(scope, handoff);
             requireHash(original.id(),expectedHash);
             if (!preparation.equals(configuration.preparations().read(original.id()).orElseThrow(NativePipelineDeletion::fenced))) throw fenced();
             if (mapping.phase()==PipelineStateMapping.Phase.ACTIVE) requireRest(scope);
