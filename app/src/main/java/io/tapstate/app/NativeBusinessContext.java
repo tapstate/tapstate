@@ -4,6 +4,7 @@ import com.hazelcast.core.HazelcastInstance;
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
 import io.tapstate.adapters.pdk.ConnectorProvisioner;
 import io.tapstate.control.core.*;
+import io.tapstate.control.restapi.OperationRequestMappingHandlerMapping;
 import io.tapstate.control.restapi.RuntimeHttpHandlers;
 import io.tapstate.core.lifecycle.*;
 import io.tapstate.core.model.*;
@@ -751,7 +752,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
             return owner.payloadCleanup;
         }
         @Bean RequestMappingHandlerMapping runtimeRequestMappingHandlerMapping() {
-            var mapping = new RequestMappingHandlerMapping(); mapping.setOrder(0);
+            var mapping = new OperationRequestMappingHandlerMapping(); mapping.setOrder(0);
             mapping.setPathPrefixes(Map.of("/api", HandlerTypePredicate.forAnnotation(org.springframework.web.bind.annotation.RestController.class)));
             return mapping;
         }
