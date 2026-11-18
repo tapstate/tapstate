@@ -2480,30 +2480,39 @@ final class StoreBackedDagSource implements DagSource {
     /** Resolve every input separately, retaining its stream identity through projection and expansion. */
     static Map<String, List<String>> parentKeysReaching(Step step, Map<String, Step.Inline> steps,
             Function<FromRef, Map<String, List<String>>> sourceKeys) {
-        return step instanceof Step.Inline inline
-                ? parentKeysReaching(step.id(), inline.from(), steps, sourceKeys, new HashSet<>()) : Map.of();
+        if (!(step instanceof Step.Inline inline)) return Map.of();
+        Map<String, List<String>> result = new LinkedHashMap<>();
+        parentKeyCandidates(step.id(), inline.from(), steps, sourceKeys, new HashSet<>())
+                .forEach((stream, key) -> {
+                    if (key.stream().anyMatch(Set::isEmpty)) {
+                        throw unresolvedParentKey(step.id(), stream, "a parent-key column was overwritten");
+                    }
+                    result.put(stream, key.stream().map(names -> names.iterator().next()).toList());
+                });
+        return result;
     }
 
-    private static Map<String, List<String>> parentKeysReaching(String stepId, FromClause from, Map<String, Step.Inline> steps,
+    private static Map<String, List<Set<String>>> parentKeyCandidates(String stepId, FromClause from, Map<String, Step.Inline> steps,
             Function<FromRef, Map<String, List<String>>> sourceKeys, Set<String> visiting) {
-        Map<String, List<String>> keys = new LinkedHashMap<>();
+        Map<String, List<Set<String>>> keys = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
-            sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream, key));
+            sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream,
+                    key.stream().map(Set::of).toList()));
             for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
                     continue;
                 }
-                Map<String, List<String>> above = parentKeysReaching(stepId, upstream.from(), steps, sourceKeys, visiting);
+                Map<String, List<Set<String>>> above = parentKeyCandidates(stepId, upstream.from(), steps, sourceKeys, visiting);
                 visiting.remove(upstream.id());
                 above.forEach((stream, key) -> {
-                    List<String> current = key;
+                    List<Set<String>> current = key;
                     if (upstream.body() instanceof TransformBody.MapProjection projection) {
-                        current = KeyProjection.renamed(current, projection.fields());
+                        current = KeyProjection.candidates(current, projection.fields());
                     } else if (upstream.body() instanceof TransformBody.Unwind unwind) {
                         String locator = UnwindWriteKeys.elementLocator(unwind);
-                        if (locator != null && !current.isEmpty() && !current.contains(locator)) {
+                        if (locator != null && !current.isEmpty() && current.stream().noneMatch(names -> names.contains(locator))) {
                             current = new ArrayList<>(current);
-                            current.add(locator);
+                            current.add(Set.of(locator));
                             current = List.copyOf(current);
                         }
                     }
@@ -2514,8 +2523,8 @@ final class StoreBackedDagSource implements DagSource {
         return keys;
     }
 
-    private static void mergeParentKey(String stepId, Map<String, List<String>> keys, String stream, List<String> key) {
-        List<String> previous = keys.putIfAbsent(stream, key);
+    private static void mergeParentKey(String stepId, Map<String, List<Set<String>>> keys, String stream, List<Set<String>> key) {
+        List<Set<String>> previous = keys.putIfAbsent(stream, key);
         if (previous != null && !previous.equals(key)) {
             throw unresolvedParentKey(stepId, stream,
                     "the same stream reaches this step with conflicting parent-key columns");

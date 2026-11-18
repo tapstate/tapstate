@@ -133,6 +133,19 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void anUnwindKeySurvivesDroppingAnAliasInALaterMap() {
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
+        NodeColumns aliased = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("alias_no", FieldRule.computed("after.item_no"))), one(expanded), null);
+        NodeColumns dropped = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("alias_no", FieldRule.drop())), one(aliased), null);
+        assertThat(dropped.key()).containsExactly("item_no");
+        NodeColumns originalDropped = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("item_no", FieldRule.drop())), one(aliased), null);
+        assertThat(originalDropped.key()).containsExactly("alias_no");
+    }
+
+    @Test
     void anUnwindKeyIgnoresAModifiedComputedExpressionInASubsequentMap() {
         NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
         Map<String, FieldRule> rules = new LinkedHashMap<>();
@@ -149,6 +162,20 @@ class UnwindDerivedKeyTest {
                 Map.of("missing_alias", FieldRule.computed("after.absent"))), one(atTheSource()), null);
 
         assertThat(projected.origins()).doesNotContainKey("missing_alias");
+    }
+
+    @Test
+    void aBeforeImageReadDoesNotInheritSourceIdentity() {
+        Map<String, FieldRule> rules = new LinkedHashMap<>();
+        rules.put("order_id", FieldRule.computed("before.o_id"));
+        rules.put("o_id", FieldRule.drop());
+        NodeColumns projected = NodeColumns.of(new TransformBody.MapProjection(rules), one(atTheSource()), null);
+        assertThat(projected.origins()).doesNotContainKey("order_id");
+        assertThat(publishedKey(projected)).isEmpty();
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
+        NodeColumns overwritten = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("item_no", FieldRule.computed("before.item_no"))), one(expanded), null);
+        assertThat(overwritten.key()).isEmpty();
     }
 
     @Test

@@ -100,7 +100,15 @@ import java.util.Set;
  */
 record NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
         Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
-        Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields) {
+        Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields,
+        List<Set<String>> keyCandidates) {
+
+    NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
+            Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
+            Set<String> unchangedFields, Map<String, StringType> stringTypes, List<String> unwindSourceIdFields) {
+        this(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, stringTypes,
+                unwindSourceIdFields, key.stream().map(Set::of).toList());
+    }
 
     NodeColumns(Map<String, String> columns, List<String> key, String unknownBecause,
             Map<String, String> origins, boolean expanded, Map<String, NumericType> numericTypes,
@@ -128,15 +136,15 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
     }
 
     NodeColumns withStringTypes(Map<String, StringType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdFields);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, unchangedFields, types, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns withUnchangedFields(Set<String> fields) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdFields);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, numericTypes, fields, stringTypes, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns withNumericTypes(Map<String, NumericType> types) {
-        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdFields);
+        return new NodeColumns(columns, key, unknownBecause, origins, expanded, types, unchangedFields, stringTypes, unwindSourceIdFields, keyCandidates);
     }
 
     NodeColumns {
@@ -144,6 +152,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // that loses it turns every rebuild of the same node into a differently ordered record.
         columns = Collections.unmodifiableMap(new LinkedHashMap<>(columns));
         key = List.copyOf(key);
+        keyCandidates = keyCandidates.stream().map(names -> Collections.unmodifiableSet(new LinkedHashSet<>(names))).toList();
         unwindSourceIdFields = List.copyOf(unwindSourceIdFields);
         origins = Collections.unmodifiableMap(new LinkedHashMap<>(origins));
         numericTypes = Collections.unmodifiableMap(new LinkedHashMap<>(numericTypes));
@@ -376,9 +385,11 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         // own locator and the first one's together, and falling back to the table's own key would be
         // claiming the first expansion's rows are one row.
         List<String> key = new ArrayList<>(upstream.key());
+        List<Set<String>> candidates = new ArrayList<>(upstream.keyCandidates());
         String locator = UnwindWriteKeys.elementLocator(unwind);
         if (locator != null && !key.contains(locator)) {
             key.add(locator);
+            candidates.add(Set.of(locator));
         }
         Map<String, String> origins = new LinkedHashMap<>(upstream.origins());
         origins.remove(unwind.path());
@@ -395,7 +406,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         }
         return new NodeColumns(out, key, null, origins, true, numbers, unchanged, strings,
                 unwind.sourceIdField() != null || upstream.unwindSourceIdFields().isEmpty()
-                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields());
+                        ? List.of(unwind.resolvedSourceIdField()) : upstream.unwindSourceIdFields(), candidates);
     }
 
     /** The declared element type as the shared vocabulary spells it, or unknown for anything else. */
@@ -549,8 +560,13 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         passThrough(upstream, out, numbers, strings, unchanged, consumed, dropped);
         Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
 
-        return new NodeColumns(out, projectedKey(rules, upstream.key(), out), null,
-                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields());
+        List<Set<String>> candidates = KeyProjection.candidates(upstream.keyCandidates(), rules).stream()
+                .map(names -> names.stream().filter(out::containsKey)
+                        .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new)))
+                .filter(names -> !names.isEmpty()).map(names -> (Set<String>) names).toList();
+        List<String> key = candidates.stream().map(names -> names.iterator().next()).toList();
+        return new NodeColumns(out, key, null,
+                origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields(), candidates);
     }
 
     private static void applyRules(
@@ -639,7 +655,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
                     ? upstream.origins().get(source) : upstream.origins().get(output);
         }
         if (rule instanceof FieldRule.Computed computed) {
-            String moved = RowExpressions.movedColumn(computed.celExpr());
+            String moved = RowExpressions.movedAfterColumn(computed.celExpr());
             if (moved != null && upstream.columns().containsKey(moved)) {
                 return upstream.origins().get(moved);
             }
@@ -669,22 +685,6 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         if (upstream.numericTypes().containsKey(moved)) {
             numbers.put(output, upstream.numericTypes().get(moved));
         }
-    }
-
-    /**
-     * What an upstream node's added key columns are called after a projection, and which of them
-     * still exist. A rename is followed rather than treated as a loss: the column is the same column
-     * under another name, and dropping the claim would leave rows an expansion made distinct looking
-     * like one row again - the failure the claim exists to remove, arriving through a rule that only
-     * renamed something. A column the projection does not carry at all is a loss, and is dropped:
-     * naming a column the target has not got reads as a key that is complete.
-     */
-    private static List<String> projectedKey(
-            Map<String, FieldRule> rules, List<String> upstreamKey, Map<String, String> out) {
-        if (upstreamKey.isEmpty()) {
-            return List.of();
-        }
-        return KeyProjection.renamed(upstreamKey, rules).stream().filter(out::containsKey).toList();
     }
 
     /**

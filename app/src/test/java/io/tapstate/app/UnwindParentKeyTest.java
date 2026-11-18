@@ -108,6 +108,28 @@ class UnwindParentKeyTest {
     }
 
     @Test
+    void aSurvivingOriginalKeyRemainsAvailableAfterAnAliasIsDropped() {
+        Step.Inline alias = step("alias", "orders", new TransformBody.MapProjection(
+                Map.of("alias_id", FieldRule.computed("after.o_id"))));
+        Step.Inline drop = step("drop", "alias", new TransformBody.MapProjection(
+                Map.of("alias_id", FieldRule.drop())));
+        Step.Inline expand = step("expand", "drop", unwind(null, "sku"));
+        assertThat(keyReaching(expand, alias, drop, expand)).containsExactly("o_id");
+        Step.Inline dropOriginal = step("dropOriginal", "alias", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.drop())));
+        Step.Inline expandAlias = step("expandAlias", "dropOriginal", unwind(null, "sku"));
+        assertThat(keyReaching(expandAlias, alias, dropOriginal, expandAlias)).containsExactly("alias_id");
+    }
+
+    @Test
+    void anOverwrittenParentKeyCannotMasqueradeAsItsOriginalIdentity() {
+        Step.Inline map = step("map", "orders", new TransformBody.MapProjection(
+                Map.of("o_id", FieldRule.computed("before.o_id"))));
+        Step.Inline expand = step("expand", "map", unwind(null, "sku"));
+        assertThatThrownBy(() -> keyReaching(expand, map, expand)).isInstanceOf(TapstateException.class);
+    }
+
+    @Test
     void aSecondExpansionUsesRenamedParentAndEarlierLocatorColumns() {
         Step.Inline outer = step("outer", "orders", unwind("item_no", null));
         Step.Inline rename = step("rename", "outer", new TransformBody.MapProjection(
