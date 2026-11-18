@@ -804,12 +804,43 @@ class MongoCacheOperatorStateStoreIT {
         withFixture(f -> withExtra(f,(bound,target) -> {
             var fence = WorkloadClaimFence.from(f.claim); String operation = UUID.randomUUID().toString();
             bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE);
+            bound.nestShapes(SCOPE, target.getName(), fence, ACTIVE).recordIfAbsent("extra-step", Set.of("root"));
             target.getCollection(missing).drop(); var names = new HashSet<>(target.listCollectionNames().into(new ArrayList<>()));
             var before = f.snapshot();
-            code(() -> bound.nestShapes(SCOPE,target.getName()).read("extra-step"),IoError.DOCUMENT_UNREADABLE);
+            if (missing.equals("nest_state")) {
+                assertThat(bound.nestShapes(SCOPE, target.getName()).read("extra-step")).contains(Set.of("root"));
+            } else {
+                code(() -> bound.nestShapes(SCOPE, target.getName()).read("extra-step"), IoError.DOCUMENT_UNREADABLE);
+            }
             code(() -> bound.prepareOperatorDatabase(SCOPE,target.getName(),fence,operation,ACTIVE),IoError.DOCUMENT_UNREADABLE);
             assertThat(target.listCollectionNames()).containsExactlyInAnyOrderElementsOf(names);
             assertThat(f.snapshot()).isEqualTo(before);
+        }));
+    }
+
+    @Test void anOperatorViewFailureInspectsOnlyTheRegisteredChildNamespace() {
+        withFixture(f -> withExtra(f, (bound, target) -> {
+            var fence = WorkloadClaimFence.from(f.claim);
+            bound.prepareOperatorDatabase(SCOPE, target.getName(), fence, UUID.randomUUID().toString(), ACTIVE);
+            bound.nestShapes(SCOPE, target.getName(), fence, ACTIVE).recordIfAbsent("extra-step", Set.of("root"));
+            var at = new OperatorPlacement(SCOPE, target.getName(), OperatorPlacement.Resource.NEST_STATE,
+                    "extra-step", "root", "logical");
+            var writer = bound.operatorState(at, fence, ACTIVE);
+            var physicalName = SystemCollections.CACHE_NEST_STATE.collectionName();
+            SystemCollections.CACHE_NEST_STATE.on(target).drop();
+            target.createView(physicalName, "unrelated_fixture", List.of());
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                assertThatThrownBy(() -> writer.save(at.mapName(), "late", new byte[]{1}))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> {
+                            assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(error.args().get("detail").toString())
+                                    .contains(target.getName() + "." + physicalName, "COLLECTION_TYPE");
+                        });
+                var groups = (List<?>) diagnostics.snapshot().get("mongo_groups");
+                assertThat(groups).filteredOn(group -> "listCollections".equals(((Map<?, ?>) group).get("command")))
+                        .singleElement().satisfies(group ->
+                                assertThat(((Map<?, ?>) group).get("database")).isEqualTo(target.getName()));
+            }
         }));
     }
 

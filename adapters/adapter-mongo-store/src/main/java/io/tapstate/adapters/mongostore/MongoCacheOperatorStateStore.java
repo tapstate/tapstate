@@ -251,12 +251,12 @@ final class MongoCacheOperatorStateStore implements NestReleaseStore, LeasedStat
 
     private <T> T read(Function<ClientSession, T> action) {
         if (validation == Validation.TRANSACTION) return transaction(false, action);
-        return leased(false, proved -> access.leasedRead(committed, action));
+        return leased(false, proved -> access.leasedRead(committed, target, action));
     }
 
     private <T> T write(Function<ClientSession, T> action) {
         if (validation == Validation.TRANSACTION) return transaction(true, action);
-        return leased(true, proved -> access.leasedWrite(committed, session -> {
+        return leased(true, proved -> access.leasedWrite(committed, target, session -> {
             requireProvedInventory(session, proved);
             return action.apply(session);
         }));

@@ -122,12 +122,14 @@ final class MongoCachePipelineAccess {
      * is not advanced: every ownership change it would catch also rewrites the claim document. Any failure,
      * including a refused claim, propagates unchanged; the caller decides the lease is lost.
      */
-    <T> T leasedWrite(LeasedClock committed, Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+    <T> T leasedWrite(LeasedClock committed, MongoDatabase target, Function<ClientSession, T> action) {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
                 requireActive.run();
                 try (var session = client.startSession()) {
                     T written = session.withTransaction(() -> {
+                        MongoStructureFailureScope.beginCallback();
+                        MongoStructureFailureScope.includeOperatorDatabase(client, target);
                         requireActive.run();
                         compareAndSetClaim(session, "fencedPipelineWrites");
                         T result = action.apply(session);
@@ -138,7 +140,7 @@ final class MongoCachePipelineAccess {
                     return written;
                 }
             } catch (RuntimeException failure) { requireActive.run(); throw failure; }
-        });
+        }));
     }
 
     /**
@@ -146,8 +148,9 @@ final class MongoCachePipelineAccess {
      * (set by the caller on the collection), in a causally consistent session that starts no earlier than
      * {@code after}, the last write this store committed.
      */
-    <T> T leasedRead(LeasedClock after, Function<ClientSession, T> action) {
-        return StoreIo.call(() -> {
+    <T> T leasedRead(LeasedClock after, MongoDatabase target, Function<ClientSession, T> action) {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
+            MongoStructureFailureScope.includeOperatorDatabase(client, target);
             requireActive.run();
             try (var session = client.startSession(com.mongodb.ClientSessionOptions.builder().causallyConsistent(true).build())) {
                 after.advance(session);
@@ -155,7 +158,7 @@ final class MongoCachePipelineAccess {
                 requireActive.run();
                 return result;
             }
-        });
+        }));
     }
 
     /**
@@ -165,7 +168,6 @@ final class MongoCachePipelineAccess {
      */
     long proveLease(ClientSession session) {
         if (original == null) throw fenced();
-        MongoCacheWorkloadClaimStore.requireCollection(database);
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         var filter = WorkloadClaimDocuments.livePipeline(session, table, original)
                 .append(PIPELINE_SCOPE, MongoPipelinePreparationFacts.scope(scope)).append("pipelinePreparation.phase", "PREPARED");
@@ -264,9 +266,12 @@ final class MongoCachePipelineAccess {
             }
             Document current = state(session, true);
             if (!database.getName().equals(target.getName())) {
-                String preparation = MongoCacheOperatorDatabases.require(session, target, operatorDatabases);
-                MongoOperatorInventory.requireDatabase(MongoOperatorInventory.require(session, database, scope), target.getName(), preparation, scope);
-                new MongoCacheMetadataStructure(target, rateRetention).verifyFacet(table);
+                var inventory = MongoOperatorInventory.require(session, database, scope);
+                if (inventory.getList("databases", Document.class).stream()
+                        .noneMatch(entry -> target.getName().equals(entry.get("database")))) throw unreadable("operator-database");
+                MongoStructureFailureScope.includeOperatorDatabase(client, target);
+                String preparation = MongoCacheOperatorDatabases.requireOwner(session, target, operatorDatabases);
+                MongoOperatorInventory.requireDatabase(inventory, target.getName(), preparation, scope);
             }
             if (mutation) { proveClaim(session, true); updateState(session, current, new Document(), false); }
             return action.apply(session);

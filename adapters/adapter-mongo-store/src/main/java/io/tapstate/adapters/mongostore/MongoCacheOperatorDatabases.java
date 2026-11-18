@@ -76,6 +76,11 @@ final class MongoCacheOperatorDatabases {
         if (binding == null) throw MongoCachePipelineAccess.fenced();
         var structure = new MongoCacheMetadataStructure(target, MongoRateHistoryStore.DEFAULT_RETENTION);
         for (var table : TABLES) structure.verifyFacet(table);
+        return requireOwner(session, target, binding);
+    }
+
+    static String requireOwner(ClientSession session, MongoDatabase target, OperatorDatabaseBinding binding) {
+        if (binding == null) throw MongoCachePipelineAccess.fenced();
         var identities = SystemCollections.CACHE_IDENTITY.on(target);
         if (!identity(target, binding).equals(identities.find(session, new Document("_id", "operator")).first())
                 || identities.countDocuments(session) != 1) throw unavailable();

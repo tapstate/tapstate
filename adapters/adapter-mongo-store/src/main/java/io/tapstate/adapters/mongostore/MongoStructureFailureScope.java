@@ -23,6 +23,7 @@ final class MongoStructureFailureScope {
     private static final Set<Integer> STRUCTURE_ERRORS = Set.of(26, 27, 48, 85, 86, 121, 166, 171, 197, 11000);
     private final MongoClient client;
     private final MongoReadBudget budget;
+    private MongoDatabase operatorDatabase;
     private Target pending;
     private Target failed;
     private int requestId;
@@ -82,9 +83,14 @@ final class MongoStructureFailureScope {
         return original;
     }
 
+    static void includeOperatorDatabase(MongoClient client, MongoDatabase database) {
+        var scope = CURRENT.get();
+        if (scope != null && scope.client == client) scope.operatorDatabase = database;
+    }
+
     static void beginCallback() {
         var scope = CURRENT.get();
-        if (scope != null) { scope.failed = null; scope.translated = null; scope.failedDriver = null; scope.failedCode = 0; }
+        if (scope != null) { scope.failed = null; scope.translated = null; scope.failedDriver = null; scope.failedCode = 0; scope.operatorDatabase = null; }
     }
 
     static void translated(MongoException failure, RuntimeException translated) {
@@ -113,7 +119,9 @@ final class MongoStructureFailureScope {
                 scope.pending = null;
                 if (!COMMANDS.contains(event.getCommandName())) return;
                 scope.failed = null; scope.translated = null; scope.failedDriver = null; scope.failedCode = 0;
-                var database = originalDatabase.get();
+                var operator = scope.operatorDatabase;
+                var database = operator != null && operator.getName().equals(event.getDatabaseName())
+                        ? operator : originalDatabase.get();
                 if (database == null || !database.getName().equals(event.getDatabaseName())) return;
                 var target = event.getCommand().get(event.getCommandName());
                 if (target == null || !target.isString()) return;

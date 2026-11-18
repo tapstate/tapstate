@@ -39,6 +39,7 @@ final class MongoOperatorInventory {
     }
 
     static void requireInitial(ClientSession session, MongoDatabase database, PipelineIntentScope scope, String preparationId) {
+        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
         Document root = require(session, database, scope);
         if (!preparationId.equals(root.get("preparationId")) || !Long.valueOf(0).equals(root.get("revision"))
                 || !root.getList("databases", Document.class).isEmpty() || !root.getList("shapes", Document.class).isEmpty() || !root.getList("placements", Document.class).isEmpty())
@@ -46,7 +47,6 @@ final class MongoOperatorInventory {
     }
 
     static Document require(ClientSession session, MongoDatabase database, PipelineIntentScope scope) {
-        new MongoCacheMetadataStructure(database, MongoRateHistoryStore.DEFAULT_RETENTION).verifyFacet(SystemCollections.CACHE_OPERATOR_CLEANUP);
         Document root = SystemCollections.CACHE_OPERATOR_CLEANUP.on(database).find(session, new Document("_id", MongoPipelinePreparationFacts.scope(scope))).first();
         return decode(session, database, scope, root, true);
     }
