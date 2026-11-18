@@ -408,8 +408,9 @@ print_next_steps() {
     fi
     uri="mongodb://mongo:27017/views?directConnection=true"
     # Piped, the reader's shell is still where the one-liner was typed, and every command below runs in
-    # the directory this run made. Said once, at the top, with the cd that gets there; in place there is
-    # nothing to say, and the line stays empty.
+    # the directory this run works in -- not "made": on a piped re-run, mkdir -p finds the directory an
+    # earlier run left. Said once, at the top, with the cd that gets there; in place there is nothing to
+    # say, and the line stays empty.
     go_there=""
     [ -z "$demo_cd" ] || go_there="
 The commands below run in $this_dir, the directory this run works in; your shell is still where you started:
