@@ -305,7 +305,14 @@ public final class StorageControlDispatcher {
         if (failure.code() == io.tapstate.spi.store.IoError.CONFIGURATION_IMPORT_LIMIT)
             return new TapstateException(failure.code(), Map.of("limit", "configured-import-budget"), null);
         String code = failure.code().code();
-        if (code.startsWith("io.") || code.startsWith("store.") && !Set.of("store.storage-connection-unsupported", "store.invalid-uri", "store.tls-trust-invalid", "store.initialization-refused").contains(code))
+        boolean store = code.startsWith("store.") || io.tapstate.core.common.StoreErrorDefinitions.registered()
+                .stream().anyMatch(definition -> definition.code().equals(code));
+        var safeStoreCodes = Set.of("store.storage-connection-unsupported", "store.invalid-uri", "store.tls-trust-invalid", "store.initialization-refused",
+                io.tapstate.core.common.StoreErrorDefinitions.STORAGE_CONNECTION_UNSUPPORTED.code(),
+                io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI.code(),
+                io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID.code(),
+                io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED.code());
+        if (code.startsWith("io.") || store && !safeStoreCodes.contains(code))
             return new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         // Do not retain a nested connector or driver cause in any storage-facing diagnostic.
         return new TapstateException(failure.code(), failure.args(), null);

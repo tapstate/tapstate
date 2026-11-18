@@ -68,6 +68,13 @@ still stop the unauthorized run; a new code cannot grant execution or replay a
 write. Runtime exception types, original causes, closing suppression and bare
 programmer-error branches retain their existing contracts.
 
+Storage connection and startup diagnostics use module `047`. Initialization and
+unsupported configuration schema refusals retain HTTP 409; invalid URI, unsupported
+connection settings and invalid TLS trust retain HTTP 400. Keyring repair must keep
+the original encrypted configuration and installation identity. Retention mismatch
+still requires an explicit, coordinated database change; startup never rewrites TTL
+indexes, and diagnostic migration does not authorize destructive recovery.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

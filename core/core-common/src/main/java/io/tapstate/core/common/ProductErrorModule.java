@@ -29,7 +29,8 @@ public enum ProductErrorModule {
     ROW_VALUE("043"),
     ENGINE("044"),
     TRANSFORM("045"),
-    NEST_SIZING("046");
+    NEST_SIZING("046"),
+    STORE("047");
 
     private final String number;
 

@@ -94,7 +94,8 @@ class ErrorCodeGatesTest {
                 io.tapstate.core.common.RowValueErrorDefinitions.registered(),
                 io.tapstate.core.common.EngineErrorDefinitions.registered(),
                 io.tapstate.core.common.TransformErrorDefinitions.registered(),
-                io.tapstate.core.common.NestSizingErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+                io.tapstate.core.common.NestSizingErrorDefinitions.registered(),
+                io.tapstate.core.common.StoreErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
         return registered;
@@ -231,7 +232,8 @@ class ErrorCodeGatesTest {
                                 && io.tapstate.messages.RowValueDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.EngineDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.TransformDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
-                                && io.tapstate.messages.NestSizingDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                                && io.tapstate.messages.NestSizingDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.StoreDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();

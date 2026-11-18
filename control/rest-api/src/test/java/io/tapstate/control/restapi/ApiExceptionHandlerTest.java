@@ -51,6 +51,17 @@ class ApiExceptionHandlerTest {
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
     @Test
+    void migratedStoreRefusalsKeepTheirExplicitStatuses() {
+        for (var definition : List.of(io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED,
+                io.tapstate.core.common.StoreErrorDefinitions.AI_PROVIDER_SCHEMA_UNSUPPORTED))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.CONFLICT);
+        for (var definition : List.of(io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI,
+                io.tapstate.core.common.StoreErrorDefinitions.STORAGE_CONNECTION_UNSUPPORTED,
+                io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
     void publishedHttpStatusesFollowTheirDefinitionsAcrossIdentityChanges() throws Exception {
         Map<String, TapstateErrorCode> definitions = new HashMap<>();
         for (Class<? extends Enum<?>> owner : List.of(AlertError.class, ControlError.class,

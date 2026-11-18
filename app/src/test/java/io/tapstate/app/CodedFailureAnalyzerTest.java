@@ -27,7 +27,7 @@ class CodedFailureAnalyzerTest {
         FailureAnalysis analysis = new CodedFailureAnalyzer().analyze(coded);
 
         assertThat(analysis).as("a coded startup failure produces an analysis").isNotNull();
-        assertThat(analysis.getDescription()).isEqualTo("[store.unreachable] Cannot reach the store at localhost:27017.");
+        assertThat(analysis.getDescription()).isEqualTo("[TS0470001] Cannot reach the store at localhost:27017.");
         assertThat(analysis.getAction())
                 .isEqualTo("Check the store is running and the connection settings are correct, then restart.");
         assertThat(analysis.getCause()).isSameAs(coded);

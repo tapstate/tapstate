@@ -352,7 +352,7 @@ class CloudExternalConfigStartupIT {
                     LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
                 }
                 gate.release();
-                running.awaitUnavailable("store.unreachable", "UNAVAILABLE");
+                running.awaitUnavailable("TS0470001", "UNAVAILABLE");
                 assertThat(running.get("/version").body()).contains("\"dataVersion\":null");
                 assertDatabaseUntouched(database);
                 assertDatabaseUntouched(database + "_operator");
@@ -473,7 +473,7 @@ class CloudExternalConfigStartupIT {
         String uri = "mongodb://unreachable-user:atlas-password-sentinel@127.0.0.1:1/metadata";
         Running running = start(Carrier.ENVIRONMENT, cloudValues(uri), MONGO.getReplicaSetUrl(ignored),
                 "--tapstate.store.mongo.server-selection-timeout=500ms");
-        running.awaitUnavailable("store.unreachable", "UNAVAILABLE");
+        running.awaitUnavailable("TS0470001", "UNAVAILABLE");
         assertDatabaseUntouched(ignored);
         assertOnlyDeniedConfigurationClaim();
         assertSafeOutput(running, uri);
