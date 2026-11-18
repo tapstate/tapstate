@@ -229,8 +229,8 @@ class ApiExceptionHandlerTest {
         // a coded error the surface has no client-attributable mapping for is a server-side failure (500),
         // yet still carries the structured coded body — it is not a bare, uncoded crash
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);
-        assertThat(response.getBody().code()).isEqualTo("control.audit-blocked");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("control.audit-blocked");
+        assertThat(response.getBody().code()).isEqualTo("TS0210015");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0210015");
     }
 
     @Test
@@ -239,7 +239,7 @@ class ApiExceptionHandlerTest {
                 new TapstateException(ControlError.PREVIEW_OVERLOADED, Map.of(), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
-        assertThat(response.getBody().code()).isEqualTo("control.preview-overloaded");
+        assertThat(response.getBody().code()).isEqualTo("TS0210014");
     }
 
     @Test
@@ -279,7 +279,7 @@ class ApiExceptionHandlerTest {
                 handler.handle(new TapstateException(ControlError.BOOTSTRAP_CLOSED, Map.of(), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.CONFLICT);
-        assertThat(response.getBody().code()).isEqualTo("control.bootstrap-closed");
+        assertThat(response.getBody().code()).isEqualTo("TS0210018");
     }
 
     /**

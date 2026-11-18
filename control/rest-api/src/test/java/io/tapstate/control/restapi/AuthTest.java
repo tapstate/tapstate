@@ -889,7 +889,7 @@ class AuthTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("control.bootstrap-closed");
+        assertThat(body.code()).isEqualTo("TS0210018");
     }
 
     @Test

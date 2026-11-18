@@ -1014,7 +1014,7 @@ class ApplyServiceTest {
         assertThat(refreshed).containsExactly("second_pipeline");
         assertThat(first.warnings()).hasSize(2).contains(advisory);
         assertThat(first.warnings().get(1)).satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "ora2my_ods")
                     .containsEntry("causeCode", ArtifactError.NOT_FOUND.code())
                     .containsEntry("causeParams", Map.of("id", "missing_model"));

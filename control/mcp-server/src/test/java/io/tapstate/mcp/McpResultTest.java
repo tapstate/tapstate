@@ -25,10 +25,11 @@ class McpResultTest {
         assertThat(success.body().get("warnings")).isSameAs(warnings);
     }
 
-    @Test
-    void appliedArtifactsWithAnIncompleteModelRefreshRetainTheirNestedCauseParameters() {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0210016", "control.schema-derivation-incomplete"})
+    void appliedArtifactsWithAnIncompleteModelRefreshRetainTheirNestedCauseParameters(String code) {
         var params = Map.of("pipeline", "orders", "causeCode", "runtime.busy", "causeParams", Map.of("state", "RUNNING"));
-        var warning = Map.of("code", "control.schema-derivation-incomplete", "params", params);
+        var warning = Map.of("code", code, "params", params);
         var result = McpResult.success(Map.of("warnings", List.of(warning), "applied", true)).withWarningText();
         assertThat(result.error()).isFalse();
         assertThat(result.body()).containsEntry("applied", true);

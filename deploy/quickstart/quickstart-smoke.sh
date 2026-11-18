@@ -391,7 +391,7 @@ case "$*" in
   *"/installation/first-admin"*)
     cat > .first-admin-request
     if [ "${FAKE_ADMIN_FAILURE:-no}" = yes ]; then
-        printf '%s\n403' '{"code":"control.bootstrap-forbidden"}'
+        printf '%s\n403' '{"code":"TS0210017"}'
     else
         touch .first-admin-created
         printf '%s\n200' '{"phase":"COMPLETE"}'
@@ -660,7 +660,7 @@ fi
 
 FAKE_ADMIN_FAILURE=yes run_phase_fakes
 if [ "$RUN_RC" -ne 0 ] && [ ! -e "$RUN/.cli-stdin" ] \
-   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, control.bootstrap-forbidden'; then
+   && printf '%s' "$RUN_OUT" | grep -q 'HTTP 403, TS0210017'; then
   ok "reports the administrator setup refusal before driving the CLI"
 else
   bad "the administrator setup refusal was lost (rc=$RUN_RC): $RUN_OUT"

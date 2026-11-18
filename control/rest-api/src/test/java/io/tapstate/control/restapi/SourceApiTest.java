@@ -641,7 +641,7 @@ class SourceApiTest {
         context.getBean(RecordingAuditStore.class).fail = true;
         assertError(request("writer").post().uri("/api/sources")
                         .contentType(MediaType.APPLICATION_JSON).body(sourceJson("orders", "before")),
-                HttpStatus.INTERNAL_SERVER_ERROR, "control.audit-blocked");
+                HttpStatus.INTERNAL_SERVER_ERROR, "TS0210015");
         assertThat(context.getBean(InMemoryArtifactStore.class).get("orders")).isEmpty();
     }
 

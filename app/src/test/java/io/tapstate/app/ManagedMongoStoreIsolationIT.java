@@ -508,7 +508,7 @@ class ManagedMongoStoreIsolationIT {
                 var management = process.management(files, issued.token());
                 assertThatThrownBy(() -> management.post().uri("/installation/first-admin").body(Map.of("username", "admin", "password", "original-admin-password"))
                         .retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                failure -> assertThat(failure.getResponseBodyAsString()).contains("control.audit-blocked"));
+                                failure -> assertThat(failure.getResponseBodyAsString()).contains("TS0210015"));
                 assertThat(database.getCollection("users").countDocuments()).isZero();
                 assertThat(database.getCollection("op_bootstrap").find().first().getString("phase")).isEqualTo("PENDING");
                 assertThat(database.getCollection("audit").countDocuments(administratorAudit)).isZero();

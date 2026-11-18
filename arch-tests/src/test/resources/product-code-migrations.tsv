@@ -72,3 +72,13 @@ control.ai-provider-failed	TS0210010
 control.ai-provider-output-limit	TS0210011
 control.ai-invalid-proposal	TS0210012
 control.ai-overloaded	TS0210013
+control.preview-overloaded	TS0210014
+control.audit-blocked	TS0210015
+control.schema-derivation-incomplete	TS0210016
+control.bootstrap-forbidden	TS0210017
+control.bootstrap-closed	TS0210018
+control.auth-mode-unavailable	TS0210019
+control.browser-auth-config-invalid	TS0210020
+control.cloud-auth-unavailable	TS0210021
+control.state-database-unavailable	TS0210022
+control.source-config-reveal-unavailable	TS0210023

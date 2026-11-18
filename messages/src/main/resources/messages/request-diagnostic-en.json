@@ -50,5 +50,45 @@
   "TS0210013": {
     "message": "The AI assistant is busy. Try again shortly.",
     "solution": "Wait briefly, then submit a new request."
+  },
+  "TS0210014": {
+    "message": "Pipeline preview is at capacity.",
+    "solution": "Wait for an active preview to finish, then retry."
+  },
+  "TS0210015": {
+    "message": "Operation '{op}' was refused because its required audit record could not be written.",
+    "solution": "An audited operation must leave an audit record before it runs; check the store is reachable and healthy, then retry."
+  },
+  "TS0210016": {
+    "message": "The artifacts were applied, but the model refresh for pipeline `{pipeline}` did not finish: {causeCode} {causeParams}. Its models may be unchanged or partially refreshed.",
+    "solution": "Resolve the reported cause, then apply again, even if the artifact content is unchanged. Stop the pipeline and wait until it is at rest if a live run blocked the refresh. Inspect `derived-schema {pipeline}` before starting, and use `derived-schema {pipeline} --accept` only after reviewing any remaining drift."
+  },
+  "TS0210017": {
+    "message": "The initial-admin bootstrap channel accepts only local (loopback) connections.",
+    "solution": "Create the first admin from a session on the server host itself, or pre-seed one at deployment."
+  },
+  "TS0210018": {
+    "message": "The initial-admin bootstrap channel is closed because an admin account already exists.",
+    "solution": "Sign in with an existing admin account to create more users."
+  },
+  "TS0210019": {
+    "message": "The `{mode}` deployment does not expose this authentication flow.",
+    "solution": "Use the authentication entry point for the selected deployment mode."
+  },
+  "TS0210020": {
+    "message": "The browser authentication public-origin configuration is invalid.",
+    "solution": "Configure absolute HTTPS origins without paths, queries, fragments, or credentials."
+  },
+  "TS0210021": {
+    "message": "Managed Cloud authentication is not available.",
+    "solution": "Install the SDK exchange/online-validation and trusted deployment bindings, then enter from Cloud again."
+  },
+  "TS0210022": {
+    "message": "Cloud mode does not allow an explicit Nest state.database.",
+    "solution": "Remove state.database to use the deployment-owned operator-state database. On-prem deployments can still select a database."
+  },
+  "TS0210023": {
+    "message": "Stored Source configuration cannot be revealed by this release.",
+    "solution": "Use the normal Source edit flow to replace configuration. A later audited reveal flow requires dedicated permission, recent step-up authentication, and a one-time grant."
   }
 }

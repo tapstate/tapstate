@@ -4139,13 +4139,14 @@ class ReplTest {
                 .isEqualTo(Cli.EXIT_OK);
     }
 
-    @Test
-    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(@TempDir Path base) throws Exception {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"TS0210016", "control.schema-derivation-incomplete"})
+    void applyRefreshWarningExplainsCommittedArtifactsPartialModelsAndRetry(String code, @TempDir Path base) throws Exception {
         copyWorkspace("/ws-valid", base);
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.applyOutcome = new ApplyOutcome.Applied(
                 List.of(new ApplyOutcome.Item("kfk2my", "pipeline", "CREATED")),
-                List.of(new ApplyOutcome.Warning("control.schema-derivation-incomplete", Map.of(
+                List.of(new ApplyOutcome.Warning(code, Map.of(
                         "pipeline", "kfk2my", "causeCode", "io.store-unavailable",
                         "causeParams", Map.of("detail", "test outage")))));
         SplitHarness h = onlineSplitStreamSession(base, client);

@@ -252,7 +252,7 @@ class PipelineLifecycleServiceTest {
         assertThat(thrown).isNotNull();
         assertThat(thrown.code().code())
                 .as("no audit, no execute: a failed audit write refuses the desired-state write")
-                .isEqualTo("control.audit-blocked");
+                .isEqualTo("TS0210015");
         assertThat(desired.read("pl1")).as("the desired state is not written when its audit record could not be").isEmpty();
     }
 

@@ -731,7 +731,7 @@ class ArtifactMutationServiceTest {
         assertThatThrownBy(() -> blocked.delete(PRINCIPAL, "orders", before))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("control.audit-blocked"));
+                        .isEqualTo("TS0210015"));
 
         assertThat(store.get("orders")).isPresent();
         assertThat(hash(store.get("orders").orElseThrow())).isEqualTo(before);

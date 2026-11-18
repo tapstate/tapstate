@@ -80,7 +80,7 @@ class SchemaRefreshAllNodesTest {
         assertThat(partial.outcomes()).hasSize(DRAFTS.size()).allSatisfy(outcome ->
                 assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.UNCHANGED));
         assertThat(partial.warnings()).singleElement().satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
                     .containsEntry("causeCode", "io.store-unavailable");
         });
@@ -128,7 +128,7 @@ class SchemaRefreshAllNodesTest {
         assertThat(((SourceResource) store.artifacts().get("views").orElseThrow()).config())
                 .containsEntry("uri", "updated");
         assertThat(result.warnings()).singleElement().satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
                     .containsEntry("causeCode", "actuation.schema-sync-while-running");
         });

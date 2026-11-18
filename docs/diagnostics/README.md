@@ -10,7 +10,8 @@ This page describes an unshipped migration candidate. The first migrated request
 refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
 through `TS0210005`, respectively. AI assistant and provider refusals use
-`TS0210006` through `TS0210013`. Source mutation errors use `TS0220001`
+`TS0210006` through `TS0210013`. Control capability refusals and the post-apply
+model-refresh warning use `TS0210014` through `TS0210023`. Source mutation errors use `TS0220001`
 through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
 `023`, `024` and `025`. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
@@ -47,6 +48,14 @@ applying partial output, bounded provider behavior and explicit user recovery.
 The numeric identity does not authorize an additional retry. Existing English
 messages and recovery advice remain; entries without advice now supply localized
 recovery guidance through the shared catalog.
+
+Control capability and bootstrap refusals preserve their information boundaries
+and existing statuses. An audit-write refusal means the operation did not run.
+By contrast, `TS0210016` is a warning after artifacts were committed: retain the
+nested cause parameters, partial-refresh explanation, successful CLI exit and
+MCP success result. Never reclassify it as rejection of the committed artifacts.
+Diagnostic-only scripts preserve a bounded canonical code and still omit
+arbitrary server messages, credentials and parameters.
 
 DSL definitions live in `DslErrorDefinitions`, with the existing `DslError` and
 `ExecutionAdvisoryError` enums retaining their typed APIs. Corpus rule symbols

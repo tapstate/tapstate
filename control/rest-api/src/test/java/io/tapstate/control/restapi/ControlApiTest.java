@@ -257,7 +257,7 @@ class ControlApiTest {
                 assertThat(outcome.change()).isEqualTo(ArtifactOutcome.Change.CREATED));
         assertThat(context.getBean(ArtifactStore.class).get("refresh_failed")).isPresent();
         assertThat(applied.warnings()).singleElement().satisfies(warning -> {
-            assertThat(warning.code()).isEqualTo("control.schema-derivation-incomplete");
+            assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "refresh_failed")
                     .containsEntry("causeCode", "io.store-unavailable")
                     .containsEntry("causeParams", Map.of("detail", "test outage"));

@@ -191,7 +191,7 @@ async function jsonRequest(base, path, body, cookie) {
     headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify(body) });
   const value = await response.json();
   if (response.status !== 200) {
-    const code = /^[a-z][a-z0-9.-]{0,100}$/.test(value.code) ? value.code : 'unavailable';
+    const code = typeof value.code === 'string' && /^(?:[a-z][a-z0-9.-]{0,100}|TS(?!000)[0-9]{3}(?!0000)[0-9]{4})$/.test(value.code) ? value.code : 'unavailable';
     stage += ` (HTTP ${response.status}, code ${code})`;
   }
   assert.equal(response.status, 200);

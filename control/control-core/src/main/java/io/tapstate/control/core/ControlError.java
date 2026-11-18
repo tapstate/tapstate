@@ -29,17 +29,16 @@ public enum ControlError implements TapstateErrorCode {
     MALFORMED_REQUEST(RequestErrorDefinitions.MALFORMED_REQUEST),
 
     /** A valid preview request could not enter the bounded candidate-compilation pool. */
-    PREVIEW_OVERLOADED("control.preview-overloaded", Set.of()),
+    PREVIEW_OVERLOADED(RequestErrorDefinitions.PREVIEW_OVERLOADED),
 
     /**
      * An audited operation was refused because its mandatory audit record could not be written first;
      * {@code op} is the operation id. No audit, no execute — the operation never ran.
      */
-    AUDIT_BLOCKED("control.audit-blocked", Set.of("op")),
+    AUDIT_BLOCKED(RequestErrorDefinitions.AUDIT_BLOCKED),
 
     /** Artifacts committed, but one pipeline's model refresh was skipped or only partly completed. */
-    SCHEMA_DERIVATION_INCOMPLETE("control.schema-derivation-incomplete",
-            Set.of("pipeline", "causeCode", "causeParams")),
+    SCHEMA_DERIVATION_INCOMPLETE(RequestErrorDefinitions.SCHEMA_DERIVATION_INCOMPLETE),
 
     /**
      * The zero-user bootstrap channel was reached from a non-loopback caller and refused. It carries no
@@ -48,14 +47,14 @@ public enum ControlError implements TapstateErrorCode {
      * that state. Distinct from {@code bootstrap-closed}, which a trusted loopback caller sees once an
      * admin already exists.
      */
-    BOOTSTRAP_FORBIDDEN("control.bootstrap-forbidden", Set.of()),
+    BOOTSTRAP_FORBIDDEN(RequestErrorDefinitions.BOOTSTRAP_FORBIDDEN),
 
     /**
      * The zero-user bootstrap channel was reached after an admin already exists and refused: the one
      * exception is closed for good the moment the user table stops being empty. Reached only by a
      * loopback caller — a remote one is turned away earlier with {@code bootstrap-forbidden}.
      */
-    BOOTSTRAP_CLOSED("control.bootstrap-closed", Set.of()),
+    BOOTSTRAP_CLOSED(RequestErrorDefinitions.BOOTSTRAP_CLOSED),
 
     /**
      * A login was rejected: the username does not exist, or the password did not match. One code
@@ -65,19 +64,19 @@ public enum ControlError implements TapstateErrorCode {
     AUTH_FAILED(RequestErrorDefinitions.AUTH_FAILED),
 
     /** The caller reached an authentication flow that the selected deployment mode does not expose. */
-    AUTH_MODE_UNAVAILABLE("control.auth-mode-unavailable", Set.of("mode")),
+    AUTH_MODE_UNAVAILABLE(RequestErrorDefinitions.AUTH_MODE_UNAVAILABLE),
 
     /** The configured browser authentication public-origin allow-list is invalid. */
-    BROWSER_AUTH_CONFIG_INVALID("control.browser-auth-config-invalid", Set.of()),
+    BROWSER_AUTH_CONFIG_INVALID(RequestErrorDefinitions.BROWSER_AUTH_CONFIG_INVALID),
 
     /** Managed authentication was reached before its real SDK/validated deployment binding was installed. */
-    CLOUD_AUTH_UNAVAILABLE("control.cloud-auth-unavailable", Set.of()),
+    CLOUD_AUTH_UNAVAILABLE(RequestErrorDefinitions.CLOUD_AUTH_UNAVAILABLE),
 
     /** A Cloud author attempted to select the deployment-owned Nest state database. */
-    STATE_DATABASE_UNAVAILABLE("control.state-database-unavailable", Set.of()),
+    STATE_DATABASE_UNAVAILABLE(RequestErrorDefinitions.STATE_DATABASE_UNAVAILABLE),
 
     /** The reserved Source plaintext flow has no production authorizer in this release. */
-    SOURCE_CONFIG_REVEAL_UNAVAILABLE("control.source-config-reveal-unavailable", Set.of()),
+    SOURCE_CONFIG_REVEAL_UNAVAILABLE(RequestErrorDefinitions.SOURCE_CONFIG_REVEAL_UNAVAILABLE),
 
     /**
      * A protected operation was reached with no valid credential — none was presented, or the one
@@ -114,16 +113,18 @@ public enum ControlError implements TapstateErrorCode {
 
     private final String code;
     private final Set<String> placeholders;
+    private final Severity severity;
 
     ControlError(ProductErrorDefinition definition) {
-        this(definition.code(), definition.parameters());
-        if (definition.severity() != Severity.ERROR)
-            throw new IllegalArgumentException("request refusal must have error severity");
+        this.code = definition.code();
+        this.placeholders = definition.parameters();
+        this.severity = definition.severity();
     }
 
     ControlError(String code, Set<String> placeholders) {
         this.code = code;
         this.placeholders = placeholders;
+        this.severity = Severity.ERROR;
     }
 
     @Override
@@ -133,7 +134,7 @@ public enum ControlError implements TapstateErrorCode {
 
     @Override
     public Severity severity() {
-        return this == SCHEMA_DERIVATION_INCOMPLETE ? Severity.WARNING : Severity.ERROR;
+        return severity;
     }
 
     @Override

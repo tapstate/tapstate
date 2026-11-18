@@ -25,7 +25,7 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(java.util.Arrays.stream(ProductErrorModule.values()).map(ProductErrorModule::number).toList())
                 .doesNotHaveDuplicates().allMatch(number -> number.matches("(?!000)[0-9]{3}"));
         var request = RequestErrorDefinitions.MALFORMED_REQUEST;
-        assertThat(RequestErrorDefinitions.registered()).hasSize(13).contains(request);
+        assertThat(RequestErrorDefinitions.registered()).hasSize(23).contains(request);
         assertThat(request.code()).isEqualTo("TS0210001");
         assertThat(request.parameters()).isEqualTo(Set.of("reason"));
         assertThat(request.severity()).isEqualTo(Severity.ERROR);
@@ -61,7 +61,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(73);
+        assertThat(replacements).hasSize(83);
         baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
     }
@@ -124,6 +124,34 @@ class RequestDiagnosticDefinitionGatesTest {
             }
             assertThat(messages).hasSize(3);
             assertThat(RequestDiagnosticCatalog.bundled().resolve(historical.get(i), Map.of(), List.of(), Locale.ENGLISH)).isEmpty();
+        }
+    }
+
+    @Test
+    void controlCapabilityAndWarningDefinitionsPreserveSeverityParametersAndHistoricalText() {
+        var owners = List.of(ControlError.PREVIEW_OVERLOADED, ControlError.AUDIT_BLOCKED,
+                ControlError.SCHEMA_DERIVATION_INCOMPLETE, ControlError.BOOTSTRAP_FORBIDDEN,
+                ControlError.BOOTSTRAP_CLOSED, ControlError.AUTH_MODE_UNAVAILABLE,
+                ControlError.BROWSER_AUTH_CONFIG_INVALID, ControlError.CLOUD_AUTH_UNAVAILABLE,
+                ControlError.STATE_DATABASE_UNAVAILABLE, ControlError.SOURCE_CONFIG_REVEAL_UNAVAILABLE);
+        var catalog = io.tapstate.messages.MessageCatalog.bundled();
+        for (int i = 0; i < owners.size(); i++) {
+            var owner = owners.get(i);
+            String historical = "control." + owner.name().toLowerCase(Locale.ROOT).replace('_', '-');
+            assertThat(owner.code()).isEqualTo("TS021" + String.format("%04d", i + 14));
+            assertThat(owner.severity()).isEqualTo(owner == ControlError.SCHEMA_DERIVATION_INCOMPLETE
+                    ? Severity.WARNING : Severity.ERROR);
+            Map<String, Object> args = new java.util.HashMap<>();
+            owner.placeholders().forEach(name -> args.put(name, "value-" + name));
+            assertThat(catalog.render(owner.code(), args)).isEqualTo(catalog.render(historical, args));
+            var messages = new java.util.HashSet<String>();
+            for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+                var resolved = RequestDiagnosticCatalog.bundled().resolve(owner.code(), args, List.of(), locale).orElseThrow();
+                messages.add(resolved.message());
+                assertThat(resolved.solution()).isNotBlank();
+            }
+            assertThat(messages).hasSize(3);
+            assertThat(RequestDiagnosticCatalog.bundled().resolve(historical, args, List.of(), Locale.ENGLISH)).isEmpty();
         }
     }
 
