@@ -139,6 +139,40 @@ class AlertNotificationPlannerIT {
             assertThat(f.store().state(binding.key(),f.reads()).orElseThrow()).isEqualTo(before);
         });
     }
+    @Test void rootWritesAndConflictsRefreshTheSnapshotButStableRootsDoNot() {
+        AlertEvaluationHostIT.withFixture(f -> {
+            route(f, Duration.ofSeconds(10));
+            var initial = planner(f, "planner-a");
+            f.evaluator().withPlanner(initial);
+            bad(f);
+            var reads = new java.util.concurrent.atomic.AtomicInteger();
+            var writes = new java.util.concurrent.atomic.AtomicInteger();
+            var lastProposalRead = new java.util.concurrent.atomic.AtomicInteger();
+            var observed = org.mockito.Mockito.mock(AlertStore.class, org.mockito.AdditionalAnswers.delegatesTo(f.store()));
+            org.mockito.Mockito.doAnswer(call -> {
+                reads.incrementAndGet();
+                return f.store().planning();
+            }).when(observed).planning();
+            org.mockito.Mockito.doAnswer(call -> {
+                int currentRead = reads.get();
+                assertThat(currentRead).isGreaterThan(lastProposalRead.getAndSet(currentRead));
+                if (writes.incrementAndGet() == 1) return AlertStore.Outcome.CONFLICT;
+                return f.store().commit(call.getArgument(0));
+            }).when(observed).commit(org.mockito.ArgumentMatchers.any());
+            var candidate = new AlertNotificationPlanner(observed, f.clock(), "planner-a", null, ACTIVE);
+            candidate.tick();
+            assertThat(writes.get()).isEqualTo(3);
+            assertThat(reads.get()).isEqualTo(3);
+            assertThat(intents(f)).isEmpty();
+            candidate.tick();
+            assertThat(reads.get()).isEqualTo(4);
+            assertThat(writes.get()).isEqualTo(3);
+            f.now().set(T.plusSeconds(10));
+            candidate.tick();
+            assertThat(intents(f)).hasSize(2);
+        });
+    }
+
     @Test void stateAndPendingMembershipCommitTogetherAndRestartCreatesOneIntentPerTarget(){
         AlertEvaluationHostIT.withFixture(f->{route(f,Duration.ZERO);var p=planner(f,"planner-a");f.evaluator().withPlanner(p);bad(f);
             assertThat(f.store().planning().schedules()).hasSize(2);assertThat(intents(f)).isEmpty();

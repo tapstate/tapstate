@@ -30,6 +30,312 @@ class MongoCacheSrsStoresIT {
             SystemCollections.SRS_MODEL_CONTEXTS,SystemCollections.SRS_EVENTS,SystemCollections.SRS_LOG_BOUNDS,
             SystemCollections.SRS_CONSUMERS,SystemCollections.CACHE_SRS_CONSUMER_OFFSETS,SystemCollections.CACHE_WORKLOAD_CLAIMS);
 
+    @Test void admittedReadersDoNotRepeatTheBusinessIndexAudit() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            f.domain.verifyBusinessReady(f.scope);
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), ACTIVE);
+            var observations = f.domain.pipelineObservations(prepared.scope(), prepared.fence(), ACTIVE);
+            var at = java.time.Instant.parse("2026-11-16T00:00:00Z");
+            var checkpoint = states.read("pipeline").orElseThrow();
+            assertThat(states.compareAndSwap("pipeline", checkpoint.epoch(), "STOPPED", at))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            var stopped = new io.tapstate.core.lifecycle.Observation("pipeline", io.tapstate.core.lifecycle.PipelineState.STOPPED,
+                    Map.of(), Map.of(), Map.of(), null, at, List.of());
+            observations.save(stopped, checkpoint.epoch() + 1);
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(states.read("pipeline")).isPresent();
+                assertReadBudget(commands, 4);
+                commands.clear();
+                assertThat(observations.read("pipeline")).contains(stopped);
+                assertReadBudget(commands, 5);
+                commands.clear();
+                assertThat(observations.refreshTerminal(stopped, checkpoint.epoch() + 1, at.plusSeconds(1))).isPresent();
+                assertReadBudget(commands, 6);
+                commands.clear();
+                assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+                assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
+                assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).hasSize(1);
+                assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    private static void assertReadBudget(List<String> commands, int count) {
+        assertThat(commands).hasSize(count);
+        assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
+        assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).isEmpty();
+        assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"observation-drop", "state-view", "cursor-drop", "retired", "generation", "claim", "guard"})
+    void admittedReadersKeepNamespaceAndAuthorityChecks(String damage) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var active = new AtomicBoolean(true);
+            Runnable guard = () -> { if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); };
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), guard);
+            var observations = f.domain.pipelineObservations(prepared.scope(), prepared.fence(), guard);
+            f.domain.verifyBusinessReady(f.scope);
+            assertThat(states.read("pipeline")).isPresent();
+            assertThat(f.domain.observationCursor(f.scope, context, guard)).isPresent();
+            Runnable read = () -> states.read("pipeline");
+            IoError expected = IoError.DOCUMENT_UNREADABLE;
+            switch (damage) {
+                case "observation-drop" -> {
+                    SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database).drop();
+                    assertThat(observations.read("pipeline")).isEmpty();
+                    return;
+                }
+                case "state-view" -> {
+                    var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database);
+                    f.database.getCollection("state_copy").insertOne(state.find().first());
+                    state.drop();
+                    f.database.createView(SystemCollections.CACHE_PIPELINE_STATE.collectionName(), "state_copy", List.of());
+                    var checkpoint = states.read("pipeline").orElseThrow();
+                    assertThatThrownBy(() -> states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                                assertThat(error.args().get("detail").toString()).contains("pipeline_state", "COLLECTION_TYPE");
+                            });
+                    assertThat(states.read("pipeline")).contains(checkpoint);
+                    return;
+                }
+                case "cursor-drop" -> {
+                    SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database).drop();
+                    read = () -> f.domain.observationCursor(f.scope, context, guard);
+                }
+                case "retired" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("businessPhase", "RETIRED")));
+                    expected = IoError.CACHE_BUSINESS_FENCED;
+                    code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+                }
+                case "generation" -> {
+                    SystemCollections.CACHE_PIPELINE_STATE.on(f.database).updateOne(new Document("_id", "pipeline"),
+                            new Document("$set", new Document("scope.stateGeneration", 2L)));
+                    expected = IoError.CACHE_BUSINESS_FENCED;
+                }
+                case "claim" -> {
+                    SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database).updateOne(
+                            new Document("_id", MongoWorkloadClaimStore.id(prepared.fence().key())),
+                            new Document("$set", new Document("pipelineScope.stateGeneration", 2L)));
+                    expected = IoError.WORKLOAD_CLAIM_FENCED;
+                }
+                default -> {
+                    active.set(false);
+                    expected = IoError.WORKLOAD_CLAIM_FENCED;
+                    code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+                }
+            }
+            code(read::run, expected);
+        });
+    }
+
+    @Test void checkpointWritesLeaveIndexDriftToInspection() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            f.domain.verifyBusinessReady(f.scope);
+            var states = f.domain.pipelineStates(prepared.scope(), prepared.fence(), ACTIVE);
+            var checkpoint = states.read("pipeline").orElseThrow();
+            SystemCollections.CACHE_PIPELINE_STATE.on(f.database).createIndex(new Document("touchMillis", 1),
+                    new IndexOptions().name("unexpected_ttl").expireAfter(10L, java.util.concurrent.TimeUnit.SECONDS));
+            SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+            assertThat(states.read("pipeline")).contains(checkpoint);
+            assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+            assertThat(states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
+            code(() -> f.domain.verifyBusinessReady(f.scope), IoError.DOCUMENT_UNREADABLE);
+            assertThat(states.read("pipeline").orElseThrow().epoch()).isEqualTo(checkpoint.epoch() + 1);
+            code(() -> f.domain.observationCursor(f.scope, context, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+        });
+    }
+
+    @Test void coherentRetentionUsesOneNativeTransactionAndKeepsItsCallerGuard() {
+        withFixture(f -> {
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var active = new AtomicBoolean(true);
+            var consumers = stores.consumers().guardedBy(() -> {
+                if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+            });
+            var fallback = (SrsChainStore) java.lang.reflect.Proxy.newProxyInstance(SrsChainStore.class.getClassLoader(),
+                    new Class<?>[]{SrsChainStore.class}, (proxy, method, arguments) -> { throw new AssertionError("native retention must not reopen its chain"); });
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                var read = consumers.retentionSnapshot(CHAIN, fallback);
+                assertThat(read.chain().miningChainId()).isEqualTo(CHAIN);
+                assertThat(read.topology().scope()).isEqualTo(f.scope);
+                assertThat(commands.stream().filter(("find:" + SystemCollections.SRS_CHAINS.collectionName())::equals)).hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:"))).hasSize(1);
+                int before = commands.size();
+                active.set(false);
+                code(() -> consumers.retentionSnapshot(CHAIN, fallback), IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(commands).hasSize(before);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @Test void retentionFloorsDoNotReopenAnAuditedTransactionForEachSubscriber() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+            assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+            assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+            var first = new SrsConsumerContext(f.consumer(), 1);
+            var second = new SrsConsumerContext(new SrsConsumerKey(CHAIN, "pipeline", "second"), 1);
+            stores.consumers().attach(first, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            stores.consumers().attach(second, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            assertThat(stores.consumers().startReadingAfter(first, 1, 0, "orders", 12, prepared.fence())).isTrue();
+            assertThat(stores.consumers().startReadingAfter(second, 1, 0, "orders", 4, prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceReadSequence(first, 1, "orders", 99, prepared.fence())).isTrue();
+            assertThat(stores.consumers().advanceReadSequence(second, 1, "orders", 100, prepared.fence())).isTrue();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(stores.consumers().retentionFloors(CHAIN, stores.chains())).hasValue(Map.of("orders", 4L));
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
+                        .as("topology and every confirmed floor share the original native snapshot").hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
+                        .as("all eight physical facets are audited once, not once per subscriber").hasSize(8);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @Test void coherentRetentionKeepsItsMissingRootDiagnosis() {
+        withFixture(f -> {
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var root = SystemCollections.SRS_CHAINS.on(f.database).find(new Document("_id", CHAIN)).first();
+            assertThat(root).isNotNull();
+            SystemCollections.SRS_CHAINS.on(f.database).deleteOne(new Document("_id", CHAIN));
+            code(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()), IoError.SRS_CHECKPOINT_UNPROVEN);
+            SystemCollections.SRS_CHAINS.on(f.database).insertOne(root);
+            SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+            var original = catchThrowable(() -> stores.consumers().attached(CHAIN));
+            assertThat(original).isInstanceOf(TapstateException.class);
+            assertThat(((TapstateException) original).code()).isNotEqualTo(IoError.SRS_CHECKPOINT_UNPROVEN);
+            assertThatThrownBy(() -> stores.consumers().retentionSnapshot(CHAIN, stores.chains()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(((TapstateException) original).code()));
+        });
+    }
+
+    @Test void admittedObservationChecksOneStructureAndOneTransaction() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try {
+                assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:")))
+                        .as("admission and cursor proof belong to one snapshot").hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("listIndexes:")))
+                        .as("the cursor does not reopen the same eight physical facets").hasSize(8);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings = {"admission", "retired", "index", "guard"})
+    void combinedObservationKeepsFreshAdmissionStructureAndCallerChecks(String damage) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            var active = new AtomicBoolean(true);
+            Runnable guard = () -> { if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null); };
+            assertThat(f.domain.observationCursor(f.scope, context, guard)).isPresent();
+            IoError expected = switch (damage) {
+                case "admission" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$unset", new Document("claimAdmissionFence", "")));
+                    yield IoError.DOCUMENT_UNREADABLE;
+                }
+                case "retired" -> {
+                    SystemCollections.CACHE_IDENTITY.on(f.database).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("businessPhase", "RETIRED")));
+                    yield IoError.CACHE_BUSINESS_FENCED;
+                }
+                case "index" -> {
+                    SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+                    yield IoError.DOCUMENT_UNREADABLE;
+                }
+                default -> { active.set(false); yield IoError.WORKLOAD_CLAIM_FENCED; }
+            };
+            code(() -> f.domain.observationCursor(f.scope, context, guard), expected);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void combinedRetentionRefusesMissingCursorOrPinnedModel(boolean missingModel) {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            var stores = f.domain.srs(f.scope, ACTIVE);
+            stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+            assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+            assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+            stores.models().publish(f.model(), f.capture);
+            var context = new SrsConsumerContext(f.consumer(), 1);
+            var member = stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+            assertThat(stores.consumers().pinSnapshot(context, member.revision(), 0,
+                    new SrsSnapshotPin(1, "seam", Map.of("orders", f.model().key())), prepared.fence())).isTrue();
+            assertThat(stores.consumers().retentionFloors(CHAIN, stores.chains())).hasValue(Map.of("orders", -1L));
+            if (missingModel) SystemCollections.SRS_MODELS.on(f.database).deleteMany(new Document());
+            else SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database).deleteMany(new Document());
+            var before = f.snapshot();
+            assertThatThrownBy(() -> stores.consumers().retentionFloors(CHAIN, stores.chains()))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(f.snapshot()).isEqualTo(before);
+        });
+    }
+
+    @Test void nativeRuntimeKeepsModelAndLogWritesWithoutCatalogQueries() {
+        withFixture(f -> {
+            var prepared = f.pipeline();
+            f.domain.verifyBusinessReady(f.scope);
+            var index = SystemCollections.SRS_MODELS.indexes().getFirst();
+            SystemCollections.SRS_MODELS.on(f.database).dropIndex(index.indexName());
+            try (var diagnostics = MongoHttpDiagnosticsScope.open()) {
+                var stores = f.domain.runtimeSrs(f.scope, ACTIVE);
+                var model = f.model();
+                stores.chains().requestTables(CHAIN, Set.of("orders"), f.capture);
+                assertThat(stores.chains().openEpoch(CHAIN, 0, f.capture)).hasValue(1);
+                assertThat(stores.models().publish(model, f.capture)).isEqualTo(model);
+                assertThat(stores.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.capture)).isTrue();
+                var event = new SrsLogRecord("token", Op.INSERT, 1, null, Map.of("id", 1), 0, f.capture, 1);
+                stores.log().store(RING, 0, event);
+                assertThat(stores.log().load(RING, 0)).contains(event);
+                var context = new SrsConsumerContext(f.consumer(), 1);
+                var member = stores.consumers().attach(context, 0, Set.of("orders"), prepared.fence()).orElseThrow();
+                assertThat(stores.consumers().pinSnapshot(context, member.revision(), 0,
+                        new SrsSnapshotPin(1, "seam", Map.of("orders", model.key())), prepared.fence())).isTrue();
+                var snapshot = diagnostics.snapshot();
+                assertThat(snapshot).containsEntry("complete", true);
+                assertThat((List<?>) snapshot.get("mongo_groups")).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+            assertThat(f.domain.inspectStructure(f.auth, new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(difference -> {
+                        assertThat(difference.index()).isEqualTo(index.indexName());
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                    });
+        });
+    }
+
     @Test void actualModelPublicationAndLogReadsSurviveReopeningOnlyTheCacheOwner() {
         withFixture(f -> {
             var stores = f.domain.srs(f.scope,ACTIVE); var model = f.model();

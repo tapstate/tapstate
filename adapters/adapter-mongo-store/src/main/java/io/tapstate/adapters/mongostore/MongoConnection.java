@@ -422,6 +422,9 @@ public final class MongoConnection implements AutoCloseable {
     MongoClientSettings buildClientSettings(ConnectionString connectionString) {
         MongoClientSettings.Builder builder = MongoClientSettings.builder()
                 .addCommandListener(MongoCommandObservation.LISTENER)
+                .addCommandListener(MongoStructureFailureScope.listener(() -> client, () -> database,
+                        explicitDatabase != null ? SystemCollections.Database.CACHE
+                                : strictStorage ? SystemCollections.Database.CONFIG : SystemCollections.Database.STORE))
                 .applyToConnectionPoolSettings(pool -> pool.addConnectionPoolListener(MongoHttpDiagnosticsScope.POOL_LISTENER))
                 .applyConnectionString(connectionString)
                 .addCommandListener(new com.mongodb.event.CommandListener() {

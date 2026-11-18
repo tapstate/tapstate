@@ -113,19 +113,17 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     @Override public Optional<StorageBinding> load() {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> {
             requireActive.run();
-            verifyIndex();
             return transaction(session -> load(session).map(Loaded::binding));
-        });
+        }));
     }
 
     @Override public Optional<CachePreparation> cachePreparation() {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> {
             requireActive.run();
-            verifyIndex();
             return transaction(session -> load(session).map(Loaded::cachePreparation));
-        });
+        }));
     }
     MongoStorageRecoveryStore.Authentication authenticationRecovery() {
         return StoreIo.call(() -> transaction(session -> {
@@ -385,7 +383,6 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
 
     /** Same-client configuration consumers reuse the original transaction's authoritative scope. */
     Optional<CachePreparation> cachePreparationForTransaction(ClientSession session) {
-        verifyIndex();
         return load(session).map(Loaded::cachePreparation);
     }
 
@@ -425,7 +422,6 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     Optional<StorageBinding> loadForTransaction(ClientSession session) {
-        verifyIndex();
         return load(session).map(Loaded::binding);
     }
 
@@ -434,6 +430,10 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     TransactionFacts readForTransaction(ClientSession session) {
+        return read(session);
+    }
+
+    TransactionFacts readForStorageLifecycle(ClientSession session) {
         verifyIndex();
         return read(session);
     }
@@ -544,6 +544,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     private <T> T transaction(Function<ClientSession, T> body, Runnable requireCommit) {
         try (ClientSession session = client.startSession()) {
             return session.withTransaction(() -> {
+                MongoStructureFailureScope.beginCallback();
                 requireActive.run();
                 requireCommit.run();
                 T result = body.apply(session);

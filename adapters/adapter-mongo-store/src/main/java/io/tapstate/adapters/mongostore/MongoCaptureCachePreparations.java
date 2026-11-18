@@ -16,7 +16,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     @Override public SharedSrsRecoveryReceipt replace(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {
         var admitted=MongoStorageRecoveryCommands.requireSharedOriginal(original,targetFingerprint);requireScope(admitted.replacement());
         requireSharedNode(currentNode);
-        var result=transaction(() -> {},session -> {
+        var result=recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
@@ -60,7 +60,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     }
     @Override public Optional<SharedSrsRecoveryReceipt> applied(SharedSrsRecoveryPreparation original) {
         var admitted=MongoStorageRecoveryCommands.requireSharedOriginal(original,targetFingerprint);requireScope(admitted.replacement());
-        var result=transaction(() -> {},session -> {
+        var result=recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
@@ -81,7 +81,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     @Override public SharedSrsRecoveryReceipt cancel(SharedSrsRecoveryPreparation original,WorkloadClaimFence currentNode) {
         var admitted=MongoStorageRecoveryCommands.requireSharedCancellationAuthority(original,targetFingerprint);requireScope(admitted.replacement());requireSharedNode(currentNode);
         // Fix the CACHE attempt before CONFIG admission; a delayed old admission cannot undo a later cancellation.
-        var boundary=transaction(() -> {},session -> {
+        var boundary=recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var previous=admitted.plan().manifest().sharedSrs().previous();
@@ -91,7 +91,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             return new Document(root);
         });
         admitted.requireCurrent().run();
-        var result=transaction(() -> {},session -> {
+        var result=recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
@@ -173,7 +173,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     }
     private void requireSharedReceipt(SharedReceipt receipt) {
         receipt.original.requireCurrent().run();
-        transaction(() -> {},session -> {
+        recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             var consumers=new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs);
@@ -194,7 +194,7 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     private SharedSrsRecoverySnapshot cancelledSnapshot(SharedReceipt receipt) {
         if(receipt.outcome!=SharedSrsRecoveryReceipt.Outcome.CANCELLED)throw MongoCapturePreparationFacts.fenced();
         receipt.original.requireCurrent().run();
-        var result=transaction(() -> {},session -> {
+        var result=recoveryTransaction(session -> {
             var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
             new MongoCacheBusinessIdentity(database,scope).requireReady(session);
             return verifyCancelled(session,receipt.original,new MongoSrsConsumerStore(client,database,scope,active,structure::verifySrs)).snapshot();
@@ -230,11 +230,8 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         var preparation=original.preparation();var request=original.request();String ringRetention=original.retention();requireScope(preparation);
         if(preparation.replacement())throw history(preparation);
         return transaction(original::requireActive,session -> {
-            var structure=new MongoCacheMetadataStructure(database,retention);
-            if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)structure.verifySrs();
-            if(preparation.mode()==CapturePreparation.Mode.DIRECT)structure.verifyDirect();
             var pipeline=new MongoCachePipelineAccess(client,database,request.pipeline(),request.originalPipeline(),() -> {active.run();original.requireActive();});
-            pipeline.verifyStateStructure();var state=pipeline.state(session);pipeline.proveClaim(session);pipeline.updateState(session,state,new Document(),false);
+            var state=pipeline.state(session,true);pipeline.proveClaim(session,true);pipeline.updateState(session,state,new Document(),false);
             var retained=MongoPipelineSourcePreparations.retained(session,database,request.pipeline());
             if(!retained.equals(request.inputs()))throw MongoPipelineSourcePreparations.identityUnproven(request.pipeline());
             var identity=new MongoCacheBusinessIdentity(database,scope);identity.admitClaim(session);
@@ -248,8 +245,12 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
                     .append("topologyRevision",initial.topologyRevision()).append("leaseUntil",now).append("capturePreparation",MongoCapturePreparationFacts.row(preparation));
             if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)row.append("fencedChainWrites",1L);
             SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).insertOne(session,row);
-            if(preparation.mode()==CapturePreparation.Mode.SHARED_SRS)SystemCollections.SRS_CHAINS.on(database).insertOne(session,MongoSrsChainStore.initialRow(scope,preparation.chainId(),ringRetention,initial));
-            return loadInSession(session,preparation);
+            var claim = captureFence(session, preparation, row);
+            if (preparation.mode() != CapturePreparation.Mode.SHARED_SRS)
+                return new CaptureCacheState(preparation, claim, Optional.empty());
+            var root = MongoSrsChainStore.initialRow(scope, preparation.chainId(), ringRetention, initial);
+            SystemCollections.SRS_CHAINS.on(database).insertOne(session, root);
+            return new CaptureCacheState(preparation, claim, Optional.of(chainState(session, preparation, root)));
         });
     }
     @Override public Control control(CapturePreparation original,String table){
@@ -261,7 +262,6 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             if(row==null||!original.equals(requirePreparation(row,key,scope)))throw history(original);
             var claim=WorkloadClaimFence.from(new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row));
             if(original.mode()!=CapturePreparation.Mode.SHARED_SRS)return new Control(original,claim,0,false);
-            new MongoCacheMetadataStructure(database,retention).verifySrs();
             var header=new Document("formatVersion",1).append("cacheIncarnation",1).append("captureId",1).append("captureFence",1).append("epoch",1).append("recoveryControl",1)
                     .append("tablesType",new Document("$type","$servingTables"))
                     .append("serves",new Document("$in",List.of(new Document("$literal",table),new Document("$ifNull",List.of("$servingTables",List.of())))));
@@ -277,16 +277,26 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
     private CaptureCacheState loadInSession(ClientSession session,CapturePreparation original) {
         var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,original.captureId());
         var row=SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first();
-        if(row==null)throw history(original);
-        if(!original.equals(requirePreparation(row,key,scope)))throw history(original);
-        var claim=new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database)).inStrictSession(session).decodeStored(row);
+        var claim = captureFence(session, original, row);
         Optional<SrsChainState> chain=Optional.empty();
         if(original.mode()==CapturePreparation.Mode.SHARED_SRS) {
-            var structure=new MongoCacheMetadataStructure(database,retention);structure.verifySrs();
-            var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",original.chainId())).first();if(root==null || !original.captureId().equals(root.get("captureId")))throw history(original);
-            chain=Optional.of(new MongoSrsChainStore(client,database,scope).state(session,root));
+            var root=SystemCollections.SRS_CHAINS.on(database).find(session,new Document("_id",original.chainId())).first();
+            chain=Optional.of(chainState(session, original, root));
         }
-        return new CaptureCacheState(original,WorkloadClaimFence.from(claim),chain);
+        return new CaptureCacheState(original, claim, chain);
+    }
+
+    private WorkloadClaimFence captureFence(ClientSession session, CapturePreparation original, Document row) {
+        var key = new WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.CAPTURE, original.captureId());
+        if (row == null || !original.equals(requirePreparation(row, key, scope))) throw history(original);
+        var claim = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database))
+                .inStrictSession(session).decodeStored(row);
+        return WorkloadClaimFence.from(claim);
+    }
+
+    private SrsChainState chainState(ClientSession session, CapturePreparation original, Document root) {
+        if (root == null || !original.captureId().equals(root.get("captureId"))) throw history(original);
+        return new MongoSrsChainStore(client, database, scope).state(session, root);
     }
     static CapturePreparation requirePreparation(Document row,WorkloadClaimKey key,CacheBusinessScope scope) {
         if(!(row.get("capturePreparation")instanceof Document marker))throw MongoCapturePreparationFacts.unreadable();
@@ -309,16 +319,22 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
         }
     }
     private void requireScope(CapturePreparation original){if(!scope.equals(original.scope()))throw MongoCapturePreparationFacts.fenced();}
+    private <T>T recoveryTransaction(Function<ClientSession,T> body) {
+        return transaction(() -> {}, session -> {
+            MongoCacheWorkloadClaimStore.requireCollection(database);
+            return body.apply(session);
+        });
+    }
     private <T>T transaction(Runnable originalActive,Function<ClientSession,T> body) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
-                active.run();originalActive.run();MongoCacheWorkloadClaimStore.requireCollection(database);
+                active.run();originalActive.run();
                 try(var session=client.startSession()) {
-                    var result=session.withTransaction(() -> {active.run();originalActive.run();new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);var value=body.apply(session);active.run();originalActive.run();return value;},TRANSACTION);
+                    var result=session.withTransaction(() -> {MongoStructureFailureScope.beginCallback();active.run();originalActive.run();new MongoCacheBusinessIdentity(database,scope).requireAdmissionState(session);var value=body.apply(session);active.run();originalActive.run();return value;},TRANSACTION);
                     active.run();originalActive.run();return result;
                 }
             }catch(RuntimeException failure){active.run();originalActive.run();throw failure;}
-        });
+        }));
     }
     private static io.tapstate.core.common.TapstateException history(CapturePreparation preparation){return MongoCapturePreparationFacts.history(preparation.captureId());}
 }

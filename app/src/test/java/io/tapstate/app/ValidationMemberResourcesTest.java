@@ -11,6 +11,51 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.*;
 
 class ValidationMemberResourcesTest {
+    @Test void aFencedQueuedControlReportsItsFailureWithoutEscapingTheWorker() throws Exception {
+        var entered = new CountDownLatch(4);
+        var release = new CountDownLatch(1);
+        var live = new AtomicBoolean(true);
+        var called = new AtomicBoolean();
+        var refused = new TapstateException(io.tapstate.spi.store.IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+        var uncaught = new ConcurrentLinkedQueue<Throwable>();
+        var threads = new ConcurrentLinkedQueue<Thread>();
+        try (var process = new ValidationMemberResources()) {
+            var io = (ThreadPoolExecutor) org.springframework.test.util.ReflectionTestUtils.getField(process, "controls");
+            var original = io.getThreadFactory();
+            io.setThreadFactory(task -> {
+                var thread = original.newThread(task);
+                thread.setUncaughtExceptionHandler((worker, failure) -> uncaught.add(failure));
+                threads.add(thread);
+                return thread;
+            });
+            var member = process.bind("cluster", "node", "boot", 4, () -> { if (!live.get()) throw refused; });
+            for (int index = 0; index < 4; index++) io.execute(() -> {
+                entered.countDown();
+                try { release.await(); }
+                catch (InterruptedException interrupted) { throw new AssertionError(interrupted); }
+            });
+            try {
+                assertThat(entered.await(2, TimeUnit.SECONDS)).isTrue();
+                var control = member.admitControl();
+                control.execute(() -> called.set(true));
+                live.set(false);
+                release.countDown();
+                assertThatThrownBy(() -> control.released().toCompletableFuture().get(2, TimeUnit.SECONDS))
+                        .isInstanceOf(ExecutionException.class).hasCause(refused);
+                io.shutdown();
+                assertThat(io.awaitTermination(2, TimeUnit.SECONDS)).isTrue();
+                // Release completes before an uncaught handler; join every worker before inspecting it.
+                for (var thread : threads) {
+                    thread.join(2000);
+                    assertThat(thread.isAlive()).isFalse();
+                }
+                assertThat(uncaught).isEmpty();
+                assertThat(called).isFalse();
+                assertThat(member.snapshot().processReserved().isEmpty()).isTrue();
+                assertThat(member.snapshot().metadataFrames()).isZero();
+            } finally { release.countDown(); }
+        } finally { release.countDown(); }
+    }
     @Test void deferredMetadataRetirementAndCancellationReturnTheWaitingWorkerWithoutReturningOtherFrames()throws Exception{
         for(String ending:List.of("member","process","cancel")){
             var budget=new ValidationMetadataBudget();var cancelled=new AtomicBoolean();

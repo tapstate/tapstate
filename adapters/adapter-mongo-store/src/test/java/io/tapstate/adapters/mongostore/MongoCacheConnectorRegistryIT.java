@@ -486,7 +486,7 @@ class MongoCacheConnectorRegistryIT {
             var registry = f.registry(); registry.register("example", "1", RegistrationSource.SEED, JAR);
             f.domain.advanceAuthGeneration(AUTH, 2, "auth-reset", ACTIVE); assertThat(registry.artifact(HASH)).contains(JAR);
             SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(f.database).drop();
-            assertCode(() -> f.domain.connectors(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            assertCode(() -> f.domain.connectors(SCOPE, ACTIVE).artifact(HASH), IoError.DOCUMENT_UNREADABLE);
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("connector_artifacts.chunks");
             f.domain.retireBusiness(SCOPE, "retired", ACTIVE); assertCode(registry::list, IoError.CACHE_BUSINESS_FENCED);
             assertCode(() -> registry.register("example", "1", RegistrationSource.SEED, JAR), IoError.CACHE_BUSINESS_FENCED);

@@ -64,7 +64,9 @@ final class MongoAlertConfigurationStore {
                 "pipeline.observation-stale", "Pipeline observation stale",
                 "source.connection-failed", "Source connection failed",
                 "cluster.node-unavailable", "Cluster node unavailable",
-                "cluster.storage-unavailable", "Required storage unavailable");
+                "cluster.storage-unavailable", "Required storage unavailable",
+                "cluster.config-structure-drift", "CONFIG collection or index changed",
+                "cluster.cache-structure-drift", "CACHE collection or index changed");
         return catalog.types().stream().map(type -> {
             var identity = AlertConfiguration.Identity.create(Kind.RULE, scope, "builtin-" + type.id());
             var header = AlertConfiguration.Header.create(identity, deployment, at, "system:cluster-initialization");

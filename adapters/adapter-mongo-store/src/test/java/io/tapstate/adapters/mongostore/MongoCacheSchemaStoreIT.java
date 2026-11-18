@@ -310,7 +310,7 @@ class MongoCacheSchemaStoreIT {
         withFixture(f -> {
             var store = f.store(); store.save(discovery("source-a", "old", 1L)); f.domain.advanceAuthGeneration(AUTH, 2, "auth-reset", ACTIVE);
             assertThat(store.get("source-a")).contains(discovery("source-a", "old", 1L));
-            f.rows().drop(); assertCode(() -> f.domain.schemas(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            f.rows().drop(); assertThat(f.domain.schemas(SCOPE, ACTIVE).get("source-a")).isEmpty();
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("source_schemas");
             f.domain.close(); assertCode(() -> store.get("source-a"), IoError.CACHE_BUSINESS_FENCED);
         });

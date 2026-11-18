@@ -185,6 +185,17 @@ final class AlertEvaluationHost {
     }
 
     Result tick(Binding binding) {
+        return tick(binding, false);
+    }
+
+    /** A freshly confirmed stopped intent makes this lifecycle condition inapplicable, not a new sample. */
+    Result tickStoppedPipeline(Binding binding) {
+        if (!binding.definition().typeId().equals("pipeline.failed") || binding.definition().metric() != null)
+            throw new IllegalArgumentException("stopped housekeeping requires a pipeline failure rule");
+        return tick(binding, true);
+    }
+
+    private Result tick(Binding binding, boolean stopped) {
         for (int retry = 0; retry < 3; retry++) {
             binding.requireCurrent().run();
             var retained = store.state(binding.key(), read);
@@ -202,7 +213,10 @@ final class AlertEvaluationHost {
                 if(outcome==AlertStore.Outcome.CONFLICT)continue;
                 points.remove(binding.key());return Result.ACCEPTED;
             }
-            var timed=AlertLifecycle.tick(before.snapshot(),now);
+            var snapshot = before.snapshot();
+            var timed = stopped && snapshot.quality() == AlertSnapshot.Quality.UNKNOWN
+                    && snapshot.lastObservedAt() != null && !snapshot.lastObservedAt().isAfter(now)
+                    ? new AlertUpdate(snapshot, List.of(), false) : AlertLifecycle.tick(snapshot, now);
             var episode=timed.snapshot().episode();
             var severity=now.isBefore(binding.definition().header().updatedAt()) || episode!=null&&now.isBefore(episode.firedAt())
                     || timed.snapshot().lastObservedAt()!=null&&timed.snapshot().lastObservedAt().isAfter(now)
@@ -259,7 +273,12 @@ final class AlertEvaluationHost {
                 || !before.binding().ruleIdentity().equals(r.header().identity())
                 || before.binding().sourceBindingRevision()!=b.sourceBindingRevision())) generation = Math.incrementExact(generation);
         return new AlertRule(b.key(), r.evaluationRevision(), generation, b.producer(),
-                seconds(r, "trigger-for", 0), seconds(r, "resolve-for", 0), Duration.ofSeconds(15), Duration.ofSeconds(5));
+                seconds(r, "trigger-for", 0), seconds(r, "resolve-for", 0),
+                structureInspection(r.typeId()) ? Duration.ofMinutes(65) : Duration.ofSeconds(15),
+                structureInspection(r.typeId()) ? Duration.ofMinutes(65) : Duration.ofSeconds(5));
+    }
+    static boolean structureInspection(String typeId) {
+        return typeId.equals("cluster.config-structure-drift") || typeId.equals("cluster.cache-structure-drift");
     }
     static Duration seconds(AlertConfiguration.Rule r, String name, int fallback) {
         return Duration.ofSeconds(r.parameters().getOrDefault(name, java.math.BigDecimal.valueOf(fallback)).longValueExact());

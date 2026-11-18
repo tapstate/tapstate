@@ -88,8 +88,9 @@ final class StoreBackedPipelineWriteTargets implements PipelineWriteTargets {
                 return stores;
             }
         };
-        return new StartPlanner.Reads(() -> chains.progressChainsOf(pipeline.id(), captured, discovery, progress),
-                chain -> store.startProgress(chain, progress.get()), () -> source.startWriteTargets(pipeline, captured, discovery),
+        var startProgress=chains.startProgress(pipeline,scope.scope(),captured,discovery,progress);
+        return new StartPlanner.Reads(startProgress::chains,
+                startProgress::read, () -> source.startWriteTargets(pipeline, captured, discovery),
                 scope.verify(), () -> {
                     var expanded = PipelineInlining.inline(pipeline, captured);
                     var sources = new LinkedHashMap<String, SourceResource>();

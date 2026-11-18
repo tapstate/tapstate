@@ -161,6 +161,35 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     /** The CONFIG schema fact verified when this domain was opened, not a CACHE readiness signal. */
     public int schemaVersion() { requireOpen(); return installedSchemaVersion; }
 
+    /** Catalog-only inspection. On-demand collections are inspected when present, not treated as missing. */
+    public java.util.List<MongoStructureInspection.Difference> inspectStructure(MongoReadBudget budget) {
+        requireOpen();
+        var database = connection.database();
+        var required = java.util.EnumSet.of(SystemCollections.CONFIG_CLUSTER_IDENTITY, SystemCollections.STORAGE_SETUP,
+                SystemCollections.STORAGE_BINDING, SystemCollections.CLUSTER_KEYS, SystemCollections.SCHEMA_MIGRATIONS,
+                SystemCollections.CONFIGURATION_VERSION, SystemCollections.CAPTURE_PREPARATIONS, SystemCollections.SOURCES,
+                SystemCollections.PDK_NOTE_SCOPES, SystemCollections.CONFIGURATION_IMPORTS);
+        var schema = StoreIo.call(() -> SystemCollections.SCHEMA_MIGRATIONS.on(budget.database(database))
+                .find(new Document("_id", "config")).first());
+        var skipped = java.util.EnumSet.noneOf(SystemCollections.class);
+        if (schema != null) {
+            if (schema.get("validation") instanceof Document marker && "READY".equals(marker.getString("phase")))
+                required.addAll(MongoValidationSchema.CONFIG);
+            else skipped.addAll(MongoValidationSchema.CONFIG);
+            if (schema.get(MongoAlertStorageSchema.FIELD) instanceof Document marker
+                    && Integer.valueOf(MongoAlertStorageSchema.VERSION).equals(marker.get("installedVersion")))
+                required.addAll(MongoAlertStorageSchema.COLLECTIONS);
+            else skipped.addAll(MongoAlertStorageSchema.COLLECTIONS);
+        }
+        var selected = java.util.Arrays.stream(SystemCollections.values())
+                .filter(table -> table.database() == SystemCollections.Database.CONFIG && !skipped.contains(table))
+                .toList();
+        var result = MongoStructureInspection.inspect(database,
+                MongoStructureInspection.namespaces(selected, required, MongoRateHistoryStore.DEFAULT_RETENTION), budget);
+        requireOpen();
+        return result;
+    }
+
     /** Feature schema validation is load-only and does not change the global CONFIG version. */
     public int alertSchemaVersion() {
         return alertSchemaVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5)));
@@ -185,10 +214,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         currentAlertSchema();
     }
 
+    int alertAuthorityVersion(MongoReadBudget budget) {
+        var marker = loadAlertAuthority(budget);
+        return marker == null ? 0 : marker.getInteger("installedVersion");
+    }
+
+    private Document loadAlertAuthority(MongoReadBudget budget) {
+        requireOpen();
+        return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
+                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadAuthorityMarker(budget);
+    }
+
     private void verifyAlertSchema() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
-        Document marker = new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadVerifiedMarker(budget);
+        Document marker = loadAlertAuthority(budget);
         if (marker == null || marker.getInteger("installedVersion") != MongoAlertStorageSchema.VERSION)
             throw unreadable("alert-store", "schema-capability");
         verifiedAlertSchema = new VerifiedAlertSchema(marker, System.nanoTime());
@@ -238,7 +277,9 @@ public final class MongoConfigurationDomain implements AutoCloseable {
     MongoAlertConfigurationStore alertDefinitions(io.tapstate.core.alerting.AlarmKey.Scope scope,
             io.tapstate.core.alerting.AlarmTypeCatalog catalog) {
         if (!clusterId.equals(scope.clusterId())) { throw unreadable("alert-configuration", "scope"); }
-        if (alertSchemaVersion() != MongoAlertStorageSchema.VERSION) { throw unreadable("alert-configuration", "schema-not-prepared"); }
+        if (alertAuthorityVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5))) != MongoAlertStorageSchema.VERSION) {
+            throw unreadable("alert-configuration", "schema-not-prepared");
+        }
         return new MongoAlertConfigurationStore(connection.database(), scope, catalog, this::requireOpen, configurationKey);
     }
 
@@ -782,6 +823,20 @@ public final class MongoConfigurationDomain implements AutoCloseable {
                 throw MongoCachePipelineAccess.fenced();
         }
         @Override public String toString() { return "AuthoringModels[original]"; }
+    }
+
+    /** A discovery hint must not get ahead of the majority snapshot used for task definitions. */
+    public long validationDiscoveryRevision() {
+        requireOpen();
+        return StoreIo.call(() -> {
+            try (var session = connection.client().startSession()) {
+                return session.withTransaction(() -> {
+                    requireOpen();
+                    return ConfigurationVersion.read(session, SystemCollections.CONFIGURATION_VERSION.on(connection.database()));
+                }, TransactionOptions.builder().readConcern(ReadConcern.SNAPSHOT)
+                        .writeConcern(WriteConcern.MAJORITY.withJournal(true)).readPreference(ReadPreference.primary()).build());
+            }
+        });
     }
 
     public long configurationRevision() {

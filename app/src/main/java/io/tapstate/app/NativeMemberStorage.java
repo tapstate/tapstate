@@ -80,7 +80,7 @@ final class NativeMemberStorage implements MemberStorage, AutoCloseable {
             @Override public <T> T withCaptureStartup(CacheBusinessScope expected, java.util.function.Supplier<T> step) {
                 requireNode();
                 if (!expected.equals(bound.preparation().businessScope())) throw ThreeLayerStorePort.refused();
-                return bound.cache().withCaptureStartup(expected, step);
+                return step.get();
             }
 
             @Override public DirectChannelStore directChannels(CacheBusinessScope expected, Runnable active) {

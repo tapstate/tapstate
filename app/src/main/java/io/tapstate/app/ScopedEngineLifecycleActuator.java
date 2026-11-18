@@ -18,6 +18,7 @@ import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
+import io.tapstate.adapters.mongostore.MongoHttpDiagnosticsScope.Phase;
 
 /** One fixed convergence command and its captured concrete job, never a later same-name execution. */
 final class ScopedEngineLifecycleActuator implements LifecycleActuator {
@@ -75,28 +76,30 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         this.connectors = Objects.requireNonNull(connectors,"connectors"); this.clock = Objects.requireNonNull(clock,"clock");
         this.ports = Objects.requireNonNull(ports,"ports"); this.submissions = Objects.requireNonNull(submissions,"submissions");
         this.command = pass.claim(); require();
-        run = engine.captureRun(id()).orElse(null); require();
+        run = engine.captureRun(id()).orElse(null); requireLocal();
         if (run != null) {
             manifest = run.operatorManifest();
             if (!(manifest.executionIdentity() instanceof ExecutionFence fixed)) throw fenced();
             requireEarlier(fixed); original = fixed;
         } else if (command.executionGeneration() > 0) original = new ExecutionFence(pass.scope(),command);
-        submissions.observed(id(),manifest); require();
+        submissions.observed(id(),manifest);
         if (original != null && !engine.isLost()) capture = boundCapture(original);
-        require();
+        requireLocal();
     }
 
     private String id() { return pass.scope().pipelineId(); }
     private void requireId(String pipeline) { if (!id().equals(pipeline)) throw fenced(); require(); }
-    private void require() {
+    private void requireLocal() {
         if (invalidated) throw fenced();
         pass.requirePipeline(id());
         if (!command.equals(pass.claim())) throw fenced();
+    }
+    private void require() {
+        requireLocal();
         boolean proved = checkingStart ? ownership.proveStartClaim(pass.scope(), command)
                 : ownership.proveClaim(pass.scope(), command);
         if (!proved) throw fenced();
-        pass.requirePipeline(id());
-        if (!command.equals(pass.claim())) throw fenced();
+        requireLocal();
     }
     private void requireEarlier(ExecutionFence fixed) {
         var scope = fixed.scope(); var current = pass.scope();
@@ -112,13 +115,16 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                 && original.equals(new ExecutionFence(pass.scope(),command));
     }
     private PipelineCaptureCoordinator boundCapture(ExecutionFence fixed) {
-        require(); var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view"); require(); return bound;
+        requireLocal();
+        var bound = Objects.requireNonNull(captures.forRun(pass.scope(),command,fixed),"fixed capture view");
+        requireLocal();
+        return bound;
     }
 
     @Override public synchronized void start(String pipeline) {
         checkingStart = true;
         try {
-            startOwned(pipeline);
+            PipelineDiagnostics.measure(pipeline, Phase.PIPELINE_START, () -> { startOwned(pipeline); return null; });
         } finally {
             checkingStart = false;
         }
@@ -129,38 +135,73 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         DagSource.StartPreparation prepared;
         Set<String> shared;
         try {
-            prepared = dags.prepareStart(pass,defaultDatabase); require();
-            if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
-            shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
-                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_DAG_PREPARE)) {
+                prepared = dags.prepareStart(pass,defaultDatabase); requireLocal();
+                if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
+            }
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CONNECTORS)) {
+                shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
+                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); requireLocal();
+            }
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
-        stopOriginal(); require();
-        var execution = ownership.beginExecution(pass.scope(),command);
-        if (!execution.allowed()) throw fenced();
-        pass.advancedSubmission(execution); command = execution.claimFence(); require();
-        original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
-        run = null; capture = boundCapture(original);
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_STOP_PREVIOUS)) {
+            if (run != null || capture != null || manifest != null || original != null || pass.displacedExecution() > 0) {
+                stopOriginal();
+            }
+        }
+        PipelineActuationOwnership.Execution execution;
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_EXECUTION_CLAIM)) {
+            execution = ownership.beginExecution(pass.scope(),command);
+            if (!execution.allowed()) throw fenced();
+            pass.advancedSubmission(execution); command = execution.claimFence(); requireLocal();
+            original = execution.fence(); manifest = prepared.operatorPlan().orElseThrow().bind(original);
+            run = null; capture = boundCapture(original);
+            PipelineDiagnostics.execution(original);
+        }
         boolean submissionAttempted = false;
         try {
-            pass.prepareOperatorDatabases(command,
-                    prepared.operatorPlan().orElseThrow().nestDatabases().values(), this::require); require();
-            var planned = prepared.plan(); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_DATABASES)) {
+                var databases = prepared.operatorPlan().orElseThrow().nestDatabases().values();
+                if (!databases.isEmpty()) pass.prepareOperatorDatabases(command, databases, this::require);
+            }
+            var planned = prepared.plan(); requireLocal();
             var members = planned.members();
-            ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require); require();
-            try { capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); }
-            catch (RingNotOpenYet waiting) { return; }
-            require(); pass.bindCapture(command,capture.captureBindings()); require();
-            var built = planned.build(original); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_MAPS)) {
+                ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require);
+            }
+            try {
+                require();
+                PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_START, () -> {
+                    capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); return null;
+                });
+            } catch (RingNotOpenYet waiting) { PipelineDiagnostics.event("waiting_for_capture_ring"); return; }
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CAPTURE_BIND)) {
+                var bindings = capture.captureBindings();
+                require();
+                pass.bindCapture(command, bindings);
+            }
+            DagSource.StartPlan built;
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_DAG_BUILD)) { built = planned.build(original); requireLocal(); }
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");
-            var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
-            var previous = recorder.last(id()); require();
-            recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_PLAN_RECORD)) {
+                var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder");
+                var previous = recorder.last(id());
+                var plan = EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared)
+                        .replacing(previous);
+                require();
+                recorder.record(plan);
+            }
             checkingStart = false;
-            submissions.attempting(manifest); submissionAttempted = true;
-            run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
-            submissions.returned(manifest); require();
+            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_JET_SUBMIT)) {
+                require();
+                submissions.attempting(manifest); submissionAttempted = true;
+                run = engine.submitRun(id(),built.dag(),prepared.capacity().mapDatabases(),prepared.capacity().settings(),manifest);
+                submissions.returned(manifest); require();
+                PipelineDiagnostics.job(run.jobId());
+                PipelineDiagnostics.event("jet_submission_returned");
+            }
         } catch (RuntimeException | Error failed) {
             if (submissionAttempted && run == null) {
                 // The original writer may exist. A later pass must observe this exact manifest before proceeding.
@@ -277,9 +318,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline);
         if(run==null || !isCurrentRun() || !run.completed() || capture==null || !capture.isCapturing(pipeline))return false;
         var bindings=capture.captureBindings();
-        boolean complete=!bindings.snapshots().isEmpty() && capture.loadDelivered(pipeline)
-                && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
-        require();return complete;
+        boolean complete;
+        try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_TARGET_CONFIRM)) {
+            complete=!bindings.snapshots().isEmpty() && capture.loadDelivered(pipeline)
+                    && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
+            require();
+        }
+        if (complete) PipelineDiagnostics.event("bounded_confirmation_observed");
+        return complete;
     }
     @Override public synchronized Optional<Completion> completion(String pipeline) {
         if (!completed(pipeline)) return Optional.empty();

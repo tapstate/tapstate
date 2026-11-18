@@ -128,7 +128,7 @@ final class StorageAuthentication implements AutoCloseable {
                 }, value.humanToken()));
             }
             if (!cloud.cloud() && verified.isPresent()) {
-                original.requireActive(budget);
+                original.requireLocallyActive();
             }
             if (verified.isEmpty()) return Optional.empty();
             if (cloud.cloud() && organization.isEmpty()) return Optional.empty();

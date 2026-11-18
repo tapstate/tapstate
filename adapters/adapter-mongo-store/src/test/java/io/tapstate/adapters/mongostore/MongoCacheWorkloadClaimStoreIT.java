@@ -55,6 +55,272 @@ class MongoCacheWorkloadClaimStoreIT {
     private static final Duration TTL = Duration.ofSeconds(30);
     private static final Runnable ACTIVE = () -> {};
 
+    @org.junit.jupiter.api.RepeatedTest(3)
+    void executionAdmissionKeepsItsFirstWriteAheadOfRenewalInterleavings() {
+        withBusiness(f -> {
+            var domainClaims = f.domain().workloadClaims(SCOPE);
+            var original = domainClaims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var expected = new java.util.concurrent.atomic.AtomicReference<>(original);
+            var compete = new AtomicBoolean();
+            var competingWrites = new AtomicInteger();
+            var writeConflicts = new AtomicInteger();
+            var competingRenewal = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.WorkloadClaim>();
+            var competingFailure = new java.util.concurrent.atomic.AtomicReference<RuntimeException>();
+            var firstTransactionCommand = new java.util.concurrent.atomic.AtomicReference<String>();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    commands.add(event.getCommandName());
+                    if (event.getCommand().containsKey("startTransaction")) firstTransactionCommand.compareAndSet(null, event.getCommandName());
+                    if (compete.get() && event.getCommandName().equals("findAndModify")
+                            && competingWrites.incrementAndGet() <= 2) {
+                        try { competingRenewal.set(domainClaims.renew(expected.get(), TTL).orElseThrow()); }
+                        catch (RuntimeException failure) { competingFailure.set(failure); }
+                    }
+                }
+                @Override public void commandFailed(CommandFailedEvent event) {
+                    if (event.getThrowable() instanceof com.mongodb.MongoCommandException error && error.getCode() == 112)
+                        writeConflicts.incrementAndGet();
+                }
+            };
+            String name = "execution-conflict-" + UUID.randomUUID();
+            try (var observed = MongoClients.create(MongoClientSettings.builder()
+                    .applyConnectionString(new ConnectionString(MONGO.getReplicaSetUrl()))
+                    .applicationName(name).addCommandListener(listener).build())) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var ownership = new MongoClaimOperations(observed);
+                var claims = new MongoCacheWorkloadClaimStore(observed,
+                        observed.getDatabase(f.database().getName()), SCOPE, ACTIVE, null, ownership);
+                failCommand(f, new Document("failCommands", List.of("find", "aggregate", "listCollections",
+                        "listIndexes", "findAndModify", "update", "commitTransaction"))
+                        .append("appName", name).append("blockConnection", true).append("blockTimeMS", 350), "alwaysOn");
+                try {
+                    long baseline = System.nanoTime();
+                    var advanced = claims.withDeadline(baseline + Duration.ofSeconds(10).toNanos(), ACTIVE,
+                            () -> claims.advanceExecution(expected.get(), 1, Set.of(OWNER.nodeId()))).orElseThrow();
+                    assertThat(advanced.executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+                    expected.set(advanced);
+                    commands.clear();firstTransactionCommand.set(null);compete.set(true);
+                    long started = System.nanoTime();
+                    var result = new java.util.concurrent.atomic.AtomicReference<io.tapstate.spi.store.WorkloadClaim>();
+                    org.assertj.core.api.Assertions.assertThatCode(() -> result.set(claims.withDeadline(
+                            started + Duration.ofSeconds(10).toNanos(), ACTIVE,
+                            () -> claims.advanceExecution(expected.get(), 1, Set.of(OWNER.nodeId()))).orElseThrow()))
+                            .as("renewals committed before the first claim write do not invalidate admission")
+                            .doesNotThrowAnyException();
+                    claims.awaitQuiescence(deadline());
+                    assertThat(competingFailure.get()).isNull();
+                    assertThat(competingRenewal.get()).isNotNull();
+                    assertThat(WorkloadClaimFence.from(competingRenewal.get())).isEqualTo(WorkloadClaimFence.from(advanced));
+                    assertThat(competingRenewal.get().leaseUntil()).isAfter(advanced.leaseUntil());
+                    assertThat(firstTransactionCommand.get()).isEqualTo("findAndModify");
+                    assertThat(result.get().leaseUntil()).isEqualTo(competingRenewal.get().leaseUntil());
+                    assertThat(writeConflicts).hasValue(0);
+                    assertThat(competingWrites).hasValue(1);
+                    assertThat(result.get().executionGeneration()).isEqualTo(advanced.executionGeneration() + 1);
+                    assertThat(domainClaims.read(KEY).orElseThrow().claim()).isEqualTo(result.get());
+                    assertThat(commands).filteredOn(command -> command.equals("commitTransaction")).hasSize(1);
+                    assertThat(commands).doesNotContain("abortTransaction");
+                } finally {
+                    failCommand(f, new Document(), "off");
+                    claims.awaitQuiescence(deadline());ownership.closeIfIdle();
+                }
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"context", "members", "failure", "lease"})
+    void executionAdmissionRejectsMalformedPreimagesWithoutRepairingThem(String damage) {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var acquired = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var run = claims.advanceExecution(acquired, 1, Set.of(OWNER.nodeId())).orElseThrow();
+            Document mutation = switch (damage) {
+                case "context" -> new Document("contextExecutionGeneration", 1.25d);
+                case "members" -> new Document("executionNodeIds", List.of(OWNER.nodeId(), OWNER.nodeId()));
+                case "failure" -> new Document("failureAfterMemberLoss", "invalid");
+                case "lease" -> new Document("leaseUntil", new org.bson.types.MaxKey());
+                default -> throw new AssertionError(damage);
+            };
+            SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document("_id", MongoWorkloadClaimStore.id(KEY)),
+                    new Document("$set", mutation));
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.advanceExecution(run, 1, Set.of(OWNER.nodeId())))
+                    .isInstanceOfSatisfying(TapstateException.class, e -> assertThat(e.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE));
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing-checkpoint", "epoch", "fence", "scope", "view", "retired", "schema", "prepared"})
+    void executionAdmissionRollsBackItsFirstWriteWhenRetainedFactsRefuse(String damage) {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            switch (damage) {
+                case "missing-checkpoint" -> state.deleteMany(new Document());
+                case "epoch" -> state.updateOne(new Document(), new Document("$set", new Document("epoch", -1L)));
+                case "fence" -> state.updateOne(new Document(), new Document("$set", new Document("runtimeWriteFence", "invalid")));
+                case "scope" -> state.updateOne(new Document(), new Document("$set", new Document("scope", header(
+                        new PipelineIntentScope(SCOPE.clusterId(), 2, SCOPE.cacheIncarnation(), PIPELINE.pipelineId(), 1)))));
+                case "view" -> {
+                    state.drop();f.database().createView(state.getNamespace().getCollectionName(), "unrelated_fixture", List.of());
+                }
+                case "retired" -> SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document(),
+                        new Document("$set", new Document("businessPhase", "RETIRED")));
+                case "schema" -> SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database()).deleteOne(new Document("_id", "business"));
+                case "prepared" -> SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(),
+                        new Document("$set", new Document("pipelinePreparation.phase", "PREPARING")));
+                default -> throw new AssertionError(damage);
+            }
+            var before = snapshot(f.database());
+            assertThatThrownBy(() -> claims.advanceExecution(original, 1, Set.of(OWNER.nodeId()))).isInstanceOf(TapstateException.class);
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"expired", "replacement", "topology"})
+    void executionAdmissionCannotAdoptAnExpiredOrDifferentOriginal(String loss) {
+        withBusiness(f -> {
+            var claims = f.domain().workloadClaims(SCOPE);
+            var original = claims.acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            if (loss.equals("expired")) SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()).updateOne(new Document(),
+                    new Document("$set", new Document("leaseUntil", new java.util.Date(0))));
+            if (loss.equals("replacement")) {
+                assertThat(claims.release(original)).isTrue();
+                assertThat(claims.acquirePipeline(PIPELINE, new WorkloadOwner("node-b", "replacement"), 1, TTL).acquired()).isTrue();
+            }
+            var before = snapshot(f.database());
+            assertThat(claims.advanceExecution(original, loss.equals("topology") ? 2 : 1, Set.of(OWNER.nodeId()))).isEmpty();
+            assertThat(snapshot(f.database())).isEqualTo(before);
+        });
+    }
+
+    @Test void aPipelineProofReadsItsDependentFactsInOneSnapshot() {
+        withBusiness(f -> {
+            var expected = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var commands = new java.util.concurrent.CopyOnWriteArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    var target = event.getCommand().get(event.getCommandName());
+                    commands.add(event.getCommandName() + ":" + (target != null && target.isString() ? target.asString().getValue() : "-"));
+                }
+            };
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                commands.clear();
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(expected);
+                assertThat(commands).as("one bounded data query with all original catalog checks")
+                        .containsExactly("find:cache_identity", "listCollections:-", "listCollections:-", "listIndexes:pipeline_state",
+                                "aggregate:schema_migrations", "commitTransaction:-");
+            }
+        });
+    }
+
+    @Test void anInvalidBusinessIdentityRefusesBeforeReadingTheSchemaView() {
+        withBusiness(f -> {
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("businessPhase", "RETIRED")));
+            String schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName();
+            SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database()).drop();
+            f.database().getCollection("unreadable_schema_fixture").insertOne(new Document("_id", "business"));
+            f.database().createView(schema, "unreadable_schema_fixture", List.of(
+                    new Document("$set", new Document("installedVersion",
+                            new Document("$divide", List.of(1, 0))))));
+            try (var observed = client(new CommandListener() {})) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                assertThatThrownBy(() -> claims.readPipeline(PIPELINE)).satisfies(MongoCacheWorkloadClaimStoreIT::fenced);
+            }
+        });
+    }
+
+    @Test void oversizedOrCollatedCheckpointsKeepTheCollectionLocalRead() {
+        withBusiness(f -> {
+            var claim = f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim();
+            var joinReads = new AtomicInteger();
+            var scalarReads = new AtomicInteger();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    var name = event.getCommandName();
+                    var command = event.getCommand();
+                    if ("aggregate".equals(name) && "schema_migrations".equals(command.getString(name).getValue()))
+                        joinReads.incrementAndGet();
+                    if ("find".equals(name) && "pipeline_state".equals(command.getString(name).getValue()))
+                        scalarReads.incrementAndGet();
+                }
+            };
+            var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database());
+            var original = state.find(new Document("_id", "orders")).first();
+            try (var observed = client(listener)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                state.updateOne(new Document("_id", "orders"), new Document("$set", new Document("pad", "x".repeat(70 * 1024))));
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
+                assertThat(joinReads).hasValue(1);
+                assertThat(scalarReads).hasValue(1);
+
+                state.drop();
+                f.database().createCollection(state.getNamespace().getCollectionName(),
+                        new com.mongodb.client.model.CreateCollectionOptions().collation(com.mongodb.client.model.Collation.builder()
+                                .locale("en").collationStrength(com.mongodb.client.model.CollationStrength.PRIMARY).build()));
+                state.insertOne(original);
+                assertThat(claims.readPipeline(PIPELINE).orElseThrow().claim()).isEqualTo(claim);
+                assertThat(joinReads).hasValue(1);
+                assertThat(scalarReads).hasValue(2);
+            }
+        });
+    }
+
+    @Test void simultaneousDeadlineProofReadsKeepIndependentMongoSessionsAndCallerGuards() {
+        withBusiness(f -> {
+            var expected = WorkloadClaimFence.from(f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim());
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var selected = new AtomicBoolean();
+            var sessions = new java.util.concurrent.ConcurrentHashMap<Long, String>();
+            var guards = new java.util.concurrent.ConcurrentHashMap<Long, AtomicInteger>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) {
+                    if (!event.getCommandName().equals("aggregate")
+                            || !event.getCommand().getString("aggregate").getValue().equals(SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())) return;
+                    sessions.put(Thread.currentThread().threadId(), event.getCommand().getDocument("lsid").toJson());
+                    if (selected.compareAndSet(false, true)) { entered.countDown(); await(release); }
+                }
+            };
+            try (var observed = client(listener); var callers = Executors.newFixedThreadPool(2)) {
+                observed.getDatabase("admin").runCommand(new Document("ping", 1));
+                var claims = new MongoCacheWorkloadClaimStore(observed, observed.getDatabase(f.database().getName()), SCOPE, ACTIVE);
+                java.util.function.Supplier<WorkloadClaimFence> read = () -> {
+                    var checks = new AtomicInteger();
+                    var ioThread = new java.util.concurrent.atomic.AtomicReference<Thread>();
+                    return claims.withDeadline(deadline(), () -> {
+                        var thread = Thread.currentThread();
+                        var original = ioThread.get();
+                        if (original == null) ioThread.compareAndSet(null, thread);
+                        assertThat(thread).isSameAs(ioThread.get());
+                        guards.putIfAbsent(thread.threadId(), checks);
+                        checks.incrementAndGet();
+                    }, () -> WorkloadClaimFence.from(claims.readPipeline(PIPELINE).orElseThrow().claim()));
+                };
+                var blocked = callers.submit(read::get);
+                try {
+                    assertThat(entered.await(3, TimeUnit.SECONDS)).isTrue();
+                    assertThat(callers.submit(read::get).get(3, TimeUnit.SECONDS)).isEqualTo(expected);
+                    assertThat(release.getCount()).isEqualTo(1);
+                    assertThat(sessions.values()).hasSize(2).doesNotHaveDuplicates();
+                    assertThat(guards.values()).hasSize(2).allSatisfy(value -> assertThat(value.get()).isPositive());
+                } finally { release.countDown(); }
+                assertThat(blocked.get(3, TimeUnit.SECONDS)).isEqualTo(expected);
+                claims.awaitQuiescence(deadline());
+            } finally { release.countDown(); }
+        });
+    }
+
     @Test void validationTenureUsesIndependentNativeClientsWithoutReleasingThePipeline() {
         withBusiness(f -> {
             var claims = f.domain().workloadClaims(SCOPE);
@@ -415,8 +681,11 @@ class MongoCacheWorkloadClaimStoreIT {
         });
     }
 
-    @Test void unknownCommitRetriesOnlyTheOriginalCommitAndNeverReplaysTheClaimCallback() {
+    @ParameterizedTest @ValueSource(strings = {"acquire", "advance"})
+    void unknownCommitRetriesOnlyTheOriginalCommitAndNeverReplaysTheClaimCallback(String operation) {
         withBusiness(f -> {
+            var original = operation.equals("advance")
+                    ? f.domain().workloadClaims(SCOPE).acquirePipeline(PIPELINE, OWNER, 1, TTL).claim() : null;
             var commands=new java.util.concurrent.CopyOnWriteArrayList<org.bson.BsonDocument>();
             var listener=new CommandListener(){@Override public void commandStarted(CommandStartedEvent event){
                 if(event.getCommand().containsKey("txnNumber"))commands.add(event.getCommand().clone());
@@ -426,8 +695,13 @@ class MongoCacheWorkloadClaimStoreIT {
                 var claims=new MongoCacheWorkloadClaimStore(observed,observed.getDatabase(f.database().getName()),SCOPE,ACTIVE,null,ownership);
                 failCommand(f,new Document("failCommands",List.of("commitTransaction")).append("closeConnection",true),new Document("times",2));
                 try {
-                    var result=claims.withDeadline(deadline(),()->claims.acquirePipeline(PIPELINE,OWNER,1,TTL));
-                    assertThat(result.acquired()).isTrue();
+                    if (original == null) {
+                        assertThat(claims.withDeadline(deadline(), () -> claims.acquirePipeline(PIPELINE, OWNER, 1, TTL)).acquired()).isTrue();
+                    } else {
+                        var result = claims.withDeadline(deadline(), () -> claims.advanceExecution(original, 1, Set.of(OWNER.nodeId()))).orElseThrow();
+                        assertThat(result.executionGeneration()).isEqualTo(original.executionGeneration() + 1);
+                        assertThat(f.domain().workloadClaims(SCOPE).read(KEY).orElseThrow().claim()).isEqualTo(result);
+                    }
                 } finally {
                     failCommand(f,new Document(),"off");claims.awaitQuiescence(deadline());
                 }

@@ -34,6 +34,8 @@ final class PipelineLogAppender extends AppenderBase<ILoggingEvent> {
 
     @Override
     protected void append(ILoggingEvent event) {
+        // Optional profiling belongs to process logs, not the operator's bounded Pipeline log tail.
+        if (PipelineDiagnostics.LOGGER_NAME.equals(event.getLoggerName())) return;
         String pipelineId = event.getMDCPropertyMap().get(PIPELINE_ID_MDC_KEY);
         if (pipelineId == null || pipelineId.isBlank()) {
             return;

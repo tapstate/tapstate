@@ -130,28 +130,49 @@ final class ThreeLayerStorePort implements StorePort {
         return sharedReading(pipeline, source, canonical, true, stores, false);
     }
 
+    boolean sharedStartSource(io.tapstate.core.model.PipelineResource pipeline, io.tapstate.core.model.SourceResource source) {
+        return pipeline.sources().stream().noneMatch(reference -> reference.id().equals(source.id())
+                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
+                && (pipeline.settings() == null || pipeline.settings().readMode() != io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY);
+    }
+
+    Optional<SourceCaptureResolution> startPlanningDescriptor(io.tapstate.core.model.PipelineResource pipeline,
+            io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical) {
+        active();
+        if (!sharedStartSource(pipeline,source)) return Optional.of(canonical);
+        var original = scope(pipeline.id());
+        var prepared = sharedCaptureDescriptor(source,canonical);
+        active(); if (!original.equals(scope(pipeline.id()))) throw refused();
+        return prepared.map(fixed -> canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+    }
+
+    private Optional<CapturePreparation> sharedCaptureDescriptor(io.tapstate.core.model.SourceResource source,
+            SourceCaptureResolution canonical) {
+        String capture = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+        var prepared = configuration.capturePreparations().read(business(),capture);
+        if (prepared.isPresent()) {
+            var fixed = prepared.orElseThrow();
+            if (fixed.mode() != CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
+                    || !canonical.chainId().value().equals(fixed.canonicalChainId())
+                    || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config()))) throw refused();
+        }
+        return prepared;
+    }
+
     private Optional<SourceCaptureResolution> sharedReading(io.tapstate.core.model.PipelineResource pipeline,
             io.tapstate.core.model.SourceResource source, SourceCaptureResolution canonical, boolean requireAttachment,
             Supplier<SrsStores> stores, boolean verifyMissingCapture) {
         active();
-        if(pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id())
-                && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
-                || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
+        if (!sharedStartSource(pipeline,source))
             return Optional.of(canonical);
         var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
-        var prepared=configuration.capturePreparations().read(business(),capture);
+        var prepared=sharedCaptureDescriptor(source,canonical);
         if(prepared.isEmpty()) {
             // Start planning can leave the absent-history proof to the transaction that creates capture.
-            if (verifyMissingCapture && (bound.cache().workloadClaims(business())
-                    .read(new WorkloadClaimKey(business().clusterId(), WorkloadClaimType.CAPTURE, capture)).isPresent()
-                    || stores.get().chains().load(canonical.chainId().value()).isPresent()))
-                throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
+            if (verifyMissingCapture) requireNoOrphanedCapture(canonical, capture, stores);
             return requireAttachment?Optional.empty():Optional.of(canonical);
         }
         var fixed=prepared.orElseThrow();
-        if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
-                || !canonical.chainId().value().equals(fixed.canonicalChainId())
-                || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config())))throw refused();
         var topology=stores.get().consumers().attached(fixed.chainId());
         var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
                 && member.context().key().sourceId().equals(source.id())).findFirst();
@@ -159,6 +180,13 @@ final class ThreeLayerStorePort implements StorePort {
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
         return Optional.of(canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+    }
+
+    private void requireNoOrphanedCapture(SourceCaptureResolution canonical, String capture, Supplier<SrsStores> stores) {
+        if (bound.cache().workloadClaims(business())
+                .read(new WorkloadClaimKey(business().clusterId(), WorkloadClaimType.CAPTURE, capture)).isPresent()
+                || stores.get().chains().load(canonical.chainId().value()).isPresent())
+            throw new TapstateException(IoError.CAPTURE_STATE_REBUILD_REQUIRED,Map.of("capture",capture),null);
     }
     PipelineIntentScope scope(String pipeline) {
         active();
@@ -500,6 +528,23 @@ final class ThreeLayerStorePort implements StorePort {
                     pending == null ? null : pending.editedAt(), false);
         });
     }
+    Optional<SrsMeta> unsharedStartProgress(String chain) { return directPosition(chain); }
+    Optional<ConsumerOffset> sharedSinkOffset(PlanningScope reading, io.tapstate.core.model.SourceResource source,
+            SourceCaptureResolution canonical) {
+        var original = reading.scope();
+        var prepared = sharedCaptureDescriptor(source, canonical);
+        if (prepared.isEmpty()) {
+            var capture = io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+            requireNoOrphanedCapture(canonical, capture, () -> bound.cache().srs(business(), this::active));
+            return Optional.empty();
+        }
+        // The cursor snapshot proves its own attachment, generation and checkpoint dependencies.
+        var context = new io.tapstate.spi.store.SrsConsumerContext(
+                new io.tapstate.spi.store.SrsConsumerKey(prepared.orElseThrow().chainId(), original.pipelineId(), source.id()),
+                original.stateGeneration());
+        return bound.cache().observationCursor(business(), context, this::active);
+    }
+
     Optional<SrsMeta> startProgress(String chain, SrsStores stores) {
         var shared = stores.chains().load(chain);
         if (shared.isEmpty()) return directPosition(chain);

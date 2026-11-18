@@ -46,6 +46,33 @@ class MongoPipelineIntentStoreIT {
     private static final String HASH = CanonicalHash.of(pipeline());
 
     @Test
+    void schedulingHintsUseOneProjectionAndTrackEveryIntentRevisionAndPhysicalScope() {
+        withConfiguration((domain, database, scope) -> {
+            assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
+            String material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            try (var reads = new MongoCommandWitness(MONGO.getReplicaSetUrl(), database.getName(), "find",
+                    SystemCollections.PIPELINE_INTENTS.collectionName())) {
+                var observed = new MongoPipelineIntentStore(reads.client, reads.database, "cluster-a",
+                        new MongoStorageBindingStore(reads.client, reads.database, ciphers));
+                assertThat(observed.scanCandidates()).containsExactly(new io.tapstate.spi.store.PipelineIntentStore.ScanCandidate(
+                        "flow", 0, scope, 1, PipelineState.STOPPED));
+                assertThat(reads.confirmedCommands()).isOne();
+                assertThat(domain.intents().compareAndSet(scope, 1, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+                assertThat(observed.scanCandidates()).containsExactly(new io.tapstate.spi.store.PipelineIntentStore.ScanCandidate(
+                        "flow", 2, scope, 2, PipelineState.RUNNING));
+                assertThat(reads.confirmedCommands()).isEqualTo(2);
+                var next = new PipelineIntentScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation(), "flow", scope.stateGeneration()+1);
+                SystemCollections.PIPELINE_INTENTS.on(database).updateOne(new Document("_id", "flow"),
+                        new Document("$set", new Document("stateGeneration", next.stateGeneration())));
+                assertThat(observed.scanCandidates()).containsExactly(new io.tapstate.spi.store.PipelineIntentStore.ScanCandidate(
+                        "flow", 2, next, 2, PipelineState.RUNNING));
+                assertThat(reads.confirmedCommands()).isEqualTo(3);
+            }
+        });
+    }
+
+    @Test
     void latestIntentAndCoordinatesSurviveReopenWithoutAnyCacheResource() {
         withConfiguration((domain, database, scope) -> {
             var store = domain.intents();
@@ -77,6 +104,22 @@ class MongoPipelineIntentStoreIT {
                 assertThat(snapshot.desired().rebuiltAtStateEpoch()).isEqualTo(12L);
             });
             assertThat(SystemCollections.PIPELINE_INTENTS.on(database).countDocuments()).isOne();
+        });
+    }
+
+    @Test
+    void aRetainedStartChecksTheBindingOnceInsideTheIntentWrite() {
+        withConfiguration((domain, database, scope) -> {
+            assertThat(domain.intents().compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
+            String material = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var ciphers = SourceConfigCipherProvider.fixed(new SourceConfigCipher(java.util.Base64.getUrlDecoder().decode(material)));
+            try (var reads = new MongoCommandWitness(MONGO.getReplicaSetUrl(), database.getName(), "find",
+                    SystemCollections.STORAGE_BINDING.collectionName())) {
+                var observed = new MongoPipelineIntentStore(reads.client, reads.database, "cluster-a",
+                        new MongoStorageBindingStore(reads.client, reads.database, ciphers));
+                assertThat(observed.compareAndSet(scope, 1, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+                assertThat(reads.confirmedCommands()).as("one authoritative binding snapshot for the intent CAS").isOne();
+            }
         });
     }
 

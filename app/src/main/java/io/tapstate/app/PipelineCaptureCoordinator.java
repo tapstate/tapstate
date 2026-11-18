@@ -15,6 +15,13 @@ import java.util.function.Predicate;
  */
 interface PipelineCaptureCoordinator {
 
+    /** One observation may project several views of the same original capture facts. */
+    default io.tapstate.runtime.scheduler.CaptureMeasurements measurements(String pipeline,
+            io.tapstate.core.lifecycle.ExecutionPlan plan, java.time.Instant at) {
+        return new io.tapstate.runtime.scheduler.CaptureMeasurements(snapshotProgress(pipeline),
+                runSnapshotProgress(pipeline), initialLoad(pipeline, plan, at), Optional.empty());
+    }
+
     /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
     default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
             SourceModelSnapshot discovered) {

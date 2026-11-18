@@ -1,6 +1,8 @@
 package io.tapstate.app;
 
 import io.tapstate.adapters.mongostore.MongoConfigurationDomain;
+import io.tapstate.adapters.mongostore.MongoReadBudget;
+import io.tapstate.adapters.mongostore.StoreError;
 import io.tapstate.control.core.*;
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.*;
@@ -45,6 +47,97 @@ class StorageAuthenticationTest {
             verifyNoInteractions(f.configuration, f.cache, f.tokens);
         });
     }
+    @Test void admissionKeepsTheAuthorityChecksAroundTheMachineRecordRead() {
+        withOpAuthentication(f -> {
+            var preparation = f.bound.preparation();
+            var record = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), false, f.clock.instant());
+            when(f.tokens.find("machine")).thenAnswer(ignored -> {
+                doThrow(new TapstateException(StoreError.INITIALIZATION_REFUSED, Map.of(), null))
+                        .when(f.configuration).requireAuthenticationPublished(eq(preparation), any(MongoReadBudget.class));
+                return Optional.of(record);
+            });
+            assertThatThrownBy(() -> f.authentication.credentials().authenticateContext("cyxt_machine.test-secret"))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            verify(f.configuration, times(2)).requireAuthenticationPublished(eq(preparation), any(MongoReadBudget.class));
+            verify(f.cache, times(1)).loadAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            verify(f.tokens, times(1)).find("machine");
+        });
+    }
+
+    @Test void changedCacheAuthorityStillRefusesTheFinalVerification() {
+        withOpAuthentication(f -> {
+            var reads = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(ignored -> {
+                if (reads.incrementAndGet() == 2)
+                    throw new TapstateException(IoError.CACHE_AUTH_FENCED, Map.of(), null);
+                return null;
+            }).when(f.cache).loadAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope).issue("admin", Scope.ADMIN);
+            assertThatThrownBy(() -> f.authentication.credentials().authenticateContext(jwt))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.STORAGE_UNAVAILABLE));
+            assertThat(reads).hasValue(2);
+        });
+    }
+
+    @Test void epochInvalidationDuringVerificationAndReplacementAfterAdmissionRefuseTheOriginalOwner() {
+        withOpAuthentication(f -> {
+            String jwt = new HmacTokenSigner(new byte[32], HmacTokenSigner.DEFAULT_TTL, f.clock, f.scope).issue("admin", Scope.ADMIN);
+            var proof = f.authentication.credentials().authenticateContext(jwt).orElseThrow();
+            f.authentication.invalidateFormal();
+            f.authentication.install(f.bound);
+            assertThatThrownBy(proof.evidence().orElseThrow().requireLocallyActive()::run)
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            var reads = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(ignored -> {
+                if (reads.incrementAndGet() == 2) f.authentication.invalidateFormal();
+                return null;
+            }).when(f.cache).loadAuthScope(eq(f.scope), any(MongoReadBudget.class));
+            assertThatThrownBy(() -> f.authentication.credentials().authenticateContext(jwt))
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            assertThat(reads).hasValue(2);
+        });
+    }
+
+    @Test void laterRequestsAndExplicitRevalidationReadRevocationWithFreshBudgets() {
+        withOpAuthentication(f -> {
+            var record = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), false, f.clock.instant());
+            when(f.tokens.find("machine")).thenReturn(Optional.of(record));
+            var proof = f.authentication.credentials().authenticateContext("cyxt_machine.test-secret").orElseThrow();
+            when(f.tokens.find("machine")).thenReturn(Optional.of(new TokenRecord(
+                    "machine", "ADMIN", record.secretHash(), true, record.createdAt())));
+            assertThat(f.authentication.credentials().authenticateContext("cyxt_machine.test-secret")).isEmpty();
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            verify(f.tokens, times(3)).find("machine");
+            var budgets = org.mockito.ArgumentCaptor.forClass(MongoReadBudget.class);
+            verify(f.configuration, times(6)).requireAuthenticationPublished(eq(f.bound.preparation()), budgets.capture());
+            var values = budgets.getAllValues();
+            assertThat(values.get(0)).isSameAs(values.get(1));
+            assertThat(values.get(2)).isSameAs(values.get(3)).isNotSameAs(values.get(0));
+            assertThat(values.get(4)).isSameAs(values.get(5)).isNotSameAs(values.get(2));
+        });
+    }
+
+    @Test void machineRecordReplacementCannotRevalidateAnEarlierIdentity() {
+        withOpAuthentication(f -> {
+            var record = new TokenRecord("machine", "ADMIN", f.secrets.hash("test-secret"), false, f.clock.instant());
+            when(f.tokens.find("machine")).thenReturn(Optional.of(record));
+            var proof = f.authentication.credentials().authenticateContext("cyxt_machine.test-secret").orElseThrow();
+            var replacement = new TokenRecord("machine", "READ", record.secretHash(), false, record.createdAt());
+            when(f.tokens.find("machine")).thenReturn(Optional.of(replacement));
+            assertThatThrownBy(proof.requireActive()::run).isInstanceOfSatisfying(TapstateException.class,
+                    failure -> assertThat(failure.code()).isEqualTo(ControlError.UNAUTHENTICATED));
+            var current = f.authentication.credentials().authenticateContext("cyxt_machine.test-secret").orElseThrow();
+            assertThat(current.token().scope()).isEqualTo(Scope.READ);
+            assertThat(current.evidence().orElseThrow().configurationTokenBinding()).contains(replacement.authenticationBinding());
+            verify(f.tokens, times(3)).find("machine");
+        });
+    }
+
     @Test void simultaneousCloudRequestsValidateOneFrozenCohort() throws Exception {
         var properties = new CloudProperties();
         properties.setBaseUrl("https://cloud.example"); properties.setClusterId("cluster");
@@ -248,7 +341,7 @@ class StorageAuthenticationTest {
 
     private record OpFixture(StorageAuthentication authentication, MongoConfigurationDomain configuration,
             io.tapstate.adapters.mongostore.MongoCacheDomain cache, TokenStore tokens, TokenSecrets secrets,
-            CacheAuthScope scope, Clock clock, AtomicReference<Instant> now) { }
+            CacheAuthScope scope, Clock clock, AtomicReference<Instant> now, StorageRuntime.Bound bound) { }
 
     private static void withOpAuthentication(java.util.function.Consumer<OpFixture> action) {
         var now = new AtomicReference<>(Instant.parse("2026-10-27T00:00:00Z"));
@@ -271,7 +364,7 @@ class StorageAuthenticationTest {
         var secrets = new RandomTokenSecrets();
         try (var authentication = new StorageAuthentication(configuration, CloudRuntimeSettings.resolve(new CloudProperties()), null, secrets, clock, new byte[32])) {
             authentication.install(bound);
-            action.accept(new OpFixture(authentication, configuration, cache, tokens, secrets, scope, clock, now));
+            action.accept(new OpFixture(authentication, configuration, cache, tokens, secrets, scope, clock, now, bound));
         }
     }
 }

@@ -29,13 +29,16 @@ import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -54,6 +57,186 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
+    @ParameterizedTest
+    @CsvSource({"1,1", "1,8", "2,8", "2,80"})
+    void startPredictionReadsOnlyItsOwnSourceCursorsInOneSnapshot(int ownSources, int peers) {
+        withBusiness(f -> {
+            var selected = new java.util.LinkedHashMap<SrsConsumerContext,io.tapstate.spi.store.SrsConsumerProgress>();
+            for (int index = 0; index < ownSources; index++) {
+                var context = index == 0 ? A : context(A.key().pipelineId(), "second-source", A.stateGeneration());
+                f.consumers().attach(context,0,Set.of("orders"),f.fenceA()).orElseThrow();
+                selected.put(context,f.consumers().progress(context).orElseThrow());
+            }
+            var records = new MongoSrsConsumerRecords(SCOPE);
+            var addedMembers = new java.util.ArrayList<Document>();
+            var addedCursors = new java.util.ArrayList<Document>();
+            SrsConsumerContext damaged = null;
+            for (int index = 0; index < peers; index++) {
+                var context = index == 0 ? B : context("sibling-" + index,"other-source",1);
+                if (index == 0) f.consumers().attach(context,0,Set.of("orders"),f.fenceB()).orElseThrow();
+                else {
+                    // Peer control facts do not grant an execution lease or require a running job.
+                    var fence = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(),WorkloadClaimType.PIPELINE_ACTUATION,
+                            context.key().pipelineId()),f.pipelineB().owner(),1,1,1);
+                    var member = new io.tapstate.spi.store.SrsConsumerMembership(context,1,false,Set.of("orders"),fence);
+                    addedMembers.add(records.membership(member));
+                    addedCursors.add(records.cursor(member,records.initial(context.key(),Set.of("orders")),0));
+                }
+                damaged = context;
+            }
+            if (!addedMembers.isEmpty()) {
+                SystemCollections.SRS_CONSUMERS.on(f.database()).insertMany(addedMembers);
+                SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).insertMany(addedCursors);
+                SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id",CHAIN),
+                        new Document("$inc",new Document("consumerCount",(long)addedMembers.size()).append("consumerRevision",(long)addedMembers.size())));
+            }
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(damaged),
+                    new Document("$set",new Document("contentHash","damaged-peer-cursor")));
+            var commands = new java.util.ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command,collection) -> commands.add(command + ":" + collection));
+            try {
+                var result = f.consumers().planningProgress(positionScope(A),CHAIN,
+                        selected.keySet().stream().map(context -> context.key().sourceId()).collect(java.util.stream.Collectors.toSet())).orElseThrow();
+                assertThat(result.chain().miningChainId()).isEqualTo(CHAIN);
+                assertThat(result.consumers()).containsExactlyInAnyOrderElementsOf(selected.values());
+                assertThat(commands.stream().filter(("find:" + SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName())::equals))
+                        .as("one cursor-header closure and one batch of this pipeline's payloads").hasSize(2);
+                assertThat(commands.stream().filter(value -> value.startsWith("commitTransaction:"))).hasSize(1);
+                assertThat(commands.stream().filter(value -> value.startsWith("getMore:"))).hasSize(peers >= 64 ? 2 : 0);
+                assertThat(commands).as("metadata closure and own payload batches have a bounded command budget").hasSizeLessThanOrEqualTo(24);
+                System.out.println("START_PLANNING_COMMAND_BUDGET own_sources=" + ownSources + " peers=" + peers + " commands=" + commands.size());
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThatThrownBy(() -> f.consumers().attached(CHAIN)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings={"peer-generation","peer-revision","peer-format","peer-progress-revision","own-payload","own-cursor","own-membership","peer-cursor","revision-sum"})
+    void startPredictionKeepsControlAndOwnProgressRefusals(String damage) {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            switch (damage) {
+                case "peer-generation" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("stateGeneration",2L)));
+                case "peer-revision" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("membershipRevision",2L)));
+                case "peer-format" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("formatVersion",2)));
+                case "peer-progress-revision" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("progressRevision",-1L)));
+                case "own-payload" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),new Document("$set",new Document("contentHash","bad-own-hash")));
+                case "own-cursor" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(A));
+                case "own-membership" -> SystemCollections.SRS_CONSUMERS.on(f.database()).deleteOne(id(A));
+                case "peer-cursor" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(B));
+                case "revision-sum" -> SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id",CHAIN),new Document("$inc",new Document("consumerRevision",1L)));
+                default -> throw new AssertionError(damage);
+            }
+            var before=root(f); var own=cursor(f,A); var peer=cursor(f,B);
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(root(f)).isEqualTo(before); assertThat(cursor(f,A)).isEqualTo(own); assertThat(cursor(f,B)).isEqualTo(peer);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(strings={"absent","detached-current","detached-older"})
+    void startPredictionProvesAbsenceWithoutParsingPeerProgress(String absence) {
+        withBusiness(f -> {
+            var original=A;
+            if (!absence.equals("absent")) {
+                var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+                f.consumers().detach(A,member.revision(),f.fenceA()).orElseThrow();
+                if (absence.equals("detached-older")) {
+                    original=new SrsConsumerContext(A.key(),2); replacePipelineScope(f,original);
+                }
+            }
+            f.consumers().attach(B,0,Set.of("orders"),f.fenceB()).orElseThrow();
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),new Document("$set",new Document("contentHash","bad-peer-hash")));
+            assertThat(f.consumers().planningProgress(positionScope(original),CHAIN,Set.of(A.key().sourceId())).orElseThrow().consumers()).isEmpty();
+            assertThatThrownBy(() -> f.consumers().attached(CHAIN)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void startPredictionRefusesLostRootsAndCallerLossBeforeOwnPayloads() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var active=new java.util.concurrent.atomic.AtomicBoolean(true);
+            var guarded=f.consumers().guardedBy(() -> {
+                if (!active.get()) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED,Map.of(),null);
+            });
+            var cursorReads=new java.util.concurrent.atomic.AtomicInteger();
+            MongoCommandObservation.COLLECTIONS.set((command,collection) -> {
+                if (command.equals("find") && collection.equals(SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName())) {
+                    cursorReads.incrementAndGet(); active.set(false);
+                }
+            });
+            try {
+                assertThatThrownBy(() -> guarded.planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId())))
+                        .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.WORKLOAD_CLAIM_FENCED));
+                assertThat(cursorReads).hasValue(1);
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            SystemCollections.SRS_CHAINS.on(f.database()).deleteOne(new Document("_id",CHAIN));
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId())))
+                    .isInstanceOfSatisfying(TapstateException.class,error -> assertThat(error.code()).isEqualTo(IoError.SRS_CHECKPOINT_UNPROVEN));
+            assertThat(f.consumers().planningProgress(positionScope(A),"no-history",Set.of(A.key().sourceId()))).isEmpty();
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans={false,true})
+    void startPredictionNeverRetargetsAnotherActiveGeneration(boolean future) {
+        withBusiness(f -> {
+            var member=f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var requested=new SrsConsumerContext(A.key(),2);
+            if (future) {
+                var records=new MongoSrsConsumerRecords(SCOPE);
+                var next=new io.tapstate.spi.store.SrsConsumerMembership(requested,member.revision(),false,member.tables(),member.commandFence());
+                var cursor=f.consumers().progress(A).orElseThrow();
+                SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),records.membership(next));
+                SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).replaceOne(id(A),records.cursor(next,cursor.cursor(),cursor.revision()));
+                requested=A;
+            } else replacePipelineScope(f,requested);
+            var original=requested;
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(original),CHAIN,Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @Test void startPredictionKeepsBusinessAndLiveIndexGuards() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var commands=new java.util.ArrayList<String>();
+            MongoCommandObservation.CURRENT.set(commands::add);
+            try {
+                var other=new io.tapstate.spi.store.PipelineIntentScope("other-cluster",SCOPE.bindingVersion(),SCOPE.cacheIncarnation(),A.key().pipelineId(),A.stateGeneration());
+                assertThatThrownBy(() -> f.consumers().planningProgress(other,CHAIN,Set.of(A.key().sourceId()))).isInstanceOf(TapstateException.class);
+                assertThat(commands).isEmpty();
+            } finally { MongoCommandObservation.CURRENT.remove(); }
+            SystemCollections.SRS_CONSUMERS.on(f.database()).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
+            var before=root(f);
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId()))).isInstanceOf(TapstateException.class);
+            assertThat(root(f)).isEqualTo(before);
+        });
+    }
+
+    @Test void startPredictionDoesNotAdoptACollationAliasForACursorIdentity() {
+        withBusiness(f -> {
+            f.consumers().attach(A,0,Set.of("orders"),f.fenceA()).orElseThrow();
+            var row=cursor(f,A);
+            var table=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS;
+            table.on(f.database()).drop();
+            f.database().createCollection(table.collectionName(),new com.mongodb.client.model.CreateCollectionOptions()
+                    .collation(com.mongodb.client.model.Collation.builder().locale("en")
+                            .collationStrength(com.mongodb.client.model.CollationStrength.SECONDARY).build()));
+            try (var session=f.client().startSession()) {
+                for (var index:table.indexes()) IndexEnsure.createInTransaction(session,table.on(f.database()),index);
+            }
+            table.on(f.database()).insertOne(row);
+            assertThat(f.consumers().planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId())).orElseThrow().consumers()).hasSize(1);
+            table.on(f.database()).deleteOne(id(A));
+            var alias=new Document(row);
+            alias.put("_id",new Document(row.get("_id",Document.class)).append("consumer",A.key().consumerId().toUpperCase(java.util.Locale.ROOT)));
+            table.on(f.database()).insertOne(alias);
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(A),CHAIN,Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+            assertThat(table.on(f.database()).find().first()).isEqualTo(alias);
+        });
+    }
     @ParameterizedTest @ValueSource(strings={"revision","state","owner","detached","hash"})
     void validationMembershipRefusesChangedOriginalCoordinates(String changed){
         withBusiness(f->{
@@ -362,6 +545,40 @@ class MongoSrsConsumerStoreIT {
         });
     }
 
+    @ParameterizedTest
+    @CsvSource({"false,1", "true,1", "false,4", "true,4"})
+    void retainedProgressSharesModelProofBetweenCheckpointAndSnapshot(boolean planning, int tables) {
+        withBusiness(f -> {
+            var selected = java.util.stream.IntStream.range(0, tables).mapToObj(i -> "table_" + i)
+                    .collect(java.util.stream.Collectors.toSet());
+            var refs = publishSnapshotModels(f, selected);
+            f.chains().requestTables(CHAIN, selected, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, selected, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "original"),
+                    refs.entrySet().stream().collect(java.util.stream.Collectors.toMap(Map.Entry::getKey,
+                            entry -> new io.tapstate.spi.store.SrsTableCheckpoint(entry.getValue(), -1))), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, selected, f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "original", refs);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            if (tables == 1) {
+                f.chains().openEpoch(CHAIN, 1, f.captureFence()).orElseThrow();
+                String table = selected.iterator().next();
+                var next = new SrsModelKey(CHAIN, table, SCOPE.cacheIncarnation(), 2, 0);
+                models(f).publishInitial(next, ring(table), new SourceTable(table,
+                        List.of(new SourceField("id", "int")), List.of(), List.of()), f.captureFence());
+            }
+            try (var reads = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database().getName(), "find", "srs_models")) {
+                var consumer = new MongoSrsConsumerStore(reads.client, reads.database, SCOPE);
+                var retained = planning ? consumer.planningProgress(positionScope(A), CHAIN, Set.of(A.key().sourceId()))
+                        .orElseThrow().consumers().getFirst() : consumer.progress(A).orElseThrow();
+                assertThat(retained.snapshot()).isEqualTo(pin);
+                assertThat(reads.confirmedCommands()).as("both proofs share exact model bodies; history requires a distinct ring existence check")
+                        .isEqualTo(tables == 1 ? 2 : 1);
+            }
+        });
+    }
+
     @Test void anAttachedSnapshotKeepsItsClosedModelContextUntilItsOwnDetach() {
         withBusiness(f -> {
             var refs=publishSnapshotModels(f,Set.of("orders"));var first=refs.get("orders");
@@ -486,6 +703,24 @@ class MongoSrsConsumerStoreIT {
             assertThatThrownBy(() -> f.consumers().cursor(A)).satisfies(MongoSrsConsumerStoreIT::unavailable);
             assertThatThrownBy(() -> f.consumers().detach(A,1,f.fenceA())).satisfies(error -> code(error,IoError.CACHE_BUSINESS_FENCED));
             assertThat(f.consumers().cursor(next)).isPresent();
+        });
+    }
+
+    @Test void aStoppedSuccessorTreatsADetachedPredecessorAsAbsentButRefusesAnOrphanCursor() {
+        withBusiness(f -> {
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var predecessorCursor = cursor(f, A);
+            var next = new SrsConsumerContext(A.key(), A.stateGeneration() + 1);
+            f.consumers().detach(A, member.revision(), f.fenceA()).orElseThrow();
+            replacePipelineScope(f, next);
+            assertThat(f.consumers().observationCursor(next)).isEmpty();
+            var offsets = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database());
+            offsets.insertOne(predecessorCursor);
+            assertThatThrownBy(() -> f.consumers().observationCursor(next)).satisfies(MongoSrsConsumerStoreIT::unavailable);
+            offsets.deleteOne(id(A));
+            f.consumers().attach(next, member.revision() + 1, Set.of("orders"), f.fenceA()).orElseThrow();
+            assertThatThrownBy(() -> f.consumers().observationCursor(A))
+                    .satisfies(error -> code(error, IoError.WORKLOAD_CLAIM_FENCED));
         });
     }
 
@@ -1006,6 +1241,7 @@ class MongoSrsConsumerStoreIT {
 
             assertThat(raw.release(renewedNode)).isTrue();
             assertThat(authority.readPipeline(positionScope(A)).orElseThrow().leased()).isFalse();
+            assertThat(authority.advanceExecution(next, 1, Set.of(SCOPE.clusterId()))).isEmpty();
             assertThatThrownBy(() -> f.consumers().beginWriterRun(A, member.revision(), "second", roster,
                     WorkloadClaimFence.from(next))).satisfies(MongoSrsConsumerStoreIT::fenced);
             var replacement = raw.acquire(nodeKey, new WorkloadOwner(SCOPE.clusterId(), "second-boot"), 1, ttl).claim();
@@ -1219,6 +1455,48 @@ class MongoSrsConsumerStoreIT {
             assertThat(f.consumers().startReadingAfter(A,1,0,arrivals,f.fenceA())).isTrue();
             assertThat(f.consumers().progress(A)).contains(progressed);
             assertThat(cursor(f,B)).isEqualTo(other); assertThat(root(f)).isEqualTo(chain);
+        });
+    }
+
+    @Test void singleTableStartupReadsTheOriginalChainProgressModelAndBoundsInFewerCommands() {
+        withBusiness(f -> {
+            preparedTrimLog(f);
+            var tables = Set.of("orders");
+            var selection = Map.of("orders", ring("orders"));
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var key = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0);
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1,4), "t4"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(key, 4)));
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+
+            var separate = new ArrayList<String>();
+            var combined = new ArrayList<String>();
+            io.tapstate.spi.store.SrsChainState chain;
+            io.tapstate.spi.store.SrsConsumerProgress progress;
+            Optional<Map<String, SrsModel>> published;
+            io.tapstate.spi.store.SrsConsumerStore.StartupSnapshot sample;
+            var before = controlRows(f);
+            try {
+                MongoCommandObservation.CURRENT.set(separate::add);
+                chain = f.chains().load(CHAIN).orElseThrow();
+                progress = f.consumers().progress(A).orElseThrow();
+                published = models(f).publishedForNewSnapshot(CHAIN, selection);
+                MongoCommandObservation.CURRENT.set(combined::add);
+                sample = f.consumers().startupSnapshot(A, selection).orElseThrow();
+            } finally {
+                MongoCommandObservation.CURRENT.remove();
+            }
+
+            assertThat(sample.chain()).isEqualTo(chain);
+            assertThat(sample.progress()).isEqualTo(progress);
+            assertThat(sample.published()).isEqualTo(published).isPresent();
+            assertThat(sample.bounds()).containsOnlyKeys(ring("orders"));
+            assertThat(sample.bounds().get(ring("orders")).largestSequence()).isEqualTo(4);
+            assertThat(combined.stream().filter("commitTransaction"::equals)).hasSize(1);
+            assertThat(combined).hasSizeLessThan(separate.size());
+            assertThat(controlRows(f)).isEqualTo(before);
         });
     }
 
@@ -1507,9 +1785,7 @@ class MongoSrsConsumerStoreIT {
     }
 
     private static MongoSrsConsumerStore runtimeConsumer(MongoClient client, MongoDatabase database) {
-        var structure = new MongoCacheMetadataStructure(database, Duration.ofHours(1));
-        structure.verifySrsRuntime();
-        return MongoSrsConsumerStore.admittedRuntime(client, database, SCOPE, () -> {}, structure::verifySrs);
+        return MongoSrsConsumerStore.admittedRuntime(client, database, SCOPE, () -> {}, () -> {});
     }
 
     @Test void fusedReadKeepsTheHistoricalModelAndItsExactEffectiveRange() {

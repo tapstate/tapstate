@@ -34,6 +34,15 @@ public interface ObservationStore {
     /** Returns the current observation for a pipeline, or empty if none has been published. */
     Optional<Observation> read(String pipelineId);
 
+    /**
+     * Refreshes only the lifecycle time of an exact measured terminal projection. A scoped store
+     * verifies its current checkpoint and original execution in one coherent operation. Empty means
+     * unsupported or no longer matching; the caller must take an ordinary fresh measurement.
+     */
+    default Optional<Observation> refreshTerminal(Observation expected, long checkpointEpoch, java.time.Instant at) {
+        return Optional.empty();
+    }
+
     /** Reads a page of observations, omitting unpublished rows. */
     default java.util.Map<String, Observation> readAll(java.util.List<String> ids) {
         var result = new java.util.HashMap<String, Observation>();

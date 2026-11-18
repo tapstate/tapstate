@@ -124,17 +124,32 @@ final class ConfigurationVersion {
 
     /** Pure alerts contend with every authoring/token/user mutation of this same document. */
     static long advanceAlert(ClientSession session, MongoCollection<Document> versions) {
+        return advanceAlert(session, versions, alertWritePreimage(session, versions));
+    }
+
+    static Document alertWritePreimage(ClientSession session, MongoCollection<Document> versions) {
         MongoAlertStateStore.requireTransaction(session);
         Document current = versions.find(session, new Document("_id", ID)).first();
-        validateAlertState(current, true);
-        long fence = (Long) current.get(ALERT_FENCE);
-        if (fence >= Long.MAX_VALUE - 1) { throw unreadable(ALERT_FENCE); }
+        requireAlertWriteHeadroom(current);
+        return current;
+    }
+
+    /** The preimage belongs to this same callback; the actual write still arbitrates concurrent changes. */
+    static long advanceAlert(ClientSession session, MongoCollection<Document> versions, Document current) {
+        MongoAlertStateStore.requireTransaction(session);
+        requireAlertWriteHeadroom(current);
+        long fence = current.getLong(ALERT_FENCE);
         if (versions.updateOne(session, new Document("_id", ID).append("revision", current.get("revision"))
                         .append(ALERT_FENCE, fence), new Document("$inc", new Document(ALERT_FENCE, 1L)))
                 .getModifiedCount() != 1) {
             throw new IllegalStateException("alert fence changed within one transaction snapshot");
         }
         return fence + 1;
+    }
+
+    private static void requireAlertWriteHeadroom(Document current) {
+        validateAlertState(current, true);
+        if (current.getLong(ALERT_FENCE) >= Long.MAX_VALUE - 1) throw unreadable(ALERT_FENCE);
     }
 
     /** Only an explicit, same-session component preparation may enroll an absent counter. */

@@ -15,6 +15,29 @@ import java.util.Optional;
 import static org.assertj.core.api.Assertions.assertThat;
 
 class SecretTrackingArtifactStoreTest {
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"startup", "list", "save", "refresh"})
+    void aBatchTracksEverySecretUsingOneFreshCatalog(String operation) {
+        var delegate = new RecordingStore();
+        var sources = List.<Resource>of(source("first", "batch-first-secret"), source("second", "batch-second-secret"));
+        if (operation.equals("startup")) delegate.saveAll(sources);
+        var reads = new java.util.concurrent.atomic.AtomicInteger();
+        var redactor = new SecretRedactor();
+        var decorated = new SecretTrackingArtifactStore(delegate, () -> {
+            reads.incrementAndGet();
+            return TapstateCatalog.load();
+        }, redactor);
+        if (operation.equals("save")) decorated.saveAll(sources);
+        if (operation.equals("list") || operation.equals("refresh")) {
+            delegate.saveAll(sources);
+            if (operation.equals("list")) decorated.list();
+            else decorated.refreshLoaded(java.util.Set.of("first", "second"));
+        }
+        assertThat(reads).as("one operation uses one catalog for all source secrets").hasValue(1);
+        assertThat(redactor.redact("batch-first-secret batch-second-secret")).isEqualTo("******** ********");
+        decorated.list();
+        assertThat(reads).as("a later operation must refresh the catalog").hasValue(2);
+    }
 
     @Test void readableListingForwardsNativeBatchAndSharesOneLiveCatalogWithSourceProjection() {
         var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
@@ -51,6 +74,66 @@ class SecretTrackingArtifactStoreTest {
                 "version: tapstate/v1\nkind: pipeline\nid: p\nsource: views\nview: {from: orders, primary_key: id}\n"))))
                 .isInstanceOfSatisfying(io.tapstate.core.common.TapstateException.class,
                         failure -> assertThat(failure.code()).isEqualTo(io.tapstate.control.core.ControlError.MALFORMED_REQUEST));
+    }
+
+    @Test void blockedSourceReadDoesNotDelayPublicationOrReplaceNewerSecrets() throws Exception {
+        var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
+        org.mockito.Mockito.when(delegate.listStored()).thenReturn(List.of());
+        var stale = source("source", "stale-read-secret");
+        var current = source("source", "current-write-secret");
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var retryEntered = new java.util.concurrent.CountDownLatch(1);
+        var releaseRetry = new java.util.concurrent.CountDownLatch(1);
+        org.mockito.Mockito.when(delegate.get("source")).thenAnswer(invocation -> {
+            entered.countDown();
+            if (!release.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("read not released");
+            return Optional.of(stale);
+        }).thenAnswer(invocation -> {
+            retryEntered.countDown();
+            if (!releaseRetry.await(10, java.util.concurrent.TimeUnit.SECONDS)) throw new AssertionError("retry not released");
+            return Optional.of(current);
+        });
+        org.mockito.Mockito.when(delegate.draftPublicationInventory(null)).thenReturn(Optional.of(
+                new ArtifactStore.ReadableInventory(List.of(current), Optional.empty())));
+        var redactor = new SecretRedactor();
+        var store = tracking(delegate, redactor);
+        store.saveAll(List.of(current));
+        try (var workers = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var blocked = workers.submit(() -> store.get("source"));
+            try {
+                assertThat(entered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(workers.submit(() -> store.draftPublicationInventory(null))
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS)).isPresent();
+                assertThat(redactor.redact("current-write-secret")).isEqualTo("********");
+                release.countDown();
+                assertThat(retryEntered.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+                assertThat(workers.submit(() -> store.draftPublicationInventory(null))
+                        .get(5, java.util.concurrent.TimeUnit.SECONDS)).isPresent();
+            } finally {
+                release.countDown();
+                releaseRetry.countDown();
+            }
+            assertThat(blocked.get(5, java.util.concurrent.TimeUnit.SECONDS)).contains(current);
+        }
+        assertThat(redactor.redact("stale-read-secret current-write-secret")).isEqualTo("stale-read-secret ********");
+    }
+
+    @Test void anUnrelatedReadCannotInvalidateFirstRegistrationOfImportedSecrets() {
+        var delegate = org.mockito.Mockito.mock(ArtifactStore.class);
+        org.mockito.Mockito.when(delegate.listStored()).thenReturn(List.of());
+        var imported = source("imported", "new-imported-secret");
+        var other = source("other", "unrelated-secret");
+        var redactor = new SecretRedactor();
+        var store = tracking(delegate, redactor);
+        org.mockito.Mockito.when(delegate.get("other")).thenReturn(Optional.of(other));
+        org.mockito.Mockito.when(delegate.get("imported")).thenAnswer(invocation -> {
+            assertThat(store.get("other")).contains(other);
+            return Optional.of(imported);
+        });
+        store.refreshLoaded(java.util.Set.of("imported"));
+        assertThat(redactor.redact("new-imported-secret unrelated-secret")).isEqualTo("******** ********");
+        org.mockito.Mockito.verify(delegate).get("imported");
     }
 
     @Test void readingANativelyPublishedSourceRegistersSecretsBeforePipelineLogging() {

@@ -3,9 +3,11 @@ package io.tapstate.app;
 import io.tapstate.core.catalog.ConnectorCatalogEntry;
 import io.tapstate.core.catalog.SecretConfigPaths;
 import io.tapstate.core.catalog.TapstateCatalog;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.dsl.DslParser;
 import io.tapstate.core.logging.SecretRedactor;
 import io.tapstate.core.logging.MongoUriUserInfo;
+import io.tapstate.core.model.PipelineResource;
 import io.tapstate.core.model.Resource;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.ArtifactMutation;
@@ -13,14 +15,18 @@ import io.tapstate.spi.store.ArtifactBatchWrite;
 import io.tapstate.spi.store.ArtifactStore;
 import io.tapstate.spi.store.StoredArtifactRecord;
 import io.tapstate.spi.store.ArtifactWrite;
+import io.tapstate.spi.store.IoError;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -32,6 +38,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     private final ArtifactStore delegate;
     private final Supplier<TapstateCatalog> catalog;
     private final SecretRedactor redactor;
+    private long trackingRevision;
+    private int activeTrackingReads;
+    // Only owners published during overlapping reads need an ordering receipt.
+    private final Map<String, Long> recentRegistrations = new HashMap<>();
 
     SecretTrackingArtifactStore(
             ArtifactStore delegate, Supplier<TapstateCatalog> catalog, SecretRedactor redactor) {
@@ -42,12 +52,13 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         // unreadable. The browse projection keeps the good rows available and leaves the bad row for
         // repair/diagnostics; its secrets cannot be inferred safely, so it is skipped here.
         DslParser parser = new DslParser();
+        var startupCatalog = operationCatalog();
         delegate.listStored().stream()
                 .filter(StoredArtifactRecord::readable)
                 .filter(row -> row.canonicalForm() != null)
                 .forEach(row -> {
                     try {
-                        track(parser.parse(row.canonicalForm()));
+                        track(parser.parse(row.canonicalForm()), startupCatalog);
                     } catch (RuntimeException ignored) {
                         // The store already classified this row; tracking is best effort on startup.
                     }
@@ -58,7 +69,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     public synchronized ArtifactMutation create(Resource artifact) {
         ArtifactMutation result = delegate.create(artifact);
         if (result == ArtifactMutation.CREATED) {
-            track(artifact);
+            trackMutation(List.of(artifact));
         }
         return result;
     }
@@ -68,7 +79,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
             String id, String expectedContentHash, Resource replacement) {
         ArtifactMutation result = delegate.replace(id, expectedContentHash, replacement);
         if (result == ArtifactMutation.REPLACED) {
-            track(replacement);
+            trackMutation(List.of(replacement));
         }
         return result;
     }
@@ -78,6 +89,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         ArtifactMutation result = delegate.delete(id, expectedContentHash);
         if (result == ArtifactMutation.DELETED) {
             redactor.remove(id);
+            recordRegistration(id);
         }
         return result;
     }
@@ -86,7 +98,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     public synchronized ArtifactBatchWrite writeAll(List<ArtifactWrite> writes) {
         ArtifactBatchWrite result = delegate.writeAll(writes);
         if (result.appliedSuccessfully()) {
-            writes.forEach(write -> track(write.resource()));
+            trackMutation(writes.stream().map(ArtifactWrite::resource).toList());
         }
         return result;
     }
@@ -94,7 +106,7 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
     @Override
     public synchronized void saveAll(List<Resource> artifacts) {
         delegate.saveAll(artifacts);
-        artifacts.forEach(this::track);
+        trackMutation(artifacts);
     }
 
     @Override
@@ -104,66 +116,126 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         // A refused batch wrote nothing, so nothing it named is in the store to track — tracking it
         // would teach the redactor secrets that were never stored.
         if (conflicted.isEmpty()) {
-            artifacts.forEach(this::track);
+            trackMutation(artifacts);
         }
         return conflicted;
     }
 
-    @Override
-    public synchronized Optional<Resource> get(String id) {
-        var current = delegate.get(id); current.ifPresent(this::track); return current;
+    @Override public Optional<Resource> get(String id) {
+        return trackedRead(() -> delegate.get(id), Optional::stream);
     }
-    @Override public synchronized Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
-        var current=delegate.sourceBinding(id);current.ifPresent(value->track(value.source()));return current;
+
+    @Override public Optional<io.tapstate.spi.store.SourceBindingSnapshot> sourceBinding(String id) {
+        return trackedRead(() -> delegate.sourceBinding(id), value -> value.stream().map(binding -> binding.source()));
     }
+
     @Override public Optional<String> managedDefaultSourceId() { return delegate.managedDefaultSourceId(); }
 
-    /** Native publication supplies only identities; refresh current committed values under the same mutation lock. */
-    synchronized void refreshLoaded(java.util.Set<String> ids) { ids.forEach(this::get); }
-
-    /** Registers a store-proven startup winner, never a candidate from a refused write. */
-    synchronized void trackLoaded(Resource resource) {
-        track(resource);
+    /** Registers only sources that were committed by the native publication. */
+    void refreshLoaded(java.util.Set<String> ids) {
+        trackedRead(() -> ids.stream().flatMap(id -> delegate.get(id).stream()).toList(), List::stream);
     }
 
-    @Override
-    public synchronized List<Resource> list() {
-        var current = delegate.list(); current.forEach(this::track); return current;
+    @Override public List<Resource> list() { return trackedRead(delegate::list, List::stream); }
+
+    @Override public List<StoredArtifactRecord> listStored() { return delegate.listStored(); }
+
+    @Override public List<Resource> listReadable() { return readableInventory().resources(); }
+
+    @Override public ReadableInventory readableInventory() {
+        return trackedInventory(() -> Optional.of(delegate.readableInventory())).orElseThrow();
     }
 
-    @Override
-    public List<StoredArtifactRecord> listStored() {
-        return delegate.listStored();
+    @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
+        return trackedInventory(() -> delegate.draftPublicationInventory(candidate));
     }
 
-    @Override public synchronized List<Resource> listReadable() {
-        return readableInventory().resources();
+    @Override public Optional<ReadableInventory> startPlanningInventory(PipelineResource candidate) {
+        return trackedInventory(() -> delegate.startPlanningInventory(candidate));
     }
 
-    @Override public synchronized ReadableInventory readableInventory() {
-        return trackInventory(delegate.readableInventory());
+    @Override public ReadableInventory readableInventory(String kind) {
+        return trackedInventory(() -> Optional.of(delegate.readableInventory(kind))).orElseThrow();
     }
 
-    @Override public synchronized Optional<ReadableInventory> draftPublicationInventory(
-            io.tapstate.core.model.PipelineResource candidate) {
-        return delegate.draftPublicationInventory(candidate).map(this::trackInventory);
+    @Override public ReadableInventory readableInventory(String kind, String id) {
+        return trackedInventory(() -> Optional.of(delegate.readableInventory(kind, id))).orElseThrow();
     }
 
-    @Override public synchronized ReadableInventory readableInventory(String kind) {
-        return trackInventory(delegate.readableInventory(kind));
+    private Optional<ReadableInventory> trackedInventory(Supplier<Optional<ReadableInventory>> read) {
+        return tracked(() -> {
+            var result = read.get();
+            if (result.isEmpty()) return new Registration<>(result, Map.of());
+            var inventory = result.orElseThrow();
+            var selected = operationCatalog(() -> inventory.connectorCatalog().orElseGet(catalog));
+            var values = secrets(inventory.resources().stream(), selected);
+            if (inventory.resources().stream().anyMatch(SourceResource.class::isInstance)) {
+                result = Optional.of(new ReadableInventory(inventory.resources(), Optional.of(selected.get()),
+                        inventory.managedDefaultSourceId(), inventory.exactLookupIds()));
+            }
+            return new Registration<>(result, values);
+        });
     }
 
-    @Override public synchronized ReadableInventory readableInventory(String kind, String id) {
-        return trackInventory(delegate.readableInventory(kind, id));
+    private record Registration<T>(T value, Map<String, Collection<String>> secrets) {}
+
+    private <T> T trackedRead(Supplier<T> read, Function<T, java.util.stream.Stream<? extends Resource>> resources) {
+        return tracked(() -> {
+            T value = read.get();
+            return new Registration<>(value, secrets(resources.apply(value), operationCatalog()));
+        });
     }
 
-    private ReadableInventory trackInventory(ReadableInventory inventory) {
-        boolean hasSources = inventory.resources().stream().anyMatch(SourceResource.class::isInstance);
-        if (!hasSources) { inventory.resources().forEach(this::track); return inventory; }
-        TapstateCatalog captured = inventory.connectorCatalog().orElseGet(catalog);
-        inventory.resources().forEach(resource -> track(resource, () -> captured));
-        return new ReadableInventory(inventory.resources(), Optional.of(captured), inventory.managedDefaultSourceId(),
-                inventory.exactLookupIds());
+    private <T> T tracked(Supplier<Registration<T>> read) {
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final long before;
+            synchronized (this) {
+                activeTrackingReads++;
+                before = trackingRevision;
+            }
+            try {
+                var result = read.get();
+                if (result.secrets().isEmpty()) return result.value();
+                synchronized (this) {
+                    // Resolve disagreement for the same owner with a fresh read outside the lock.
+                    if (result.secrets().entrySet().stream().anyMatch(entry ->
+                            recentRegistrations.getOrDefault(entry.getKey(), 0L) > before
+                                    && !redactor.matches(entry.getKey(), entry.getValue()))) continue;
+                    publish(result.secrets());
+                    return result.value();
+                }
+            } finally {
+                synchronized (this) {
+                    if (--activeTrackingReads == 0) recentRegistrations.clear();
+                }
+            }
+        }
+        throw new TapstateException(IoError.STORE_UNAVAILABLE,
+                Map.of("detail", "Source credentials changed during the artifact read"), null);
+    }
+
+    private void trackMutation(Collection<Resource> resources) {
+        publish(secrets(resources.stream(), operationCatalog()));
+    }
+
+    private void publish(Map<String, Collection<String>> values) {
+        values.forEach((owner, secrets) -> {
+            redactor.replace(owner, secrets);
+            // Even identical values prove a newer observation of this owner.
+            recordRegistration(owner);
+        });
+    }
+
+    private void recordRegistration(String owner) {
+        if (activeTrackingReads != 0) recentRegistrations.put(owner, ++trackingRevision);
+    }
+
+    private Map<String, Collection<String>> secrets(java.util.stream.Stream<? extends Resource> resources,
+            Supplier<TapstateCatalog> selected) {
+        var result = new LinkedHashMap<String, Collection<String>>();
+        resources.forEach(resource -> result.put(resource.id(), resource instanceof SourceResource source
+                ? secretValues(source, selected) : List.of()));
+        return result;
     }
 
     @Override
@@ -183,16 +255,22 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         };
     }
 
-    private void track(Resource resource) {
-        track(resource, catalog);
+    /** One operation's successful catalog reading is shared; no facts survive into the next operation. */
+    private Supplier<TapstateCatalog> operationCatalog() { return operationCatalog(catalog); }
+
+    private static Supplier<TapstateCatalog> operationCatalog(Supplier<TapstateCatalog> catalog) {
+        return new Supplier<>() {
+            private TapstateCatalog captured;
+            @Override public TapstateCatalog get() {
+                if (captured == null) captured = catalog.get();
+                return captured;
+            }
+        };
     }
 
     private void track(Resource resource, Supplier<TapstateCatalog> selectedCatalog) {
-        if (!(resource instanceof SourceResource source)) {
-            redactor.remove(resource.id());
-            return;
-        }
-        redactor.replace(source.id(), secretValues(source, selectedCatalog));
+        redactor.replace(resource.id(), resource instanceof SourceResource source
+                ? secretValues(source, selectedCatalog) : List.of());
     }
 
     private Collection<String> secretValues(SourceResource source, Supplier<TapstateCatalog> selectedCatalog) {

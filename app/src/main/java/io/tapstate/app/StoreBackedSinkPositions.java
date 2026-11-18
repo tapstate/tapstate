@@ -41,14 +41,16 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
         if (pipeline.isEmpty()) {
             return Map.of();
         }
-        Runnable current=storePort instanceof ThreeLayerStorePort nativeStore?nativeStore.readingGuard(pipelineId):() -> {};
+        var nativeStore = storePort instanceof ThreeLayerStorePort scoped ? scoped : null;
+        var current = nativeStore == null ? null : nativeStore.planningScope(pipelineId);
         Map<String, SourceCaptureResolution> resolutions = new LinkedHashMap<>();
+        Map<String, SourceResource> shared = new LinkedHashMap<>();
         for (String sourceId : pipeline.get().sourceIds()) {
             SourceResource source = StoredArtifacts.requireSource(storePort.artifacts(), sourceId);
             SourceCaptureResolution resolution;
             try {
-                resolution = SourceCaptureResolution.forStoredPipeline(
-                        storePort,pipeline.get(), source, SourceDiscovery.model(storePort, source)).orElse(null);
+                resolution = SourceCaptureResolution.forPipeline(
+                        pipeline.get(), source, SourceDiscovery.model(storePort, source)).orElse(null);
             } catch (TapstateException unresolved) {
                 if (unresolved.code() == ActuationError.SOURCE_SCHEMA_NOT_DISCOVERED) {
                     // The read face treats a not-yet-resolvable selection as absent while discovery catches up.
@@ -56,34 +58,45 @@ final class StoreBackedSinkPositions implements Function<String, Map<String, Str
                 }
                 throw unresolved;
             }
-            if (resolution != null) {
-                resolutions.put(sourceId, resolution);
-            }
+            if (resolution == null) continue;
+            resolutions.put(sourceId, resolution);
+            if (nativeStore != null && nativeStore.sharedStartSource(pipeline.get(), source)) shared.put(sourceId, source);
         }
         Map<String, String> positions = new LinkedHashMap<>();
         resolutions.forEach((sourceId, resolution) -> {
+            if (shared.containsKey(sourceId)) {
+                nativeStore.sharedSinkOffset(current, shared.get(sourceId), resolution)
+                        .ifPresent(offset -> addConfirmedPositions(positions, resolution.tables(), offset));
+                return;
+            }
             boolean singleNode = resolutions.values().stream()
                     .filter(candidate -> candidate.chainId().equals(resolution.chainId())).count() == 1;
-            storePort.meta().read(resolution.chainId().value()).ifPresent(meta -> {
-                ConsumerOffset offset = meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
-                        .orElseGet(() -> singleNode ? meta.consumerOffset(pipelineId).orElse(null) : null);
-                if (offset == null) {
-                    return;
-                }
-                for (String table : resolution.tables()) {
-                    ChainPosition confirmed = offset.sinkAckedByTable().get(table);
-                    if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
-                            || (offset.progressKind() == ConsumerProgressKind.LEGACY
-                                    && resolution.tables().size() == 1 && offset.perTableSeq().size() <= 1))) {
-                        confirmed = offset.sinkAcked();
-                    }
-                    if (confirmed != null && confirmed.token() != null) {
-                        positions.put(table, confirmed.token());
-                    }
-                }
-            });
+            ConsumerOffset offset = storePort.meta().read(resolution.chainId().value())
+                    .flatMap(meta -> meta.consumerOffset(SrsConsumerId.of(pipelineId, sourceId).value())
+                            .or(() -> singleNode ? meta.consumerOffset(pipelineId) : Optional.empty()))
+                    .orElse(null);
+            if (offset != null) {
+                addConfirmedPositions(positions, resolution.tables(), offset);
+            }
         });
-        current.run();return positions;
+        if (current != null) current.verify().run();
+        return positions;
+    }
+
+    /** The same durable acknowledgement projection serves live samples and stored-position fallbacks. */
+    static void addConfirmedPositions(Map<String, String> positions, java.util.Collection<String> tables,
+            ConsumerOffset offset) {
+        for (String table : tables) {
+            ChainPosition confirmed = offset.sinkAckedByTable().get(table);
+            if (confirmed == null && (offset.progressKind() == ConsumerProgressKind.DIRECT_SOURCE
+                    || (offset.progressKind() == ConsumerProgressKind.LEGACY
+                            && tables.size() == 1 && offset.perTableSeq().size() <= 1))) {
+                confirmed = offset.sinkAcked();
+            }
+            if (confirmed != null && confirmed.token() != null) {
+                positions.put(table, confirmed.token());
+            }
+        }
     }
 
     /** The stored pipeline for the id, or empty when its artifact is absent or names another kind. */

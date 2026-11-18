@@ -21,6 +21,204 @@ import static org.assertj.core.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ScopedPipelineCaptureCoordinatorTest {
+    @Test void sharedTakeoverKeepsOneOpenerWhenAnotherPipelineAddsDemand() throws Exception {
+        try (var f = new Fixture(ReadMode.CDC_ONLY)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            f.checkPortIdentity.set(true);
+            var authored = (PipelineResource) f.memory.artifacts().get("flow").orElseThrow();
+            f.memory.artifacts().create(new PipelineResource("peer", null, authored.sources(), authored.transforms(),
+                    authored.view(), authored.serve(), authored.settings(), authored.experimental()));
+            var peerScope = new PipelineIntentScope("cluster", 1, "cache", "peer", 11);
+            var peerClaim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "peer"), OWNER, 5, 6, 1);
+            var peer = new ExecutionFence(peerScope, peerClaim);
+            when(f.authorization.require(peer)).thenReturn(peerClaim);
+            when(f.authorization.authorized(peer)).thenReturn(true);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var consumers = stores.consumers();
+            var peerContext = new SrsConsumerContext(new SrsConsumerKey("mck-key", "peer", "input"), 11);
+            var first = new SrsConsumerMembership(f.streamingContext, 1, false, Set.of("orders"), PIPELINE);
+            var second = new SrsConsumerMembership(peerContext, 1, false, Set.of("orders"), peerClaim);
+            var members = new ArrayList<>(List.of(first, second));
+            when(consumers.find(peerContext.key())).thenReturn(Optional.of(second));
+            for (var member : members) {
+                var cursor = new ConsumerOffset(member.context().key().consumerId(), Map.of("orders", 0L), null,
+                        List.of(), null, 0, Map.of(), ConsumerProgressKind.SRS);
+                when(consumers.progress(member.context())).thenReturn(Optional.of(new SrsConsumerProgress(
+                        member.context(), 1, 1, cursor, null, null, Map.of("orders", 0L))));
+            }
+            when(consumers.attached("mck-key")).thenAnswer(call -> new SrsConsumerTopology(BUSINESS, "mck-key", members.size(), List.copyOf(members)));
+            var checkpoint = new SrsCaptureCheckpoint(new ChainPosition(new SourceOrder(1, 0), "retained"),
+                    Map.of("orders", new SrsTableCheckpoint(new SrsModelKey("mck-key", "orders", "cache", 1, 0), 0)));
+            var chain = new AtomicReference<>(new SrsChainState("mck-key", "mck-key", "1h", 1,
+                    Set.of("orders"), Set.of("orders"), 1, checkpoint, Instant.EPOCH, 2, 2));
+            when(stores.chains().load("mck-key")).thenAnswer(call -> Optional.of(chain.get()));
+            when(stores.chains().requestTables(eq("mck-key"), anySet(), any())).thenAnswer(call -> {
+                var old = chain.get();
+                chain.set(new SrsChainState(old.miningChainId(), old.captureId(), old.retention(), old.epoch(),
+                        call.getArgument(1), old.servingTables(), 1, checkpoint, Instant.EPOCH, members.size(), members.size()));
+                return chain.get();
+            });
+            when(stores.chains().openEpoch(eq("mck-key"), anyLong(), any())).thenAnswer(call -> {
+                var old = chain.get();
+                chain.set(new SrsChainState(old.miningChainId(), old.captureId(), old.retention(), old.epoch() + 1,
+                        old.requestedTables(), old.requestedTables(), 1, checkpoint, Instant.EPOCH, members.size(), members.size()));
+                return OptionalLong.of(chain.get().epoch());
+            });
+            when(stores.chains().publishServingTables(anyString(), anyLong(), anySet(), any())).thenReturn(true);
+            var tail = mock(NativeSrsCaptureRunUnit.Tail.class);
+            when(tail.health()).thenReturn(new CaptureHealth());
+            doAnswer(call -> {
+                java.util.function.Function<SrsCaptureWriter, CapturePort> open = call.getArgument(5);
+                open.apply(mock(SrsCaptureWriter.class));
+                return tail;
+            }).when(f.runtime).startTail(any(), any(), any(), any(), any(), any(), any(), anyBoolean());
+            doNothing().when(f.runtime).retain(any(), anyString(), any(), any());
+            var flow = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            var other = f.coordinator.forRun(peerScope, peerClaim, peer);
+            flow.startCapture("flow", f.snapshot(), f.models());
+            other.startCapture("peer", f.snapshot(), SourceModelSnapshot.capture("peer", f.definitions, f.memory.schemas()));
+            var local = new WorkloadClaim(f.capture.key(), OWNER, 2, 0, 1, Instant.now().plusSeconds(60));
+            var prepared = ((CaptureCreationResult.AlreadyIssued) f.configuration.issueFirstCreate(null)).preparation();
+            when(f.cache.load(prepared)).thenAnswer(call -> new CaptureCacheState(prepared, WorkloadClaimFence.from(local), Optional.of(chain.get())));
+            when(f.ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(true, local));
+            doAnswer(call -> {
+                var expected = call.getArgument(1, WorkloadClaimFence.class);
+                if (expected.owner().nodeId().equals("remote")) throw new TapstateException(IoError.WORKLOAD_CLAIM_FENCED, Map.of(), null);
+                return expected;
+            }).when(f.authorization).requireCapture(any(), any());
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            assertThat(flow.captureFailure("flow")).as("the first takeover opens its original tail").isEmpty();
+            assertThat(other.captureFailure("peer")).as("the follower keeps the same capture").isEmpty();
+            assertThat(f.checkedConfigurations).hasSize(1);
+            var opener = f.checkedConfigurations.getFirst();
+            assertThat(opener.node()).isEqualTo(new PipelineNode("flow", "input"));
+            assertThat(opener.original()).isEqualTo(ORIGINAL);
+            assertThat(opener.primary().owner().namespace()).isEqualTo("pdk.chain.mck-key");
+            var extraContext = new SrsConsumerContext(new SrsConsumerKey("mck-key", "expander", "input"), 1);
+            var extraClaim = new WorkloadClaimFence(new WorkloadClaimKey("cluster", WorkloadClaimType.PIPELINE_ACTUATION, "expander"), OWNER, 5, 6, 1);
+            members.add(new SrsConsumerMembership(extraContext, 1, false, Set.of("customers"), extraClaim));
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            assertThat(flow.captureFailure("flow")).isEmpty();
+            assertThat(other.captureFailure("peer")).isEmpty();
+            assertThat(f.checkedConfigurations).hasSize(2).allSatisfy(opened -> {
+                assertThat(opened.node()).isEqualTo(opener.node());
+                assertThat(opened.primary()).isEqualTo(opener.primary());
+                assertThat(opened.artifactHash()).isEqualTo(opener.artifactHash());
+            });
+            verify(f.runtime, times(2)).startTail(eq(BUSINESS), any(), eq(WorkloadClaimFence.from(local)),
+                    any(), any(), any(), any(), anyBoolean());
+        }
+    }
+
+    @Test void combinedBoundedMeasurementsKeepStoredPositionsAndRetainedCountsSeparate() throws Exception {
+        try (var f = new Fixture()) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            verify(f.snapshots, timeout(3000)).recordCount("input", "orders", 1, 1);
+            when(f.snapshots.count("input", "orders", 1)).thenReturn(OptionalLong.of(20));
+            when(f.boundedLoads.complete(ORIGINAL)).thenReturn(true);
+            clearInvocations(f.boundedLoads);
+            var at = Instant.now();
+            var sample = run.measurements("flow", new ExecutionPlan("flow", 2L, 3L, 1L, List.of(), List.of(), at), at);
+            assertThat(sample.positions()).isEmpty();
+            assertThat(sample.snapshot().byTable().get("orders").rowsDone()).isEqualTo(20);
+            assertThat(sample.runSnapshot().byTable().get("orders").rowsDone()).isOne();
+            assertThat(sample.initialLoad().tables().get("orders").rowsRead()).isOne();
+            assertThat(sample.initialLoad().tables().get("orders").stage()).isEqualTo(InitialLoad.Stage.LANDED);
+            verify(f.boundedLoads, times(1)).complete(ORIGINAL);
+        }
+    }
+
+    @Test void combinedCdcOnlyMeasurementsPublishOnlyTheirOwnDurableTargetPositions() {
+        try (var f = new Fixture(ReadMode.CDC_ONLY)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var progress = f.streamingProgress.get();
+            var ack = new ChainPosition(new SourceOrder(1, 3), "cdc-target-confirmed");
+            var cursor = new ConsumerOffset(progress.cursor().pipelineId(), Map.of("orders", 3L), ack,
+                    List.of(), null, 0L, Map.of("orders", ack), ConsumerProgressKind.SRS);
+            f.streamingProgress.set(new SrsConsumerProgress(progress.context(), 1, 1, cursor, null));
+            var at = Instant.now();
+            var sample = run.measurements("flow", new ExecutionPlan("flow", 2L, 3L, 1L, List.of(), List.of(), at), at);
+            assertThat(sample.snapshot()).isEqualTo(SnapshotReading.NONE);
+            assertThat(sample.runSnapshot()).isEqualTo(SnapshotReading.NONE);
+            assertThat(sample.initialLoad().tables()).isEmpty();
+            assertThat(sample.positions()).contains(Map.of("orders", "cdc-target-confirmed"));
+        }
+    }
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void healthyMaintenanceNeverChecksRemoteAuthorizationUnderTheCoordinatorMonitor(boolean localOwner) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            if (localOwner) ownedShared(f);
+            else f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL).startCapture("flow", f.snapshot(), f.models());
+            var underMonitor = new AtomicBoolean();
+            var calls = new AtomicInteger();
+            doAnswer(call -> {
+                calls.incrementAndGet();
+                if (Thread.holdsLock(f.coordinator)) underMonitor.set(true);
+                return call.getArgument(1);
+            }).when(f.authorization).requireCapture(any(), any());
+
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+
+            assertThat(calls).hasPositiveValue();
+            assertThat(underMonitor).as("a healthy remote fence read must not block unrelated start planning").isFalse();
+        }
+    }
+    @Test void healthyMaintenanceReusesTheChainValidatedWithAttachedConsumers() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            var held = ownedShared(f);
+            var stores = f.sources.srs(BUSINESS, () -> {});
+            var topology = stores.consumers().attached(held.chain());
+            var chain = stores.chains().load(held.chain()).orElseThrow();
+            when(stores.consumers().attachedWithChain(eq(held.chain()), any(SrsChainStore.class)))
+                    .thenReturn(new SrsConsumerStore.AttachedChain(topology, chain));
+            clearInvocations(stores.chains(), stores.consumers());
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            verify(stores.chains(), never()).load(held.chain());
+            verify(stores.consumers()).attachedWithChain(eq(held.chain()), any(SrsChainStore.class));
+        }
+    }
+
+    @Test void onePublicationSharesOneOriginalCursorAcrossAllCaptureProjections() {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var run = f.coordinator.forRun(SCOPE, PIPELINE, ORIGINAL);
+            run.startCapture("flow", f.snapshot(), f.models());
+            var progress = f.progress(true, 1, 1);
+            var ack = new ChainPosition(new SourceOrder(1, 3), "target-confirmed");
+            var cursor = new ConsumerOffset(progress.cursor().pipelineId(), Map.of("orders", 3L), ack,
+                    List.of("orders"), "seam", 1L, Map.of("orders", ack), ConsumerProgressKind.SRS);
+            f.streamingProgress.set(new SrsConsumerProgress(progress.context(), 1, 1, cursor, progress.snapshot()));
+            var consumers = f.sources.srs(BUSINESS, () -> {}).consumers();
+            clearInvocations(consumers);
+            var observations = new InMemoryStorePort();
+            observations.state().create("flow", StateJson.of(PipelineState.RUNNING), Instant.now());
+            var plan = new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), Instant.now());
+            var publisher = new RuntimeConvergenceConfiguration().observationPublisher(observations,
+                    mock(io.tapstate.runtime.engine.Engine.class), run, ids -> Map.of("flow", plan));
+
+            var observed = publisher.publish("flow").orElseThrow();
+
+            verify(consumers, times(1)).progress(f.streamingContext);
+            assertThat(observed.positions()).containsOnly(entry("orders", "target-confirmed"));
+            assertThat(observed.snapshot().get("orders").landed()).isTrue();
+            assertThat(observed.initialLoad().tables().get("orders").stage()).isEqualTo(InitialLoad.Stage.LANDED);
+            f.streamingProgress.set(f.progress(false, 1, 1));
+            var next = publisher.publish("flow").orElseThrow();
+            assertThat(next.positions()).isEmpty();
+            assertThat(next.snapshot().get("orders").landed()).isFalse();
+            assertThat(next.initialLoad().tables().get("orders").stage()).isNotEqualTo(InitialLoad.Stage.LANDED);
+            verify(consumers, times(2)).progress(f.streamingContext);
+        }
+    }
     @Test void validationRouteUsesTheOriginalAliasMembershipAndCurrentRemoteCapture() {
         try(var f=new Fixture(ReadMode.SNAPSHOT_AND_CDC)){
             var run=f.coordinator.forRun(SCOPE,PIPELINE,ORIGINAL);run.startCapture("flow",f.snapshot(),f.models());
@@ -215,6 +413,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                     : f.progress(true, "membership".equals(damage) ? 2 : 1, "snapshot".equals(damage) ? 2 : 1));
             assertThatThrownBy(() -> run.snapshotProgress("flow")).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> run.runSnapshotProgress("flow")).isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> run.measurements("flow", null, Instant.now())).isInstanceOf(TapstateException.class);
             assertThatThrownBy(() -> run.initialLoad("flow",
                     new ExecutionPlan("flow", 2L, 3L, 1L, List.of("node"), List.of(), Instant.now()), Instant.now()))
                     .isInstanceOf(TapstateException.class);
@@ -376,6 +575,86 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    @Test void aBlockedMaintenanceChainReadDoesNotDelayCaptureBindings() throws Exception {
+        try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100));
+                var callers = Executors.newSingleThreadExecutor()) {
+            var held = ownedShared(f);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            var original = chains.load(held.chain()).orElseThrow();
+            var entered = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            doAnswer(call -> {
+                if (Thread.currentThread().getName().equals("tapstate-native-shared-capture")) {
+                    entered.countDown();
+                    release.await();
+                }
+                return Optional.of(original);
+            }).when(chains).load(held.chain());
+            try {
+                assertThat(entered.await(3, TimeUnit.SECONDS)).as("maintenance reaches the chain read").isTrue();
+                var bindings = callers.submit(held.run()::captureBindings);
+                assertThat(bindings.get(1, TimeUnit.SECONDS)).isNotNull();
+                assertThat(release.getCount()).as("the store read is still withheld").isEqualTo(1);
+            } finally { release.countDown(); }
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadCannotRetireAReplacementOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("old owner read failed") : new IllegalStateException("old owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            held.run().stopCapture("flow", false);
+            var replacement = ownedShared(f);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(replacement.run().isCapturing("flow")).isTrue();
+            assertThat(replacement.run().captureFailure("flow")).isEmpty();
+            verify(replacement.tail(), never()).close();
+        }
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aFailedMaintenanceReadStillFailsItsOriginalOwner(boolean fatal) throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            Throwable failure = fatal ? new AssertionError("original owner read failed") : new IllegalStateException("original owner read failed");
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            doAnswer(call -> { if (failure instanceof Error error) throw error; throw (RuntimeException) failure; })
+                    .when(chains).load(held.chain());
+            var checked = org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "checkServingTails");
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintain", checked);
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+        }
+    }
+
+    @Test void anAlreadyFailedTailIsHandledBeforeAnyServingStateRead() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var maintenance = (ScheduledExecutorService) org.springframework.test.util.ReflectionTestUtils.getField(f.coordinator, "maintenance");
+            maintenance.shutdownNow();
+            assertThat(maintenance.awaitTermination(3, TimeUnit.SECONDS)).isTrue();
+            var failure = new IllegalStateException("physical tail failed");
+            held.tail().health().recording(mock(CaptureListener.class)).onError(failure);
+            var chains = f.sources.srs(BUSINESS, () -> {}).chains();
+            clearInvocations(chains);
+            org.springframework.test.util.ReflectionTestUtils.invokeMethod(f.coordinator, "maintenanceTick");
+            assertThat(held.run().captureFailure("flow")).contains(failure);
+            verify(held.tail()).close();
+            verify(chains, never()).load(anyString());
+        }
+    }
+
     @Test void aBlockedDemandReadDoesNotDelayCaptureRenewal() throws Exception {
         try (var f = new Fixture(List.of("input"), 8, ReadMode.SNAPSHOT_AND_CDC, Duration.ofMillis(100))) {
             var entered = new CountDownLatch(1);
@@ -457,6 +736,42 @@ class ScopedPipelineCaptureCoordinatorTest {
             assertThat(readerClosed.await(3, TimeUnit.SECONDS)).isTrue();
             verify(f.ownership, timeout(3000).atLeastOnce()).release(held.claim());
             verify(f.notes, never()).clear(any(), anyBoolean());
+        }
+    }
+
+    @Test void slowRetentionDoesNotHoldTheMonitorNeededByStartPlanning() throws Exception {
+        try (var f = new Fixture(ReadMode.SNAPSHOT_AND_CDC)) {
+            var held = ownedShared(f);
+            var retaining = new CountDownLatch(1);
+            var release = new CountDownLatch(1);
+            var planned = new CountDownLatch(1);
+            doAnswer(call -> {
+                retaining.countDown();
+                if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("retention was not released");
+                return null;
+            }).when(f.runtime).retain(any(), anyString(), any(), any());
+            var preparations = mock(SinkPreparationStore.class);
+            when(preparations.hasPreparedModels()).thenReturn(true);
+            when(f.pipelines.sinkPreparations(any(),any(),any())).thenReturn(preparations);
+            var pass = mock(PipelineConvergencePass.class);
+            when(pass.scope()).thenReturn(SCOPE);
+            try (var worker = Executors.newSingleThreadExecutor()) {
+                java.util.concurrent.Future<?> planning = null;
+                try {
+                    assertThat(retaining.await(3, TimeUnit.SECONDS)).isTrue();
+                    planning = worker.submit(() -> {
+                        f.coordinator.retainedPlanningModels(pass,f.snapshot(),f.models());
+                        planned.countDown();
+                    });
+                    assertThat(planned.await(1, TimeUnit.SECONDS))
+                            .as("start planning must not wait for unrelated SRS retention I/O")
+                            .isTrue();
+                } finally {
+                    release.countDown();
+                    if (planning != null) planning.get(3, TimeUnit.SECONDS);
+                }
+            }
+            assertThat(held.run().captureFailure("flow")).isEmpty();
         }
     }
 
@@ -625,6 +940,12 @@ class ScopedPipelineCaptureCoordinatorTest {
         }
     }
 
+    private static SrsConsumerStore consumerStore() {
+        var consumers = mock(SrsConsumerStore.class);
+        when(consumers.attachedWithChain(anyString(), any(SrsChainStore.class))).thenCallRealMethod();
+        return consumers;
+    }
+
     private static OwnedShared ownedShared(Fixture f) {
         return ownedShared(f,false);
     }
@@ -636,7 +957,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         var capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,captureId),OWNER,4,2,1,Instant.now().plusSeconds(60));
         var context=new SrsConsumerContext(new SrsConsumerKey(physical,"flow","input"),7);
         var membership=new SrsConsumerMembership(context,1,false,Set.of("orders"),PIPELINE);
-        var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=mock(SrsConsumerStore.class);
+        var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=consumerStore();
         var chain=new AtomicReference<>(new SrsChainState(physical,captureId,"1h",0,Set.of("orders"),Set.of(),0,null,null,1,1));
         var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
         var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
@@ -681,7 +1002,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var capture=new WorkloadClaim(new WorkloadClaimKey("cluster",WorkloadClaimType.CAPTURE,captureId),OWNER,4,2,1,Instant.now().plusSeconds(60));
             var context=new SrsConsumerContext(new SrsConsumerKey(physical,"flow","input"),7);
             var membership=new SrsConsumerMembership(context,1,false,Set.of("orders"),PIPELINE);
-            var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=mock(SrsConsumerStore.class);
+            var chains=mock(SrsChainStore.class);var models=mock(SrsModelStore.class);var consumers=consumerStore();
             var chain=new AtomicReference<>(new SrsChainState(physical,captureId,"1h",0,Set.of("orders"),Set.of(),0,null,null,1,1));
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",-1L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var progress=new AtomicReference<>(new SrsConsumerProgress(context,1,0,cursor,null));
@@ -739,7 +1060,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             var openedChain=new SrsChainState(physical,captureId,"1h",2,Set.of("orders"),Set.of("orders"),1,checkpoint,Instant.EPOCH,1,1);
             var cursor=new ConsumerOffset(context.key().consumerId(),Map.of("orders",13L),null,List.of(),null,0,Map.of(),ConsumerProgressKind.SRS);
             var retained=new SrsConsumerProgress(context,1,1,cursor,null);
-            var consumers=mock(SrsConsumerStore.class);var chains=mock(SrsChainStore.class);
+            var consumers=consumerStore();var chains=mock(SrsChainStore.class);
             when(f.configuration.issueFirstCreate(any())).thenReturn(new CaptureCreationResult.AlreadyIssued(prepared));
             when(f.configuration.inspectSharedHistory(eq(prepared),anyString(),anyString())).thenReturn(new CaptureSharedHistory(prepared,true));
             when(f.cache.load(prepared)).thenReturn(new CaptureCacheState(prepared,WorkloadClaimFence.from(capture),Optional.of(originalChain)));
@@ -917,6 +1238,8 @@ class ScopedPipelineCaptureCoordinatorTest {
         final AtomicInteger opened=new AtomicInteger(),closedPorts=new AtomicInteger(),readRows=new AtomicInteger(),rowCount=new AtomicInteger(1);
         final AtomicReference<Throwable> closeFailure=new AtomicReference<>();
         final AtomicReference<CapturePort> portOverride=new AtomicReference<>();
+        final AtomicBoolean checkPortIdentity = new AtomicBoolean();
+        final List<ConfiguredCaptureRun> checkedConfigurations = new CopyOnWriteArrayList<>();
         final AtomicReference<Runnable> tailGuard=new AtomicReference<>();
         final AtomicLong reportNanos=new AtomicLong();
         PausedRead pausedRead;
@@ -974,13 +1297,17 @@ class ScopedPipelineCaptureCoordinatorTest {
                     ?"io.tapdata.mongodb.MongodbConnector":"not.loaded","2.0.8",null,null,"a".repeat(64),false);
             when(connectors.resolve(connector)).thenReturn(artifact);
             when(connectors.resolve(connector,"a".repeat(64))).thenReturn(artifact);
-            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),mock(SrsConsumerStore.class)),mock(HazelcastInstance.class)));
+            runtime=spy(new NativeSrsCaptureRunUnit(BUSINESS,new SrsStores(mock(SrsChainStore.class),mock(SrsModelStore.class),mock(SrsLogStore.class),consumerStore()),mock(HazelcastInstance.class)));
             var node=new WorkloadClaimFence(new WorkloadClaimKey("cluster",WorkloadClaimType.NODE_SESSION,"node"),OWNER,1,0,1);
             coordinator=new ScopedPipelineCaptureCoordinator(new ScopedPipelineCaptureCoordinator.Stores(BUSINESS,pipelines,sources,configuration,cache,notes,ignored -> false,
                             boundedLoads,completedFull),
                     new ScopedPipelineCaptureCoordinator.Execution(() -> Optional.of(node),authorization,ownership,renewal,() -> {},Clock.systemUTC()),
                     runtime,buffer,connectors,(original,config,guard,preparation,stream) -> {
                         guard.run();if(preparation!=null)snapshotCallback.set(preparation);opened.incrementAndGet();
+                        if (checkPortIdentity.get()) {
+                            original.port(config, notes, connectors, guard);
+                            checkedConfigurations.add(original);
+                        }
                         if(portOverride.get()!=null)return portOverride.get();
                         return new Port(config.node().nodeId(),guard,closedPorts,readRows,rowCount.get(),closeFailure,pausedRead);
                     },reportNanos::get);
@@ -1002,7 +1329,7 @@ class ScopedPipelineCaptureCoordinatorTest {
         private void streaming() {
             when(ownership.acquire(any())).thenReturn(new CaptureOwnership.Permit(false, capture));
             when(snapshots.count(anyString(), anyString(), anyLong())).thenReturn(OptionalLong.of(0));
-            var consumers = mock(SrsConsumerStore.class);
+            var consumers = consumerStore();
             when(consumers.attached(any(),anyString())).thenAnswer(call->{var run=call.getArgument(0,SrsConsumerRun.class);var member=consumers.find(run.context().key()).orElse(null);return member!=null&&!member.detached()&&member.context().equals(run.context())&&member.revision()==run.membershipRevision()&&member.commandFence().equals(run.originalClaim())&&member.tables().contains(call.getArgument(1,String.class));});
             streamingProgress.set(progress(false, 1, 1));
             when(consumers.find(streamingContext.key())).thenReturn(Optional.of(

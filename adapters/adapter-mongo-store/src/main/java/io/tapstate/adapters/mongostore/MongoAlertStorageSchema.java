@@ -65,6 +65,10 @@ final class MongoAlertStorageSchema {
         return marker == null ? 0 : marker.getInteger("installedVersion");
     }
 
+    Document loadAuthorityMarker(MongoReadBudget budget) {
+        return budget.transaction(client, session -> marker(session, budget));
+    }
+
     Document loadVerifiedMarker(MongoReadBudget budget) {
         Objects.requireNonNull(budget, "budget");
         return StoreIo.call(() -> {
@@ -352,13 +356,10 @@ final class MongoAlertStorageSchema {
     private Map<String, Document> structures(MongoReadBudget budget) {
         List<String> names = COLLECTIONS.stream().map(SystemCollections::collectionName).toList();
         var found = new HashMap<String, Document>();
-        try (var cursor = budget.database(database).listCollections().filter(new Document("name", new Document("$in", names)))
-                .batchSize(COLLECTIONS.size()).iterator()) {
-            while (cursor.hasNext()) {
-                budget.remainingMillis(); Document row = cursor.next();
-                if (!(row.get("name") instanceof String name) || !names.contains(name) || found.put(name, row) != null) {
-                    throw unreadable("collection-metadata");
-                }
+        for (Document row : MongoCollectionMetadata.matching(budget.database(database), names, true)) {
+            budget.remainingMillis();
+            if (!(row.get("name") instanceof String name) || !names.contains(name) || found.put(name, row) != null) {
+                throw unreadable("collection-metadata");
             }
         }
         return found;

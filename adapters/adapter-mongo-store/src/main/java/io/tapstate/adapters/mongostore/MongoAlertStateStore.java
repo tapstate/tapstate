@@ -138,6 +138,34 @@ final class MongoAlertStateStore {
         var result = MongoAlertStateEnvelope.read(key, head, episode); requireActive.run(); return Optional.of(result);
     }
 
+    /** Decode one bounded page from its original transaction; fetch all pointed episodes once. */
+    List<MongoAlertStateEnvelope.Stored> loadEnvelopes(ClientSession session, List<Document> page) {
+        requireTransaction(session);
+        requireActive.run();
+        var pointers = new java.util.ArrayList<Document>();
+        var keys = new java.util.ArrayList<AlarmKey>();
+        for (var head : page) {
+            var key = MongoAlertStateCodec.readKey(head.get("_id", Document.class));
+            requireContext(session, key);
+            keys.add(key);
+            if (head.get("episodeNumber") != null) pointers.add(new Document("alarm", MongoAlertStateCodec.key(key))
+                    .append("number", head.get("episodeNumber")));
+        }
+        var found = new java.util.HashMap<Document, Document>();
+        if (!pointers.isEmpty()) {
+            for (var row : episodes.find(session, new Document("_id", new Document("$in", pointers))))
+                found.put(row.get("_id", Document.class), row);
+        }
+        var result = new java.util.ArrayList<MongoAlertStateEnvelope.Stored>();
+        for (int i = 0; i < page.size(); i++) {
+            var head = page.get(i);
+            var pointer = new Document("alarm", MongoAlertStateCodec.key(keys.get(i))).append("number", head.get("episodeNumber"));
+            result.add(MongoAlertStateEnvelope.read(keys.get(i), head, found.get(pointer)));
+        }
+        requireActive.run();
+        return List.copyOf(result);
+    }
+
     Optional<io.tapstate.core.alerting.AlertStateRecord.Episode> episodeEnvelope(ClientSession session, AlarmKey key, long number) {
         requireContext(session, key);
         Document row = episodes.find(session, new Document("_id", new Document("alarm", MongoAlertStateCodec.key(key)).append("number", number))).first();

@@ -21,11 +21,30 @@ final class MongoCacheBusinessIdentity {
     void requireValidationPreparation(ClientSession session, String operation) { readyIdentity(session, java.util.Objects.requireNonNull(operation)); }
 
     private Document readyIdentity(ClientSession session, String maintenance) {
-        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        // Keep both facts in the original transaction snapshot without a second round trip.
+        var row = SystemCollections.CACHE_IDENTITY.on(database).aggregate(session, List.of(
+                new Document("$match", new Document("_id", "cluster")),
+                new Document("$project", new Document("identity", "$$ROOT")),
+                new Document("$lookup", new Document("from", SystemCollections.CACHE_SCHEMA_MIGRATIONS.collectionName())
+                        .append("pipeline", List.of(new Document("$match", new Document("_id", "business"))))
+                        .append("as", "schema")))).first();
+        Document identity = row == null ? null : row.get("identity", Document.class);
         requireReadyIdentity(identity, scope);
-        Document schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        var schemas = row.getList("schema", Document.class);
+        Document schema = schemas.isEmpty() ? null : schemas.getFirst();
         requireReadySchema(identity, schema, scope, maintenance);
         return identity;
+    }
+
+    Document readReadyIdentity(ClientSession session) {
+        Document identity = SystemCollections.CACHE_IDENTITY.on(database).find(session, new Document("_id", "cluster")).first();
+        requireReadyIdentity(identity, scope);
+        return identity;
+    }
+
+    void requireAdmissionState(ClientSession session, Document identity) {
+        var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(database).find(session, new Document("_id", "business")).first();
+        requireObservedAdmission(identity, schema, scope);
     }
 
     static void requireObservedAdmission(Document identity, Document schema, CacheBusinessScope scope) {
