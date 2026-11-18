@@ -211,7 +211,7 @@ class MongoCacheDomainIT {
             var cloud = new CacheAuthScope(OP.clusterId(), 1, StorageBinding.Mode.CLOUD, OP.cacheIncarnation(), 1);
             root.prepareAuth(cloud, "setup-a", ACTIVE);
             SystemCollections.CLOUD_REVOCATIONS.on(database).drop();
-            assertThatThrownBy(() -> root.loadAuthScope(cloud)).satisfies(MongoCacheDomainIT::unreadable);
+            assertThat(root.loadAuthScope(cloud)).isEqualTo(cloud);
             assertThatThrownBy(() -> root.prepareAuth(cloud, "setup-a", ACTIVE)).satisfies(MongoCacheDomainIT::unreadable);
             assertThat(database.listCollectionNames().into(new ArrayList<>())).doesNotContain("cloud_revocations");
             assertThat(SystemCollections.CACHE_IDENTITY.on(database).find().first()).containsEntry("authGeneration", 1L);

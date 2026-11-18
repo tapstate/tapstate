@@ -131,7 +131,7 @@ final class MongoCacheIdentity {
         return marker;
     }
     <T> T transaction(Function<ClientSession, T> operation) {
-        return StoreIo.call(() -> rawTransaction(operation));
+        return MongoStructureFailureScope.call(client, null, () -> StoreIo.call(() -> rawTransaction(operation)));
     }
 
     <T> T transaction(MongoReadBudget budget, Function<ClientSession, T> operation) {
@@ -140,7 +140,10 @@ final class MongoCacheIdentity {
 
     private <T> T rawTransaction(Function<ClientSession, T> operation) {
         try (var session = client.startSession()) {
-            return session.withTransaction(() -> operation.apply(session), TRANSACTION);
+            return session.withTransaction(() -> {
+                MongoStructureFailureScope.beginCallback();
+                return operation.apply(session);
+            }, TRANSACTION);
         }
     }
 

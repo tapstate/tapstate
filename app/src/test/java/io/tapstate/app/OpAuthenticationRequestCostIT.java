@@ -78,7 +78,7 @@ class OpAuthenticationRequestCostIT {
                 assertThat(sessionLogin.status()).isEqualTo(200);
                 var control = request(http, origin, "POST", "/api/sources", token, source("fast_source", storage.masterUri()));
                 assertThat(control.status()).isEqualTo(201);
-                assertThat(authCommands(control)).isEqualTo(20);
+                assertThat(authCommands(control)).isEqualTo(16);
                 var configuration = application.getBean(StorageRoot.class).runtime().requireConfiguration();
                 var tokens = new TokenService(configuration.tokens(), application.getBean(io.tapstate.control.core.TokenSecrets.class),
                         java.time.Clock.systemUTC());
@@ -86,7 +86,7 @@ class OpAuthenticationRequestCostIT {
                 var machineCreated = request(http, origin, "POST", "/api/sources", machine,
                         source("machine_source", storage.masterUri()));
                 assertThat(machineCreated.status()).isEqualTo(201);
-                assertThat(authCommands(machineCreated)).isEqualTo(21);
+                assertThat(authCommands(machineCreated)).isEqualTo(17);
                 tokens.revoke(machine.substring("cyxt_".length(), machine.indexOf('.')));
                 var revoked = request(http, origin, "POST", "/api/sources", machine,
                         source("revoked_source", storage.masterUri()));
@@ -137,11 +137,11 @@ class OpAuthenticationRequestCostIT {
                 assertThat(outcomes).extracting(Response::status)
                         .as("a healthy storage endpoint must remain usable under the bounded authentication delay")
                         .containsOnly(201);
-                assertThat(authCommands(control)).as("bounded OP admission command cost").isEqualTo(20);
+                assertThat(authCommands(control)).as("bounded OP admission command cost").isEqualTo(16);
                 var smallPage = request(http, origin, "GET", "/api/sources?limit=1", token, null);
                 assertThat(smallPage.status()).isEqualTo(200);
                 assertThat((List<?>) smallPage.body().get("items")).hasSize(1);
-                assertThat(authCommands(smallPage)).isEqualTo(20);
+                assertThat(authCommands(smallPage)).isEqualTo(16);
                 for (int index = 0; index < 25; index++) {
                     configuration.artifacts().save(new SourceResource("unrelated_" + index, null, "mongodb",
                             Map.of("isUri", true, "uri", storage.masterUri()), null, null, null, null));
@@ -150,18 +150,17 @@ class OpAuthenticationRequestCostIT {
                     var page = request(http, origin, "GET", "/api/sources?limit=" + limit, token, null);
                     assertThat(page.status()).isEqualTo(200);
                     assertThat((List<?>) page.body().get("items")).hasSize(limit);
-                    assertThat(authCommands(page)).isEqualTo(20);
+                    assertThat(authCommands(page)).isEqualTo(16);
                 }
                 SystemCollections.OP_SESSIONS.on(raw.getDatabase(storage.cacheDatabase())).drop();
                 var missingStructure = request(http, origin, "POST", "/api/sources", token,
                         source("missing_structure_source", storage.masterUri()));
-                assertThat(missingStructure.status()).isEqualTo(503);
-                assertThat(missingStructure.body().get("code")).isEqualTo("control.storage-unavailable");
-                assertThat(hasBusinessWrite(missingStructure)).isFalse();
+                assertThat(missingStructure.status()).isEqualTo(201);
+                assertThat(authCommands(missingStructure)).isEqualTo(16);
                 assertThat(raw.getDatabase(storage.cacheDatabase()).listCollectionNames())
                         .doesNotContain(SystemCollections.OP_SESSIONS.collectionName());
                 assertThat(raw.getDatabase(storage.configurationDatabase()).getCollection("sources")
-                        .countDocuments(new Document("_id", "missing_structure_source"))).isZero();
+                        .countDocuments(new Document("_id", "missing_structure_source"))).isOne();
             }
         }
     }

@@ -62,11 +62,10 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         }
     }
 
-    /** Ordinary load verifies only the original caller-supplied authentication identity and schema. */
+    /** Reads the original authentication identity and its prepared schema marker. */
     public CacheAuthScope loadAuthScope(CacheAuthScope expected) {
         var facts = facts(expected);
         facts.transaction(session -> { facts.requireReady(session); return null; });
-        verifyAuthCollections(expected.mode());
         return expected;
     }
 
@@ -79,7 +78,6 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         Objects.requireNonNull(budget, "budget");
         var facts = facts(expected);
         facts.transaction(budget, session -> { facts.requireReady(session); return null; });
-        verifyAuthCollections(expected.mode(), budget);
         budget.requireRemaining();
         return expected;
     }
@@ -217,23 +215,23 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public SessionStore sessions(CacheAuthScope scope) {
         if (scope.mode() != StorageBinding.Mode.OP) throw MongoCacheIdentity.fenced();
         loadAuthScope(scope);
-        return new MongoCacheSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
+        return new MongoCacheSessionStore(facts(scope), connection.database());
     }
 
     /** A managed-session view does not adopt a later authentication generation. */
     public CloudSessionStore cloudSessions(CacheAuthScope scope) {
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
         loadAuthScope(scope);
-        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> verifyAuthPresence(scope.mode()));
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), null);
     }
 
-    /** A request-owned view retains its scope and deadline; each operation checks structures and fences. */
+    /** A request-owned view retains its scope and deadline; each operation verifies its original scope and fence. */
     public CloudSessionStore cloudSessions(CacheAuthScope scope, MongoReadBudget budget) {
         if (scope.mode() != StorageBinding.Mode.CLOUD) throw MongoCacheIdentity.fenced();
         Objects.requireNonNull(budget, "budget").requireRemaining();
         // This view is owned by an admitted HTTP operation. Installation and recovery validate structures;
         // its transaction still reads current identity, schema, revocation and session facts.
-        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), () -> {}, budget);
+        return new MongoCacheCloudSessionStore(facts(scope), connection.database(), budget);
     }
 
     /** Verifies a fixed business identity and its schema; individual facets verify their own structures. */
@@ -817,16 +815,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheIdentity(connection.client(), connection.database(), Objects.requireNonNull(scope, "scope"));
     }
 
-    private void verifyAuthCollections(StorageBinding.Mode mode) { verifyAuthCollections(mode, null); }
-
-    private void verifyAuthCollections(StorageBinding.Mode mode, MongoReadBudget budget) {
-        verifyAuthPresence(mode, budget);
+    private void verifyAuthCollections(StorageBinding.Mode mode) {
+        verifyAuthPresence(mode);
         StoreIo.run(() -> {
             for (var table : authTables(mode)) {
-                var database = budget == null ? connection.database() : budget.database(connection.database());
-                var indexes = table.on(database).listIndexes();
-                if (budget != null) indexes.timeoutMode(com.mongodb.client.cursor.TimeoutMode.CURSOR_LIFETIME);
-                var existing = indexes.into(new ArrayList<>());
+                var existing = table.on(database).listIndexes().into(new ArrayList<>());
                 if (existing.stream().anyMatch(index -> index.containsKey("expireAfterSeconds"))) throw unreadableIndex();
                 for (var declared : table.indexes()) {
                     var found = existing.stream().filter(index -> declared.indexName().equals(index.get("name"))).findFirst().orElse(null);
@@ -839,15 +832,12 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         });
     }
 
-    private void verifyAuthPresence(StorageBinding.Mode mode) { verifyAuthPresence(mode, null); }
-
-    private void verifyAuthPresence(StorageBinding.Mode mode, MongoReadBudget budget) {
+    private void verifyAuthPresence(StorageBinding.Mode mode) {
         StoreIo.run(() -> {
             var tables = new ArrayList<>(authTables(mode));
             tables.add(SystemCollections.CACHE_IDENTITY); tables.add(SystemCollections.CACHE_SCHEMA_MIGRATIONS);
             Set<String> required = tables.stream().map(SystemCollections::collectionName).collect(java.util.stream.Collectors.toSet());
-            var database = budget == null ? connection.database() : budget.database(connection.database());
-            var actual = MongoCollectionMetadata.matching(database, required, budget != null);
+            var actual = MongoCollectionMetadata.matching(database, required);
             if (actual.size() != required.size() || actual.stream().anyMatch(row -> !"collection".equals(row.get("type")))) throw unreadableIndex();
         });
     }
