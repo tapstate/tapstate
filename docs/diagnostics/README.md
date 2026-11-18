@@ -75,6 +75,13 @@ the original encrypted configuration and installation identity. Retention mismat
 still requires an explicit, coordinated database change; startup never rewrites TTL
 indexes, and diagnostic migration does not authorize destructive recovery.
 
+Storage operations use module `048`. Quota refusal remains HTTP 503; configuration
+import refusal and required Pipeline state rebuilds remain HTTP 409. Keep the
+original import operation when its outcome is unknown instead of replaying it.
+Typed ownership fences, unreadable-document isolation and quota handling retain
+their existing decisions. Damaged document diagnostics carry both the document
+identity and a safe field category, without embedding the damaged payload.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

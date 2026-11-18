@@ -4189,7 +4189,7 @@ class ReplTest {
         client.applyOutcome = new ApplyOutcome.Applied(
                 List.of(new ApplyOutcome.Item("kfk2my", "pipeline", "CREATED")),
                 List.of(new ApplyOutcome.Warning(code, Map.of(
-                        "pipeline", "kfk2my", "causeCode", "io.store-unavailable",
+                        "pipeline", "kfk2my", "causeCode", "TS0480001",
                         "causeParams", Map.of("detail", "test outage")))));
         SplitHarness h = onlineSplitStreamSession(base, client);
 
@@ -4197,7 +4197,7 @@ class ReplTest {
 
         assertThat(h.out().toString()).contains("created").contains("kfk2my").doesNotContain("warning:");
         assertThat(h.err().toString()).contains("warning:").contains("artifacts were applied")
-                .contains("kfk2my").contains("io.store-unavailable").contains("test outage")
+                .contains("kfk2my").contains("TS0480001").contains("test outage")
                 .contains("partially refreshed").contains("apply again").contains("Stop the pipeline");
         assertThat(h.repl().lastExitCode()).isEqualTo(Cli.EXIT_OK);
     }

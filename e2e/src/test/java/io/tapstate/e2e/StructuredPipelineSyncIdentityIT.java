@@ -104,7 +104,7 @@ class StructuredPipelineSyncIdentityIT {
                         assertThat(pipelines.updateOne(key, new Document("$set", corruption)).getMatchedCount())
                                 .isEqualTo(1);
                         Map<String, Object> error = json(control.sourceRequest("GET", path, null, null, 500).body());
-                        assertThat(error).containsEntry("code", "io.document-unreadable");
+                        assertThat(error).containsEntry("code", "TS0480004");
                         assertThat(((Map<?, ?>) error.get("params")).get("field")).isEqualTo("body");
                     } finally {
                         pipelines.replaceOne(key, stored);

@@ -206,7 +206,7 @@ class SourceConfigEncryptionMutationIT {
                 Reply failed = post(fixture.client, "/api/artifacts:apply", Map.of("drafts", rollbackDrafts));
                 assertThat(failed.status()).isEqualTo(500);
                 var error = JSON.readTree(failed.body());
-                assertThat(error.path("code").asText()).isEqualTo("io.store-unavailable");
+                assertThat(error.path("code").asText()).isEqualTo("TS0480001");
                 assertThat(error.path("params").path("detail").asText()).contains("code=11000");
                 assertThat(fixture.artifacts.countDocuments(new Document("_id", rollbackFirst))).isZero();
                 assertThat(fixture.artifacts.countDocuments(new Document("_id", rollbackSecond))).isZero();

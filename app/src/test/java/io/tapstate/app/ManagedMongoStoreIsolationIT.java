@@ -2046,7 +2046,7 @@ class ManagedMongoStoreIsolationIT {
                             Map.of("chainId", directContext.channelId(), "resumeFrom", Map.of("token", "never-direct"))));
                     assertThatThrownBy(() -> client.put().uri("/api/pipelines/position_flow/position").header("Authorization", "Bearer " + login.token())
                             .body(refused).retrieve().toBodilessEntity()).isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class,
-                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("io.direct-channel-unavailable"));
+                                    failure -> assertThat(failure.getResponseBodyAsString()).contains("TS0480032"));
                     assertThat(sharedCollection.find(new Document("_id", sharedId)).first()).isEqualTo(sharedBefore);
                     assertThat(cursorCollection.find().first()).isEqualTo(cursorBefore);
                     assertThat(channelCollection.countDocuments()).isZero();
@@ -2295,7 +2295,7 @@ class ManagedMongoStoreIsolationIT {
                                 .retrieve().toBodilessEntity();
                     } catch (org.springframework.web.client.RestClientResponseException busy) {
                         var body = (Map<?,?>)io.tapstate.core.common.JsonReader.parse(busy.getResponseBodyAsString());
-                        if (busy.getStatusCode().value() == 500 && "io.workload-claim-fenced".equals(body.get("code")))
+                        if (busy.getStatusCode().value() == 500 && "TS0480009".equals(body.get("code")))
                             throw new AssertionError("the native control is not yet available",serverFailure.get());
                         throw busy;
                     }

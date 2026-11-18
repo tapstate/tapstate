@@ -634,7 +634,7 @@ class PipelineObservationApiTest {
         Object intentReadFailure = body.get("intentReadFailure");
         assertThat(intentReadFailure).isInstanceOf(Map.class);
         assertThat(((Map<?, ?>) intentReadFailure).get("code"))
-                .isEqualTo("io.document-unreadable");
+                .isEqualTo("TS0480004");
     }
 
     @Test
@@ -649,7 +649,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("io.document-unreadable");
+        assertThat(body.code()).isEqualTo("TS0480004");
         assertThat(body.params()).isEqualTo(Map.of("id", "pl1", "field", "checkpoint"));
     }
 

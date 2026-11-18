@@ -226,7 +226,7 @@ class SourceConfigClientTransportsIT {
             fixture.artifacts.updateOne(new Document("_id", "inventory_unknown"),
                     new Document("$set", new Document("body.config", "tscfg:77:bad:" + SECRET)));
             List<Document> snapshot = fixture.snapshot();
-            mcp.refused("artifact_get", Map.of("id", "inventory_unknown"), "io.document-unreadable");
+            mcp.refused("artifact_get", Map.of("id", "inventory_unknown"), "TS0480004");
             Map<?, ?> afterCorruption = mcp.success("source_list", Map.of("limit", 200));
             safe(JSON.writeValueAsString(afterCorruption));
             assertThat(((List<?>) afterCorruption.get("items")).stream()

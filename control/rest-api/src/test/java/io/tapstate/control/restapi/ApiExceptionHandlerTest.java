@@ -51,6 +51,16 @@ class ApiExceptionHandlerTest {
     private final ApiExceptionHandler handler = new ApiExceptionHandler(MessageCatalog.bundled());
 
     @Test
+    void migratedIoRefusalsKeepTheirExplicitStatuses() {
+        assertThat(ApiExceptionHandler.statusFor(new StubCode(io.tapstate.core.common.IoErrorDefinitions.STORE_QUOTA_EXCEEDED.code())))
+                .isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        for (var definition : List.of(io.tapstate.core.common.IoErrorDefinitions.CONFIGURATION_IMPORT_REFUSED,
+                io.tapstate.core.common.IoErrorDefinitions.PIPELINE_STATE_REBUILD_REQUIRED,
+                io.tapstate.core.common.IoErrorDefinitions.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED))
+            assertThat(ApiExceptionHandler.statusFor(new StubCode(definition.code()))).isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
     void migratedStoreRefusalsKeepTheirExplicitStatuses() {
         for (var definition : List.of(io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED,
                 io.tapstate.core.common.StoreErrorDefinitions.AI_PROVIDER_SCHEMA_UNSUPPORTED))

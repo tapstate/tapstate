@@ -82,7 +82,7 @@ class SchemaRefreshAllNodesTest {
         assertThat(partial.warnings()).singleElement().satisfies(warning -> {
             assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
-                    .containsEntry("causeCode", "io.store-unavailable");
+                    .containsEntry("causeCode", "TS0480001");
         });
         assertThat(records(backing).get("snapshot_rows").schema()).containsKey("region");
         assertThat(records(backing).get("trimmed")).isEqualTo(original.get("trimmed"));

@@ -277,12 +277,12 @@ class E2eExecutorTest {
 
     @Test
     void reportsTheFailureCodeMismatchAgainstTheResolvedPipeline() {
-        binding.failureCodes("io.store-unauthorized");
+        binding.failureCodes("TS0480003");
 
         assertThatThrownBy(() -> execute(minimal("steps:\n  - assert: { failure_code: engine.job-failed }\n")))
                 .isInstanceOf(AssertionError.class)
                 .hasMessageContaining("mongo2mongo expected failure code engine.job-failed")
-                .hasMessageContaining("io.store-unauthorized");
+                .hasMessageContaining("TS0480003");
     }
 
     @Test

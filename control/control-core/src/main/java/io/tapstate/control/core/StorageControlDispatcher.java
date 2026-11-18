@@ -312,7 +312,9 @@ public final class StorageControlDispatcher {
                 io.tapstate.core.common.StoreErrorDefinitions.INVALID_URI.code(),
                 io.tapstate.core.common.StoreErrorDefinitions.TLS_TRUST_INVALID.code(),
                 io.tapstate.core.common.StoreErrorDefinitions.INITIALIZATION_REFUSED.code());
-        if (code.startsWith("io.") || store && !safeStoreCodes.contains(code))
+        boolean storeIo = code.startsWith("io.") || io.tapstate.core.common.IoErrorDefinitions.registered()
+                .stream().anyMatch(definition -> definition.code().equals(code));
+        if (storeIo || store && !safeStoreCodes.contains(code))
             return new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         // Do not retain a nested connector or driver cause in any storage-facing diagnostic.
         return new TapstateException(failure.code(), failure.args(), null);

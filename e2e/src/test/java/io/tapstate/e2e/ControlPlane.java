@@ -115,7 +115,7 @@ final class ControlPlane {
         var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
         String code = codeOf(response.body());
         if ("TS0210030".equals(code)) return false;
-        if ("io.document-unreadable".equals(code)) {
+        if ("TS0480004".equals(code) || "io.document-unreadable".equals(code)) {
             var params = paramsOf(response.body());
             if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {
                 return false;

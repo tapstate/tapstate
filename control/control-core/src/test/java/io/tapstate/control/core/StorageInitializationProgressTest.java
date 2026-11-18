@@ -109,7 +109,7 @@ class StorageInitializationProgressTest {
         var unavailable = new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null);
         progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
         progress.begin(SCOPE, 0, false); progress.failed(SCOPE, unavailable);
-        assertThat(view().milestones().get(0).errorCode()).isEqualTo("io.store-quota-exceeded");
+        assertThat(view().milestones().get(0).errorCode()).isEqualTo("TS0480002");
         progress.begin(SCOPE, 0, false);
         progress.completed(SCOPE, StorageInitializationProgress.Stage.SAVE_SETTINGS);
         assertThat(progress.quotaExceeded()).isFalse();
@@ -136,7 +136,7 @@ class StorageInitializationProgressTest {
                 Map.of("secret", "private-value"), new IllegalArgumentException("private-cause")));
         progress.begin(SCOPE, 1, true);
         progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
-        assertThat(view().milestones().get(1).errorCode()).isEqualTo("io.store-quota-exceeded");
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("TS0480002");
         assertThat(view().toString()).doesNotContain("private-value", "private-cause");
         progress.begin(SCOPE, 1, true);
         progress.completed(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE);

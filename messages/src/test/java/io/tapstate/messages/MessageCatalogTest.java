@@ -160,7 +160,7 @@ class MessageCatalogTest {
 
     @Test
     void schemaReadContentionNamesTheConnectionAndExplainsWhenToRetry() {
-        MessageCatalog.Rendered rendered = EN.render("io.schema-read-contention",
+        MessageCatalog.Rendered rendered = EN.render("TS0480007",
                 Map.of("connectionId", "orders-db"));
 
         assertThat(rendered.message()).contains("orders-db", "changed", "read attempt")

@@ -30,7 +30,8 @@ public enum ProductErrorModule {
     ENGINE("044"),
     TRANSFORM("045"),
     NEST_SIZING("046"),
-    STORE("047");
+    STORE("047"),
+    IO("048");
 
     private final String number;
 

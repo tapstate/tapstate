@@ -259,7 +259,7 @@ class ControlApiTest {
         assertThat(applied.warnings()).singleElement().satisfies(warning -> {
             assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "refresh_failed")
-                    .containsEntry("causeCode", "io.store-unavailable")
+                    .containsEntry("causeCode", "TS0480001")
                     .containsEntry("causeParams", Map.of("detail", "test outage"));
         });
     }

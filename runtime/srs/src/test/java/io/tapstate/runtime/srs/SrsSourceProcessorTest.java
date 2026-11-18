@@ -191,7 +191,7 @@ class SrsSourceProcessorTest {
             long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(10);
             while(out.isEmpty()&&!job.getFuture().isDone()&&System.nanoTime()<deadline) Thread.sleep(10);
             assertThat(checks.get()).as("the member model check ran before projection").isPositive();
-            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("io.srs-event-model-unavailable");
+            assertThatThrownBy(() -> job.getFuture().get(10,TimeUnit.SECONDS)).hasStackTraceContaining("TS0480019");
             assertThat(out).isEmpty();assertThat(cursor.get()).isEqualTo(-1);
         } finally {
             if(!job.getFuture().isDone())job.cancel();hz.getUserContext().remove(MODEL_CHECKS);hz.getUserContext().remove(MODEL_CURSOR);out.destroy();

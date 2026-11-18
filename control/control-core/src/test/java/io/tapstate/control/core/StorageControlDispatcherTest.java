@@ -269,7 +269,7 @@ class StorageControlDispatcherTest {
         }
     }
     @Test void unregisteredAndOtherModuleCodesDoNotAcquireStoreClassification() {
-        for (String identity : List.of("TS0479999", "TS0440008")) {
+        for (String identity : List.of("TS0479999", "TS0489999", "TS0440008")) {
             var code = new io.tapstate.core.common.TapstateErrorCode() {
                 public String code() { return identity; }
                 public io.tapstate.core.common.Severity severity() { return io.tapstate.core.common.Severity.ERROR; }

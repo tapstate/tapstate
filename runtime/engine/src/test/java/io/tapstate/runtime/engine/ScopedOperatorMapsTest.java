@@ -87,7 +87,7 @@ class ScopedOperatorMapsTest {
             registry.install(List.of(original)); var oldMap = member.getMap(original.mapName()); Object key = List.of("key"); oldMap.put(key,"old");
             scope.set(nextScope); registry.install(List.of(next)); var newMap = member.getMap(next.mapName());
             assertThat(newMap.get(key)).isNull(); newMap.put(key,"new");
-            assertThatThrownBy(() -> oldMap.put(key,"late")).hasStackTraceContaining("io.workload-claim-fenced");
+            assertThatThrownBy(() -> oldMap.put(key,"late")).hasStackTraceContaining("TS0480009");
             assertThat(newMap.get(key)).isEqualTo("new"); newMap.evict(key); assertThat(newMap.get(key)).isEqualTo("new");
             oldMap.destroy(); assertThat(registry.release(original)).isTrue();
             assertThat(newMap.get(key)).isEqualTo("new");
