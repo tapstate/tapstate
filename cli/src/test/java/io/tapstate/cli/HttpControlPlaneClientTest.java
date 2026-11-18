@@ -3,6 +3,7 @@ package io.tapstate.cli;
 import com.sun.net.httpserver.HttpServer;
 import io.tapstate.core.common.JsonReader;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -12,9 +13,12 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.jupiter.api.Assertions.assertAll;
 
 /**
  * The production HTTP reachability probe against a tiny in-JVM server: {@code GET /healthz} returning
@@ -877,6 +881,69 @@ class HttpControlPlaneClientTest {
                     .isEmpty();
         } finally {
             server.stop(0);
+        }
+    }
+
+    @Test
+    @Timeout(12)
+    void applyUsesTheHeavyBudgetWithoutRetryingTheWrite() throws Exception {
+        Duration probeBudget = Duration.ofMillis(500);
+        Duration heavyBudget = Duration.ofSeconds(3);
+        AtomicInteger requests = new AtomicInteger();
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        var executor = Executors.newVirtualThreadPerTaskExecutor();
+        server.setExecutor(executor);
+        server.createContext("/healthz", exchange -> {
+            exchange.sendResponseHeaders(200, -1);
+            exchange.close();
+        });
+        server.createContext("/api/artifacts:apply", exchange -> {
+            try (exchange) {
+                int request = requests.incrementAndGet();
+                exchange.getRequestBody().readAllBytes();
+                try {
+                    // The first response fits only the heavy budget; the second exceeds it too.
+                    Thread.sleep(request == 1 ? 1000 : 6000);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                byte[] response = ("{\"outcomes\":[{\"id\":\"src_kfk\",\"kind\":\"source\","
+                        + "\"change\":\"CREATED\",\"contentHash\":\"h1\"}]}")
+                        .getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, response.length);
+                exchange.getResponseBody().write(response);
+            }
+        });
+        server.start();
+        try (var client = new HttpControlPlaneClient(probeBudget, heavyBudget)) {
+            // Establish the connection before measuring server work against the read budgets.
+            assertThat(client.isHealthy(baseOf(server))).isTrue();
+            List<LocalDraft> drafts = List.of(new LocalDraft("src_kfk.tap.yml",
+                    "version: tapstate/v1\nkind: source\nid: src_kfk\n"));
+            ApplyOutcome withinHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            int requestsAfterFirstApply = requests.get();
+            long started = System.nanoTime();
+            ApplyOutcome beyondHeavyBudget = client.apply(baseOf(server), "tok", drafts);
+            Duration elapsed = Duration.ofNanos(System.nanoTime() - started);
+
+            assertAll(
+                    () -> assertThat(withinHeavyBudget)
+                            .as("a valid apply response after the probe deadline but within the heavy budget")
+                            .isInstanceOfSatisfying(ApplyOutcome.Applied.class, applied ->
+                                    assertThat(applied.items()).containsExactly(
+                                            new ApplyOutcome.Item("src_kfk", "source", "CREATED"))),
+                    () -> assertThat(requestsAfterFirstApply).as("one request for the completed write").isEqualTo(1),
+                    () -> assertThat(beyondHeavyBudget).isInstanceOf(ApplyOutcome.Unreachable.class),
+                    () -> assertThat(elapsed).as("the ambiguous write waits for the heavy deadline")
+                            .isGreaterThanOrEqualTo(heavyBudget.minusMillis(500)),
+                    () -> assertThat(elapsed).as("the heavy deadline remains bounded")
+                            .isLessThan(heavyBudget.plusSeconds(2)),
+                    () -> assertThat(requests.get()).as("neither write is automatically retried").isEqualTo(2));
+        } finally {
+            server.stop(0);
+            executor.shutdownNow();
+            executor.close();
         }
     }
 
