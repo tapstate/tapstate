@@ -340,11 +340,76 @@ class MongoCapturePreparationsIT {
             assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.DOCUMENT_UNREADABLE);assertThat(f.controls().find().first()).isEqualTo(before);
         });
     }
-    @Test void ordinaryAccessDoesNotRecreateTheControlCollectionOrAdoptAChangedSource() {
-        withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
-            f.controls().drop();assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.config.listCollectionNames().into(new ArrayList<>())).doesNotContain("capture_preparations");
+    @Test void configurationIssuanceUsesRetainedFactsWithoutAuditingCatalog() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var historyIndex = SystemCollections.CAPTURE_PREPARATIONS.indexes().getFirst();
+            f.controls().dropIndex(historyIndex.indexName());
+            var sourceIndex = SystemCollections.SOURCES.indexes().getFirst();
+            SystemCollections.SOURCES.on(f.config).dropIndex(sourceIndex.indexName());
+            var indexes = f.controls().listIndexes().into(new ArrayList<>());
+            FirstCaptureCreation grant;
+            try (var measurement = MongoHttpDiagnosticsScope.open()) {
+                grant = f.issue(f.request);
+                var snapshot = measurement.snapshot();
+                assertThat(snapshot).containsEntry("complete", true);
+                var groups = (List<?>) snapshot.get("mongo_groups");
+                assertThat(groups).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+                assertThat(groups).anySatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isEqualTo("commitTransaction"));
+            }
+            assertThat(f.configuration.capturePreparations().issueFirstCreate(f.request))
+                    .isEqualTo(new CaptureCreationResult.AlreadyIssued(grant.preparation()));
+            assertThat(f.controls().listIndexes().into(new ArrayList<>())).isEqualTo(indexes);
+            assertThat(MongoStructureInspection.inspect(f.config,
+                    MongoStructureInspection.namespaces(List.of(SystemCollections.CAPTURE_PREPARATIONS),
+                            List.of(SystemCollections.CAPTURE_PREPARATIONS), Duration.ofDays(15)),
+                    new MongoReadBudget(Duration.ofSeconds(5)))).anySatisfy(difference -> {
+                        assertThat(difference.problem()).isEqualTo(MongoStructureInspection.Problem.INDEX_MISSING);
+                        assertThat(difference.index()).isEqualTo(historyIndex.indexName());
+                    });
         });
+    }
+
+    @Test void ordinaryIssuanceWithMissingHistoryUsesMongoWriteSemantics() {
+        withFixture(CapturePreparation.Mode.DIRECT, f -> {
+            var previous = f.issue(f.request).preparation();
+            f.controls().drop();
+            var issued = f.issue(f.request).preparation();
+            assertThat(issued.captureId()).isEqualTo(previous.captureId());
+            assertThat(issued.preparationId()).isNotEqualTo(previous.preparationId());
+            assertThat(f.controls().countDocuments()).isEqualTo(1);
+        });
+    }
+
+    @Test void cacheFirstCreationRechecksOnlyTheNamespaceThatFailed() {
+        withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
+            var grant = f.issue(f.request);
+            var chain = SystemCollections.SRS_CHAINS.collectionName();
+            SystemCollections.SRS_CHAINS.on(f.cache).drop();
+            f.cache.createView(chain, "unrelated_fixture", List.of());
+            try (var measurement = MongoHttpDiagnosticsScope.open()) {
+                assertThatThrownBy(() -> f.preparations().createFirst(grant))
+                        .isInstanceOfSatisfying(TapstateException.class, error -> {
+                            assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                            assertThat(error.args().get("detail").toString())
+                                    .contains(f.cache.getName() + "." + chain, "COLLECTION_TYPE");
+                        });
+                var groups = (List<?>) measurement.snapshot().get("mongo_groups");
+                assertThat(groups.stream().map(row -> (String) ((Map<?, ?>) row).get("command"))
+                        .filter(command -> command.startsWith("list") || command.equals("abortTransaction")))
+                        .containsExactly("abortTransaction", "listCollections");
+                assertThat(groups).anySatisfy(group -> {
+                    var command = (Map<?, ?>) group;
+                    assertThat(command.get("command")).isEqualTo("listCollections");
+                    assertThat(command.get("started")).isEqualTo(1L);
+                });
+            }
+            assertThat(f.captureRows()).isEmpty();
+        });
+    }
+
+    @Test void ordinaryIssuanceDoesNotAdoptAChangedSource() {
         withFixture(CapturePreparation.Mode.SHARED_SRS,f -> {
             var source=(SourceResource)f.configuration.artifacts().get("input").orElseThrow();
             f.configuration.artifacts().save(new SourceResource(source.id(),source.metadata(),source.connector(),Map.of("host","new-server"),source.mode(),source.tables(),source.srs(),source.experimental()));
@@ -482,11 +547,12 @@ class MongoCapturePreparationsIT {
                 f.controls().createIndex(keys,new com.mongodb.client.model.IndexOptions().name(expected.indexName()).unique(damage.equals("unique")));
             }
             var indexes=f.controls().listIndexes().into(new ArrayList<>());
-            assertCode(() -> f.configuration.capturePreparations().issueFirstCreate(f.request),IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.controls().listIndexes().into(new ArrayList<>())).isEqualTo(indexes);assertThat(f.controls().countDocuments()).isZero();
+            f.issue(f.request);
+            assertThat(f.controls().listIndexes().into(new ArrayList<>())).isEqualTo(indexes);
+            assertThat(f.controls().countDocuments()).isEqualTo(1);
         });
     }
-    @Test void sharedFirstCreationReturnsItsVerifiedWritesWithoutRepeatingStructureAudit() {
+    @Test void sharedFirstCreationAndLookupUseRetainedFactsWithoutAuditingCatalog() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var grant = f.issue(f.request);
             var commands = new ArrayList<String>();
@@ -501,11 +567,14 @@ class MongoCapturePreparationsIT {
                 var preparation = new MongoCaptureCachePreparations(client, client.getDatabase(f.cache.getName()),
                         f.scope, MongoStorageBindingStore.targetFingerprint(f.connection), ACTIVE, f.domain.rateRetention());
                 var created = preparation.createFirst(grant);
-                assertThat(commands).hasSize(36);
-                assertThat(commands.stream().filter("listIndexes"::equals)).hasSize(9);
-                assertThat(commands).doesNotContain("abortTransaction");
+                assertThat(commands).hasSize(22).doesNotContain("listCollections", "listIndexes", "abortTransaction");
                 assertThat(commands.getLast()).isEqualTo("commitTransaction");
-                assertThat(f.preparations().load(created.preparation())).isEqualTo(created);
+                commands.clear();
+                assertThat(preparation.load(created.preparation())).isEqualTo(created);
+                assertThat(commands).doesNotContain("listCollections", "listIndexes", "abortTransaction");
+                commands.clear();
+                assertThat(preparation.control(created.preparation(), "orders").preparation()).isEqualTo(created.preparation());
+                assertThat(commands).doesNotContain("listCollections", "listIndexes", "abortTransaction");
                 assertThat(f.captureRows()).hasSize(1);
                 assertCode(() -> preparation.createFirst(grant), IoError.PIPELINE_INTENT_FENCED);
             }

@@ -404,7 +404,7 @@ final class MongoStorageRecoveryCommands implements StorageRecoveryCommands,io.t
         });
     }
     private Document root(ClientSession session, CacheAuthScope expected) {
-        var facts = bindings.readForTransaction(session);
+        var facts = bindings.readForStorageLifecycle(session);
         var loaded = facts.loaded().orElseThrow(MongoStorageRecoveryCommands::refused);
         var preparation = loaded.cachePreparation();
         if (!preparation.authScope().equals(expected)) throw refused();

@@ -434,6 +434,10 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
     }
 
     TransactionFacts readForTransaction(ClientSession session) {
+        return read(session);
+    }
+
+    TransactionFacts readForStorageLifecycle(ClientSession session) {
         verifyIndex();
         return read(session);
     }

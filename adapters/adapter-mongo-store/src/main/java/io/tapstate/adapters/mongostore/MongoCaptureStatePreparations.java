@@ -203,14 +203,14 @@ final class MongoCaptureStatePreparations implements CaptureStatePreparations {
         return retained;
     }
     private <T>T transaction(Function<ClientSession,T> action) {
-        return StoreIo.call(() -> {
+        return MongoStructureFailureScope.inspectOnFailure(client, () -> StoreIo.call(() -> {
             try {
-                active.run();MongoCapturePreparationFacts.verify(database);
+                active.run();
                 for(int attempt=0;;attempt++)try(var session=client.startSession()) {
-                    var result=session.withTransaction(() -> {active.run();var value=action.apply(session);active.run();return value;},TRANSACTION);active.run();return result;
+                    var result=session.withTransaction(() -> {MongoStructureFailureScope.beginCallback();active.run();var value=action.apply(session);active.run();return value;},TRANSACTION);active.run();return result;
                 }catch(MongoException raced){if(attempt>=2 || ErrorCategory.fromErrorCode(raced.getCode())!=ErrorCategory.DUPLICATE_KEY)throw raced;}
             }catch(RuntimeException failure){active.run();throw failure;}
-        });
+        }));
     }
     static FirstCaptureCreation consumeFirst(FirstCaptureCreation invocation,String targetFingerprint) {
         if(!(invocation instanceof Creation creation))throw fenced();creation.consume();if(!creation.targetFingerprint.equals(targetFingerprint))throw fenced();return creation;

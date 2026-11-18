@@ -449,7 +449,11 @@ final class MongoCachePipelineAccess {
         new MongoWorkloadClaimStore(table).inStrictSession(session).decodeStored(row);
     }
 
-    void proveClaim(ClientSession session) { proveClaim(session,"fencedPipelineWrites",false); }
+    void proveClaim(ClientSession session) { proveClaim(session, false); }
+
+    void proveClaim(ClientSession session, boolean structureChecked) {
+        proveClaim(session, "fencedPipelineWrites", structureChecked);
+    }
 
     void proveConsumerClaim(ClientSession session) { proveConsumerClaim(session,false); }
 

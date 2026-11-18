@@ -8,8 +8,11 @@ import com.mongodb.event.CommandListener;
 import com.mongodb.event.CommandStartedEvent;
 import com.mongodb.event.CommandSucceededEvent;
 import io.tapstate.core.common.OperationErrorDiagnostics;
+import io.tapstate.core.common.TapstateException;
+import io.tapstate.spi.store.IoError;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -34,28 +37,42 @@ final class MongoStructureFailureScope {
 
     static <T> T call(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
         if (!OperationErrorDiagnostics.active()) return operation.get();
+        return inspectOnFailure(client, budget, operation);
+    }
+
+    /** Runtime operations without an HTTP scope carry the diagnosis in the original coded detail. */
+    static <T> T inspectOnFailure(MongoClient client, Supplier<T> operation) {
+        return inspectOnFailure(client, null, operation);
+    }
+
+    private static <T> T inspectOnFailure(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
         var previous = CURRENT.get();
         var scope = new MongoStructureFailureScope(client, budget);
         CURRENT.set(scope);
         try { return operation.get(); }
         catch (RuntimeException original) {
             CURRENT.remove();
-            if (original == scope.translated)
-                scope.inspect();
+            if (original == scope.translated) throw scope.diagnose(original);
             throw original;
         } finally { if (previous == null) CURRENT.remove(); else CURRENT.set(previous); }
     }
 
-    private void inspect() {
-        if (failed == null) return;
+    private RuntimeException diagnose(RuntimeException original) {
+        if (failed == null) return original;
         try {
-            budget.remainingMillis();
-            var differences = MongoTargetedStructureInspection.inspect(failed.database(), failed.namespace(), budget);
-            if (!differences.isEmpty()) OperationErrorDiagnostics.confirmed(differences.stream().limit(3)
-                    .map(MongoStructureInspection.Difference::description).collect(java.util.stream.Collectors.joining("; ")));
+            var allowance = budget == null ? new MongoReadBudget(Duration.ofSeconds(5)) : budget;
+            allowance.remainingMillis();
+            var differences = MongoTargetedStructureInspection.inspect(failed.database(), failed.namespace(), allowance);
+            if (differences.isEmpty()) return original;
+            String description = differences.stream().limit(3).map(MongoStructureInspection.Difference::description)
+                    .collect(java.util.stream.Collectors.joining("; "));
+            if (OperationErrorDiagnostics.active()) OperationErrorDiagnostics.confirmed(description);
+            else if (original instanceof TapstateException coded && coded.code() == IoError.STORE_UNAVAILABLE)
+                return coded.withoutCause(Map.of("detail", coded.args().get("detail") + ". " + description));
         } catch (RuntimeException unavailable) {
-            // Supplementary diagnosis must never replace or extend the original operation's allowance.
+            // Supplementary diagnosis must never replace the original operation failure.
         }
+        return original;
     }
 
     static void beginCallback() {
