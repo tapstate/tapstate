@@ -13,6 +13,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -30,7 +31,7 @@ class CliArtifactApplyDeadlineIT {
         Files.writeString(draft, "version: tapstate/v1\nkind: source\nid: slow-source\nconnector: dummy\n");
         AtomicInteger writes = new AtomicInteger();
         HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
-        var executor = Executors.newVirtualThreadPerTaskExecutor();
+        var executor = Executors.newSingleThreadScheduledExecutor();
         server.setExecutor(executor);
         server.createContext("/healthz", exchange -> reply(exchange, "{}"));
         server.createContext("/version", exchange -> reply(exchange, "{\"version\":null}"));
@@ -44,17 +45,17 @@ class CliArtifactApplyDeadlineIT {
         server.createContext("/api/artifacts:apply", exchange -> {
             exchange.getRequestBody().readAllBytes();
             writes.incrementAndGet();
-            try {
-                // Production uses a 3-second light deadline and a 30-second heavy deadline.
-                Thread.sleep(4000);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                exchange.close();
-                return;
-            }
-            reply(exchange, """
-                    {"outcomes":[{"id":"slow-source","kind":"source","change":"CREATED","contentHash":"h1"}]}
-                    """);
+            // Finish the simulated apply after the 3-second light deadline and within the 30-second heavy deadline.
+            executor.schedule(() -> {
+                try {
+                    reply(exchange, """
+                            {"outcomes":[{"id":"slow-source","kind":"source","change":"CREATED","contentHash":"h1"}]}
+                            """);
+                } catch (IOException clientGone) {
+                    // A client with the light deadline can close the socket before the response is ready.
+                    exchange.close();
+                }
+            }, 4, TimeUnit.SECONDS);
         });
         server.start();
         try {
