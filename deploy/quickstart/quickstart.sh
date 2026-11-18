@@ -58,8 +58,8 @@ shell_quote() {
 # $1, a command printed for the reader to paste, in the form that runs where it has to. In place it
 # stays bare: the reader's shell is already in the demo directory. Piped, it becomes
 # (cd <demo directory> && $1). The subshell reaches the stack without moving the reader's shell, so the
-# installer run again from that shell is still the piped form and lands back in the directory it made,
-# instead of running in place there and taking that directory for the user's own.
+# installer run again from that shell is the same piped run, from the same place, and lands back in the
+# directory it made.
 in_demo_dir() {
     if [ -n "$demo_cd" ]; then printf '(%s && %s)' "$demo_cd" "$1"; else printf '%s' "$1"; fi
 }
@@ -378,12 +378,15 @@ EOF
 
 print_next_steps() {
     demo_dir="$(basename "$PWD")"
-    # Whole-directory removal is only ever offered for a directory this script made. Run in place --
-    # a saved script executed where it sits -- the directory is the user's and holds their files, so
-    # printing `rm -rf` on it puts a command that destroys unrelated work in front of someone who has
-    # been told, correctly, that everything above was safe to copy.
+    # Whole-directory removal is only ever offered for a directory this script made, which main() reads
+    # off the file it leaves there. Run in place anywhere else -- a saved script executed where it
+    # sits -- the directory is the user's and holds their files, so printing `rm -rf` on it puts a
+    # command that destroys unrelated work in front of someone who has been told, correctly, that
+    # everything above was safe to copy. The name is quoted: run from inside the directory it made, the
+    # script reads it off that directory, which the user may have renamed, and a bare name holding a
+    # space removes the words of it beside the directory instead of the directory.
     if [ "${demo_dir_is_ours:-no}" = yes ]; then
-        removal_line="  cd .. && rm -rf $demo_dir  remove this directory (CLI, jars, workspace, agent configuration)"
+        removal_line="  cd .. && rm -rf $(shell_quote "$demo_dir")  remove this directory (CLI, jars, workspace, agent configuration)"
     else
         removal_line="  this directory is yours, so nothing here removes it. What the quickstart added:
     tapstate tap versions/ connectors/ *-connector.jar mysql-init/ postgres-init/ work/ docker-compose.yml tapstate-mcp.json"
@@ -627,7 +630,13 @@ main() {
     # everything this script adds must stay inside one removable directory. Either marker file says
     # "work here": the saved script is the download-then-run form, the compose file is a re-run of an
     # earlier one (piped re-runs land back in the same directory rather than nesting a second).
-    # Whether this directory is ours decides what the teardown may offer. Working in place is a
+    #
+    # Whether this directory is ours decides what the teardown may offer, and the directory itself
+    # keeps the answer: the piped form leaves .tapstate-quickstart-made in the directory it takes, and
+    # a directory holding that file is ours wherever the run starts. Where it starts cannot say. The
+    # closing text sends the reader's shell into the directory a piped run made, and the next run from
+    # there -- to resume after `docker compose stop`, say -- finds the compose file and works in place,
+    # in a directory that is still the one this script made. Working in place anywhere else is a
     # supported form -- a saved script run where it sits -- and there the directory is the user's, with
     # their files in it.
     demo_dir_is_ours=no
@@ -642,11 +651,14 @@ main() {
     if [ ! -f ./quickstart.sh ] && [ ! -f ./docker-compose.yml ]; then
         mkdir -p tapstate-demo
         cd tapstate-demo
-        demo_dir_is_ours=yes
+        [ -f .tapstate-quickstart-made ] \
+            || printf 'Made by the Tapstate quickstart, which treats this directory as its own and offers to remove it whole while this file is here.\n' \
+                > .tapstate-quickstart-made
         this_dir="$PWD"
         demo_cd="cd $(shell_quote "$PWD")"
         printf 'quickstart: working in %s\n' "$PWD"
     fi
+    [ ! -f .tapstate-quickstart-made ] || demo_dir_is_ours=yes
 
     # The whole product runs as a compose stack, so a machine without Docker is refused here, before
     # anything is downloaded -- an actionable sentence beats "docker: command not found" three

@@ -457,11 +457,10 @@ running_rerun_case() {
 # same in prose: its closing text says what to run "in this directory", so it has to name the directory.
 #
 # Reaching the stack is not all a printed command owes. It is pasted into that shell, which stays open
-# for whatever comes next -- the installer run again, which the login refusal asks for in so many words.
-# A printed `cd <demo directory> && ...` leaves the shell inside the demo directory, where the next run
-# finds the compose file, runs in place, and takes the directory for the user's own: it stops offering
-# to remove it. So each command is also run the way a paste runs it, in one shell, and that shell has to
-# end where it began.
+# for whatever comes next -- the installer run again, which the login refusal asks for in so many words,
+# and which should be the same piped run, from the same place, as the one it repeats. A printed
+# `cd <demo directory> && ...` leaves the shell inside the demo directory instead. So each command is
+# also run the way a paste runs it, in one shell, and that shell has to end where it began.
 piped_hints_case() {
   local scratch start start_real demo real scenario expect cmd ran got left n=0 failures=""
   scratch="$(mktemp -d)"
@@ -560,7 +559,7 @@ PASTE
       fi
       left="$(cat "$scratch/left" 2>/dev/null)"
       [ "$left" = "$start_real" ] || failures="$failures
-      $scenario: \`$cmd\`, pasted in $start, leaves that shell in ${left:-an unknown directory}, where the installer run again runs in place and no longer offers to remove the directory it made"
+      $scenario: \`$cmd\`, pasted in $start, leaves that shell in ${left:-an unknown directory} instead"
     done < <(printf '%s\n' "$RUN_OUT" | grep -oE '\(?(cd [^&;|()]+ && )?docker compose[^;,()&|]*\)?')
     [ "$ran" -gt 0 ] || failures="$failures
       $scenario: the failure printed no command to run at all: $RUN_OUT"
@@ -672,6 +671,37 @@ if [ -d "$OWNED/tapstate-demo" ]; then
   ok "and that directory is the one it made, not the caller's"
 else
   bad "the run did not make its own directory under $OWNED"
+fi
+# Owning it has to survive the reader following the closing text into it. That text gives the cd into
+# the directory, and the next run from there -- to resume after `docker compose stop`, say -- finds the
+# compose file and works in place, exactly as a saved script does in a directory of the user's. Where a
+# run starts cannot tell the two apart; only the directory itself can.
+RUN_CWD="$OWNED/tapstate-demo" run_phase_fakes
+if printf '%s' "$RUN_OUT" | grep -q 'cd \.\. && rm -rf tapstate-demo' \
+   && ! printf '%s' "$RUN_OUT" | grep -q 'this directory is yours'; then
+  ok "run again from inside the directory it made, it still offers to remove it"
+else
+  bad "run again from inside the directory it made, it took that directory for the user's own: $RUN_OUT"
+fi
+# From inside, the name in that command is read off the directory, which the reader may have renamed.
+# Printed bare, a name holding a space removes the words of it beside the directory, not the directory.
+# So the printed command is run as pasted, from inside, under an rm that only records what it was given.
+renamed="$OWNED/it's my demo"
+mv "$OWNED/tapstate-demo" "$renamed"
+RUN_CWD="$renamed" run_phase_fakes
+removal="$(printf '%s\n' "$RUN_OUT" | sed -n 's/^  \(cd \.\. && rm -rf .*\)  remove this directory .*/\1/p')"
+mkdir -p "$OWNED/rm-shim"
+cat > "$OWNED/rm-shim/rm" <<'RM'
+#!/bin/sh
+{ pwd -P; printf '%s\n' "$@"; } > "$RM_GOT"
+RM
+chmod +x "$OWNED/rm-shim/rm"
+( cd "$renamed" && PATH="$OWNED/rm-shim:$PATH" RM_GOT="$OWNED/rm-got" sh -c "$removal" ) >/dev/null 2>&1
+want="$(printf '%s\n' "$(cd "$OWNED" && pwd -P)" -rf "it's my demo")"
+if [ -n "$removal" ] && [ "$(cat "$OWNED/rm-got" 2>/dev/null)" = "$want" ]; then
+  ok "a renamed directory it made is offered for removal as one word, the directory itself"
+else
+  bad "removal of the renamed directory, pasted from inside it, ran rm with: $(tr '\n' ' ' 2>/dev/null < "$OWNED/rm-got") (printed: ${removal:-nothing})"
 fi
 rm -rf "$OWNED"
 RUN_OUT="$saved_out"; RUN_RC="$saved_rc"
