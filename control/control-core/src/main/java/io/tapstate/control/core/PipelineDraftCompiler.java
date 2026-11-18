@@ -307,7 +307,7 @@ public final class PipelineDraftCompiler {
             result.add(new Embed(related.id(), on,
                     shape,
                     relation.shape().hasPath() ? relation.path() : null,
-                    key, arrayKey, null, null,
+                    key, arrayKey, null, relation.tracksKeyChanges() ? Boolean.TRUE : null,
                     embedsFor(related.id(), children), rollup));
         }
         return result;

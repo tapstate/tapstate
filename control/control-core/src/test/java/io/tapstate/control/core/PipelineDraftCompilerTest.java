@@ -152,6 +152,32 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void tracksKeyChangesOnRelationsThatKeepRowsUnlessTurnedOff() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        List<PipelineDraft.FieldPair> on = List.of(new PipelineDraft.FieldPair("order_id", "id"));
+        Map<String, Object> rollup = Map.of("n", Map.of("count", true));
+        List<PipelineDraft.Related> related = List.of(
+                new PipelineDraft.Related("rolled", "orders", "crm", "items",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("id"),
+                                rollup), List.of()),
+                new PipelineDraft.Related("listed", "orders", "crm", "lines",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.ARRAY, "lines", List.of(), List.of("id"),
+                                null, false), List.of()),
+                new PipelineDraft.Related("profile", "orders", "crm", "profiles",
+                        new PipelineDraft.Relation(on, PipelineDraft.Shape.OBJECT, "profile", List.of(), List.of()),
+                        List.of()));
+        PipelineDraft draft = withWizard(template, wizard.root(), related, List.of(), wizard.output());
+
+        List<Embed> embeds = nestRoot(compiler.compile(draft)).embed();
+
+        assertThat(embeds).extracting(Embed::from).containsExactly("rolled", "listed", "profile");
+        assertThat(embeds.get(0).trackKeyChanges()).isTrue();
+        assertThat(embeds.get(1).trackKeyChanges()).isNull();
+        assertThat(embeds.get(2).trackKeyChanges()).isNull();
+    }
+
+    @Test
     void rejectsARollupOnlyRelationWithoutFields() {
         PipelineDraft template = wizardDraft();
         PipelineDraft.Wizard wizard = template.wizard();

@@ -86,7 +86,7 @@ class MongoPipelineDraftStoreTest {
                         new PipelineDraft.Root("orders", "mysql", "orders", List.of("id"), List.of()),
                         List.of(new PipelineDraft.Related("items", "orders", "mysql", "order_items",
                                 new PipelineDraft.Relation(List.of(new PipelineDraft.FieldPair("order_id", "id")),
-                                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("item_id"), rollup),
+                                        PipelineDraft.Shape.ROLLUP, null, List.of(), List.of("item_id"), rollup, false),
                                 List.of())),
                         List.of(), null),
                 null, null, null, Instant.EPOCH, Instant.EPOCH, "author");
@@ -95,6 +95,7 @@ class MongoPipelineDraftStoreTest {
 
         assertThat(restored).isEqualTo(draft);
         assertThat(restored.wizard().related().getFirst().relation().rollup()).containsOnlyKeys("item_count", "latest");
+        assertThat(restored.wizard().related().getFirst().relation().trackKeyChanges()).isFalse();
     }
 
     @Test
