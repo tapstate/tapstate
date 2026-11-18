@@ -16,7 +16,7 @@ final class MongoCachePipelineStateStore implements StateStore {
 
     @Override public Optional<CheckpointDoc> read(String pipelineId) {
         access.requirePipeline(pipelineId);
-        return access.readTransaction(false, session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session, true))));
+        return access.transaction(session -> Optional.of(MongoStateStore.toCheckpoint(access.state(session, true))));
     }
 
     @Override public void create(String pipelineId, String stateJson, Instant touchTime) {
@@ -28,8 +28,8 @@ final class MongoCachePipelineStateStore implements StateStore {
         access.requirePipeline(pipelineId); Objects.requireNonNull(nextStateJson, "stateJson"); Objects.requireNonNull(touchTime, "touchTime");
         if (expectedEpoch < 0) throw new IllegalArgumentException("expected epoch must be nonnegative");
         return access.transaction(session -> {
-            Document current = access.state(session);
-            access.proveClaim(session);
+            Document current = access.state(session, true);
+            access.proveClaim(session, true);
             long epoch = current.getLong("epoch");
             if (epoch != expectedEpoch) return new CasOutcome.Fenced(epoch);
             var values = new Document("stateJson", nextStateJson).append("touchMillis", touchTime.toEpochMilli());
@@ -46,12 +46,12 @@ final class MongoCachePipelineStateStore implements StateStore {
             CheckpointDoc.LeaseRecovery recovery, Instant at) {
         access.requirePipeline(pipelineId);
         return access.transaction(session -> {
-            Document current = access.state(session);
+            Document current = access.state(session, true);
             var checkpoint = MongoStateStore.toCheckpoint(current);
             if (checkpoint.epoch() != expected.epoch()
                     || !Objects.equals(checkpoint.leaseRecovery(), expected.leaseRecovery()))
                 return new CasOutcome.Fenced(checkpoint.epoch());
-            access.proveClaim(session);
+            access.proveClaim(session, true);
             var value = new Document("intentRevision", recovery.intentRevision())
                     .append("failedExecution", recovery.failedExecution()).append("attempts", recovery.attempts())
                     .append("retryAfter", recovery.retryAfter().toEpochMilli());

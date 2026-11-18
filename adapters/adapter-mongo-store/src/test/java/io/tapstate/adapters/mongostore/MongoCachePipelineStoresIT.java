@@ -79,10 +79,9 @@ class MongoCachePipelineStoresIT {
                 assertThat(refreshed.metrics()).isEqualTo(original.metrics());
                 assertThat(refreshed.positions()).isEqualTo(original.positions());
                 assertThat(refreshed.failure()).isEqualTo(original.failure());
-                assertThat(commands).hasSize(11);
+                assertThat(commands).hasSize(6).doesNotContain("listCollections", "listIndexes");
                 assertThat(java.util.Collections.frequency(commands, "commitTransaction")).isEqualTo(1);
                 assertThat(java.util.Collections.frequency(commands, "find")).isEqualTo(2);
-                assertThat(java.util.Collections.frequency(commands, "listIndexes")).isEqualTo(2);
                 assertThat(store.read("orders")).contains(refreshed);
                 assertThat(store.refreshTerminal(original, 1, AT.plusSeconds(2))).isEmpty();
                 assertThat(states.compareAndSwap("orders", 1, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
@@ -466,12 +465,18 @@ class MongoCachePipelineStoresIT {
         withFixture(f -> {
             SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database()).drop();
             assertThat(f.domain().pipelineStates(SCOPE).read("orders")).isPresent();
-            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).isEmpty();
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
             f.database().createCollection("pipeline_observation");
             SystemCollections.CACHE_PIPELINE_STATE.on(f.database()).createIndex(new Document("touchMillis", 1),
                     new com.mongodb.client.model.IndexOptions().expireAfter(60L, TimeUnit.SECONDS));
-            assertCode(() -> f.domain().pipelineStates(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain().pipelineStates(SCOPE).read("orders")).isPresent();
+            assertThat(f.domain().inspectStructure(new io.tapstate.spi.store.CacheAuthScope(SCOPE.clusterId(), SCOPE.bindingVersion(),
+                    io.tapstate.spi.store.StorageBinding.Mode.OP, SCOPE.cacheIncarnation(), 1), new MongoReadBudget(Duration.ofSeconds(5))))
+                    .anySatisfy(issue -> {
+                        assertThat(issue.collection()).isEqualTo("pipeline_state");
+                        assertThat(issue.problem()).isEqualTo(MongoStructureInspection.Problem.UNEXPECTED_CONSTRAINT);
+                    });
         });
     }
 
@@ -574,7 +579,7 @@ class MongoCachePipelineStoresIT {
             assertThat(org.assertj.core.api.Assertions.catchThrowable(() -> states.read("orders")))
                     .as("a derived projection is not a prerequisite of the retained checkpoint").isNull();
             assertThat(states.compareAndSwap("orders", 0, "RUNNING", AT)).isInstanceOf(CasOutcome.Applied.class);
-            assertCode(() -> f.domain().pipelineObservations(SCOPE).read("orders"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain().pipelineObservations(SCOPE).read("orders")).isEmpty();
             assertThat(f.database().listCollectionNames().into(new ArrayList<>())).doesNotContain("pipeline_observation");
         });
     }

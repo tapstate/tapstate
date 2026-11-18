@@ -103,12 +103,6 @@ final class MongoCacheMetadataStructure {
     /** Admitted readers keep namespace checks live; full index audits belong to admission and strict operations. */
     void verifySrsNamespaces() { verifyNamespaces(SRS_TABLES); }
 
-    void verifyPipelineNamespaces(boolean observation) {
-        verifyNamespaces(observation ? List.of(SystemCollections.CACHE_PIPELINE_STATE,
-                SystemCollections.CACHE_PIPELINE_OBSERVATION, SystemCollections.CACHE_WORKLOAD_CLAIMS)
-                : List.of(SystemCollections.CACHE_PIPELINE_STATE, SystemCollections.CACHE_WORKLOAD_CLAIMS));
-    }
-
     private void verifyNamespaces(List<SystemCollections> tables) {
         StoreIo.run(() -> requireNamespaces(names(tables), collections(names(tables))));
     }

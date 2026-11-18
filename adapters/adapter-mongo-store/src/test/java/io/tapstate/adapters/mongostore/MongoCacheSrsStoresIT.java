@@ -50,13 +50,13 @@ class MongoCacheSrsStoresIT {
             MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
             try {
                 assertThat(states.read("pipeline")).isPresent();
-                assertReadBudget(commands, 5);
+                assertReadBudget(commands, 4);
                 commands.clear();
                 assertThat(observations.read("pipeline")).contains(stopped);
-                assertReadBudget(commands, 6);
+                assertReadBudget(commands, 5);
                 commands.clear();
                 assertThat(observations.refreshTerminal(stopped, checkpoint.epoch() + 1, at.plusSeconds(1))).isPresent();
-                assertReadBudget(commands, 7);
+                assertReadBudget(commands, 6);
                 commands.clear();
                 assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
                 assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
@@ -69,7 +69,7 @@ class MongoCacheSrsStoresIT {
     private static void assertReadBudget(List<String> commands, int count) {
         assertThat(commands).hasSize(count);
         assertThat(commands.stream().filter(c -> c.startsWith("listIndexes:"))).isEmpty();
-        assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).hasSize(1);
+        assertThat(commands.stream().filter(c -> c.startsWith("listCollections:"))).isEmpty();
         assertThat(commands.stream().filter(c -> c.startsWith("commitTransaction:"))).hasSize(1);
     }
 
@@ -92,13 +92,22 @@ class MongoCacheSrsStoresIT {
             switch (damage) {
                 case "observation-drop" -> {
                     SystemCollections.CACHE_PIPELINE_OBSERVATION.on(f.database).drop();
-                    read = () -> observations.read("pipeline");
+                    assertThat(observations.read("pipeline")).isEmpty();
+                    return;
                 }
                 case "state-view" -> {
                     var state = SystemCollections.CACHE_PIPELINE_STATE.on(f.database);
                     f.database.getCollection("state_copy").insertOne(state.find().first());
                     state.drop();
                     f.database.createView(SystemCollections.CACHE_PIPELINE_STATE.collectionName(), "state_copy", List.of());
+                    var checkpoint = states.read("pipeline").orElseThrow();
+                    assertThatThrownBy(() -> states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()))
+                            .isInstanceOfSatisfying(TapstateException.class, error -> {
+                                assertThat(error.code()).isEqualTo(IoError.STORE_UNAVAILABLE);
+                                assertThat(error.args().get("detail").toString()).contains("pipeline_state", "COLLECTION_TYPE");
+                            });
+                    assertThat(states.read("pipeline")).contains(checkpoint);
+                    return;
                 }
                 case "cursor-drop" -> {
                     SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database).drop();
@@ -131,7 +140,7 @@ class MongoCacheSrsStoresIT {
         });
     }
 
-    @Test void admittedIndexPolicyNeverRelaxesCheckpointWritesOrTheNextAudit() {
+    @Test void checkpointWritesLeaveIndexDriftToInspection() {
         withFixture(f -> {
             var prepared = f.pipeline();
             var stores = f.domain.srs(f.scope, ACTIVE);
@@ -145,11 +154,10 @@ class MongoCacheSrsStoresIT {
             SystemCollections.SRS_CONSUMERS.on(f.database).dropIndex(SystemCollections.SRS_CONSUMERS.indexes().getFirst().indexName());
             assertThat(states.read("pipeline")).contains(checkpoint);
             assertThat(f.domain.observationCursor(f.scope, context, ACTIVE)).isPresent();
-            code(() -> states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()), IoError.DOCUMENT_UNREADABLE);
-            assertThat(states.read("pipeline")).contains(checkpoint);
+            assertThat(states.compareAndSwap("pipeline", checkpoint.epoch(), "RUNNING", java.time.Instant.now()))
+                    .isInstanceOf(io.tapstate.core.lifecycle.CasOutcome.Applied.class);
             code(() -> f.domain.verifyBusinessReady(f.scope), IoError.DOCUMENT_UNREADABLE);
-            // A failed re-admission also revokes the optimized mode of already-created views.
-            code(() -> states.read("pipeline"), IoError.DOCUMENT_UNREADABLE);
+            assertThat(states.read("pipeline").orElseThrow().epoch()).isEqualTo(checkpoint.epoch() + 1);
             code(() -> f.domain.observationCursor(f.scope, context, ACTIVE), IoError.DOCUMENT_UNREADABLE);
         });
     }

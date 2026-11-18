@@ -693,7 +693,7 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         var accesses = scopes.stream().map(scope -> pipelineAccess(scope, null, active)).toList();
         var ids = scopes.stream().map(io.tapstate.spi.store.PipelineIntentScope::pipelineId).toList();
         var keys = accesses.stream().map(MongoCachePipelineObservationStore::claimKey).toList();
-        return accesses.getFirst().observationTransaction(session -> {
+        return accesses.getFirst().transaction(session -> {
             var states = observationRows(session, SystemCollections.CACHE_PIPELINE_STATE, ids);
             var claims = MongoCachePipelineObservationStore.claims(session, accesses.getFirst(), keys);
             var readings = new java.util.ArrayList<MongoCachePipelineObservationStore.Reading>();
@@ -752,10 +752,8 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private MongoCachePipelineAccess pipelineAccess(io.tapstate.spi.store.PipelineIntentScope scope,
             io.tapstate.spi.store.WorkloadClaimFence original, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        var business = new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation());
         return new MongoCachePipelineAccess(client, database, scope, original,
-                () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases,
-                () -> business.equals(readAdmission));
+                () -> { businessActive(); requireActive.run(); }, rateRetention, operatorDatabases);
     }
 
     /**
