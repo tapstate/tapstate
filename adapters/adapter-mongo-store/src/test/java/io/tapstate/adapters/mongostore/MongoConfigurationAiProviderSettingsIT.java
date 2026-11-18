@@ -44,6 +44,18 @@ class MongoConfigurationAiProviderSettingsIT {
             }
         });
     }
+    @Test void onPremProviderIsEncryptedAndSurvivesReopen() {
+        fixture((uri, config, raw) -> {
+            var owner = JsonWriter.write(List.of("on-prem"));
+            config.aiProviderSettings().put(owner, setting());
+            assertThat(SystemCollections.CONFIG_AI_PROVIDER_SETTINGS.on(raw).find().first().toJson()).doesNotContain(SECRET);
+            try (var reopened = MongoConfigurationDomain.open(new MongoConnectionSettings(uri, null, Duration.ofSeconds(5)), CLUSTER)) {
+                assertThat(reopened.aiProviderSettings().get(owner)).contains(setting());
+                reopened.aiProviderSettings().delete(owner);
+                assertThat(reopened.aiProviderSettings().get(owner)).isEmpty();
+            }
+        });
+    }
     @Test void responsesUsesTheExistingEncryptedRowAndReopensWithoutChangingLegacySettings() {
         fixture((uri, config, raw) -> {
             var store = config.aiProviderSettings();

@@ -7,7 +7,6 @@ import io.tapstate.control.core.CloudAuthenticationService;
 import io.tapstate.control.core.ManagedAuthenticationContext;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.core.common.JsonWriter;
-import io.tapstate.core.common.TapstateException;
 import io.tapstate.control.core.AiProviderSettings;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
@@ -93,7 +92,10 @@ class AiProviderController {
     record Workspace(String owner, Runnable requireActive) { }
     String owner(HttpServletRequest request) { return workspace(request).owner(); }
     Workspace workspace(HttpServletRequest request) {
-        if (mode != AuthenticationMode.CLOUD) throw new TapstateException(ControlError.AUTH_MODE_UNAVAILABLE, Map.of("mode", "on-prem"), null);
+        if (mode == AuthenticationMode.ON_PREM) {
+            AuthenticatedCaller.principal();
+            return new Workspace(JsonWriter.write(java.util.List.of("on-prem")), () -> {});
+        }
         var provider = contexts == null ? null : contexts.getIfAvailable();
         var selected = provider == null ? null : provider.current();
         CloudAuthenticationService authentication = selected == null ? cloud.getIfAvailable() : selected.service();

@@ -158,6 +158,32 @@ class AiProviderSettingsApiTest {
         }
     }
 
+    @Test void onPremUsesAuthenticatedSharedProviderSettings() {
+        var values = new HashMap<String, AiProviderSettingsStore.Settings>();
+        AiProviderSettingsStore store = new AiProviderSettingsStore() {
+            public Optional<Settings> get(String owner) { return Optional.ofNullable(values.get(owner)); }
+            public void put(String owner, Settings settings) { values.put(owner, settings); }
+            public void delete(String owner) { values.remove(owner); }
+        };
+        var service = new AiProviderService(store, new AuditGate(record -> {}, Clock.fixed(NOW, ZoneOffset.UTC)));
+        var beans = new DefaultListableBeanFactory();
+        beans.registerSingleton("mode", AuthenticationMode.ON_PREM);
+        beans.registerSingleton("service", service);
+        var controller = new AiProviderController(beans.getBeanProvider(AiProviderService.class),
+                beans.getBeanProvider(CloudAuthenticationService.class), beans.getBeanProvider(AuthenticationMode.class), null);
+        var request = new MockHttpServletRequest();
+        assertThatThrownBy(() -> controller.get(request)).isInstanceOf(IllegalStateException.class);
+        SecurityContextHolder.getContext().setAuthentication(new TapstateAuthentication(
+                TapstatePrincipal.humanJwt(new VerifiedToken("local-user", Scope.WRITE))));
+        try {
+            controller.put(request, new AiProviderSettings("openai-compatible", null, "model", "private-key"));
+            assertThat(controller.get(request).getBody()).containsEntry("configured", true).doesNotContainKey("apiKey");
+            assertThat(values).containsKey("[\"on-prem\"]");
+            controller.delete(request);
+            assertThat(controller.get(request).getBody()).containsEntry("configured", false);
+        } finally { SecurityContextHolder.clearContext(); }
+    }
+
     private static MockHttpServletRequest request(String jwtId, String secret) {
         String encodedId = Base64.getUrlEncoder().withoutPadding().encodeToString(jwtId.getBytes(StandardCharsets.UTF_8));
         var request = new MockHttpServletRequest("GET", "/ai-provider-settings");
