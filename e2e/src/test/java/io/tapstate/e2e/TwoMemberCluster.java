@@ -82,7 +82,12 @@ final class TwoMemberCluster implements AutoCloseable {
 
     /** Retains the sequential launch contract for lifecycle ordering witnesses. */
     static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage) {
-        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage);
+        return startPreparedSequentially(storage, List.of());
+    }
+
+    static TwoMemberCluster startPreparedSequentially(PreparedNativeStore storage, List<String> secondMemberArguments) {
+        return start(storage.configurationUri(), storage.clusterId(), null, false, true, Map.of(), storage,
+                secondMemberArguments);
     }
 
     /**
@@ -147,6 +152,13 @@ final class TwoMemberCluster implements AutoCloseable {
 
     private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
             boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode, PreparedNativeStore preparedStore) {
+        return start(storeUri, clusterId, nodeSessionTtl, concurrent, existingAdministrator, stagingByNode, preparedStore,
+                List.of());
+    }
+
+    private static TwoMemberCluster start(String storeUri, String clusterId, Duration nodeSessionTtl,
+            boolean concurrent, boolean existingAdministrator, Map<String, Path> stagingByNode,
+            PreparedNativeStore preparedStore, List<String> secondMemberArguments) {
         String bindAddress = RoutableAddress.ofThisMachine();
         Map<String, Integer> memberPorts = new LinkedHashMap<>();
         Map<String, RealProcessServer.PreparedLaunch> preparedLaunches = new LinkedHashMap<>();
@@ -162,8 +174,12 @@ final class TwoMemberCluster implements AutoCloseable {
             seeds = bindAddress + ":" + memberPortA + "," + bindAddress + ":" + memberPortB;
             java.util.function.IntFunction<List<String>> firstArguments = httpPort -> arguments(
                     clusterId, NODE_A, memberPortA, seeds, httpPort, bindAddress, nodeSessionTtl);
-            java.util.function.IntFunction<List<String>> secondArguments = httpPort -> arguments(
-                    clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl);
+            java.util.function.IntFunction<List<String>> secondArguments = httpPort -> {
+                var settings = new ArrayList<>(arguments(
+                        clusterId, NODE_B, memberPortB, seeds, httpPort, bindAddress, nodeSessionTtl));
+                settings.addAll(secondMemberArguments);
+                return settings;
+            };
             preparedLaunches.put(NODE_A, preparedStore == null
                     ? RealProcessServer.prepare(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments)
                     : RealProcessServer.preparePrepared(storeUri, "0.0.0.0", staging(NODE_A, stagingByNode), firstArguments));
