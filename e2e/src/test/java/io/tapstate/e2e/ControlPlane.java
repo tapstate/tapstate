@@ -114,7 +114,7 @@ final class ControlPlane {
     boolean alertCenterAvailable() {
         var response = send(authed("/api/alerts/center", "{\"limit\":1}"));
         String code = codeOf(response.body());
-        if ("control.storage-unavailable".equals(code)) return false;
+        if ("TS0210030".equals(code)) return false;
         if ("io.document-unreadable".equals(code)) {
             var params = paramsOf(response.body());
             if ("alert-store".equals(params.get("id")) && "schema-capability".equals(params.get("field"))) {

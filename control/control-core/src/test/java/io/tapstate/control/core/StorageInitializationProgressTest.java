@@ -57,7 +57,7 @@ class StorageInitializationProgressTest {
         advance(6000);
         assertThat(view().state()).isEqualTo(StorageInitializationProgress.State.FAILED);
         assertThat(view().elapsedMillis()).isEqualTo(4500);
-        assertThat(view().milestones().get(2).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(view().milestones().get(2).errorCode()).isEqualTo("TS0210030");
         assertThat(view().toString()).doesNotContain("mongodb://", "private cause");
     }
 
@@ -114,20 +114,20 @@ class StorageInitializationProgressTest {
         progress.completed(SCOPE, StorageInitializationProgress.Stage.SAVE_SETTINGS);
         assertThat(progress.quotaExceeded()).isFalse();
         progress.started(SCOPE, StorageInitializationProgress.Stage.PREPARE_STORAGE); progress.failed(SCOPE, unavailable);
-        assertThat(view().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(view().milestones().get(1).errorCode()).isEqualTo("TS0210030");
         var nextGeneration = new StorageSetupScope("cluster", "installation", "setup", 2);
         progress.begin(SCOPE, 0, false); progress.failed(SCOPE, quota);
         progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, unavailable);
-        assertThat(progress.snapshot(nextGeneration).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(progress.snapshot(nextGeneration).orElseThrow().milestones().get(0).errorCode()).isEqualTo("TS0210030");
         var nextOperation = new StorageSetupScope("cluster", "installation", "different", 2);
         progress.begin(nextGeneration, 0, false); progress.failed(nextGeneration, quota);
         progress.begin(nextOperation, 0, false); progress.failed(nextOperation, unavailable);
-        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("TS0210030");
         progress.begin(nextOperation, 0, false); progress.failed(nextOperation, quota);
         progress.begin(nextOperation, 0, false);
         progress.failed(nextOperation, new TapstateException(ControlError.STORAGE_TEST_REQUIRED, Map.of(), null));
         assertThat(progress.quotaExceeded()).isFalse();
-        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("control.storage-test-required");
+        assertThat(progress.snapshot(nextOperation).orElseThrow().milestones().get(0).errorCode()).isEqualTo("TS0210025");
     }
 
     @Test void aKnownQuotaFailureSurvivesGenericRetryFailuresOnlyWithinItsOriginalStageAndScope() {
@@ -143,11 +143,11 @@ class StorageInitializationProgressTest {
         assertThat(progress.quotaExceeded()).isFalse();
         progress.started(SCOPE, StorageInitializationProgress.Stage.START_RUNTIME);
         progress.failed(SCOPE, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
-        assertThat(view().milestones().get(2).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(view().milestones().get(2).errorCode()).isEqualTo("TS0210030");
         var other = new StorageSetupScope("cluster", "installation", "other", 2);
         progress.begin(other, 1, true);
         progress.failed(other, new TapstateException(ControlError.STORAGE_UNAVAILABLE, Map.of(), null));
-        assertThat(progress.snapshot(other).orElseThrow().milestones().get(1).errorCode()).isEqualTo("control.storage-unavailable");
+        assertThat(progress.snapshot(other).orElseThrow().milestones().get(1).errorCode()).isEqualTo("TS0210030");
     }
 
     @Test void readinessIsPublishedOnlyAfterAllActualStagesFinish() {

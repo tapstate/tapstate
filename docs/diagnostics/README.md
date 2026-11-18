@@ -11,7 +11,8 @@ refusal is `TS0210001`. Authentication rejection, missing authentication,
 insufficient capability and an unreachable control service use `TS0210002`
 through `TS0210005`, respectively. AI assistant and provider refusals use
 `TS0210006` through `TS0210013`. Control capability refusals and the post-apply
-model-refresh warning use `TS0210014` through `TS0210023`. Source mutation errors use `TS0220001`
+model-refresh warning use `TS0210014` through `TS0210023`. Storage request
+refusals use `TS0210024` through `TS0210031`. Source mutation errors use `TS0220001`
 through `TS0220007`. Pipeline, artifact and Pipeline draft mutations use modules
 `023`, `024` and `025`. DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
@@ -56,6 +57,14 @@ nested cause parameters, partial-refresh explanation, successful CLI exit and
 MCP success result. Never reclassify it as rejection of the committed artifacts.
 Diagnostic-only scripts preserve a bounded canonical code and still omit
 arbitrary server messages, credentials and parameters.
+
+Storage refusals keep their layer and declared cause identities. A failed test
+does not grant a save or initialize the runtime. Retain occupied-cache checks,
+safe empty-database suggestions and the original operation when availability or
+quota is uncertain. Display progress remains bounded, process-owned evidence;
+it is not a durable preparation or authentication grant. Do not replay setup to
+recover a quota failure. Client cause categories remain an explicit allow-list,
+and arbitrary server text or connection URIs must not enter the error display.
 
 DSL definitions live in `DslErrorDefinitions`, with the existing `DslError` and
 `ExecutionAdvisoryError` enums retaining their typed APIs. Corpus rule symbols

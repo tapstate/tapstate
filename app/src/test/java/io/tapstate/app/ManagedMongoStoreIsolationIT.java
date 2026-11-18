@@ -1693,12 +1693,12 @@ class ManagedMongoStoreIsolationIT {
                     assertThatThrownBy(() -> cloudPost(application, fresh, "/api/storage/status", Map.of()))
                             .isInstanceOfSatisfying(org.springframework.web.client.RestClientResponseException.class, failure -> {
                                 assertThat(failure.getStatusCode().value()).isEqualTo(503);
-                                assertThat(failure.getResponseBodyAsString()).contains("control.storage-unavailable");
+                                assertThat(failure.getResponseBodyAsString()).contains("TS0210030");
                             });
                     rootClient(application).get().uri("/auth/exchange?code=cache-outage").exchange((outageRequest, response) -> {
                         assertThat(response.getStatusCode().value()).isEqualTo(503);
                         assertThat(response.getHeaders().getFirst("Set-Cookie")).isNull();
-                        assertThat(response.bodyTo(String.class)).contains("control.storage-unavailable");
+                        assertThat(response.bodyTo(String.class)).contains("TS0210030");
                         return null;
                     });
                     assertThat(sdk.consumed).doesNotContain("cache-outage");

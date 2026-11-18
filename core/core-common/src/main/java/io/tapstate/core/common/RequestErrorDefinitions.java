@@ -53,12 +53,30 @@ public final class RequestErrorDefinitions {
     public static final ProductErrorDefinition SOURCE_CONFIG_REVEAL_UNAVAILABLE =
             new ProductErrorDefinition(ProductErrorModule.CONTROL, 23, Severity.ERROR, Set.of());
 
+    public static final ProductErrorDefinition STORAGE_DATABASES_OVERLAP =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 24, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition STORAGE_TEST_REQUIRED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 25, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition STORAGE_TEST_FAILED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 26, Severity.ERROR, Set.of("layer", "causeCode"));
+    public static final ProductErrorDefinition STORAGE_CACHE_DATABASE_OCCUPIED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 27, Severity.ERROR, Set.of("database"));
+    public static final ProductErrorDefinition STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 28, Severity.ERROR, Set.of("database", "suggestedDatabase"));
+    public static final ProductErrorDefinition STORAGE_SCOPE_CONFLICT =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 29, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition STORAGE_UNAVAILABLE =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 30, Severity.ERROR, Set.of());
+    public static final ProductErrorDefinition STORAGE_QUOTA_EXCEEDED =
+            new ProductErrorDefinition(ProductErrorModule.CONTROL, 31, Severity.ERROR, Set.of());
+
     private RequestErrorDefinitions() {}
 
     public static List<ProductErrorDefinition> registered() {
         return List.of(MALFORMED_REQUEST, AUTH_FAILED, UNAUTHENTICATED, FORBIDDEN, UNREACHABLE,
                 AI_NOT_CONFIGURED, AI_PROVIDER_AUTH_FAILED, AI_PROVIDER_REQUEST_REJECTED,
                 AI_PROVIDER_RATE_LIMITED, AI_PROVIDER_FAILED, AI_PROVIDER_OUTPUT_LIMIT, AI_INVALID_PROPOSAL, AI_OVERLOADED,
-                PREVIEW_OVERLOADED, AUDIT_BLOCKED, SCHEMA_DERIVATION_INCOMPLETE, BOOTSTRAP_FORBIDDEN, BOOTSTRAP_CLOSED, AUTH_MODE_UNAVAILABLE, BROWSER_AUTH_CONFIG_INVALID, CLOUD_AUTH_UNAVAILABLE, STATE_DATABASE_UNAVAILABLE, SOURCE_CONFIG_REVEAL_UNAVAILABLE);
+                PREVIEW_OVERLOADED, AUDIT_BLOCKED, SCHEMA_DERIVATION_INCOMPLETE, BOOTSTRAP_FORBIDDEN, BOOTSTRAP_CLOSED, AUTH_MODE_UNAVAILABLE, BROWSER_AUTH_CONFIG_INVALID, CLOUD_AUTH_UNAVAILABLE, STATE_DATABASE_UNAVAILABLE, SOURCE_CONFIG_REVEAL_UNAVAILABLE,
+                STORAGE_DATABASES_OVERLAP, STORAGE_TEST_REQUIRED, STORAGE_TEST_FAILED, STORAGE_CACHE_DATABASE_OCCUPIED, STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED, STORAGE_SCOPE_CONFLICT, STORAGE_UNAVAILABLE, STORAGE_QUOTA_EXCEEDED);
     }
 }

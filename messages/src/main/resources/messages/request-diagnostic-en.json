@@ -90,5 +90,37 @@
   "TS0210023": {
     "message": "Stored Source configuration cannot be revealed by this release.",
     "solution": "Use the normal Source edit flow to replace configuration. A later audited reveal flow requires dedicated permission, recent step-up authentication, and a one-time grant."
+  },
+  "TS0210024": {
+    "message": "Choose a different logical database name for each storage layer. Equal names cannot prove storage isolation.",
+    "solution": "Use distinct logical database names, then test each storage layer again."
+  },
+  "TS0210025": {
+    "message": "Test every storage layer again using the current settings before saving.",
+    "solution": "Test every required layer with the current settings before saving."
+  },
+  "TS0210026": {
+    "message": "The {layer} storage test failed ({causeCode}). Check the connection and permissions.",
+    "solution": "Check the connection and permissions, then test the same layer again."
+  },
+  "TS0210027": {
+    "message": "Cache database '{database}' already contains collections. Choose an empty database.",
+    "solution": "Enter another database name and test the connection again."
+  },
+  "TS0210028": {
+    "message": "Cache database '{database}' already contains collections. Choose a new, empty database.",
+    "solution": "Try the empty name '{suggestedDatabase}' or enter another name, then test permissions again."
+  },
+  "TS0210029": {
+    "message": "The storage operation or installation phase has changed. Read its current status.",
+    "solution": "Read the current operation and installation status before deciding the next action."
+  },
+  "TS0210030": {
+    "message": "The storage operation is temporarily unavailable. Query the original operation before retrying.",
+    "solution": "Query the original operation and restore availability before considering a retry."
+  },
+  "TS0210031": {
+    "message": "Initialization cannot complete because the storage endpoint has reached its space quota. Restore capacity and check the original operation; do not submit setup again.",
+    "solution": "Restore storage capacity and inspect the original operation; do not submit setup again."
   }
 }

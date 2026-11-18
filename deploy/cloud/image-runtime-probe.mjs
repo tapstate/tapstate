@@ -303,7 +303,7 @@ export async function verify(phase, base, fixture, metadataPath, statePath) {
     const response = await request(base, '/api/connectors');
     assert.equal(response.status, 503);
     assert((response.headers.get('content-type') ?? '').includes('application/json'));
-    assert.equal((await response.json()).code, 'control.storage-unavailable');
+    assert(['TS0210030', 'control.storage-unavailable'].includes((await response.json()).code));
     assert.equal((await request(base, '/auth/bootstrap', { method: 'POST',
       headers: { 'Content-Type': 'application/json' }, body: '{}' })).status, 403);
   } else if (phase === 'onprem') {

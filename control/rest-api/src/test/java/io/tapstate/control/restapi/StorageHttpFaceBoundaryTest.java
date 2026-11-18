@@ -73,7 +73,7 @@ class StorageHttpFaceBoundaryTest {
         assertThat(response.statusCode()).as(response.body()).isEqualTo(503);
         assertThat(response.headers().firstValue("Content-Type").orElse("")).startsWith("application/json");
         var body = (Map<?, ?>) JsonReader.parse(response.body());
-        assertThat(body.get("code")).isEqualTo("control.storage-unavailable");
+        assertThat(body.get("code")).isEqualTo("TS0210030");
         assertThat(body.get("params")).isEqualTo(Map.of());
         assertThat(response.headers().firstValue("Cache-Control")).contains("no-store");
     }

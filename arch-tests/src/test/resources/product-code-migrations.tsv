@@ -82,3 +82,11 @@ control.browser-auth-config-invalid	TS0210020
 control.cloud-auth-unavailable	TS0210021
 control.state-database-unavailable	TS0210022
 control.source-config-reveal-unavailable	TS0210023
+control.storage-databases-overlap	TS0210024
+control.storage-test-required	TS0210025
+control.storage-test-failed	TS0210026
+control.storage-cache-database-occupied	TS0210027
+control.storage-cache-database-occupied-suggested	TS0210028
+control.storage-scope-conflict	TS0210029
+control.storage-unavailable	TS0210030
+control.storage-quota-exceeded	TS0210031

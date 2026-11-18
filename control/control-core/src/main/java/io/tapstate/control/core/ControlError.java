@@ -99,17 +99,16 @@ public enum ControlError implements TapstateErrorCode {
      */
     FORBIDDEN(RequestErrorDefinitions.FORBIDDEN),
 
-    STORAGE_DATABASES_OVERLAP("control.storage-databases-overlap", Set.of()),
-    STORAGE_TEST_REQUIRED("control.storage-test-required", Set.of()),
-    STORAGE_TEST_FAILED("control.storage-test-failed", Set.of("layer", "causeCode")),
+    STORAGE_DATABASES_OVERLAP(RequestErrorDefinitions.STORAGE_DATABASES_OVERLAP),
+    STORAGE_TEST_REQUIRED(RequestErrorDefinitions.STORAGE_TEST_REQUIRED),
+    STORAGE_TEST_FAILED(RequestErrorDefinitions.STORAGE_TEST_FAILED),
     /** A fresh CACHE candidate contains one or more collections. */
-    STORAGE_CACHE_DATABASE_OCCUPIED("control.storage-cache-database-occupied", Set.of("database")),
+    STORAGE_CACHE_DATABASE_OCCUPIED(RequestErrorDefinitions.STORAGE_CACHE_DATABASE_OCCUPIED),
     /** An occupied CACHE candidate has a separately checked empty database suggestion. */
-    STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED("control.storage-cache-database-occupied-suggested",
-            Set.of("database", "suggestedDatabase")),
-    STORAGE_SCOPE_CONFLICT("control.storage-scope-conflict", Set.of()),
-    STORAGE_UNAVAILABLE("control.storage-unavailable", Set.of()),
-    STORAGE_QUOTA_EXCEEDED("control.storage-quota-exceeded", Set.of());
+    STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED(RequestErrorDefinitions.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED),
+    STORAGE_SCOPE_CONFLICT(RequestErrorDefinitions.STORAGE_SCOPE_CONFLICT),
+    STORAGE_UNAVAILABLE(RequestErrorDefinitions.STORAGE_UNAVAILABLE),
+    STORAGE_QUOTA_EXCEEDED(RequestErrorDefinitions.STORAGE_QUOTA_EXCEEDED);
 
     private final String code;
     private final Set<String> placeholders;
@@ -121,11 +120,6 @@ public enum ControlError implements TapstateErrorCode {
         this.severity = definition.severity();
     }
 
-    ControlError(String code, Set<String> placeholders) {
-        this.code = code;
-        this.placeholders = placeholders;
-        this.severity = Severity.ERROR;
-    }
 
     @Override
     public String code() {

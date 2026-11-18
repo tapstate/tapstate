@@ -25,7 +25,7 @@ class RequestDiagnosticDefinitionGatesTest {
         assertThat(java.util.Arrays.stream(ProductErrorModule.values()).map(ProductErrorModule::number).toList())
                 .doesNotHaveDuplicates().allMatch(number -> number.matches("(?!000)[0-9]{3}"));
         var request = RequestErrorDefinitions.MALFORMED_REQUEST;
-        assertThat(RequestErrorDefinitions.registered()).hasSize(23).contains(request);
+        assertThat(RequestErrorDefinitions.registered()).hasSize(31).contains(request);
         assertThat(request.code()).isEqualTo("TS0210001");
         assertThat(request.parameters()).isEqualTo(Set.of("reason"));
         assertThat(request.severity()).isEqualTo(Severity.ERROR);
@@ -61,7 +61,7 @@ class RequestDiagnosticDefinitionGatesTest {
             assertThat(baseline.remove(pair[0])).as("existing legacy identity %s", pair[0]).isTrue();
             assertThat(replacements.add(pair[1])).as("unique replacement %s", pair[1]).isTrue();
         }
-        assertThat(replacements).hasSize(83);
+        assertThat(replacements).hasSize(91);
         baseline.addAll(replacements);
         assertThat(readCodes("error-codes.golden")).isEqualTo(baseline);
     }
@@ -144,6 +144,35 @@ class RequestDiagnosticDefinitionGatesTest {
             Map<String, Object> args = new java.util.HashMap<>();
             owner.placeholders().forEach(name -> args.put(name, "value-" + name));
             assertThat(catalog.render(owner.code(), args)).isEqualTo(catalog.render(historical, args));
+            var messages = new java.util.HashSet<String>();
+            for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
+                var resolved = RequestDiagnosticCatalog.bundled().resolve(owner.code(), args, List.of(), locale).orElseThrow();
+                messages.add(resolved.message());
+                assertThat(resolved.solution()).isNotBlank();
+            }
+            assertThat(messages).hasSize(3);
+            assertThat(RequestDiagnosticCatalog.bundled().resolve(historical, args, List.of(), Locale.ENGLISH)).isEmpty();
+        }
+    }
+
+    @Test
+    void storageDefinitionsKeepTheirParametersAndHistoricalMessagesWithLocalizedRecovery() {
+        var owners = List.of(ControlError.STORAGE_DATABASES_OVERLAP, ControlError.STORAGE_TEST_REQUIRED,
+                ControlError.STORAGE_TEST_FAILED, ControlError.STORAGE_CACHE_DATABASE_OCCUPIED,
+                ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED, ControlError.STORAGE_SCOPE_CONFLICT,
+                ControlError.STORAGE_UNAVAILABLE, ControlError.STORAGE_QUOTA_EXCEEDED);
+        var catalog = io.tapstate.messages.MessageCatalog.bundled();
+        for (int i = 0; i < owners.size(); i++) {
+            var owner = owners.get(i);
+            String historical = "control." + owner.name().toLowerCase(Locale.ROOT).replace('_', '-');
+            assertThat(owner.code()).isEqualTo("TS021" + String.format("%04d", i + 24));
+            assertThat(owner.severity()).isEqualTo(Severity.ERROR);
+            Map<String, Object> args = new java.util.HashMap<>();
+            owner.placeholders().forEach(name -> args.put(name, "value-" + name));
+            var current = catalog.render(owner.code(), args);
+            var previous = catalog.render(historical, args);
+            assertThat(current.message()).isEqualTo(previous.message());
+            if (previous.solution() != null) assertThat(current.solution()).isEqualTo(previous.solution());
             var messages = new java.util.HashSet<String>();
             for (var locale : List.of(Locale.ENGLISH, Locale.SIMPLIFIED_CHINESE, Locale.TRADITIONAL_CHINESE)) {
                 var resolved = RequestDiagnosticCatalog.bundled().resolve(owner.code(), args, List.of(), locale).orElseThrow();

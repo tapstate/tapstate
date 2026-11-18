@@ -197,6 +197,10 @@ test('a seed refusal requires the unavailable business code while retaining the 
   const probe = () => verifyPhase('seed-refused', base, undefined,
     new URL('./connectors.lock.json', import.meta.url), undefined);
   await probe();
+  code = 'TS0210030';
+  await probe();
+  code = 'TS0210021';
+  await assert.rejects(probe);
   code = 'control.cloud-auth-unavailable';
   await assert.rejects(probe);
   code = 'control.storage-unavailable'; status = 200;
