@@ -143,6 +143,10 @@ class UnwindDerivedKeyTest {
         NodeColumns originalDropped = NodeColumns.of(new TransformBody.MapProjection(
                 Map.of("item_no", FieldRule.drop())), one(aliased), null);
         assertThat(originalDropped.key()).containsExactly("alias_no");
+        NodeColumns merged = NodeColumns.merged(List.of(aliased, aliased));
+        NodeColumns afterMerge = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("alias_no", FieldRule.drop())), one(merged), null);
+        assertThat(afterMerge.key()).containsExactly("item_no");
     }
 
     @Test
@@ -176,6 +180,8 @@ class UnwindDerivedKeyTest {
         NodeColumns overwritten = NodeColumns.of(new TransformBody.MapProjection(
                 Map.of("item_no", FieldRule.computed("before.item_no"))), one(expanded), null);
         assertThat(overwritten.key()).isEmpty();
+        assertThat(publishedKey(overwritten)).isEmpty();
+        assertThat(publishedKey(NodeColumns.merged(List.of(overwritten, overwritten)))).isEmpty();
     }
 
     @Test

@@ -291,8 +291,23 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Map<String, StringType> strings = commonDescriptors(inputs, out.keySet(), NodeColumns::stringTypes);
         Set<String> unchanged = new LinkedHashSet<>(out.keySet());
         inputs.forEach(input -> unchanged.retainAll(input.unchangedFields()));
-        return new NodeColumns(out, agreed.stream().filter(out::containsKey).toList(), null,
-                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs));
+        List<String> mergedKey = agreed.stream().filter(out::containsKey).toList();
+        List<Set<String>> mergedCandidates = new ArrayList<>(mergedKey.stream().map(Set::of).toList());
+        if (!mergedKey.isEmpty() && inputs.stream().allMatch(input ->
+                input.keyCandidates().size() == mergedKey.size()
+                        && input.keyCandidates().stream().noneMatch(Set::isEmpty))) {
+            mergedCandidates = new ArrayList<>();
+            for (int i = 0; i < mergedKey.size(); i++) {
+                Set<String> common = new LinkedHashSet<>(first.keyCandidates().get(i));
+                for (NodeColumns input : inputs) common.retainAll(input.keyCandidates().get(i));
+                mergedCandidates.add(common);
+            }
+        }
+        if (inputs.stream().anyMatch(input -> input.keyCandidates().stream().anyMatch(Set::isEmpty))) {
+            mergedCandidates.add(Set.of());
+        }
+        return new NodeColumns(out, mergedKey, null,
+                origins, expanded, numbers, unchanged, strings, mergedSourceIdentityFields(inputs), mergedCandidates);
     }
 
     private static <T> Map<String, T> commonDescriptors(Collection<NodeColumns> inputs, Set<String> columns,
@@ -560,11 +575,18 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         passThrough(upstream, out, numbers, strings, unchanged, consumed, dropped);
         Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
 
-        List<Set<String>> candidates = KeyProjection.candidates(upstream.keyCandidates(), rules).stream()
-                .map(names -> names.stream().filter(out::containsKey)
-                        .collect(java.util.stream.Collectors.toCollection(LinkedHashSet::new)))
-                .filter(names -> !names.isEmpty()).map(names -> (Set<String>) names).toList();
-        List<String> key = candidates.stream().map(names -> names.iterator().next()).toList();
+        List<Set<String>> candidates = new ArrayList<>();
+        for (Set<String> names : KeyProjection.candidates(upstream.keyCandidates(), rules)) {
+            if (names.isEmpty()) {
+                candidates.add(Set.of());
+                continue;
+            }
+            Set<String> surviving = new LinkedHashSet<>(names);
+            surviving.retainAll(out.keySet());
+            if (!surviving.isEmpty()) candidates.add(surviving);
+        }
+        List<String> key = candidates.stream().filter(names -> !names.isEmpty())
+                .map(names -> names.iterator().next()).toList();
         return new NodeColumns(out, key, null,
                 origins, upstream.expanded(), numbers, unchanged, strings, upstream.unwindSourceIdFields(), candidates);
     }
