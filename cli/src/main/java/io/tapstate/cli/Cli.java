@@ -494,14 +494,18 @@ public final class Cli implements Runnable {
             System.exit(newCommandLine().execute(launch.command().toArray(new String[0])));
             return;
         }
+        System.exit(runSession(launch, HttpControlPlaneClient::new));
+    }
+
+    /** Checks for usage help before creating the client for an online command or interactive session. */
+    static int runSession(LaunchOptions launch, Supplier<ControlPlaneClient> client) {
         if (launch.isOneShot()) {
             Integer helpExit = executeUsageHelp(launch.command());
             if (helpExit != null) {
-                System.exit(helpExit);
-                return;
+                return helpExit;
             }
         }
-        System.exit(runSession(launch, new HttpControlPlaneClient(), Cli::terminalPrompter));
+        return runSession(launch, client.get(), Cli::terminalPrompter);
     }
 
     private static Integer executeUsageHelp(List<String> words) {
