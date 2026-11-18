@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.Operation;
 import io.tapstate.control.core.OperationRegistry;
 import io.tapstate.control.core.TapstatePrincipal;
+import io.tapstate.control.restapi.OperationRequestMappingHandlerMapping.OptionsHandler;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.server.RequestPath;
@@ -18,8 +19,9 @@ import org.springframework.web.servlet.HandlerExecutionChain;
 import org.springframework.web.util.ServletRequestPathUtils;
 import org.springframework.web.util.UrlPathHelper;
 
-import java.util.Objects;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Objects;
 import java.util.function.Supplier;
 
 /**
@@ -45,19 +47,48 @@ final class OperationAuthorizationManager implements AuthorizationManager<Reques
     public AuthorizationResult authorize(Supplier<? extends Authentication> authentication,
             RequestAuthorizationContext context) {
         HttpServletRequest request = context.getRequest();
-        Operation operation = operationFor(request);
-        if (operation == null) {
+        HandlerMethod handler = handlerFor(request);
+        if (handler == null) {
+            OperationRequestMappingHandlerMapping.recordOptionsLookup(request, null);
             return null;
         }
-        request.setAttribute(OPERATION_ATTRIBUTE, operation);
-        Authentication current = authentication.get();
-        if (!(current != null && current.isAuthenticated() && current.getPrincipal() instanceof TapstatePrincipal principal)) {
-            return new AuthorizationDecision(false);
+        if (handler instanceof OptionsHandler options) {
+            // Resolve every mapping before granting discovery and report a stable refusal for mixed scopes.
+            var operations = options.contributors().stream().map(this::operationFor)
+                    .distinct().sorted(Comparator.comparing(Operation::id)).toList();
+            Authentication current = authentication.get();
+            for (Operation operation : operations) {
+                if (!permits(current, operation)) {
+                    request.setAttribute(OPERATION_ATTRIBUTE, operation);
+                    return new AuthorizationDecision(false);
+                }
+            }
+            OperationRequestMappingHandlerMapping.recordOptionsLookup(request, handler);
+            return new AuthorizationDecision(true);
         }
-        return new AuthorizationDecision(principal.permits(operation.scope()));
+        Operation operation = operationFor(handler);
+        request.setAttribute(OPERATION_ATTRIBUTE, operation);
+        boolean granted = permits(authentication.get(), operation);
+        if (granted) {
+            OperationRequestMappingHandlerMapping.recordOptionsLookup(request, handler);
+        }
+        return new AuthorizationDecision(granted);
     }
 
-    private Operation operationFor(HttpServletRequest request) {
+    private static boolean permits(Authentication current, Operation operation) {
+        return current != null && current.isAuthenticated() && current.getPrincipal() instanceof TapstatePrincipal principal
+                && principal.permits(operation.scope());
+    }
+
+    private Operation operationFor(HandlerMethod handler) {
+        Verb verb = handler.getMethodAnnotation(Verb.class);
+        if (verb == null) {
+            throw new IllegalStateException("an /api handler carries no @Verb: " + handler);
+        }
+        return registry.resolve(verb.value());
+    }
+
+    private HandlerMethod handlerFor(HttpServletRequest request) {
         HandlerMappingIntrospector introspector = handlers.getObject();
         List<HandlerMapping> mappings = introspector.getHandlerMappings();
         boolean parsePath = mappings.stream().anyMatch(HandlerMapping::usesPathPatterns);
@@ -80,11 +111,7 @@ final class OperationAuthorizationManager implements AuthorizationManager<Reques
                 if (!(chain.getHandler() instanceof HandlerMethod handler)) {
                     continue;
                 }
-                Verb verb = handler.getMethodAnnotation(Verb.class);
-                if (verb == null) {
-                    throw new IllegalStateException("an /api handler carries no @Verb: " + handler);
-                }
-                return registry.resolve(verb.value());
+                return handler;
             }
             return null;
         } finally {
