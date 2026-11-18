@@ -581,7 +581,7 @@ class MongoCapturePreparationsIT {
         });
     }
 
-    @Test void admittedSpecLookupLeavesCatalogInspectionToTheScheduledWorkerButWritesStillRefuseLoss() {
+    @Test void specReadsAndWritesLeaveCatalogInspectionToTheScheduledWorker() {
         withFixture(CapturePreparation.Mode.SHARED_SRS, f -> {
             var bytes = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
             var hash = ContentHash.of(bytes);
@@ -590,7 +590,7 @@ class MongoCapturePreparationsIT {
             try (var strict = MongoCacheDomain.connect(f.connection, Duration.ofSeconds(5), "inspect-strict-control");
                  var measurement = MongoHttpDiagnosticsScope.open()) {
                 assertThat(strict.connectorSpecs(f.scope, ACTIVE).get(hash)).contains(bytes);
-                assertThat(((Map<?, ?>) measurement.snapshot().get("mongo")).get("started")).isEqualTo(7L);
+                assertThat(((Map<?, ?>) measurement.snapshot().get("mongo")).get("started")).isEqualTo(3L);
             }
             try (var measurement = MongoHttpDiagnosticsScope.open()) {
                 assertThat(f.domain.connectorSpecs(f.scope, ACTIVE).get(hash)).contains(bytes);
@@ -603,9 +603,13 @@ class MongoCapturePreparationsIT {
 
             SystemCollections.CACHE_CONNECTOR_SPECS.on(f.cache).drop();
             assertThat(f.domain.connectorSpecs(f.scope, ACTIVE).get(hash)).isEmpty();
-            assertCode(() -> f.domain.connectorSpecs(f.scope, ACTIVE).put(hash, bytes), IoError.DOCUMENT_UNREADABLE);
-            assertThat(f.cache.listCollectionNames().into(new ArrayList<>()))
-                    .doesNotContain(SystemCollections.CACHE_CONNECTOR_SPECS.collectionName());
+            try (var measurement = MongoHttpDiagnosticsScope.open()) {
+                f.domain.connectorSpecs(f.scope, ACTIVE).put(hash, bytes);
+                var groups = (List<?>) measurement.snapshot().get("mongo_groups");
+                assertThat(groups).noneSatisfy(group ->
+                        assertThat(((Map<?, ?>) group).get("command")).isIn("listCollections", "listIndexes"));
+            }
+            assertThat(f.domain.connectorSpecs(f.scope, ACTIVE).get(hash)).contains(bytes);
         });
     }
 

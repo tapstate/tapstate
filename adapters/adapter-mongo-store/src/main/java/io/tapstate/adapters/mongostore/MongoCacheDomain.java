@@ -497,15 +497,14 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
         return new MongoCacheSchemaStore(metadataAccess(expected, SystemCollections.CACHE_SOURCE_SCHEMAS, requireActive));
     }
 
-    /** Read planning keeps the business fence and reuses admitted collection structure. */
+    /** Start planning reads the original schema and business scope. */
     public io.tapstate.spi.store.SchemaStore admittedStartSchemas(CacheBusinessScope expected, Runnable requireActive) {
-        return new MongoCacheSchemaStore(new MongoCacheMetadataAccess(client, database, expected,
-                SystemCollections.CACHE_SOURCE_SCHEMAS, () -> { businessActive(); requireActive.run(); }, false));
+        return schemas(expected, requireActive);
     }
 
     public io.tapstate.spi.store.ConnectorRegistry connectors(CacheBusinessScope expected, Runnable requireActive) {
-        var registry = new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
-        registry.verify(); return registry;
+        businessActive();
+        return new MongoCacheConnectorRegistry(client, database, expected, this::businessActive, requireActive);
     }
 
     public io.tapstate.spi.store.ConnectorCatalogStore connectorCatalog(CacheBusinessScope expected, Runnable requireActive) {
@@ -523,13 +522,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     }
     private MongoCacheMetadataAccess metadataAccess(CacheBusinessScope expected, SystemCollections table, Runnable requireActive) {
         Objects.requireNonNull(requireActive, "requireActive");
-        var access = new MongoCacheMetadataAccess(client, database, expected, table,
-                () -> { businessActive(); requireActive.run(); }, false);
-        // The admitted catalog and spec reads are derived lookups. Their writes still verify structure.
-        boolean admittedLookup = expected.equals(readAdmission) && (table == SystemCollections.CACHE_CONNECTOR_SPECS
-                || table == SystemCollections.CACHE_CONNECTOR_CATALOG);
-        if (!admittedLookup) access.verify();
-        return access;
+        businessActive();
+        return new MongoCacheMetadataAccess(client, database, expected, table,
+                () -> { businessActive(); requireActive.run(); });
     }
 
     /** Controlled first preparation retains this exact cache domain and caller lifecycle. */

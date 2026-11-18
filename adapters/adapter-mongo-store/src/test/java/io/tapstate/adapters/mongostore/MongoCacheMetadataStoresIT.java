@@ -347,7 +347,7 @@ class MongoCacheMetadataStoresIT {
             assertThat(catalog.get("example")).contains(entry("example"));
             assertThat(f.domain.connectorCatalog(SCOPE, ACTIVE).list()).containsExactly(entry("example"));
             SystemCollections.CACHE_CONNECTOR_SPECS.on(f.database).drop(); var before = f.snapshot();
-            assertCode(() -> f.domain.connectorSpecs(SCOPE, ACTIVE), IoError.DOCUMENT_UNREADABLE);
+            assertThat(f.domain.connectorSpecs(SCOPE, ACTIVE).get(HASH)).isEmpty();
             assertThat(f.snapshot()).isEqualTo(before);
             assertThat(f.database.listCollectionNames().into(new ArrayList<>())).doesNotContain("connector_specs");
         });

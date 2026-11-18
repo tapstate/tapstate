@@ -45,7 +45,7 @@ final class MongoStructureFailureScope {
         return inspectOnFailure(client, null, operation);
     }
 
-    private static <T> T inspectOnFailure(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
+    static <T> T inspectOnFailure(MongoClient client, MongoReadBudget budget, Supplier<T> operation) {
         var previous = CURRENT.get();
         var scope = new MongoStructureFailureScope(client, budget);
         CURRENT.set(scope);

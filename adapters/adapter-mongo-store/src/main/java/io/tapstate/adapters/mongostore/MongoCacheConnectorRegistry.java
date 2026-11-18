@@ -68,7 +68,6 @@ final class MongoCacheConnectorRegistry implements ConnectorRegistry {
                 .withReadPreference(ReadPreference.primary()).withWriteConcern(WriteConcern.MAJORITY.withJournal(true));
         this.chunks = SystemCollections.CACHE_CONNECTOR_ARTIFACTS.chunksOn(database);
     }
-    void verify() { access.verify(); }
 
     @Override public RegistrationOutcome register(String connectorId, String pdkApiVersion, RegistrationSource source, byte[] artifact) {
         Objects.requireNonNull(connectorId, "connectorId"); Objects.requireNonNull(source, "source");

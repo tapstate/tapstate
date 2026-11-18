@@ -53,7 +53,7 @@ final class MongoCacheSchemaStore implements SchemaStore {
             // A schema may exceed one document or transaction budget. These rows remain unreachable.
             for (int at = 0; at < tables.size(); at += INSERT_BATCH) {
                 List<Document> batch = List.copyOf(tables.subList(at, Math.min(at + INSERT_BATCH, tables.size())));
-                access.verify(); StoreIo.run(id, () -> rows.insertMany(batch)); access.verify();
+                access.writeBatch(id, () -> rows.insertMany(batch));
             }
             publish(discovered, generation);
         } catch (RuntimeException failure) {
@@ -176,7 +176,7 @@ final class MongoCacheSchemaStore implements SchemaStore {
                 if (!garbage.isEmpty()) {
                     Document exact = scoped(new Document("_id", ownedKeys(id)).append(GENERATION, new Document("$in", List.copyOf(garbage))));
                     // Revocation won before deletion; a late writer cannot publish these exact UUIDs.
-                    access.verify(); StoreIo.run(id, () -> rows.deleteMany(exact)); access.verify();
+                    access.writeBatch(id, () -> rows.deleteMany(exact));
                 }
                 return;
             }
