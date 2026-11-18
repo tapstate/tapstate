@@ -19,7 +19,14 @@ public enum ProductErrorModule {
     CLI("033"),
     ALERT("034"),
     CAPTURE("035"),
-    ACTUATION("036");
+    ACTUATION("036"),
+    CLUSTER("037"),
+    CONNECTOR_CATALOG("038"),
+    DATA_BROWSER("039"),
+    MONITOR("040"),
+    POSITION("041"),
+    MIGRATION("042"),
+    ROW_VALUE("043");
 
     private final String number;
 

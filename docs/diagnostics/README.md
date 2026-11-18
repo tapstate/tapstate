@@ -51,6 +51,16 @@ original typed recovery decisions. Declarative verification accepts canonical TS
 identities and historical codes during migration; both the parser and published
 schema reject zero modules/serials, malformed lengths and padded TS codes.
 
+Cluster membership, connector lookup, data browsing, monitoring, position write-back,
+store migration and row-map key validation use modules `037` through `043`.
+Only the typed missing-collection refusal makes a target probe empty; source lookup
+and invariant failures still propagate. A status response with HTTP 404 and
+`TS0400001` means no observation is available yet, not that execution failed or
+stopped. Polling consumers also accept the historical `monitor.no-observation`
+reply during migration and must reject unrelated 404 and authorization failures.
+Store migrations preserve transaction and version checks. Verification that launches
+an actual older binary continues to expect that binary's historical refusal code.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

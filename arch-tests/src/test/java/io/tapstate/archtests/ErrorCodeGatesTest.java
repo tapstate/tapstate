@@ -84,7 +84,14 @@ class ErrorCodeGatesTest {
                 io.tapstate.core.common.CliErrorDefinitions.registered(),
                 io.tapstate.core.common.AlertErrorDefinitions.registered(),
                 io.tapstate.core.common.CaptureErrorDefinitions.registered(),
-                io.tapstate.core.common.ActuationErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
+                io.tapstate.core.common.ActuationErrorDefinitions.registered(),
+                io.tapstate.core.common.ClusterErrorDefinitions.registered(),
+                io.tapstate.core.common.ConnectorCatalogErrorDefinitions.registered(),
+                io.tapstate.core.common.DataBrowserErrorDefinitions.registered(),
+                io.tapstate.core.common.MonitorErrorDefinitions.registered(),
+                io.tapstate.core.common.PositionErrorDefinitions.registered(),
+                io.tapstate.core.common.MigrationErrorDefinitions.registered(),
+                io.tapstate.core.common.RowValueErrorDefinitions.registered()).flatMap(List::stream).forEach(definition -> {
             assertThat(registered.put(definition.code(), definition)).isNull();
         });
         return registered;
@@ -211,7 +218,14 @@ class ErrorCodeGatesTest {
                                 && io.tapstate.messages.CliDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.AlertDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
                                 && io.tapstate.messages.CaptureDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
-                                && io.tapstate.messages.ActuationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
+                                && io.tapstate.messages.ActuationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ClusterDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.ConnectorCatalogDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.DataBrowserDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MonitorDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.PositionDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.MigrationDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty()
+                                && io.tapstate.messages.RowValueDiagnosticCatalog.bundled().resolve(code, args, List.of(), java.util.Locale.ENGLISH).isEmpty();
                     }
                     Map<String, String> entry = catalog.get(code);
                     return entry == null || entry.get("message") == null || entry.get("message").isBlank();

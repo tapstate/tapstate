@@ -1,0 +1,6 @@
+{
+  "TS0380001": {
+    "message": "Connector '{connector}' is not present in the online catalog.",
+    "solution": "Choose a connector returned by `connector.list`, or register it before requesting its form metadata."
+  }
+}

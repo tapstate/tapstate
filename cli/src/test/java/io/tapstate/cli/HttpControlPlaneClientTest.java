@@ -1867,13 +1867,13 @@ class HttpControlPlaneClientTest {
     @Test
     void statusReturnsRejectedWithTheServerCodeAndMessageOnACodedError() throws Exception {
         HttpServer server = apiServer("/api/pipelines/ghost/status", 404,
-                "{\"code\":\"monitor.no-observation\",\"params\":{\"pipeline\":\"ghost\"},"
+                "{\"code\":\"TS0400001\",\"params\":{\"pipeline\":\"ghost\"},"
                         + "\"message\":\"No observation is available for pipeline ghost.\"}",
                 new AtomicReference<>());
         try {
             StatusOutcome outcome = new HttpControlPlaneClient().status(baseOf(server), "tok", "ghost");
             assertThat(outcome).isEqualTo(new StatusOutcome.Rejected(
-                    "monitor.no-observation", "No observation is available for pipeline ghost."));
+                    "TS0400001", "No observation is available for pipeline ghost."));
         } finally {
             server.stop(0);
         }

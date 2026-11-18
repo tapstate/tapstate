@@ -276,8 +276,8 @@ class ApiExceptionHandlerTest {
                 handler.handle(new TapstateException(MonitorError.NO_OBSERVATION, Map.of("pipeline", "pl1"), null));
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(response.getBody().code()).isEqualTo("monitor.no-observation");
-        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("monitor.no-observation");
+        assertThat(response.getBody().code()).isEqualTo("TS0400001");
+        assertThat(response.getBody().message()).isNotBlank().isNotEqualTo("TS0400001");
     }
 
     @Test
@@ -376,9 +376,9 @@ class ApiExceptionHandlerTest {
         // they answer 500, which tells a caller the server broke rather than that their request was
         // refused - the one thing a refusal has to be distinguishable from.
         for (String code : List.of(
-                "data-browser.invalid-limit",
-                "data-browser.connector-not-browsable",
-                "data-browser.unorderable-field")) {
+                "TS0390002",
+                "TS0390004",
+                "TS0390003")) {
             assertThat(ApiExceptionHandler.statusFor(new StubCode(code))).as(code)
                     .isEqualTo(HttpStatus.BAD_REQUEST);
         }
@@ -432,11 +432,11 @@ class ApiExceptionHandlerTest {
 
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
         ApiError body = response.getBody();
-        assertThat(body.code()).isEqualTo("cluster.membership-unreadable");
+        assertThat(body.code()).isEqualTo("TS0370001");
         assertThat(body.message())
                 .describedAs("rendered from the catalog, not left as the bare code -- a person reading "
                         + "a failing run's output is the first caller this reaches")
-                .isNotEqualTo("cluster.membership-unreadable")
+                .isNotEqualTo("TS0370001")
                 .contains("cannot read who is in the cluster");
     }
 

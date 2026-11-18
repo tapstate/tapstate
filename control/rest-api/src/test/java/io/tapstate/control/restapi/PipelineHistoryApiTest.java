@@ -84,7 +84,7 @@ class PipelineHistoryApiTest {
 
         ApiError changed = historyError((String) first.get("nextCursor"), List.of("orders"),
                 HttpStatus.BAD_REQUEST);
-        assertThat(changed.code()).isEqualTo("monitor.invalid-cursor");
+        assertThat(changed.code()).isEqualTo("TS0400002");
         assertThat(changed.params()).containsEntry("reason", "QUERY_MISMATCH");
 
         ApiError anotherPipeline = client().get().uri(uri -> uri
@@ -101,14 +101,14 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(anotherPipeline.code()).isEqualTo("monitor.invalid-cursor");
+        assertThat(anotherPipeline.code()).isEqualTo("TS0400002");
         assertThat(anotherPipeline.params()).containsEntry("reason", "QUERY_MISMATCH");
 
         String cursor = (String) first.get("nextCursor");
         char replacement = cursor.endsWith("A") ? 'B' : 'A';
         ApiError tampered = historyError(cursor.substring(0, cursor.length() - 1) + replacement,
                 List.of(), HttpStatus.BAD_REQUEST);
-        assertThat(tampered.code()).isEqualTo("monitor.invalid-cursor");
+        assertThat(tampered.code()).isEqualTo("TS0400002");
         assertThat(tampered.params()).containsEntry("reason", "TAMPERED");
     }
 
@@ -124,7 +124,7 @@ class PipelineHistoryApiTest {
                 new Key(from.plusSeconds(30), "00000001"), from.plusSeconds(30));
 
         ApiError gone = historyError(expired, List.of(), HttpStatus.GONE);
-        assertThat(gone.code()).isEqualTo("monitor.cursor-expired");
+        assertThat(gone.code()).isEqualTo("TS0400003");
 
         ApiError largePage = client().get().uri(uri -> uri
                         .path("/api/pipelines/pl1/metrics/history")
@@ -155,7 +155,7 @@ class PipelineHistoryApiTest {
                     assertThat(response.getHeaders().getCacheControl()).isEqualTo("no-store");
                     return response.bodyTo(ApiError.class);
                 });
-        assertThat(selectors.code()).isEqualTo("monitor.query-budget-exceeded");
+        assertThat(selectors.code()).isEqualTo("TS0400004");
         assertThat(selectors.params()).containsEntry("budget", "SERIES").containsEntry("limit", 22);
 
         ApiError unbounded = client().get().uri(uri -> uri

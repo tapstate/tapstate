@@ -468,7 +468,7 @@ class ConnectorApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("connector.not-found");
+        assertThat(body.code()).isEqualTo("TS0380001");
         assertThat(body.params()).containsEntry("connector", "missing");
     }
 

@@ -1,0 +1,30 @@
+{
+  "TS0390001": {
+    "message": "Source '{source}' has no collection named '{collection}'.",
+    "solution": "List what the source holds and read one of those names."
+  },
+  "TS0390002": {
+    "message": "A read of {limit} rows is not served; ask for between 1 and {max}.",
+    "solution": "Ask for at most {max} rows, or narrow the read with a filter."
+  },
+  "TS0390003": {
+    "message": "Field '{field}' is named with a dot in it, and results cannot be ordered by such a field.",
+    "solution": "Order by another field. This one can still be filtered on, by escaping the dot that belongs to its name: write it price\\\\.usd in the shell, and \"price\\\\\\\\.usd\" in JSON, where a lone backslash is not an escape the format allows. Filtering it reads every row, though: an index is written the same way a path is, so a field whose name holds a dot cannot have one."
+  },
+  "TS0390004": {
+    "message": "Connector '{connector}' answers reads in its own shape, and this face asks in documents, so its rows cannot be browsed.",
+    "solution": "Browse a source on one of: {browsable}. This source can still be listed and sized, and it can still be read by a pipeline."
+  },
+  "TS0390005": {
+    "message": "Following stopped: the source being followed was deleted.",
+    "solution": "Declare the source again, or follow a collection of a source that still exists."
+  },
+  "TS0390006": {
+    "message": "Following stopped: the stream from the source failed.",
+    "solution": "Check the server log for what the connector reported, then follow it again."
+  },
+  "TS0390007": {
+    "message": "Following stopped after 10 minutes with no changes; the connector instance it held was given back.",
+    "solution": "Follow it again to keep watching."
+  }
+}

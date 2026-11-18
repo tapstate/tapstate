@@ -470,7 +470,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.unknown-collection");
+        assertThat(body.code()).isEqualTo("TS0390001");
         assertThat(body.params()).containsEntry("source", "views").containsEntry("collection", "absent");
     }
 
@@ -490,7 +490,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.unorderable-field");
+        assertThat(body.code()).isEqualTo("TS0390003");
         // Named as the caller wrote it: parsed, they would go looking for a different field.
         assertThat(body.params()).containsEntry("field", "price\\.usd");
     }
@@ -533,7 +533,7 @@ class DataBrowserApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("data-browser.invalid-limit");
+        assertThat(body.code()).isEqualTo("TS0390002");
         assertThat(body.params()).containsEntry("max", "200");
     }
 

@@ -109,7 +109,7 @@ class PipelineStatusWatchHandlerTest {
 
     @Test
     void aPipelineAppliedButNotYetConvergedKeepsThePollLoopOpen() {
-        // monitor.no-observation is transient: nothing to stream yet, but the watch must not give up.
+        // TS0400001 is transient: nothing to stream yet, but the watch must not give up.
         PipelineObservationQueryService observations = serviceWith(emptyObservations(), "orders");
         PipelineStatusWatchHandler handler = handler(observations);
         FakeWebSocketSession session = new FakeWebSocketSession();

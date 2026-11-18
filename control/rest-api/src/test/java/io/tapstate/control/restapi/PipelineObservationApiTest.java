@@ -106,7 +106,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p>Status returns a catalog projection for a known authoring draft or applied pipeline. A known
  * transition can report a display state before it has a runtime state to report. Metrics, snapshot, and
- * explanation still return {@code monitor.no-observation} when runtime data is not yet available. The tests
+ * explanation still return {@code TS0400001} when runtime data is not yet available. The tests
  * prove the reads round-trip through the real query service, that an unknown id returns the permanent coded
  * error, that the interceptor guards a read like any other verb, and that read endpoints derive from the registry.
  * The context is booted programmatically so the module stays on the reactor's JUnit line; it imports the
@@ -550,7 +550,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("monitor.no-observation");
+        assertThat(body.code()).isEqualTo("TS0400001");
         assertThat(body.params()).containsEntry("pipeline", "pl1");
     }
 
@@ -1086,7 +1086,7 @@ class PipelineObservationApiTest {
                     return response.bodyTo(ApiError.class);
                 });
 
-        assertThat(body.code()).isEqualTo("position.write-back-while-live");
+        assertThat(body.code()).isEqualTo("TS0410001");
         assertThat(body.message()).contains("pl2");
     }
 

@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.catchThrowableOfType;
 /**
  * The pipeline observation read side: the three store-backed read faces (status / metrics / snapshot)
  * each project the latest published observation for a pipeline, and a read of a pipeline that has
- * published no observation is a coded {@code monitor.no-observation} diagnostic — never a bare crash,
+ * published no observation is a coded {@code TS0400001} diagnostic — never a bare crash,
  * so the same read serves a frontend with no stderr/exit channel.
  */
 class PipelineObservationQueryServiceTest {

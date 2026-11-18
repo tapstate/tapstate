@@ -128,7 +128,7 @@ class MessageCatalogTest {
         // Both forms, because which one they need depends on whether they are typing it or sending it.
         // Named by its literal code: this module cannot see the enum that declares it, and the golden
         // in arch-tests pins the string, so it cannot drift here unnoticed.
-        MessageCatalog.Rendered r = EN.render("data-browser.unorderable-field",
+        MessageCatalog.Rendered r = EN.render("TS0390003",
                 Map.of("field", "price\\.usd"));
 
         assertThat(r.solution())
@@ -147,7 +147,7 @@ class MessageCatalogTest {
         // field whose name holds a dot cannot be indexed at all, and every read that matches on it walks
         // the collection. A hint that sends a reader down that path as though it were the free one is
         // wrong in the direction that never gets reported - the answers are right, only slow.
-        MessageCatalog.Rendered r = EN.render("data-browser.unorderable-field",
+        MessageCatalog.Rendered r = EN.render("TS0390003",
                 Map.of("field", "price\\.usd"));
 
         assertThat(r.solution())

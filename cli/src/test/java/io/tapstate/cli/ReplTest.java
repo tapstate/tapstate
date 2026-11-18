@@ -4449,7 +4449,7 @@ class ReplTest {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.NoObservation();
         client.explainOutcome = new ExplainOutcome.Rejected(
-                "monitor.no-observation", "No observation is available for pipeline pl1.");
+                "TS0400001", "No observation is available for pipeline pl1.");
         Harness h = onlineSession(Path.of("tap-work"), client);
 
         h.repl().dispatch("restart pl1");
@@ -4457,7 +4457,7 @@ class ReplTest {
         assertThat(client.lifecycleCalls).isEmpty();
         assertThat(client.explainCalls).containsExactly("jwt-tok@http://node1:7900/pl1");
         assertThat(h.sink().toString())
-                .contains("monitor.no-observation")
+                .contains("TS0400001")
                 .contains("No observation is available for pipeline pl1.");
     }
 
@@ -5639,14 +5639,14 @@ class ReplTest {
     void positionRendersACodedRefusalRatherThanReportingSuccess() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.positionOutcome = new PositionOutcome.Rejected(
-                "position.write-back-while-live", "Chain shop@mysql-1 is still being read by: orders_sync.");
+                "TS0410001", "Chain shop@mysql-1 is still being read by: orders_sync.");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
         assertThat(h.repl().dispatch("position pl1")).isTrue();
 
         assertThat(h.sink().toString().substring(mark))
-                .contains("position.write-back-while-live")
+                .contains("TS0410001")
                 .contains("still being read by");
     }
 
@@ -6505,13 +6505,13 @@ class ReplTest {
     void aReadVerbRejectionShowsTheCodeAndMessageAndDoesNotFailOver() {
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
         client.statusOutcome = new StatusOutcome.Rejected(
-                "monitor.no-observation", "No observation is available for pipeline pl1.");
+                "TS0400001", "No observation is available for pipeline pl1.");
         Harness h = onlineSession(Path.of("tap-work"), client);
         int probesBefore = client.probed.size();
         int mark = h.sink().toString().length();
         h.repl().dispatch("status pl1");
         String out = h.sink().toString().substring(mark);
-        assertThat(out).contains("monitor.no-observation").contains("No observation is available");
+        assertThat(out).contains("TS0400001").contains("No observation is available");
         // a coded refusal is not a transport failure: it must not trigger failover
         assertThat(out).doesNotContain("reconnected").doesNotContain("connection lost");
         assertThat(client.probed.size()).isEqualTo(probesBefore);
@@ -7205,7 +7205,7 @@ class ReplTest {
                     List.of("read"));
             client.collectionsOutcome = new DataBrowserOutcome.Collections.Listed(List.of("orders"));
             client.findOutcome = new DataBrowserOutcome.Find.Read(List.of(), null, false);
-            client.tailRefusal = "data-browser.follow-idle";
+            client.tailRefusal = "TS0390007";
             CommandLine commandLine = Cli.newCommandLine();
             StringWriter output = new StringWriter();
             commandLine.setOut(new PrintWriter(output));
@@ -7702,14 +7702,14 @@ class ReplTest {
         // field. The reader is somebody watching a screen that just stopped updating, so the code has
         // to be turned back into a sentence here; there is nowhere else it could be done.
         FakeControlPlane client = new FakeControlPlane(URI.create("http://node1:7900"));
-        client.tailRefusal = "data-browser.follow-idle";
+        client.tailRefusal = "TS0390007";
         Harness h = onlineSession(Path.of("tap-work"), client);
         int mark = h.sink().toString().length();
 
         h.repl().dispatch("tail views.order_state");
 
         String output = h.sink().toString().substring(mark);
-        assertThat(output).contains("data-browser.follow-idle");
+        assertThat(output).contains("TS0390007");
         assertThat(output)
                 .as("the catalog sentence, not the literal text of a missing one")
                 .contains("no changes")
