@@ -73,5 +73,8 @@ jobs:
         if: always()
         with:
           name: performance-calibration-batch-${{ matrix.batch }}
-          path: ${{ runner.temp }}/calibration/
+          path: |
+            ${{ runner.temp }}/calibration/
+            !${{ runner.temp }}/calibration/run/**/runtime-input/**
+            !${{ runner.temp }}/calibration/run/**/witness-input/**
           if-no-files-found: error
