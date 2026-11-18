@@ -791,6 +791,8 @@ final class StoreBackedDagSource implements DagSource {
                 pipeline.view() instanceof ViewBlock.Inline view ? FromClause.list(view.from()) : null,
                 bySourceTable, assembled, sourceVertices, sourceColumns);
         requireFactKeyPublishedWhereAWriteMatchesOnIt(pipeline, compiledJoins, serving.streams());
+        requirePublishedIdentityWhereAWriteMatchesOnIt(
+                pipeline, bySourceTable, serving.targets(), serving.streams());
         Map<String, TargetTable> targets = serving.targets();
         Map<String, TargetTable> viewTargets = viewing.targets();
         Set<String> serveLanding = serving.landing();
@@ -2091,15 +2093,7 @@ final class StoreBackedDagSource implements DagSource {
     private static void requireFactKeyPublishedWhereAWriteMatchesOnIt(
             PipelineResource pipeline, Map<String, CompiledJoin> compiledJoins,
             Set<String> serveStreams) {
-        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) {
-            return;
-        }
-        boolean matchesOnAKey = false;
-        for (SyncElement sync : serve.sync()) {
-            matchesOnAKey |= sync.writeMode() == null
-                    || sync.writeMode() == io.tapstate.core.model.WriteMode.UPSERT;
-        }
-        if (!matchesOnAKey) {
+        if (!matchesOnAKey(pipeline)) {
             return;
         }
         for (String stream : serveStreams) {
@@ -2114,6 +2108,49 @@ final class StoreBackedDagSource implements DagSource {
                         null);
             }
         }
+    }
+
+    /**
+     * Refuses a stream whose source table declares a key but whose published target has none, where
+     * something matches a write to an existing row on that key.
+     *
+     * <p>Identity that went away is what is refused, not identity that never existed: a source with
+     * no declared key has lost nothing and is left alone. A view is not judged here either - it
+     * declares its own key and its own gate compares that key against what feeds it. Append never
+     * matches a write to an existing row, so it is not judged at all.
+     */
+    private static void requirePublishedIdentityWhereAWriteMatchesOnIt(
+            PipelineResource pipeline, Map<String, TargetTable> bySourceTable,
+            Map<String, TargetTable> published, Set<String> streams) {
+        if (!matchesOnAKey(pipeline)) {
+            return;
+        }
+        for (String stream : streams) {
+            TargetTable source = bySourceTable.get(stream);
+            TargetTable target = published.get(stream);
+            if (source == null || target == null) {
+                continue;
+            }
+            if (source.fields().stream().anyMatch(TargetField::primaryKey)
+                    && target.fields().stream().noneMatch(TargetField::primaryKey)) {
+                throw new TapstateException(ActuationError.SYNC_OUTPUT_IDENTITY_UNRESOLVED,
+                        Map.of("pipeline", pipeline.id(), "stream", stream), null);
+            }
+        }
+    }
+
+    /** Whether any sync element of the serve block matches a write to an existing row on a key. */
+    private static boolean matchesOnAKey(PipelineResource pipeline) {
+        if (!(pipeline.serve() instanceof ServeBlock.Inline serve) || serve.sync() == null) {
+            return false;
+        }
+        for (SyncElement sync : serve.sync()) {
+            if (sync.writeMode() == null
+                    || sync.writeMode() == io.tapstate.core.model.WriteMode.UPSERT) {
+                return true;
+            }
+        }
+        return false;
     }
 
 

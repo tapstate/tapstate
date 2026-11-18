@@ -101,7 +101,8 @@ class StoreBackedDagSourceTargetModelTest {
                 io.tapstate.core.model.FieldRule.literal(0),
                 io.tapstate.core.model.FieldRule.computed("after.tenant + 1"),
                 io.tapstate.core.model.FieldRule.rename("other"))) {
-            InMemoryStorePort store = seededProjectingPipeline(Map.of("tenant", rule));
+            InMemoryStorePort store = seededProjectingPipeline(
+                    Map.of("tenant", rule), io.tapstate.core.model.WriteMode.APPEND);
             store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
                     new SourceField("id", "INT"), new SourceField("tenant", "INT"),
                     new SourceField("other", "INT")), List.of("id", "tenant"), List.of())));
@@ -125,7 +126,8 @@ class StoreBackedDagSourceTargetModelTest {
             Map<String, io.tapstate.core.model.FieldRule> rules = new LinkedHashMap<>();
             rules.put("ORDER_ID", io.tapstate.core.model.FieldRule.rename("id"));
             rules.put("region", rule);
-            InMemoryStorePort store = seededProjectingPipeline(rules);
+            InMemoryStorePort store = seededProjectingPipeline(
+                    rules, io.tapstate.core.model.WriteMode.APPEND);
             store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
                     new SourceField("id", "INT"), new SourceField("region", "VARCHAR"),
                     new SourceField("other", "VARCHAR")), List.of("id", "region"), List.of())));
@@ -161,6 +163,57 @@ class StoreBackedDagSourceTargetModelTest {
             assertThat(target.indexes()).extracting(TargetIndex::fields, TargetIndex::unique)
                     .containsExactly(tuple(List.of("ORDER_ID", "REGION"), true));
         });
+    }
+
+    /**
+     * The same keyless target a preview refuses still reaches a sync that matches writes on a key.
+     * Preview is not part of every run, so without this the rows are written to a target nothing can
+     * match them against - the collapse the publisher stopped producing a partial key for.
+     */
+    @Test
+    void anUpsertSyncRefusesAStreamWhosePublishedIdentityWasLost() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("tenant", io.tapstate.core.model.FieldRule.drop()));
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of("id", "tenant"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        assertThatThrownBy(() -> new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p"))
+                .isInstanceOf(io.tapstate.core.common.TapstateException.class)
+                .hasMessageContaining("actuation.sync-output-identity-unresolved");
+    }
+
+    /** Append never matches a write to an existing row, so a key it never needs is not required. */
+    @Test
+    void anAppendSyncIsNotJudgedForAStreamWhosePublishedIdentityWasLost() {
+        InMemoryStorePort store = seededProjectingPipeline(
+                Map.of("tenant", io.tapstate.core.model.FieldRule.drop()),
+                io.tapstate.core.model.WriteMode.APPEND);
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of("id", "tenant"), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).noneMatch(TargetField::primaryKey));
+    }
+
+    /** A source that never declared a key lost nothing here; this refusal is about identity going away. */
+    @Test
+    void anUpsertSyncDoesNotJudgeASourceThatNeverDeclaredAKey() {
+        InMemoryStorePort store = seededProjectingPipeline(Map.of());
+        store.schemas().save(discovered("orders_src", "mysql", new SourceTable("orders", List.of(
+                new SourceField("id", "INT"), new SourceField("tenant", "INT")),
+                List.of(), List.of())));
+        List<TargetTable> bound = new ArrayList<>();
+
+        new StoreBackedDagSource(store, capturingBinder(bound)).dagFor("p");
+
+        assertThat(bound).singleElement().satisfies(target ->
+                assertThat(target.fields()).noneMatch(TargetField::primaryKey));
     }
 
     @Test
@@ -910,6 +963,12 @@ class StoreBackedDagSourceTargetModelTest {
     /** The single-source pipeline above with one projection step between the source and the sink. */
     private static InMemoryStorePort seededProjectingPipeline(
             Map<String, io.tapstate.core.model.FieldRule> rules) {
+        return seededProjectingPipeline(rules, null);
+    }
+
+    private static InMemoryStorePort seededProjectingPipeline(
+            Map<String, io.tapstate.core.model.FieldRule> rules,
+            io.tapstate.core.model.WriteMode writeMode) {
         InMemoryStorePort store = new InMemoryStorePort();
         store.artifacts().save(new SourceResource("orders_src", null, "mysql", Map.of("host", "h"),
                 SourceMode.CDC, List.of(TableRef.literal("orders")), null, null));
@@ -921,7 +980,7 @@ class StoreBackedDagSourceTargetModelTest {
                         new TransformBody.MapProjection(new LinkedHashMap<>(rules)), null)),
                 null,
                 new ServeBlock.Inline(null, FromRef.literal("project"),
-                        List.of(new SyncElement("sync_1", "orders_dest", null, null, null)),
+                        List.of(new SyncElement("sync_1", "orders_dest", writeMode, null, null)),
                         null, null),
                 null, null));
         OpenRingGenerations.forSources(store, "orders_src");
