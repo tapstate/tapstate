@@ -435,6 +435,7 @@ class BenchmarkRunIT {
         }
 
         awaitContent(entry, operators, target, initial, "operator initial state");
+        waitFor(entry, "target writer settled the initial state", () -> settled(control) >= initial.size());
         var previousAcks = operatorPositions(control, operators.mutableInputs(), "targetAcked");
         var inputBeforeAnchor = capturedChanges(control);
         long targetBeforeAnchor = settled(control);
@@ -445,16 +446,23 @@ class BenchmarkRunIT {
         if (anchor.equals(initial)) {
             throw new Unverified("The readiness change does not reach the expected target projection");
         }
-        waitFor(entry, "confirmed operator readiness changes", () -> {
+        try {
+            waitFor(entry, "confirmed operator readiness changes", () -> {
+                var captured = capturedChanges(control);
+                return operators.mutableInputs().stream().allMatch(name -> captured.getOrDefault(name, 0L)
+                                >= inputBeforeAnchor.getOrDefault(name, 0L) + 1)
+                        && settled(control) > targetBeforeAnchor
+                        && BenchmarkOperatorOracle.difference(operators, target, anchor) == null;
+            });
+        } catch (Limit failure) {
             var current = operatorPositions(control, operators.mutableInputs(), "targetAcked");
-            var captured = capturedChanges(control);
-            return !current.isEmpty() && current.entrySet().stream()
-                    .allMatch(chain -> !chain.getValue().equals(previousAcks.get(chain.getKey())))
-                    && operators.mutableInputs().stream().allMatch(name -> captured.getOrDefault(name, 0L)
-                            >= inputBeforeAnchor.getOrDefault(name, 0L) + 1)
-                    && settled(control) > targetBeforeAnchor
-                    && BenchmarkOperatorOracle.difference(operators, target, anchor) == null;
-        });
+            throw new Limit(failure.getMessage() + ": captured " + capturedChanges(control) + ", settled "
+                    + targetBeforeAnchor + " -> " + settled(control) + ", target position advanced "
+                    + (!current.isEmpty() && !current.equals(previousAcks)) + ": "
+                    + BenchmarkOperatorOracle.difference(operators, target, anchor));
+        }
+        var confirmedAcks = operatorPositions(control, operators.mutableInputs(), "targetAcked");
+        evidence.result.put("initial_target_position_advanced", !confirmedAcks.isEmpty() && !confirmedAcks.equals(previousAcks));
         evidence.phase("initial_state", initialStart);
         var mix = operators.paired() ? new WorkloadRecipe.Mix(0, 70, 30) : mix(entry);
         if (mode.equals("backlog-throughput")) {
@@ -519,13 +527,13 @@ class BenchmarkRunIT {
     private static void operatorBacklog(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
             Map<String, BsonDocument> initial, WorkloadRecipe.Mix mix) {
-        var resume = operatorPositions(control, operators.mutableInputs(), "resumeFrom");
-        if (resume.isEmpty()) {
-            throw new Unverified("The operator has no persisted pre-batch position");
-        }
         control.stop(PIPELINE, false);
         waitFor(entry, "operator stopped before prewrite",
                 () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent());
+        var resume = operatorPositions(control, operators.mutableInputs(), "resumeFrom");
+        if (resume.isEmpty()) {
+            throw new Unverified("The stopped operator has no persisted pre-batch position");
+        }
         evidence.stage = "prewrite";
         long prewrite = System.nanoTime();
         var backlog = prepared.prewrite(number(entry, "backlog_events"), mix, null);
