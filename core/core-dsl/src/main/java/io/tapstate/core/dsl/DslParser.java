@@ -684,6 +684,17 @@ public final class DslParser {
      * count) {@code true}, and every expression compiles over a row. Whether the expressions type-check
      * against the level's columns and references is judged where the tree and its models are known.
      */
+    /**
+     * Reads a {@code rollup:} map that arrives already structured, as plain maps, lists and scalars, under
+     * exactly the rules of a written embed's. {@code path} names where it sits, for diagnostics.
+     */
+    public Map<String, RollupField> rollupFieldsFromTree(Map<String, Object> rollup, String path) {
+        Objects.requireNonNull(rollup, "rollup");
+        Map<String, Object> owner = new LinkedHashMap<>();
+        owner.put("rollup", rollup);
+        return rollupFields(YamlMap.of(TreeNodes.mapping(owner, path), path));
+    }
+
     private Map<String, RollupField> rollupFields(YamlMap embed) {
         YamlMap fields = embed.mapping("rollup");
         if (fields == null) {
