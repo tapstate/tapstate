@@ -38,6 +38,11 @@ import java.util.concurrent.Semaphore;
 
 /** Compiles unsaved candidates before opening a bounded, read-only Pipeline preview session. */
 public final class PipelinePreviewService {
+    private static final String KIND_KEY = "kind";
+    private static final String ORIGIN_KEY = "origin";
+    private static final String ANNOTATION_KEY = "annotation";
+    private static final String COMPUTED = "computed";
+    private static final String UNKNOWN = "unknown";
 
     public static final int DEFAULT_ROOT_LIMIT = 100;
     public static final Duration DEADLINE = Duration.ofSeconds(45);
@@ -235,7 +240,7 @@ public final class PipelinePreviewService {
         List<Map<String, Object>> contexts = new ArrayList<>();
         Map<String, Object> root = new LinkedHashMap<>();
         root.put("id", "root");
-        root.put("kind", "root");
+        root.put(KIND_KEY, "root");
         root.put("sourceIds", pipeline.sourceIds());
         root.put("pointerPatterns", List.of());
         contexts.add(Map.copyOf(root));
@@ -258,7 +263,7 @@ public final class PipelinePreviewService {
         String path = parent.isEmpty() ? segment : parent + "/" + segment;
         Map<String, Object> relation = new LinkedHashMap<>();
         relation.put("id", "relation:" + stepId + ":" + path);
-        relation.put("kind", "relation");
+        relation.put(KIND_KEY, "relation");
         relation.put("stepId", stepId);
         relation.put("path", path);
         relation.put("parentPath", parent);
@@ -276,40 +281,57 @@ public final class PipelinePreviewService {
         }
     }
 
+    private static void addMapEffects(TransformBody.MapProjection map, List<Map<String, Object>> effects,
+            List<String> pointers) {
+        map.fields().forEach((output, rule) -> {
+            String pointer = pointerField(output);
+            effects.add(mapEffect(pointer, output, rule));
+            pointers.add(pointer);
+        });
+        if (map.softDelete() != null) {
+            // Not a constant: the step writes false on live rows and true on the update a delete
+            // becomes, so it reads as a value the step works out per row.
+            String pointer = pointerField(map.softDelete());
+            effects.add(Map.of("pointer", pointer, KIND_KEY, COMPUTED, ORIGIN_KEY, COMPUTED,
+                    ANNOTATION_KEY, "map: soft_delete (true where the source row was deleted)"));
+            pointers.add(pointer);
+        }
+    }
+
+    private static Map<String, Object> mapEffect(String pointer, String output, FieldRule rule) {
+        Map<String, Object> effect = new LinkedHashMap<>();
+        effect.put("pointer", pointer);
+        if (rule instanceof FieldRule.Drop) {
+            effect.put(KIND_KEY, "removed");
+            effect.put(ANNOTATION_KEY, "map: drop " + output);
+        } else if (rule instanceof FieldRule.Rename rename) {
+            effect.put(KIND_KEY, "renamed");
+            effect.put(ORIGIN_KEY, rename.sourceField());
+            effect.put(ANNOTATION_KEY, "map: rename " + rename.sourceField() + " -> " + output);
+        } else if (rule instanceof FieldRule.Computed computed) {
+            effect.put(KIND_KEY, COMPUTED);
+            effect.put(ORIGIN_KEY, COMPUTED);
+            effect.put(ANNOTATION_KEY, "map: " + abbreviate(computed.celExpr()));
+        } else if (rule instanceof FieldRule.Literal) {
+            effect.put(KIND_KEY, "literal");
+            effect.put(ORIGIN_KEY, "literal");
+            effect.put(ANNOTATION_KEY, "map: literal");
+        }
+        return Map.copyOf(effect);
+    }
+
     private static Map<String, Object> transformContext(Step step, TransformBody body) {
-        String type = body == null ? "unknown" : body.type();
+        String type = body == null ? UNKNOWN : body.type();
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("id", "transform:" + step.id());
-        context.put("kind", "transform");
+        context.put(KIND_KEY, "transform");
         context.put("stepId", step.id());
         context.put("type", type);
         List<Map<String, Object>> effects = new ArrayList<>();
         List<String> pointers = new ArrayList<>();
         boolean pointerPatternsComplete = true;
         if (body instanceof TransformBody.MapProjection map) {
-            map.outputFields().forEach((output, rule) -> {
-                String pointer = pointerField(output);
-                Map<String, Object> effect = new LinkedHashMap<>();
-                effect.put("pointer", pointer);
-                if (rule instanceof FieldRule.Drop) {
-                    effect.put("kind", "removed");
-                    effect.put("annotation", "map: drop " + output);
-                } else if (rule instanceof FieldRule.Rename rename) {
-                    effect.put("kind", "renamed");
-                    effect.put("origin", rename.sourceField());
-                    effect.put("annotation", "map: rename " + rename.sourceField() + " -> " + output);
-                } else if (rule instanceof FieldRule.Computed computed) {
-                    effect.put("kind", "computed");
-                    effect.put("origin", "computed");
-                    effect.put("annotation", "map: " + abbreviate(computed.celExpr()));
-                } else if (rule instanceof FieldRule.Literal) {
-                    effect.put("kind", "literal");
-                    effect.put("origin", "literal");
-                    effect.put("annotation", "map: literal");
-                }
-                effects.add(Map.copyOf(effect));
-                pointers.add(pointer);
-            });
+            addMapEffects(map, effects, pointers);
         } else if (body instanceof TransformBody.Unwind unwind) {
             pointers.add(pointerPath(unwind.path()));
             if (unwind.includeArrayIndex() != null && !unwind.includeArrayIndex().isBlank()) {
@@ -319,9 +341,9 @@ public final class PipelinePreviewService {
         } else if (body instanceof TransformBody.Filter) {
             context.put("countEffect", "drop");
         } else if (body instanceof TransformBody.Js) {
-            context.put("origin", "unknown");
+            context.put(ORIGIN_KEY, UNKNOWN);
             context.put("lastChangedBy", step.id());
-            context.put("determinism", "unknown");
+            context.put("determinism", UNKNOWN);
             pointerPatternsComplete = false;
         } else if (body instanceof TransformBody.Union) {
             context.put("countEffect", "merge");

@@ -705,7 +705,7 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
      * not one of these is unknown rather than the closest of them, for the same reason a computed
      * value outside the expression language's own types is.
      */
-    private static TapstateType literalType(Object value) {
+    static TapstateType literalType(Object value) {
         return switch (value) {
             case Boolean ignored -> TapstateType.BOOLEAN;
             case String ignored -> TapstateType.STRING;

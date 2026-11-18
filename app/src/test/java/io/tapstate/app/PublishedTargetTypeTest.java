@@ -120,6 +120,24 @@ class PublishedTargetTypeTest {
         return byName;
     }
 
+    /**
+     * A soft-delete marker named after the table's key column writes false under that name on every
+     * live row. Keyed on it, a target would upsert every row onto one: the key holds only where the
+     * column still carries the source's own value, and a sink told of a key one column short reports it.
+     */
+    @Test
+    void aKeyColumnTheMapWritesAMarkerOverIsNotTheTargetsKey() {
+        NodeColumns marked = NodeColumns.of(new TransformBody.MapProjection(Map.of(), "o_id"),
+                Map.of("in", atTheSource()), null);
+        NodeColumns passedThrough = NodeColumns.of(new TransformBody.MapProjection(Map.of(), "is_deleted"),
+                Map.of("in", atTheSource()), null);
+
+        assertThat(StoreBackedDagSource.publishedAs(source(), marked, atTheSource()).fields())
+                .noneMatch(TargetField::primaryKey);
+        assertThat(StoreBackedDagSource.publishedAs(source(), passedThrough, atTheSource()).fields())
+                .filteredOn(TargetField::primaryKey).extracting(TargetField::name).containsExactly("o_id");
+    }
+
     @Test
     @DisplayName("a column the pipeline did not retype keeps the word the source declared")
     void anUntouchedColumnKeepsTheSourcesOwnTypeToken() {

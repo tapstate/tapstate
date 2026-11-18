@@ -39,9 +39,11 @@ class MapSoftDeleteTest {
         return r;
     }
 
+    /** A row through a map with no rules: the marker comes first, then every column passed through. */
     private static Map<String, Object> marked(Map<String, Object> row, boolean deleted) {
-        Map<String, Object> r = new LinkedHashMap<>(row);
+        Map<String, Object> r = new LinkedHashMap<>();
         r.put(MARKER, deleted);
+        r.putAll(row);
         return r;
     }
 
@@ -107,8 +109,8 @@ class MapSoftDeleteTest {
         Map<String, Object> expected = new LinkedHashMap<>();
         expected.put("email_id", 1);
         expected.put("contact", "mail:a@x");
-        expected.put("email", "a@x");
         expected.put(MARKER, true);
+        expected.put("email", "a@x");
         assertThat(out.after()).containsExactlyEntriesOf(expected);
     }
 
