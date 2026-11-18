@@ -43,7 +43,7 @@ class PipelineOutputNamesTest {
             assertThat(row.status().state()).isEqualTo("not-loaded");
         });
         assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                .hasMessageContaining("actuation.source-schema-not-discovered");
+                .hasMessageContaining("TS0360004");
     }
 
     @Test
@@ -120,7 +120,7 @@ class PipelineOutputNamesTest {
         assertThat(result.items()).singleElement().satisfies(row -> assertThat(row.pipelineId()).isEqualTo("p"));
         assertThat(result.unresolved()).singleElement().satisfies(problem -> {
             assertThat(problem.pipelineId()).isEqualTo("unresolved");
-            assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered");
+            assertThat(problem.code()).isEqualTo("TS0360004");
             assertThat(problem.params()).containsEntry("source", "unknown");
         });
     }
@@ -150,11 +150,11 @@ class PipelineOutputNamesTest {
         assertThat(report.items()).singleElement().satisfies(row ->
                 assertThat(row.location().collection()).isEqualTo("out_orders"));
         assertThat(report.unresolved()).singleElement().satisfies(problem -> {
-            assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered");
+            assertThat(problem.code()).isEqualTo("TS0360004");
             assertThat(problem.params()).containsEntry("source", "unknown");
         });
         assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                .hasMessageContaining("actuation.source-schema-not-discovered");
+                .hasMessageContaining("TS0360004");
         store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("unknown", "mongodb", 0L,
                 new io.tapstate.spi.store.SourceModel(List.of(new io.tapstate.spi.store.SourceTable("customers",
                         List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of())))));
@@ -181,13 +181,13 @@ class PipelineOutputNamesTest {
             var before = resolver.outputNameResult(pipeline);
             assertThat(before.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
             assertThat(before.unresolved()).singleElement().satisfies(problem -> {
-                assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered");
+                assertThat(problem.code()).isEqualTo("TS0360004");
                 assertThat(problem.params()).containsEntry("source", "src");
             });
             assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                    .hasMessageContaining("actuation.source-schema-not-discovered");
+                    .hasMessageContaining("TS0360004");
             assertThatThrownBy(() -> resolver.validateStart(pipeline.id()))
-                    .hasMessageContaining("actuation.source-schema-not-discovered");
+                    .hasMessageContaining("TS0360004");
             store.schemas().save(new io.tapstate.spi.store.DiscoveredSourceModel("src", "mongodb", 0L,
                     new io.tapstate.spi.store.SourceModel(List.of(
                             new io.tapstate.spi.store.SourceTable("orders", List.of(new io.tapstate.spi.store.SourceField("id", "INT")), List.of("id"), List.of()),
@@ -209,7 +209,7 @@ class PipelineOutputNamesTest {
             assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
             assertThat(report.unresolved()).isEmpty();
             assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                    .hasMessageContaining("actuation.source-schema-not-discovered");
+                    .hasMessageContaining("TS0360004");
         }
     }
 
@@ -222,7 +222,7 @@ class PipelineOutputNamesTest {
             var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
             assertThat(report.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
             assertThat(report.unresolved()).singleElement().satisfies(problem ->
-                    assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+                    assertThat(problem.code()).isEqualTo("TS0360004"));
         }
     }
 
@@ -233,7 +233,7 @@ class PipelineOutputNamesTest {
         var report = new StoreBackedDagSource(store).outputNameResult(pipeline);
         assertThat(report.outputs()).isEmpty();
         assertThat(report.unresolved()).singleElement().satisfies(problem -> {
-            assertThat(problem.code()).isEqualTo("actuation.source-table-not-discovered");
+            assertThat(problem.code()).isEqualTo("TS0360005");
             assertThat(problem.params()).containsEntry("source", "src").containsEntry("table", "absent");
         });
     }
@@ -260,7 +260,7 @@ class PipelineOutputNamesTest {
         assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
         assertThat(result.unresolved()).hasSize(1);
         assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                .hasMessageContaining("actuation.source-schema-not-discovered");
+                .hasMessageContaining("TS0360004");
     }
 
     @Test
@@ -297,7 +297,7 @@ class PipelineOutputNamesTest {
         assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table)
                 .containsExactly("out_orders", "out_customers");
         assertThat(result.unresolved()).singleElement().satisfies(problem ->
-                assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+                assertThat(problem.code()).isEqualTo("TS0360004"));
     }
 
     @Test
@@ -339,7 +339,7 @@ class PipelineOutputNamesTest {
         assertThat(result.outputs()).extracting(PipelineOutputNames.Output::table).containsExactly("out_orders");
         assertThat(result.unresolved()).isEmpty();
         assertThatThrownBy(() -> new StoreBackedPipelineWriteTargets(store).of(pipeline))
-                .hasMessageContaining("actuation.source-schema-not-discovered");
+                .hasMessageContaining("TS0360004");
     }
 
     @Test

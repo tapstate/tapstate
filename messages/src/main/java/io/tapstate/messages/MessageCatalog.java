@@ -102,6 +102,8 @@ public final class MessageCatalog {
             registered = AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isEmpty())
             registered = CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
+        if (registered.isEmpty())
+            registered = ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), locale);
         if (registered.isPresent()) {
             var resolved = registered.orElseThrow();
             return new Rendered(resolved.message(), resolved.solution());
@@ -129,7 +131,8 @@ public final class MessageCatalog {
                 .or(() -> RoleDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> CliDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
                 .or(() -> AlertDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
-                .or(() -> CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
+                .or(() -> CaptureDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH))
+                .or(() -> ActuationDiagnosticCatalog.bundled().resolve(code, args, java.util.List.of(), Locale.ENGLISH));
         if (registered.isPresent()) {
             var text = registered.orElseThrow();
             return Optional.of(new Rendered(text.message(), text.solution()));

@@ -235,7 +235,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> StoreBackedDagSource.parentKeysReaching(merged, chain(left, right, merged),
                 ref -> ref.equals(FromRef.literal("orders")) ? Map.of("orders", List.of("o_id")) : Map.of()))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test
@@ -244,7 +244,7 @@ class UnwindParentKeyTest {
         assertThatThrownBy(() -> StoreBackedDagSource.transformPortByStream(
                 expand, Map.of("orders", List.of()), null))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test

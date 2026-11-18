@@ -297,7 +297,7 @@ class StoreBackedDagSourceTest {
                 List.of(SourceRef.spec("orders_src", true)), List.of(drop, mixed, expand), null, null, null, null);
         assertThatThrownBy(() -> source.transformBinding(mixedPipeline, mixed))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+                .hasMessageContaining("TS0360008");
     }
 
     @Test
@@ -555,7 +555,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-not-configured"));
+                        .isEqualTo("TS0360022"));
     }
 
     @Test
@@ -605,7 +605,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store, refusing("connection refused")).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-unreachable"));
+                        .isEqualTo("TS0360023"));
     }
 
     @Test
@@ -713,7 +713,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> {
                     TapstateException coded = (TapstateException) e;
-                    assertThat(coded.code().code()).isEqualTo("actuation.view-store-unreachable");
+                    assertThat(coded.code().code()).isEqualTo("TS0360023");
                     assertThat(String.valueOf(coded.args().get("reason")))
                             .as("what the connector said, carried through to the operator")
                             .contains("connection refused by mongo:27017");
@@ -755,7 +755,7 @@ class StoreBackedDagSourceTest {
                 store, StoreReachability.bounded(neverAnswers, Duration.ofMillis(200))).dagFor("p"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(e -> assertThat(((TapstateException) e).code().code())
-                        .isEqualTo("actuation.view-store-unreachable"));
+                        .isEqualTo("TS0360023"));
         assertThat(Duration.ofNanos(System.nanoTime() - startedAt))
                 .as("the start gave up on its own rather than waiting for the probe")
                 .isLessThan(Duration.ofMinutes(1));
@@ -1135,7 +1135,7 @@ class StoreBackedDagSourceTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.source-table-ambiguous"));
+                        .isEqualTo("TS0360009"));
     }
 
     @Test
@@ -1151,7 +1151,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.source-table-not-discovered");
+                    assertThat(coded.code().code()).isEqualTo("TS0360005");
                     assertThat(coded.args()).containsEntry("source", "src_a");
                     assertThat(coded.args()).containsEntry("table", "customers");
                 });
@@ -1165,7 +1165,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.pipeline-not-found");
+                    assertThat(coded.code().code()).isEqualTo("TS0360002");
                     assertThat(coded.args()).containsEntry("pipeline", "ghost");
                 });
     }
@@ -1179,7 +1179,7 @@ class StoreBackedDagSourceTest {
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> {
                     TapstateException coded = (TapstateException) thrown;
-                    assertThat(coded.code().code()).isEqualTo("actuation.not-a-pipeline");
+                    assertThat(coded.code().code()).isEqualTo("TS0360003");
                     assertThat(coded.args()).containsEntry("pipeline", "orders_src");
                     assertThat(coded.args()).containsEntry("kind", "source");
                 });

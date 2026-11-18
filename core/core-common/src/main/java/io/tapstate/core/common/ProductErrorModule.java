@@ -18,7 +18,8 @@ public enum ProductErrorModule {
     ROLE("032"),
     CLI("033"),
     ALERT("034"),
-    CAPTURE("035");
+    CAPTURE("035"),
+    ACTUATION("036");
 
     private final String number;
 

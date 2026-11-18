@@ -30,5 +30,5 @@ seed:
 steps:
   - start
   - await: { state: FAILED }
-  - assert: { failure_code: actuation.join-sql-invalid }
+  - assert: { failure_code: TS0360014 }
   - assert: { count: { views.order_state: 0 } }

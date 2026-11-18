@@ -518,9 +518,9 @@ public final class EnvelopeParser {
 
     private static String failureCode(Object node, String where) {
         String code = string(node, where);
-        if (!code.matches("[a-z0-9]+\\.[a-z0-9-]+")) {
+        if (!code.matches("(?:TS(?!000)[0-9]{3}(?!0000)[0-9]{4}|[a-z0-9]+\\.[a-z0-9-]+)")) {
             throw new EnvelopeException(
-                    "a failure code reads '<domain>.<symbol>' in lower kebab-case, found: " + code);
+                    "a failure code is a canonical TS identity or a historical '<domain>.<symbol>', found: " + code);
         }
         return code;
     }

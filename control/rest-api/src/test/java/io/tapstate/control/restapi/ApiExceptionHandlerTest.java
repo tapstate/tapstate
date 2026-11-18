@@ -79,6 +79,13 @@ class ApiExceptionHandlerTest {
     }
 
     @Test
+    void migratedSourceSchemaRefusalKeepsItsConflictStatus() {
+        assertThat(ApiExceptionHandler.statusFor(
+                new StubCode(io.tapstate.core.common.ActuationErrorDefinitions.SOURCE_SCHEMA_NOT_DISCOVERED.code())))
+                .isEqualTo(HttpStatus.CONFLICT);
+    }
+
+    @Test
     void unknownIdentitiesKeepServerFailureUnlessTheVerbAttributesTheRefusal() {
         var failure = new TapstateException(new StubCode("TS9999999"), Map.of("detail", "safe detail"), null);
         assertThat(handler.handle(failure).getStatusCode()).isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR);

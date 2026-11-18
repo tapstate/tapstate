@@ -2465,7 +2465,7 @@ class ManagedMongoStoreIsolationIT {
                     assertThat(value.table()).isEqualTo("out_orders");
                 });
                 assertThat(output.unresolved()).singleElement().satisfies(problem ->
-                        assertThat(problem.code()).isEqualTo("actuation.source-schema-not-discovered"));
+                        assertThat(problem.code()).isEqualTo("TS0360004"));
                 var catalog = child.getBean(io.tapstate.control.core.ViewCatalogService.class).catalog();
                 assertThat(catalog.items()).singleElement().satisfies(item -> {
                     assertThat(item.location().database()).isEqualTo(databases.master());

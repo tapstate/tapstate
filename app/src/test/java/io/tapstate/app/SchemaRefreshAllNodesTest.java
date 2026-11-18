@@ -130,7 +130,7 @@ class SchemaRefreshAllNodesTest {
         assertThat(result.warnings()).singleElement().satisfies(warning -> {
             assertThat(warning.code()).isEqualTo("TS0210016");
             assertThat(warning.params()).containsEntry("pipeline", "orders_pipeline")
-                    .containsEntry("causeCode", "actuation.schema-sync-while-running");
+                    .containsEntry("causeCode", "TS0360027");
         });
         assertThat(records(store)).isEqualTo(original);
         original.forEach((node, record) ->

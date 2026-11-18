@@ -45,6 +45,12 @@ Latest Pipeline observations keep their existing code-string and parameter field
 old and new identities read through the same codec without rewriting stored rows.
 A later recovery clears the current failure under the original observation epoch.
 
+Execution preparation uses module `036`. Source-schema admission retains HTTP 409,
+while join shape drift, member staging and view storage refusals retain their
+original typed recovery decisions. Declarative verification accepts canonical TS
+identities and historical codes during migration; both the parser and published
+schema reject zero modules/serials, malformed lengths and padded TS codes.
+
 DSL errors use `TS0010001` through `TS0010031`, and
 execution advisories use `TS0010032` and `TS0010033`. Other error families retain their existing contract until
 their producer, consumers and behavior tests migrate together. The complete

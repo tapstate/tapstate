@@ -464,7 +464,7 @@ class ThreeLayerSharedCaptureIT {
 
     private static void assertSharedPreflightFence(int status, Map<?, ?> response) {
         assertThat(status).as("shared recovery preflight: %s", response).isEqualTo(500);
-        assertThat(response.get("code")).isEqualTo("actuation.shared-recovery-member-unavailable");
+        assertThat(response.get("code")).isEqualTo("TS0360034");
         assertThat(((Map<?, ?>) response.get("params")).get("reason")).isEqualTo("io.workload-claim-fenced");
     }
     private static void restartClaimDiagnostic(MongoDatabase cache,String cluster,String phase) {

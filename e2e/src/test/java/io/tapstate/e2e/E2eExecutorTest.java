@@ -38,10 +38,10 @@ class E2eExecutorTest {
                 name: refused
                 pipeline: p.tap.yml
                 steps:
-                  - start_refused: actuation.source-schema-not-discovered
+                  - start_refused: TS0360004
                 """);
         assertThat(binding.calls).containsExactly("apply:[p.tap.yml]",
-                "start_refused:" + PIPELINE_ID + ":actuation.source-schema-not-discovered");
+                "start_refused:" + PIPELINE_ID + ":TS0360004");
     }
 
     @Test
@@ -247,7 +247,7 @@ class E2eExecutorTest {
                 .filter(path -> path.getParent().getFileName().toString().equals(example))
                 .findFirst().orElseThrow();
         binding.states(PipelineState.FAILED);
-        binding.failureCodesUnobservedThen("actuation.source-schema-not-discovered");
+        binding.failureCodesUnobservedThen("TS0360004");
 
         execute(Examples.read(specification));
 
@@ -262,7 +262,7 @@ class E2eExecutorTest {
         var workspace = Examples.ROOT.resolve("a-view-whose-store-cannot-be-reached-fails-with-a-named-code");
         binding.states(PipelineState.FAILED);
         // The checkpoint exposes FAILED before the observation publishes its diagnosis.
-        binding.failureCodesUnobservedThen("actuation.view-store-unreachable");
+        binding.failureCodesUnobservedThen("TS0360023");
         var target = new TableAlias("tgt_file", "orders");
         binding.countsOverTime(target, 0L);
 

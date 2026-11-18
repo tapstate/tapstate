@@ -266,7 +266,7 @@ class ValidatedPipelineBuildsTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("wide"))
                 .isInstanceOf(TapstateException.class)
-                .hasMessageContaining("actuation.join-source-key-missing");
+                .hasMessageContaining("TS0360011");
     }
 
     /**
@@ -329,7 +329,7 @@ class ValidatedPipelineBuildsTest {
         assertThatThrownBy(() -> new StoreBackedDagSource(store, discardingBinder()).dagFor("wide"))
                 .isInstanceOf(TapstateException.class)
                 .satisfies(thrown -> assertThat(((TapstateException) thrown).code().code())
-                        .isEqualTo("actuation.join-source-not-declared"));
+                        .isEqualTo("TS0360012"));
     }
 
     @Test

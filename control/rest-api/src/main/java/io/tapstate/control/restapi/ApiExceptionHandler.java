@@ -162,6 +162,7 @@ class ApiExceptionHandler {
             Map.entry(AlertError.COMMAND_NOT_YET_VALID.code(), HttpStatus.CONFLICT),
             Map.entry(AlertError.CHANNEL_UNAVAILABLE.code(), HttpStatus.SERVICE_UNAVAILABLE),
             Map.entry("actuation.source-schema-not-discovered", HttpStatus.CONFLICT),
+            Map.entry(io.tapstate.core.common.ActuationErrorDefinitions.SOURCE_SCHEMA_NOT_DISCOVERED.code(), HttpStatus.CONFLICT),
             Map.entry(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED.code(), HttpStatus.BAD_REQUEST),
             Map.entry(ControlError.STORAGE_CACHE_DATABASE_OCCUPIED_SUGGESTED.code(), HttpStatus.BAD_REQUEST),
             Map.entry(ControlError.STORAGE_DATABASES_OVERLAP.code(), HttpStatus.BAD_REQUEST),

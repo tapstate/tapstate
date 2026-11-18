@@ -20,5 +20,5 @@ pipeline: pipeline.tap.yml
 seed:
   src_file.orders: { rows: 3 }
 steps:
-  - start_refused: actuation.source-schema-not-discovered
+  - start_refused: TS0360004
   - assert: { count: { views.order_state: 0 } }

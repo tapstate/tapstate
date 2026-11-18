@@ -61,7 +61,7 @@ Unsupported SQL constructs are rejected during validation; additional runtime sh
 restrictions can fail when the job initializes. Run `tapstate validate` and `tapstate explain` before
 applying a pipeline; successful SQL parsing alone does not establish that the runtime shape
 is supported. Column names are checked against the discovered source schemas when the pipeline
-starts: a column no input table has fails the start with `actuation.join-sql-invalid`, and the
+starts: a column no input table has fails the start with `TS0360014`, and the
 pipeline stays failed until the SQL or the source is corrected and it is started again. MERGE statements are outside the Join SELECT surface.
 
 Any NULL component makes a join key unmatchable, including when the opposite side also has
@@ -74,7 +74,7 @@ For **default/upsert sync**, project every primary-key column of the driving fac
 direct column reference. Aliases are allowed, as in `o.id AS order_id` above. Computed
 substitutes such as `UPPER(o.id)` do not count. For a composite primary key, publish all of
 its columns. A missing key column is refused with
-`actuation.join-output-key-not-published`.
+`TS0360015`.
 
 The sync target key is derived from the fact primary key. Dimension keys can be projected
 as ordinary fields but are not added to that target key. The output model uses the fact table

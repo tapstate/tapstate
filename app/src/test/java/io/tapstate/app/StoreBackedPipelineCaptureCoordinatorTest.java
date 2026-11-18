@@ -1689,7 +1689,7 @@ class StoreBackedPipelineCaptureCoordinatorTest {
 
         assertThatThrownBy(() -> coordinator.startCapture("p"))
                 .isInstanceOfSatisfying(TapstateException.class, refused -> assertThat(refused.code().code())
-                        .isEqualTo("actuation.source-schema-not-discovered"));
+                        .isEqualTo("TS0360004"));
         assertThat(opened).isEmpty();
         assertThat(coordinator.isCapturing("p")).isFalse();
     }

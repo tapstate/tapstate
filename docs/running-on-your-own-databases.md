@@ -103,10 +103,10 @@ definition - and the run then fails on the next convergence pass, so `status` is
 
 ```
 order_pipeline  failed
-reason: actuation.source-schema-not-discovered
+reason: TS0360004
   Source `src_orders` needs a discovered schema before its tables can be selected.
-why: the run failed, and said why: actuation.source-schema-not-discovered
-  read       status.failure = actuation.source-schema-not-discovered
+why: the run failed, and said why: TS0360004
+  read       status.failure = TS0360004
   next       tapstate logs order_pipeline
 moving     not known -- the run failed
 ```

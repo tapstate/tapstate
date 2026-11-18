@@ -304,7 +304,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -340,7 +340,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -357,7 +357,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -367,7 +367,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).validateStart("p"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-schema-not-discovered")
+                .hasMessageContaining("TS0360004")
                 .hasMessageContaining("orders_src");
     }
 
@@ -565,7 +565,7 @@ class StoreBackedDagSourceTargetModelTest {
 
         assertThatThrownBy(() -> new StoreBackedDagSource(store).dagFor("ambiguous"))
                 .isInstanceOf(io.tapstate.core.common.TapstateException.class)
-                .hasMessageContaining("actuation.source-table-ambiguous");
+                .hasMessageContaining("TS0360009");
     }
 
     @Test
