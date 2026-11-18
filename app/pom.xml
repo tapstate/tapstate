@@ -323,6 +323,13 @@
         </includes>
       </resource>
       <resource>
+        <directory>${project.basedir}/../deploy/connectors</directory>
+        <targetPath>META-INF/tapstate</targetPath>
+        <includes>
+          <include>supported-connectors.json</include>
+        </includes>
+      </resource>
+      <resource>
         <directory>${project.build.directory}/generated-resources/tapstate-web</directory>
       </resource>
     </resources>

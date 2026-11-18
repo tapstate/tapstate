@@ -243,6 +243,8 @@ public enum SystemCollections {
     CACHE_SOURCE_SCHEMAS("source_schemas", Database.CACHE, MongoCacheSchemaStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_CATALOG("connector_catalog", Database.CACHE, MongoCacheConnectorCatalogStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_SPECS("connector_specs", Database.CACHE, MongoCacheConnectorSpecStore.class, Strategy.MIGRATED, 1),
+    CACHE_CONNECTOR_ARTIFACT_HOLDINGS("connector_artifact_holdings", Database.CACHE,
+            MongoCacheConnectorArtifactHoldings.class, Strategy.OWNED_ELSEWHERE, 0),
     CACHE_CONNECTION_TEST_RESULTS("connection_test_results", Database.CACHE, MongoCacheConnectionTestResultStore.class, Strategy.MIGRATED, 1),
     CACHE_CONNECTOR_ARTIFACTS("connector_artifacts", Database.CACHE, MongoCacheConnectorRegistry.class, Strategy.IMMUTABLE, 1, Kind.GRIDFS_BUCKET,
             new IndexSpec(List.of("metadata.connectorId"), false)),

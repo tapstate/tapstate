@@ -560,14 +560,19 @@ class ControlPlaneConfiguration {
     // The startup seed sweep: the release's connectors/ directory goes through the same
     // register-if-absent path an explicit register uses, so restarts and concurrent nodes are harmless.
 
+    @Bean(initMethod = "start", destroyMethod = "close")
+    ConnectorCatalogBackground connectorCatalogBackground(ConnectorPluginProperties properties, Clock clock) {
+        return new ConnectorCatalogBackground(properties.getPluginsDir().toAbsolutePath().normalize().getParent(), clock);
+    }
+
     @Bean
     ConnectorArtifactRegistrar connectorArtifactRegistrar(
             ConnectorRegistry registry, ConnectorIntrospector introspector,
             CapabilityDeriver capabilityDeriver, ConnectorCatalogStore connectorCatalogStore,
-            ConnectorSpecStore connectorSpecStore, ConnectorPluginProperties properties) {
+            ConnectorSpecStore connectorSpecStore, ConnectorPluginProperties properties, ConnectorCatalogBackground catalog) {
         return new ConnectorArtifactRegistrar(
                 registry, introspector, capabilityDeriver, connectorCatalogStore, connectorSpecStore,
-                properties.getAlsoAcceptIds());
+                catalog::admittedIds, properties.getAlsoAcceptIds());
     }
 
     @Bean

@@ -63,7 +63,7 @@ class SystemCollectionsGatesTest {
         }
         Set<String> expectedResources = new HashSet<>(
                 Arrays.stream(SystemCollections.values()).map(SystemCollections::resourceId).toList());
-        expectedResources.addAll(Set.of("local.installation", "local.connector-cache",
+        expectedResources.addAll(Set.of("local.installation", "local.connector-cache", "local.connector-support-snapshot", "local.connector-install-record",
                 "temporary.connector-registration", "temporary.connector-trust", "temporary.connector-download", "temporary.validation-sort",
                 "user.cli-context", "user.cli-auth", "user.workspace", "user.local-stack", "user.alias-links", "build.catalog"));
         assertThat(rows.keySet()).containsExactlyInAnyOrderElementsOf(expectedResources);

@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.jar.JarFile;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * Registers a connector artifact on disk into the distribution store by what the artifact itself
@@ -86,7 +87,8 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     private final CapabilityDeriver capabilityDeriver;
     private final ConnectorCatalogStore catalogStore;
     private final ConnectorSpecStore specStore;
-    private final List<String> acceptedConnectorIds;
+    private final Supplier<List<String>> supportedConnectorIds;
+    private final List<String> alsoAccept;
 
     /** Registers with the release's own accepted set — what every shipped artifact uses. */
     public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
@@ -104,27 +106,32 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
     public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
                                       CapabilityDeriver capabilityDeriver, ConnectorCatalogStore catalogStore,
                                       ConnectorSpecStore specStore, List<String> alsoAccept) {
+        this(registry, introspector, capabilityDeriver, catalogStore, specStore,
+                ConnectorArtifactRegistrar::officialConnectorIds, alsoAccept);
+    }
+
+    /** Uses the current server support manifest for registration admission. */
+    public ConnectorArtifactRegistrar(ConnectorRegistry registry, ConnectorIntrospector introspector,
+                                      CapabilityDeriver capabilityDeriver, ConnectorCatalogStore catalogStore,
+                                      ConnectorSpecStore specStore, Supplier<List<String>> supportedConnectorIds,
+                                      List<String> alsoAccept) {
         java.util.Arrays.setAll(registrationLocks, ignored -> new Object());
         this.registry = Objects.requireNonNull(registry, "registry");
         this.introspector = Objects.requireNonNull(introspector, "introspector");
         this.capabilityDeriver = Objects.requireNonNull(capabilityDeriver, "capabilityDeriver");
         this.catalogStore = Objects.requireNonNull(catalogStore, "catalogStore");
         this.specStore = Objects.requireNonNull(specStore, "specStore");
-        Objects.requireNonNull(alsoAccept, "alsoAccept");
-        if (alsoAccept.isEmpty()) {
-            // The shipped path accepts that list itself rather than a copy of it, so no edit can move
-            // one without the other.
-            this.acceptedConnectorIds = OfficialConnectors.IDS;
-        } else {
-            List<String> accepted = new ArrayList<>(OfficialConnectors.IDS);
-            accepted.addAll(alsoAccept);
-            this.acceptedConnectorIds = List.copyOf(accepted);
-        }
+        this.supportedConnectorIds = Objects.requireNonNull(supportedConnectorIds, "supportedConnectorIds");
+        this.alsoAccept = List.copyOf(alsoAccept);
     }
 
-    /** The ids this registrar accepts: the official set, widened by whatever the deployment named. */
+    /** The ids this registrar accepts: the effective set, widened by whatever the deployment named. */
     List<String> acceptedConnectorIds() {
-        return acceptedConnectorIds;
+        List<String> supported = supportedConnectorIds.get();
+        if (alsoAccept.isEmpty()) return supported;
+        var accepted = new ArrayList<>(supported);
+        accepted.addAll(alsoAccept);
+        return List.copyOf(accepted);
     }
 
     /** Registers the artifact at {@code artifact} if its content hash is not already registered. */
@@ -249,6 +256,7 @@ public final class ConnectorArtifactRegistrar implements ConnectorRegistrar {
      * per-jar failure the sweep reports and carries on from, exactly like any other defective artifact.
      */
     private void rejectUnofficialConnector(String connectorId) {
+        List<String> acceptedConnectorIds = acceptedConnectorIds();
         if (acceptedConnectorIds.contains(connectorId)) {
             return;
         }

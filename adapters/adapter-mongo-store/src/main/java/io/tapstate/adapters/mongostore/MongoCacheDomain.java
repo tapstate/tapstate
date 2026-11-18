@@ -489,6 +489,11 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     public io.tapstate.spi.store.ConnectorCatalogStore connectorCatalog(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheConnectorCatalogStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_CATALOG, requireActive));
     }
+    public io.tapstate.spi.store.ConnectorArtifactHoldings connectorArtifactHoldings(CacheBusinessScope expected, Runnable requireActive) {
+        Runnable active = () -> { businessActive(); requireActive.run(); };
+        MongoCacheConnectorArtifactHoldings.prepare(client, database, expected, active);
+        return new MongoCacheConnectorArtifactHoldings(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_ARTIFACT_HOLDINGS, requireActive));
+    }
     public io.tapstate.spi.store.ConnectorSpecStore connectorSpecs(CacheBusinessScope expected, Runnable requireActive) {
         return new MongoCacheConnectorSpecStore(metadataAccess(expected, SystemCollections.CACHE_CONNECTOR_SPECS, requireActive));
     }

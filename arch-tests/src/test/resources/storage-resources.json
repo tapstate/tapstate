@@ -26,11 +26,11 @@
       ]
     },
     "connector-catalog": {
-      "goal": "Rebuild the derived connector catalog and Cloud bundled registration metadata and icons from verified artifacts.",
-      "entry": "SeedSweepRunner after CACHE admission for Cloud; normal connector registration or seed sweep for on-premises.",
+      "goal": "Rebuild all retained connector versions and their catalog metadata, specs and icons from verified local artifacts.",
+      "entry": "Verified connector installation, or startup reconciliation after CACHE admission.",
       "prerequisites": [
-        "Cloud uses the eight immutable image JARs and matching release lock. Store the existing content-addressed spec before publishing its catalog document.",
-        "On-premises derives the catalog from the existing connector registration path."
+        "Use the verified JARs in the current bundle and persistent plugins directory with their installation records.",
+        "Re-derive and store the original spec by spec content hash before publishing the exact artifact catalog and node possession."
       ]
     },
     "derived-cache": {
@@ -1104,6 +1104,32 @@
         "validationCountOwner formatVersion 1 holds generation, preparationId, nodeId, bootId, claimGeneration, executionGeneration, and topologyRevision. It has authority only when it matches the current COMPLETE validationPreparation and the current scope. Older rows without it remain readable and a verified manual COUNT acquisition creates it. A different Pipeline lifetime never inherits this authority.",
         "First COUNT acquisition publishes the exact committed CACHE birth and lease under the original ISSUED preparation only when CONFIG advances that original to COMPLETE. An expired or mismatching original is discarded. No replay creates another lease or revives a superseded owner."
       ]
+    },
+    "connector-support-snapshot": {
+      "goal": "Restore the most recent valid official connector support manifest before any network request.",
+      "entry": "Connector catalog initialization after service start or CACHE rebuild.",
+      "prerequisites": [
+        "Validate the bundled and local manifests, prefer the higher independent manifest version, and reuse local on equal versions.",
+        "Recover missing or corrupt local state from the bundled manifest, then accept a successfully validated newer remote manifest.",
+        "Pipeline artifact bindings and CDC positions remain in their original durable records."
+      ]
+    },
+    "connector-artifact-holdings": {
+      "goal": "Rebuild only this node's artifact possession from complete local connector installations.",
+      "entry": "Prepare the derived collection under the current CACHE write admission, then reconcile the current verified bundle and persistent plugins directory at startup.",
+      "prerequisites": [
+        "A trusted current CACHE scope, stable node id or fixed single-node identity, and verified readable local JARs.",
+        "Commit catalog, spec and icon before possession. Remove possession before deleting the last valid local copy. Retain possession when a verified bundled copy still exists."
+      ]
+    },
+    "connector-install-record": {
+      "goal": "Resume an interrupted connector installation and rebuild derived CACHE metadata from retained local files.",
+      "entry": "Reconcile the installation record and verified artifact at startup or during an idempotent retry.",
+      "prerequisites": [
+        "One record per persistent JAR SHA-256, and an actual retained JAR for registration.",
+        "A complete registration includes spec, catalog, icon and the local node possession record in the current CACHE scope.",
+        "A missing or unreadable record requires normal artifact verification before it can be rebuilt."
+      ]
     }
   },
   "consistencyProfiles": {
@@ -1346,6 +1372,14 @@
     "operator-generations-validation-count-r1": {
       "atomicDomain": "CONFIG",
       "fencing": "Existing ordinary CONFIG transactions remain. The shared operation start atomically verifies the original immutable plan, complete current dependency/scope revisions, reserves one fixed effective mapping and installs only exact affected old-scope gates and STOPPED intents. CACHE executes independently with an adapter-issued narrow handle and separate transaction, with CONFIG checks outside that transaction. Protected reconfirm requires the exact CACHE CANCELLED arbitration receipt; completion requires the original reservation and exact RETIRED/new-namespace/CAPTURE receipt without reinterpreting later authoring. The winning per-Pipeline explicit full completion removes only its original scope gate. No cross-instance atomicity is promised. Manual COUNT CONFIG writes conditionally touch the same operator_generations row and compare the exact current validationCountOwner and preparation. CACHE commits separately under its live lease."
+    },
+    "connector-support-snapshot": {
+      "atomicDomain": "LOCAL",
+      "fencing": "Serialize refresh per instance; replace the validated complete manifest by same-directory atomic rename before publishing to memory."
+    },
+    "connector-install-record": {
+      "atomicDomain": "LOCAL",
+      "fencing": "Serialize operations for the same hash. Publish PENDING before the verified JAR rename and COMPLETE after scoped CACHE registration. Each file replacement is atomic; CACHE and file operations commit separately."
     }
   },
   "resources": [
@@ -3163,15 +3197,15 @@
     },
     {
       "id": "mongo.cache.connector_catalog",
-      "resourceVersion": 1,
-      "proposalVersion": 2,
+      "resourceVersion": 2,
+      "proposalVersion": 3,
       "kind": "COLLECTION",
       "layer": "CACHE",
       "database": "CACHE",
       "physicalNames": [
         "connector_catalog"
       ],
-      "responsibility": "Derived connector catalog metadata. Cloud rows also hold a bundledArtifact subdocument with the JAR SHA-256, PDK API version, SEED source and optional media type and binary icon. Each row is published atomically under its original CACHE scope after its spec is stored.",
+      "responsibility": "Scoped, derived connector catalog with one row per connector id and JAR SHA-256. Stores normalized connector metadata, artifact version, PDK API version, installation origin, JAR byte count, spec content hash and optional icon. Exact reads by original binding and default reads for available local versions. Earlier ID-only rows remain readable until regenerated from verified local artifacts.",
       "writers": [
         "io.tapstate.adapters.mongostore.MongoCacheConnectorCatalogStore"
       ],
@@ -3180,10 +3214,35 @@
       ],
       "recovery": "connector-catalog",
       "consistency": "cache",
-      "growth": "On-premises retains its existing one-row-per-connector behavior. Cloud is bounded to eight rows per CACHE scope and at most 1 MiB of icon bytes per row. Cloud stores no JAR bytes.",
+      "growth": "One metadata row and optional icon per retained JAR hash. Specs shared by content hash can be removed when no catalog or recovery path refers to them.",
       "evidence": [
         "app/src/test/java/io/tapstate/app/ManagedMongoStoreIsolationIT.java",
-        "app/src/test/java/io/tapstate/app/CloudConnectorSeedReadinessIT.java"
+        "app/src/test/java/io/tapstate/app/CloudConnectorSeedReadinessIT.java",
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheConnectorRegistryIT.java"
+      ]
+    },
+    {
+      "id": "mongo.cache.connector_artifact_holdings",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "COLLECTION",
+      "layer": "CACHE",
+      "database": "CACHE",
+      "physicalNames": [
+        "connector_artifact_holdings"
+      ],
+      "responsibility": "One node's verified possession of a local connector artifact under the original CACHE scope, keyed by scope, node id and JAR SHA-256. The row contains the connector id and artifact version.",
+      "writers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorArtifactHoldings"
+      ],
+      "readers": [
+        "io.tapstate.adapters.mongostore.MongoCacheConnectorArtifactHoldings"
+      ],
+      "recovery": "connector-artifact-holdings",
+      "consistency": "cache",
+      "growth": "One row per live scope, node and hash possession. Different local copies with the same hash reuse one row.",
+      "evidence": [
+        "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoCacheConnectorRegistryIT.java"
       ]
     },
     {
@@ -4417,6 +4476,54 @@
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationControlStoreIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationSchemaIT.java",
         "adapters/adapter-mongo-store/src/test/java/io/tapstate/adapters/mongostore/MongoValidationIndependentPreparationIT.java"
+      ]
+    },
+    {
+      "id": "local.connector-support-snapshot",
+      "resourceVersion": 1,
+      "proposalVersion": 2,
+      "kind": "FILE_SET",
+      "layer": "CACHE",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${dataDir}/cache/connector-support.json"
+      ],
+      "responsibility": "One most recent valid official connector support manifest, including format version, independent manifest version and entries.",
+      "writers": [
+        "io.tapstate.app.ConnectorSupportSnapshot"
+      ],
+      "readers": [
+        "io.tapstate.app.ConnectorSupportSnapshot"
+      ],
+      "recovery": "connector-support-snapshot",
+      "consistency": "connector-support-snapshot",
+      "growth": "One published manifest per instance, linear in the number of supported connectors and independent of refresh count.",
+      "evidence": [
+        "app/src/test/java/io/tapstate/app/ConnectorSupportSnapshotTest.java"
+      ]
+    },
+    {
+      "id": "local.connector-install-record",
+      "resourceVersion": 1,
+      "proposalVersion": 1,
+      "kind": "FILE_SET",
+      "layer": "CONFIG",
+      "database": "LOCAL",
+      "physicalNames": [
+        "${dataDir}/plugins/<sha256>.json"
+      ],
+      "responsibility": "Records schemaVersion, connectorId, artifact version, installation origin, verified sizeBytes and PENDING or COMPLETE state next to an installed JAR named by its SHA-256.",
+      "writers": [
+        "io.tapstate.adapters.pdk.ConnectorInstallRecords"
+      ],
+      "readers": [
+        "io.tapstate.adapters.pdk.ConnectorInstallRecords"
+      ],
+      "recovery": "connector-install-record",
+      "consistency": "connector-install-record",
+      "growth": "One small JSON record per retained persistent JAR hash. Cleanup removes the record with its artifact.",
+      "evidence": [
+        "adapters/adapter-pdk/src/test/java/io/tapstate/adapters/pdk/ConnectorInstallRecordsTest.java"
       ]
     }
   ]
