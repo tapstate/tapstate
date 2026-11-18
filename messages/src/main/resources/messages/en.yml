@@ -1531,6 +1531,7 @@ aggregate.group-invalid:
 aggregate.step-busy:
   message: "Aggregate step `{step}` of pipeline `{pipeline}` did not answer in time."
   solution: "The step answers a check or a repair between its own updates, a few at a time. Nothing was left half done: ask again, and narrow the request to one group if the step is under heavy load."
+
 control.ai-provider-request-rejected:
   message: "The AI provider rejected the model or request protocol."
   solution: "Check the model ID and API protocol. For current OpenAI models, select Responses API."
