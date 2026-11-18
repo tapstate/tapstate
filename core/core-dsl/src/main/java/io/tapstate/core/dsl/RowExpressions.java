@@ -46,7 +46,8 @@ import java.util.Set;
  * <p>Expressions bind the event envelope as their root: {@code op} / {@code ts} / {@code src} are
  * scalars, {@code before} / {@code after} / {@code schema} are maps. The function environment is the
  * CEL standard library (with the standard macros {@code has} / {@code exists} / {@code all} /
- * {@code map} / {@code filter}) plus the one builtin the grammar commits ({@code now()}). Two shapes:
+ * {@code map} / {@code filter}) plus the clock functions ({@code now()}, {@code today(zone)}, and the
+ * calendar arithmetic {@link RowClock} describes). Two shapes:
  * a predicate must compile to {@code bool}; a computed value may compile to any type.
  *
  * <p>The row's columns are typed in one of two ways, and the difference is the whole point of the
@@ -76,9 +77,33 @@ public final class RowExpressions {
     private RowExpressions() {
     }
 
-    /** {@code now()} — current event time; the one builtin beyond the CEL standard library. */
+    /** {@code now()}: the moment the row is processed, as a timestamp. */
     private static final CelFunctionDecl NOW = CelFunctionDecl.newFunctionDeclaration(
-            "now", CelOverloadDecl.newGlobalOverload("now_timestamp", SimpleType.TIMESTAMP));
+            "now", CelOverloadDecl.newGlobalOverload(RowClock.NOW_OVERLOAD, SimpleType.TIMESTAMP));
+
+    /**
+     * The calendar functions beside {@code now()}: {@code today(zone)}, date arithmetic and the day a date and
+     * time falls on. Each returns a tapstate date, so its result orders against a DATE column like another
+     * DATE does. {@link RowClock} says what each computes.
+     */
+    private static List<CelFunctionDecl> calendarFunctions() {
+        CelType date = opaqueTypeOf(TapstateType.DATE);
+        CelType datetime = opaqueTypeOf(TapstateType.DATETIME);
+        return List.of(
+                CelFunctionDecl.newFunctionDeclaration(RowClock.TODAY,
+                        CelOverloadDecl.newGlobalOverload(RowClock.TODAY_OVERLOAD, date, SimpleType.STRING)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_DAYS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_DAYS_OVERLOAD, date, date, SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_MONTHS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_MONTHS_OVERLOAD, date, date,
+                                SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.ADD_YEARS,
+                        CelOverloadDecl.newMemberOverload(RowClock.ADD_YEARS_OVERLOAD, date, date,
+                                SimpleType.INT)),
+                CelFunctionDecl.newFunctionDeclaration(RowClock.TO_DATE,
+                        CelOverloadDecl.newMemberOverload(RowClock.TO_DATE_OVERLOAD, date, datetime,
+                                SimpleType.STRING)));
+    }
 
     /**
      * The temporal types two values of which may be ordered against each other. Comparing two values
@@ -118,6 +143,7 @@ public final class RowExpressions {
                 .addVar("src", SimpleType.STRING)
                 .addVar("schema", MapType.create(SimpleType.STRING, SimpleType.DYN))
                 .addFunctionDeclarations(NOW)
+                .addFunctionDeclarations(calendarFunctions())
                 .addFunctionDeclarations(sameTypeComparisons());
     }
 
@@ -260,6 +286,9 @@ public final class RowExpressions {
         }
         CelAbstractSyntaxTree ast = checked(result);
         String diagnostic = indexedRow(ast);
+        if (diagnostic == null) {
+            diagnostic = zoneError(ast);
+        }
         if (diagnostic == null && ast.getResultType().equals(celTypeOf(TapstateType.DECIMAL))
                 && movedColumn(ast.getExpr()) == null) {
             return "a computed tapstate.decimal result has no declared precision, scale or bounds; "
@@ -396,7 +425,27 @@ public final class RowExpressions {
         if (result.hasError()) {
             return result.getErrorString();
         }
-        return indexedRow(checked(result));
+        CelAbstractSyntaxTree ast = checked(result);
+        String indexed = indexedRow(ast);
+        return indexed != null ? indexed : zoneError(ast);
+    }
+
+    /**
+     * The diagnostic for a time zone written as a literal that is not one, or null when every literal zone
+     * given to a calendar function is a real one. A zone computed from the row is judged when it is read.
+     */
+    static String zoneError(CelAbstractSyntaxTree ast) {
+        return CelNavigableAst.fromAst(ast).getRoot().allNodes()
+                .filter(node -> node.getKind() == CelExpr.ExprKind.Kind.CALL)
+                .map(node -> node.expr().call())
+                .filter(call -> call.function().equals(RowClock.TODAY) || call.function().equals(RowClock.TO_DATE))
+                .flatMap(call -> call.args().stream())
+                .filter(arg -> arg.getKind() == CelExpr.ExprKind.Kind.CONSTANT
+                        && arg.constant().getKind() == dev.cel.common.ast.CelConstant.Kind.STRING_VALUE)
+                .map(arg -> RowClock.zoneError(arg.constant().stringValue()))
+                .filter(java.util.Objects::nonNull)
+                .findFirst()
+                .orElse(null);
     }
 
     /**

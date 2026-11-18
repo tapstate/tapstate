@@ -1,0 +1,17 @@
+version: tapstate/v1
+kind: pipeline
+id: e2e_filter_reads_the_clock
+source: src_file
+settings: { read_mode: snapshot_and_cdc }
+transforms:
+  - id: kept_by_the_clock
+    from: [orders]
+    type: filter
+    expr: >-
+      now() > timestamp('2020-01-01T00:00:00Z')
+      && today('America/Los_Angeles') > today('America/Los_Angeles').addYears(-5)
+      && today('UTC').addDays(1).addMonths(-1) < today('UTC')
+serve:
+  from: kept_by_the_clock
+  sync:
+    - source: tgt_file

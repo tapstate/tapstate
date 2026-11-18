@@ -2,14 +2,19 @@ package io.tapstate.adapters.transform;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.NullValue;
+import com.google.protobuf.Timestamp;
 import dev.cel.common.CelAbstractSyntaxTree;
 import dev.cel.runtime.CelEvaluationException;
 import dev.cel.runtime.CelFunctionBinding;
+import dev.cel.runtime.CelLateFunctionBindings;
 import dev.cel.runtime.CelRuntime;
 import dev.cel.runtime.CelRuntimeFactory;
+import io.tapstate.core.dsl.RowClock;
 import io.tapstate.core.dsl.RowExpressions;
 import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
+import java.time.Clock;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -39,7 +44,48 @@ final class RowExpressionProgram {
     // shared: building the per-expression program is the only per-instance cost.
     private static final CelRuntime RUNTIME = CelRuntimeFactory.standardCelRuntimeBuilder()
             .addFunctionBindings(sameTypeOrderings())
+            .addFunctionBindings(calendarArithmetic())
             .build();
+
+    /**
+     * The calendar functions that do not read the clock, bound once. A failure is a value the function cannot
+     * take - a zone that is not one, a receiver that is not a date - and surfaces as an evaluation failure of
+     * the expression rather than as a crash.
+     */
+    private static List<CelFunctionBinding> calendarArithmetic() {
+        return List.of(
+                CelFunctionBinding.from(RowClock.ADD_DAYS_OVERLOAD, Object.class, Long.class,
+                        (date, days) -> calendar(() -> RowClock.addDays(date, days))),
+                CelFunctionBinding.from(RowClock.ADD_MONTHS_OVERLOAD, Object.class, Long.class,
+                        (date, months) -> calendar(() -> RowClock.addMonths(date, months))),
+                CelFunctionBinding.from(RowClock.ADD_YEARS_OVERLOAD, Object.class, Long.class,
+                        (date, years) -> calendar(() -> RowClock.addYears(date, years))),
+                CelFunctionBinding.from(RowClock.TO_DATE_OVERLOAD, Object.class, String.class,
+                        (value, zone) -> calendar(() -> RowClock.toDate(value, zone))));
+    }
+
+    /**
+     * The functions that read the clock, bound for one evaluation at the instant it was read, so every clock
+     * call in one expression sees the same moment.
+     */
+    private static CelLateFunctionBindings clockAt(Instant now) {
+        Timestamp timestamp = Timestamp.newBuilder()
+                .setSeconds(now.getEpochSecond())
+                .setNanos(now.getNano())
+                .build();
+        return CelLateFunctionBindings.from(
+                CelFunctionBinding.from(RowClock.NOW_OVERLOAD, List.of(), args -> timestamp),
+                CelFunctionBinding.from(RowClock.TODAY_OVERLOAD, String.class,
+                        zone -> calendar(() -> RowClock.today(now, zone))));
+    }
+
+    private static Object calendar(java.util.function.Supplier<Object> computation) throws CelEvaluationException {
+        try {
+            return computation.get();
+        } catch (IllegalArgumentException | java.time.DateTimeException refused) {
+            throw new CelEvaluationException(refused.getMessage());
+        }
+    }
 
     /**
      * One runtime binding per ordering operator, serving every temporal type the compiler declares it
@@ -86,25 +132,38 @@ final class RowExpressionProgram {
     private final CelRuntime.Program program;
     // The source expression, kept so an evaluation failure can name the expression that failed.
     private final String expr;
+    // What now() reads: the processing host's clock, replaced only by a test that has to hold time still.
+    private final Clock clock;
 
-    private RowExpressionProgram(CelRuntime.Program program, String expr) {
+    private RowExpressionProgram(CelRuntime.Program program, String expr, Clock clock) {
         this.program = program;
         this.expr = expr;
+        this.clock = clock;
     }
 
     /** Compiles a predicate (bool) expression into an evaluable program. */
     static RowExpressionProgram predicate(String expr) {
-        return of(RowExpressions.predicateAst(expr), expr);
+        return predicate(expr, Clock.systemUTC());
+    }
+
+    /** A predicate whose clock functions read {@code clock}. */
+    static RowExpressionProgram predicate(String expr, Clock clock) {
+        return of(RowExpressions.predicateAst(expr), expr, clock);
     }
 
     /** Compiles a computed-value expression (any type) into an evaluable program. */
     static RowExpressionProgram value(String expr) {
-        return of(RowExpressions.valueAst(expr), expr);
+        return value(expr, Clock.systemUTC());
     }
 
-    private static RowExpressionProgram of(CelAbstractSyntaxTree ast, String expr) {
+    /** A computed value whose clock functions read {@code clock}. */
+    static RowExpressionProgram value(String expr, Clock clock) {
+        return of(RowExpressions.valueAst(expr), expr, clock);
+    }
+
+    private static RowExpressionProgram of(CelAbstractSyntaxTree ast, String expr, Clock clock) {
         try {
-            return new RowExpressionProgram(RUNTIME.createProgram(ast), expr);
+            return new RowExpressionProgram(RUNTIME.createProgram(ast), expr, clock);
         } catch (CelEvaluationException e) {
             // A checked AST builds into a program; a failure here is an invariant violation, not a
             // user condition.
@@ -127,7 +186,7 @@ final class RowExpressionProgram {
         vars.put("after", bind(after));
         vars.put("schema", bind(event.schema()));
         try {
-            return unbound(program.eval(vars));
+            return unbound(program.eval(vars, clockAt(clock.instant())));
         } catch (CelEvaluationException e) {
             // A row-level evaluation failure (a missing field, a type clash on a dyn value, a function
             // that type-checks but is unbound at runtime) is a user-diagnosable condition: surface it
@@ -182,6 +241,11 @@ final class RowExpressionProgram {
         }
         if (value instanceof ByteString bytes) {
             return bytes.toByteArray();
+        }
+        // A timestamp is the expression language's own representation of an instant; a sink is owed the
+        // platform's, the one a source's date and time with an offset arrives as.
+        if (value instanceof Timestamp timestamp) {
+            return Instant.ofEpochSecond(timestamp.getSeconds(), timestamp.getNanos());
         }
         return mapped(value, RowExpressionProgram::unbound);
     }

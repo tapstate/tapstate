@@ -83,3 +83,55 @@ fails evaluation with `transform.expression-failed`; guard a nullable column
 with `has()` or a null check. The filter judges each update against the row it
 replaces, so a stale value that a partial update has already merged into the
 source row travels on with the next newer update.
+
+## Comparing with today
+
+`now()` is the moment the row is processed, and `today(zone)` is that moment's
+calendar day in a time zone. A DATE can move by whole days, months or years
+with `addDays(n)`, `addMonths(n)` and `addYears(n)`, and a DATETIME gives the
+day it falls on with `toDate(zone)`. These keep only comps issued in the last
+five years, by Las Vegas days:
+
+```yaml
+expr: "after.IssueDate > today('America/Los_Angeles').addYears(-5)"
+```
+
+```yaml
+expr: "after.IssuedAt.toDate('America/Los_Angeles') > today('America/Los_Angeles').addYears(-5)"
+```
+
+| Function | Returns | Notes |
+| --- | --- | --- |
+| `now()` | timestamp | Read once per evaluation: every call in one expression sees the same moment. A computed field holding it is written as a date and time with an offset. |
+| `today(zone)` | DATE | The zone is required. Use a region id such as `America/Los_Angeles` or a fixed offset such as `+08:00`; an abbreviation such as `PST` is refused. |
+| `date.addDays(n)`, `date.addMonths(n)`, `date.addYears(n)` | DATE | A day past the end of a shorter month lands on its last day, so 29 February plus one year is 28 February. |
+| `datetime.toDate(zone)` | DATE | A date and time without an offset already is a wall-clock reading and keeps its own day; one with an offset or an instant takes the day in `zone`. |
+
+A literal zone that names no zone is refused when the pipeline is applied. A
+zone read from the row is judged when the row is processed, and one that names
+no zone fails with `transform.expression-failed`.
+
+### The answer is fixed when the row is processed
+
+Tapstate recomputes a value when the rows it reads change, never because the
+clock moved. A row that passed `IssueDate > today(...).addYears(-5)` stays in
+the view after its issue date ages past five years, until the row itself
+changes again. A field computed with `today()` keeps the day it was computed
+on.
+
+So use the clock to decide what to do with a row as it arrives, such as
+dropping a comp that is already too old. For a value that has to follow the
+calendar on its own, such as "the player is in house today", keep the fact in
+the document and compare it with today where it is read:
+
+- Keep the date: a rollup such as `LastAccountingDate: { max: $AccountingDate }`
+  on the player document changes whenever an accounting day is added or
+  removed.
+- Compare it where it is read: a formula field in the CRM, a database view, or
+  the query itself, for example `LastAccountingDate == today` evaluated by the
+  reader.
+- Remove rows that age out with the target's own retention, such as a MongoDB
+  TTL index on the issue date.
+
+Rollup fields and aggregate steps do not offer the clock functions, so a
+rollup filter cannot silently depend on the day it was computed.

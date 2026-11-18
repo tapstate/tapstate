@@ -69,6 +69,11 @@ embeds merge in, the objects and arrays its references resolve to, and the rollu
 levels (those are computed first, so a total can sum line totals). It never sees its siblings, its parent
 or another document.
 
+There is no `now()` or `today()` here. A rollup is recomputed when its elements change, not when the
+day changes, so "elements dated today" would stay true past midnight. Roll up the date itself
+(`LastDay: { max: $day }`) and compare it with today where the document is read; see
+[comparing with today](../filter/README.md#comparing-with-today).
+
 Expressions are checked when the pipeline is applied, against the discovered models of the level's table
 and of every table it references. A misspelt column of a referenced row is refused there, not read as an
 absent value forever after. The element's own columns follow the rule every row expression follows: a

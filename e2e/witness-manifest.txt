@@ -132,3 +132,5 @@ nest-rollup-fields-snapshot on IN_PROCESS
 nest-rollup-fields-snapshot on REAL_PROCESS
 several-tables-feed-one-array-and-each-keeps-its-own-rows on IN_PROCESS
 several-tables-feed-one-array-and-each-keeps-its-own-rows on REAL_PROCESS
+a-filter-reads-the-clock-when-each-row-arrives on IN_PROCESS
+a-filter-reads-the-clock-when-each-row-arrives on REAL_PROCESS
