@@ -169,6 +169,18 @@ class UnwindDerivedKeyTest {
     }
 
     @Test
+    void aRenamePublishesTheUnwindLocatorOnlyWhenTheRenamesSourceIsAbsent() {
+        NodeColumns expanded = NodeColumns.of(unwind("item_no", null), one(atTheSource()), null);
+        NodeColumns overwritten = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("item_no", FieldRule.rename("o_region"))), one(expanded), null);
+        assertThat(publishedKey(overwritten)).isEmpty();
+
+        NodeColumns preserved = NodeColumns.of(new TransformBody.MapProjection(
+                Map.of("item_no", FieldRule.rename("absent"))), one(expanded), null);
+        assertThat(publishedKey(preserved)).containsExactly("o_id", "item_no");
+    }
+
+    @Test
     void aBeforeImageReadDoesNotInheritSourceIdentity() {
         Map<String, FieldRule> rules = new LinkedHashMap<>();
         rules.put("order_id", FieldRule.computed("before.o_id"));

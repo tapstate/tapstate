@@ -95,6 +95,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
@@ -2366,22 +2367,22 @@ final class StoreBackedDagSource implements DagSource {
                 && guardedPath == null) {
             return transformPort(step, List.of(), previewExecutionId);
         }
-        Function<FromRef, Map<String, List<String>>> sourceKeys = ref -> {
-            Map<String, List<String>> byStream = new LinkedHashMap<>();
+        Function<FromRef, Map<String, SourceTable>> sourceTables = ref -> {
+            Map<String, SourceTable> byStream = new LinkedHashMap<>();
             for (String key : upstreams(ref, keysByTable, keysBySource, vertices, stepIds)) {
                 SourceVertex vertex = vertices.get(key);
                 if (vertex != null) {
-                    List<String> primaryKey = Optional.ofNullable(modelInputs.apply(StoredArtifacts.requireSource(artifacts(),vertex.sourceId())))
-                            .map(model -> discoveredTable(model, vertex.table()))
-                            .map(SourceTable::primaryKey).orElse(List.of());
-                    byStream.put(vertex.stream(), primaryKey);
+                    SourceTable table = Optional.ofNullable(modelInputs.apply(
+                                    StoredArtifacts.requireSource(artifacts(), vertex.sourceId())))
+                            .map(model -> discoveredTable(model, vertex.table())).orElse(null);
+                    byStream.put(vertex.stream(), table);
                 }
             }
             return byStream;
         };
-        Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceKeys);
+        Map<String, List<String>> keys = parentKeysReaching(step, steps, sourceTables);
         Set<String> guardedStreams = guardedPath == null ? Set.of()
-                : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceKeys);
+                : unmodifiedStreamsReaching((Step.Inline) step, steps, sourceTables);
         return transformPortByStream(step, keys, guardedPath, guardedStreams, previewExecutionId);
     }
 
@@ -2444,8 +2445,8 @@ final class StoreBackedDagSource implements DagSource {
 
     /** Check the physical earlier row once, before the first projection can change its shape. */
     private static Set<String> unmodifiedStreamsReaching(Step.Inline step, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys) {
-        Map<String, Set<Boolean>> states = mutationStatesReaching(step.from(), steps, sourceKeys, new HashSet<>());
+            Function<FromRef, Map<String, SourceTable>> sourceTables) {
+        Map<String, Set<Boolean>> states = mutationStatesReaching(step.from(), steps, sourceTables, new HashSet<>());
         Set<String> unmodified = new LinkedHashSet<>();
         states.forEach((stream, checked) -> {
             if (checked.size() > 1) {
@@ -2460,11 +2461,11 @@ final class StoreBackedDagSource implements DagSource {
     }
 
     private static Map<String, Set<Boolean>> mutationStatesReaching(FromClause from,
-            Map<String, Step.Inline> steps, Function<FromRef, Map<String, List<String>>> sourceKeys,
+            Map<String, Step.Inline> steps, Function<FromRef, Map<String, SourceTable>> sourceTables,
             Set<String> visiting) {
         Map<String, Set<Boolean>> states = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
-            sourceKeys.apply(ref).keySet().forEach(stream ->
+            sourceTables.apply(ref).keySet().forEach(stream ->
                     states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>()).add(false));
             for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
@@ -2474,7 +2475,7 @@ final class StoreBackedDagSource implements DagSource {
                 boolean mutates = body instanceof TransformBody.MapProjection || body instanceof TransformBody.Js
                         || body instanceof TransformBody.Unwind;
                 if (mutates || body instanceof TransformBody.Filter || body instanceof TransformBody.Union) {
-                    mutationStatesReaching(upstream.from(), steps, sourceKeys, visiting).forEach((stream, checked) ->
+                    mutationStatesReaching(upstream.from(), steps, sourceTables, visiting).forEach((stream, checked) ->
                             states.computeIfAbsent(stream, ignored -> new LinkedHashSet<>())
                                     .addAll(mutates ? Set.of(true) : checked));
                 }
@@ -2517,11 +2518,12 @@ final class StoreBackedDagSource implements DagSource {
 
     /** Resolve every input separately, retaining its stream identity through projection and expansion. */
     static Map<String, List<String>> parentKeysReaching(Step step, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys) {
+            Function<FromRef, Map<String, SourceTable>> sourceTables) {
         if (!(step instanceof Step.Inline inline)) return Map.of();
         Map<String, List<String>> result = new LinkedHashMap<>();
-        parentKeyCandidates(step.id(), inline.from(), steps, sourceKeys, new HashSet<>())
-                .forEach((stream, key) -> {
+        parentKeyCandidates(step.id(), inline.from(), steps, sourceTables, new HashSet<>())
+                .forEach((stream, state) -> {
+                    List<Set<String>> key = state.candidates();
                     if (key.stream().anyMatch(Set::isEmpty)) {
                         throw unresolvedParentKey(step.id(), stream, "a parent-key column was overwritten");
                     }
@@ -2530,42 +2532,68 @@ final class StoreBackedDagSource implements DagSource {
         return result;
     }
 
-    private static Map<String, List<Set<String>>> parentKeyCandidates(String stepId, FromClause from, Map<String, Step.Inline> steps,
-            Function<FromRef, Map<String, List<String>>> sourceKeys, Set<String> visiting) {
-        Map<String, List<Set<String>>> keys = new LinkedHashMap<>();
+    private static Map<String, ParentKeyState> parentKeyCandidates(
+            String stepId, FromClause from, Map<String, Step.Inline> steps,
+            Function<FromRef, Map<String, SourceTable>> sourceTables, Set<String> visiting) {
+        Map<String, ParentKeyState> keys = new LinkedHashMap<>();
         for (FromRef ref : refsOf(from)) {
-            sourceKeys.apply(ref).forEach((stream, key) -> mergeParentKey(stepId, keys, stream,
-                    key.stream().map(Set::of).toList()));
+            sourceTables.apply(ref).forEach((stream, table) ->
+                    mergeParentKey(stepId, keys, stream, ParentKeyState.source(table)));
             for (Step.Inline upstream : referencedSteps(ref, steps)) {
                 if (!visiting.add(upstream.id())) {
                     continue;
                 }
-                Map<String, List<Set<String>>> above = parentKeyCandidates(stepId, upstream.from(), steps, sourceKeys, visiting);
+                var above = parentKeyCandidates(stepId, upstream.from(), steps, sourceTables, visiting);
                 visiting.remove(upstream.id());
-                above.forEach((stream, key) -> {
-                    List<Set<String>> current = key;
-                    if (upstream.body() instanceof TransformBody.MapProjection projection) {
-                        current = KeyProjection.candidates(current, projection.fields());
-                    } else if (upstream.body() instanceof TransformBody.Unwind unwind) {
-                        String locator = UnwindWriteKeys.elementLocator(unwind);
-                        if (locator != null && !current.isEmpty() && current.stream().noneMatch(names -> names.contains(locator))) {
-                            current = new ArrayList<>(current);
-                            current.add(Set.of(locator));
-                            current = List.copyOf(current);
-                        }
-                    }
-                    mergeParentKey(stepId, keys, stream, current);
-                });
+                above.forEach((stream, state) ->
+                        mergeParentKey(stepId, keys, stream, state.through(upstream.body())));
             }
         }
         return keys;
     }
 
-    private static void mergeParentKey(String stepId, Map<String, List<Set<String>>> keys, String stream, List<Set<String>> key) {
-        List<Set<String>> previous = keys.putIfAbsent(stream, key);
-        if (previous != null && !previous.equals(key)) {
-            throw unresolvedParentKey(stepId, stream,
-                    "the same stream reaches this step with conflicting parent-key columns");
+    private static void mergeParentKey(
+            String stepId, Map<String, ParentKeyState> keys, String stream, ParentKeyState state) {
+        keys.merge(stream, state, (previous, next) -> {
+            if (!previous.candidates().equals(next.candidates())) {
+                throw unresolvedParentKey(stepId, stream,
+                        "the same stream reaches this step with conflicting parent-key columns");
+            }
+            return new ParentKeyState(previous.candidates(), previous.mayContain().or(next.mayContain()));
+        });
+    }
+
+    private record ParentKeyState(List<Set<String>> candidates, Predicate<String> mayContain) {
+        static ParentKeyState source(SourceTable table) {
+            if (table == null) return new ParentKeyState(List.of(), name -> true);
+            Set<String> fields = new HashSet<>(table.primaryKey());
+            table.fields().forEach(field -> fields.add(field.name()));
+            return new ParentKeyState(table.primaryKey().stream().map(Set::of).toList(), fields::contains);
+        }
+
+        ParentKeyState through(TransformBody body) {
+            return switch (body) {
+                case TransformBody.MapProjection map -> new ParentKeyState(
+                        KeyProjection.candidates(candidates, map.fields(), mayContain),
+                        KeyProjection.projectedFields(map.fields(), mayContain));
+                case TransformBody.Unwind unwind -> expanded(unwind);
+                case TransformBody.Filter ignored -> this;
+                case TransformBody.Union ignored -> this;
+                default -> new ParentKeyState(candidates, name -> true);
+            };
+        }
+
+        private ParentKeyState expanded(TransformBody.Unwind unwind) {
+            String locator = UnwindWriteKeys.elementLocator(unwind);
+            List<Set<String>> key = candidates;
+            if (locator != null && !key.isEmpty() && key.stream().noneMatch(names -> names.contains(locator))) {
+                key = new ArrayList<>(candidates);
+                key.add(Set.of(locator));
+                key = List.copyOf(key);
+            }
+            return new ParentKeyState(key, name ->
+                    name.equals(unwind.path()) || name.equals(unwind.includeArrayIndex())
+                            || name.equals(unwind.elementKey()) || mayContain.test(name));
         }
     }
 

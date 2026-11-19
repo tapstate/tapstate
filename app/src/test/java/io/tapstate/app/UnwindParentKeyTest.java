@@ -12,6 +12,7 @@ import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.Op;
 import io.tapstate.core.model.TransformBody;
 import io.tapstate.spi.transform.TransformPort;
+import io.tapstate.spi.store.SourceTable;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -37,10 +38,10 @@ import org.junit.jupiter.api.Test;
 class UnwindParentKeyTest {
 
     /** The discovered key of the one table here; every other reference names no table. */
-    private static final Function<FromRef, List<String>> ORDERS_KEYED_ON_O_ID =
+    private static final Function<FromRef, Map<String, SourceTable>> ORDERS_KEYED_ON_O_ID =
             ref -> ref instanceof FromRef.Literal literal && literal.ref().equals("orders")
-                    ? List.of("o_id")
-                    : List.of();
+                    ? Map.of("orders", new SourceTable("orders", List.of(), List.of("o_id"), List.of()))
+                    : Map.of();
 
     private static Step.Inline step(String id, String from, TransformBody body) {
         return new Step.Inline(id, new FromClause.Flow(List.of(new FromRef.Literal(from))), body,
@@ -60,10 +61,8 @@ class UnwindParentKeyTest {
     }
 
     private static List<String> keyReaching(Step.Inline step, Step.Inline... chain) {
-        return StoreBackedDagSource.parentKeysReaching(step, chain(chain), ref -> {
-            List<String> key = ORDERS_KEYED_ON_O_ID.apply(ref);
-            return key.isEmpty() ? Map.of() : Map.of("orders", key);
-        }).getOrDefault("orders", List.of());
+        return StoreBackedDagSource.parentKeysReaching(step, chain(chain), ORDERS_KEYED_ON_O_ID)
+                .getOrDefault("orders", List.of());
     }
 
     @Test
@@ -255,7 +254,7 @@ class UnwindParentKeyTest {
         Step.Inline merged = Step.inline("expand",
                 FromClause.list(FromRef.literal("left"), FromRef.literal("right")), unwind("item_no", null), null);
         assertThatThrownBy(() -> StoreBackedDagSource.parentKeysReaching(merged, chain(left, right, merged),
-                ref -> ref.equals(FromRef.literal("orders")) ? Map.of("orders", List.of("o_id")) : Map.of()))
+                ORDERS_KEYED_ON_O_ID))
                 .isInstanceOf(TapstateException.class)
                 .hasMessageContaining("actuation.unwind-parent-key-unresolved");
     }

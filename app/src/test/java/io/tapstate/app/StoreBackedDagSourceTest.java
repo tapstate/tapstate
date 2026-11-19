@@ -218,6 +218,62 @@ class StoreBackedDagSourceTest {
     }
 
     @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({
+        "absent, false", "present, true", "generated, true", "dropped, false"
+    })
+    void aRenameOverwritesTheUnwindParentKeyOnlyWhenItsSourceCanReachIt(
+            String region, boolean overwritten) throws Exception {
+        FakeStorePort store = new FakeStorePort();
+        store.artifacts().save(cdcSource("orders_src", "orders"));
+        List<SourceField> fields = new ArrayList<>(List.of(
+                new SourceField("o_id", "bigint", TapstateType.INT64),
+                new SourceField("items", "array", TapstateType.ARRAY)));
+        if (region.equals("present") || region.equals("dropped")) {
+            fields.add(new SourceField("o_region", "varchar", TapstateType.STRING));
+        }
+        store.schemas.save(new DiscoveredSourceModel("orders_src", "mysql", 1L,
+                new SourceModel(List.of(new SourceTable("orders", fields, List.of("o_id"), List.of())))));
+        List<Step> steps = new ArrayList<>();
+        String upstream = "orders";
+        if (region.equals("generated") || region.equals("dropped")) {
+            FieldRule rule = region.equals("generated") ? FieldRule.literal("east") : FieldRule.drop();
+            steps.add(Step.inline("prepare", FromClause.list(FromRef.literal(upstream)),
+                    new TransformBody.MapProjection(Map.of("o_region", rule)), null));
+            upstream = "prepare";
+        }
+        Step.Inline rename = Step.inline("rename", FromClause.list(FromRef.literal(upstream)),
+                new TransformBody.MapProjection(Map.of("o_id", FieldRule.rename("o_region"))), null);
+        Step.Inline expand = Step.inline("expand", FromClause.list(FromRef.literal("rename")),
+                new TransformBody.Unwind("items", null, false, "sku", null), null);
+        steps.add(rename);
+        steps.add(expand);
+        var pipeline = new PipelineResource("p", null, List.of(SourceRef.spec("orders_src", true)),
+                steps, null, null, null, null);
+        var source = new StoreBackedDagSource(store);
+        if (overwritten) {
+            assertThatThrownBy(() -> source.transformBinding(pipeline, expand))
+                    .isInstanceOf(TapstateException.class)
+                    .hasMessageContaining("actuation.unwind-parent-key-unresolved");
+        } else {
+            List<Map<String, String>> items = List.of(Map.of("sku", "same"));
+            Map<String, Object> before = new LinkedHashMap<>(Map.of("o_id", 1L, "items", items));
+            Map<String, Object> after = new LinkedHashMap<>(Map.of("o_id", 2L, "items", items));
+            if (region.equals("dropped")) {
+                before.put("o_region", "east");
+                after.put("o_region", "east");
+            }
+            var event = new io.tapstate.core.event.Envelope(io.tapstate.core.event.Op.UPDATE, 1L, "orders",
+                    before, after, null);
+            for (Step projection : steps.subList(0, steps.size() - 1)) {
+                event = source.transformBinding(pipeline, projection).get().transform(event).getFirst();
+            }
+            assertThat(source.transformBinding(pipeline, expand).get().transform(event))
+                    .extracting(io.tapstate.core.event.Envelope::op)
+                    .containsExactly(io.tapstate.core.event.Op.DELETE, io.tapstate.core.event.Op.INSERT);
+        }
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
     @org.junit.jupiter.params.provider.CsvSource({"DELETE,false", "UPDATE,false", "DELETE,true", "UPDATE,true"})
     void projectionCannotManufactureAnUnwindsBeforeImage(String operation, boolean computed) throws Exception {
         FakeStorePort store = new FakeStorePort();

@@ -576,7 +576,8 @@ record NodeColumns(Map<String, String> columns, List<String> key, String unknown
         Map<String, String> origins = projectedOrigins(rules, upstream, out.keySet());
 
         List<Set<String>> candidates = new ArrayList<>();
-        for (Set<String> names : KeyProjection.candidates(upstream.keyCandidates(), rules)) {
+        for (Set<String> names : KeyProjection.candidates(
+                upstream.keyCandidates(), rules, upstream.columns()::containsKey)) {
             if (names.isEmpty()) {
                 candidates.add(Set.of());
                 continue;
