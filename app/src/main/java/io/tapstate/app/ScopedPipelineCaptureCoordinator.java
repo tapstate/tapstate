@@ -317,10 +317,20 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             if (!original.scope().equals(commandScope) || !claim(original).equals(command)) throw refused();
             start(this,captured,models);
         }
-        @Override public void stopCapture(String pipeline,boolean purge) {
+        @Override public void stopCapture(String pipeline, boolean purge) {
+            stopCaptureIfPresent(pipeline, purge);
+        }
+
+        @Override public boolean stopCaptureIfPresent(String pipeline, boolean purge) {
             requireId(pipeline);
             if (purge) throw refused();
-            synchronized (ScopedPipelineCaptureCoordinator.this) { var session=sessions.get(original); if(session!=null) {stop(session);forgetSession(session);} }
+            synchronized (ScopedPipelineCaptureCoordinator.this) {
+                var session = sessions.get(original);
+                if (session == null) return false;
+                stop(session);
+                forgetSession(session);
+                return true;
+            }
         }
         @Override public PipelineCaptureBindings captureBindings() { return session().bindings; }
         @Override public ValidationCaptureRoute validationRoute(String alias,String table) {

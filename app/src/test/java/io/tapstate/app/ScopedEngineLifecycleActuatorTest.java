@@ -67,6 +67,7 @@ class ScopedEngineLifecycleActuatorTest {
         when(submitted.awaitTerminal(any())).thenReturn(true); when(submitted.isCarryingAJob()).thenReturn(true);
         when(captures.forRun(any(),any(),any())).thenAnswer(call -> { events.add("bind:"+((ExecutionFence)call.getArgument(2)).executionGeneration()); return fixedCapture; });
         doAnswer(call -> { events.add("capture"); return null; }).when(fixedCapture).startCapture(eq("p"),any(ArtifactStore.class),any(SourceModelSnapshot.class));
+        when(fixedCapture.stopCaptureIfPresent(anyString(), anyBoolean())).thenCallRealMethod();
         when(fixedCapture.loadDelivered("p")).thenReturn(true);
         when(fixedCapture.captureBindings()).thenAnswer(call -> new PipelineCaptureBindings(new ExecutionFence(SCOPE,held.get()),Map.of(),false));
         when(ownership.beginExecution(eq(SCOPE),any())).thenAnswer(call -> {
@@ -180,6 +181,25 @@ class ScopedEngineLifecycleActuatorTest {
         new io.tapstate.runtime.scheduler.PipelineConverger(desired,state,actuator(),Clock.systemUTC()).converge("p");
         verify(fixedCapture).stopCapture("p",false);assertThat(released).containsExactly(manifest(1));
         assertThat(forgottenPlans).containsExactly(new ExecutionFence(SCOPE,claim(1)));verify(dags,never()).prepareStart(any(PipelineConvergencePass.class),anyString());
+    }
+
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void startOnlyReprovesPreviousCaptureWhenItWasStopped(boolean retired) {
+        when(engine.captureRun("p")).thenReturn(Optional.empty());
+        doReturn(retired).when(fixedCapture).stopCaptureIfPresent("p", false);
+        var localPorts = new ScopedEngineLifecycleActuator.Ports((m, c, n, g) -> {}, released::add,
+                (p, m) -> {}, (f, c) -> ExecutionPlanRecorder.NONE);
+        var actor = new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                ConnectorReadiness.NONE, Clock.systemUTC(), localPorts, submissions);
+        var boundary = new IllegalStateException("execution boundary");
+        when(ownership.beginExecution(eq(SCOPE), any())).thenThrow(boundary);
+        assertThatThrownBy(() -> actor.start("p")).isSameAs(boundary);
+        // One proof at Start entry and one at old-instance cleanup. A real cleanup adds a post-proof.
+        verify(ownership, times(retired ? 3 : 2)).proveStartClaim(SCOPE, claim(1));
+        verify(fixedCapture).stopCaptureIfPresent("p", false);
+        verify(previous, never()).cancel();
+        assertThat(released).isEmpty();
     }
 
     @Test void ordinaryStopUsesTheCapturedJobAndNeverResolvesItsReplacementOrPurgesColdState() {

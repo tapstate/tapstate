@@ -35,13 +35,14 @@ class HazelcastExecutionPlansTest {
         oldRecorder.record(first); nextRecorder.record(second);
         assertThat(plans.current(List.of("pipeline"))).containsEntry("pipeline", second);
         assertThatThrownBy(() -> oldRecorder.record(first)).isInstanceOf(TapstateException.class);
-        oldRecorder.forget("pipeline");
+        assertThat(oldRecorder.forgetIfPresent("pipeline")).isFalse();
         oldRecorder.forget(first);
         assertThat(plans.current(List.of("pipeline"))).containsEntry("pipeline", second);
         assertThat(nextRecorder.last("pipeline")).isEqualTo(second);
         assertThatThrownBy(() -> nextRecorder.forget(first)).isInstanceOf(TapstateException.class);
         assertThat(plans.current(List.of("pipeline"))).containsEntry("pipeline", second);
-        nextRecorder.forget(second);
+        assertThat(nextRecorder.forgetIfPresent("pipeline")).isTrue();
+        assertThat(nextRecorder.forgetIfPresent("pipeline")).isFalse();
         assertThat(plans.current(List.of("pipeline"))).isEmpty();
         assertThat(plans.last("pipeline")).isEqualTo(second);
         assertThatThrownBy(() -> nextRecorder.record(second)).isInstanceOf(TapstateException.class);

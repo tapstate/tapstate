@@ -237,11 +237,12 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             scoped.retireScope(pass.scope(), command);
             require();
         } else if (capture != null) {
-            capture.stopCapture(id(), false);
-            require();
+            if (capture.stopCaptureIfPresent(id(), false) || !checkingStart) require();
         }
         if (manifest != null && !engine.isLost()) { ports.releaseHot().accept(manifest); require(); }
-        if (original != null) { ports.plans().apply(original, command).forget(id()); require(); }
+        if (original != null) {
+            if (ports.plans().apply(original, command).forgetIfPresent(id()) || !checkingStart) require();
+        }
     }
 
     @Override public synchronized void stop(String pipeline,boolean purge) {

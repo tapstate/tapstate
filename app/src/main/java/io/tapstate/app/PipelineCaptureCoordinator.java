@@ -84,6 +84,12 @@ interface PipelineCaptureCoordinator {
      */
     void stopCapture(String pipelineId, boolean purgeState);
 
+    /** A coordinator reports an empty cleanup only when proved at the stop boundary. */
+    default boolean stopCaptureIfPresent(String pipelineId, boolean purgeState) {
+        stopCapture(pipelineId, purgeState);
+        return true;
+    }
+
     /**
      * Whether a capture started for the pipeline is still open on this member: started, and not stopped since.
      * The run it was opened for may be over all the same -- a job lost with a member ends with no stop -- so an

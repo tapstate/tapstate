@@ -50,14 +50,17 @@ final class HazelcastExecutionPlans implements ExecutionPlans, ExecutionPlanReco
                 publish(LAST_MAP_NAME, new ScopedPlan(original, plan, true), active);
                 publish(MAP_NAME, new ScopedPlan(original, plan, true), active);
             }
-            @Override public void forget(String pipeline) {
+            @Override public void forget(String pipeline) { forgetIfPresent(pipeline); }
+
+            @Override public boolean forgetIfPresent(String pipeline) {
                 // Confirmed retirement may finish after authorization expired; exact CAS cannot remove a successor.
                 if (!original.pipelineId().equals(pipeline)) throw ThreeLayerStorePort.refused();
-                var map = member.<String,Object>getMap(MAP_NAME); Object held = map.get(pipeline);
-                if (held == null) return;
+                var map = member.<String, Object>getMap(MAP_NAME);
+                Object held = map.get(pipeline);
+                if (held == null) return false;
                 if (!(held instanceof ScopedPlan prior)) throw ThreeLayerStorePort.refused();
-                if (prior.original().equals(original) && prior.live())
-                    map.replace(pipeline, prior, new ScopedPlan(original, prior.plan(), false));
+                return prior.original().equals(original) && prior.live()
+                        && map.replace(pipeline, prior, new ScopedPlan(original, prior.plan(), false));
             }
             @Override public void forget(ExecutionPlan expected) {
                 Objects.requireNonNull(expected, "expected");
