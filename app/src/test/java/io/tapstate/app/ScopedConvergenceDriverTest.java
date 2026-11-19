@@ -347,6 +347,10 @@ class ScopedConvergenceDriverTest {
 
     private static void scheduledPass(ConvergenceDriver driver) throws Exception {
         driver.schedule();
+        awaitPasses(driver);
+    }
+
+    private static void awaitPasses(ConvergenceDriver driver) throws Exception {
         var field = ConvergenceDriver.class.getDeclaredField("passes");
         field.setAccessible(true);
         var executor = (PipelinePassExecutor) field.get(driver);
@@ -389,6 +393,39 @@ class ScopedConvergenceDriverTest {
                 assertThat(outcomes.await(2, TimeUnit.SECONDS))
                         .as("sustained start probes do not take the last periodic slot").isTrue();
             } finally { release.countDown(); }
+        }
+    }
+
+    @Test void aSaturatedPeriodicScanPreservesTheNextPipelineTurn() throws Exception {
+        var occupied = new java.util.concurrent.CountDownLatch(3);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var next = new java.util.concurrent.CountDownLatch(1);
+        var store = mock(PipelineIntentStore.class);
+        when(store.scanCandidates()).thenReturn(List.of("old-a", "old-b", "old-c", "pending-stop").stream()
+                .map(id -> new PipelineIntentStore.ScanCandidate(id, 0)).toList());
+        when(store.loadForActuation(any())).thenAnswer(call -> {
+            if (call.<String>getArgument(0).equals("pending-stop")) {
+                next.countDown();
+            } else {
+                occupied.countDown();
+                if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("periodic barrier timed out");
+            }
+            return Optional.empty();
+        });
+        var port = new ConvergenceDriver.ScopedPorts(store, views, () -> {},
+                pass -> { throw new AssertionError("empty intent cannot actuate"); },
+                pass -> RebuildAdmission.never(), ids -> {});
+        try (var driver = ConvergenceDriver.scoped(null, mock(ObservationPublisher.class), null,
+                MetricsExport.none(), () -> true, ownership, port)) {
+            try {
+                driver.schedule();
+                assertThat(occupied.await(2, TimeUnit.SECONDS)).isTrue();
+                for (int i = 0; i < 3; i++) driver.schedule();
+                assertThat(next.getCount()).isEqualTo(1);
+            } finally { release.countDown(); }
+            awaitPasses(driver);
+            scheduledPass(driver);
+            assertThat(next.getCount()).as("the first free scan must admit the deferred Stop").isZero();
         }
     }
 

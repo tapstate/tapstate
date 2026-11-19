@@ -53,6 +53,7 @@ final class ConvergenceDriver implements AutoCloseable {
     private final PipelinePassExecutor passes = new PipelinePassExecutor(4);
     private final java.util.concurrent.atomic.AtomicBoolean scanning = new java.util.concurrent.atomic.AtomicBoolean();
     private int nextPipeline;
+    private int nextPeriodicPipeline;
     private final LongSupplier nanoTime;
     private static final long TERMINAL_RECHECK_NANOS = java.time.Duration.ofSeconds(30).toNanos();
     private record TerminalPass(PipelineIntentScope scope, long revision, PipelineState target,
@@ -193,17 +194,25 @@ final class ConvergenceDriver implements AutoCloseable {
             List<String> pipelineIds = candidates.stream().map(PipelineIntentStore.ScanCandidate::pipelineId).toList();
             int size = candidates.size();
             int start = size == 0 ? 0 : Math.floorMod(nextPipeline, size);
-            var periodic = new java.util.ArrayList<PipelineIntentStore.ScanCandidate>();
+            var periodic = new boolean[size];
             for (int offset = 0; offset < size; offset++) {
-                var candidate = candidates.get((start + offset) % size);
+                int index = (start + offset) % size;
+                var candidate = candidates.get(index);
                 if (!asynchronous) passes.runInline(candidate.pipelineId(), () -> reconcilePipeline(candidate));
                 else if (!prioritizeStarts) passes.submit(candidate.pipelineId(), () -> reconcilePipeline(candidate));
                 else if (isNewStart(candidate)) passes.submitStart(candidate.pipelineId(), () -> reconcilePipeline(candidate));
-                else periodic.add(candidate);
+                else periodic[index] = true;
             }
-            for (var candidate : periodic) {
-                if (periodicDue(candidate))
-                    passes.submitPeriodic(candidate.pipelineId(), () -> reconcilePipeline(candidate));
+            if (prioritizeStarts && size > 0) {
+                // Keep the next turn across saturated scans, independently of new-start ordering.
+                int periodicStart = Math.floorMod(nextPeriodicPipeline, size);
+                for (int offset = 0; offset < size; offset++) {
+                    int index = (periodicStart + offset) % size;
+                    if (!periodic[index]) continue;
+                    var candidate = candidates.get(index);
+                    if (periodicDue(candidate) && passes.submitPeriodic(candidate.pipelineId(), () -> reconcilePipeline(candidate)))
+                        nextPeriodicPipeline = index + 1;
+                }
             }
             nextPipeline = size == 0 ? 0 : (start + 1) % size;
             var retained = new java.util.HashSet<>(pipelineIds);
