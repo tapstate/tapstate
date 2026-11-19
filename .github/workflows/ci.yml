@@ -15,15 +15,15 @@ jobs:
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
-      - name: Allocate the two qualification batches
+      - name: Allocate the memory qualification batches
         run: |
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
-          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"js.snapshot.basic.small": 50, "js.snapshot.basic.standard": 50, "js.snapshot.basic.wide": 55, "js.snapshot.basic.large": 60, "js.live.basic.standard": 70, "js.backlog.basic.standard": 75, "mixed.snapshot.double-map.standard": 55}}
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"copy.live.slow-target.large": 900, "copy.snapshot.basic.large": 250, "copy.snapshot.basic.wide": 240, "join.lifecycle.release.standard": 920, "join.live.hot-update.wide": 1200, "join.live.steady-state.standard": 350, "nest.snapshot.fanout.wide": 530}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id js.snapshot.basic.small --id js.snapshot.basic.standard --id js.snapshot.basic.wide --id js.snapshot.basic.large --id js.live.basic.standard --id js.backlog.basic.standard --id mixed.snapshot.double-map.standard --repeats 1 --rows 128 --timeout-seconds 55 --slots 2 --batch-seconds 600 --deadline-seconds 900 --reserve-seconds 120 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --suite memory --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 4 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
-          name: operator-qualification-manifest
+          name: memory-qualification-manifest
           path: |
             ${{ runner.temp }}/manifest.json
             ${{ runner.temp }}/estimates.json
@@ -32,11 +32,11 @@ jobs:
   calibration:
     needs: calibration-plan
     runs-on: ubuntu-24.04
-    timeout-minutes: 28
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
-        batch: [0, 1]
+        batch: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -46,7 +46,7 @@ jobs:
           cache: maven
       - uses: actions/download-artifact@v4
         with:
-          name: operator-qualification-manifest
+          name: memory-qualification-manifest
           path: ${{ runner.temp }}/manifest
       - name: Verify the connector inputs and capture the environment
         run: |
@@ -66,15 +66,18 @@ jobs:
           docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
       - name: Build the matching OP candidate
         run: mvn -B -T 2 -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1
+      - name: Validate the catalog, selection and report
+        run: python3 -B -m unittest discover -s benchmarks/src/test
       - name: Replay the assigned batch
         run: |
           python3 -B benchmarks/runner.py run --manifest "$RUNNER_TEMP/manifest/manifest.json" --batch ${{ matrix.batch }} --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/calibration/run"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: operator-qualification-batch-${{ matrix.batch }}
+          name: memory-qualification-batch-${{ matrix.batch }}
           path: |
             ${{ runner.temp }}/calibration/
             !${{ runner.temp }}/calibration/run/**/runtime-input/**
             !${{ runner.temp }}/calibration/run/**/witness-input/**
+            !${{ runner.temp }}/calibration/build.log
           if-no-files-found: error
