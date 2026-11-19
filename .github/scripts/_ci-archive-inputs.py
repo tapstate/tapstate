@@ -156,7 +156,7 @@ def plan_read(value, checkout):
     require(isinstance(expected, list) and expected and isinstance(workers, list) and workers, 'empty shard plan')
     for test in expected:
         require(isinstance(test, dict) and {'module', 'kind', 'class'} <= set(test)
-                <= {'module', 'kind', 'class', 'example', 'requires_cloud_release_inputs'},
+                <= {'module', 'kind', 'class', 'example', 'method', 'requires_cloud_release_inputs'},
                 'invalid planned test')
         shards.cloud_inputs_required(test)
         source.variants.path_name(test['module'])
@@ -164,6 +164,10 @@ def plan_read(value, checkout):
                 and re.fullmatch(r'[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*', test['class']), 'invalid planned class')
         if 'example' in test:
             source.variants.path_name(test['example'])
+        if 'method' in test:
+            require(value.get('selection') == 'fast-reactor' and test['kind'] == 'it' and 'example' not in test
+                    and isinstance(test['method'], str) and re.fullmatch(r'[A-Za-z_$][\w$]*', test['method']),
+                    'invalid planned method selector')
     require(value.get('cohort_hash') == shards.cohort(expected)
             and len(set(shards.key(t) for t in expected)) == len(expected), 'invalid planned cohort')
     ids = [worker['id'] for worker in workers]
