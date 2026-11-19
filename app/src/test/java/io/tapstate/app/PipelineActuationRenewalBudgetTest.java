@@ -123,6 +123,37 @@ class PipelineActuationRenewalBudgetTest {
         }
     }
 
+    @Test
+    void aFreeingWorkerCannotLetALaterLeasePassAnEarlierDeferredLease() throws Exception {
+        try (var io = new ControlledIo()) {
+            var owner = io.owner(true, Duration.ofSeconds(10));
+            var earlierId = IDS.getFirst();
+            var laterId = IDS.get(1);
+            var earlier = seedOne(io, owner, earlierId);
+            io.localOffset.addAndGet(Duration.ofSeconds(3).toNanos());
+            var later = seedOne(io, owner, laterId);
+            var probes = new java.util.concurrent.atomic.AtomicInteger();
+            doAnswer(call -> {
+                if (probes.incrementAndGet() == 1) throw new WorkloadClaimRenewalException(
+                        WorkloadClaimRenewalException.Reason.NOT_STARTED, "previous renewal still owns the worker");
+                return io.bounded(io.renewalWorker, call.getArgument(0), call.getArgument(1), call.getArgument(2));
+            }).when(io.store).withRenewalDeadline(anyLong(), any(), any());
+            io.localOffset.addAndGet(Duration.ofSeconds(11).toNanos());
+
+            owner.renewDue();
+            assertThat(io.attempts).as("a deferred earlier lease ends the batch before a later lease can use the freed worker").isEmpty();
+
+            io.localOffset.addAndGet(Duration.ofMillis(1100).toNanos());
+            owner.renewDue();
+            assertThat(io.attempts).containsExactly(earlierId, laterId);
+            for (WorkloadClaim expected : List.of(earlier, later)) {
+                var actual=owner.permit(scope(expected.key().resourceId())).claim();
+                assertThat(WorkloadClaimFence.from(actual)).isEqualTo(WorkloadClaimFence.from(expected));
+                assertThat(actual.leaseUntil()).isAfter(expected.leaseUntil());
+            }
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void deferringWithoutStartingKeepsTheOriginalProofAndConfirmationPhase(boolean alreadyUnconfirmed) throws Exception {

@@ -817,7 +817,7 @@ final class PipelineActuationOwnership {
                 long dispatch = nanoTime.getAsLong();
                 var lease = state.scopedLease.get();
                 if (lease != null && !lease.retry() && earlierRecoveryNeedsTurn(lease, dispatch)) return;
-                renewScoped(state, dispatch);
+                if (!renewScoped(state, dispatch)) return;
             }
             return;
         }
@@ -845,18 +845,19 @@ final class PipelineActuationOwnership {
         return Math.min(lease.deadline(), now + Math.min(renewIntervalNanos, RENEW_RETRY_NANOS));
     }
 
-    private void renewScoped(Held state, long now) {
+    /** Returns whether this scan can dispatch another renewal. */
+    private boolean renewScoped(Held state, long now) {
         var lease = state.scopedLease.get();
         if (lease == null || lease.lost() || lease.inFlight() || now - lease.due() < 0
-                || !stillHeld(state, lease) || !admission.enter()) return;
+                || !stillHeld(state, lease) || !admission.enter()) return true;
         try {
             if (now - lease.deadline() >= 0) {
                 state.scopedLease.compareAndSet(lease, new ScopedLease(lease.expected(), lease.deadline(),
                         lease.due(), lease.retries(), false, false, RenewalOutcome.UNCONFIRMED));
-                return;
+                return true;
             }
             var pending = lease.inFlightCopy();
-            if (!state.scopedLease.compareAndSet(lease, pending)) return;
+            if (!state.scopedLease.compareAndSet(lease, pending)) return true;
             Optional<WorkloadClaim> renewed = Optional.empty();
             long renewedDeadline = now + ttl.toNanos();
             long renewedDue = now + renewIntervalNanos;
@@ -896,7 +897,7 @@ final class PipelineActuationOwnership {
                     long after = nanoTime.getAsLong();
                     state.scopedLease.compareAndSet(pending, new ScopedLease(lease.expected(), lease.deadline(),
                             retryDue(lease, after), lease.retries(), false, lease.confirm(), null));
-                    return;
+                    return false;
                 }
                 failed = true;
                 retry = retryableRenewal(failure);
@@ -942,6 +943,7 @@ final class PipelineActuationOwnership {
         } finally {
             admission.leave();
         }
+        return true;
     }
 
     private Optional<WorkloadClaim> renewOriginal(ScopedLease lease, long budget) {
