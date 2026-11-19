@@ -373,7 +373,7 @@ class BenchmarkRunIT {
                             }
                             if (memory && !lifecycle) {
                                 evidence.window("idle");
-                                pause(number(memoryProfile, "idle_seconds"));
+                                observeIdleWindow(server, number(memoryProfile, "idle_seconds"));
                             }
                         } finally {
                             if (memory) {
@@ -692,9 +692,11 @@ class BenchmarkRunIT {
         evidence.windowPrefix = "";
     }
 
-    private static void pause(int seconds) {
+    private static void observeIdleWindow(RealProcessServer server, int seconds) {
         try {
-            Thread.sleep(Duration.ofSeconds(seconds));
+            if (server.exitsWithin(Duration.ofSeconds(seconds))) {
+                throw new Unverified("OP exited before teardown");
+            }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             throw new Unverified("Interrupted in the idle window");

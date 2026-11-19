@@ -605,6 +605,10 @@ final class RealProcessServer implements ServerHandle {
         return process.isAlive();
     }
 
+    boolean exitsWithin(Duration window) throws InterruptedException {
+        return process.waitFor(window.toNanos(), TimeUnit.NANOSECONDS);
+    }
+
     /** Waits for all startup runners, not merely the earlier Tomcat health response. */
     void awaitReady() {
         awaitReady(STARTUP_BUDGET);
