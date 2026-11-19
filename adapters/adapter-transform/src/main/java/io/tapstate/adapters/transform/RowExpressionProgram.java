@@ -15,6 +15,7 @@ import io.tapstate.core.event.ConvertedValue;
 import io.tapstate.core.event.Envelope;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.Temporal;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -92,8 +93,10 @@ final class RowExpressionProgram {
      * for. The compiler admits these only where both operands carry the same temporal column type, so at
      * runtime both are that column's own values and are ordered by the ordering those values carry. The
      * runtime program is built from the untyped expression, where every declared overload of an operator
-     * is a candidate; binding one per operator keeps the dispatch unambiguous, and the type judgement has
-     * already been made where the columns' types are known. A pair with no order in common - two different
+     * is a candidate; binding one per operator, accepting temporal values only, keeps the dispatch
+     * unambiguous: a number, string or double never matches it, so CEL's own orderings still answer for
+     * two columns of those kinds. The type judgement has already been made where the columns' types are
+     * known. A pair with no order in common - two different
      * classes, or a class with no natural order - fails the evaluation rather than being guessed at.
      */
     private static List<CelFunctionBinding> sameTypeOrderings() {
@@ -110,7 +113,7 @@ final class RowExpressionProgram {
                 case "_>=_" -> order -> order >= 0;
                 default -> throw new IllegalStateException("no ordering for " + comparison.function());
             };
-            bindings.add(CelFunctionBinding.from(comparison.overloadId(), Object.class, Object.class,
+            bindings.add(CelFunctionBinding.from(comparison.overloadId(), Temporal.class, Temporal.class,
                     (left, right) -> holds.test(order(left, right))));
         }
         return List.copyOf(bindings);

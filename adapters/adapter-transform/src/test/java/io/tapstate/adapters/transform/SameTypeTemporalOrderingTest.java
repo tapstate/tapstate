@@ -69,6 +69,19 @@ class SameTypeTemporalOrderingTest {
     }
 
     @Test
+    @DisplayName("two columns of a built-in kind compare with each other, not only with a literal")
+    void twoColumnsOfABuiltInKindCompare() {
+        TransformPort filter = StatelessTransforms.filter("after.a < after.b && after.s < after.t && after.d < after.e");
+        Envelope row = Envelope.insert(1L, "t",
+                Map.of("a", 3L, "b", 4L, "s", "a", "t", "b", "d", 1.5d, "e", 2.5d), null);
+        Envelope reversed = Envelope.insert(2L, "t",
+                Map.of("a", 4L, "b", 3L, "s", "a", "t", "b", "d", 1.5d, "e", 2.5d), null);
+
+        assertThat(filter.transform(row)).containsExactly(row);
+        assertThat(filter.transform(reversed)).isEmpty();
+    }
+
+    @Test
     @DisplayName("the orderings CEL already had still answer as before")
     void builtInOrderingsAreUnchanged() {
         TransformPort filter = StatelessTransforms.filter("after.n < 10 && after.s > 'a' && after.d <= 2.5");
