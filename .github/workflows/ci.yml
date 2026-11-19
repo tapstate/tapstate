@@ -52,7 +52,7 @@ jobs:
         run: |
           status=0
           for rows in 96 128; do
-            python3 -B benchmarks/runner.py run --offline --id mixed.snapshot.map-nest.standard \
+            python3 -B benchmarks/runner.py run --id mixed.snapshot.map-nest.standard \
               --repeats 2 --rows "$rows" --rate 8 --measurement-seconds 6 --timeout-seconds 95 \
               --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/control/rows-$rows" || status=1
           done
