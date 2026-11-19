@@ -191,6 +191,30 @@ class AggregateStepRulesTest {
     }
 
     @Test
+    @DisplayName("a step with more fields than one row can carry is refused before it runs")
+    void aStepWithTooManyFieldsIsRefused() {
+        StringBuilder fields = new StringBuilder();
+        for (int i = 0; i < 65; i++) {
+            fields.append(i == 0 ? "" : ", ").append("n").append(i).append(": { count: true }");
+        }
+        refused(() -> Workspace.of(batch("""
+                  - id: by_region
+                    from: [ orders ]
+                    type: aggregate
+                    groupBy: { region: $region }
+                    fields: { %s }
+                """.formatted(fields))), AggregateError.TOO_MANY_FIELDS,
+                Map.of("step", "by_region", "count", 65, "limit", 64));
+        assertThatCode(() -> Workspace.of(batch("""
+                  - id: by_region
+                    from: [ orders ]
+                    type: aggregate
+                    groupBy: { region: $region }
+                    fields: { %s }
+                """.formatted(fields.substring(0, fields.lastIndexOf(", ")))))).doesNotThrowAnyException();
+    }
+
+    @Test
     @DisplayName("the output is the group names in order as the key, then the fields with their result types")
     void theOutputShapeIsGroupsThenTypedFields() {
         AggregateStepSpec spec = AggregateStepRules.compile("by_region", step("""

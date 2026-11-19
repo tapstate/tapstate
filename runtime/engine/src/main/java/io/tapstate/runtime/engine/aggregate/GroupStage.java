@@ -73,8 +73,8 @@ public final class GroupStage {
         this.clock = clock;
         this.fields = spec.fields();
         this.store = store;
-        if (fields.size() > 0xFFFF) {
-            throw new IllegalArgumentException("more fields than a group's keys can number");
+        if (fields.size() > AggregateStepSpec.MAX_FIELDS) {
+            throw new IllegalArgumentException("more fields than a stored row can mark as unusable");
         }
     }
 

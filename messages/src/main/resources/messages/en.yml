@@ -1531,6 +1531,9 @@ aggregate.group-invalid:
 aggregate.step-busy:
   message: "Aggregate step `{step}` of pipeline `{pipeline}` did not answer in time."
   solution: "The step answers a check or a repair between its own updates, a few at a time. Nothing was left half done: ask again, and narrow the request to one group if the step is under heavy load."
+aggregate.too-many-fields:
+  message: "Aggregate step `{step}` declares {count} fields; a step may declare at most {limit}."
+  solution: "Split the fields across two aggregate steps that read the same input and group the same way."
 
 control.ai-provider-request-rejected:
   message: "The AI provider rejected the model or request protocol."

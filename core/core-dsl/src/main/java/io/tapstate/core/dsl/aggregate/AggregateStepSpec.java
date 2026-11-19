@@ -42,6 +42,9 @@ public record AggregateStepSpec(
      */
     public static final String GLOBAL_KEY = "aggregate";
 
+    /** The most fields one step may declare: each stored input row marks the fields it could not feed in 64 bits. */
+    public static final int MAX_FIELDS = Long.SIZE;
+
     /** Whether the step has no group names, so that every member row is in its one group. */
     public boolean global() {
         return groupBy.isEmpty();

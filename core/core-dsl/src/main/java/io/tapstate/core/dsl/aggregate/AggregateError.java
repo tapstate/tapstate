@@ -63,7 +63,10 @@ public enum AggregateError implements TapstateErrorCode {
     GROUP_INVALID("aggregate.group-invalid", Set.of("step", "reason")),
 
     /** A running step did not take or answer a check or a repair in the time allowed. */
-    STEP_BUSY("aggregate.step-busy", Set.of("pipeline", "step"));
+    STEP_BUSY("aggregate.step-busy", Set.of("pipeline", "step")),
+
+    /** The step declares more fields than one of its stored rows can account for. */
+    TOO_MANY_FIELDS("aggregate.too-many-fields", Set.of("step", "count", "limit"));
 
     /** The step's code for a reason the shared function library reports under its own name. */
     public static AggregateError of(RollupError reason) {

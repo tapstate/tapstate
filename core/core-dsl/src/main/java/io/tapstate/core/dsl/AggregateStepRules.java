@@ -61,6 +61,7 @@ public final class AggregateStepRules {
             pipeline.transforms().forEach(step -> steps.put(step.id(), step));
             for (Step step : pipeline.transforms()) {
                 if (bodyOf(step, byId) instanceof TransformBody.Aggregate aggregate) {
+                    refuseTooManyFields(step.id(), aggregate);
                     refuseNameConflicts(step.id(), aggregate);
                     refuseUnsupportedInput(step, steps, byId);
                     refuseFiltersUpstream(step.id(), pipeline, byId);
@@ -198,6 +199,7 @@ public final class AggregateStepRules {
 
     private static AggregateStepSpec checked(String step, TransformBody.Aggregate aggregate,
             Map<String, ValueType> input, boolean known, List<String> key) {
+        refuseTooManyFields(step, aggregate);
         if (known) {
             for (String column : key) {
                 if (!input.containsKey(column)) {
@@ -258,6 +260,14 @@ public final class AggregateStepRules {
         String first = (end < 0 ? reason : reason.substring(0, end)).trim();
         return new TapstateException(AggregateError.EXPRESSION_INVALID,
                 Map.of("step", step, "field", field, "part", part, "reason", first), null);
+    }
+
+    private static void refuseTooManyFields(String step, TransformBody.Aggregate aggregate) {
+        int count = aggregate.fields().size();
+        if (count > AggregateStepSpec.MAX_FIELDS) {
+            throw new TapstateException(AggregateError.TOO_MANY_FIELDS,
+                    Map.of("step", step, "count", count, "limit", AggregateStepSpec.MAX_FIELDS), null);
+        }
     }
 
     private static void refuseNameConflicts(String step, TransformBody.Aggregate aggregate) {
