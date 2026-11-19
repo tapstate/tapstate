@@ -57,9 +57,12 @@ final class ConnectorCenterController {
 
     @Verb("connector-center.download")
     @PostMapping("/connector-center/{id}:download")
-    Map<String, Object> download(@PathVariable("id") String id) {
+    Map<String, Object> download(@PathVariable("id") String id,
+            @RequestParam(name = "sha256", required = false) String expectedSha256) {
         MalformedRequest.requireText(id, "a connector id is required");
-        return service().download(id, AuthenticatedCaller.subject());
+        if (expectedSha256 != null && !expectedSha256.matches("[a-f0-9]{64}"))
+            throw MalformedRequest.rejecting("a lowercase SHA-256 is required", null);
+        return service().download(id, expectedSha256, AuthenticatedCaller.subject());
     }
 
     @Verb("connector-center.operation")

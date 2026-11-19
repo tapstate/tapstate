@@ -184,6 +184,7 @@ class ApiExceptionHandler {
             Map.entry("source.already-exists", HttpStatus.CONFLICT),
             Map.entry("source.in-use", HttpStatus.CONFLICT),
             Map.entry("source.srs-change-while-running", HttpStatus.CONFLICT),
+            Map.entry("connector.download-target-changed", HttpStatus.PRECONDITION_FAILED),
             Map.entry("source.version-conflict", HttpStatus.PRECONDITION_FAILED),
             Map.entry("source.precondition-required", HttpStatus.PRECONDITION_REQUIRED),
             Map.entry("artifact.not-found", HttpStatus.NOT_FOUND),

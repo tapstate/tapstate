@@ -59,6 +59,11 @@ class ConnectorCenterControllerTest {
                     .andReturn().getResponse().getContentAsString()).contains("mongodb");
             mvc.perform(post("/api/connector-center:refresh")).andExpect(status().isOk());
             mvc.perform(post("/api/connector-center/mongodb:download")).andExpect(status().isOk());
+            assertThat(center.expectedSha256).isNull();
+            String confirmed = "b".repeat(64);
+            mvc.perform(post("/api/connector-center/mongodb:download").param("sha256", confirmed))
+                    .andExpect(status().isOk());
+            assertThat(center.expectedSha256).isEqualTo(confirmed);
             mvc.perform(get("/api/connector-center/operations/original-operation")).andExpect(status().isOk());
             String hash = "a".repeat(64);
             String usage = mvc.perform(get("/api/connector-center/mongodb/versions/" + hash + "/usages")
@@ -119,11 +124,16 @@ class ConnectorCenterControllerTest {
         private long length;
         private String expectedConnectorId;
         private String download;
+        private String expectedSha256;
         private String operation;
 
         @Override public Map<String, Object> catalog() { return Map.of("connectors", List.of("mongodb")); }
         @Override public Map<String, Object> refresh() { return Map.of("stage", "refreshed"); }
-        @Override public Map<String, Object> download(String id) { download = id; return Map.of("id", "original-operation"); }
+        @Override public Map<String, Object> download(String id, String expectedSha256) {
+            download = id;
+            this.expectedSha256 = expectedSha256;
+            return Map.of("id", "original-operation");
+        }
         @Override public Map<String, Object> operation(String id) { operation = id; return Map.of("stage", "installing"); }
         @Override public Map<String, Object> upload(InputStream artifact, long contentLength, String expectedConnectorId) {
             try {

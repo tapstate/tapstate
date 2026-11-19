@@ -5,13 +5,16 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 import static io.tapstate.app.ConnectorReleaseCatalog.Download;
 
 /** The local support and remote downloads visible to one running service. */
 final class ConnectorCatalogRefresh {
-    record Catalog(ConnectorSupportManifest support, Map<String, Download> downloads, Instant refreshedAt) {
+    record Catalog(ConnectorSupportManifest support, Map<String, Download> downloads,
+                   Map<String, String> authentication, Instant refreshedAt) {
     }
 
     private final ConnectorSupportSnapshot snapshot;
@@ -33,7 +36,7 @@ final class ConnectorCatalogRefresh {
         this.hostApiVersion = hostApiVersion;
         this.fetch = fetch;
         this.clock = clock;
-        this.catalog = new Catalog(snapshot.restore(bundledSupport), Map.of(), null);
+        this.catalog = new Catalog(snapshot.restore(bundledSupport), Map.of(), Map.of(), null);
     }
 
     Catalog current() {
@@ -50,8 +53,16 @@ final class ConnectorCatalogRefresh {
                 new String(fetch.read(repositoriesUri), StandardCharsets.UTF_8));
         var downloads = ConnectorReleaseCatalog.resolve(
                 support, repositories, original.downloads(), engineVersion, hostApiVersion, fetch);
+        var authentication = new HashMap<String, String>();
+        for (var download : downloads.values()) {
+            String id = download.connectorId();
+            var previous = original.downloads().get(id);
+            String marker = previous != null && previous.sha256().equals(download.sha256())
+                    ? original.authentication().get(id) : fetch.authentication(download.jar());
+            authentication.put(id, Objects.requireNonNullElse(marker, ""));
+        }
         if (newer) snapshot.replace(json);
-        catalog = new Catalog(support, downloads, clock.instant());
+        catalog = new Catalog(support, downloads, Map.copyOf(authentication), clock.instant());
         return catalog;
     }
 }

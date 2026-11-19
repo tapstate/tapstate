@@ -402,6 +402,21 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
                 .sorted(RELEASE_ORDER.reversed()).map(Installed::metadata).toList();
     }
 
+    public record Inventory(List<ConnectorArtifactMetadata> versions, List<ConnectorArtifactMetadata> defaults) { }
+
+    public synchronized Inventory inventory() {
+        return new Inventory(versions(), catalog());
+    }
+
+    public String manifestAuthentication(String sha256) throws IOException {
+        var artifact = installed.get(sha256);
+        if (artifact == null) return null;
+        try (var jar = new JarFile(artifact.file().toFile())) {
+            var manifest = jar.getManifest();
+            return manifest == null ? null : manifest.getMainAttributes().getValue("Authentication");
+        }
+    }
+
     private Optional<Installed> selected(String id) {
         return installed.values().stream().filter(value -> value.registration().connectorId().equals(id))
                 .filter(value -> Files.isRegularFile(value.file()))

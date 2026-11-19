@@ -23,9 +23,9 @@ public final class ConnectorCenterService {
                 new AuditContext(principal, "connector-catalog"), center::refresh);
     }
 
-    public Map<String, Object> download(String connectorId, String principal) {
+    public Map<String, Object> download(String connectorId, String expectedSha256, String principal) {
         return audit.dispatch(ControlOperations.CONNECTOR_CENTER_DOWNLOAD,
-                new AuditContext(principal, connectorId), () -> center.download(connectorId));
+                new AuditContext(principal, connectorId), () -> center.download(connectorId, expectedSha256));
     }
 
     public Map<String, Object> operation(String operationId) {

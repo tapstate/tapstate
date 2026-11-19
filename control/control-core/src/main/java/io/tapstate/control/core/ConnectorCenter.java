@@ -9,7 +9,7 @@ public interface ConnectorCenter {
 
     Map<String, Object> refresh();
 
-    Map<String, Object> download(String connectorId);
+    Map<String, Object> download(String connectorId, String expectedSha256);
 
     Map<String, Object> operation(String operationId);
 

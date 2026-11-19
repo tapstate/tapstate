@@ -168,6 +168,7 @@ connector.class-not-found
 connector.cloud-upload-disabled
 connector.config-type-mismatch
 connector.discover-failed
+connector.download-target-changed
 connector.instance-limit-reached
 connector.instances-busy
 connector.load-failed

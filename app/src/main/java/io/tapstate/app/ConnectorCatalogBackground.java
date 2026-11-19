@@ -42,7 +42,10 @@ final class ConnectorCatalogBackground implements AutoCloseable {
     }
 
     List<String> admittedIds() {
-        var support = catalog.current().support();
+        return admittedIds(catalog.current().support());
+    }
+
+    List<String> admittedIds(ConnectorSupportManifest support) {
         return support.entries().keySet().stream()
                 .filter(id -> support.admitted(id, engineVersion).isPresent())
                 .toList();

@@ -64,7 +64,7 @@ public final class PdkApiLevels {
         return hostLevel.isPresent() && artifactLevel.isPresent() && artifactLevel.getAsInt() <= hostLevel.getAsInt();
     }
 
-    static int compareArtifactVersions(String left, String right) {
+    public static int compareArtifactVersions(String left, String right) {
         String[] a = baseVersion(left).split("\\.");
         String[] b = baseVersion(right).split("\\.");
         boolean numericLeft = baseVersion(left).matches("[0-9]+(\\.[0-9]+)*");

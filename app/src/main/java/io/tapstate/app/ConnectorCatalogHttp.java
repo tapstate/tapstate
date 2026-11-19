@@ -1,10 +1,14 @@
 package io.tapstate.app;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
+import java.util.jar.Manifest;
+import java.util.zip.ZipInputStream;
 
 final class ConnectorCatalogHttp implements ConnectorReleaseCatalog.Fetch {
+    private static final int MANIFEST_PREFIX_BYTES = 16 * 1024;
     private static final int MAX_METADATA_BYTES = 1024 * 1024;
     private static final int TIMEOUT_MILLIS = 10_000;
 
@@ -36,6 +40,33 @@ final class ConnectorCatalogHttp implements ConnectorReleaseCatalog.Fetch {
             return true;
         } finally {
             connection.disconnect();
+        }
+    }
+
+    @Override
+    public String authentication(URI uri) throws IOException {
+        var connection = open(uri);
+        connection.setRequestProperty("Range", "bytes=0-" + (MANIFEST_PREFIX_BYTES - 1));
+        try {
+            int status = connection.getResponseCode();
+            if (status != HttpURLConnection.HTTP_PARTIAL) verify(status);
+            try (var body = connection.getInputStream()) {
+                return authentication(body.readNBytes(MANIFEST_PREFIX_BYTES));
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    // Published JARs put the manifest first, optionally preceded by directory entries.
+    static String authentication(byte[] prefix) throws IOException {
+        try (var zip = new ZipInputStream(new ByteArrayInputStream(prefix))) {
+            var entry = zip.getNextEntry();
+            while (entry != null && entry.isDirectory()) entry = zip.getNextEntry();
+            if (entry == null || !"META-INF/MANIFEST.MF".equalsIgnoreCase(entry.getName())) return null;
+            byte[] manifest = zip.readNBytes(MANIFEST_PREFIX_BYTES + 1);
+            if (manifest.length > MANIFEST_PREFIX_BYTES) throw new IOException("Connector manifest exceeds its size limit");
+            return new Manifest(new ByteArrayInputStream(manifest)).getMainAttributes().getValue("Authentication");
         }
     }
 

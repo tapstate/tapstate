@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.adapters.pdk.ConnectorError;
 import io.tapstate.adapters.pdk.LocalConnectorArtifacts;
+import io.tapstate.adapters.pdk.PdkApiLevels;
 import io.tapstate.control.core.ConnectorCatalogError;
 import io.tapstate.control.core.ConnectorCenter;
 import io.tapstate.control.core.ControlError;
@@ -13,10 +14,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.Locale;
 import java.util.Map;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
 
 /** Connects the catalog and artifact installer to authenticated operations. */
@@ -30,6 +34,7 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
     private final ConnectorCatalogHttp http = new ConnectorCatalogHttp();
     private final ExecutorService workers = Executors.newVirtualThreadPerTaskExecutor();
     private final Map<String, Operation> operations = new LinkedHashMap<>();
+    private final Map<String, String> localStages = new ConcurrentHashMap<>();
 
     ConnectorCenterRuntime(ConnectorCatalogBackground remote, LocalConnectorArtifacts local, boolean cloud) {
         this.remote = remote;
@@ -42,8 +47,13 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         var catalog = remote.current();
         boolean downloadAvailable = remote.reachable();
         var support = catalog.support().entries();
-        var installed = local.versions();
-        var ids = new TreeSet<String>(remote.admittedIds());
+        var inventory = local.inventory();
+        var installed = inventory.versions();
+        var defaults = inventory.defaults().stream().collect(Collectors.toMap(artifact -> artifact.catalog().id(),
+                artifact -> artifact));
+        localStages.keySet().retainAll(defaults.values().stream()
+                .map(ConnectorArtifactMetadata::sha256).collect(Collectors.toSet()));
+        var ids = new TreeSet<String>(remote.admittedIds(catalog.support()));
         installed.forEach(artifact -> ids.add(artifact.catalog().id()));
         ids.remove("dummy");
         var rows = new ArrayList<Map<String, Object>>();
@@ -52,12 +62,23 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
                     .map(ConnectorCenterRuntime::version).toList();
             var item = support.get(id);
             var download = catalog.downloads().get(id);
+            var current = defaults.get(id);
             var row = new LinkedHashMap<String, Object>();
             row.put("id", id);
             row.put("name", item == null ? id : item.name());
             if (item != null) row.put("roles", item.roles());
             row.put("installedVersions", versions);
             row.put("downloadable", download != null && downloadAvailable);
+            if (current != null) {
+                row.put("defaultSha256", current.sha256());
+                if (current.catalog().icon() != null) row.put("icon", current.catalog().icon());
+            }
+            row.put("updateAvailable", current != null && download != null
+                    && PdkApiLevels.compareArtifactVersions(download.release().coordinate().version(), current.version()) > 0);
+            String stage = current == null
+                    ? releaseStage(catalog.authentication().get(id))
+                    : localStages.computeIfAbsent(current.sha256(), this::readLocalStage);
+            row.put("properties", Map.of("authentication", stage == null ? "Alpha" : stage));
             if (download != null) {
                 var target = download.release().coordinate();
                 row.put("downloadVersion", target.version());
@@ -74,6 +95,23 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
         return view;
     }
 
+    private String readLocalStage(String sha256) {
+        try {
+            return releaseStage(local.manifestAuthentication(sha256));
+        } catch (IOException unreadable) {
+            LOG.debug("Could not read connector manifest for {}", sha256, unreadable);
+            return null;
+        }
+    }
+
+    static String releaseStage(String authentication) {
+        return switch (authentication == null ? "" : authentication.strip().toLowerCase(Locale.ROOT)) {
+            case "ga" -> "GA";
+            case "beta" -> "Beta";
+            default -> "Alpha";
+        };
+    }
+
     private static Map<String, Object> version(ConnectorArtifactMetadata artifact) {
         return Map.of("version", artifact.version(), "sha256", artifact.sha256(), "sizeBytes", artifact.sizeBytes(),
                 "pdkApiVersion", artifact.pdkApiVersion(), "origin", artifact.origin().name());
@@ -86,9 +124,13 @@ final class ConnectorCenterRuntime implements ConnectorCenter, AutoCloseable {
     }
 
     @Override
-    public Map<String, Object> download(String id) {
+    public Map<String, Object> download(String id, String expectedSha256) {
+        if (id.equals("dummy")) throw notFound(id);
         var download = remote.current().downloads().get(id);
-        if (download == null || id.equals("dummy")) throw notFound(id);
+        if (expectedSha256 != null && (download == null || !expectedSha256.equals(download.sha256()))) {
+            throw new TapstateException(ConnectorCatalogError.DOWNLOAD_TARGET_CHANGED, Map.of("connector", id), null);
+        }
+        if (download == null) throw notFound(id);
         if (!remote.reachable()) throw unavailable();
         var operation = begin(id, -1);
         workers.submit(() -> {

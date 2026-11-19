@@ -22,6 +22,8 @@ final class ConnectorReleaseCatalog {
         byte[] read(URI uri) throws IOException, InterruptedException;
 
         boolean available(URI uri) throws IOException, InterruptedException;
+
+        String authentication(URI jar) throws IOException, InterruptedException;
     }
 
     record Repository(URI baseUrl, MavenConnectorCatalog.Coordinate bom) {

@@ -3,6 +3,7 @@ package io.tapstate.app;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -12,6 +13,8 @@ import java.time.Clock;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -42,12 +45,14 @@ class ConnectorCatalogRefreshTest {
         var first = refresh.refresh();
         var captured = first.downloads().get("mysql");
         assertThat(captured.jar()).isEqualTo(original.resolve(jarPath("mysql")));
+        assertThat(first.authentication()).containsEntry("mysql", "GA");
         assertThat(first.downloads()).doesNotContainKey("unlisted");
 
         remote.repoint(replacement);
         remote.files.put(SUPPORT, ConnectorSupportSnapshotTest.manifest(11, "postgres"));
         var second = refresh.refresh();
         assertThat(second.downloads()).containsOnlyKeys("postgres");
+        assertThat(second.authentication()).containsOnlyKeys("postgres").containsEntry("postgres", "Beta");
         assertThat(second.downloads().get("postgres").jar()).isEqualTo(replacement.resolve(jarPath("postgres")));
         assertThat(captured.jar()).isEqualTo(original.resolve(jarPath("mysql")));
         assertThat(catalog(new RepositoryFixture(), ConnectorSupportSnapshotTest.manifest(10, "mysql"))
@@ -93,6 +98,22 @@ class ConnectorCatalogRefreshTest {
         assertThat(refresh.current().support().version()).isEqualTo(11);
     }
 
+    @Test
+    void readsAndNormalizesTheAuthenticationManifestAttribute() throws Exception {
+        var manifest = new Manifest();
+        manifest.getMainAttributes().putValue("Manifest-Version", "1.0");
+        manifest.getMainAttributes().putValue("Authentication", "bEtA");
+        var bytes = new ByteArrayOutputStream();
+        try (var jar = new JarOutputStream(bytes, manifest)) {
+            jar.finish();
+        }
+        assertThat(ConnectorCenterRuntime.releaseStage(ConnectorCatalogHttp.authentication(bytes.toByteArray())))
+                .isEqualTo("Beta");
+        assertThat(ConnectorCenterRuntime.releaseStage(" ga ")).isEqualTo("GA");
+        assertThat(ConnectorCenterRuntime.releaseStage("")).isEqualTo("Alpha");
+        assertThat(ConnectorCenterRuntime.releaseStage(null)).isEqualTo("Alpha");
+    }
+
     private ConnectorCatalogRefresh catalog(RepositoryFixture remote, String bundled) throws IOException {
         return new ConnectorCatalogRefresh(new ConnectorSupportSnapshot(directory), bundled, SUPPORT, REPOSITORIES,
                 "0.8.0", "2.0.11-SNAPSHOT", remote, Clock.systemUTC());
@@ -116,6 +137,11 @@ class ConnectorCatalogRefreshTest {
         @Override
         public boolean available(URI uri) {
             return !missing.contains(uri) && files.containsKey(URI.create(uri + ".sha256"));
+        }
+
+        @Override
+        public String authentication(URI jar) {
+            return jar.getPath().endsWith("mysql-connector-2.11.0.jar") ? "GA" : "Beta";
         }
 
         private void repoint(URI repository) {
