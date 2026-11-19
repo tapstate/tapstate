@@ -11,19 +11,22 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 4f23665a4f1bc4ac6bb07af8c7ed2c192caf9ee2
+          persist-credentials: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
-      - name: Allocate the memory qualification batches
+      - name: Allocate the candidate qualification batches
         run: |
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
-          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"copy.live.slow-target.large": 950, "copy.live.basic.standard": 220, "copy.snapshot.basic.large": 250, "copy.snapshot.basic.wide": 240, "join.lifecycle.release.standard": 920, "join.live.hot-update.wide": 1200, "join.live.steady-state.standard": 350, "nest.snapshot.fanout.wide": 530}}
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"mixed.snapshot.map-nest.standard": 230, "copy.live.basic.standard": 240, "copy.backlog.fixed-iud.standard": 245, "union.live.basic.standard": 290, "nest.snapshot.fanout.wide": 530}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id join.live.hot-update.wide --repeats 1 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 1 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id mixed.snapshot.map-nest.standard --id copy.live.basic.standard --id copy.backlog.fixed-iud.standard --id union.live.basic.standard --id nest.snapshot.fanout.wide --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 2 --batch-seconds 1200 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
-          name: memory-qualification-manifest
+          name: candidate-qualification-manifest
           path: |
             ${{ runner.temp }}/manifest.json
             ${{ runner.temp }}/estimates.json
@@ -36,9 +39,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        batch: [0]
+        batch: [0, 1]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: 4f23665a4f1bc4ac6bb07af8c7ed2c192caf9ee2
+          persist-credentials: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -46,7 +52,7 @@ jobs:
           cache: maven
       - uses: actions/download-artifact@v4
         with:
-          name: memory-qualification-manifest
+          name: candidate-qualification-manifest
           path: ${{ runner.temp }}/manifest
       - name: Verify the connector inputs and capture the environment
         run: |
@@ -67,7 +73,8 @@ jobs:
       - name: Build the matching OP candidate
         run: |
           for attempt in 1 2 3; do
-            if mvn -B -pl e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build-$attempt.log" 2>&1; then
+            if mvn -B -pl app,cli,e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build-$attempt.log" 2>&1; then
+              sha256sum app/target/app-0.8.0-boot.jar cli/target/cli-0.8.0.jar "$RUNNER_TEMP/connectors/"*.jar > "$RUNNER_TEMP/calibration/artifacts.sha256"
               exit 0
             fi
             tail -60 "$RUNNER_TEMP/calibration/build-$attempt.log"
@@ -85,7 +92,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: memory-qualification-batch-${{ matrix.batch }}
+          name: candidate-qualification-batch-${{ matrix.batch }}
           path: |
             ${{ runner.temp }}/calibration/
             !${{ runner.temp }}/calibration/run/**/runtime-input/**
