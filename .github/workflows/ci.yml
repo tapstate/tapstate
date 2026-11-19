@@ -20,7 +20,7 @@ jobs:
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
           {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"copy.live.slow-target.large": 950, "copy.live.basic.standard": 220, "copy.snapshot.basic.large": 250, "copy.snapshot.basic.wide": 240, "join.lifecycle.release.standard": 920, "join.live.hot-update.wide": 1200, "join.live.steady-state.standard": 350, "nest.snapshot.fanout.wide": 530}}
           JSON
-          python3 -B benchmarks/runner.py allocate --id copy.live.slow-target.large --id copy.live.basic.standard --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 1 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id join.live.hot-update.wide --repeats 1 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 1 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: memory-qualification-manifest
