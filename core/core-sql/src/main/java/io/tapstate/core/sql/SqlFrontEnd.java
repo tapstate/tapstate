@@ -685,12 +685,16 @@ public final class SqlFrontEnd {
     /**
      * Every spelling a validated column reference may carry for a source, mapped onto the one name
      * the plan calls that source by. Validation qualifies a column with the name in scope, which is
-     * the alias where a source has one, so both spellings are accepted and the alias wins.
+     * the alias where a source has one, so both spellings are accepted and the alias wins. A source
+     * the front end added for an OR alternative reads the same table, but the table's name still means
+     * the source the statement declared: the added one answers only to its own name.
      */
     private static Map<String, String> spellings(JoinTree tree) {
         Map<String, String> map = new HashMap<>();
         for (JoinTree.Source source : tree.sources()) {
-            map.put(source.table(), source.name());
+            if (source.alternativeOf() == null) {
+                map.put(source.table(), source.name());
+            }
             map.put(source.name(), source.name());
         }
         return map;

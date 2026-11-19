@@ -125,6 +125,26 @@ class AnOrJoinReadsTheFirstAlternativeThatMatchesTest {
     }
 
     @Test
+    @DisplayName("a table joined on OR without an alias is read by its own name, not by the alternative added for it")
+    void anUnaliasedTableReadsTheAlternativeItsColumnsSay() {
+        JoinPlan plan = SqlFrontEnd.derive("SELECT t.tran_id, location.name FROM wallet_tran t LEFT JOIN location "
+                + "ON t.locn_code = location.locn_code OR t.hub_locn_id = location.hub_locn_id", TABLES);
+        Expr name = plan.outputFields().get(1).from();
+        assertThat(plan.outputColumns("location"))
+                .as("an edit to the first alternative's row reaches the output").containsExactly("locn_code", "name");
+        Map<String, Map<String, Object>> sources = new HashMap<>();
+        sources.put("t", Map.of("tran_id", 7L));
+        sources.put("location", location(1, "A", null, "Atrium"));
+        sources.put("location$or2", null);
+
+        assertThat(Expressions.evaluate(name, sources))
+                .as("only the first alternative matched").isEqualTo("Atrium");
+        sources.put("location", null);
+        sources.put("location$or2", location(2, null, "H2", "Harbor"));
+        assertThat(Expressions.evaluate(name, sources)).isEqualTo("Harbor");
+    }
+
+    @Test
     @DisplayName("a column of the OR-joined table read without its table name is refused, not guessed")
     void anUnqualifiedColumnOfTheOrJoinedTableIsRefused() {
         assertThatThrownBy(() -> SqlFrontEnd.derive("SELECT t.tran_id, name FROM wallet_tran t LEFT JOIN location l "
