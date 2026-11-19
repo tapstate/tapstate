@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "graph": [],
   "inputs": {
     "records": {
@@ -26,7 +26,8 @@
       "target limit",
       "limit window",
       "drain timeout"
-    ]
+    ],
+    "trial_target_command_delay_ms": 1200
   },
   "expected": {
     "readback": [

@@ -113,3 +113,76 @@ paired cases report selected hotspot keys against a separately seeded uniform ar
 
 The operator suite covers supported pipeline shapes. The JS and double-map cases
 check that MongoDB preserves untouched Decimal128 values alongside script output.
+
+## Memory qualification
+
+List or run the versioned memory selection with the same entry point. The bounded
+example uses 96 rows, eight source events per second and six seconds of live
+measurement. Use enough input keys for the matched Join change batch.
+
+```sh
+python3 -B benchmarks/runner.py list --suite memory --format json
+python3 -B benchmarks/runner.py run --suite memory --repeats 3 --rows 96 \
+  --rate 8 --measurement-seconds 6 --timeout-seconds 90 \
+  --connectors /tmp/perf-connectors --output /tmp/perf-memory
+```
+
+- Wide and large Copy cases retain their own data profile. Compare each with
+  the same Case ID, effective row count and operating conditions.
+- Nest compares four and sixteen children per root with the same root count
+  and calibrated string lengths. Join compares uniform and hot dimension keys
+  with the same initial state and operation counts. The generator reports
+  the actual hotspot selections after the distinct-key constraint.
+- Slow-target Copy uses an owned test replica set for each arm with the same
+  topology. Only the target connector's write commands have an application and
+  namespace filter. Check matched source histories, target confirmations at
+  release, delayed commands, eventual acknowledgements and target readback.
+- Steady Join updates existing keys and reports three equal measurement
+  subwindows and logical cardinality. Lifecycle Join stops three times within
+  one JVM, observes the target collection during each stopped window, and
+  retains durable state for resume. Independent repeats start new JVMs.
+
+The repeat results name each resource window with start, end, scope and coverage.
+The OP samples use process RSS from procfs on Linux and ps on macOS. Natural JVM
+GC pauses are retained in `gc.log`, with identifiable post-pause heap samples
+listed by pause type. The generator's CPU time, actual write rates and history
+verification are separate. The outer run writes timestamped, owner-filtered
+Docker samples to `mongo-resource.jsonl` for the shared MongoDB containers.
+Use the repeat and phase timestamps when inspecting this file. MongoDB resources
+are instance totals. Queue release, physical state size and host OOM attribution
+require a supported signal. Missing observations and unfrozen thresholds remain
+visible in the report.
+
+For node timing and overhead experiments, use the same manifest on matched
+runtime builds and capture their exact identities and environment separately.
+Use `mixed.snapshot.double-map.standard` to distinguish the two Map nodes,
+`copy.snapshot.basic.standard` for batch and event units, Nest and Join for
+amplification and state, and `copy.live.slow-target.large` for target wait.
+Keep the normal backend and MongoDB topology fixed within a pair.
+
+## Reconcile and compare a batch run
+
+Use one allocated manifest and include one summary per completed batch. JSON
+contains raw repeat results and comparisons. The optional Markdown view shows
+correctness, missing runs, measurement eligibility and resource evidence.
+
+```sh
+python3 -B benchmarks/runner.py report --manifest /tmp/perf-manifest.json \
+  --summary /tmp/perf-replay/summary.json --output /tmp/perf-report.json \
+  --markdown /tmp/perf-report.md
+```
+
+Supply an explicit `--baseline /tmp/baseline.json` to enable comparison. The
+baseline object has `id`, `kind` (`fixture` or `accepted`), `environment`
+and `cases` keyed by Case ID. Case records carry the same condition and
+measurement fields as the report rows, including paired arm records when
+applicable. Fixture deltas exercise the report without implying accepted
+performance. Changes in workload, definition, environment, connector artifact
+or resource source can make observations incompatible. The report emits
+unavailable results and exits nonzero for failed, invalid or missing repeats.
+
+Provide whole-case duration estimates for all three repeats including startup,
+preparation, measurement, verification and cleanup for both arms of any pair.
+Allocate with a reserve for build, shared setup and report generation. Review
+the longest estimated batch plus reserve against the suite deadline. Keep the
+sizing and evidence for scaled estimates explicit when the inputs were bounded.

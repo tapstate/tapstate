@@ -131,7 +131,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "join.live.hot-update.wide",
-        version = 1,
+        version = 2,
         description = "Measure memory amplification from hot dimension updates with wide rows.",
         group = "join",
         operators = {"join"},
@@ -150,7 +150,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "join.live.steady-state.standard",
-        version = 1,
+        version = 2,
         description = "Measure resource growth under a fixed key set of active Join records.",
         group = "join",
         operators = {"join"},
@@ -169,7 +169,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "join.lifecycle.release.standard",
-        version = 1,
+        version = 2,
         description = "Measure release of Join resources over three start-stop cycles in one JVM.",
         group = "join",
         operators = {"join"},

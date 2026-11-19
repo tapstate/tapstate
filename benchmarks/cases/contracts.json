@@ -96,6 +96,17 @@
     "metrics": ["RSS", "heap", "GC", "quota headroom", "queue high water", "exit and OOM evidence"],
     "sampling_interval_and_budgets": "pending-calibration"
   },
+  "memory_profile": {
+    "version": 1,
+    "op_rss_sample_interval_ms": 500,
+    "mongo_sample_interval_seconds": 2,
+    "minimum_samples_per_window": 2,
+    "minimum_coverage_fraction": 0.5,
+    "idle_seconds": 2,
+    "steady_windows": 3,
+    "op_heap_limit_mib": 768,
+    "formal_limits_status": "pending-calibration"
+  },
   "eligibility": {
     "calibration_status": "pending",
     "unfrozen": ["formal scale", "concurrency", "hard timeout", "cache and warm-up conditions", "resource quotas", "applicable memory windows"],

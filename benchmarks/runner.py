@@ -8,9 +8,11 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 import catalog as definitions
+import report
 
 
 ROOT = definitions.BENCHMARKS.parent
@@ -81,7 +83,7 @@ def operator_scope(case):
 
 
 def implemented(case):
-    return case["id"] in BASE_CASES or operator_scope(case)
+    return case["id"] in BASE_CASES or operator_scope(case) or "memory-regression" in case["tags"]
 
 
 def case_listing(case):
@@ -179,7 +181,7 @@ def replay(catalog, manifest, index):
     return checked_entries(entries)
 
 
-def run_entries(entries, binding, args):
+def run_entries(entries, binding, args, manifest=None):
     checked_entries(entries)
     if not args.boot_jar.is_file() or not args.connectors.is_dir():
         raise ValueError("Supply the candidate OP boot jar and pinned connector directory")
@@ -189,6 +191,7 @@ def run_entries(entries, binding, args):
     request = {
         "run_id": run_id,
         "identity": binding,
+        "environment": manifest["environment"] if manifest else None,
         "entries": entries,
         "connector_dir": str(args.connectors.resolve()),
         "output": str(output),
@@ -204,11 +207,23 @@ def run_entries(entries, binding, args):
     ]
     if args.offline:
         command.insert(1, "-o")
-    upper_bound = 600 + sum(entry["repeats"] * (entry["timeout_seconds"] + 45) for entry in entries)
+    upper_bound = 600 + sum(
+        entry["repeats"] * (2 if "paired-control" in entry["case"]["tags"] else 1)
+        * (entry["timeout_seconds"] * 8 + entry["warmup_seconds"] + entry["measurement_seconds"] + 60)
+        for entry in entries
+    )
+    if manifest:
+        upper_bound = min(upper_bound, manifest.get("execution_limit_seconds", upper_bound))
+    started = time.monotonic()
     with (output / "maven.log").open("w", encoding="utf-8") as log:
         process = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         done = threading.Event()
-        sampler = threading.Thread(target=sample_database, args=(done, run_id, output / "mongo-resource.jsonl"),
+        memory_intervals = {
+            profile["mongo_sample_interval_seconds"] for entry in entries
+            if (profile := entry["case"]["workload_spec"].get("memory_profile"))
+        }
+        sampler = threading.Thread(target=sample_database,
+                                   args=(done, run_id, output / "mongo-resource.jsonl", min(memory_intervals or {2})),
                                    daemon=True)
         sampler.start()
         try:
@@ -237,17 +252,21 @@ def run_entries(entries, binding, args):
                 "run_id": run_id, "case_id": case["id"], "case_version": case["case_version"],
                 "repeat": repeat, "status": status, "reason": reason,
             })
-    summary = {"run_id": run_id, "identity": binding, "process_exit": code, "results": results}
+    summary = {"run_id": run_id, "identity": binding, "process_exit": code, "results": results,
+               "elapsed_seconds": time.monotonic() - started,
+               "mongo_resource_file": "mongo-resource.jsonl" if (output / "mongo-resource.jsonl").is_file() else None}
+    if manifest:
+        summary.update(batch=args.batch, manifest_sha256=manifest["manifest_sha256"])
     write_json(output / "summary.json", summary)
     print(json.dumps({"run_id": run_id, "results": str(output / "summary.json"),
                       "statuses": [result["status"] for result in results]}))
     return 1 if code or any(result["status"] != "completed" for result in results) else 0
 
 
-def sample_database(done, owner, destination):
+def sample_database(done, owner, destination, interval):
     from datetime import datetime, timezone
 
-    while not done.wait(2):
+    while not done.wait(interval):
         try:
             listing = subprocess.run(
                 ["docker", "ps", "-q", "--filter", f"label=io.tapstate.e2e.resource-owner={owner}"],
@@ -264,9 +283,12 @@ def sample_database(done, owner, destination):
                         output.write(json.dumps({"observed_at": datetime.now(timezone.utc).isoformat(),
                                                  "scope": "owned shared MongoDB container",
                                                  "docker_stats": json.loads(line)}) + "\n")
-        except (OSError, ValueError, subprocess.SubprocessError):
-            # Contention or shutdown can cause a missing resource sample.
-            continue
+        except (OSError, ValueError, subprocess.SubprocessError) as failure:
+            with destination.open("a", encoding="utf-8") as output:
+                output.write(json.dumps({"observed_at": datetime.now(timezone.utc).isoformat(),
+                                         "scope": "owned shared MongoDB container",
+                                         "status": "sample-missing",
+                                         "reason": type(failure).__name__}) + "\n")
 
 
 def stop_process(process):
@@ -347,8 +369,22 @@ def main():
     execute.add_argument("--boot-jar", type=Path, default=ROOT / "app/target/app-0.8.0-boot.jar")
     execute.add_argument("--output", type=Path, required=True)
     execute.add_argument("--offline", action="store_true")
+    reporter = sub.add_parser("report")
+    reporter.add_argument("--manifest", type=Path, required=True)
+    reporter.add_argument("--summary", type=Path, action="append", default=[])
+    reporter.add_argument("--baseline", type=Path)
+    reporter.add_argument("--output", type=Path, required=True)
+    reporter.add_argument("--markdown", type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "report":
+            result = report.reconcile(definitions.read_json(args.manifest),
+                                      [definitions.read_json(path) for path in args.summary],
+                                      definitions.read_json(args.baseline) if args.baseline else None)
+            write_json(args.output, result)
+            if args.markdown:
+                args.markdown.write_text(report.markdown(result), encoding="utf-8")
+            return int(bool(result["errors"]) or any(row["status"] != "completed" for row in result["results"]))
         catalog = definitions.build_catalog()
         binding = identity(catalog)
         if args.command == "describe":
@@ -359,8 +395,9 @@ def main():
         if args.command == "run" and args.manifest:
             if args.id or args.where or args.suite != "all":
                 raise ValueError("Select in the manifest or on the command line")
-            entries = replay(catalog, definitions.read_json(args.manifest), args.batch)
-            return run_entries(entries, binding, args)
+            manifest = definitions.read_json(args.manifest)
+            entries = replay(catalog, manifest, args.batch)
+            return run_entries(entries, binding, args, manifest)
         cases = select(catalog["cases"], args.id, args.where, args.suite, allow_empty=args.command == "list")
         if args.command == "list":
             if args.offset < 0:
@@ -380,6 +417,7 @@ def main():
                               args.batch_seconds, args.deadline_seconds, args.reserve_seconds)
         manifest = {
             "identity": binding, "environment": args.environment,
+            "execution_limit_seconds": min(args.batch_seconds, args.deadline_seconds - args.reserve_seconds),
             "selected_ids": [case["id"] for case in cases], **allocation,
         }
         manifest["manifest_sha256"] = definitions.digest(manifest)

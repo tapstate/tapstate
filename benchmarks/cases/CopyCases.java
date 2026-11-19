@@ -38,7 +38,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "copy.snapshot.basic.wide",
-        version = 1,
+        version = 2,
         description = "Copy a bounded source collection and compare exact target rows.",
         group = "copy",
         operators = {},
@@ -57,7 +57,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "copy.snapshot.basic.large",
-        version = 1,
+        version = 2,
         description = "Copy a bounded source collection and compare exact target rows.",
         group = "copy",
         operators = {},
@@ -146,7 +146,7 @@ import io.tapstate.benchmarks.PerfCase;
 )
 @PerfCase(
         id = "copy.live.slow-target.large",
-        version = 1,
+        version = 2,
         description = "Compare unlimited and rate-limited target writes under fixed injection.",
         group = "copy",
         operators = {},

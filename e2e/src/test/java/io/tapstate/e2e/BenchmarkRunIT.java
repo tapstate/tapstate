@@ -34,6 +34,7 @@ import org.bson.BsonInt64;
 import org.bson.BsonInt32;
 import org.bson.BsonString;
 import org.bson.BsonValue;
+import org.bson.Document;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 
@@ -90,26 +91,37 @@ class BenchmarkRunIT {
         String connector = text(definition, "source");
         var evidence = new Evidence(request, definition, repeat, mode, artifact, entry);
         long start = System.nanoTime();
+        evidence.result.put("started_epoch_ms", System.currentTimeMillis());
         try {
+            String scenario = definition.getString("spec").getValue();
+            boolean slowTarget = scenario.equals("specs/copy-slow-target.json");
             BenchmarkOperators operators = text(definition, "group").equals("copy")
-                    ? null : new BenchmarkOperators(definition, number(entry, "rows"));
+                    ? null : new BenchmarkOperators(definition, number(entry, "rows"), false);
             if (connector.equals("dummy")) {
                 evidence.stage = "snapshot";
                 runDummy(entry, artifact, folder, evidence, false);
                 evidence.stage = "content-witness";
                 runDummy(entry, artifact, folder, evidence, true);
-            } else if (operators != null && operators.paired()) {
-                var arms = new LinkedHashMap<String, Object>();
+            } else if (slowTarget || operators != null && operators.paired()) {
+                var arms = new LinkedHashMap<String, Map<String, Object>>();
                 evidence.result.put("paired_arms", arms);
                 evidence.stage = "paired-operator";
                 var failures = new ArrayList<String>();
-                for (String arm : List.of("uniform", "hot")) {
+                boolean fanout = operators != null && operators.fanout != null;
+                var names = slowTarget ? List.of("unlimited", "limited")
+                        : fanout ? List.of("ordinary", "high-fanout") : List.of("uniform", "hot");
+                var baseLengths = new LinkedHashMap<String, Integer>();
+                for (String arm : names) {
                     var armEvidence = new Evidence(request, definition, repeat, mode, artifact, entry);
                     arms.put(arm, armEvidence.result);
                     long armStart = System.nanoTime();
+                    armEvidence.result.put("started_epoch_ms", System.currentTimeMillis());
                     try {
                         runMongo(entry, definition, artifact, Files.createDirectory(folder.resolve(arm)), armEvidence,
-                                operators, arm.equals("hot") ? new MongoWorkloadGenerator.HotKeys(25, 70) : null);
+                                arm.equals("high-fanout")
+                                        ? new BenchmarkOperators(definition, number(entry, "rows"), true) : operators,
+                                arm.equals("hot") ? new MongoWorkloadGenerator.HotKeys(25, 70) : null,
+                                baseLengths, slowTarget, arm.equals("limited"));
                         armEvidence.result.put("status", "completed");
                     } catch (RuntimeException | AssertionError | IOException failure) {
                         recordFailure(armEvidence, failure);
@@ -117,12 +129,16 @@ class BenchmarkRunIT {
                     }
                     armEvidence.result.put("last_stage", armEvidence.stage);
                     armEvidence.result.put("total_nanos", System.nanoTime() - armStart);
+                    armEvidence.result.put("finished_epoch_ms", System.currentTimeMillis());
                 }
                 if (!failures.isEmpty()) {
                     throw new Unverified(String.join(System.lineSeparator(), failures));
                 }
+                if (slowTarget) {
+                    verifyBackpressure(arms.get("unlimited"), arms.get("limited"), evidence);
+                }
             } else {
-                runMongo(entry, definition, artifact, folder, evidence, operators, null);
+                runMongo(entry, definition, artifact, folder, evidence, operators, null, new LinkedHashMap<>(), false, false);
             }
             evidence.result.put("status", "completed");
         } catch (RuntimeException | AssertionError | IOException | URISyntaxException failure) {
@@ -130,7 +146,26 @@ class BenchmarkRunIT {
         }
         evidence.result.put("last_stage", evidence.stage);
         evidence.result.put("total_nanos", System.nanoTime() - start);
+        evidence.result.put("finished_epoch_ms", System.currentTimeMillis());
         return evidence.result;
+    }
+
+    private static void verifyBackpressure(Map<String, Object> unlimited, Map<String, Object> limited, Evidence evidence) {
+        long unrestricted = (long) unlimited.get("target_settled_before_drain");
+        long restricted = (long) limited.get("target_settled_before_drain");
+        var sourceUnlimited = JSON.valueToTree(unlimited.get("source_window"));
+        var sourceLimited = JSON.valueToTree(limited.get("source_window"));
+        var first = sourceUnlimited.path(RECORDS);
+        var second = sourceLimited.path(RECORDS);
+        if (!first.path("sequence_sha256").equals(second.path("sequence_sha256"))
+                || !first.path("acknowledged").equals(second.path("acknowledged"))
+                || restricted >= unrestricted) {
+            throw new Unverified("The matched slow-target pair did not show reduced target confirmations under identical input");
+        }
+        evidence.result.put("backpressure_pair", Map.of("same_source_sequence", true,
+                "unlimited_target_confirmed_at_draining", unrestricted, "limited_target_confirmed_at_draining", restricted,
+                "source_rate_unlimited", sourceUnlimited.path("acknowledged_per_second"),
+                "source_rate_limited", sourceLimited.path("acknowledged_per_second")));
     }
 
     private static void recordFailure(Evidence evidence, Throwable failure) {
@@ -222,46 +257,89 @@ class BenchmarkRunIT {
     }
 
     private static void runMongo(BsonDocument entry, BsonDocument definition, Path artifact, Path folder,
-            Evidence evidence, BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot) throws Exception {
+            Evidence evidence, BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot,
+            Map<String, Integer> baseLengths, boolean slowTarget, boolean limited) throws Exception {
         String namespace = "perf_" + UUID.randomUUID().toString().replace("-", "");
         String sourceName = namespace + "_src";
         String targetName = namespace + "_tgt";
-        String sourceUri = SharedMongo.replicaSetUrl(sourceName);
-        String targetUri = SharedMongo.replicaSetUrl(targetName);
         Path seeds = Files.createDirectory(folder.resolve("runtime-input"));
         Files.copy(artifact, seeds.resolve("mongodb-connector.jar"));
-        try (var client = MongoClients.create(sourceUri)) {
-            var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
-            var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
-            try {
-                evidence.stage = "prepare";
-                long preparing = System.nanoTime();
-                var rowCounts = operators == null ? Map.of(RECORDS, number(entry, "rows")) : operators.rows;
-                var recipe = WorkloadRecipe.fromCatalog(definition, rowCounts, null);
-                evidence.result.put("effective_input_rows", rowCounts);
-                var generator = new MongoWorkloadGenerator(sourceDb, recipe, text(evidence.request, "run_id"), 32);
-                var prepared = generator.prepare(generator.calibrateStringLengths());
-                evidence.result.put("source_data", prepared.preparation());
-                evidence.phase("prepare", preparing);
-                var source = sourceDb.getCollection(RECORDS, BsonDocument.class);
-                var target = targetDb.getCollection(RECORDS, BsonDocument.class);
-                long startup = System.nanoTime();
-                evidence.stage = "startup";
-                try (var storage = PreparedNativeStore.create();
-                        var server = RealProcessServer.startPrepared(storage.configurationUri(), "127.0.0.1",
-                                ignored -> List.of("--tapstate.connectors.seed-dir=" + seeds))) {
+        try (var owned = slowTarget ? BenchmarkTargetLimit.newReplicaSet() : null) {
+            if (owned != null) {
+                owned.start();
+            }
+            String sourceUri = owned == null ? SharedMongo.replicaSetUrl(sourceName) : owned.getReplicaSetUrl(sourceName);
+            String targetUri = owned == null ? SharedMongo.replicaSetUrl(targetName) : owned.getReplicaSetUrl(targetName);
+            evidence.result.put("mongo_topology", slowTarget ? "owned shared replica set with test commands"
+                    : "shared replica set");
+            try (var client = MongoClients.create(sourceUri)) {
+                var sourceDb = client.getDatabase(sourceName).withWriteConcern(WriteConcern.MAJORITY);
+                var targetDb = client.getDatabase(targetName).withReadConcern(ReadConcern.MAJORITY);
+                runMongo(entry, definition, evidence, folder, operators, hot, baseLengths, seeds, sourceUri, targetUri,
+                        sourceDb, targetDb, client.getDatabase("admin"), limited);
+            }
+        }
+    }
+
+    private static void runMongo(BsonDocument entry, BsonDocument definition, Evidence evidence, Path folder,
+            BenchmarkOperators operators, MongoWorkloadGenerator.HotKeys hot, Map<String, Integer> baseLengths,
+            Path seeds, String sourceUri, String targetUri, MongoDatabase sourceDb, MongoDatabase targetDb,
+            MongoDatabase admin, boolean limited) throws Exception {
+        var memoryProfile = definition.getDocument("workload_spec").getDocument("memory_profile", null);
+        boolean memory = memoryProfile != null;
+        boolean steady = operators != null && operators.scenario.equals("join-steady-state");
+        boolean lifecycle = operators != null && operators.scenario.equals("join-lifecycle-release");
+        try {
+            evidence.stage = "prepare";
+            long preparing = System.nanoTime();
+            var rowCounts = operators == null ? Map.of(RECORDS, number(entry, "rows")) : operators.rows;
+            var recipe = WorkloadRecipe.fromCatalog(definition, rowCounts, operators == null ? null : operators.fanout);
+            evidence.result.put("effective_input_rows", rowCounts);
+            var generator = new MongoWorkloadGenerator(sourceDb, recipe, text(evidence.request, "run_id"), 32);
+            if (baseLengths.isEmpty()) {
+                baseLengths.putAll(generator.calibrateStringLengths());
+            }
+            var prepared = generator.prepare(baseLengths);
+            evidence.result.put("source_data", prepared.preparation());
+            var settings = prepared.preparation().source();
+            evidence.result.put("database_conditions", Map.of("mongo_version", settings.mongoVersion(),
+                    "replica_set", settings.replicaSet(), "write_concern", settings.writeConcern(),
+                    "pre_images", settings.preImages(), "batch_size", settings.batchSize(),
+                    "string_base_lengths", settings.stringBaseLengths()));
+            evidence.phase("prepare", preparing);
+            var source = sourceDb.getCollection(RECORDS, BsonDocument.class);
+            var target = targetDb.getCollection(RECORDS, BsonDocument.class);
+            long startup = System.nanoTime();
+            evidence.stage = "startup";
+            int heapLimit = memory ? number(memoryProfile, "op_heap_limit_mib") : 768;
+            var jvmOptions = new ArrayList<>(List.of("-Xmx" + heapLimit + "m", "-XX:ActiveProcessorCount=2"));
+            if (memory) {
+                jvmOptions.add("-Xlog:gc:file=" + folder.resolve("gc.log") + ":timemillis,uptime,level,tags");
+            }
+            try (var storage = PreparedNativeStore.create()) {
+                var server = RealProcessServer.startPreparedInJvm(storage.configurationUri(), jvmOptions,
+                        ignored -> List.of("--tapstate.connectors.seed-dir=" + seeds));
+                try (server) {
                     var control = new ControlPlane(server.baseUrl());
                     storage.loginAndAwaitBusiness(control);
-                    try (var peaks = new BenchmarkResources(server.pid())) {
+                    try (var peaks = memory ? new BenchmarkResources(server.pid(), folder.resolve("op-resource.jsonl"),
+                            number(memoryProfile, "op_rss_sample_interval_ms"), number(memoryProfile, "minimum_samples_per_window"),
+                            memoryProfile.getNumber("minimum_coverage_fraction").doubleValue())
+                            : new BenchmarkResources(server.pid())) {
+                        if (memory) {
+                            evidence.resources = peaks;
+                        }
                         var src = Map.<String, Object>of("uri", sourceUri, "preImage", true);
-                        var tgt = Map.<String, Object>of("uri", targetUri + (targetUri.contains("?") ? "&" : "?") + "w=majority");
+                        String targetApplication = targetDb.getName() + "_writer";
+                        var tgt = Map.<String, Object>of("uri", targetUri + (targetUri.contains("?") ? "&" : "?")
+                                + "w=majority&appName=" + targetApplication);
                         String input = operators == null ? RECORDS : String.join(", ", operators.sources());
                         var workspace = new LinkedHashMap<>(Map.of(
                                 "source.tap.yml", resource("src_perf", "mongodb", src, input),
                                 "target.tap.yml", resource("tgt_perf", "mongodb", tgt, null)));
                         control.apply(workspace);
                         discover(control, "src_perf", "mongodb", src);
-                        boolean snapshot = text(definition, "mode").equals("snapshot");
+                        boolean snapshot = text(definition, "mode").equals("snapshot") && !lifecycle;
                         String yaml = operators == null ? pipeline(snapshot ? "snapshot_only" : "snapshot_and_cdc", "clear")
                                 : JSON.writerWithDefaultPrettyPrinter().writeValueAsString(operators.pipeline(PIPELINE, snapshot, sourceDb));
                         Files.writeString(folder.resolve("pipeline.tap.yml"), yaml);
@@ -275,7 +353,14 @@ class BenchmarkRunIT {
                                 if (snapshot) {
                                     mongoSnapshot(entry, control, evidence);
                                 } else {
-                                    mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"));
+                                    int delay = limited ? number(definition.getDocument("workload_spec")
+                                            .getDocument("scenario").getDocument("parameters"),
+                                            "trial_target_command_delay_ms") : 0;
+                                    try (var limit = limited ? new BenchmarkTargetLimit(admin, targetApplication,
+                                            target.getNamespace().getFullName(), delay) : null) {
+                                        mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
+                                                limit, delay);
+                                    }
                                 }
                                 evidence.stage = "readback";
                                 long verify = System.nanoTime();
@@ -283,7 +368,32 @@ class BenchmarkRunIT {
                                 evidence.phase("readback", verify);
                                 evidence.result.put("target_readback_rows", target.countDocuments());
                             }
+                            if (memory && !lifecycle) {
+                                evidence.window("idle");
+                                pause(number(memoryProfile, "idle_seconds"));
+                            }
                         } finally {
+                            if (memory) {
+                                var resourceReport = peaks.report(steady ? number(memoryProfile, "steady_windows") : 0);
+                                resourceReport.put("op_heap_limit_mib", heapLimit);
+                                evidence.result.put("resources", resourceReport);
+                                evidence.diagnostic("target_bson_storage", () -> {
+                                    var collections = operators == null ? List.of(RECORDS) : operators.targets();
+                                    var sizes = new LinkedHashMap<String, Object>();
+                                    for (var collection : collections) {
+                                        var reading = targetDb.runCommand(new Document("collStats", collection));
+                                        sizes.put(collection, Map.of("documents", reading.get("count", Number.class),
+                                                "logical_bson_bytes", reading.get("size", Number.class)));
+                                    }
+                                    return sizes;
+                                });
+                                boolean alive = ProcessHandle.of(server.pid()).map(ProcessHandle::isAlive).orElse(false);
+                                evidence.result.put("op_alive_before_teardown", alive);
+                                if (!alive) {
+                                    evidence.result.put("exit_attribution", "unattributed-process-exit");
+                                    throw new Unverified("OP exited before teardown");
+                                }
+                            }
                             evidence.diagnostic("runtime_metrics", () -> control.metrics(PIPELINE));
                             evidence.diagnostic("runtime_position", () -> control.positionReading(PIPELINE));
                             evidence.result.put("op_rss_peak_kib", peaks.peakKiB());
@@ -294,22 +404,37 @@ class BenchmarkRunIT {
                     } finally {
                         saveProcess(server, folder.resolve("op.log"));
                     }
-                }
-            } finally {
-                evidence.stageBeforeCleanup();
-                long cleanup = System.nanoTime();
-                try {
-                    sourceDb.drop();
                 } finally {
-                    targetDb.drop();
-                    evidence.phase("cleanup", cleanup);
+                    if (memory) {
+                        evidence.diagnostic("op_exit_code", server::exitValue);
+                        var log = folder.resolve("op.log");
+                        if (Files.isRegularFile(log)) {
+                            try (var lines = Files.lines(log)) {
+                                if (lines.anyMatch(line -> line.stripLeading().startsWith("java.lang.OutOfMemoryError:")
+                                        || line.contains("Caused by: java.lang.OutOfMemoryError:"))) {
+                                    evidence.result.put("exit_attribution", "observed-java-out-of-memory");
+                                    throw new AssertionError("OP reported OutOfMemoryError");
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+        } finally {
+            evidence.stageBeforeCleanup();
+            long cleanup = System.nanoTime();
+            try {
+                sourceDb.drop();
+            } finally {
+                targetDb.drop();
+                evidence.phase("cleanup", cleanup);
             }
         }
     }
 
     private static void mongoSnapshot(BsonDocument entry, ControlPlane control, Evidence evidence) {
         evidence.stage = "snapshot";
+        evidence.window("snapshot");
         int rows = number(entry, "rows");
         long start = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -317,6 +442,7 @@ class BenchmarkRunIT {
                 () -> snapshotLanded(control, RECORDS, rows));
         evidence.measure(start, rows, rows);
         evidence.result.put("snapshot_landed", control.initialLoad(PIPELINE).orElseThrow());
+        evidence.window("readback");
     }
 
     private static boolean snapshotLanded(ControlPlane control, String table, int rows) {
@@ -327,8 +453,10 @@ class BenchmarkRunIT {
     }
 
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
-            MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode) {
+            MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode,
+            BenchmarkTargetLimit limit, int delay) {
         evidence.stage = "initial-state";
+        evidence.window("load");
         int initial = number(entry, "rows");
         long prepareState = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -389,13 +517,26 @@ class BenchmarkRunIT {
             evidence.stage = "live";
             long baseline = settled(control);
             long[] observedWarm = new long[1];
+            long[] observedBeforeDrain = new long[1];
             int rate = number(entry, "rate");
             int warmup = number(entry, "warmup_seconds");
             int measure = number(entry, "measurement_seconds");
+            evidence.window("warmup");
             var result = prepared.inject(new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
                     Duration.ofSeconds(measure)), mix, null, () -> {
                         settleExpected(entry, control, baseline + (long) rate * warmup);
                         observedWarm[0] = settled(control);
+                        if (limit != null) {
+                            limit.arm();
+                        }
+                        evidence.window("measurement");
+                    }, () -> {
+                        evidence.window("drain");
+                        observedBeforeDrain[0] = settled(control) - observedWarm[0];
+                        if (limit != null) {
+                            evidence.result.put("target_delay_millis", delay);
+                            evidence.result.put("target_commands_delayed", limit.release());
+                        }
                     });
             evidence.result.put("warmup", phase(result.warmup()));
             evidence.result.put("source_window", phase(result.measured()));
@@ -404,6 +545,15 @@ class BenchmarkRunIT {
             }
             long measured = result.measured().streams().get(RECORDS).observed().total();
             long drain = System.nanoTime();
+            long acknowledged = observedBeforeDrain[0];
+            if (limit != null) {
+                long delayed = (long) evidence.result.get("target_commands_delayed");
+                evidence.result.put("source_minus_target_at_release", measured - acknowledged);
+                if (delayed <= 0 || acknowledged >= measured) {
+                    throw new Unverified("The target-only delay did not prove an acknowledgement deficit");
+                }
+            }
+            evidence.result.put("target_settled_before_drain", acknowledged);
             settleExpected(entry, control, observedWarm[0] + measured);
             evidence.phase("ack_wait", drain);
             var threshold = entry.getDocument("case").getDocument("workload_spec").getDocument("measurements")
@@ -421,8 +571,10 @@ class BenchmarkRunIT {
     private static void operatorRun(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence,
             MongoWorkloadGenerator.HotKeys hot) {
-        String mode = text(entry.getDocument("case"), "mode");
+        boolean lifecycle = operators.scenario.equals("join-lifecycle-release");
+        String mode = lifecycle ? "live-latency" : text(entry.getDocument("case"), "mode");
         evidence.stage = "initial-state";
+        evidence.window(mode.equals("snapshot") ? "snapshot" : "load");
         var initial = operators.expected(source);
         long initialStart = System.nanoTime();
         control.lifecycle(PIPELINE, LifecycleVerb.START);
@@ -430,6 +582,7 @@ class BenchmarkRunIT {
         if (mode.equals("snapshot")) {
             long input = operators.rows.values().stream().mapToLong(Integer::longValue).sum();
             evidence.measure(initialStart, input, initial.size());
+            evidence.window("readback");
             verifyOperator(operators, target, initial, evidence);
             return;
         }
@@ -464,11 +617,65 @@ class BenchmarkRunIT {
         var confirmedAcks = operatorPositions(control, operators.mutableInputs(), "targetAcked");
         evidence.result.put("initial_target_position_advanced", !confirmedAcks.isEmpty() && !confirmedAcks.equals(previousAcks));
         evidence.phase("initial_state", initialStart);
+        if (lifecycle) {
+            lifecycleCycles(entry, prepared, control, source, target, operators, evidence);
+            return;
+        }
         var mix = operators.paired() ? new WorkloadRecipe.Mix(0, 70, 30) : mix(entry);
         if (mode.equals("backlog-throughput")) {
             operatorBacklog(entry, prepared, control, source, target, operators, evidence, anchor, mix);
         } else {
             operatorLive(entry, prepared, control, source, target, operators, evidence, mix, hot);
+        }
+    }
+
+    private static void lifecycleCycles(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
+            MongoDatabase source, MongoDatabase target, BenchmarkOperators operators, Evidence evidence) {
+        int cycles = number(entry.getDocument("case").getDocument("workload_spec").getDocument("scenario")
+                .getDocument("parameters"), "same_jvm_cycles_per_repeat");
+        int idle = number(entry.getDocument("case").getDocument("workload_spec").getDocument("memory_profile"),
+                "idle_seconds");
+        var observations = new ArrayList<Map<String, Object>>();
+        evidence.result.put("lifecycle_cycles", observations);
+        for (int cycle = 1; cycle <= cycles; cycle++) {
+            evidence.stage = "lifecycle-cycle-" + cycle;
+            evidence.windowPrefix = evidence.stage + "/";
+            if (cycle > 1) {
+                evidence.window("start");
+                control.lifecycle(PIPELINE, LifecycleVerb.START);
+                waitFor(entry, "Join resumed", () -> control.state(PIPELINE).filter(PipelineState.RUNNING::equals).isPresent());
+            }
+            operatorLive(entry, prepared, control, source, target, operators, evidence, null, null);
+            var warmup = evidence.result.get("warmup");
+            var measurement = evidence.result.get("source_window");
+            evidence.window("stop");
+            control.stop(PIPELINE, false);
+            waitFor(entry, "Join stopped", () -> control.state(PIPELINE).filter(PipelineState.STOPPED::equals).isPresent());
+            var output = target.getCollection("facts", BsonDocument.class);
+            try (var activity = output.watch().maxAwaitTime(200, java.util.concurrent.TimeUnit.MILLISECONDS).cursor()) {
+                evidence.window("idle");
+                long until = System.nanoTime() + Duration.ofSeconds(idle).toNanos();
+                while (System.nanoTime() < until) {
+                    if (activity.tryNext() != null) {
+                        throw new Unverified("The target collection changed in the stopped window");
+                    }
+                }
+            }
+            verifyOperator(operators, target, operators.expected(source), evidence);
+            observations.add(Map.of("cycle", cycle, "state", "STOPPED", "target_changes_while_idle", 0,
+                    "idle_seconds", idle, "target_readback", "verified", "durable_state", "retained",
+                    "queue_release", "unavailable from runtime read face",
+                    "warmup", warmup, "measurement", measurement));
+        }
+        evidence.windowPrefix = "";
+    }
+
+    private static void pause(int seconds) {
+        try {
+            Thread.sleep(Duration.ofSeconds(seconds));
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new Unverified("Interrupted in the idle window");
         }
     }
 
@@ -585,17 +792,24 @@ class BenchmarkRunIT {
         var warm = new LinkedHashMap<String, Long>();
         var warmRows = new LinkedHashMap<String, BsonDocument>();
         long[] warmOutput = new long[1];
-        var run = prepared.inject(new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
-                Duration.ofSeconds(measurement)), mix, hot, () -> {
-                    var expected = operators.expected(source);
-                    waitFor(entry, "operator warm-up seen at both endpoints",
-                            () -> capturedChanges(control).values().stream().mapToLong(Long::longValue).sum()
-                                    >= baseline.values().stream().mapToLong(Long::longValue).sum() + (long) rate * warmup
-                                    && BenchmarkOperatorOracle.difference(operators, target, expected) == null);
-                    warmRows.putAll(expected);
-                    warm.putAll(capturedChanges(control));
-                    warmOutput[0] = settled(control);
-                });
+        evidence.window("warmup");
+        var windowSize = new MongoWorkloadGenerator.LiveWindow(rate, Duration.ofSeconds(warmup),
+                Duration.ofSeconds(measurement));
+        Runnable afterWarmup = () -> {
+            var expected = operators.expected(source);
+            waitFor(entry, "operator warm-up seen at both endpoints",
+                    () -> capturedChanges(control).values().stream().mapToLong(Long::longValue).sum()
+                            >= baseline.values().stream().mapToLong(Long::longValue).sum() + (long) rate * warmup
+                            && BenchmarkOperatorOracle.difference(operators, target, expected) == null);
+            warmRows.putAll(expected);
+            warm.putAll(capturedChanges(control));
+            warmOutput[0] = settled(control);
+            evidence.window("measurement");
+        };
+        Runnable afterWrites = () -> evidence.window("drain");
+        var run = operators.scenario.equals("join-lifecycle-release")
+                ? prepared.injectSteadyCycle(windowSize, afterWarmup, afterWrites)
+                : prepared.inject(windowSize, mix, hot, afterWarmup, afterWrites);
         evidence.result.put("warmup", phase(run.warmup()));
         evidence.result.put("source_window", phase(run.measured()));
         if (!run.measured().complete()) {
@@ -613,7 +827,18 @@ class BenchmarkRunIT {
                 window.put(name, actual.getOrDefault(name, 0L) - warm.getOrDefault(name, 0L)));
         evidence.result.put("source_captured_changes", window);
         evidence.result.put("measurement_status", "insufficient-event-correlation");
+        evidence.window("readback");
         verifyOperator(operators, target, expected, evidence);
+        if (operators.scenario.equals("join-steady-state")) {
+            var factRows = source.getCollection("facts").countDocuments();
+            var dimensionRows = source.getCollection("dimensions").countDocuments();
+            if (factRows != operators.rows.get("facts") || dimensionRows != operators.rows.get("dimensions")
+                    || expected.size() != warmRows.size() || !expected.keySet().equals(warmRows.keySet())) {
+                throw new AssertionError("Steady-state workload changed the logical key space");
+            }
+            evidence.result.put("steady_state_logical_rows", Map.of("facts", factRows, "dimensions", dimensionRows,
+                    "joined", expected.size()));
+        }
     }
 
     private static void awaitOperatorPhase(BsonDocument entry, ControlPlane control, MongoDatabase target,
@@ -707,6 +932,8 @@ class BenchmarkRunIT {
         var result = new LinkedHashMap<String, Object>();
         result.put("complete", report.complete());
         result.put("started_at", report.startedAt() == null ? null : report.startedAt().toString());
+        result.put("writes_finished_at", report.writesFinishedAt() == null ? null : report.writesFinishedAt().toString());
+        result.put("generator_process_cpu_nanos", report.generatorProcessCpuNanos());
         result.put("write_nanos", report.writeNanos());
         result.put("history_nanos", report.historyNanos());
         result.put("submitted_per_second", report.actualSubmittedEventsPerSecond());
@@ -899,6 +1126,8 @@ class BenchmarkRunIT {
         final Map<String, Object> result = new LinkedHashMap<>();
         final Map<String, Long> phases = new LinkedHashMap<>();
         String stage = "prepare";
+        BenchmarkResources resources;
+        String windowPrefix = "";
 
         Evidence(BsonDocument request, BsonDocument definition, int repeat, String mode, Path artifact, BsonDocument entry)
                 throws Exception {
@@ -911,6 +1140,10 @@ class BenchmarkRunIT {
             result.put("repeat", repeat);
             result.put("mode", mode);
             result.put("scale", text(entry, "scale"));
+            var effective = entry.clone();
+            effective.remove("case");
+            effective.remove("repeats");
+            result.put("effective_load", JSON.readTree(effective.toJson()));
             result.put("connector_sha256", digest(artifact));
             result.put("op_boot_sha256", digest(Path.of(System.getProperty("tapstate.e2e.boot-jar"))));
             result.put("environment", Map.of("os", System.getProperty("os.name"), "arch", System.getProperty("os.arch"),
@@ -935,7 +1168,13 @@ class BenchmarkRunIT {
         }
 
         void phase(String name, long start) {
-            phases.put(name, System.nanoTime() - start);
+            phases.put(windowPrefix + name, System.nanoTime() - start);
+        }
+
+        void window(String name) {
+            if (resources != null) {
+                resources.phase(windowPrefix + name);
+            }
         }
 
         void stageBeforeCleanup() {

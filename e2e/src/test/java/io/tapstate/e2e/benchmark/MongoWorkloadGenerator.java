@@ -200,6 +200,7 @@ public final class MongoWorkloadGenerator {
     public final class Prepared {
         private final Preparation preparation;
         private final AtomicBoolean used = new AtomicBoolean();
+        private WorkloadChanges steadyChanges;
 
         private Prepared(Preparation preparation) {
             this.preparation = preparation;
@@ -225,16 +226,40 @@ public final class MongoWorkloadGenerator {
 
         /** Call after CDC is ready. The callback separates warm-up from scoring and may await target readiness. */
         public Live inject(LiveWindow window, Mix override, HotKeys hotKeys, Runnable afterWarmup) {
+            return inject(window, override, hotKeys, afterWarmup, () -> {});
+        }
+
+        /** The end callback runs after writes finish, before independent history verification. */
+        public Live inject(LiveWindow window, Mix override, HotKeys hotKeys, Runnable afterWarmup, Runnable afterWrites) {
+            return inject(window, mix(override, hotKeys), hotKeys, afterWarmup, afterWrites,
+                    new WorkloadChanges(recipe, hotKeys), false);
+        }
+
+        /** Retains the deterministic mutation sequence across restarts of an update-only workload. */
+        public synchronized Live injectSteadyCycle(LiveWindow window, Runnable afterWarmup, Runnable afterWrites) {
+            if (recipe.changeMode != WorkloadRecipe.Changes.STEADY) {
+                throw new IllegalArgumentException("Repeated cycles require an update-only workload");
+            }
+            if (steadyChanges == null) {
+                claim();
+                steadyChanges = new WorkloadChanges(recipe, null);
+            }
+            return inject(window, recipe.mix, null, afterWarmup, afterWrites, steadyChanges, true);
+        }
+
+        private Live inject(LiveWindow window, Mix mix, HotKeys hotKeys, Runnable afterWarmup, Runnable afterWrites,
+                            WorkloadChanges changes, boolean continuing) {
             Objects.requireNonNull(afterWarmup);
-            Mix mix = mix(override, hotKeys);
-            var changes = new WorkloadChanges(recipe, hotKeys);
+            Objects.requireNonNull(afterWrites);
             var warmup = changes.allocate(eventsFor(window.eventsPerSecond(), window.warmup()), mix);
             var scored = changes.allocate(eventsFor(window.eventsPerSecond(), window.measurement()), mix);
             if (scored.stream().allMatch(counts -> counts.total() == 0)) {
                 throw new IllegalArgumentException("The measurement duration must admit at least one scheduled event");
             }
             changes.validate(warmup, scored);
-            claim();
+            if (!continuing) {
+                claim();
+            }
             var lengths = preparation.source().stringBaseLengths();
             var warm = runPhase("warmup", changes.phase(warmup), window.eventsPerSecond(), window.warmup(), lengths);
             var measurementStreams = changes.phase(scored);
@@ -249,7 +274,7 @@ public final class MongoWorkloadGenerator {
                 blocked = "Warm-up incomplete";
             }
             var measure = blocked == null
-                    ? runPhase("measurement", measurementStreams, window.eventsPerSecond(), window.measurement(), lengths)
+                    ? runPhase("measurement", measurementStreams, window.eventsPerSecond(), window.measurement(), lengths, afterWrites)
                     : notRun(measurementStreams, window.eventsPerSecond(), blocked);
             return new Live(preparation.source(), mix, hotKeys, window, warm, measure);
         }
@@ -291,6 +316,11 @@ public final class MongoWorkloadGenerator {
 
     private PhaseReport runPhase(String name, List<WorkloadChanges.Stream> streams, Integer rate,
                                  Duration liveDuration, Map<String, Integer> lengths) {
+        return runPhase(name, streams, rate, liveDuration, lengths, () -> {});
+    }
+
+    private PhaseReport runPhase(String name, List<WorkloadChanges.Stream> streams, Integer rate,
+                                 Duration liveDuration, Map<String, Integer> lengths, Runnable afterWrites) {
         var states = new ArrayList<StreamState>();
         try {
             for (var stream : streams) {
@@ -308,6 +338,7 @@ public final class MongoWorkloadGenerator {
             long duration = System.nanoTime() - start;
             Instant writesFinishedAt = Instant.now();
             Long writerCpu = cpuElapsed(cpu);
+            afterWrites.run();
             long historyStarted = System.nanoTime();
             for (var state : states) {
                 state.readHistory();
