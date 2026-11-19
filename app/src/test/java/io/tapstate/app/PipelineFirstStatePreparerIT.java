@@ -56,6 +56,69 @@ class PipelineFirstStatePreparerIT {
     private static final Clock CLOCK = Clock.fixed(Instant.parse("2026-10-18T08:00:00Z"), ZoneOffset.UTC);
     private static final WorkloadOwner OWNER = new WorkloadOwner("node-a", "boot-a");
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(strings = {"issued-live", "issued-expired", "unassigned", "complete-missing"})
+    void keepingStopCanCancelDeferredPreparationBeforeTheCheckpointExists(String situation) {
+        withFixture(false, f -> {
+            var id = f.scope.pipelineId();
+            var intentStore = f.configuration.intents();
+            String hash = CanonicalHash.of(f.configuration.artifacts().get(id).orElseThrow());
+            var start = new DesiredState(id, PipelineState.RUNNING, hash);
+            var inputs = new PipelinePreparationInputs(hash, Map.of(), Map.of(), List.of());
+            assertThat(intentStore.compareAndSetStart(f.scope, 0, start, inputs)).isTrue();
+            var pending = intentStore.pendingStart(id).orElseThrow();
+            var nodeClaims = f.cache.workloadClaims(f.business());
+            var node = nodeClaims.read(f.node.key()).orElseThrow().claim();
+            if (situation.equals("complete-missing")) {
+                var preparer = new PipelineFirstStatePreparer(f.business(), f.configuration.preparations(),
+                        f.cache.admittedPipelinePreparations(f.business(), ACTIVE), () -> Optional.of(f.node), ACTIVE, CLOCK, TTL);
+                preparer.prepareDeferred(pending);
+                assertThat(f.state()).isNotNull();
+                assertThat(f.cacheDatabase.getCollection("pipeline_state").deleteOne(new Document("_id", id)).getDeletedCount()).isOne();
+            } else if (situation.startsWith("issued")) {
+                var issuance = (FirstPipelineCreationResult.Issued) f.configuration.preparations().issueDeferred(pending, f.node);
+                var reservation = f.cache.admittedPipelinePreparations(f.business(), ACTIVE).reserveFirst(issuance.creation(), TTL);
+                assertThat(reservation.phase()).isEqualTo(io.tapstate.spi.store.PipelineCachePreparations.Phase.RESERVED);
+                assertThat(f.claim()).isNotNull();
+            }
+            if (situation.equals("issued-expired")) assertThat(nodeClaims.release(node)).isTrue();
+            boolean leased = nodeClaims.read(f.node.key()).orElseThrow().leased();
+            assertThat(leased).isEqualTo(!situation.equals("issued-expired"));
+            assertThat(f.state()).isNull();
+            var preparation = f.configuration.preparations().read(id).orElseThrow().phase();
+
+            var bound = org.mockito.Mockito.mock(StorageRuntime.Bound.class);
+            org.mockito.Mockito.when(bound.cache()).thenReturn(f.cache);
+            org.mockito.Mockito.when(bound.preparation()).thenReturn(f.configuration.bindings().cachePreparation().orElseThrow());
+            var port = new ThreeLayerStorePort(f.configuration, bound,
+                    ignored -> {throw new AssertionError("Stop cannot issue preparation");},
+                    (scope, captured) -> {throw new AssertionError("Stop cannot issue preparation");}, true);
+            var service = new io.tapstate.control.core.PipelineLifecycleService(
+                    new io.tapstate.control.core.ArtifactQueryService(port.artifacts()),
+                    port.desired(), new io.tapstate.control.core.AuditGate(f.configuration.audit(), CLOCK), port.state()::read);
+            var before = intentStore.load(id).orElseThrow();
+            assertThat(before.intentRevision()).isOne();
+            if (!situation.equals("complete-missing")) {
+                assertThat(preparation).isEqualTo(situation.equals("unassigned")
+                        ? PipelinePreparation.Phase.UNASSIGNED : PipelinePreparation.Phase.ISSUED);
+                var stopped=service.stop("operator",id,false);
+                assertThat(stopped.targetState()).isEqualTo(PipelineState.STOPPED);
+                assertThat(intentStore.load(id).orElseThrow().intentRevision()).isEqualTo(2);
+                assertThat(intentStore.pendingStart(id)).isEmpty();
+                assertThat(f.state()).isNull();
+            } else {
+                assertThat(preparation).isEqualTo(PipelinePreparation.Phase.COMPLETE);
+                Throwable cause=org.assertj.core.api.Assertions.catchThrowable(() -> service.stop("operator",id,false));
+                assertThat(cause).isInstanceOfSatisfying(TapstateException.class, error -> {
+                    assertThat(error.code()).isEqualTo(IoError.DOCUMENT_UNREADABLE);
+                    assertThat(error.args()).containsEntry("id",id).containsEntry("field","checkpoint");
+                });
+                assertThat(intentStore.load(id)).contains(before);
+                assertThat(f.state()).isNull();
+            }
+        });
+    }
+
     @Test void unpreparedAuthoringModelsAreRetiredWithoutInventingExecutionHistory() {
         withFixture(f -> {
             var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {
@@ -921,6 +984,10 @@ class PipelineFirstStatePreparerIT {
         assertThatThrownBy(action).isInstanceOfSatisfying(TapstateException.class, failure -> assertThat(failure.code()).isEqualTo(code));
     }
     private static void withFixture(Scenario scenario) {
+        withFixture(true, scenario);
+    }
+
+    private static void withFixture(boolean seedIntent, Scenario scenario) {
         String suffix = UUID.randomUUID().toString().replace("-", "");
         String configName = "app_first_cfg_" + suffix; String cacheName = "app_first_cache_" + suffix;
         try (var configClient = MongoClients.create(CONFIG.getReplicaSetUrl()); var cacheClient = MongoClients.create(CACHE.getReplicaSetUrl())) {
@@ -937,7 +1004,7 @@ class PipelineFirstStatePreparerIT {
                 var pipeline = new DslParser().parse("version: tapstate/v1\nkind: pipeline\nid: flow\nsource: []\n");
                 configuration.artifacts().create(pipeline);
                 var scope = new PipelineIntentScope(business.clusterId(), business.bindingVersion(), business.cacheIncarnation(), "flow", 1);
-                configuration.intents().compareAndSet(scope, 0, new DesiredState("flow", PipelineState.RUNNING, CanonicalHash.of(pipeline)));
+                if (seedIntent) configuration.intents().compareAndSet(scope, 0, new DesiredState("flow", PipelineState.RUNNING, CanonicalHash.of(pipeline)));
                 var node = cache.workloadClaims(business).acquire(new WorkloadClaimKey("cluster-a", WorkloadClaimType.NODE_SESSION, "node-a"), OWNER, 1, TTL).claim();
                 scenario.run(new Fixture(configuration, cache, configDb, cacheDb, settings, cacheConnection, scope, WorkloadClaimFence.from(node)));
             } finally { configDb.drop(); cacheDb.drop(); }

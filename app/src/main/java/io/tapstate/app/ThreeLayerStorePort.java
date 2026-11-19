@@ -206,10 +206,12 @@ final class ThreeLayerStorePort implements StorePort {
         var cache = business();
         return new PipelineIntentScope(cache.clusterId(), cache.bindingVersion(), cache.cacheIncarnation(), pipeline, mapping.stateGeneration());
     }
-    private boolean unprepared(String pipeline) {
+    private PipelinePreparation preparation(String pipeline) {
         active();
-        return configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused).phase()
-                == PipelinePreparation.Phase.UNASSIGNED;
+        return configuration.preparations().read(pipeline).orElseThrow(ThreeLayerStorePort::refused);
+    }
+    private boolean unprepared(String pipeline) {
+        return preparation(pipeline).phase() == PipelinePreparation.Phase.UNASSIGNED;
     }
     @Override public boolean pipelineRecoveryRequired(String pipeline) {
         var mapping = currentMapping(pipeline);
@@ -350,7 +352,14 @@ final class ThreeLayerStorePort implements StorePort {
         return new StateStore() {
             @Override public Optional<CheckpointDoc> read(String pipeline) {
                 var original = scope(pipeline);
-                return unprepared(pipeline) ? Optional.empty() : bound.cache().pipelineStates(original).read(pipeline);
+                var prepared = preparation(pipeline);
+                if (prepared.phase() == PipelinePreparation.Phase.UNASSIGNED) return Optional.empty();
+                if (deferFirstStart && prepared.phase() == PipelinePreparation.Phase.ISSUED) {
+                    if (!original.equals(prepared.scope())) throw refused();
+                    // The CACHE checkpoint need not exist until deferred preparation completes.
+                    return Optional.empty();
+                }
+                return bound.cache().pipelineStates(original).read(pipeline);
             }
             @Override public void create(String pipeline, String json, Instant time) { throw refused(); }
             @Override public CasOutcome compareAndSwap(String pipeline, long epoch, String json, Instant time) { throw refused(); }
