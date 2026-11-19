@@ -158,21 +158,37 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
 
     @Override
     public boolean hasPreparedModels() {
-        return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false, this::hasPreparedModels);
+        return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false,
+                session -> hasPreparedModels(session, claim(session), false));
     }
 
-    boolean hasPreparedModels(ClientSession session) {
-        var control = marker(claim(session));
+    boolean hasPreparedModels(ClientSession session, Document preparedClaim) {
+        return hasPreparedModels(session, requireClaimScope(preparedClaim), true);
+    }
+
+    private boolean hasPreparedModels(ClientSession session, Document claim, boolean reuseRows) {
+        var control = marker(claim);
         if (control.get(TARGETS) == null) return false;
         var manifest = documents(control.get(TARGETS));
-        verifyClosure(session, manifest, control.getString(PREPARATION_ID));
-        if (manifest.isEmpty()) return false;
+        var rows = verifyClosure(session, manifest, control.getString(PREPARATION_ID));
         for (var input : manifest) {
-            var raw = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database)
-                    .find(session, new Document("_id", id(decodeInput(input).key()))).first();
+            var key = decodeInput(input).key();
+            var expectedId = id(key);
+            var raw = rows.get(key);
+            if (!reuseRows || !sameBsonId(expectedId, raw.get("_id", Document.class))) {
+                raw = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database)
+                        .find(session, new Document("_id", expectedId)).first();
+            }
             if (storedModel(raw).isPresent()) return true;
         }
         return false;
+    }
+
+    private static boolean sameBsonId(Document expected, Document actual) {
+        // Embedded IDs used by Mongo point lookups are sensitive to field order.
+        var codec = new DocumentCodec();
+        return new RawBsonDocument(expected, codec).getByteBuffer().asNIO()
+                .equals(new RawBsonDocument(actual, codec).getByteBuffer().asNIO());
     }
 
     @Override
@@ -603,6 +619,10 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
                         .on(access.database)
                         .find(session, new Document("_id", MongoWorkloadClaimStore.id(key)))
                         .first();
+        return requireClaimScope(claim);
+    }
+
+    private Document requireClaimScope(Document claim) {
         if (claim == null
                 || !MongoPipelinePreparationFacts.scope(access.scope)
                         .equals(claim.get("pipelineScope"))) throw rebuild(access.scope);

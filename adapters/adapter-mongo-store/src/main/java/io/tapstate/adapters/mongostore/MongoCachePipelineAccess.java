@@ -207,6 +207,16 @@ final class MongoCachePipelineAccess {
         return metadataTransaction(table, database, mutation, action);
     }
 
+    /** Returns the full prepared claim only to this retained startup snapshot. */
+    <T> T retainedStartRead(java.util.function.BiFunction<ClientSession, Document, T> action) {
+        T result = transaction(session -> {
+            stateRow(session);
+            return action.apply(session, requirePreparedClaim(session, true));
+        });
+        requireActive.run();
+        return result;
+    }
+
     /** One bounded publication batch keeps the original proof at the transaction's write boundaries. */
     <T> T publicationModelsTransaction(Function<ClientSession, T> action) {
         if (!unpreparedModels || authoringModels == null)
@@ -397,12 +407,13 @@ final class MongoCachePipelineAccess {
                 || !(state.get("stateJson") instanceof String) || !(state.get("touchMillis") instanceof Long)) throw unreadable("checkpoint");
     }
 
-    private void requirePreparedClaim(ClientSession session, boolean structureChecked) {
+    private Document requirePreparedClaim(ClientSession session, boolean structureChecked) {
         if (!structureChecked) MongoCacheWorkloadClaimStore.requireCollection(database);
         var key = new io.tapstate.spi.store.WorkloadClaimKey(scope.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION, scope.pipelineId());
         var table = SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database);
         Document row = table.find(session, new Document("_id", MongoWorkloadClaimStore.id(key))).first();
-        requirePreparedClaim(session,row);
+        requirePreparedClaim(session, row);
+        return row;
     }
     void requirePreparedClaim(ClientSession session,Document row){
         if (row == null) throw MongoCachePipelinePreparations.rebuild(scope);

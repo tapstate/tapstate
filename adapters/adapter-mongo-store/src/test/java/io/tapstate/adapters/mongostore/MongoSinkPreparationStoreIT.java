@@ -36,7 +36,8 @@ import static org.assertj.core.api.Assertions.*;
 class MongoSinkPreparationStoreIT {
     @Container private static final MongoDBContainer MONGO = ownedMongo();
     private static MongoDBContainer ownedMongo() {
-        var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"));String owner=System.getProperty("tapstate.e2e.resource-owner");
+        var mongo=new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
+                .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");String owner=System.getProperty("tapstate.e2e.resource-owner");
         if(owner!=null && !owner.isBlank())mongo.withLabel(System.getProperty("tapstate.e2e.resource-owner-label","io.tapstate.e2e.resource-owner"),owner)
                 .withTmpFs(Map.of("/data/db","rw,size=1g","/data/configdb","rw,size=16m"));return mongo;
     }
@@ -318,12 +319,12 @@ class MongoSinkPreparationStoreIT {
         withFixture(f -> {
             var inputs = authoring(f);
             var model = prepared(f, "orders", "STRING(100)");
-            var commands = new ArrayList<com.mongodb.event.CommandStartedEvent>();
+            var commands = new ArrayList<CommandCall>();
             var settings = com.mongodb.MongoClientSettings.builder()
                     .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
                     .addCommandListener(new com.mongodb.event.CommandListener() {
                         @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
-                            commands.add(event);
+                            commands.add(new CommandCall(event.getCommandName(), event.getCommand().clone()));
                         }
                     }).build();
             try (var client = MongoClients.create(settings)) {
@@ -331,26 +332,30 @@ class MongoSinkPreparationStoreIT {
                 var preparations = new MongoCachePipelinePreparations(client, database, f.business, ACTIVE);
                 var sinks = new MongoSinkPreparationStore(new MongoCachePipelineAccess(client, database, f.scope, f.fence, ACTIVE));
                 assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isFalse();
+                f.store().prepareTargets(List.of(model.input()));
+                assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isFalse();
                 f.store().prepareModels(List.of(model));
                 var before = f.snapshot();
                 commands.clear();
                 preparations.verifySources(f.scope, inputs);
                 assertThat(sinks.hasPreparedModels()).isTrue();
                 assertThat(commands).hasSize(15);
-                assertThat(commands.stream().filter(e -> e.getCommandName().equals("commitTransaction"))).hasSize(2);
+                assertThat(commands.stream().filter(e -> e.name().equals("commitTransaction"))).hasSize(2);
                 commands.clear();
                 assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isTrue();
-                assertThat(commands).hasSize(11);
-                assertThat(commands.stream().map(com.mongodb.event.CommandStartedEvent::getCommandName))
+                assertThat(commands).hasSize(8);
+                assertThat(commands.stream().map(CommandCall::name))
                         .containsExactly("aggregate", "find", "find", "find", "find", "find", "find",
-                                "find", "find", "find", "commitTransaction");
-                var transaction = commands.getFirst().getCommand();
+                                "commitTransaction");
+                assertThat(commands.stream().filter(e -> finds(e, "workload_claims"))).hasSize(1);
+                assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))).hasSize(1);
+                var transaction = commands.getFirst().command();
                 assertThat(commands).allSatisfy(event -> {
-                    assertThat(event.getCommand().get("lsid")).isEqualTo(transaction.get("lsid"));
-                    assertThat(event.getCommand().get("txnNumber")).isEqualTo(transaction.get("txnNumber"));
+                    assertThat(event.command().get("lsid")).isEqualTo(transaction.get("lsid"));
+                    assertThat(event.command().get("txnNumber")).isEqualTo(transaction.get("txnNumber"));
                 });
                 assertThat(f.snapshot()).isEqualTo(before);
-                System.out.println("Retained startup CACHE commands 15 -> 11; commits 2 -> 1");
+                System.out.println("Combined retained startup CACHE commands 11 -> 8; one commit");
 
                 var expanded = new PipelinePreparationInputs(inputs.pipelineHash(), inputs.sourceHashes(),
                         Map.of("input", Set.of("orders", "customers")), List.of());
@@ -361,8 +366,8 @@ class MongoSinkPreparationStoreIT {
                 assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, expanded, f.fence,
                         probeSink::incrementAndGet), IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED);
                 assertThat(probeSink).hasValue(0);
-                assertThat(commands).noneMatch(e -> e.getCommand().toString().contains("sink_preparations"));
-                assertThat(commands.getLast().getCommandName()).isEqualTo("abortTransaction");
+                assertThat(commands).noneMatch(e -> e.command().toString().contains("sink_preparations"));
+                assertThat(commands.getLast().name()).isEqualTo("abortTransaction");
 
                 orders.deleteOne(new Document("_id", savedOrder.get("_id")));
                 assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence,
@@ -391,6 +396,111 @@ class MongoSinkPreparationStoreIT {
                         IoError.CACHE_BUSINESS_FENCED);
             }
         });
+    }
+
+    @Test
+    void retainedStartupUsesTheOriginalPointLookupForANoncanonicalBsonId() {
+        withFixture(f -> {
+            var inputs = authoring(f);
+            var model = prepared(f, "orders", "STRING(100)");
+            var plain = prepared(f, "customers", "STRING(100)").input();
+            f.store().prepareTargets(List.of(plain, model.input()), List.of(model));
+            var modelId = MongoSinkPreparationStore.id(model.input().key());
+            var original = f.rows().find(new Document("_id", modelId)).first();
+            var reordered = new Document();
+            for (String part : new ArrayList<>(modelId.keySet()).reversed()) reordered.put(part, modelId.get(part));
+
+            var commands = new ArrayList<CommandCall>();
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) { commands.add(new CommandCall(event.getCommandName(), event.getCommand().clone())); }
+            };
+            try (var client = observe("retained-bson-order", listener)) {
+                var database = client.getDatabase(f.cache.getName());
+                var preparations = new MongoCachePipelinePreparations(client, database, f.business, ACTIVE);
+                var sinks = new MongoSinkPreparationStore(new MongoCachePipelineAccess(client, database, f.scope, f.fence, ACTIVE));
+                assertThat(sinks.hasPreparedModels()).isTrue();
+                commands.clear();
+                assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isTrue();
+                assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))).hasSize(1);
+
+                f.rows().deleteOne(new Document("_id", modelId));
+                f.rows().insertOne(new Document(original).append("_id", reordered));
+                assertThat(f.rows().find(new Document("_id", modelId)).first()).isNull();
+                Throwable previous = catchThrowable(sinks::hasPreparedModels);
+                assertThat(previous).isNotNull();
+                commands.clear();
+                assertThatThrownBy(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE))
+                        .isExactlyInstanceOf(previous.getClass());
+                assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))).hasSize(2);
+                assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))
+                        .map(e -> e.command().getDocument("filter")).toList().getLast()).containsKey("_id");
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void retainedStartupReadsTheClaimAgainOnARealTransactionRetry(boolean revokePass) {
+        withFixture(f -> {
+            var inputs = authoring(f);
+            f.store().prepareModels(List.of(prepared(f, "orders", "STRING(100)")));
+            var before = f.snapshot();
+            var commands = new ArrayList<CommandCall>();
+            var armed = new java.util.concurrent.atomic.AtomicBoolean();
+            var active = new java.util.concurrent.atomic.AtomicBoolean(true);
+            String appName = "retained-retry-" + UUID.randomUUID();
+            var admin = f.client.getDatabase("admin");
+            var listener = new com.mongodb.event.CommandListener() {
+                @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                    commands.add(new CommandCall(event.getCommandName(), event.getCommand().clone()));
+                    if (finds(commands.getLast(), "snapshot_orders") && armed.compareAndSet(false, true)) {
+                        admin.runCommand(new Document("configureFailPoint", "failCommand")
+                                .append("mode", new Document("times", 1))
+                                .append("data", new Document("failCommands", List.of("find"))
+                                        .append("appName", appName).append("errorCode", 112)
+                                        .append("errorLabels", List.of("TransientTransactionError"))));
+                    }
+                }
+                @Override public void commandFailed(com.mongodb.event.CommandFailedEvent event) {
+                    if (revokePass && armed.get() && event.getCommandName().equals("find")) active.set(false);
+                }
+            };
+            try (var client = observe(appName, listener)) {
+                var database = client.getDatabase(f.cache.getName());
+                var preparations = new MongoCachePipelinePreparations(client, database, f.business, ACTIVE);
+                Runnable requirePass = () -> { if (!active.get()) throw MongoCachePipelineAccess.claimFenced(); };
+                if (revokePass) {
+                    assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, requirePass),
+                            IoError.WORKLOAD_CLAIM_FENCED);
+                } else {
+                    assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, requirePass)).isTrue();
+                }
+                var claimReads = commands.stream().filter(e -> finds(e, "workload_claims")).toList();
+                assertThat(claimReads).hasSize(2);
+                assertThat(claimReads.getFirst().command().get("lsid")).isEqualTo(claimReads.getLast().command().get("lsid"));
+                assertThat(claimReads.getFirst().command().get("txnNumber"))
+                        .isNotEqualTo(claimReads.getLast().command().get("txnNumber"));
+                assertThat(commands.stream().filter(e -> finds(e, "sink_preparations"))).hasSize(revokePass ? 0 : 1);
+                assertThat(commands.stream().filter(e -> e.name().equals("commitTransaction")))
+                        .hasSize(revokePass ? 0 : 1);
+                assertThat(f.snapshot()).isEqualTo(before);
+            } finally {
+                admin.runCommand(new Document("configureFailPoint", "failCommand").append("mode", "off"));
+            }
+        });
+    }
+
+    private static MongoClient observe(String appName, com.mongodb.event.CommandListener listener) {
+        return MongoClients.create(com.mongodb.MongoClientSettings.builder()
+                .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                .applicationName(appName).addCommandListener(listener).build());
+    }
+
+    private record CommandCall(String name, org.bson.BsonDocument command) {}
+
+    private static boolean finds(CommandCall event, String collection) {
+        return event.name().equals("find") && event.command().get("find") instanceof org.bson.BsonString found
+                && found.getValue().equals(collection);
     }
 
     private static SinkPreparationStore.Prepared prepared(Fixture f,String target,String type) {

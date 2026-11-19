@@ -188,7 +188,8 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         requireScope(scope);
         var access = new MongoCachePipelineAccess(client, database, scope, null, requireActive);
         access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
-            verifyRetainedSources(session, scope, expected);
+            verifyRetainedSources(session, scope, expected,
+                    MongoPipelineSourcePreparations.retained(session, database, scope));
             return null;
         });
     }
@@ -204,12 +205,12 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         boolean[] checkingSink = {false};
         boolean prepared;
         try {
-            prepared = access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
+            prepared = access.retainedStartRead((session, claim) -> {
                 checkingSink[0] = false;
-                verifyRetainedSources(session, scope, expected);
+                verifyRetainedSources(session, scope, expected, MongoPipelineSourcePreparations.retained(claim, scope));
                 checkingSink[0] = true;
                 requireSinkActive.run();
-                boolean present = sinks.hasPreparedModels(session);
+                boolean present = sinks.hasPreparedModels(session, claim);
                 requireSinkActive.run();
                 return present;
             });
@@ -221,8 +222,8 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         return prepared;
     }
 
-    private void verifyRetainedSources(ClientSession session, PipelineIntentScope scope, PipelinePreparationInputs expected) {
-        var original = MongoPipelineSourcePreparations.retained(session, database, scope);
+    private void verifyRetainedSources(ClientSession session, PipelineIntentScope scope, PipelinePreparationInputs expected,
+            PipelinePreparationInputs original) {
         if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
         var added = new java.util.TreeSet<String>();
         expected.selectedTables().forEach((source, tables) -> tables.forEach(table -> {
