@@ -321,8 +321,6 @@ public final class StorageSetupService {
         if (java.util.stream.Stream.of(normalized.configuration(), normalized.cache(), normalized.master())
                 .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
             throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
-        if (mode == StorageBinding.Mode.CLOUD && (normalized.cache().kind() != StorageBinding.Connection.Kind.ATLAS
-                || normalized.master().kind() != StorageBinding.Connection.Kind.ATLAS)) throw conflict();
         ConnectorIdentity connector = target.identity(normalized.master());
         SourceResource source = (SourceResource) new DslParser().parse(new CanonicalWriter().write(
                 target.definition(normalized.master(), StorageBinding.defaultSourceId(mode))));
@@ -362,8 +360,6 @@ public final class StorageSetupService {
         if (java.util.stream.Stream.of(local.configuration(), local.cache(), local.master())
                 .map(StorageBinding.Connection::database).distinct().count() != Layer.values().length)
             throw new TapstateException(ControlError.STORAGE_DATABASES_OVERLAP, Map.of(), null);
-        if (mode == StorageBinding.Mode.CLOUD && (local.cache().kind() != StorageBinding.Connection.Kind.ATLAS
-                || local.master().kind() != StorageBinding.Connection.Kind.ATLAS)) throw conflict();
         return local;
     }
     private static String cacheHash(StorageBinding.Connection cache) {
