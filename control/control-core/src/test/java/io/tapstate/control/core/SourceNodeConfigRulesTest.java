@@ -34,6 +34,16 @@ class SourceNodeConfigRulesTest {
     }
 
     @Test
+    void cannotSetAnOverrideBeforeTheSourceAndItsSpecificationExist() {
+        Map<String, Object> overrides = Map.of("preImage", false);
+
+        assertThatThrownBy(() -> SourceNodeConfigRules.validate(null, overrides, id -> CONNECTOR))
+                .isInstanceOf(TapstateException.class).hasMessageContaining("require an existing Source");
+        assertThatThrownBy(() -> SourceNodeConfigRules.validate(SOURCE, overrides, id -> null))
+                .isInstanceOf(TapstateException.class).hasMessageContaining("specification is required");
+    }
+
+    @Test
     void rejectsConnectionFieldsAndWriteOnlyNodeFields() {
         assertThatThrownBy(() -> SourceNodeConfigRules.validate(SOURCE, Map.of("uri", "value"), id -> CONNECTOR))
                 .isInstanceOf(TapstateException.class)

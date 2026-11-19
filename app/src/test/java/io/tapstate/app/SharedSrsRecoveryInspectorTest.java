@@ -66,8 +66,9 @@ class SharedSrsRecoveryInspectorTest {
         when(consumers.inspectSharedRecovery(previous)).thenReturn(snapshot);
         inspector=new SharedSrsRecoveryInspector(configuration,cache,BUSINESS,() -> {});
     }
-    private PipelineResource pipeline(String id) {
-        return new PipelineResource(id,null,List.of(SourceRef.spec("input",true)),null,
+    private PipelineResource pipeline(String id) { return pipeline(id, Map.of()); }
+    private PipelineResource pipeline(String id, Map<String, Object> nodeConfig) {
+        return new PipelineResource(id,null,List.of(new SourceRef.Spec("input",true,nodeConfig)),null,
                 new ViewBlock.Inline("view-"+id,FromRef.literal("orders"),"id",null,WriteMode.UPSERT,OnFullLoad.APPEND),null,null,null);
     }
     private void desired(String id,PipelineState desired,boolean reassemble,Long epoch) {
@@ -111,6 +112,34 @@ class SharedSrsRecoveryInspectorTest {
         when(configuration.configurationRevision()).thenReturn(10L,11L);
         assertThatThrownBy(() -> inspector.inspect(selection)).isInstanceOf(TapstateException.class);verifyNoInteractionsExceptRead();
     }
+    @Test void sharedRecoveryRequiresEveryConsumerToRetainTheEffectiveNodeSettings() {
+        var localA = pipeline("a", Map.of("preImage", false));
+        var localB = pipeline("b", Map.of("preImage", false));
+        store.artifacts().saveAll(List.of(localA, localB));
+        String chain = PipelineSourceConfig.chain(localA, input);
+        var prepared = new CapturePreparation(BUSINESS, CapturePreparation.Mode.SHARED_SRS, chain,
+                SourceCaptureIdentity.sharedCapture(chain), PipelineSourceConfig.physical(localA, input), UUID.randomUUID().toString());
+        var members = snapshot.consumers().stream().map(member -> new SrsConsumerMembership(
+                new SrsConsumerContext(new SrsConsumerKey(chain, member.context().key().pipelineId(), "input"), 1),
+                member.revision(), false, member.tables(), member.commandFence())).toList();
+        var observed = new SharedSrsRecoverySnapshot(prepared, new WorkloadClaimFence(
+                new WorkloadClaimKey("cluster", WorkloadClaimType.CAPTURE, prepared.captureId()), OWNER, 1, 0, 1),
+                snapshot.controlHash(), members, snapshot.pipelines());
+        var selected = new StorageRecoveryCommands.Selection(StorageRecoveryCommands.Extent.SHARED_SRS, Set.of(), chain, chain);
+        var token = new RequiredNoteScope(new RequiredNoteOwner(1, "pdk.chain." + chain, RequiredNoteOwner.Kind.CHAIN, chain, 0), 1);
+        when(notes.open(token.owner())).thenReturn(token);
+        when(notes.origin(token)).thenReturn(ConnectorNoteOrigin.capture(input.connector(), "a".repeat(64), PipelineSourceConfig.settings(localA, input)));
+        when(captures.read(BUSINESS, prepared.captureId())).thenReturn(Optional.of(prepared));
+        when(consumers.inspectSharedRecovery(prepared)).thenReturn(observed);
+        var manifest = inspector.inspect(selected);
+        assertThat(manifest.affectedPipelineIds()).containsExactly("a", "b");
+        assertThat(manifest.definitionHashes()).containsEntry("input", CanonicalHash.of(input));
+        assertThat(input.config()).doesNotContainKey("preImage");
+        store.artifacts().save(pipeline("b", Map.of("preImage", true)));
+        assertThatThrownBy(() -> inspector.requireConfiguration(manifest)).isInstanceOf(TapstateException.class);
+        verifyNoInteractionsExceptRead();
+    }
+
     private void verifyNoInteractionsExceptRead() {
         verify(notes,never()).initialize(any());verify(notes,never()).prepareOrigin(any(),any());verify(captures,never()).issueFirstCreate(any());
     }

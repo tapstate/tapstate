@@ -45,6 +45,23 @@ class PipelineRepresentationTest {
     private final PipelineRepresentation representation = new PipelineRepresentation();
 
     @Test
+    void typedEditsPreserveAnOmittedOverrideAndClearAnExplicitEmptyMap() {
+        Map<String, Object> view = Map.of("from", "orders", "primaryKey", "id");
+        PipelineInput configured = new PipelineInput("p1", null,
+                List.of(Map.of("id", "crm", "nodeConfig", Map.of("preImage", false))),
+                null, view, null, null, null);
+        PipelineResource stored = representation.toModel(configured, null);
+        PipelineInput legacy = new PipelineInput("p1", null, List.of(Map.of("id", "crm")),
+                null, view, null, null, null);
+        PipelineInput inherit = new PipelineInput("p1", null,
+                List.of(Map.of("id", "crm", "nodeConfig", Map.of())), null, view, null, null, null);
+
+        assertThat(representation.toModel(legacy, stored).sources().getFirst().nodeConfig())
+                .containsExactlyEntriesOf(Map.of("preImage", false));
+        assertThat(representation.toModel(inherit, stored).sources()).containsExactly(SourceRef.bare("crm"));
+    }
+
+    @Test
     void mapsTheCompleteEditorPayloadToTheCanonicalPipelineModel() {
         Map<String, Object> mapFields = new LinkedHashMap<>();
         mapFields.put("removed", false);
