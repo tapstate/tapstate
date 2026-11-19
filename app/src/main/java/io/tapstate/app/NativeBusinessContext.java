@@ -70,11 +70,9 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
-        var resultStore = diagnosticCandidate == null ? port.connectionTestResults()
-                : isolatedConnectionTestResults(diagnosticCandidate);
-        if (diagnosticCandidate != null) {
-            beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
-        }
+        if (diagnosticCandidate != null && !diagnosticCandidate.matches(original.binding())) throw StorageRuntime.unavailable();
+        var resultStore = original.cache().diagnosticResults(original.preparation().businessScope(), original::requireBusiness);
+        beans.registerSingleton("activeConnectionDiagnostics", IsolatedConnectionDiagnostics.Active.INSTANCE);
         beans.registerSingleton("defaultSourceVerification", new DefaultSourceVerification(() -> {
             original.requireBusiness();
             var binding = configuration.bindings().load().orElseThrow(StorageRuntime::unavailable);
@@ -92,7 +90,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
                 || "connector.test-timeout".equals(item.connectorErrorCode()))),
         Duration.ofSeconds(60)));
         var overrides = new LinkedHashMap<String,Object>();
-        if (diagnosticCandidate != null) overrides.put("connectionTestResultStore", resultStore);
+        overrides.put("connectionTestResultStore", resultStore);
         overrides.put("tokenStore", configuration.tokens());
         overrides.put("aiProviderSettingsStore", configuration.aiProviderSettings());
         var providerClient = parent.getBeanProvider(AiProviderClient.class).getIfAvailable();
@@ -128,11 +126,6 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         original.requireBusiness(); active.set(true);
         context.getBean(NativeValidationScheduler.class).start();
 
-    }
-
-    private io.tapstate.spi.store.ConnectionTestResultStore isolatedConnectionTestResults(IsolatedConnectionDiagnostics candidate) {
-        if (!candidate.matches(original.binding())) throw StorageRuntime.unavailable();
-        return original.cache().isolatedDiagnosticResults(original.preparation().businessScope(), original::requireBusiness);
     }
 
     @Override public void afterInitialReady() {
