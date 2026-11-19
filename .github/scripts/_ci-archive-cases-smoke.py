@@ -385,6 +385,23 @@ def foreign_cloud_marker_controls(context):
              'source Cloud input metadata differs from archived plan')
 
 
+def fast_selection_controls():
+    whole = {'module': 'app', 'kind': 'it', 'class': 'sample.WholeIT'}
+    method = {'module': 'e2e', 'kind': 'it', 'class': 'sample.DummyIT', 'method': 'retained'}
+    example = {'module': 'e2e', 'kind': 'it', 'class': 'sample.PublishedExamplesIT',
+               'example': 'examples/sample/spec.e2e.yml'}
+    cases = [
+        dict(whole, **{'class': 'sample.WholeIT$Nested'}, method='nested', parameter=''),
+        dict(method, parameter=''),
+        dict(method, method='moved', parameter=''),
+        dict(example, method='run', parameter=example['example'] + ' on IN_PROCESS'),
+        dict(example, method='run', parameter=example['example'] + ' on REAL_PROCESS'),
+        dict(example, method='run', parameter='examples/moved/spec.e2e.yml on REAL_PROCESS'),
+    ]
+    check(m.selected_source_cases(cases, [whole, method, example]) == [cases[i] for i in (0, 1, 3, 4)],
+          'fast archive keeps exact classes, selected methods and both selected example tiers')
+
+
 if __name__ == '__main__':
     fixture.run(cloud_source_controls, source_case=fixture.CLOUD_SOURCE_CASE,
                 source_setup=fixture.cloud_source_setup, only_callback=True)
@@ -407,4 +424,5 @@ class SampleTest {
 ''', only_callback=True)
     published_controls()
     source_entry_controls()
+    fast_selection_controls()
     print('CI archive case total controls passed: ' + str(count))

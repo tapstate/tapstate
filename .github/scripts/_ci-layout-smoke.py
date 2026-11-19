@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
 HERE = Path(__file__).resolve().parent
@@ -192,7 +193,7 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
         rejected(lambda: s.balance([{'module': 'core', 'kind': 'unit', 'class': 'sample.CoreTest'}], 1,
                                   {'sample.CoreTest': value}), 'invalid duration scalar')
     workflow = (HERE.parent / 'workflows/ci.yml').read_text()
-    title = '      - name: Derive every test from the current reactor\n'
+    title = '      - name: Derive the test selection from the current reactor\n'
     check(workflow.count(title) == 1, 'the exercised workflow producer step is unique')
     step = workflow.split(title, 1)[1].split('\n      - ', 1)[0]
     block = step.split('        run: |\n', 1)[1]
@@ -203,16 +204,28 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
     producer.chmod(0o755)
     output = root / 'workflow-output'
     result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command], cwd=root,
-        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output)}, capture_output=True, text=True)
+        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output),
+             'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main'}, capture_output=True, text=True)
     check((root / 'matrix-called').is_file(), 'the actual workflow block executed the failing producer')
     check(result.returncode != 0 and not output.exists(), 'workflow must stop before publishing a failed matrix')
     expected = '{"include":[{"shard":"sample","prepare_cloud_inputs":false}]}'
     producer.write_text('#!/usr/bin/env bash\nset -e\n'
         'if [[ "$1" == "matrix" ]]; then printf \'%s\\n\' \'' + expected + '\'; exit 0; fi\n'
-        '[[ "$1" == "plan" ]]\n')
+        '[[ "$1" == "plan" ]]\n'
+        'printf "%s\\n" "$@" > "$RUNNER_TEMP/plan-args"\n')
+    for event, ref, expected_fast in (('pull_request', 'refs/pull/1/merge', True),
+                                     ('push', 'refs/heads/main', True),
+                                     ('push', 'refs/tags/v1.0.0', False),
+                                     ('workflow_dispatch', 'refs/heads/main', False)):
+        result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command], cwd=root,
+            env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output),
+                 'GITHUB_EVENT_NAME': event, 'GITHUB_REF': ref}, capture_output=True, text=True)
+        check(result.returncode == 0 and ('--fast' in (root / 'plan-args').read_text().splitlines()) == expected_fast,
+              'the workflow selects the proper suite for ' + event + ' ' + ref)
     output.write_text('prior=unchanged\n')
     result = subprocess.run(['bash', '--noprofile', '--norc', '-e', '-o', 'pipefail', '-c', command], cwd=root,
-        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output)}, capture_output=True, text=True)
+        env={**os.environ, 'RUNNER_TEMP': str(root), 'GITHUB_OUTPUT': str(output),
+             'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_REF': 'refs/heads/main'}, capture_output=True, text=True)
     check(result.returncode == 0 and output.read_text() == 'prior=unchanged\nmatrix=' + expected + '\n',
           'successful workflow publication preserves existing outputs and the exact matrix JSON')
 
@@ -250,3 +263,31 @@ with tempfile.TemporaryDirectory(prefix='ci-layout-controls-') as temporary:
         independent[('e2e', 'unit', 'sample.SelectorTest')] += 1
 
 print('CI source layout controls passed:', count)
+
+# The checked-in policy must be an exact projection of the current full reactor.
+repository = HERE.parents[1]
+full = s.discover(repository)
+fast = s.fast_tests(repository, full)
+check({s.class_key(t) for t in fast if t['kind'] == 'unit'}
+      == {s.class_key(t) for t in full if t['kind'] == 'unit'},
+      'each source unit test remains in the fast reactor')
+check({s.class_key(t) for t in fast} <= {s.class_key(t) for t in full},
+      'the full reactor includes every fast class')
+dummy = next(t for t in fast if t['class'].endswith('.RealDummyPipelineIT'))
+expected_method = ET.fromstring(f'<testcase name="{dummy["method"]}"/>')
+s.validate_smoke_reports([dummy], [expected_method])
+rejected(lambda: s.validate_smoke_reports([dummy], []), 'a reported Dummy suite without the smoke method')
+rejected(lambda: s.validate_smoke_reports([dummy], [expected_method, ET.Element('testcase', name='anotherTest')]),
+         'a report outside the selected Dummy method')
+selected_examples = [t for t in fast if 'example' in t]
+example_cases = []
+for test in selected_examples:
+    for tier in ('IN_PROCESS', 'REAL_PROCESS'):
+        case = ET.Element('testcase')
+        ET.SubElement(case, 'system-out').text = f'tapstate.published-case={test["example"]} on {tier}\n'
+        example_cases.append(case)
+s.validate_smoke_reports(selected_examples, example_cases)
+rejected(lambda: s.validate_smoke_reports(selected_examples, example_cases[:-1]), 'a missing published smoke tier')
+ET.SubElement(example_cases[-1], 'skipped')
+rejected(lambda: s.validate_smoke_reports(selected_examples, example_cases), 'a skipped published smoke tier')
+print('ci-fast smoke: all units, full ownership and exact smoke execution passed')
