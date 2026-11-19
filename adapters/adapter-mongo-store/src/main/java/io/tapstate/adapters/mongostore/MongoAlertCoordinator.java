@@ -110,15 +110,18 @@ final class MongoAlertCoordinator implements AlertStore {
             T result=action.apply(session);host.locallyActive().run();return result;
         }));
     }
-    private record HostReading(Document marker, Document version) {}
+    private record HostReading(Document marker, Document version, Boolean deliveryIntentsEmpty) {}
 
     private HostReading currentHost(ClientSession session,boolean write) {
+        return currentHost(session, write, false);
+    }
+    private HostReading currentHost(ClientSession session, boolean write, boolean includeDelivery) {
         if(!write){
-            host.locallyActive().run();var facts=bindings.admittedAlertHost(session);
+            host.locallyActive().run();var facts=bindings.admittedAlertHost(session, includeDelivery);
             if(facts!=null){
                 if(!MongoAlertHostIdentity.current(facts.setup(),host.setup(),facts.binding()))throw stale("host-installation");
                 if((facts.binding().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
-                return new HostReading(hostMarker(facts.schema(),facts.version(),domain.alertReadKeyId(facts.key())), facts.version());
+                return new HostReading(hostMarker(facts.schema(),facts.version(),domain.alertReadKeyId(facts.key())), facts.version(), facts.deliveryIntentsEmpty());
             }
         }
         host.locallyActive().run();var scope=host.setup();
@@ -129,7 +132,7 @@ final class MongoAlertCoordinator implements AlertStore {
         if(binding.isPresent()&&(binding.get().mode()==StorageBinding.Mode.OP)!=(host.deployment()==AlertChannelPolicy.Deployment.ON_PREM))throw stale("deployment");
         Document schema=SystemCollections.SCHEMA_MIGRATIONS.on(db).find(session,new Document("_id","config")).first();
         Document version=SystemCollections.CONFIGURATION_VERSION.on(db).find(session,new Document("_id",ConfigurationVersion.ID)).first();
-        return new HostReading(hostMarker(schema,version,write?keys.currentForWrite().activeKeyId():domain.alertReadKeyId(session)), version);
+        return new HostReading(hostMarker(schema,version,write?keys.currentForWrite().activeKeyId():domain.alertReadKeyId(session)), version, null);
     }
     private Document hostMarker(Document schema,Document version,String keyId){
         if(schema==null)throw unreadable("schema-capability");
@@ -414,17 +417,23 @@ final class MongoAlertCoordinator implements AlertStore {
 
     @Override public boolean deliveryIntentsEmpty() {
         // Any row retains the original scoped checks, even when its ID or format is unknown.
-        return poll((session, version) -> SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(session)
-                .hintString("_id_").projection(new Document("_id",1)).limit(1).first()==null);
+        return poll(true, (session, current) -> current.deliveryIntentsEmpty() != null
+                ? current.deliveryIntentsEmpty()
+                : SystemCollections.ALERT_DELIVERY_INTENTS.on(db).find(session)
+                        .hintString("_id_").projection(new Document("_id",1)).limit(1).first()==null);
     }
 
     private <T> T poll(java.util.function.BiFunction<ClientSession, Document, T> read) {
+        return poll(false, (session, current) -> read.apply(session, current.version()));
+    }
+
+    private <T> T poll(boolean includeDelivery, java.util.function.BiFunction<ClientSession, HostReading, T> read) {
         host.locallyActive().run();
         var verified = domain.currentAlertSchema();
         return domain.alertPollingRead(new MongoReadBudget(Duration.ofSeconds(10)), session -> {
-            var current = currentHost(session, false);
+            var current = currentHost(session, false, includeDelivery);
             domain.requireVerifiedAlertSchema(current.marker());
-            T value = read.apply(session, current.version());
+            T value = read.apply(session, current);
             domain.requireVerifiedAlertSchema(verified);
             host.locallyActive().run();
             return value;

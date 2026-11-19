@@ -279,7 +279,7 @@ final class MongoPipelineObservationRead {
 
     static Document boundedRow() { return boundedRow(ROW_BYTES); }
 
-    private static Document boundedRow(int maxBytes) {
+    static Document boundedRow(int maxBytes) {
         return new Document("$replaceWith", new Document("$cond", List.of(
                 new Document("$lte", List.of(new Document("$bsonSize", "$$ROOT"), maxBytes)), "$$ROOT",
                 new Document(OVERSIZED, true))));

@@ -74,25 +74,31 @@ final class MongoBindingReadFacts {
         return new Facts(cluster, stage, global, conflict, version);
     }
 
-    record AlertHost(Document identity,Document setup,Document binding,Document schema,Document version,Document recovery,Document key) { }
-    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database){
+    record AlertHost(Document identity,Document setup,Document binding,Document schema,Document version,Document recovery,Document key,
+            Boolean deliveryIntentsEmpty) { }
+    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database) {
+        return alertHost(session, database, false);
+    }
+    static AlertHost alertHost(ClientSession session,com.mongodb.client.MongoDatabase database, boolean includeDelivery) {
         var identity=SystemCollections.CONFIG_CLUSTER_IDENTITY.on(database);
         var setup=SystemCollections.STORAGE_SETUP.on(database);var binding=SystemCollections.STORAGE_BINDING.on(database);
         var schema=SystemCollections.SCHEMA_MIGRATIONS.on(database);var version=SystemCollections.CONFIGURATION_VERSION.on(database);
         var recovery=SystemCollections.STORAGE_RECOVERY.on(database);var key=SystemCollections.CLUSTER_KEYS.on(database);
-        var pipeline=List.of(new Document("$match",new Document("_id",SINGLETON_ID)),new Document("$limit",1),captured(),
+        var pipeline=new ArrayList<>(List.of(new Document("$match",new Document("_id",SINGLETON_ID)),new Document("$limit",1),captured(),
                 probe(setup,"setup",2,captured()),probe(binding,"binding",2,captured()),
                 probe(schema,"schema",2,captured()),probe(version,"version",2,captured()),
-                probe(recovery,"recovery",2,captured()),probe(key,"key",2,captured()));
+                probe(recovery,"recovery",2,captured()),probe(key,"key",2,captured())));
+        if (includeDelivery) pipeline.add(probe(SystemCollections.ALERT_DELIVERY_INTENTS.on(database), "delivery", 1, presence()));
         var row=identity.aggregate(session,pipeline).first();
-        if(row==null)return new AlertHost(null,null,null,null,null,null,null);
+        if(row==null)return new AlertHost(null,null,null,null,null,null,null,null);
         return new AlertHost(unpack(session,row,identity,SINGLETON_ID),
                 singleton(session,row.getList("setup",Document.class),setup,SINGLETON_ID),
                 singleton(session,row.getList("binding",Document.class),binding,SINGLETON_ID),
                 singleton(session,row.getList("schema",Document.class),schema,"config"),
                 singleton(session,row.getList("version",Document.class),version,ConfigurationVersion.ID),
                 unambiguous(row.getList("recovery",Document.class),"cluster"),
-                singleton(session,row.getList("key",Document.class),key,SINGLETON_ID));
+                singleton(session,row.getList("key",Document.class),key,SINGLETON_ID),
+                includeDelivery ? row.getList("delivery", Document.class).isEmpty() : null);
     }
 
     private static Document probe(MongoCollection<Document> table, String field, int limit, Document projection) {

@@ -20,6 +20,36 @@ import static org.assertj.core.api.Assertions.*;
 
 @RequiresDocker
 class MongoAlertCoordinatorIT {
+    @Test void deliveryEmptyPollUsesTheSameHostAggregateAndSeesTheNextIntent() {
+        withStore(f -> {
+            bindForPolling(f);
+            var commands = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+            try { assertThat(f.store.deliveryIntentsEmpty()).isTrue(); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(commands).containsOnlyOnce("aggregate:cluster_identity")
+                    .doesNotContain("find:alert_delivery_intents");
+            var id = new Document("unknown", "future-intent");
+            SystemCollections.ALERT_DELIVERY_INTENTS.on(f.db).insertOne(new Document("_id", id).append("formatVersion", 999));
+            assertThat(f.store.deliveryIntentsEmpty()).isFalse();
+        });
+    }
+
+    @Test void deliveryEmptyPollRetainsTheLegacyHostAndQueueReads() {
+        withStore(f -> {
+            bindForPolling(f);
+            try (var topology = org.mockito.Mockito.mockStatic(MongoBindingReadFacts.class, org.mockito.Mockito.CALLS_REAL_METHODS)) {
+                topology.when(() -> MongoBindingReadFacts.supported(org.mockito.ArgumentMatchers.any(com.mongodb.client.MongoClient.class)))
+                        .thenReturn(false);
+                var commands = new ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> commands.add(command + ":" + collection));
+                try { assertThat(f.store.deliveryIntentsEmpty()).isTrue(); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(commands).contains("find:alert_delivery_intents");
+            }
+        });
+    }
+
     @Test void aLegacyNodeReadStillRequiresTheLivePersistentKey(){
         withStore(f->{
             bindForPolling(f);var nodes=f.domain.alertNodeLifecycles(SCOPE,f.host.setup(),()->{});

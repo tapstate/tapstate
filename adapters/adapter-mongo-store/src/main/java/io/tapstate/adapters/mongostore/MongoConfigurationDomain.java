@@ -166,9 +166,13 @@ public final class MongoConfigurationDomain implements AutoCloseable {
         return alertSchemaVersion(new MongoReadBudget(java.time.Duration.ofSeconds(5)));
     }
     int alertSchemaVersion(MongoReadBudget budget) {
+        return alertSchemaReader().load(budget);
+    }
+
+    private MongoAlertStorageSchema alertSchemaReader() {
         requireOpen();
         return new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).load(budget);
+                configurationKey.current().activeKeyId(), this::requireOpen, configurationKey::requireCurrent);
     }
 
     private synchronized void startAlertSchemaVerification() {
@@ -187,8 +191,7 @@ public final class MongoConfigurationDomain implements AutoCloseable {
 
     private void verifyAlertSchema() {
         var budget = new MongoReadBudget(java.time.Duration.ofSeconds(5));
-        Document marker = new MongoAlertStorageSchema(connection.client(), connection.database(), clusterId,
-                configurationKey.refresh(budget).activeKeyId(), this::requireOpen).loadVerifiedMarker(budget);
+        Document marker = alertSchemaReader().loadVerifiedMarker(budget);
         if (marker == null || marker.getInteger("installedVersion") != MongoAlertStorageSchema.VERSION)
             throw unreadable("alert-store", "schema-capability");
         verifiedAlertSchema = new VerifiedAlertSchema(marker, System.nanoTime());

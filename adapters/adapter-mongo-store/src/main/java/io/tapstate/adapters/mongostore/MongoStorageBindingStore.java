@@ -451,10 +451,14 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         }
     }
 
-    record AlertHostFacts(Document setup,StorageBinding binding,Document schema,Document version,Document key) { }
-    AlertHostFacts admittedAlertHost(ClientSession session){
+    record AlertHostFacts(Document setup,StorageBinding binding,Document schema,Document version,Document key,
+            Boolean deliveryIntentsEmpty) { }
+    AlertHostFacts admittedAlertHost(ClientSession session) {
+        return admittedAlertHost(session, false);
+    }
+    AlertHostFacts admittedAlertHost(ClientSession session, boolean includeDelivery) {
         if(!MongoBindingReadFacts.supported(client))return null;
-        var facts=MongoBindingReadFacts.alertHost(session,database);var cluster=facts.identity();
+        var facts=MongoBindingReadFacts.alertHost(session,database,includeDelivery);var cluster=facts.identity();
         requireClusterIdentity(cluster);long version=cluster.getLong(BINDING_VERSION);
         // An unbound installation retains its full original admission checks.
         if(version==0)return null;
@@ -462,7 +466,7 @@ public final class MongoStorageBindingStore implements StorageBindingStore {
         var bound = decodeBound(facts.binding(), cluster.getString("clusterId"), version, facts.setup(), generation);
         if (facts.recovery() == null) MongoStorageRecoveryStore.read(session, database, bound, facts.setup());
         else MongoStorageRecoveryStore.read(facts.recovery(), bound.setup(), bound.mode(), version, facts::setup);
-        return new AlertHostFacts(facts.setup(), bound, facts.schema(), facts.version(), facts.key());
+        return new AlertHostFacts(facts.setup(), bound, facts.schema(), facts.version(), facts.key(), facts.deliveryIntentsEmpty());
     }
 
     boolean belongsTo(MongoClient expectedClient, String expectedDatabase) {

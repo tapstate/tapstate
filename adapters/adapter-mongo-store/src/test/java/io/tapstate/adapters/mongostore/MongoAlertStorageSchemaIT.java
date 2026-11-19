@@ -74,6 +74,22 @@ class MongoAlertStorageSchemaIT {
         });
     }
 
+    @Test void schemaVerificationChecksKeyMaterialAndBindingFromOneRead() {
+        withConfiguration(false, fixture -> {
+            var calls = new ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((command, collection) -> calls.add(command + ":" + collection));
+            try { assertThat(fixture.domain().alertSchemaVersion()).isEqualTo(MongoAlertStorageSchema.VERSION); }
+            finally { MongoCommandObservation.COLLECTIONS.remove(); }
+            assertThat(calls).containsOnlyOnce("find:cluster_keys");
+
+            var keys = SystemCollections.CLUSTER_KEYS.on(fixture.database());
+            keys.updateOne(new Document("_id", "cluster"), new Document("$set", new Document("material", "bad-token")));
+            assertThatThrownBy(() -> fixture.domain().alertSchemaVersion())
+                    .isInstanceOfSatisfying(TapstateException.class,
+                            invalid -> assertThat(invalid.code()).isEqualTo(StoreError.SOURCE_CONFIG_KEYRING_INVALID));
+        });
+    }
+
     @Test void firstInstallationPublishesTheWholeFeatureWithoutChangingTheGlobalConfigVersion() {
         withConfiguration(false, fixture -> {
             assertThat(fixture.domain().schemaVersion()).isEqualTo(2);

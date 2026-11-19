@@ -27,6 +27,9 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
     private final MongoClaimOperations claimOperations;
     private final MongoStructureProof structures = new MongoStructureProof();
     private final MongoSrsControlProofs srsControlProofs = new MongoSrsControlProofs();
+    private volatile boolean srsControlSnapshotCollations;
+    private volatile boolean srsControlReadinessCollations;
+    private volatile boolean srsReclaimReferenceCollations;
     private final Duration rateRetention;
     private final io.tapstate.spi.store.OperatorDatabaseBinding operatorDatabases;
     private final String targetFingerprint;
@@ -461,12 +464,39 @@ public final class MongoCacheDomain implements io.tapstate.spi.store.PipelineSto
             };
         }
         var lease = MongoSrsLease.selected(verifyStructure);
-        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease);
+        java.util.function.BooleanSupplier batchSrsRelations = reuseStructure ? this::canBatchSrsControlSnapshot : () -> false;
+        var models = new MongoSrsModelStore(client, database, expected, active, verifyStructure, lease, batchSrsRelations,
+                reuseStructure ? this::canBatchSrsControlReadiness : () -> false,
+                reuseStructure ? this::canBatchSrsReclaimReferences : () -> false);
         return new io.tapstate.spi.store.SrsStores(
                 new MongoSrsChainStore(client, database, expected, active, verifyStructure, lease,srsControlProofs), models,
                 new MongoSrsLogStore(client, SystemCollections.SRS_EVENTS.on(database), SystemCollections.SRS_LOG_BOUNDS.on(database),
                         SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database), models, lease),
-                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(verifyStructure), runtime,srsControlProofs));
+                new MongoSrsConsumerStore(client, database, expected, active, verifyStructure, MongoSrsLease.selected(verifyStructure),
+                        runtime, srsControlProofs, batchSrsRelations,
+                        reuseStructure ? this::canBatchSrsControlReadiness : () -> false));
+    }
+
+    private boolean canBatchSrsControlSnapshot() {
+        if (!MongoReadBudget.supportsSnapshotReads(client)) return false;
+        structures.require(MongoStructureProof.Kind.SRS_CONTROL_SNAPSHOT, () ->
+                srsControlSnapshotCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.SRS_CHAINS, SystemCollections.SRS_CONSUMERS, SystemCollections.CACHE_SRS_CONSUMER_OFFSETS)));
+        return srsControlSnapshotCollations;
+    }
+
+    private boolean canBatchSrsControlReadiness() {
+        structures.require(MongoStructureProof.Kind.SRS_CONTROL_READINESS, () ->
+                srsControlReadinessCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.CACHE_IDENTITY, SystemCollections.CACHE_SCHEMA_MIGRATIONS)));
+        return srsControlReadinessCollations;
+    }
+
+    private boolean canBatchSrsReclaimReferences() {
+        structures.require(MongoStructureProof.Kind.SRS_RECLAIM_REFERENCES, () ->
+                srsReclaimReferenceCollations = MongoCacheMetadataStructure.simpleCollations(database, List.of(
+                        SystemCollections.SRS_MODELS, SystemCollections.SRS_MODEL_CONTEXTS, SystemCollections.SRS_LOG_BOUNDS)));
+        return srsReclaimReferenceCollations;
     }
 
     @Override public io.tapstate.spi.store.SnapshotStateStore snapshotStates(io.tapstate.spi.store.PipelineIntentScope scope,

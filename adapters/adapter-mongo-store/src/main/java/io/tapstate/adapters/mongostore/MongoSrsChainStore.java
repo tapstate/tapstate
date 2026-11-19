@@ -15,6 +15,7 @@ import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsCaptureCheckpoint;
 import io.tapstate.spi.store.SrsChainState;
 import io.tapstate.spi.store.SrsChainStore;
+import io.tapstate.spi.store.SrsModelKey;
 import io.tapstate.spi.store.SrsTableCheckpoint;
 import io.tapstate.spi.store.WorkloadClaimFence;
 import io.tapstate.spi.store.WorkloadClaimType;
@@ -24,6 +25,8 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -225,11 +228,11 @@ public final class MongoSrsChainStore implements SrsChainStore {
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
                                     WorkloadClaimFence fence, boolean writing) {
-        validateCheckpoint(session, root, checkpoint, fence, writing, false);
+        validateCheckpoint(session, root, checkpoint, fence, writing, false, null, false);
     }
 
     private void validateCheckpoint(ClientSession session, Document root, SrsCaptureCheckpoint checkpoint,
-                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked) {
+                                    WorkloadClaimFence fence, boolean writing, boolean businessChecked, Set<SrsModelKey> provedForPins, boolean batchReferences) {
         String chain = root.getString("_id");
         for (var at : checkpoint.tables().values()) {
             var key = at.model();
@@ -237,8 +240,13 @@ public final class MongoSrsChainStore implements SrsChainStore {
                     || key.captureEpoch() != checkpoint.position().order().epoch()) throw unproven(chain);
         }
         var keys = checkpoint.tables().values().stream().map(SrsTableCheckpoint::model).collect(java.util.stream.Collectors.toSet());
-        var current = models.currentReferences(session, root, keys, businessChecked);
-        var boundsByRing = current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
+        Map<String, io.tapstate.spi.store.SrsLogBounds> collected = batchReferences ? new HashMap<>() : Map.of();
+        var current = batchReferences ? models.currentReferences(session, root, keys, businessChecked, collected) : Optional.<Map<SrsModelKey, MongoSrsModelStore.ModelReference>>empty();
+        if (current.isEmpty()) {
+            if (batchReferences) collected.clear();
+            current = models.currentReferences(session, root, keys, businessChecked);
+        }
+        var boundsByRing = !collected.isEmpty() ? collected : current.isEmpty() ? Map.<String, io.tapstate.spi.store.SrsLogBounds>of()
                 : log.boundsForProvenRings(session, current.orElseThrow().values().stream().map(reference -> reference.model().ringName())
                         .collect(java.util.stream.Collectors.toSet()));
         for (var entry : checkpoint.tables().entrySet()) {
@@ -255,6 +263,8 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 if (at.sequence() >= range.firstSequence() && (event.epoch() != key.captureEpoch() || event.schemaVer() != key.modelVersion()
                         || !reference.fence().equals(event.captureFence()))) throw unproven(chain);
             }
+            // A pin requires a persisted bounds row, even when a checkpoint can use empty bounds.
+            if (provedForPins != null && boundsByRing.containsKey(ring)) provedForPins.add(key);
         }
     }
     static String controlFingerprint(Document row){
@@ -292,8 +302,21 @@ public final class MongoSrsChainStore implements SrsChainStore {
     }
 
     SrsChainState state(ClientSession session, Document row, boolean businessChecked) {
+        return state(session, row, businessChecked, null, false);
+    }
+
+    record ReclaimState(SrsChainState state, Set<SrsModelKey> checkpointModels) {}
+
+    ReclaimState stateForReclaim(ClientSession session, Document row, boolean batchReferences) {
+        var models = new HashSet<SrsModelKey>();
+        var state = state(session, row, true, models, batchReferences);
+        return new ReclaimState(state, Set.copyOf(models));
+    }
+
+    private SrsChainState state(ClientSession session, Document row, boolean businessChecked, Set<SrsModelKey> provedForPins, boolean batchReferences) {
         SrsChainState state = decode(row);
-        if (state.checkpoint() != null) validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked);
+        if (state.checkpoint() != null)
+            validateCheckpoint(session, row, state.checkpoint(), null, false, businessChecked, provedForPins, batchReferences);
         if (state.pendingFreshFull() != null)
             models.requireSnapshotReferences(session, Set.copyOf(state.pendingFreshFull().models().values()));
         return state;

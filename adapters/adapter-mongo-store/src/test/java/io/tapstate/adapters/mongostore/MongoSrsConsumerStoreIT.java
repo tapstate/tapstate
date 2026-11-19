@@ -7,8 +7,10 @@ import io.tapstate.core.common.TapstateException;
 import io.tapstate.spi.store.CacheBusinessScope;
 import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.SrsConsumerContext;
+import io.tapstate.spi.store.SrsConsumerMembership;
 import io.tapstate.spi.store.SrsConsumerRun;
 import io.tapstate.spi.store.SrsSnapshotPin;
+import io.tapstate.spi.store.StorageBinding;
 import io.tapstate.spi.store.SrsModel;
 import io.tapstate.spi.store.SrsModelKey;
 import io.tapstate.spi.store.SrsLogRecord;
@@ -71,7 +73,7 @@ class MongoSrsConsumerStoreIT {
         });
     }
     @org.junit.jupiter.params.ParameterizedTest
-    @org.junit.jupiter.params.provider.ValueSource(strings={"fence","logical","orphan","pin-chain","pin-cache","bad-fence","scope"})
+    @org.junit.jupiter.params.provider.ValueSource(strings={"fence","logical","orphan","pin-chain","pin-cache","bad-fence","scope","schema-mismatch","schema-missing"})
     void sharedControlProofsKeepCurrentRowsAndFullClosure(String change){
         withBusiness(f->{
             SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id","cluster"),new Document("$set",new Document("claimAdmissionFence",0L)));
@@ -92,6 +94,9 @@ class MongoSrsConsumerStoreIT {
                 var commands=new java.util.ArrayList<String>();MongoCommandObservation.COLLECTIONS.set((command,collection)->commands.add(command+":"+collection));
                 try{assertThat(current.controlSnapshot(CHAIN)).contains(expected);}finally{MongoCommandObservation.COLLECTIONS.remove();}
                 assertThat(commands).doesNotContain("find:srs_models","find:srs_model_contexts","find:srs_log_bounds");
+                assertThat(commands).containsOnlyOnce("aggregate:cache_identity")
+                        .doesNotContain("find:cache_identity", "find:schema_migrations",
+                                "find:srs_chains", "find:srs_consumers", "find:srs_consumer_offsets");
                 assertThatThrownBy(()->first.controlSnapshot(CHAIN)).isInstanceOf(TapstateException.class);
                 current.controlSnapshot(CHAIN).orElseThrow();
                 if(change.equals("fence")){
@@ -109,6 +114,16 @@ class MongoSrsConsumerStoreIT {
                     SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).insertOne(new Document(row).append("_id",id));
                 }else if(change.equals("bad-fence"))SystemCollections.SRS_CHAINS.on(db).updateOne(new Document("_id",CHAIN),new Document("$set",new Document("modelWriteFence","invalid")));
                 else if(change.equals("scope"))SystemCollections.CACHE_IDENTITY.on(db).updateOne(new Document("_id","cluster"),new Document("$set",new Document("cacheIncarnation","foreign-cache")));
+                else if (change.equals("schema-mismatch") || change.equals("schema-missing")) {
+                    var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(db);
+                    var id = new Document("_id", "business");
+                    if (change.equals("schema-mismatch"))
+                        schema.updateOne(id, new Document("$set", new Document("operationId", "unrelated")));
+                    else
+                        schema.deleteOne(id);
+                    assertThatThrownBy(() -> current.controlSnapshot(CHAIN)).satisfies(error -> code(error, IoError.DOCUMENT_UNREADABLE));
+                    return;
+                }
                 else{
                     var records=new MongoSrsConsumerRecords(SCOPE);var row=SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(db).find().first();
                     var member=records.membership(SystemCollections.SRS_CONSUMERS.on(db).find().first());var held=records.cursor(member,row);
@@ -140,6 +155,94 @@ class MongoSrsConsumerStoreIT {
             var oversized=new io.tapstate.spi.store.SrsConsumerMembership(a.context(),a.revision(),false,large,a.commandFence());
             SystemCollections.SRS_CONSUMERS.on(f.database()).replaceOne(id(A),new MongoSrsConsumerRecords(SCOPE).membership(oversized));
             assertThatThrownBy(()->f.consumers().attached(original,"orders")).isInstanceOf(TapstateException.class).hasMessageContaining("validation.controlMetadata");
+        });
+    }
+
+    @ParameterizedTest
+    @org.junit.jupiter.params.provider.CsvSource({"2500,true", "9000,false"})
+    void controlSnapshotBatchesNormalCursorTokensAndFallsBackForOversizedRows(int tokenBytes, boolean batched) {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var refs = publishSnapshotModels(f, tables);
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            var pin = new SrsSnapshotPin(1, "t".repeat(tokenBytes), refs);
+            assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, pin, f.fenceA())).isTrue();
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var database = f.database().getName();
+            var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl(database), database, null);
+            try (var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "control-snapshot-cursor")) {
+                var reader = domain.runtimeSrs(SCOPE, () -> {}).consumers();
+                var expected = reader.controlSnapshot(CHAIN).orElseThrow();
+                assertThat(expected.cursors().getFirst().cdcStartPosition()).isEqualTo(pin.sourcePosition());
+                var reads = new java.util.ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> reads.add(command + ":" + collection));
+                try { assertThat(reader.controlSnapshot(CHAIN)).contains(expected); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(reads).containsOnlyOnce("aggregate:cache_identity");
+                if (batched) assertThat(reads).doesNotContain("find:cache_identity", "find:schema_migrations",
+                        "find:srs_chains", "find:srs_consumers", "find:srs_consumer_offsets");
+                else assertThat(reads).contains("find:cache_identity", "find:schema_migrations",
+                        "find:srs_chains", "find:srs_consumers", "find:srs_consumer_offsets");
+            }
+        });
+    }
+
+    @Test void batchedRetentionSnapshotNeverMixesAConcurrentAttachWithTheOldEpoch() {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var refs = publishSnapshotModels(f, tables);
+            f.chains().requestTables(CHAIN, tables, f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, tables, f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "before"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)));
+            assertThat(f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence())).isPresent();
+            f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                    new Document("$set", new Document("claimAdmissionFence", 0L)));
+            var database = f.database().getName();
+            var binding = new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                    MONGO.getReplicaSetUrl(database), database, null);
+            try (var domain = MongoCacheDomain.connect(binding, Duration.ofSeconds(5), "control-snapshot-attach");
+                    var worker = Executors.newSingleThreadExecutor()) {
+                var reader = domain.runtimeSrs(SCOPE, () -> {}).consumers();
+                var reading = new CountDownLatch(1);
+                var release = new CountDownLatch(1);
+                var original = worker.submit(() -> {
+                    var snapshotStarted = new java.util.concurrent.atomic.AtomicBoolean();
+                    MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                        if ("aggregate".equals(command) && "cache_identity".equals(collection)) snapshotStarted.set(true);
+                        // This validation read follows the aggregate that fixed the original snapshot.
+                        if (!"find".equals(command) || !"srs_chains".equals(collection)
+                                || !snapshotStarted.compareAndSet(true, false)) return;
+                        reading.countDown();
+                        try {
+                            if (!release.await(15, TimeUnit.SECONDS)) throw new AssertionError("the attachment did not finish");
+                        } catch (InterruptedException interrupted) {
+                            Thread.currentThread().interrupt();
+                            throw new AssertionError(interrupted);
+                        }
+                    });
+                    try { return reader.retentionSnapshot(CHAIN).orElseThrow(); }
+                    finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                });
+                try {
+                    assertThat(reading.await(10, TimeUnit.SECONDS)).isTrue();
+                    f.consumers().attach(B, 0, tables, f.fenceB()).orElseThrow();
+                    assertThat(f.chains().openEpoch(CHAIN, 1, f.captureFence())).hasValue(2);
+                    assertThat(f.chains().publishServingTables(CHAIN, 2, tables, f.captureFence())).isTrue();
+                } finally { release.countDown(); }
+
+                var before = original.get(20, TimeUnit.SECONDS);
+                assertThat(before.chain().epoch()).isOne();
+                assertThat(before.consumers()).extracting(c -> c.membership().context()).containsExactly(A);
+                var after = reader.retentionSnapshot(CHAIN).orElseThrow();
+                assertThat(after.chain().epoch()).isEqualTo(2);
+                assertThat(after.consumers()).extracting(c -> c.membership().context()).containsExactlyInAnyOrder(A, B);
+            }
         });
     }
 
@@ -417,6 +520,41 @@ class MongoSrsConsumerStoreIT {
                 assertThat(reads.get()).as("one progress read must not reopen the same snapshot proof for every table").isLessThanOrEqualTo(14);
             }
         });
+    }
+
+    @Test void reclaimReadsSharedCheckpointAndPinnedBoundsOnce() {
+        withBusiness(f -> {
+            pinCurrentCheckpointModels(f, Set.of("orders", "items"));
+            try (var witness = new MongoCommandWitness(MONGO.getReplicaSetUrl(), f.database().getName(), "find", "srs_log_bounds")) {
+                var observed = new MongoSrsModelStore(witness.client, witness.database, SCOPE);
+                assertThat(observed.reclaim(CHAIN, f.captureFence())).isZero();
+                assertThat(witness.confirmedCommands()).isEqualTo(1);
+            }
+        });
+    }
+
+    @Test void reclaimStillValidatesPinnedModelsOutsideTheCheckpoint() {
+        withBusiness(f -> {
+            pinCurrentCheckpointModels(f, Set.of("orders", "items", "quiet"));
+            SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteOne(new Document("_id", MongoSrsLogStore.boundsId(ring("quiet"))));
+
+            assertThatThrownBy(() -> models(f).reclaim(CHAIN, f.captureFence()))
+                    .isInstanceOfSatisfying(TapstateException.class, failure ->
+                            assertThat(failure.code()).isEqualTo(IoError.SRS_MODEL_UNAVAILABLE));
+        });
+    }
+
+    private static void pinCurrentCheckpointModels(Fixture f, Set<String> tables) {
+        var keys = publishSnapshotModels(f, tables);
+        var checkpointTables = Set.of("orders", "items");
+        f.chains().requestTables(CHAIN, checkpointTables, f.captureFence());
+        assertThat(f.chains().publishServingTables(CHAIN, 1, checkpointTables, f.captureFence())).isTrue();
+        var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "seam"),
+                Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(keys.get("orders"), -1),
+                        "items", new io.tapstate.spi.store.SrsTableCheckpoint(keys.get("items"), -1)));
+        assertThat(f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence())).isPresent();
+        var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+        assertThat(f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "seam", keys), f.fenceA())).isTrue();
     }
 
     @Test void anAttachedSnapshotKeepsItsClosedModelContextUntilItsOwnDetach() {
@@ -1914,6 +2052,229 @@ class MongoSrsConsumerStoreIT {
     private static io.tapstate.spi.store.SourcePositionEdits.Logged positionMove(Fixture f, String token, WorkloadClaimFence capture) {
         return new io.tapstate.spi.store.SourcePositionEdits.Logged(f.chains().load(CHAIN).orElseThrow(),
                 Map.of(A, f.consumers().progress(A).orElseThrow(), B, f.consumers().progress(B).orElseThrow()), token, capture);
+    }
+
+    @Test void runtimeReclaimCombinesCurrentModelsContextsAndBoundsInItsTransaction() {
+        withBusiness(f -> {
+            pinCurrentCheckpointModels(f, Set.of("orders", "items"));
+            try (var domain = openRuntimeReclaim(f)) {
+                var models = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var calls = new java.util.ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> calls.add(command + ":" + collection));
+                try { assertThat(models.reclaim(CHAIN, f.captureFence())).isZero(); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(calls).containsOnlyOnce("aggregate:srs_models")
+                        .doesNotContain("find:srs_models", "find:srs_log_bounds");
+                assertThat(calls.stream().filter("find:srs_model_contexts"::equals).count()).isOne();
+                assertThat(calls.indexOf("update:workload_claims")).isLessThan(calls.indexOf("aggregate:srs_models"));
+            }
+        });
+    }
+
+    @Test void runtimeReclaimKeepsUnreadableDiagnosisForAMalformedModelRingName() {
+        withBusiness(f -> {
+            pinCurrentCheckpointModels(f, Set.of("orders", "items"));
+            try (var domain = openRuntimeReclaim(f)) {
+                var models = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var stored = SystemCollections.SRS_MODELS.on(f.database());
+                var id = MongoSrsModelStore.key(new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 1, 0));
+                var row = stored.find(new Document("_id", id)).first();
+                row.put("ringName", new Document("invalid", true));
+                row.remove("contentHash");
+                row.put("contentHash", io.tapstate.core.model.canonical.CanonicalHash.ofText(row.toJson()));
+                stored.replaceOne(new Document("_id", id), row);
+                assertThatThrownBy(() -> models.reclaim(CHAIN, f.captureFence())).satisfies(error -> code(error, IoError.DOCUMENT_UNREADABLE));
+            }
+        });
+    }
+
+    @Test void runtimeReclaimRejectsMissingBoundsAfterCombinedReferenceFallback() {
+        withBusiness(f -> {
+            pinCurrentCheckpointModels(f, Set.of("orders", "items"));
+            try (var domain = openRuntimeReclaim(f)) {
+                var models = domain.runtimeSrs(SCOPE, () -> {}).models();
+                SystemCollections.SRS_LOG_BOUNDS.on(f.database()).deleteOne(
+                        new Document("_id", MongoSrsLogStore.boundsId(ring("orders"))));
+                assertThatThrownBy(() -> models.reclaim(CHAIN, f.captureFence())).isInstanceOf(TapstateException.class);
+            }
+        });
+    }
+
+    @Test void runtimeReclaimReadsReadinessOnceBeforeTakingItsCaptureClaim() {
+        withBusiness(f -> {
+            var original = publishSnapshotModels(f, Set.of("orders")).get("orders");
+            var newer = publishReclaimSuccessor(f);
+            try (var domain = openRuntimeReclaim(f)) {
+                var models = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var calls = new java.util.ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> calls.add(command + ":" + collection));
+                try { assertThat(models.reclaim(CHAIN, f.captureFence())).isOne(); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(calls).containsOnlyOnce("aggregate:cache_identity")
+                        .doesNotContain("find:cache_identity", "find:schema_migrations");
+                assertThat(calls.indexOf("aggregate:cache_identity")).isLessThan(calls.indexOf("update:workload_claims"));
+                assertThat(reclaimStored(f, original)).isFalse();
+                assertThat(reclaimStored(f, newer)).isTrue();
+            }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"identity", "schema-missing", "schema-mismatch"})
+    void runtimeReclaimStillRejectsInvalidReadinessBeforeItsClaim(String fault) {
+        withBusiness(f -> {
+            var original = publishSnapshotModels(f, Set.of("orders")).get("orders");
+            publishReclaimSuccessor(f);
+            try (var domain = openRuntimeReclaim(f)) {
+                var models = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var schema = SystemCollections.CACHE_SCHEMA_MIGRATIONS.on(f.database());
+                if (fault.equals("identity"))
+                    SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                            new Document("$set", new Document("cacheIncarnation", "foreign")));
+                else if (fault.equals("schema-missing"))
+                    schema.deleteOne(new Document("_id", "business"));
+                else
+                    schema.updateOne(new Document("_id", "business"), new Document("$set", new Document("operationId", "foreign")));
+                var calls = new java.util.ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> calls.add(command + ":" + collection));
+                try {
+                    assertThatThrownBy(() -> models.reclaim(CHAIN, f.captureFence())).isInstanceOf(TapstateException.class);
+                } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(calls).doesNotContain("update:workload_claims", "delete:srs_models");
+                assertThat(reclaimStored(f, original)).isTrue();
+            }
+        });
+    }
+
+    @Test void runtimeReclaimUsesOneRelationReadAndDeletesTheReleasedModel() {
+        withBusiness(f -> {
+            var old = publishSnapshotModels(f, Set.of("orders")).get("orders");
+            var newer = publishReclaimSuccessor(f);
+            try (var domain = openRuntimeReclaim(f)) {
+                var reclaim = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var reads = new java.util.ArrayList<String>();
+                MongoCommandObservation.COLLECTIONS.set((command, collection) -> reads.add(command + ":" + collection));
+                try { assertThat(reclaim.reclaim(CHAIN, f.captureFence())).isOne(); }
+                finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                assertThat(reads).containsOnlyOnce("aggregate:srs_chains")
+                        .doesNotContain("find:srs_consumers", "find:srs_consumer_offsets");
+                assertThat(reclaimStored(f, old)).isFalse();
+                assertThat(reclaimStored(f, newer)).isTrue();
+            }
+        });
+    }
+
+    @Test void runtimeReclaimRetriesAfterAttachAndPreservesTheNewlyPinnedModel() {
+        withBusiness(f -> {
+            var tables = Set.of("orders");
+            var old = publishSnapshotModels(f, tables);
+            var newer = publishReclaimSuccessor(f);
+            f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            try (var domain = openRuntimeReclaim(f); var worker = Executors.newSingleThreadExecutor()) {
+                var reclaim = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var reading = new CountDownLatch(1);
+                var resume = new CountDownLatch(1);
+                var relationReads = new java.util.concurrent.atomic.AtomicInteger();
+                var result = worker.submit(() -> {
+                    MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                        if ("aggregate".equals(command) && "srs_chains".equals(collection)
+                                && relationReads.incrementAndGet() == 1) {
+                            reading.countDown();
+                            awaitReclaimBarrier(resume);
+                        }
+                    });
+                    try { return reclaim.reclaim(CHAIN, f.captureFence()); }
+                    finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                });
+                SrsConsumerMembership member;
+                try {
+                    assertThat(reading.await(10, TimeUnit.SECONDS)).isTrue();
+                    member = f.consumers().attach(B, 0, tables, f.fenceB()).orElseThrow();
+                    assertThat(f.consumers().pinSnapshot(B, member.revision(), 0,
+                            new SrsSnapshotPin(1, "pinned-during-reclaim", old), f.fenceB())).isTrue();
+                } finally { resume.countDown(); }
+
+                assertThat(result.get(20, TimeUnit.SECONDS)).isZero();
+                assertThat(relationReads.get()).isGreaterThanOrEqualTo(2);
+                assertThat(reclaimStored(f, old.get("orders"))).isTrue();
+                assertThat(f.consumers().detach(B, member.revision(), f.fenceB())).isPresent();
+                assertThat(reclaim.reclaim(CHAIN, f.captureFence())).isOne();
+                assertThat(reclaimStored(f, old.get("orders"))).isFalse();
+                assertThat(reclaimStored(f, newer)).isTrue();
+            }
+        });
+    }
+
+    @Test void runtimeReclaimReadsRelationsOnlyAfterReacquiringCaptureClaimAcrossEpochChange() {
+        withBusiness(f -> {
+            var original = publishSnapshotModels(f, Set.of("orders")).get("orders");
+            try (var domain = openRuntimeReclaim(f); var workers = Executors.newFixedThreadPool(2)) {
+                var reclaim = domain.runtimeSrs(SCOPE, () -> {}).models();
+                var switching = new CountDownLatch(1);
+                var commit = new CountDownLatch(1);
+                var beforeClaim = new CountDownLatch(1);
+                var order = new java.util.concurrent.CopyOnWriteArrayList<String>();
+                var epoch = workers.submit(() -> {
+                    MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                        if (!"commitTransaction".equals(command)) return;
+                        switching.countDown();
+                        awaitReclaimBarrier(commit);
+                    });
+                    try { return f.chains().openEpoch(CHAIN, 1, f.captureFence()); }
+                    finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                });
+                try {
+                    assertThat(switching.await(10, TimeUnit.SECONDS)).isTrue();
+                    var cleanup = workers.submit(() -> {
+                        MongoCommandObservation.COLLECTIONS.set((command, collection) -> {
+                            if ("update".equals(command) && "workload_claims".equals(collection)) {
+                                order.add("claim");
+                                beforeClaim.countDown();
+                            }
+                            if ("aggregate".equals(command) && "srs_chains".equals(collection)) order.add("relations");
+                        });
+                        try { return reclaim.reclaim(CHAIN, f.captureFence()); }
+                        finally { MongoCommandObservation.COLLECTIONS.remove(); }
+                    });
+                    assertThat(beforeClaim.await(10, TimeUnit.SECONDS)).isTrue();
+                    commit.countDown();
+                    assertThat(epoch.get(20, TimeUnit.SECONDS)).hasValue(2);
+                    assertThat(cleanup.get(20, TimeUnit.SECONDS)).isZero();
+                    assertThat(order).startsWith("claim", "claim").endsWith("relations");
+                    assertThat(f.chains().load(CHAIN).orElseThrow().epoch()).isEqualTo(2);
+                    assertThat(reclaimStored(f, original)).isTrue();
+                } finally { commit.countDown(); }
+            }
+        });
+    }
+
+    private static void awaitReclaimBarrier(CountDownLatch signal) {
+        try {
+            if (!signal.await(15, TimeUnit.SECONDS)) throw new AssertionError("reclaim barrier timed out");
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
+    private static MongoCacheDomain openRuntimeReclaim(Fixture f) {
+        SystemCollections.CACHE_IDENTITY.on(f.database()).updateOne(new Document("_id", "cluster"),
+                new Document("$set", new Document("claimAdmissionFence", 0L)));
+        var db = f.database().getName();
+        return MongoCacheDomain.connect(new StorageBinding.Connection(StorageBinding.Connection.Kind.MONGODB,
+                MONGO.getReplicaSetUrl(db), db, null), Duration.ofSeconds(5), "runtime-reclaim-relations");
+    }
+
+    private static SrsModelKey publishReclaimSuccessor(Fixture f) {
+        assertThat(f.chains().openEpoch(CHAIN, 1, f.captureFence())).hasValue(2);
+        var next = new SrsModelKey(CHAIN, "orders", SCOPE.cacheIncarnation(), 2, 0);
+        models(f).publishInitial(next, ring("orders"),
+                new SourceTable("orders", List.of(new SourceField("id", "int")), List.of(), List.of()), f.captureFence());
+        return next;
+    }
+
+    private static boolean reclaimStored(Fixture f, SrsModelKey model) {
+        return SystemCollections.SRS_MODELS.on(f.database()).find(new Document("_id", MongoSrsModelStore.key(model))).first() != null;
     }
 
     private static void withBusiness(Scenario scenario) {

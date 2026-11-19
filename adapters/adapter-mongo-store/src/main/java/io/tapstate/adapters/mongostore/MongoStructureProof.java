@@ -6,7 +6,7 @@ import java.util.function.LongSupplier;
 
 /** Physical metadata only; live identity, claim and transaction fences are never cached here. */
 final class MongoStructureProof {
-    enum Kind { SRS, SRS_RUNTIME, CLAIMS, PIPELINE_STATE, CHECKPOINT_READ, OBSERVATION, UNPREPARED_VALIDATION }
+    enum Kind { SRS, SRS_RUNTIME, SRS_CONTROL_SNAPSHOT, SRS_CONTROL_READINESS, SRS_RECLAIM_REFERENCES, CLAIMS, PIPELINE_STATE, CHECKPOINT_READ, OBSERVATION, UNPREPARED_VALIDATION }
     interface Check extends Runnable { void invalidate(); long remainingNanos(); }
     private final EnumMap<Kind,Long> verified=new EnumMap<>(Kind.class);
     private final LongSupplier nanos;

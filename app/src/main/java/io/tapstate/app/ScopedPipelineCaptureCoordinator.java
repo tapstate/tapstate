@@ -1358,19 +1358,36 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void ensureTail(Owner owner) { ensureTail(owner, false); }
 
     private ConfiguredCaptureRun ensureTail(Owner owner, boolean admitted) {
+        return ensureTail(owner, tailStores(owner), admitted, null);
+    }
+
+    private SrsStores tailStores(Owner owner) {
         if(owner.drainingReports())throw new RingNotOpenYet(new CaptureId(owner.prepared.captureId()));
         owner.require();if(owner.config==null || owner.origin==null)throw refused();
         if(owner.controlStores==null)owner.controlStores=stores.sources().srs(stores.scope(),owner::require);
-        var current=owner.controlStores;
+        return owner.controlStores;
+    }
+
+    private ConfiguredCaptureRun ensureTail(Owner owner, SrsStores current, boolean admitted,
+            SrsConsumerStore.RetentionSnapshot snapshot) {
         String chainId = owner.prepared.chainId();
-        var consumers=current.consumers();
-        var attached = admitted ? consumers.attachedWithChain(chainId) : consumers.supportsControlSnapshot()
-                ? consumers.controlSnapshot(chainId).map(value->new SrsConsumerStore.AttachedChain(value.topology(),value.chain()))
-                        .orElseThrow(ScopedPipelineCaptureCoordinator::refused) : null;
-        var topology = attached==null?consumers.attached(chainId):attached.topology();
-        var requested=new TreeSet<String>();topology.consumers().forEach(member -> requested.addAll(member.tables()));
-        if(requested.isEmpty())return null;
-        var before = attached==null?current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused):attached.chain();
+        var consumers = current.consumers();
+        var requested = new TreeSet<String>();
+        SrsChainState before;
+        if (snapshot != null) {
+            snapshot.consumers().forEach(consumer -> requested.addAll(consumer.membership().tables()));
+            if (requested.isEmpty()) return null;
+            before = snapshot.chain();
+        } else {
+            var attached = admitted ? consumers.attachedWithChain(chainId) : consumers.supportsControlSnapshot()
+                    ? consumers.controlSnapshot(chainId).map(value->new SrsConsumerStore.AttachedChain(value.topology(),value.chain()))
+                            .orElseThrow(ScopedPipelineCaptureCoordinator::refused) : null;
+            var topology = attached == null ? consumers.attached(chainId) : attached.topology();
+            topology.consumers().forEach(member -> requested.addAll(member.tables()));
+            if (requested.isEmpty()) return null;
+            before = attached == null ? current.chains().load(chainId).orElseThrow(ScopedPipelineCaptureCoordinator::refused)
+                    : attached.chain();
+        }
         if(owner.physical!=null && !owner.physical.live.get())throw refused();
         if(owner.physical!=null && before.servingTables().containsAll(requested))return null;
         var configured=owner.configured;
@@ -1500,7 +1517,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                     if(needed(owner))continue;
                     owner.ended.set(true);owner.release();owners.remove(owner.prepared.captureId(),owner);continue;
                 }
-                ensureTail(owner);retain(owner);
+                maintainTail(owner);
             }
             catch(RuntimeException|Error failure) {
                 // The loss callback is waiting for this monitor to detach the old shared owner.
@@ -1519,9 +1536,19 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             }catch(RuntimeException|Error failure){session.failure.compareAndSet(null,failure);}
         }
     }
-    private void retain(Owner owner) {
-        try { runtime.retain(stores.scope(),owner.prepared.chainId(),owner.fence,owner::require); }
-        catch (TapstateException unavailable) {
+    private void maintainTail(Owner owner) {
+        var current = tailStores(owner);
+        String chainId = owner.prepared.chainId();
+        var snapshot = current.consumers().retentionSnapshot(chainId).orElse(null);
+        var original = owner.physical;
+        ensureTail(owner, current, false, snapshot);
+        try {
+            // An epoch change replaces the physical tail. Read retention floors again for the new epoch.
+            if (snapshot != null && owner.physical == original)
+                runtime.retain(stores.scope(), chainId, owner.fence, owner::require, snapshot);
+            else
+                runtime.retain(stores.scope(), chainId, owner.fence, owner::require);
+        } catch (TapstateException unavailable) {
             if (unavailable.code()!=IoError.STORE_UNAVAILABLE) throw unavailable;
             // Cleanup can retry from current confirmed floors; capture and ownership failures remain fatal.
             owner.require();

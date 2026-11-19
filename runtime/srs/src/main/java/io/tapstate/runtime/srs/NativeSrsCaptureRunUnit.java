@@ -102,9 +102,15 @@ public final class NativeSrsCaptureRunUnit implements AutoCloseable {
 
     /** A tail proposes only its subscribers' confirmed prefix; CACHE rechecks all references atomically. */
     public void retain(CacheBusinessScope scope,String chainId,WorkloadClaimFence originalCapture,Runnable requireActive) {
+        retain(scope, chainId, originalCapture, requireActive, null);
+    }
+
+    /** Uses a planning snapshot from the same maintenance pass. Trim still checks current progress. */
+    public void retain(CacheBusinessScope scope, String chainId, WorkloadClaimFence originalCapture, Runnable requireActive,
+            SrsConsumerStore.RetentionSnapshot planned) {
         Runnable fixed=guard(requireActive);fixed.run();var stores=views.srs(scope,fixed);
         var floors = new TreeMap<String, Long>();
-        var snapshot = stores.consumers().retentionSnapshot(chainId);
+        var snapshot = planned == null ? stores.consumers().retentionSnapshot(chainId) : Optional.of(planned);
         if (snapshot.isPresent()) {
             var retained = snapshot.orElseThrow();
             for (var consumer : retained.consumers()) {
