@@ -150,6 +150,10 @@ final class SecretTrackingArtifactStore implements ArtifactStore {
         return trackedInventory(() -> delegate.draftPublicationInventory(candidate));
     }
 
+    @Override public Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
+        return trackedInventory(() -> delegate.runtimeStartInventory(pipelineId));
+    }
+
     @Override public Optional<ReadableInventory> startPlanningInventory(PipelineResource candidate) {
         return trackedInventory(() -> delegate.startPlanningInventory(candidate));
     }

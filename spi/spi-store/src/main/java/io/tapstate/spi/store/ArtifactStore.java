@@ -54,6 +54,11 @@ public interface ArtifactStore {
         return new ReadableInventory(listReadable(), Optional.empty());
     }
 
+    /** One background start's authored Pipeline, dependencies and managed binding in the same snapshot. */
+    default Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
+        return Optional.empty();
+    }
+
     /** A complete draft dependency slice, including the original target if it exists. */
     default Optional<ReadableInventory> draftPublicationInventory(io.tapstate.core.model.PipelineResource candidate) {
         return Optional.empty();

@@ -13,6 +13,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.junit.jupiter.api.Test;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
@@ -56,5 +57,13 @@ class NativeRetainedSelectionGuardTest {
         verify(preparer,never()).prepare(any(PipelineIntentScope.class),any(PipelinePreparationInputs.class));
         verify(summaries,never()).read(anyString());
         verifyNoInteractions(engine,captures,connectors,store);
+
+        doNothing().when(preparer).verifyRetainedSources(scope, expected);
+        when(captures.retainedPlanningModels(pass, snapshot, models)).thenReturn(models);
+        var inspection = recovery.inspectCaptured(pass, snapshot, models);
+        assertThat(inspection.models()).isSameAs(models);
+        assertThat(inspection.connectorHashes()).isEmpty();
+        verify(summaries, times(1)).read("flow");
+        verify(captures).retainedPlanningModels(pass, snapshot, models);
     }
 }

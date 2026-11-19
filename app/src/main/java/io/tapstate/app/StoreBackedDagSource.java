@@ -142,11 +142,9 @@ final class StoreBackedDagSource implements DagSource {
     private static final String LOCAL_MEMBER = "local";
     private final ParallelismBudget parallelismBudget;
     interface CapturedStartGuard {
-        Map<String,String> inspect(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models);
-        default SourceModelSnapshot planningModels(PipelineConvergencePass pass,ReadOnlyArtifactSnapshot artifacts,SourceModelSnapshot models) {
-            return models;
-        }
-        CapturedStartGuard NONE=(pass,artifacts,models) -> Map.of();
+        record Inspection(Map<String, String> connectorHashes, SourceModelSnapshot models) {}
+        Inspection inspect(PipelineConvergencePass pass, ReadOnlyArtifactSnapshot artifacts, SourceModelSnapshot models);
+        CapturedStartGuard NONE = (pass, artifacts, models) -> new Inspection(Map.of(), models);
     }
     private final CapturedStartGuard capturedStartGuard;
     private final java.util.function.BiFunction<ExecutionFence,Map<String,Long>,SinkAckFactory> boundedLoads;
@@ -233,7 +231,7 @@ final class StoreBackedDagSource implements DagSource {
         Objects.requireNonNull(pass, "pass");
         String pipelineId = pass.scope().pipelineId();
         pass.requirePipeline(pipelineId);
-        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.capture(artifacts());
+        ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.captureForStart(artifacts(), pipelineId);
         PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
         if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
             throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
@@ -251,8 +249,10 @@ final class StoreBackedDagSource implements DagSource {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
         SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
-        Map<String,String> confirmedHashes=pass==null?Map.of():capturedStartGuard.inspect(pass,snapshot,models);
-        if(pass!=null)models=capturedStartGuard.planningModels(pass,snapshot,models);
+        var inspection = pass == null
+                ? new CapturedStartGuard.Inspection(Map.of(), models)
+                : capturedStartGuard.inspect(pass, snapshot, models);
+        models = inspection.models();
         StoreBackedDagSource captured = new StoreBackedDagSource(
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
                 requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
@@ -266,7 +266,7 @@ final class StoreBackedDagSource implements DagSource {
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
                 () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
-                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),confirmedHashes);
+                Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),inspection.connectorHashes());
     }
 
     private record PreparedOperators(OperatorCoordinatePlan coordinates,Map<String,NestTable> tables,

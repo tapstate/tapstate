@@ -118,7 +118,6 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var scope = pass.scope();
         pass.requirePipeline(scope.pipelineId());
         if (!business(scope).equals(stores.scope())) throw refused();
-        if (stores.recoveryPinned().test(scope)) return discovered;
         var preparations =
                 stores.pipelines()
                         .sinkPreparations(

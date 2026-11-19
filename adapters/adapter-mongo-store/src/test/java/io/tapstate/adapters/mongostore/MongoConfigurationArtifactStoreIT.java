@@ -84,6 +84,52 @@ class MongoConfigurationArtifactStoreIT {
     }
 
     @Test
+    void runtimeStartReadsOnlyItsDependenciesAndBindingInOneSnapshot() {
+        withBound((domain, database) -> {
+            var input = source("src", "input-secret");
+            var target = source("target", "target-secret");
+            var flow = PARSER.parse("""
+                    version: tapstate/v1
+                    kind: pipeline
+                    id: flow
+                    source: src
+                    serve: {from: src.orders, sync: [{id: output, source: target}]}
+                    """);
+            var unrelated = definition("view", "unrelated");
+            domain.artifacts().saveAll(List.of(input, target, flow, unrelated));
+            var key = SystemCollections.CLUSTER_KEYS.on(database).find().first().getString("material");
+            var commands = new java.util.ArrayList<String>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event.getCommandName());
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                var store = new MongoConfigurationArtifactStore(client, client.getDatabase(database.getName()),
+                        new SourceConfigCipher(Base64.getUrlDecoder().decode(key)));
+                assertThat(store.list()).contains(flow, input, target, unrelated);
+                assertThat(store.managedDefaultSourceId()).contains("views");
+                int previous = commands.size();
+                commands.clear();
+                var captured = store.runtimeStartInventory("flow").orElseThrow();
+                assertThat(captured.managedDefaultSourceId()).contains("views");
+                assertThat(captured.resources()).containsExactlyInAnyOrder(flow, input, target);
+                assertThat(commands.stream().filter("commitTransaction"::equals)).hasSize(1);
+                assertThat(commands).hasSize(previous - 4).doesNotContain("listCollections", "listIndexes");
+                System.out.printf("Runtime CONFIG snapshot Mongo commands %d -> %d%n", previous, commands.size());
+
+                var serve = PARSER.parse("version: tapstate/v1\nkind: serve\nid: reusable\nsync: [{id: output, source: target}]\n");
+                var referenced = servedPipeline("referenced");
+                domain.artifacts().saveAll(List.of(serve, referenced));
+                assertThat(store.runtimeStartInventory("referenced").orElseThrow().resources())
+                        .containsExactlyInAnyOrder(referenced, input, target, serve);
+            }
+        });
+    }
+
+    @Test
     void staleDefinitionDependenciesRejectTheWholeMixedConfigurationBatch() {
         withStore((store, database) -> {
             Resource original = definition("view", "reusable");

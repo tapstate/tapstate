@@ -594,6 +594,51 @@ public final class MongoConfigurationArtifactStore implements ArtifactStore {
         return readableInventory().resources();
     }
 
+    @Override public Optional<ReadableInventory> runtimeStartInventory(String pipelineId) {
+        Objects.requireNonNull(pipelineId, "pipelineId");
+        return readSnapshot(session -> {
+            var row = find(session, pipelineId, Set.of("pipeline"));
+            if (row == null || !pipelineId.equals(row.getString("_id"))) return Optional.empty();
+            var pipeline = (PipelineResource) decode(row);
+            var binding = bindings.loadForTransaction(session).map(io.tapstate.spi.store.StorageBinding::defaultSourceId);
+            if (binding.isEmpty() && pipeline.view() != null) return Optional.empty();
+
+            var references = new LinkedHashMap<String, Resource>();
+            references.put(pipelineId, pipeline);
+            var pending = new java.util.ArrayDeque<Resource>();
+            pending.add(pipeline);
+            while (!pending.isEmpty()) {
+                var requested = new LinkedHashMap<String, Set<String>>();
+                for (var edge : io.tapstate.core.dsl.ReferenceGraph.declaredReferences(pending.removeFirst())) {
+                    var found = references.get(edge.id());
+                    if (found != null && !found.kind().equals(edge.kind())) return Optional.empty();
+                    if (found == null) requested.computeIfAbsent(edge.kind(), ignored -> new java.util.LinkedHashSet<>()).add(edge.id());
+                }
+                // The managed target can be used implicitly by an inline or referenced view.
+                if (pipeline.view() != null && binding.isPresent() && !references.containsKey(binding.orElseThrow())) {
+                    requested.computeIfAbsent("source", ignored -> new java.util.LinkedHashSet<>()).add(binding.orElseThrow());
+                }
+                for (var entry : requested.entrySet()) {
+                    var remaining = entry.getValue();
+                    try (var cursor = collection(entry.getKey())
+                            .find(session, new Document("_id", new Document("$in", List.copyOf(remaining)))).iterator()) {
+                        while (cursor.hasNext()) {
+                            var found = cursor.next();
+                            requireKind(found, entry.getKey());
+                            if (!remaining.remove(found.getString("_id"))) return Optional.empty();
+                            var decoded = decode(found);
+                            if (references.putIfAbsent(decoded.id(), decoded) != null) return Optional.empty();
+                            if (decoded instanceof io.tapstate.core.model.ServeResource) pending.add(decoded);
+                        }
+                    }
+                    if (!remaining.isEmpty()) return Optional.empty();
+                }
+            }
+            return Optional.of(new ReadableInventory(List.copyOf(references.values()), Optional.empty(), binding,
+                    references.keySet()));
+        });
+    }
+
     @Override public Optional<ReadableInventory> draftPublicationInventory(PipelineResource candidate) {
         return definitionInventory(candidate, true);
     }
