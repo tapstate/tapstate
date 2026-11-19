@@ -7,91 +7,94 @@ permissions:
   contents: read
 
 jobs:
-  map-nest-control:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: candidate
-            revision: 4f23665a4f1bc4ac6bb07af8c7ed2c192caf9ee2
+  calibration-plan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 24
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ matrix.revision }}
+          ref: 6e66ffaa7ad85ee45653f80012b4e08bda177c8f
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.13+9.0.LTS'
+      - name: Allocate the candidate qualification batches
+        run: |
+          cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
+          {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"mixed.snapshot.double-map.standard": 230, "copy.live.basic.standard": 240, "copy.backlog.fixed-iud.standard": 245, "union.live.basic.standard": 290, "nest.snapshot.fanout.wide": 530}}
+          JSON
+          python3 -B benchmarks/runner.py allocate --id mixed.snapshot.double-map.standard --id copy.live.basic.standard --id copy.backlog.fixed-iud.standard --id union.live.basic.standard --id nest.snapshot.fanout.wide --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 2 --batch-seconds 1200 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-qualification-manifest
+          path: |
+            ${{ runner.temp }}/manifest.json
+            ${{ runner.temp }}/estimates.json
+          if-no-files-found: error
+
+  calibration:
+    needs: calibration-plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        batch: [0, 1]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 6e66ffaa7ad85ee45653f80012b4e08bda177c8f
           persist-credentials: false
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21.0.13+9.0.LTS'
           cache: maven
-      - name: Prepare locked inputs and the matching OP build
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-qualification-manifest
+          path: ${{ runner.temp }}/manifest
+      - name: Verify the connector inputs and capture the environment
         run: |
-          out="$RUNNER_TEMP/control"
-          mkdir -p "$out"
-          docker info > "$out/docker-info.txt"
-          docker pull mongo:7.0
-          docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$out/mongo-image.json"
+          mkdir -p "$RUNNER_TEMP/calibration"
+          {
+            uname -a
+            lscpu
+            free -m
+            java -version
+            mvn -version
+            docker version
+            git rev-parse HEAD
+            cp deploy/cloud/connectors.lock.json "$RUNNER_TEMP/calibration/"
+          } > "$RUNNER_TEMP/calibration/environment.txt" 2>&1
           python3 -B deploy/cloud/prepare-test-inputs.py --mongodb-only --with-dummy --output "$RUNNER_TEMP/connectors"
+          docker pull mongo:7.0
+          docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
+      - name: Build the matching OP candidate
+        run: |
           for attempt in 1 2 3; do
-            if mvn -B -pl e2e -am -DskipTests package > "$out/build-$attempt.log" 2>&1; then
-              sha256sum app/target/app-0.8.0-boot.jar "$RUNNER_TEMP/connectors/"*.jar > "$out/artifacts.sha256"
+            if mvn -B -pl app,cli,e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build-$attempt.log" 2>&1; then
+              sha256sum app/target/app-0.8.0-boot.jar cli/target/cli-0.8.0.jar "$RUNNER_TEMP/connectors/"*.jar > "$RUNNER_TEMP/calibration/artifacts.sha256"
               exit 0
             fi
-            tail -60 "$out/build-$attempt.log"
-            if ! grep -q 'HTTP Status: 429' "$out/build-$attempt.log"; then
+            tail -60 "$RUNNER_TEMP/calibration/build-$attempt.log"
+            if ! grep -q 'HTTP Status: 429' "$RUNNER_TEMP/calibration/build-$attempt.log"; then
               exit 1
             fi
             sleep "$((20 * attempt))"
           done
           exit 1
-      - name: Record terminal target inventory independently of the oracle
+      - name: Validate the catalog, selection and report
+        run: python3 -B -m unittest discover -s benchmarks/src/test
+      - name: Replay the assigned batch
         run: |
-          python3 - <<'PYTHON'
-          from pathlib import Path
-          path = Path("e2e/src/test/java/io/tapstate/e2e/BenchmarkRunIT.java")
-          source = path.read_text()
-          needle = """        String difference = BenchmarkOperatorOracle.difference(operators, target, expected);
-                  if (difference != null) {"""
-          insert = """        String difference = BenchmarkOperatorOracle.difference(operators, target, expected);
-                  if (operators.scenario.equals("mixed-map-nest")) {
-                      var rows = new ArrayList<Map<String, Object>>();
-                      for (var table : operators.targets()) {
-                          var collection = target.getCollection(table, BsonDocument.class);
-                          var keys = collection.listIndexes(BsonDocument.class).into(new ArrayList<>()).stream()
-                                  .map(index -> index.getDocument("key").toJson()).toList();
-                          for (var row : collection.find()) {
-                              var children = row.getArray("children").stream()
-                                      .map(child -> child.asDocument().getNumber("_id").longValue()).toList();
-                              rows.add(Map.of("table", table, "indexes", keys, "stored_id", row.get("_id").toString(),
-                                      "root", row.getNumber("root_key").longValue(), "children", children));
-                          }
-                      }
-                      evidence.result.put("terminal_target_inventory", rows);
-                  }
-                  if (difference != null) {"""
-          # Keep the original readback and failure. Record only the bounded fixture's identities.
-          needle = needle.replace("\n                  ", "\n        ")
-          insert = insert.replace("\n                  ", "\n        ")
-          assert source.count(needle) == 1
-          path.write_text(source.replace(needle, insert))
-          PYTHON
-          git diff -- e2e/src/test/java/io/tapstate/e2e/BenchmarkRunIT.java > "$RUNNER_TEMP/control/instrumentation.diff"
-      - name: Compare the snapshot composition at both input sizes
-        run: |
-          status=0
-          for rows in 96 128; do
-            python3 -B benchmarks/runner.py run --id mixed.snapshot.map-nest.standard \
-              --repeats 3 --rows "$rows" --rate 8 --measurement-seconds 6 --timeout-seconds 95 \
-              --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/control/rows-$rows" || status=1
-          done
-          exit "$status"
+          python3 -B benchmarks/runner.py run --manifest "$RUNNER_TEMP/manifest/manifest.json" --batch ${{ matrix.batch }} --connectors "$RUNNER_TEMP/connectors" --output "$RUNNER_TEMP/calibration/run"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: map-nest-terminal-inventory-${{ matrix.label }}
+          name: candidate-qualification-batch-${{ matrix.batch }}
           path: |
-            ${{ runner.temp }}/control/
-            !${{ runner.temp }}/control/**/runtime-input/**
+            ${{ runner.temp }}/calibration/
+            !${{ runner.temp }}/calibration/run/**/runtime-input/**
+            !${{ runner.temp }}/calibration/run/**/witness-input/**
           if-no-files-found: error
