@@ -69,14 +69,13 @@ class PerfRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ArgumentTypeError, "summing to 100"):
             runner.mix("99/0/0")
 
-    def test_operator_suite_lists_blocked_definitions_and_preserves_scope(self):
+    def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")
         ids = {case["id"] for case in cases}
         self.assertEqual(50, len(ids))
         self.assertNotIn("join.live.hot-update.wide", ids)
         self.assertNotIn("copy.live.slow-target.large", ids)
-        blocked = {case["id"] for case in cases if runner.case_listing(case)["execution_status"] == "blocked"}
-        self.assertEqual(7, len(blocked))
-        self.assertIn("js.live.basic.standard", blocked)
+        self.assertEqual({"qualification-ready"}, {runner.case_listing(case)["execution_status"] for case in cases})
+        self.assertIn("js.live.basic.standard", ids)
+        self.assertIn("mixed.snapshot.double-map.standard", ids)
         self.assertNotIn("mixed.snapshot.union-branches.standard", ids)
-        self.assertIn("mixed.snapshot.double-map.standard", blocked)
