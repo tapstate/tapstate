@@ -309,15 +309,11 @@ public final class RowExpressions {
             case BINARY -> SimpleType.BYTES;
             case MAP -> MapType.create(SimpleType.STRING, SimpleType.DYN);
             case ARRAY -> ListType.create(SimpleType.DYN);
-            // No exact counterpart: an exact fixed-point number loses its scale in any binary
-            // floating point type, a temporal value without a zone cannot become an instant without
-            // assuming one, and a JSON value is not known to be any single shape. Each stays a named
-            // opaque type. DECIMAL provides exact comparison overloads while refusing arithmetic;
-            // temporal, JSON and unknown shapes match no operator overloads.
             case DECIMAL, DATE, TIME, DATETIME, YEAR, JSON, UNKNOWN -> opaqueTypeOf(type);
         };
     }
 
+    /** These types have no exact CEL counterpart. DECIMAL adds exact comparison overloads. */
     private static CelType opaqueTypeOf(TapstateType type) {
         return OpaqueType.create("tapstate." + type.name().toLowerCase(Locale.ROOT));
     }

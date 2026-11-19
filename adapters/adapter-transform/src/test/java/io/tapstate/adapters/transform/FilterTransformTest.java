@@ -205,7 +205,7 @@ class FilterTransformTest {
         Envelope row = Envelope.insert(1L, "orders", Map.of("amount", original), null);
         TransformPort map = StatelessTransforms.map(MapSpec.from(new TransformBody.MapProjection(
                 Map.of("out", FieldRule.computed("after.amount")))));
-        assertThat(map.transform(row).getFirst().after().get("out")).isEqualTo(original);
+        assertThat(map.transform(row).getFirst().after()).containsEntry("out", original);
     }
 
     @Test

@@ -222,26 +222,42 @@ public final class ValidationPredicate {
         Operator operator = comparison.operator();
         boolean equality = operator == Operator.EQ || operator == Operator.NE;
         if (a.value() == null || b.value() == null) {
-            if (!equality) return problem(ProblemKind.INCOMPATIBLE_TYPE, a.value() == null ? a.path() : b.path());
-            boolean same = a.value() == null && b.value() == null;
-            return value(operator == Operator.EQ ? same : !same);
+            return compareNulls(a, b, operator, equality);
         }
         boolean numeric = number(a.domain()) && number(b.domain());
         if (!a.domain().equals(b.domain()) && !(numeric && limits.compatibleNumericDomains()))
             return problem(ProblemKind.INCOMPATIBLE_TYPE, a.path().isEmpty() ? b.path() : a.path());
-        int order;
-        if (numeric) {
-            if (nan(a.value()) || nan(b.value())) {
-                if (!equality) return problem(ProblemKind.UNSUPPORTED_VALUE, nan(a.value()) ? a.path() : b.path());
-                boolean same = nan(a.value()) && nan(b.value());
-                return value(operator == Operator.EQ ? same : !same);
-            }
-            order = numericOrder((Number)a.value(), (Number)b.value(), budget);
-        } else if (a.value() instanceof String x && b.value() instanceof String y) {
-            order = textOrder(x, y, budget);
-        } else if (a.value() instanceof Boolean x && b.value() instanceof Boolean y && equality) {
-            order = Boolean.compare(x, y);
-        } else return problem(ProblemKind.INCOMPATIBLE_TYPE, a.path());
+        return numeric ? compareNumbers(a, b, operator, equality, budget) : compareNonNumbers(a, b, operator, equality, budget);
+    }
+
+    private static Value compareNulls(Scalar left, Scalar right, Operator operator, boolean equality) {
+        if (!equality) return problem(ProblemKind.INCOMPATIBLE_TYPE, left.value() == null ? left.path() : right.path());
+        boolean same = left.value() == null && right.value() == null;
+        return value(operator == Operator.EQ ? same : !same);
+    }
+
+    private static Value compareNumbers(Scalar left, Scalar right, Operator operator, boolean equality, Budget budget) {
+        boolean leftNan = nan(left.value());
+        boolean rightNan = nan(right.value());
+        if (leftNan || rightNan) {
+            if (!equality) return problem(ProblemKind.UNSUPPORTED_VALUE, leftNan ? left.path() : right.path());
+            boolean same = leftNan && rightNan;
+            return value(operator == Operator.EQ ? same : !same);
+        }
+        return compareOrder(numericOrder((Number)left.value(), (Number)right.value(), budget), operator);
+    }
+
+    private static Value compareNonNumbers(Scalar left, Scalar right, Operator operator, boolean equality, Budget budget) {
+        if (left.value() instanceof String x && right.value() instanceof String y) {
+            return compareOrder(textOrder(x, y, budget), operator);
+        }
+        if (left.value() instanceof Boolean x && right.value() instanceof Boolean y && equality) {
+            return compareOrder(Boolean.compare(x, y), operator);
+        }
+        return problem(ProblemKind.INCOMPATIBLE_TYPE, left.path());
+    }
+
+    private static Value compareOrder(int order, Operator operator) {
         return value(switch (operator) {
             case EQ -> order == 0; case NE -> order != 0; case LT -> order < 0;
             case LE -> order <= 0; case GT -> order > 0; case GE -> order >= 0;

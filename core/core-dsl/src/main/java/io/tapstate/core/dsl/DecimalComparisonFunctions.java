@@ -89,7 +89,7 @@ public final class DecimalComparisonFunctions {
             Operator.NOT_EQUALS.getFunction(), ComparisonOp.NE);
 
     private static final Pattern FLOAT_TOKEN = Pattern.compile(
-            "(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?");
+            "(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?");
 
     private static final RuntimeEquality DEFAULT_EQUALITY =
             ProtoMessageRuntimeEquality.create(DynamicProto.create(DefaultMessageFactory.INSTANCE), CelOptions.DEFAULT);
@@ -402,15 +402,16 @@ public final class DecimalComparisonFunctions {
         return value instanceof Double || value instanceof Float || value instanceof DecimalSpecialValue;
     }
 
+    @SuppressWarnings("java:S2111")
     private static BigDecimal finiteDecimal(Number value) {
+        if (isFloating(value)) {
+            // BigDecimal(double) captures the exact binary magnitude needed for row comparisons.
+            return new BigDecimal(value.doubleValue());
+        }
         return switch (value) {
             case BigDecimal decimal -> decimal;
             case BigInteger integer -> new BigDecimal(integer);
             case UnsignedLong unsigned -> new BigDecimal(unsigned.bigIntegerValue());
-            // Use the exact binary value held by a DOUBLE row operand. valueOf uses its printed form.
-            case Double number -> new BigDecimal(number);
-            case Float number -> new BigDecimal(number.doubleValue());
-            case DecimalSpecialValue ignored -> BigDecimal.ZERO;
             default -> BigDecimal.valueOf(value.longValue());
         };
     }
