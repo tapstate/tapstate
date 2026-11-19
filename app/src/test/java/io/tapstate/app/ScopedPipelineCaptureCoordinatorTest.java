@@ -750,9 +750,6 @@ class ScopedPipelineCaptureCoordinatorTest {
                 if (!release.await(10, TimeUnit.SECONDS)) throw new AssertionError("retention was not released");
                 return null;
             }).when(f.runtime).retain(any(), anyString(), any(), any());
-            var preparations = mock(SinkPreparationStore.class);
-            when(preparations.hasPreparedModels()).thenReturn(true);
-            when(f.pipelines.sinkPreparations(any(),any(),any())).thenReturn(preparations);
             var pass = mock(PipelineConvergencePass.class);
             when(pass.scope()).thenReturn(SCOPE);
             try (var worker = Executors.newSingleThreadExecutor()) {
@@ -760,7 +757,7 @@ class ScopedPipelineCaptureCoordinatorTest {
                 try {
                     assertThat(retaining.await(3, TimeUnit.SECONDS)).isTrue();
                     planning = worker.submit(() -> {
-                        f.coordinator.retainedPlanningModels(pass,f.snapshot(),f.models());
+                        f.coordinator.retainedPlanningModels(pass, f.snapshot(), f.models(), guard -> { guard.run(); return true; });
                         planned.countDown();
                     });
                     assertThat(planned.await(1, TimeUnit.SECONDS))
@@ -1204,14 +1201,14 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(srs.models().require(key)).thenReturn(new SrsModel(key,SrsRingbuffer.ringName(canonical,"orders"),pinned,0));
             var pass=mock(PipelineConvergencePass.class);when(pass.scope()).thenReturn(SCOPE);
             var captured=f.models();
-            var planning=f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured);
+            var planning=f.coordinator.retainedPlanningModels(pass, f.snapshot(), captured, guard -> false);
             assertThat(planning.model(f.source).tables()).containsExactly(pinned);
             assertThat(captured.model(f.source).tables()).containsExactly(observed);
             assertThat(f.models().model(f.source).tables()).containsExactly(observed);
             verify(srs.models(),never()).publishedForNewSnapshot(anyString(),anyMap());
             var missing=new TapstateException(IoError.SRS_MODEL_UNAVAILABLE,Map.of("chain",canonical,"table","orders","version","0"),null);
             when(srs.models().require(key)).thenThrow(missing);
-            assertThatThrownBy(() -> f.coordinator.retainedPlanningModels(pass,f.snapshot(),captured)).isSameAs(missing);
+            assertThatThrownBy(() -> f.coordinator.retainedPlanningModels(pass, f.snapshot(), captured, guard -> false)).isSameAs(missing);
         }
     }
 

@@ -113,21 +113,15 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     @Override
     public synchronized SourceModelSnapshot retainedPlanningModels(
-            PipelineConvergencePass pass, ArtifactStore artifacts, SourceModelSnapshot discovered) {
+            PipelineConvergencePass pass, ArtifactStore artifacts, SourceModelSnapshot discovered, RetainedStartCheck check) {
         active();
         var scope = pass.scope();
         pass.requirePipeline(scope.pipelineId());
         if (!business(scope).equals(stores.scope())) throw refused();
-        var preparations =
-                stores.pipelines()
-                        .sinkPreparations(
-                                scope,
-                                pass.claim(),
-                                () -> {
-                                    active();
-                                    pass.requirePipeline(scope.pipelineId());
-                                });
-        if (preparations.hasPreparedModels()) return discovered;
+        if (check.hasPreparedModels(() -> {
+            active();
+            pass.requirePipeline(scope.pipelineId());
+        })) return discovered;
         var pipeline =
                 PipelineInlining.inline(
                         StoredArtifacts.requirePipeline(artifacts, scope.pipelineId()), artifacts);

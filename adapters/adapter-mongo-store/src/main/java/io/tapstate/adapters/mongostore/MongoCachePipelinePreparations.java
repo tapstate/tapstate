@@ -183,22 +183,56 @@ final class MongoCachePipelinePreparations implements PipelineCachePreparations 
         return new Receipt(original.scope(), original.preparationId());
     }
 
-    @Override public void verifySources(PipelineIntentScope scope,PipelinePreparationInputs expected) {
-        Objects.requireNonNull(expected,"expected"); requireScope(scope);
-        var access = new MongoCachePipelineAccess(client,database,scope,null,requireActive);
-        access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS,false,session -> {
-            var original = MongoPipelineSourcePreparations.retained(session,database,scope);
-            if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
-            var added = new java.util.TreeSet<String>();
-            expected.selectedTables().forEach((source,tables) -> tables.forEach(table -> {
-                if (!original.selectedTables().getOrDefault(source,java.util.Set.of()).contains(table))
-                    added.add(source + "." + table);
-            }));
-            if (!added.isEmpty()) throw new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
-                    Map.of("pipeline",scope.pipelineId(),"tables",String.join(", ",added)),null);
-            MongoPipelineSourcePreparations.verifyAll(session,client,database,scope,original,requireActive);
-            MongoSnapshotStateStore.order(session,database,scope); return null;
+    @Override public void verifySources(PipelineIntentScope scope, PipelinePreparationInputs expected) {
+        Objects.requireNonNull(expected, "expected");
+        requireScope(scope);
+        var access = new MongoCachePipelineAccess(client, database, scope, null, requireActive);
+        access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
+            verifyRetainedSources(session, scope, expected);
+            return null;
         });
+    }
+
+    @Override public boolean verifySourcesAndCheckSinkModels(PipelineIntentScope scope,
+            PipelinePreparationInputs expected, WorkloadClaimFence original, Runnable requireSinkActive) {
+        Objects.requireNonNull(expected, "expected");
+        Objects.requireNonNull(requireSinkActive, "requireSinkActive");
+        requireScope(scope);
+        var access = new MongoCachePipelineAccess(client, database, scope, Objects.requireNonNull(original, "original"),
+                requireActive);
+        var sinks = new MongoSinkPreparationStore(access);
+        boolean[] checkingSink = {false};
+        boolean prepared;
+        try {
+            prepared = access.metadataTransaction(SystemCollections.DIRECT_CHANNEL_OFFSETS, false, session -> {
+                checkingSink[0] = false;
+                verifyRetainedSources(session, scope, expected);
+                checkingSink[0] = true;
+                requireSinkActive.run();
+                boolean present = sinks.hasPreparedModels(session);
+                requireSinkActive.run();
+                return present;
+            });
+        } catch (RuntimeException failure) {
+            if (checkingSink[0]) requireSinkActive.run();
+            throw failure;
+        }
+        requireSinkActive.run();
+        return prepared;
+    }
+
+    private void verifyRetainedSources(ClientSession session, PipelineIntentScope scope, PipelinePreparationInputs expected) {
+        var original = MongoPipelineSourcePreparations.retained(session, database, scope);
+        if (!original.sameRecovery(expected)) throw MongoPipelineSourcePreparations.identityUnproven(scope);
+        var added = new java.util.TreeSet<String>();
+        expected.selectedTables().forEach((source, tables) -> tables.forEach(table -> {
+            if (!original.selectedTables().getOrDefault(source, java.util.Set.of()).contains(table))
+                added.add(source + "." + table);
+        }));
+        if (!added.isEmpty()) throw new TapstateException(IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED,
+                Map.of("pipeline", scope.pipelineId(), "tables", String.join(", ", added)), null);
+        MongoPipelineSourcePreparations.verifyAll(session, client, database, scope, original, requireActive);
+        MongoSnapshotStateStore.order(session, database, scope);
     }
 
     /** Only the verification path above can construct a production completion receipt. */

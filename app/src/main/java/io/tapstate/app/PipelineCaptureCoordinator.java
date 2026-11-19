@@ -24,8 +24,14 @@ interface PipelineCaptureCoordinator {
 
     /** A retained source pin may supply frozen planning observations without replacing discovery storage. */
     default SourceModelSnapshot retainedPlanningModels(PipelineConvergencePass pass, ArtifactStore artifacts,
-            SourceModelSnapshot discovered) {
+            SourceModelSnapshot discovered, RetainedStartCheck check) {
+        check.hasPreparedModels(() -> pass.requirePipeline(pass.scope().pipelineId()));
         return discovered;
+    }
+
+    @FunctionalInterface
+    interface RetainedStartCheck {
+        boolean hasPreparedModels(Runnable requireActive);
     }
 
     /** A scoped lifecycle captures the original run separately from its current command authority. */

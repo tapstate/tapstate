@@ -158,27 +158,21 @@ final class MongoSinkPreparationStore implements SinkPreparationStore {
 
     @Override
     public boolean hasPreparedModels() {
-        return access.metadataTransaction(
-                SystemCollections.CACHE_SINK_PREPARATIONS,
-                false,
-                session -> {
-                    var control = marker(claim(session));
-                    if (control.get(TARGETS) == null) return false;
-                    var manifest = documents(control.get(TARGETS));
-                    verifyClosure(session, manifest, control.getString(PREPARATION_ID));
-                    if (manifest.isEmpty()) return false;
-                    for (var input : manifest) {
-                        var raw =
-                                SystemCollections.CACHE_SINK_PREPARATIONS
-                                        .on(access.database)
-                                        .find(
-                                                session,
-                                                new Document("_id", id(decodeInput(input).key())))
-                                        .first();
-                        if (storedModel(raw).isPresent()) return true;
-                    }
-                    return false;
-                });
+        return access.metadataTransaction(SystemCollections.CACHE_SINK_PREPARATIONS, false, this::hasPreparedModels);
+    }
+
+    boolean hasPreparedModels(ClientSession session) {
+        var control = marker(claim(session));
+        if (control.get(TARGETS) == null) return false;
+        var manifest = documents(control.get(TARGETS));
+        verifyClosure(session, manifest, control.getString(PREPARATION_ID));
+        if (manifest.isEmpty()) return false;
+        for (var input : manifest) {
+            var raw = SystemCollections.CACHE_SINK_PREPARATIONS.on(access.database)
+                    .find(session, new Document("_id", id(decodeInput(input).key()))).first();
+            if (storedModel(raw).isPresent()) return true;
+        }
+        return false;
     }
 
     @Override

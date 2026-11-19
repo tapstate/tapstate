@@ -313,6 +313,86 @@ class MongoSinkPreparationStoreIT {
         });
     }
 
+    @Test
+    void ordinaryStartupCombinesRetainedSourcesAndSinkModelsInOneReadOnlySnapshot() {
+        withFixture(f -> {
+            var inputs = authoring(f);
+            var model = prepared(f, "orders", "STRING(100)");
+            var commands = new ArrayList<com.mongodb.event.CommandStartedEvent>();
+            var settings = com.mongodb.MongoClientSettings.builder()
+                    .applyConnectionString(new com.mongodb.ConnectionString(MONGO.getReplicaSetUrl()))
+                    .addCommandListener(new com.mongodb.event.CommandListener() {
+                        @Override public void commandStarted(com.mongodb.event.CommandStartedEvent event) {
+                            commands.add(event);
+                        }
+                    }).build();
+            try (var client = MongoClients.create(settings)) {
+                var database = client.getDatabase(f.cache.getName());
+                var preparations = new MongoCachePipelinePreparations(client, database, f.business, ACTIVE);
+                var sinks = new MongoSinkPreparationStore(new MongoCachePipelineAccess(client, database, f.scope, f.fence, ACTIVE));
+                assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isFalse();
+                f.store().prepareModels(List.of(model));
+                var before = f.snapshot();
+                commands.clear();
+                preparations.verifySources(f.scope, inputs);
+                assertThat(sinks.hasPreparedModels()).isTrue();
+                assertThat(commands).hasSize(15);
+                assertThat(commands.stream().filter(e -> e.getCommandName().equals("commitTransaction"))).hasSize(2);
+                commands.clear();
+                assertThat(preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE)).isTrue();
+                assertThat(commands).hasSize(11);
+                assertThat(commands.stream().map(com.mongodb.event.CommandStartedEvent::getCommandName))
+                        .containsExactly("aggregate", "find", "find", "find", "find", "find", "find",
+                                "find", "find", "find", "commitTransaction");
+                var transaction = commands.getFirst().getCommand();
+                assertThat(commands).allSatisfy(event -> {
+                    assertThat(event.getCommand().get("lsid")).isEqualTo(transaction.get("lsid"));
+                    assertThat(event.getCommand().get("txnNumber")).isEqualTo(transaction.get("txnNumber"));
+                });
+                assertThat(f.snapshot()).isEqualTo(before);
+                System.out.println("Retained startup CACHE commands 15 -> 11; commits 2 -> 1");
+
+                var expanded = new PipelinePreparationInputs(inputs.pipelineHash(), inputs.sourceHashes(),
+                        Map.of("input", Set.of("orders", "customers")), List.of());
+                var orders = SystemCollections.CACHE_SNAPSHOT_ORDERS.on(f.cache);
+                var savedOrder = orders.find().first();
+                var probeSink = new AtomicInteger();
+                commands.clear();
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, expanded, f.fence,
+                        probeSink::incrementAndGet), IoError.PIPELINE_TABLE_SELECTION_REBUILD_REQUIRED);
+                assertThat(probeSink).hasValue(0);
+                assertThat(commands).noneMatch(e -> e.getCommand().toString().contains("sink_preparations"));
+                assertThat(commands.getLast().getCommandName()).isEqualTo("abortTransaction");
+
+                orders.deleteOne(new Document("_id", savedOrder.get("_id")));
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence,
+                        probeSink::incrementAndGet), IoError.DOCUMENT_UNREADABLE);
+                assertThat(probeSink).hasValue(0);
+                orders.insertOne(savedOrder);
+
+                var newer = new PipelineIntentScope(f.scope.clusterId(), f.scope.bindingVersion(),
+                        f.scope.cacheIncarnation(), f.scope.pipelineId(), f.scope.stateGeneration() + 1);
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(newer, inputs, f.fence, ACTIVE),
+                        IoError.CACHE_BUSINESS_FENCED);
+
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence,
+                        () -> { throw MongoCachePipelineAccess.claimFenced(); }), IoError.WORKLOAD_CLAIM_FENCED);
+                assertThat(f.snapshot()).isEqualTo(before);
+                f.rows().deleteMany(new Document());
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE),
+                        IoError.PIPELINE_STATE_REBUILD_REQUIRED);
+                var sinkGuards = new AtomicInteger();
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence,
+                        () -> { if (sinkGuards.incrementAndGet() == 2) throw MongoCachePipelineAccess.claimFenced(); }),
+                        IoError.WORKLOAD_CLAIM_FENCED);
+
+                f.domain.retireBusiness(f.business, UUID.randomUUID().toString(), ACTIVE);
+                assertCode(() -> preparations.verifySourcesAndCheckSinkModels(f.scope, inputs, f.fence, ACTIVE),
+                        IoError.CACHE_BUSINESS_FENCED);
+            }
+        });
+    }
+
     private static SinkPreparationStore.Prepared prepared(Fixture f,String target,String type) {
         var model=new PreparedTargetModel(target,List.of(new PreparedTargetModel.Field("id",type,true,null,null,null)),List.of());
         var base=f.input(target);return new SinkPreparationStore.Prepared(new SinkPreparationStore.Input(base.key(),model.modelHash(),base.policy(),base.fullLoad()),model.canonical());

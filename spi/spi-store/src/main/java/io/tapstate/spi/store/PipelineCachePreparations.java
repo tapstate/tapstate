@@ -15,6 +15,12 @@ public interface PipelineCachePreparations {
     /** Loads the retained original source manifest and necessary progress; it grants no creation authority. */
     void verifySources(PipelineIntentScope scope, PipelinePreparationInputs expected);
 
+    /** Ordinary startup validates retained sources before inspecting the original target models in one read. */
+    default boolean verifySourcesAndCheckSinkModels(PipelineIntentScope scope, PipelinePreparationInputs expected,
+            WorkloadClaimFence original, Runnable requireSinkActive) {
+        throw new UnsupportedOperationException("combined startup preparation read is not supported");
+    }
+
     /** Rechecks CONFIG outside the CACHE transaction, then verifies or publishes the original initial receipt. */
     PipelinePreparationReceipt seed(Reservation original, PipelineStatePreparations configuration, Instant touchTime);
 
