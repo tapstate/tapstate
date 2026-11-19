@@ -151,8 +151,8 @@ class BenchmarkRunIT {
     }
 
     private static void verifyBackpressure(Map<String, Object> unlimited, Map<String, Object> limited, Evidence evidence) {
-        long unrestricted = (long) unlimited.get("target_settled_before_drain");
-        long restricted = (long) limited.get("target_settled_before_drain");
+        long unrestricted = (long) unlimited.get("target_majority_visible_before_drain");
+        long restricted = (long) limited.get("target_majority_visible_before_drain");
         var sourceUnlimited = JSON.valueToTree(unlimited.get("source_window"));
         var sourceLimited = JSON.valueToTree(limited.get("source_window"));
         var first = sourceUnlimited.path(RECORDS);
@@ -163,7 +163,7 @@ class BenchmarkRunIT {
             throw new Unverified("The matched slow-target pair did not show reduced target confirmations under identical input");
         }
         evidence.result.put("backpressure_pair", Map.of("same_source_sequence", true,
-                "unlimited_target_confirmed_at_draining", unrestricted, "limited_target_confirmed_at_draining", restricted,
+                "unlimited_target_majority_visible_at_drain", unrestricted, "limited_target_majority_visible_at_drain", restricted,
                 "source_rate_unlimited", sourceUnlimited.path("acknowledged_per_second"),
                 "source_rate_limited", sourceLimited.path("acknowledged_per_second")));
     }
@@ -356,10 +356,12 @@ class BenchmarkRunIT {
                                     int delay = limited ? number(definition.getDocument("workload_spec")
                                             .getDocument("scenario").getDocument("parameters"),
                                             "trial_target_command_delay_ms") : 0;
+                                    boolean slowTarget = definition.getString("spec").getValue().equals("specs/copy-slow-target.json");
                                     try (var limit = limited ? new BenchmarkTargetLimit(admin, targetApplication,
-                                            target.getNamespace().getFullName(), delay) : null) {
+                                            target.getNamespace().getFullName(), delay) : null;
+                                            var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(admin, target) : null) {
                                         mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
-                                                limit, delay);
+                                                limit, delay, window);
                                     }
                                 }
                                 evidence.stage = "readback";
@@ -454,7 +456,7 @@ class BenchmarkRunIT {
 
     private static void mongoCdc(BsonDocument entry, MongoWorkloadGenerator.Prepared prepared, ControlPlane control,
             MongoCollection<BsonDocument> source, MongoCollection<BsonDocument> target, Evidence evidence, String mode,
-            BenchmarkTargetLimit limit, int delay) {
+            BenchmarkTargetLimit limit, int delay, BenchmarkTargetLimit.TargetWindow targetWindow) {
         evidence.stage = "initial-state";
         evidence.window("load");
         int initial = number(entry, "rows");
@@ -526,6 +528,9 @@ class BenchmarkRunIT {
                     Duration.ofSeconds(measure)), mix, null, () -> {
                         settleExpected(entry, control, baseline + (long) rate * warmup);
                         observedWarm[0] = settled(control);
+                        if (targetWindow != null) {
+                            targetWindow.begin();
+                        }
                         if (limit != null) {
                             limit.arm();
                         }
@@ -533,6 +538,9 @@ class BenchmarkRunIT {
                     }, () -> {
                         evidence.window("drain");
                         observedBeforeDrain[0] = settled(control) - observedWarm[0];
+                        if (targetWindow != null) {
+                            evidence.result.put("target_majority_visible_before_drain", targetWindow.countThroughBoundary());
+                        }
                         if (limit != null) {
                             evidence.result.put("target_delay_millis", delay);
                             evidence.result.put("target_commands_delayed", limit.release());
@@ -548,8 +556,9 @@ class BenchmarkRunIT {
             long acknowledged = observedBeforeDrain[0];
             if (limit != null) {
                 long delayed = (long) evidence.result.get("target_commands_delayed");
-                evidence.result.put("source_minus_target_at_release", measured - acknowledged);
-                if (delayed <= 0 || acknowledged >= measured) {
+                long majorityVisible = (long) evidence.result.get("target_majority_visible_before_drain");
+                evidence.result.put("source_minus_target_at_release", measured - majorityVisible);
+                if (delayed <= 0 || majorityVisible >= measured) {
                     throw new Unverified("The target-only delay did not prove an acknowledgement deficit");
                 }
             }

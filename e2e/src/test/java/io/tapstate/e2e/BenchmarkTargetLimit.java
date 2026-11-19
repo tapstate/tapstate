@@ -1,7 +1,12 @@
 package io.tapstate.e2e;
 
+import com.mongodb.client.MongoCollection;
+import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import org.bson.BsonDocument;
 import org.bson.Document;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -49,6 +54,44 @@ final class BenchmarkTargetLimit implements AutoCloseable {
 
     private static long count(Document response) {
         return response.get("count", Number.class).longValue();
+    }
+
+    /** Counts majority-visible target writes at a server-side boundary before the limit is released. */
+    static final class TargetWindow implements AutoCloseable {
+        private final MongoDatabase admin;
+        private final MongoCollection<BsonDocument> target;
+        private MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor;
+
+        TargetWindow(MongoDatabase admin, MongoCollection<BsonDocument> target) {
+            this.admin = admin;
+            this.target = target;
+        }
+
+        void begin() {
+            cursor = target.watch().maxAwaitTime(200, TimeUnit.MILLISECONDS).batchSize(128).cursor();
+        }
+
+        long countThroughBoundary() {
+            var clock = admin.runCommand(new BsonDocument("ping", new org.bson.BsonInt32(1)), BsonDocument.class)
+                    .getDocument("$clusterTime").getTimestamp("clusterTime");
+            long count = 0;
+            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+            while (System.nanoTime() < deadline) {
+                var event = cursor.tryNext();
+                if (event == null || event.getClusterTime().compareTo(clock) > 0) {
+                    return count;
+                }
+                count++;
+            }
+            throw new IllegalStateException("Target observation did not reach its boundary before timeout");
+        }
+
+        @Override
+        public void close() {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
     }
 
     @Override

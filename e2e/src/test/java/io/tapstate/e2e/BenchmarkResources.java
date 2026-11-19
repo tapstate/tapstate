@@ -18,7 +18,7 @@ import java.util.concurrent.TimeUnit;
 final class BenchmarkResources implements AutoCloseable {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final Pattern GC = Pattern.compile(
-            "^\\[(\\d+)(?:ms)?].*GC\\(\\d+\\) (Pause .+?) (\\d+)([KMG])->(\\d+)([KMG])\\(");
+            "\\[(\\d+)ms].*GC\\(\\d+\\) (Pause .+?) (\\d+)([KMG])->(\\d+)([KMG])\\(");
     private static final boolean PROCFS = Files.isDirectory(Path.of("/proc", "self"));
     private static final String SOURCE = PROCFS ? "procfs process status" : "ps process rss";
     private final ScheduledExecutorService timer;
