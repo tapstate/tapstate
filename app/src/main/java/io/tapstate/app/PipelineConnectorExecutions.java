@@ -25,6 +25,7 @@ import io.tapstate.spi.store.SrsStoreViews;
 import io.tapstate.spi.store.WorkloadClaimFence;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -101,6 +102,33 @@ final class PipelineConnectorExecutions {
         if (pending != null && pending.phase() == Phase.PREPARED && pending.intentRevision() == intent.intentRevision())
             return new Selection(pending.intentRevision(), pending.candidates(), state.effective());
         return new Selection(state.effectiveIntentRevision(), state.effective(), List.of());
+    }
+
+    Map<String, String> retainedSinkHashes(PipelineIntentSnapshot intent, List<Node> nodes, Runnable guard) {
+        if (!(connectors instanceof LocalConnectorArtifacts)
+                || nodes.stream().allMatch(node -> node.purpose() == PipelineNode.Purpose.CAPTURE)) return Map.of();
+        var scope = intent.scope();
+        var state = store(guard).load(scope).orElse(null);
+        if (state != null && state.handoff() != null && state.handoff().phase() != Phase.PUBLISHED
+                && state.handoff().intentRevision() == intent.intentRevision()) return Map.of();
+
+        // An unseeded member must stage the retained sink artifact before it can prove readiness.
+        var fixed = notes.guardedBy(guard);
+        var hashes = new LinkedHashMap<String, String>();
+        for (var node : nodes) {
+            if (node.purpose() == PipelineNode.Purpose.CAPTURE) continue;
+            var binding = state == null ? null : state.find(node.id(), node.purpose()).orElse(null);
+            var token = fixed.open(binding == null ? node.privateOwner(scope) : binding.notes().owner());
+            var origin = fixed.originIfPresent(token).orElse(null);
+            if (origin == null && binding == null) continue;
+            if (origin == null || binding != null && !binding.sha256().equals(origin.artifactHash())
+                    || !origin.equals(ConnectorNoteOrigin.capture(node.connectorId(), origin.artifactHash(), node.settings())))
+                throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
+            var ref = connectors.resolveRetained(fixed, token, origin);
+            String previous = hashes.putIfAbsent(node.connectorId(), ref.contentHash());
+            if (previous != null && !previous.equals(ref.contentHash())) throw fenced();
+        }
+        return Map.copyOf(hashes);
     }
 
     void prepare(PipelineIntentSnapshot intent, List<Node> nodes, WorkloadClaimFence claim, Runnable guard) {

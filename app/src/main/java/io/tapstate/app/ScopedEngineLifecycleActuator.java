@@ -137,8 +137,14 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         try {
             prepared = dags.prepareStart(pass,defaultDatabase); require();
             if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
-            shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
-                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); require();
+            var hashes = prepared.connectorHashes();
+            if (hashes.isEmpty() && original != null && ports.connectorExecutions() != null) {
+                hashes = ports.connectorExecutions().retainedSinkHashes(pass.intent(), prepared.connectorNodes(), this::require);
+            }
+            var sinks = Set.copyOf(prepared.sinkConnectors().values());
+            shared = Set.copyOf(hashes.isEmpty() ? connectors.requireEveryMemberCanLoad(id(), sinks)
+                    : connectors.requireEveryMemberCanLoad(id(), sinks, hashes));
+            require();
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
