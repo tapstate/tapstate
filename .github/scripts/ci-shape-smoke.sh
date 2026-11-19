@@ -60,9 +60,6 @@ def check(workflows, contexts, inputs):
     for role in ('snapshot-lock', 'test-shards', 'build'):
         assert 'Verify exact Java build' in ci[role] and 'java.runtime.version' in ci[role], \
             'each receipt producer must verify the resolved Java build'
-        maven_setup = 'run: bash .github/scripts/ci-setup-maven.sh'
-        assert ci[role].count(maven_setup) == 1 and 0 <= ci[role].find(maven_setup) < ci[role].find('mvn -B'), \
-            'each receipt producer must activate the pinned Maven build before its first reactor command'
     assert 'mvn -B -T 2 -Dmaven.repo.local="$RUNNER_TEMP/snapshot-m2" -DskipTests install' in ci['snapshot-lock'], \
         'snapshot inputs must come from a complete reactor preparation'
     lock = ci['snapshot-lock']
@@ -298,7 +295,6 @@ for original, replacement in [
     ('  build:', '  build-renamed:'),
     ('  build:', '  build:\n    strategy:\n      matrix: {part: [1, 2]}'),
     ('ci-aggregate.sh verify', 'echo verification-removed'),
-    ('run: bash .github/scripts/ci-setup-maven.sh', 'run: mvn --version'),
     ('ci-receipt.sh compare-inputs', 'echo input-comparison-removed'),
     (' --artifacts "$RUNNER_TEMP/ci-artifacts"', ''),
     ('          overwrite: true', '          overwrite: false'),

@@ -85,8 +85,6 @@ jobs:
           cache: maven
       - name: Verify exact Java build
         run: java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven build
-        run: bash .github/scripts/ci-setup-maven.sh
       - name: Resolve the reactor's snapshot inputs
         run: |
           .github/scripts/ci-maven-cache.sh seed-stable "$HOME/.m2/repository" "$RUNNER_TEMP/snapshot-m2"
@@ -135,8 +133,6 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven build
-        run: bash .github/scripts/ci-setup-maven.sh
       - uses: actions/download-artifact@v4
         with:
           name: ci-shard-plan
@@ -335,8 +331,6 @@ jobs:
         shell: bash
         run: |
           java -XshowSettings:properties -version 2>&1 | grep -Fx '    java.runtime.version = 21.0.13+9-LTS'
-      - name: Use the pinned Maven build
-        run: bash .github/scripts/ci-setup-maven.sh
       - name: Check secret availability
         id: guard
         env:
