@@ -231,11 +231,15 @@ including new methods. Put heavier scenarios in separate integration test
 classes. The existing hundred-table witness is an approved fast smoke case.
 
 A product change still needs a discriminating end-to-end case under the
-[contribution guide](../../CONTRIBUTING.md#end-to-end-cases). If the new case runs
-in Nightly, name it in the PR and provide evidence from a focused execution or
-a manual branch regression. Use the existing mutation evidence when introducing
-or changing an end-to-end assertion. A bug regression should fail before the fix
+[contribution guide](../../CONTRIBUTING.md#end-to-end-cases). For a case selected
+only for Nightly, add or update it in the PR, run it locally with a focused test
+command, and record the command and result in the PR. Leave full regression to
+the scheduled Nightly. Use the existing mutation evidence when introducing or
+changing an end-to-end assertion. A bug regression should fail before the fix
 and pass afterward.
+
+During PR review, address failures from that PR's own CI, including build and
+Sonar. Follow up failures from the scheduled Nightly separately.
 
 In the PR's **CI cost delta and lane placement** field, list where new tests run.
 For a fast-list addition, state which critical path it protects, why it needs
