@@ -4,6 +4,8 @@ import java.util.Optional;
 
 /** Owner-scoped provider credentials; implementations encrypt secrets before durable writes. */
 public interface AiProviderSettingsStore {
+    String ON_PREM_OWNER = "[\"on-prem\"]";
+
     static boolean supportsProvider(String provider) {
         return "openai-compatible".equals(provider) || "openai-responses".equals(provider);
     }
