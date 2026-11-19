@@ -65,7 +65,11 @@ jobs:
           docker pull mongo:7.0
           docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
       - name: Build the matching OP candidate
-        run: mvn -B -T 2 -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1
+        run: |
+          mvn -B -pl e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1 || {
+            tail -100 "$RUNNER_TEMP/calibration/build.log"
+            exit 1
+          }
       - name: Validate the catalog, selection and report
         run: python3 -B -m unittest discover -s benchmarks/src/test
       - name: Replay the assigned batch
@@ -79,5 +83,4 @@ jobs:
             ${{ runner.temp }}/calibration/
             !${{ runner.temp }}/calibration/run/**/runtime-input/**
             !${{ runner.temp }}/calibration/run/**/witness-input/**
-            !${{ runner.temp }}/calibration/build.log
           if-no-files-found: error
