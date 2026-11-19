@@ -76,7 +76,7 @@ jobs:
       tag: ${{ steps.next.outputs.tag }}
       is_latest: ${{ steps.next.outputs.is_latest }}
       sha: ${{ steps.sha.outputs.sha }}
-      full-ci-already-required: ${{ steps.sha.outputs.full-ci-already-required }}
+      full_ci_already_required: ${{ steps.sha.outputs.full_ci_already_required }}
       web_sha: ${{ steps.web-pin.outputs.sha }}
       # The tag the version was counted up from. Two jobs downstream need the same range -- the
       # documentation gate and the notes -- and working it out a second time is a second chance to
@@ -107,7 +107,7 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           # Earlier commits already had to pass the full reactor in their main build.
           if [[ ! -f .github/ci-fast-integration.json ]]; then
-            echo "full-ci-already-required=true" >> "$GITHUB_OUTPUT"
+            echo "full_ci_already_required=true" >> "$GITHUB_OUTPUT"
           fi
 
       - id: next
@@ -283,7 +283,7 @@ jobs:
     uses: ./.github/workflows/reactor-regression.yml
     with:
       source-sha: ${{ needs.version.outputs.sha }}
-      full-ci-already-verified: ${{ needs.version.outputs.full-ci-already-required == 'true' }}
+      full-ci-already-verified: ${{ needs.version.outputs.full_ci_already_required == 'true' }}
 
   gates:
     # The reactor regression, native CLI, paired Cloud/OP smoke, connector shards and full join matrix must
