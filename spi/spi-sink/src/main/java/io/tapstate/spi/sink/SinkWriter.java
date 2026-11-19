@@ -24,6 +24,9 @@ public interface SinkWriter extends AutoCloseable {
      */
     CompletionStage<WriteResult> write(List<Envelope> records);
 
+    /** The runtime has delivered every snapshot row on this input, including an empty snapshot. */
+    default void snapshotDelivered(String stream) { }
+
     /** Closes the writer, releasing the target resource. Idempotent. */
     @Override
     void close();

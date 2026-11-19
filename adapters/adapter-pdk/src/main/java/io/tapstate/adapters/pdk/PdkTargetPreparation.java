@@ -7,12 +7,16 @@ import io.tapdata.pdk.apis.context.TapConnectorContext;
 import io.tapdata.pdk.apis.functions.ConnectorFunctions;
 import io.tapdata.pdk.apis.entity.TapAdvanceFilter;
 import io.tapdata.pdk.apis.entity.TapExecuteCommand;
+import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.sink.OnFullLoad;
 import io.tapstate.spi.capture.SourceOperationObserver;
 import io.tapstate.spi.sink.SinkPreparationNamespace;
 import io.tapstate.spi.sink.TargetTable;
+import io.tapstate.spi.store.IoError;
 import io.tapstate.spi.store.KeyedStateStore;
+import io.tapstate.spi.store.SinkPreparationStore;
+import java.time.Duration;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -20,14 +24,13 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 /**
  * Prepares each table before writing; a durable receipt prevents destructive preparation on recovery.
  *
- * <p>A writer whose tables were prepared before it opened prepares nothing, and was checked for their receipts
- * as it opened ({@link #requirePrepared}). Preparing again from each of several writers is what that avoids -
- * the receipt is looked up and then written, not claimed, so two writers finding none would each clear the
- * table, and the second would clear rows the first had already written.
+ * <p>Ordinary tables are prepared by the coordinator. For deferred tables the first eligible writer claims
+ * the scoped attempt, which serializes physical preparation before any writer can write to that table.
  */
 final class PdkTargetPreparation {
     private static final Set<String> MONGO_TARGETS = Set.of(
@@ -120,14 +123,14 @@ final class PdkTargetPreparation {
     void prepare(TargetTable target, TapTable table) throws Throwable {
         requireActive.run();
         if (receipts != null) {
-            if (target == null || preparedAhead || prepared.contains(target.name())) {
+            if (target == null || (preparedAhead && !target.hasDeferredDecimal()) || prepared.contains(target.name())) {
                 PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
-                // A prepared writer carries the frozen model and never issues preparation mutations.
                 // The caller still checks the exact execution immediately before writeRecord.
                 if (preparedAhead) verifiedReady.add(target);
                 return;
             }
             prepareScoped(target, table);
+            if (preparedAhead) verifiedReady.add(target);
             return;
         }
         if (target == null || prepared.contains(target.name())) {
@@ -196,16 +199,50 @@ final class PdkTargetPreparation {
         }
     }
 
+    /**
+     * Deferred tables are prepared by a writer. Multiple writers can observe the same pending
+     * receipt, but only the writer that issues the attempt may perform physical preparation.
+     */
+    private SinkPreparationStore.Attempt beginDeferred(TargetTable target) {
+        var observed = PdkSinkPreparations.host(() -> receipts.load(target));
+        if (observed.phase() == SinkPreparationStore.Phase.READY) return null;
+        if (observed.revision() == 0) {
+            try {
+                return PdkSinkPreparations.host(() -> receipts.begin(target));
+            } catch (TapstateException refusal) {
+                if (refusal.code() != IoError.PIPELINE_STATE_REBUILD_REQUIRED) throw refusal;
+                observed = PdkSinkPreparations.host(() -> receipts.load(target));
+                if (observed.revision() == 0) throw refusal;
+            }
+        }
+        long deadline = System.nanoTime() + Duration.ofSeconds(10).toNanos();
+        while (observed.phase() != SinkPreparationStore.Phase.READY) {
+            requireActive.run();
+            if (System.nanoTime() >= deadline || Thread.currentThread().isInterrupted()) {
+                PdkSinkPreparations.host(() -> { receipts.requireReady(target); return null; });
+                return null;
+            }
+            LockSupport.parkNanos(Duration.ofMillis(20).toNanos());
+            observed = PdkSinkPreparations.host(() -> receipts.load(target));
+        }
+        return null;
+    }
+
     private void prepareScoped(TargetTable target,TapTable table)throws Throwable {
         var held=PdkSinkPreparations.host(() -> receipts.load(target));boolean created;
-        if(held.phase()==io.tapstate.spi.store.SinkPreparationStore.Phase.READY)created=held.result().created();
+        if(held.phase()==SinkPreparationStore.Phase.READY)created=held.result().created();
         else {
-            var original=PdkSinkPreparations.host(() -> receipts.begin(target));
-            requireActive.run();
-            if(mongoTarget && fullLoad)prepareExisting(table);
-            created=create(table);
-            if(!mongoTarget && !created && fullLoad)prepareExisting(table);
-            requireActive.run();boolean confirmedCreated=created;PdkSinkPreparations.host(() -> {receipts.complete(original,confirmedCreated);return null;});
+            var original = target.hasDeferredDecimal() ? beginDeferred(target)
+                    : PdkSinkPreparations.host(() -> receipts.begin(target));
+            if (original == null) {
+                created = PdkSinkPreparations.host(() -> receipts.load(target)).result().created();
+            } else {
+                requireActive.run();
+                if(mongoTarget && fullLoad)prepareExisting(table);
+                created=create(table);
+                if(!mongoTarget && !created && fullLoad)prepareExisting(table);
+                requireActive.run();boolean confirmedCreated=created;PdkSinkPreparations.host(() -> {receipts.complete(original,confirmedCreated);return null;});
+            }
         }
         if(functions.getCreateIndexFunction()!=null) {
             var event=TargetTapTable.createIndexEvent(target,created);

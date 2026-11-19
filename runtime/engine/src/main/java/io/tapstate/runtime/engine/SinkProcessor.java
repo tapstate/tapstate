@@ -11,6 +11,7 @@ import com.hazelcast.jet.core.Watermark;
 import io.tapstate.core.event.ChainPosition;
 import io.tapstate.core.event.Envelope;
 import io.tapstate.core.event.PayloadBytes;
+import io.tapstate.core.event.SourceOrder;
 import io.tapstate.core.lifecycle.HistogramBounds;
 import io.tapstate.core.lifecycle.HistogramValue;
 import io.tapstate.core.lifecycle.Stage;
@@ -646,13 +647,22 @@ public final class SinkProcessor extends AbstractProcessor implements Staged {
             if (due == null) {
                 continue;
             }
+            String chain = frontier.chainOf(due);
+            SourceOrder through = chain == null ? null : FrontierOrders.unpack(due.timestamp());
+            if (through != null && through.seq() == SourceOrder.SNAPSHOT_SEQ) {
+                try {
+                    writer.snapshotDelivered(chain);
+                } catch (RuntimeException | Error failure) {
+                    if (failureRegistry != null) failureRegistry.record(failure);
+                    throw failure;
+                }
+            }
             frontier.bound(due, ack);
             // Every change this writer was given at or below the bound has landed, whatever the frontier made
             // of it: a writer given none of a chain's rows says so here and holds no chain back by having
             // nothing to write for it.
-            String chain = frontier.chainOf(due);
             if (chain != null) {
-                ack.bounded(chain, FrontierOrders.unpack(due.timestamp()));
+                ack.bounded(chain, through);
             }
         }
     }

@@ -173,6 +173,7 @@ final class PdkSinkWriter implements SinkWriter {
         connector.underLoader(() -> {
             for (Map.Entry<String, TargetTable> entry : targets.entrySet()) {
                 TargetTable target = projectedTarget(entry.getKey(), entry.getValue());
+                if (target.hasDeferredDecimal()) continue;
                 preparation.prepare(target, tableModel(entry.getKey(), target));
             }
             if (identityConfig != null) {
@@ -225,6 +226,22 @@ final class PdkSinkWriter implements SinkWriter {
                 }
             });
             return result;
+        }
+    }
+
+    @Override
+    public synchronized void snapshotDelivered(String stream) {
+        TargetTable target = projectedTarget(stream, targets.get(stream));
+        if (target == null || !target.hasDeferredDecimal()) return;
+        try {
+            connector.underLoader(() -> {
+                preparation.prepareForWrite(target, tableModel(stream, target));
+                return null;
+            });
+        } catch (TapstateException failure) {
+            throw failure;
+        } catch (Throwable failure) {
+            throw writeFailed(connector.connectorId(), failure);
         }
     }
 
@@ -334,6 +351,11 @@ final class PdkSinkWriter implements SinkWriter {
         TargetTable target = projectedTarget(env.src(), targets.get(env.src()));
         var fields = target == null ? Map.<String, io.tapdata.entity.schema.TapField>of()
                 : tableModel(env.src(), target).getNameFieldMap();
+        if (target != null && target.hasDeferredDecimal()) {
+            return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions(),
+                    PdkDeferredDecimal.fields(target, fields, env.before()),
+                    PdkDeferredDecimal.fields(target, fields, env.after()));
+        }
         return (TapRecordEvent) TapEventCodec.encode(env, connector.conversions(), fields);
     }
 
