@@ -270,16 +270,27 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline); var lost = engine.lost(id()).map(Throwable.class::cast); require(); return lost;
     }
     @Override public synchronized boolean isCarryingAJob(String pipeline) {
-        requireId(pipeline); boolean carrying = run != null && isCurrentRun() && run.isCarryingAJob(); require(); return carrying;
+        requireId(pipeline);
+        // A successful bounded job still owns completion while its target receipts arrive.
+        boolean carrying = (run != null && isCurrentRun() && run.isCarryingAJob()) || successfulBoundedJob(pipeline);
+        require();
+        return carrying;
     }
     @Override public synchronized void settleCompleted(String pipeline) { retryCompletion(pipeline); }
     @Override public synchronized boolean completed(String pipeline) {
         requireId(pipeline);
-        if(run==null || !isCurrentRun() || !run.completed() || capture==null || !capture.isCapturing(pipeline))return false;
-        var bindings=capture.captureBindings();
-        boolean complete=!bindings.snapshots().isEmpty() && capture.loadDelivered(pipeline)
+        if (!successfulBoundedJob(pipeline)) {
+            return false;
+        }
+        boolean complete = capture.loadDelivered(pipeline)
                 && capture.captureFailure(pipeline).isEmpty() && run.failure().isEmpty();
-        require();return complete;
+        require();
+        return complete;
+    }
+
+    private boolean successfulBoundedJob(String pipeline) {
+        return run != null && isCurrentRun() && run.completed() && capture != null
+                && capture.isCapturing(pipeline) && !capture.captureBindings().snapshots().isEmpty();
     }
     @Override public synchronized Optional<Completion> completion(String pipeline) {
         if (!completed(pipeline)) return Optional.empty();
