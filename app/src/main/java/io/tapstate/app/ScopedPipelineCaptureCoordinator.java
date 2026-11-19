@@ -306,10 +306,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             this.commandScope=commandScope; this.command=command; this.original=original;
         }
         @Override public void startCapture(String pipeline) { throw refused(); }
-        @Override public void startCapture(String pipeline,ArtifactStore captured,SourceModelSnapshot models) {
+        @Override public void startCapture(String pipeline, ArtifactStore captured, SourceModelSnapshot models) {
+            prepareCaptureStart(pipeline, captured, models).run();
+        }
+        @Override public Runnable prepareCaptureStart(String pipeline, ArtifactStore captured, SourceModelSnapshot models) {
             requireId(pipeline);
             if (!original.scope().equals(commandScope) || !claim(original).equals(command)) throw refused();
-            start(this,captured,models);
+            var inputs = captureInputs(original, captured, models);
+            return () -> start(this, inputs);
         }
         @Override public void stopCapture(String pipeline, boolean purge) {
             stopCaptureIfPresent(pipeline, purge);
@@ -394,10 +398,10 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         requireSession(held);execution.authorization().requireCapture(stores.scope(),expected);
         return new ValidationCaptureRoute(held.original,alias,table,state.preparation(),expected,channel,epoch,membership);
     }
-    private synchronized void start(Run run, ArtifactStore artifacts, SourceModelSnapshot models) {
+    private synchronized void start(Run run, CaptureInputs inputs) {
         startingOrActiveCaptures.add(run.original);
         try {
-            startOwned(run, artifacts, models);
+            startOwned(run, inputs);
         } finally {
             if (!sessions.containsKey(run.original)) startingOrActiveCaptures.remove(run.original);
         }
@@ -405,36 +409,40 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void forgetSession(Session session) {
         if (sessions.remove(session.original, session)) startingOrActiveCaptures.remove(session.original);
     }
-    private void startOwned(Run run, ArtifactStore artifacts, SourceModelSnapshot models) {
+    private record CaptureInputs(ArtifactStore artifacts, SourceModelSnapshot models, PipelineResource authored,
+            PipelineResource pipeline, Map<String, SourceResource> sources, PipelinePreparationInputs preparation) {}
+
+    private CaptureInputs captureInputs(ExecutionFence original, ArtifactStore artifacts, SourceModelSnapshot models) {
+        active();
+        Objects.requireNonNull(artifacts);
+        Objects.requireNonNull(models).requirePipeline(original.pipelineId());
+        var authored = StoredArtifacts.requirePipeline(artifacts, original.pipelineId());
+        var pipeline = PipelineInlining.inline(authored, artifacts);
+        var sources = new LinkedHashMap<String, SourceResource>();
+        for (String id : pipeline.sourceIds()) sources.put(id, StoredArtifacts.requireSource(artifacts, id));
+        var prepared = models.preparationInputs(original.scope(), authored, pipeline, sources);
+        return new CaptureInputs(artifacts, models, authored, pipeline, Collections.unmodifiableMap(sources), prepared);
+    }
+
+    private void startOwned(Run run, CaptureInputs inputs) {
         active();
         requirePipeline(run.original);
-        Objects.requireNonNull(artifacts);
-        Objects.requireNonNull(models).requirePipeline(run.original.pipelineId());
-        var authored = StoredArtifacts.requirePipeline(artifacts, run.original.pipelineId());
-        var pipeline = PipelineInlining.inline(authored, artifacts);
-        var sourceDefinitions = new LinkedHashMap<String, SourceResource>();
-        for (String id : pipeline.sourceIds())
-            sourceDefinitions.put(id, StoredArtifacts.requireSource(artifacts, id));
-        var inputs =
-                models.preparationInputs(
-                        run.original.scope(), authored, pipeline, sourceDefinitions);
         var existing = sessions.get(run.original);
         if (existing != null) {
-            if (!existing.inputs.equals(inputs)) throw refused();
+            if (!existing.inputs.equals(inputs.preparation())) throw refused();
             return;
         }
-        var mode =
-                pipeline.settings() == null || pipeline.settings().readMode() == null
-                        ? ReadMode.SNAPSHOT_AND_CDC
-                        : pipeline.settings().readMode();
-        var session = new Session(run.original, inputs, execution.clock().instant(), mode);
+        var pipeline = inputs.pipeline();
+        var mode = pipeline.settings() == null || pipeline.settings().readMode() == null
+                ? ReadMode.SNAPSHOT_AND_CDC : pipeline.settings().readMode();
+        var session = new Session(run.original, inputs.preparation(), execution.clock().instant(), mode);
         sessions.put(run.original, session);
         try {
             var node =
                     execution.node().get().orElseThrow(ScopedPipelineCaptureCoordinator::refused);
             if (!node.owner().equals(claim(run.original).owner())) throw refused();
-            prepareSources(session, pipeline, sourceDefinitions, models, node);
-            startSources(session, pipeline, node, artifacts, authored);
+            prepareSources(session, pipeline, inputs.sources(), inputs.models(), node);
+            startSources(session, pipeline, node, inputs.artifacts(), inputs.authored());
         } catch (RuntimeException | Error failure) {
             try {
                 stop(session);
@@ -647,11 +655,13 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         var snapshots = snapshotBindings(session, state);
         var direct = prepareDirectSources(session, pipeline);
         var logged = new LinkedHashMap<String, PipelineCaptureBindings.LoggedSource>();
+        var verifiedChains = new HashSet<String>();
         for (var source : session.sources.values()) {
             if (source.shared)
                 PipelineDiagnostics.measure(session.original.pipelineId(), Phase.CAPTURE_SOURCE_PREPARE, () -> {
                     PipelineDiagnostics.source(source.id);
-                    return prepareLoggedSource(session, source, pipeline, node, artifacts, authored);
+                    return prepareLoggedSource(session, source, pipeline, node, artifacts, authored,
+                            session.snapshot && verifiedChains.add(source.prepared.chainId()));
                 })
                         .ifPresent(binding -> logged.put(source.id, binding));
         }
@@ -694,14 +704,16 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
             PipelineResource pipeline,
             WorkloadClaimFence node,
             ArtifactStore artifacts,
-            PipelineResource authored) {
+            PipelineResource authored,
+            boolean verifyControlClosure) {
         var consumers = source.srs.consumers();
         var context = source.consumer.context();
         boolean admitted = stores.sources().supportsAdmittedCaptureStartup();
         SrsChainState before;
         SrsConsumerProgress retained;
         if (admitted) {
-            var sampled = consumers.startupSnapshot(context, Map.of()).orElseThrow(ScopedPipelineCaptureCoordinator::refused);
+            var sampled = consumers.startupSnapshot(context, Map.of(), verifyControlClosure)
+                    .orElseThrow(ScopedPipelineCaptureCoordinator::refused);
             before = sampled.chain();
             retained = sampled.progress();
         } else {

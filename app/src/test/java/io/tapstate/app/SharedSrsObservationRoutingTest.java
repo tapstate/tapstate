@@ -122,7 +122,7 @@ class SharedSrsObservationRoutingTest {
         when(chains.load(physical)).thenReturn(Optional.of(state));
         var scope = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
         var ids = own.stream().map(context -> context.key().sourceId()).collect(java.util.stream.Collectors.toSet());
-        when(consumers.planningProgress(scope,physical,ids)).thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,values)));
+        when(consumers.startLoadProgress(scope,physical,ids)).thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,values)));
         when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
 
         var reads = new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),selectedPipeline,Optional.empty());
@@ -132,7 +132,7 @@ class SharedSrsObservationRoutingTest {
         assertThat(progress.consumerOffsets()).extracting(ConsumerOffset::pipelineId)
                 .containsExactlyInAnyOrderElementsOf(own.stream().map(context -> context.key().consumerId()).toList());
         assertThat(StartLoad.of(null,pipeline.id(),List.of(progress))).isEqualTo(StartLoad.RESUME);
-        verify(consumers,times(1)).planningProgress(scope,physical,ids);
+        verify(consumers,times(1)).startLoadProgress(scope,physical,ids);
         verify(consumers,never()).progress(any());
         verify(consumers,never()).cursor(sibling);
         verify(consumers,never()).attached(physical);
@@ -146,10 +146,10 @@ class SharedSrsObservationRoutingTest {
         when(consumers.attached(physical)).thenReturn(new SrsConsumerTopology(BUSINESS,physical,2,
                 detached ? List.of() : List.of(marker)));
         var scope = new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
-        if (detached) when(consumers.planningProgress(scope,physical,Set.of(source.id())))
+        if (detached) when(consumers.startLoadProgress(scope,physical,Set.of(source.id())))
                 .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(new SrsChainState(physical,preparation.captureId(),null,2,
                         Set.of("orders"),Set.of("orders"),0,null,null,0,2),List.of())));
-        else when(consumers.planningProgress(scope,physical,Set.of(source.id())))
+        else when(consumers.startLoadProgress(scope,physical,Set.of(source.id())))
                 .thenThrow(new TapstateException(IoError.SRS_CONSUMER_UNAVAILABLE,Map.of("chain",physical),null));
         when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
         var reads = new StoreBackedPipelineWriteTargets(port).capture(port,new StoreBackedPipelineChains(port),pipeline,Optional.empty());
@@ -169,7 +169,7 @@ class SharedSrsObservationRoutingTest {
         var progress=new SrsConsumerProgress(context,1,0,offset,null);
         var state=new SrsChainState(chain,"original-capture",null,2,Set.of("orders"),Set.of("orders"),0,null,null,1,1);
         var scope=new PipelineIntentScope(BUSINESS.clusterId(),BUSINESS.bindingVersion(),BUSINESS.cacheIncarnation(),pipeline.id(),2);
-        when(consumers.planningProgress(scope,chain,Set.of(source.id())))
+        when(consumers.startLoadProgress(scope,chain,Set.of(source.id())))
                 .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,List.of(progress))));
         when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
         when(consumers.attached(chain)).thenThrow(new AssertionError("private-mode planning must not enumerate peer payloads"));
@@ -177,7 +177,7 @@ class SharedSrsObservationRoutingTest {
         assertThat(reads.progressChains().get()).containsExactly(chain);
         assertThat(StartLoad.of(null,pipeline.id(),List.of(reads.progress().apply(chain).orElseThrow()))).isEqualTo(StartLoad.RESUME);
         reads.verify().run();
-        verify(consumers,times(1)).planningProgress(scope,chain,Set.of(source.id()));
+        verify(consumers,times(1)).startLoadProgress(scope,chain,Set.of(source.id()));
         verify(consumers,never()).attached(chain); verifyNoInteractions(captures);
     }
 
@@ -197,7 +197,7 @@ class SharedSrsObservationRoutingTest {
             var context=new SrsConsumerContext(new SrsConsumerKey(descriptor.getValue(),pipeline.id(),descriptor.getKey()),2);
             var offset=new ConsumerOffset(context.key().consumerId(),Map.of("orders",2L),null,List.of(),null,0L,Map.of(),ConsumerProgressKind.SRS);
             var state=new SrsChainState(descriptor.getValue(),"capture",null,2,Set.of("orders"),Set.of("orders"),0,null,null,1,1);
-            when(consumers.planningProgress(scope,descriptor.getValue(),Set.of(descriptor.getKey())))
+            when(consumers.startLoadProgress(scope,descriptor.getValue(),Set.of(descriptor.getKey())))
                     .thenReturn(Optional.of(new SrsConsumerStore.PlanningProgress(state,List.of(new SrsConsumerProgress(context,1,0,offset,null)))));
         }
         when(cache.startPlanningSrs(eq(BUSINESS),any())).thenReturn(new SrsStores(chains,mock(SrsModelStore.class),mock(SrsLogStore.class),consumers));
@@ -206,8 +206,8 @@ class SharedSrsObservationRoutingTest {
         assertThat(reads.progress().apply(physical).orElseThrow().consumerOffsets()).hasSize(1);
         assertThat(reads.progress().apply(preparedSecond.chainId()).orElseThrow().consumerOffsets()).hasSize(1);
         reads.verify().run();
-        verify(consumers,times(1)).planningProgress(scope,physical,Set.of(source.id()));
-        verify(consumers,times(1)).planningProgress(scope,preparedSecond.chainId(),Set.of(second.id()));
+        verify(consumers,times(1)).startLoadProgress(scope,physical,Set.of(source.id()));
+        verify(consumers,times(1)).startLoadProgress(scope,preparedSecond.chainId(),Set.of(second.id()));
         verify(consumers,never()).attached(anyString());
     }
     @Test void aStoppedOldScopeWithoutAnAttachmentDoesNotInheritTheNewScopesConfirmation() {

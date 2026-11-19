@@ -38,6 +38,20 @@ final class PipelineDiagnostics {
         }
     }
 
+    static <T> Supplier<T> branch(Phase phase, Supplier<T> action) {
+        var current = CURRENT.get();
+        if (current == null) return action;
+        var inherited = new LinkedHashMap<>(current.root.facts);
+        inherited.putAll(current.details);
+        int parentSequence = current.sequence;
+        return () -> {
+            try (var span = new Span(null, null, null, phase, null, inherited, parentSequence)) {
+                try { return action.get(); }
+                catch (RuntimeException | Error failed) { span.failed(failed); throw failed; }
+            }
+        };
+    }
+
     static void retention(String capture, Runnable action) {
         try (var span = open(null, capture, Phase.CAPTURE_RETENTION, null)) {
             try { action.run(); }
@@ -151,17 +165,23 @@ final class PipelineDiagnostics {
         private final Map<String, Object> facts;
         private final Map<String, Object> details;
         private final int sequence;
+        private final int linkedParent;
         private int nextSequence;
         private Throwable failure;
         private boolean closed;
 
         private Span() {
             parent = null; root = this; phase = null; started = 0; measurement = null;
-            stage = null; facts = Map.of(); details = Map.of(); sequence = 0;
+            stage = null; facts = Map.of(); details = Map.of(); sequence = 0; linkedParent = 0;
         }
         private Span(Span parent, String pipeline, String capture, Phase phase, Attempt attempt) {
+            this(parent, pipeline, capture, phase, attempt, Map.of(), 0);
+        }
+        private Span(Span parent, String pipeline, String capture, Phase phase, Attempt attempt,
+                Map<String, Object> inherited, int linkedParent) {
             this.parent = parent; this.root = parent == null ? this : parent.root;
             this.phase = phase; this.started = System.nanoTime();
+            this.linkedParent = linkedParent;
             this.measurement = parent == null ? MongoHttpDiagnosticsScope.open() : null;
             this.facts = parent == null ? new LinkedHashMap<>() : root.facts;
             this.details = parent == null ? new LinkedHashMap<>() : new LinkedHashMap<>(parent.details);
@@ -171,6 +191,7 @@ final class PipelineDiagnostics {
                 if (capture != null) facts.put("capture_id", identifier(capture));
                 if (attempt != null && attempt.id != null)
                     facts.put("dispatch_wait_ms", TimeUnit.NANOSECONDS.toMillis(started - attempt.askedAt));
+                facts.putAll(inherited);
             }
             sequence = ++root.nextSequence;
             stage = MongoHttpDiagnosticsScope.phase(phase);
@@ -185,7 +206,7 @@ final class PipelineDiagnostics {
             value.put("thread", identifier(Thread.currentThread().getName()));
             value.put("thread_id", Thread.currentThread().threadId());
             value.put("phase", phase.name()); value.put("span_id", sequence);
-            value.put("parent_span_id", parent == null ? 0 : parent.sequence);
+            value.put("parent_span_id", parent == null ? linkedParent : parent.sequence);
             value.put("edge", edge); value.put("outcome", identifier(outcome));
             value.put("elapsed_ms", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
             if (failure != null) {

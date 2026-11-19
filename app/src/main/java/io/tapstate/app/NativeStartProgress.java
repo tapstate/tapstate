@@ -66,7 +66,7 @@ final class NativeStartProgress {
             String chain=entry.getKey(); var selections=entry.getValue();
             var sourceIds=selections.stream().map(Selection::source).collect(java.util.stream.Collectors.toSet());
             store.planningScope(scope).verify().run();
-            var progress=stores.get().consumers().planningProgress(scope,chain,sourceIds);
+            var progress=stores.get().consumers().startLoadProgress(scope,chain,sourceIds);
             store.planningScope(scope).verify().run();
             if (progress.isEmpty() && selections.stream().anyMatch(Selection::shared)) throw unavailable(chain);
             var attached=new HashSet<String>();

@@ -66,7 +66,7 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
         var beans = context.getDefaultListableBeanFactory();
         beans.setConversionService(org.springframework.boot.convert.ApplicationConversionService.getSharedInstance());
         beans.registerSingleton("nativeBusinessContext", this);
-        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::preparePipeline, true);
+        port = new ThreeLayerStorePort(configuration, original, this::preparePipeline, this::prepareStartIntent, true);
         beans.registerSingleton("storePort", port);
         beans.registerSingleton("storageBindingStore", configuration.bindings());
         var diagnosticCandidate = parent.getBeanProvider(IsolatedConnectionDiagnostics.class).getIfAvailable();
@@ -218,6 +218,10 @@ final class NativeBusinessContext implements StorageRuntime.Business, RuntimeHtt
     private void preparePipeline(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
         original.requireBusiness();
         context.getBean(PipelineFirstStatePreparer.class).prepare(scope, inputs);
+    }
+    private void prepareStartIntent(PipelineIntentScope scope, PipelinePreparationInputs inputs) {
+        original.requireBusiness();
+        context.getBean(PipelineFirstStatePreparer.class).prepareForStartIntent(scope, inputs);
     }
     private StoreBackedDerivedSchemas.Command modelCommand(String pipeline, PipelineActuationOwnership ownership) {
         return modelCommand(pipeline, ownership, false);

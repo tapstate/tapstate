@@ -228,24 +228,32 @@ final class StoreBackedDagSource implements DagSource {
 
     @Override
     public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
+        return prepareStart(pass, defaultDatabase, (connectors, hashes) -> {});
+    }
+
+    @Override
+    public StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase,
+            java.util.function.BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
         Objects.requireNonNull(pass, "pass");
+        Objects.requireNonNull(connectorInputs, "connectorInputs");
         String pipelineId = pass.scope().pipelineId();
         pass.requirePipeline(pipelineId);
         ReadOnlyArtifactSnapshot snapshot = ReadOnlyArtifactSnapshot.captureForStart(artifacts(), pipelineId);
         PipelineResource original = StoredArtifacts.requirePipeline(snapshot, pipelineId);
         if (!io.tapstate.core.model.canonical.CanonicalHash.of(original).equals(pass.intent().desired().revision()))
             throw new TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
-        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(),pass);
+        StartPreparation prepared = prepareCapturedStart(snapshot, pipelineId, defaultDatabase, pass.derivedSchemas(), pass, connectorInputs);
         pass.requirePipeline(pipelineId);
         return prepared;
     }
 
     private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot, String pipelineId, String defaultDatabase,
             io.tapstate.spi.store.DerivedSchemaStore records) {
-        return prepareCapturedStart(snapshot,pipelineId,defaultDatabase,records,null);
+        return prepareCapturedStart(snapshot, pipelineId, defaultDatabase, records, null, (connectors, hashes) -> {});
     }
     private StartPreparation prepareCapturedStart(ReadOnlyArtifactSnapshot snapshot,String pipelineId,String defaultDatabase,
-            io.tapstate.spi.store.DerivedSchemaStore records,PipelineConvergencePass pass) {
+            io.tapstate.spi.store.DerivedSchemaStore records, PipelineConvergencePass pass,
+            java.util.function.BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
         PipelineResource pipeline = PipelineInlining.inline(StoredArtifacts.requirePipeline(snapshot,pipelineId),snapshot);
         var sources = pipeline.sourceIds().stream().distinct().map(id -> StoredArtifacts.requireSource(snapshot,id)).toList();
         SourceModelSnapshot models = SourceModelSnapshot.capture(pipelineId,sources,storePort.schemas());
@@ -257,6 +265,8 @@ final class StoreBackedDagSource implements DagSource {
                 storePort, sinkWriterBinder, nestSettings, storeReachability, sourcePlacement, snapshot,
                 requireMarkedStore, members, parallelismBudget, records, models::model, boundedLoads, CapturedStartGuard.NONE, initialReceipts);
         captured.validateStart(pipelineId);
+        Map<String, String> sinkConnectors = captured.sinkConnectors(pipelineId);
+        connectorInputs.accept(Set.copyOf(sinkConnectors.values()), inspection.connectorHashes());
         PreparedOperators operators = pass == null ? null : captured.prepareOperators(pipeline,defaultDatabase,pass);
         NestCapacity capacity = operators == null ? captured.capacityOf(pipelineId) : NestCapacity.none();
         Set<OperatorStateLocation> locations = operators == null ? captured.stateLocations(pipelineId,defaultDatabase) : Set.of();
@@ -265,7 +275,7 @@ final class StoreBackedDagSource implements DagSource {
         boolean freshFullLoad = pass == null && captured.freshFullLoad(pipeline);
         return new StartPreparation(
                 capacity, locations, Optional.of(snapshot),
-                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), captured.sinkConnectors(pipelineId),
+                () -> captured.plannedTopology(pipelineId,pipeline,freshFullLoad,operators), sinkConnectors,
                 Optional.of(models),Optional.ofNullable(operators).map(PreparedOperators::coordinates),inspection.connectorHashes());
     }
 

@@ -84,6 +84,9 @@ class ScopedEngineLifecycleActuatorTest {
                     events.add("build"); return new DagSource.PlannedDag(new DAG(),ExecutionShape.totalOne(),List.of("node"),Map.of(),Map.of());
                 }),Map.of(),Optional.of(SourceModelSnapshot.capture("p",List.of(),mock(SchemaStore.class))),Optional.of(coordinates));
         when(dags.prepareStart(eq(pass),eq("cache"))).thenAnswer(call -> { events.add("prepare"); return preparation; });
+        when(dags.prepareStart(any(PipelineConvergencePass.class), anyString(), any())).thenCallRealMethod();
+        when(fixedCapture.prepareCaptureStart(anyString(), any(ArtifactStore.class), any(SourceModelSnapshot.class)))
+                .thenCallRealMethod();
     }
     private ScopedEngineLifecycleActuator.Ports ports() {
         return new ScopedEngineLifecycleActuator.Ports((original,capacities,members,guard) -> {
@@ -411,6 +414,70 @@ class ScopedEngineLifecycleActuatorTest {
         verify(fixedCapture,never()).startCapture(anyString(),any(ArtifactStore.class),any(SourceModelSnapshot.class));
         verify(engine,never()).submitRun(anyString(),any(),anyMap(),any(),any(OperatorRunManifest.class));
     }
+    @Test void connectorReadinessOverlapsPlanningButOldRunWaitsForBoth() {
+        var checking = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var checked = new AtomicBoolean();
+        ConnectorReadiness readiness = (pipelineId, ids) -> {
+            assertThat(ids).containsExactly("sink");
+            checking.countDown();
+            await(release);
+            checked.set(true);
+            return Set.of();
+        };
+        doAnswer(call -> {
+            call.<java.util.function.BiConsumer<Set<String>, Map<String, String>>>getArgument(2)
+                    .accept(Set.of("sink"), Map.of());
+            try {
+                await(checking);
+                verify(previous, never()).cancel();
+                var p = preparation;
+                return new DagSource.StartPreparation(p.capacity(), p.stateLocations(), p.artifactSnapshot(), p.planner(),
+                        Map.of("target", "sink"), p.sourceModels(), p.operatorPlan());
+            } finally {
+                release.countDown();
+            }
+        }).when(dags).prepareStart(eq(pass), eq("cache"), any());
+        when(previous.awaitTerminal(any())).thenAnswer(call -> {
+            assertThat(checked.get()).isTrue();
+            return true;
+        });
+        new ScopedEngineLifecycleActuator(pass, engine, dags, captures, ownership, "cache",
+                readiness, Clock.systemUTC(), ports(), submissions).start("p");
+        verify(previous).cancel();
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    @Test void readOnlyCaptureInputsOverlapMapsAndCaptureOpensOnlyAfterBoth() {
+        var preparingCapture = new java.util.concurrent.CountDownLatch(1);
+        var mapsReady = new java.util.concurrent.CountDownLatch(1);
+        doAnswer(call -> {
+            preparingCapture.countDown();
+            await(mapsReady);
+            return (Runnable) () -> fixedCapture.startCapture("p", call.getArgument(1), call.getArgument(2));
+        }).when(fixedCapture).prepareCaptureStart(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        onPrepare = () -> {
+            try {
+                await(preparingCapture);
+                verify(fixedCapture, never()).startCapture(anyString(), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+            } finally {
+                mapsReady.countDown();
+            }
+        };
+        actuator().start("p");
+        verify(fixedCapture).startCapture(eq("p"), any(ArtifactStore.class), any(SourceModelSnapshot.class));
+        verify(engine).submitRun(eq("p"), any(), anyMap(), any(), any(OperatorRunManifest.class));
+    }
+
+    private static void await(java.util.concurrent.CountDownLatch step) {
+        try {
+            assertThat(step.await(5, java.util.concurrent.TimeUnit.SECONDS)).isTrue();
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError(interrupted);
+        }
+    }
+
     @Test void aTopologyWithoutAnOriginalMemberSnapshotCannotStartCapture() {
         preparation = new DagSource.StartPreparation(preparation.capacity(),Set.of(),preparation.artifactSnapshot(),
                 () -> fence -> new DagSource.PlannedDag(new DAG(),ExecutionShape.totalOne(),List.of("node"),Map.of(),Map.of()),

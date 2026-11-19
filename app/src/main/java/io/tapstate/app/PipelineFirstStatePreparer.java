@@ -65,6 +65,12 @@ final class PipelineFirstStatePreparer {
         cache.verifySources(original,inputs); requireActive.run(); return result;
     }
 
+    /** Keeps CONFIG admission and preparation; the owning startup verifies retained CACHE sources. */
+    void prepareForStartIntent(PipelineIntentScope original, PipelinePreparationInputs inputs) {
+        prepareAttempt(original, Objects.requireNonNull(inputs, "inputs"), null, () -> {});
+        requireActive.run();
+    }
+
     void prepareDeferred(io.tapstate.spi.store.PipelineIntentStore.PendingStart pending) {
         var scope = pending.intent().scope();
         if (!business.equals(new CacheBusinessScope(scope.clusterId(), scope.bindingVersion(), scope.cacheIncarnation()))) throw fenced();

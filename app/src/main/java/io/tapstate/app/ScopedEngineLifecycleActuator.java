@@ -134,15 +134,20 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         requireId(pipeline); engine.refuseIfLost(id());
         DagSource.StartPreparation prepared;
         Set<String> shared;
-        try {
+        try (var readiness = new PipelineStartWork<Set<String>>()) {
             try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_DAG_PREPARE)) {
-                prepared = dags.prepareStart(pass,defaultDatabase); requireLocal();
+                prepared = dags.prepareStart(pass, defaultDatabase, (ids, hashes) -> {
+                    if (!ids.isEmpty()) {
+                        readiness.tryStart(PipelineDiagnostics.branch(Phase.PIPELINE_CONNECTORS,
+                                () -> checkConnectors(ids, hashes)));
+                    }
+                });
+                requireLocal();
                 if (prepared.operatorPlan().isEmpty() || prepared.artifactSnapshot().isEmpty() || prepared.sourceModels().isEmpty()) throw fenced();
             }
-            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CONNECTORS)) {
-                shared = Set.copyOf(prepared.connectorHashes().isEmpty()?connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values())):
-                    connectors.requireEveryMemberCanLoad(id(),Set.copyOf(prepared.sinkConnectors().values()),prepared.connectorHashes())); requireLocal();
-            }
+            shared = readiness.awaitOrRun(() -> PipelineDiagnostics.measure(id(), Phase.PIPELINE_CONNECTORS,
+                    () -> checkConnectors(Set.copyOf(prepared.sinkConnectors().values()), prepared.connectorHashes())));
+            requireLocal();
         } catch (TapstateException refused) {
             ownership.startRefusedBeforeItsRun(pass.scope(),command); throw refused;
         }
@@ -168,13 +173,22 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             }
             var planned = prepared.plan(); requireLocal();
             var members = planned.members();
-            try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_MAPS)) {
-                ports.operators().prepare(manifest,prepared.operatorPlan().orElseThrow().capacities(),members,this::require);
+            Runnable openCapture;
+            try (var captureInputs = new PipelineStartWork<Runnable>()) {
+                java.util.function.Supplier<Runnable> prepareCapture = () -> capture.prepareCaptureStart(id(),
+                        prepared.artifactSnapshot().orElseThrow(), prepared.sourceModels().orElseThrow());
+                captureInputs.tryStart(PipelineDiagnostics.branch(Phase.PIPELINE_CAPTURE_INPUTS, prepareCapture));
+                try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_OPERATOR_MAPS)) {
+                    ports.operators().prepare(manifest, prepared.operatorPlan().orElseThrow().capacities(), members, this::require);
+                }
+                openCapture = captureInputs.awaitOrRun(() ->
+                        PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_INPUTS, prepareCapture));
             }
             try {
                 require();
                 PipelineDiagnostics.measure(id(), Phase.PIPELINE_CAPTURE_START, () -> {
-                    capture.startCapture(id(),prepared.artifactSnapshot().orElseThrow(),prepared.sourceModels().orElseThrow()); return null;
+                    openCapture.run();
+                    return null;
                 });
             } catch (RingNotOpenYet waiting) { PipelineDiagnostics.event("waiting_for_capture_ring"); return; }
             try (var timing = PipelineDiagnostics.phase(Phase.PIPELINE_CAPTURE_BIND)) {
@@ -211,6 +225,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             }
             throw failed;
         }
+    }
+
+    private Set<String> checkConnectors(Set<String> ids, java.util.Map<String, String> hashes) {
+        return Set.copyOf(hashes.isEmpty() ? connectors.requireEveryMemberCanLoad(id(), ids)
+                : connectors.requireEveryMemberCanLoad(id(), ids, hashes));
     }
 
     /** Failed-start cleanup uses only the handles captured by that start, even after command revocation. */

@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 
 /**
@@ -44,6 +45,15 @@ interface DagSource {
     /** Scope-aware assembly must be explicitly implemented; it never falls back to a bare Pipeline id. */
     default StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase) {
         throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED, Map.of(), null);
+    }
+
+    /** Starts connector readiness once this attempt has fixed its sink connector identities. */
+    default StartPreparation prepareStart(PipelineConvergencePass pass, String defaultDatabase,
+            BiConsumer<Set<String>, Map<String, String>> connectorInputs) {
+        Objects.requireNonNull(connectorInputs, "connectorInputs");
+        var prepared = prepareStart(pass, defaultDatabase);
+        connectorInputs.accept(Set.copyOf(prepared.sinkConnectors().values()), prepared.connectorHashes());
+        return prepared;
     }
 
     /**

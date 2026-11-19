@@ -34,6 +34,11 @@ interface PipelineCaptureCoordinator {
         boolean hasPreparedModels(Runnable requireActive);
     }
 
+    /** Prepares read-only inputs; the returned action opens the original capture only after readiness. */
+    default Runnable prepareCaptureStart(String pipeline, ArtifactStore artifacts, SourceModelSnapshot models) {
+        return () -> startCapture(pipeline, artifacts, models);
+    }
+
     /** A scoped lifecycle captures the original run separately from its current command authority. */
     default PipelineCaptureCoordinator forRun(io.tapstate.spi.store.PipelineIntentScope commandScope, io.tapstate.spi.store.WorkloadClaimFence command, ExecutionFence original) {
         throw new io.tapstate.core.common.TapstateException(io.tapstate.spi.store.IoError.PIPELINE_INTENT_FENCED,java.util.Map.of(),null);

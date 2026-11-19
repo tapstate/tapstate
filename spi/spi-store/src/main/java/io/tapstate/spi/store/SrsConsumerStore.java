@@ -50,6 +50,11 @@ public interface SrsConsumerStore {
         return Optional.of(new PlanningProgress(held.chain(), selected));
     }
 
+    /** Predicts only this start's load mode; complete chain integrity is verified during startup. */
+    default Optional<PlanningProgress> startLoadProgress(PipelineIntentScope original, String chain, Set<String> sourceIds) {
+        return planningProgress(original, chain, sourceIds);
+    }
+
     default AttachedChain attachedWithChain(String chain) {
         throw new UnsupportedOperationException("combined Capture topology is not supported");
     }
@@ -105,6 +110,12 @@ public interface SrsConsumerStore {
      */
     default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable) {
         throw new UnsupportedOperationException("Capture startup sampling is not supported");
+    }
+
+    /** The first source on a shared chain also verifies its complete membership control closure. */
+    default Optional<StartupSnapshot> startupSnapshot(SrsConsumerContext context, Map<String, String> ringsByTable,
+            boolean verifyControlClosure) {
+        return startupSnapshot(context, ringsByTable);
     }
 
     /** The exact progress committed by an admitted startup's conditional write. */

@@ -58,6 +58,138 @@ class MongoSrsConsumerStoreIT {
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
     @ParameterizedTest
+    @CsvSource({"1,1", "2,8", "2,80"})
+    void loadPredictionReadsOnlyOriginalConsumersWithoutPeerOrModelScans(int ownSources, int peers) {
+        withBusiness(f -> {
+            var expected = new java.util.ArrayList<io.tapstate.spi.store.SrsConsumerProgress>();
+            for (int i = 0; i < ownSources; i++) {
+                var context = i == 0 ? A : context(A.key().pipelineId(), "second-source", A.stateGeneration());
+                f.consumers().attach(context, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+                expected.add(f.consumers().progress(context).orElseThrow());
+            }
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            var records = new MongoSrsConsumerRecords(SCOPE);
+            for (int i = 1; i < peers; i++) {
+                var context = context("peer-" + i, "other-source", 1);
+                var fence = new WorkloadClaimFence(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.PIPELINE_ACTUATION,
+                        context.key().pipelineId()), f.pipelineB().owner(), 1, 1, 1);
+                var member = new io.tapstate.spi.store.SrsConsumerMembership(context, 1, false, Set.of("orders"), fence);
+                SystemCollections.SRS_CONSUMERS.on(f.database()).insertOne(records.membership(member));
+                SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).insertOne(records.cursor(member,
+                        records.initial(context.key(), Set.of("orders")), 0));
+            }
+            if (peers > 1) SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id", CHAIN),
+                    new Document("$inc", new Document("consumerCount", (long) peers - 1).append("consumerRevision", (long) peers - 1)));
+            var sources = expected.stream().map(v -> v.context().key().sourceId()).collect(java.util.stream.Collectors.toSet());
+            var commands = new java.util.ArrayList<String>();
+            MongoCommandObservation.COLLECTIONS.set((name, collection) -> commands.add(name + ":" + collection));
+            try {
+                var admitted = new MongoSrsConsumerStore(f.client(), f.database(), SCOPE, () -> {}, () -> {});
+                var actual = admitted.startLoadProgress(positionScope(A), CHAIN, sources).orElseThrow();
+                assertThat(actual.consumers()).containsExactlyInAnyOrderElementsOf(expected);
+                assertThat(commands).hasSize(5);
+                assertThat(commands.stream().filter(v -> v.equals("find:srs_consumers"))).hasSize(1);
+                assertThat(commands.stream().filter(v -> v.equals("find:srs_consumer_offsets"))).hasSize(1);
+                assertThat(commands).noneMatch(v -> v.contains("srs_models") || v.contains("srs_events") || v.startsWith("getMore:"));
+                System.out.println("LIGHT_START_PROGRESS own=" + ownSources + " peers=" + peers + " commands=" + commands.size());
+            } finally { MongoCommandObservation.COLLECTIONS.remove(); }
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"peer-cursor", "revision-sum", "model"})
+    void startupVerifiesIntegrityDeferredByTheLoadPrediction(String fault) {
+        withBusiness(f -> {
+            var refs = publishSnapshotModels(f, Set.of("orders"));
+            f.chains().requestTables(CHAIN, Set.of("orders"), f.captureFence());
+            assertThat(f.chains().publishServingTables(CHAIN, 1, Set.of("orders"), f.captureFence())).isTrue();
+            var checkpoint = new io.tapstate.spi.store.SrsCaptureCheckpoint(new ChainPosition(SourceOrder.snapshotRow(1), "original"),
+                    Map.of("orders", new io.tapstate.spi.store.SrsTableCheckpoint(refs.get("orders"), -1)), true);
+            f.chains().checkpoint(CHAIN, 0, checkpoint, f.captureFence()).orElseThrow();
+            var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            f.consumers().pinSnapshot(A, member.revision(), 0, new SrsSnapshotPin(1, "original", refs), f.fenceA());
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            switch (fault) {
+                case "peer-cursor" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(B));
+                case "revision-sum" -> SystemCollections.SRS_CHAINS.on(f.database()).updateOne(new Document("_id", CHAIN),
+                        new Document("$inc", new Document("consumerRevision", 1L)));
+                case "model" -> SystemCollections.SRS_MODELS.on(f.database()).deleteMany(new Document());
+                default -> throw new AssertionError(fault);
+            }
+            var read = f.consumers().startLoadProgress(positionScope(A), CHAIN, Set.of(A.key().sourceId())).orElseThrow();
+            assertThat(read.consumers()).hasSize(1);
+            assertThat(io.tapstate.spi.store.StartLoad.of(io.tapstate.core.model.ReadMode.SNAPSHOT_AND_CDC,
+                    A.key().pipelineId(), List.of(new io.tapstate.spi.store.SrsMeta(CHAIN, null,
+                    read.consumers().stream().map(io.tapstate.spi.store.SrsConsumerProgress::cursor).toList(),
+                    List.of(), read.chain().retention(), read.chain().epoch(), null))))
+                    .isEqualTo(io.tapstate.spi.store.StartLoad.RESUME);
+            assertThatThrownBy(() -> f.consumers().startupSnapshot(A, Map.of(), true)).isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"absent", "detached-current", "detached-older"})
+    void lightLoadPredictionKeepsANewConsumerDistinctFromAnExistingProgress(String absence) {
+        withBusiness(f -> {
+            var requested = A;
+            if (!absence.equals("absent")) {
+                var member = f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+                f.consumers().detach(A, member.revision(), f.fenceA()).orElseThrow();
+                if (absence.equals("detached-older")) {
+                    requested = new SrsConsumerContext(A.key(), 2);
+                    replacePipelineScope(f, requested);
+                }
+            }
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(B),
+                    new Document("$set", new Document("contentHash", "damaged-peer-payload")));
+            assertThat(f.consumers().startLoadProgress(positionScope(requested), CHAIN, Set.of(A.key().sourceId()))
+                    .orElseThrow().consumers()).isEmpty();
+        });
+    }
+
+    @Test
+    void lightLoadPredictionDoesNotTreatReorderedOwnIdsAsMissingProgress() {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            var membershipTable = SystemCollections.SRS_CONSUMERS.on(f.database());
+            var cursorTable = SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database());
+            var membership = membershipTable.find(id(A)).first();
+            var cursor = cursorTable.find(id(A)).first();
+            var reordered = new Document();
+            for (String key : new java.util.ArrayList<>(membership.get("_id", Document.class).keySet()).reversed())
+                reordered.put(key, membership.get("_id", Document.class).get(key));
+            membershipTable.deleteOne(id(A));
+            membershipTable.insertOne(new Document(membership).append("_id", reordered));
+            cursorTable.deleteOne(id(A));
+            cursorTable.insertOne(new Document(cursor).append("_id", reordered));
+            assertThatThrownBy(() -> f.consumers().startLoadProgress(positionScope(A), CHAIN, Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+            assertThatThrownBy(() -> f.consumers().planningProgress(positionScope(A), CHAIN, Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"cursor", "membership", "hash", "generation"})
+    void lightLoadPredictionRetainsOriginalConsumerRefusals(String fault) {
+        withBusiness(f -> {
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            switch (fault) {
+                case "cursor" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).deleteOne(id(A));
+                case "membership" -> SystemCollections.SRS_CONSUMERS.on(f.database()).deleteOne(id(A));
+                case "hash" -> SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.on(f.database()).updateOne(id(A),
+                        new Document("$set", new Document("contentHash", "damaged")));
+                case "generation" -> replacePipelineScope(f, new SrsConsumerContext(A.key(), 2));
+                default -> throw new AssertionError(fault);
+            }
+            var original = fault.equals("generation") ? new SrsConsumerContext(A.key(), 2) : A;
+            assertThatThrownBy(() -> f.consumers().startLoadProgress(positionScope(original), CHAIN, Set.of(A.key().sourceId())))
+                    .isInstanceOf(TapstateException.class);
+        });
+    }
+
+    @ParameterizedTest
     @CsvSource({"1,1", "1,8", "2,8", "2,80"})
     void startPredictionReadsOnlyItsOwnSourceCursorsInOneSnapshot(int ownSources, int peers) {
         withBusiness(f -> {

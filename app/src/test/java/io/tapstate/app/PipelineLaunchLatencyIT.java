@@ -274,7 +274,10 @@ class PipelineLaunchLatencyIT {
                             assertThat(observation.get("complete")).isEqualTo(true);
                             var collections=(Map<?,?>)observation.get("collections");
                             assertThat(((Number)collections.get("find:" + io.tapstate.adapters.mongostore.SystemCollections.CACHE_SRS_CONSUMER_OFFSETS.collectionName())).intValue())
-                                    .as("the real HTTP restart reads cursor headers and one own payload batch").isEqualTo(2);
+                                    .as("the real HTTP restart reads only the current Pipeline's cursor batch").isEqualTo(1);
+                            assertThat(collections.keySet().stream().map(Object::toString).toList()).doesNotContain(
+                                    "find:" + io.tapstate.adapters.mongostore.SystemCollections.SRS_MODELS.collectionName(),
+                                    "find:" + io.tapstate.adapters.mongostore.SystemCollections.SRS_EVENTS.collectionName());
                         });
                         var checks=(Map<?,?>)restarted.get("startChecks");
                         assertThat((List<?>)checks.get("plan")).isNotEmpty()
