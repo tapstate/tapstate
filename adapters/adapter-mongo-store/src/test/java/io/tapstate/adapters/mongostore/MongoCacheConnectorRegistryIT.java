@@ -494,6 +494,25 @@ class MongoCacheConnectorRegistryIT {
     }
 
     private static Runnable guard(AtomicBoolean live) { return () -> { if (!live.get()) throw MongoCacheBusinessIdentity.businessFenced(); }; }
+    @Test void oneExactReadinessLookupUsesOneThreeCommandTransaction() {
+        withFixture(f -> {
+            var registered = f.registry().register("example", "1", RegistrationSource.SEED, JAR).registration();
+            var commands = new java.util.ArrayList<String>();
+            var listener = new CommandListener() {
+                @Override public void commandStarted(CommandStartedEvent event) { commands.add(event.getCommandName()); }
+            };
+            try (var observed = client(listener)) {
+                var registry = f.registry(observed, ACTIVE);
+                assertThat(registry.list()).containsExactly(registered);
+                assertThat(registry.findAll("example")).containsExactly(registered);
+                assertThat(commands).hasSize(6);
+                commands.clear();
+                assertThat(registry.findAll("example")).containsExactly(registered);
+                assertThat(commands).containsExactly("aggregate", "find", "commitTransaction");
+            }
+        });
+    }
+
     private static CommandListener publicationBarrier(CountDownLatch staged, CountDownLatch proceed) {
         var once = new AtomicBoolean(); return new CommandListener() { @Override public void commandStarted(CommandStartedEvent e) {
             if (updates(e, "cache_identity") && once.compareAndSet(false, true)) { staged.countDown(); await(proceed); }

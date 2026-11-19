@@ -49,6 +49,40 @@ class RegistryConnectorProvisionerTest {
         assertSafeLoadFailure(() -> provisioner.resolveCaptureStartup("orders"));
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {false, true})
+    void readinessOfAnAlreadyStagedJarUsesOneFreshRegistrationRead(boolean loadSeedInPlace, @TempDir Path dir) throws IOException {
+        byte[] first = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("first")));
+        byte[] second = Files.readAllBytes(Synthetic.annotatedEmittingConnector(dir.resolve("second")));
+        var registry = org.mockito.Mockito.spy(new InMemoryConnectorRegistry());
+        var registered = registry.register("orders", "1.3.5", RegistrationSource.SEED, first).registration();
+        Path seeds = Files.createDirectories(dir.resolve("seeds"));
+        Files.write(seeds.resolve("orders-connector.jar"), first);
+        var provisioner = new RegistryConnectorProvisioner(registry, new ConnectorIntrospector(), dir.resolve("plugins"), seeds, loadSeedInPlace);
+        var initial = provisioner.resolve("orders");
+        org.mockito.Mockito.clearInvocations(registry);
+        registry.shareSafe.put(registered.contentHash(), "v1");
+        var warm = provisioner.resolveForReadiness("orders", null);
+        assertThat(warm.contentHash()).isEqualTo(initial.contentHash());
+        assertThat(warm.shareSafe()).isTrue();
+        org.mockito.Mockito.verify(registry).findAll("orders");
+        assertThat(registry.artifactCalls).isZero();
+
+        registry.shareSafe.clear();
+        registry.register("orders", "2.0.8", RegistrationSource.REGISTER, second);
+        assertThatThrownBy(() -> provisioner.resolveForReadiness("orders", null))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ConnectorError.AMBIGUOUS_REGISTRATION));
+        assertThat(provisioner.resolveForReadiness("orders", initial.contentHash()).shareSafe()).isFalse();
+        org.mockito.Mockito.doReturn(List.of()).when(registry).findAll("orders");
+        assertThatThrownBy(() -> provisioner.resolveForReadiness("orders", initial.contentHash()))
+                .isInstanceOfSatisfying(TapstateException.class,
+                        error -> assertThat(error.code()).isEqualTo(ConnectorError.NOT_REGISTERED));
+        org.mockito.Mockito.doReturn(List.of(registered)).when(registry).findAll("orders");
+        Files.writeString(initial.classpath().getFirst(), "damaged cache");
+        assertSafeLoadFailure(() -> provisioner.resolveForReadiness("orders", initial.contentHash()));
+    }
+
     @Test
     void captureStartupReusesInspectionOnlyForARegisteredAndVerifiedArtifact(@TempDir Path dir) throws IOException {
         byte[] bytes = Files.readAllBytes(Synthetic.annotatedConnector(dir.resolve("source")));

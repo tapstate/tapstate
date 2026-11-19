@@ -28,6 +28,11 @@ public interface ConnectorProvisioner {
         return ref;
     }
 
+    /** Checks a member's current readiness, optionally requiring the exact retained hash. */
+    default ConnectorRef resolveForReadiness(String connectorId, String retainedHash) {
+        return retainedHash == null ? resolve(connectorId) : resolve(connectorId, retainedHash);
+    }
+
     /** Resolves only the connector needed by the current Capture startup. */
     default ConnectorRef resolveCaptureStartup(String connectorId) { return resolve(connectorId); }
 
