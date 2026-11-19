@@ -429,7 +429,9 @@ class ControlPlaneConfiguration {
                         new NestSizingAdvisories(settings.entriesHeldInMemory()),
                         new DocumentKeyAdvisories(),
                         new ExecutionAdvisories()),
-                derivation, livePipelines, attribution, stateDatabasePolicy);
+                derivation, livePipelines, attribution, stateDatabasePolicy,
+                stateDatabasePolicy == StateDatabasePolicy.CLOUD ? DeploymentProfile.CLOUD : DeploymentProfile.ON_PREM,
+                connectorCatalogView::detail);
     }
 
     /** Preserves the direct assembly seam used by focused on-prem wiring tests. */

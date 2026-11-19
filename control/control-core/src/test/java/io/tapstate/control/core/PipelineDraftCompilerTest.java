@@ -61,6 +61,23 @@ class PipelineDraftCompilerTest {
     }
 
     @Test
+    void compilesOneOverrideForAllWizardTablesOfTheSameSource() {
+        PipelineDraft template = wizardDraft();
+        PipelineDraft.Wizard wizard = template.wizard();
+        PipelineDraft configured = new PipelineDraft(template.pipelineId(), template.schemaVersion(),
+                template.revision(), template.mode(), template.name(), template.description(), null,
+                new PipelineDraft.Wizard(wizard.root(), wizard.related(), wizard.transforms(), wizard.output(),
+                        Map.of("crm", Map.of("preImage", false))),
+                template.baseArtifactHash(), template.publishedDraftRevision(), template.publishedArtifactHash(),
+                template.createdAt(), template.updatedAt(), template.updatedBy());
+
+        PipelineResource compiled = compiler.compile(configured);
+
+        assertThat(compiled.sourceIds()).containsExactly("crm");
+        assertThat(compiled.sources().getFirst().nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
+    }
+
+    @Test
     void compileIsAStableCanonicalFixedPoint() {
         PipelineDraft draft = wizardDraft();
         CanonicalWriter writer = new CanonicalWriter();
@@ -310,7 +327,7 @@ class PipelineDraftCompilerTest {
                         new PipelineDraft.Edge("source-to-filter", "source-orders", "active-orders"),
                         new PipelineDraft.Edge("filter-to-view", "active-orders", "orders-view"),
                         new PipelineDraft.Edge("filter-to-target", "active-orders", "warehouse-orders")),
-                new PipelineDraft.Viewport(0, 0, 1));
+                new PipelineDraft.Viewport(0, 0, 1), Map.of("crm", Map.of("preImage", false)));
         PipelineDraft draft = new PipelineDraft("orders", 1, 1, PipelineDraft.Mode.DAG,
                 "Orders", "", graph, null, null, null, null,
                 java.time.Instant.parse("2026-09-21T00:00:00Z"),
@@ -319,6 +336,7 @@ class PipelineDraftCompilerTest {
         PipelineResource compiled = compiler.compile(draft);
 
         assertThat(compiled.sources()).extracting(source -> source.id()).containsExactly("crm");
+        assertThat(compiled.sources().getFirst().nodeConfig()).containsExactlyEntriesOf(Map.of("preImage", false));
         assertThat(compiled.transforms()).extracting(Step::id).containsExactly("active-orders");
         assertThat(compiled.view()).isEqualTo(new ViewBlock.Inline(
                 "orders_view", io.tapstate.core.model.FromRef.literal("active-orders"), null, null));

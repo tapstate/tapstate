@@ -148,7 +148,7 @@ class StoreBackedDagSourceTest {
         Step.Inline filter = Step.inline("filter", FromClause.list(FromRef.literal("orders_src.orders")),
                 new TransformBody.Filter("true"), null);
         PipelineResource pipeline = new PipelineResource("preview_pipeline", null,
-                List.of(SourceRef.spec("orders_src", true)), List.of(filter),
+                List.of(new SourceRef.Spec("orders_src", true, Map.of("preImage", false))), List.of(filter),
                 new ViewBlock.Inline("orders_view", FromRef.literal("filter"), "id", null),
                 null, null, null);
         StoreBackedDagSource dagSource = new StoreBackedDagSource(store, io.tapstate.runtime.engine.nest.NestSettings
@@ -156,6 +156,7 @@ class StoreBackedDagSourceTest {
 
         assertThat(dagSource.previewSourceTables(pipeline)).singleElement().satisfies(table -> {
             assertThat(table.sourceKey()).isEqualTo("orders_src");
+            assertThat(table.settings()).containsEntry("preImage", false);
             assertThat(table.schema().fields()).extracting(io.tapstate.spi.capture.FieldSchema::name)
                     .containsExactly("id");
         });

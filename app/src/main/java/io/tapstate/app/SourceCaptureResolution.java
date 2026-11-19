@@ -53,7 +53,7 @@ record SourceCaptureResolution(
         boolean direct = pipeline.sources().stream().anyMatch(ref -> ref.id().equals(source.id())
                 && ref instanceof SourceRef.Spec spec && !spec.srs());
         return tables.isEmpty() ? Optional.empty()
-                : Optional.of(withTables(source, tables).scopedTo(pipeline.id(), !direct));
+                : Optional.of(withTables(source, tables, pipeline).scopedTo(pipeline.id(), !direct));
     }
 
     /** Current diagnostic reads use the actual attached scope; retained run handles keep their original namespace. */
@@ -93,7 +93,13 @@ record SourceCaptureResolution(
     }
 
     private static SourceCaptureResolution withTables(SourceResource source, List<String> tables) {
-        CaptureConfig config = new CaptureConfig(source.connector(), source.config(), tables);
+        return withTables(source, tables, null);
+    }
+
+    private static SourceCaptureResolution withTables(SourceResource source, List<String> tables, PipelineResource pipeline) {
+        var settings = pipeline == null ? source.config() : io.tapstate.core.model.PipelineSourceConfig.settings(pipeline, source);
+        var overrides = pipeline == null ? java.util.Map.<String,Object>of() : io.tapstate.core.model.PipelineSourceConfig.overrides(pipeline, source);
+        CaptureConfig config = new CaptureConfig(source.connector(), settings, tables, null, null, overrides);
         String srsKey = source.srs() != null ? source.srs().key() : null;
         return new SourceCaptureResolution(
                 source.id(), config, tables, srsKey, MiningChainId.resolve(config, srsKey));

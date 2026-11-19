@@ -67,10 +67,16 @@ public final class PipelineRepresentation {
                 .equals(sourceSummaries.stream().map(PipelineSourceSummary::id).toList())) {
             throw new IllegalArgumentException("source summaries must match declared pipeline source references");
         }
+        Map<String, Map<String, Object>> nodeConfigs = new LinkedHashMap<>();
+        pipeline.sources().forEach(ref -> nodeConfigs.put(ref.id(), ref.nodeConfig()));
+        List<PipelineSourceSummary> summaries = sourceSummaries.stream()
+                .map(source -> new PipelineSourceSummary(source.id(), source.metadata(), source.connector(),
+                        source.resolved(), nodeConfigs.get(source.id())))
+                .toList();
         return new PipelineView(
                 pipeline.id(),
                 pipeline.metadata(),
-                sourceSummaries,
+                summaries,
                 transformViews(pipeline.transforms()),
                 viewValue(pipeline.view()),
                 serveValue(pipeline.serve()),
@@ -92,9 +98,7 @@ public final class PipelineRepresentation {
             return new PipelineResource(
                     input.id(),
                     input.metadata(),
-                    sourceIds(input.sources()).stream()
-                            .map(id -> (SourceRef) SourceRef.bare(id))
-                            .toList(),
+                    sourceRefs(input.sources(), existing),
                     transforms(input.transforms()),
                     view(input.view()),
                     serve(input.serve()),
@@ -108,19 +112,29 @@ public final class PipelineRepresentation {
         }
     }
 
-    private static List<String> sourceIds(List<Object> values) {
-        List<String> ids = new ArrayList<>(values.size());
+    private static List<SourceRef> sourceRefs(List<Object> values, PipelineResource existing) {
+        Map<String, Map<String, Object>> previous = new LinkedHashMap<>();
+        if (existing != null) {
+            existing.sources().forEach(ref -> previous.put(ref.id(), ref.nodeConfig()));
+        }
+        List<SourceRef> sources = new ArrayList<>(values.size());
         for (int index = 0; index < values.size(); index++) {
             Object value = values.get(index);
+            String path = "sources[" + index + "]";
             if (value instanceof PipelineSourceSummary summary) {
-                ids.add(summary.id());
+                sources.add(SourceRef.of(summary.id(), null, summary.nodeConfig()));
             } else if (value instanceof Map<?, ?>) {
-                ids.add(requiredText(object(value, "sources[" + index + "]"), "id", "sources[" + index + "]"));
+                Map<String, Object> fields = object(value, path);
+                String id = requiredText(fields, "id", path);
+                Map<String, Object> nodeConfig = fields.containsKey("nodeConfig")
+                        ? copyJson(object(fields.get("nodeConfig"), path + ".nodeConfig")) : previous.get(id);
+                sources.add(SourceRef.of(id, null, nodeConfig));
             } else {
-                ids.add(requiredString(value, "sources[" + index + "]"));
+                String id = requiredString(value, path);
+                sources.add(SourceRef.of(id, null, previous.get(id)));
             }
         }
-        return List.copyOf(ids);
+        return List.copyOf(sources);
     }
 
     private static List<Step> transforms(List<Map<String, Object>> values) {

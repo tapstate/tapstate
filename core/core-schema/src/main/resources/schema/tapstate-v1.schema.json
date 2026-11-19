@@ -752,7 +752,7 @@
       ]
     },
     "SourceRef": {
-      "description": "A source this pipeline reads from: a bare source id, or an object carrying its srs switch.",
+      "description": "A source this pipeline reads from: a bare source id or a reference with local settings.",
       "oneOf": [
         {
           "type": "string"
@@ -764,20 +764,24 @@
     },
     "SourceRef.Spec": {
       "type": "object",
-      "description": "A source reference carrying this pipeline's own srs switch for that source.",
+      "description": "A source reference with optional Pipeline-owned settings.",
       "properties": {
         "id": {
           "description": "Id of the source this pipeline reads from.",
           "type": "string"
         },
         "srs": {
-          "description": "Whether this pipeline reads that source through the shared replay store. Materialized from the source on first apply, and only follows this file after.",
+          "description": "Whether this pipeline reads that source through the shared replay store. Materialized on apply when omitted.",
           "type": "boolean"
+        },
+        "nodeConfig": {
+          "description": "Connector node parameters for this Pipeline. Omitted fields inherit from the Source.",
+          "type": "object",
+          "additionalProperties": true
         }
       },
       "required": [
-        "id",
-        "srs"
+        "id"
       ],
       "additionalProperties": false
     },

@@ -128,6 +128,12 @@ public final class LivePipelines {
         if (stored == null || !changeWouldGoUnreported(replacement.id())) {
             return;
         }
+        if (!nodeConfigs(stored).equals(nodeConfigs(replacement))) {
+            String id = replacement.id();
+            throw new TapstateException(ArtifactError.PIPELINE_NOT_STOPPED,
+                    Map.of("id", id, "actual", actualStateOf(id).name(), "desired", intentOf(id).name()),
+                    null);
+        }
         Map<String, Boolean> before = recordedSwitches(stored);
         List<String> moved = new ArrayList<>();
         for (Map.Entry<String, Boolean> after : recordedSwitches(replacement).entrySet()) {
@@ -143,6 +149,16 @@ public final class LivePipelines {
                     Map.of("id", moved.get(0), "pipelines", List.of(replacement.id())),
                     null);
         }
+    }
+
+    private static Map<String, Map<String, Object>> nodeConfigs(PipelineResource pipeline) {
+        Map<String, Map<String, Object>> configs = new LinkedHashMap<>();
+        for (SourceRef ref : pipeline.sources()) {
+            if (!ref.nodeConfig().isEmpty()) {
+                configs.put(ref.id(), ref.nodeConfig());
+            }
+        }
+        return configs;
     }
 
     /** The switches this pipeline has recorded, by source id; references carrying none are absent. */

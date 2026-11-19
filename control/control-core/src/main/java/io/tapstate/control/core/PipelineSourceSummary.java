@@ -2,16 +2,23 @@ package io.tapstate.control.core;
 
 import io.tapstate.core.model.Metadata;
 
+import java.util.Map;
 import java.util.Objects;
 
 /** Stable Source identity and display metadata embedded in a Pipeline projection. */
-public record PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved) {
+public record PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved,
+        Map<String, Object> nodeConfig) {
 
     public PipelineSourceSummary {
         Objects.requireNonNull(id, "id");
+        nodeConfig = SourceDraft.copyJsonMap(nodeConfig, false);
         if (resolved) {
             Objects.requireNonNull(connector, "connector");
         }
+    }
+
+    public PipelineSourceSummary(String id, Metadata metadata, String connector, boolean resolved) {
+        this(id, metadata, connector, resolved, Map.of());
     }
 
     public PipelineSourceSummary(String id, Metadata metadata, String connector) {

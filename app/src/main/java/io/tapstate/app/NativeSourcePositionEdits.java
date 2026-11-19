@@ -60,7 +60,7 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
             if (privateChannel) {
                 var mode=pipeline.settings()==null || pipeline.settings().readMode()==null?ReadMode.SNAPSHOT_AND_CDC:pipeline.settings().readMode();
                 if (mode==ReadMode.SNAPSHOT_ONLY) throw fenced();
-                var preparation=DirectChannelPreparation.of(port.scope(pipelineId),source,mode,pipeline.settings()==null?null:pipeline.settings().startFrom(),sourceReading.tables());
+                var preparation=DirectChannelPreparation.of(port.scope(pipelineId),source,pipeline,mode,pipeline.settings()==null?null:pipeline.settings().startFrom(),sourceReading.tables());
                 var before=cache.directChannels(business,active).load(preparation.context());
                 if (!before.context().channelId().equals(move.getKey()) || before.cursor().sinkAcked()==null) throw fenced();
                 direct.add(new Direct(before,move.getValue()));
@@ -78,7 +78,7 @@ final class NativeSourcePositionEdits implements PipelinePositionService.WriteBa
                         if (!(reference instanceof SourceRef.Spec spec) || !spec.srs()) continue;
                         var declared=StoredArtifacts.requireSource(configuration.artifacts(),reference.id());
                         String key=declared.srs()==null?null:declared.srs().key();
-                        if (move.getKey().equals(SourceCaptureIdentity.resolve(declared.connector(),declared.config(),key))) readers.add(candidate.id());
+                        if (move.getKey().equals(PipelineSourceConfig.chain(candidate,declared))) readers.add(candidate.id());
                     }
                 }
             }

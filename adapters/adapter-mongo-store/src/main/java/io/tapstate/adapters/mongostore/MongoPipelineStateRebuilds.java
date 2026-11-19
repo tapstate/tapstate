@@ -224,14 +224,13 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
                 || pipeline.settings() != null && pipeline.settings().readMode() == io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY
                 || pipeline.sources().stream().noneMatch(ref -> ref.id().equals(sourceId)
                     && ref instanceof io.tapstate.core.model.SourceRef.Spec spec && spec.srs())) throw fenced();
-        String actual = io.tapstate.core.model.canonical.SourceCaptureIdentity.resolve(source.connector(), source.config(),
-                source.srs() == null ? null : source.srs().key());
+        String actual = io.tapstate.core.model.PipelineSourceConfig.chain(pipeline, source);
         var target = completed.targetScope;
         var captures = new MongoCaptureStatePreparations(owner.client, owner.database, owner.clusterId, owner.bindings, owner.artifacts, owner.requireActive);
         var prepared = captures.read(new CacheBusinessScope(target.clusterId(), target.bindingVersion(), target.cacheIncarnation()),
                 io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(actual)).orElseThrow(MongoPipelineStateRebuilds::fenced);
         if(!prepared.canonicalChainId().equals(actual) || !prepared.chainId().equals(chain))throw fenced();
-        captures.inspectSharedHistory(prepared, sourceId, expectedHash);
+        captures.inspectSharedHistory(prepared, sourceId, expectedHash, pipeline.id(), CanonicalHash.of(pipeline));
         completed.requireCurrent();
         return prepared;
     }

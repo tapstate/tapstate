@@ -122,7 +122,7 @@ public final class PipelineDraftCompiler {
                 || firstText(wizard.output().config(), "table", "destinationTable") == null)
                 ? null : compileWizardOutput(wizard.output(), previous, root.table());
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(), steps, null, serve, null, Map.of());
+                sourceRefs(sourceIds, wizard.sourceNodeConfigs()), steps, null, serve, null, Map.of());
     }
 
     private static ServeBlock compileWizardOutput(PipelineDraft.Output output, String from, String inputTable) {
@@ -321,6 +321,13 @@ public final class PipelineDraftCompiler {
         return Step.inline(transform.id(), from, body, Map.of());
     }
 
+    private static List<SourceRef> sourceRefs(Set<String> ids, Map<String, Map<String, Object>> configs) {
+        if (!ids.containsAll(configs.keySet())) {
+            throw new IllegalArgumentException("source node settings must refer to a Pipeline input");
+        }
+        return ids.stream().map(id -> SourceRef.of(id, null, configs.get(id))).toList();
+    }
+
     private static void addUnionSources(List<PipelineDraft.Transform> transforms, Set<String> sourceIds) {
         for (PipelineDraft.Transform transform : transforms) {
             if ("union".equals(transform.type())) {
@@ -472,7 +479,7 @@ public final class PipelineDraftCompiler {
             }
         }
         return new PipelineResource(draft.pipelineId(), metadata(draft),
-                sourceIds.stream().map(id -> (SourceRef) SourceRef.bare(id)).toList(),
+                sourceRefs(sourceIds, graph.sourceNodeConfigs()),
                 steps, view, serve, null, Map.of());
     }
 

@@ -511,6 +511,33 @@ class ApplyServiceTest {
     }
 
     @Test
+    void refusesAConnectorReplacementThatInvalidatesAnExistingPipelineOverride() {
+        ApplyService configured = new ApplyService(
+                TapstateCatalog::load, store, new AuditGate(auditStore, FIXED_CLOCK), new EmptySchemaStore(),
+                PlanAdvisories.none(), SchemaDerivation.none(), null, ResourceAttributionPolicy.onPrem(),
+                StateDatabasePolicy.ON_PREM, DeploymentProfile.ON_PREM,
+                id -> new ConnectorDetail(id, id, "", "database", List.of(), "", true, false, "",
+                        List.of(), SpecSource.of("hash", id.equals("postgres")
+                                ? "{}" : """
+                                        {"configOptions":{"node":{"properties":{"preImage":{"type":"boolean"}}}}}
+                                        """), true));
+        String reader = READER_PIPELINE.replace("source: orders_src",
+                "source: { id: orders_src, nodeConfig: { preImage: false } }");
+        configured.apply("author", List.of(draft(BUFFERED_SRC), draft(reader)));
+        Resource original = store.get("orders_src").orElseThrow();
+        SourceResource source = (SourceResource) original;
+        Map<String, Object> postgres = new LinkedHashMap<>(source.config());
+        postgres.put("schema", "public");
+        SourceResource replacement = new SourceResource(source.id(), source.metadata(), "postgres", postgres,
+                source.mode(), source.tables(), source.srs(), source.execution(), source.experimental());
+
+        assertThat(stored("p1")).contains("preImage: false");
+        assertThatThrownBy(() -> configured.replace("author", replacement, CanonicalHash.of(original)))
+                .isInstanceOf(TapstateException.class).hasMessageContaining("undeclared field");
+        assertThat(store.get("orders_src")).contains(original);
+    }
+
+    @Test
     void draftPublicationPlanningAlsoRefusesToChangeTheLivePipelinesBufferingSwitch() {
         service.apply("author", List.of(draft(BUFFERED_SRC), draft(READER_PIPELINE)));
         ApplyService guarded = guardedWith(PipelineState.RUNNING);

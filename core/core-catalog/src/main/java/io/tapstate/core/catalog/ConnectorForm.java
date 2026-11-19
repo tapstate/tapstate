@@ -1,6 +1,4 @@
-package io.tapstate.adapters.pdk;
-
-import io.tapstate.core.common.JsonReader;
+package io.tapstate.core.catalog;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -19,13 +17,10 @@ import java.util.Map;
  *       the host hands it, and nowhere else.</li>
  * </ul>
  *
- * <p>The host authors one settings map, so the form a name is declared in is the only thing that says
- * which config a connector will look for that setting in. That makes both forms host-side questions,
- * asked of the raw spec text the ref carries: read with the host's json reader, never under the
- * connector's loader, and answered only from what the connector shipped — no reflection, and no table
- * of field names of our own.
+ * <p>The form a name is declared in determines which PDK config map exposes it. Both forms are read
+ * from the parsed specification the connector shipped.
  */
-enum ConnectorForm {
+public enum ConnectorForm {
 
     CONNECTION("connection"),
     NODE("node");
@@ -43,15 +38,7 @@ enum ConnectorForm {
      * declaring no such form. Connectors are free to ship one form and not the other, and the synthetic
      * connectors carry no spec at all.
      */
-    Map<String, Map<?, ?>> items(String spec) {
-        return spec == null || !(JsonReader.parse(spec) instanceof Map<?, ?> root) ? Map.of() : itemsIn(root);
-    }
-
-    /**
-     * As {@link #items(String)}, from an already-parsed spec — so a caller that reads both forms parses
-     * the spec once rather than once per form.
-     */
-    Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot) {
+    public Map<String, Map<?, ?>> itemsIn(Map<?, ?> specRoot) {
         Map<String, Map<?, ?>> items = new LinkedHashMap<>();
         if (specRoot.get("configOptions") instanceof Map<?, ?> configOptions
                 && configOptions.get(key) instanceof Map<?, ?> form

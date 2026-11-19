@@ -163,13 +163,14 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
                         .read(stores.scope(), SourceCaptureIdentity.sharedCapture(canonical));
         if (prepared.isEmpty()) return result;
         var original = prepared.orElseThrow();
-        requirePlanningPreparation(original, canonical, source);
+        requirePlanningPreparation(original, canonical, io.tapstate.core.model.PipelineSourceConfig.effective(pipeline, source));
         var origin =
                 stores.configuration()
                         .inspectSharedOrigin(
                                 stores.scope(),
                                 source.id(),
-                                io.tapstate.core.model.canonical.CanonicalHash.of(source))
+                                io.tapstate.core.model.canonical.CanonicalHash.of(source),
+                                pipeline.id(), io.tapstate.core.model.canonical.CanonicalHash.of(StoredArtifacts.requirePipeline(artifacts, pipeline.id())))
                         .orElseThrow(
                                 () ->
                                         new TapstateException(
@@ -178,7 +179,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
         if (!origin.artifactHash().equals(artifact.contentHash())
                 || !origin.equals(
                         io.tapstate.adapters.pdk.ConnectorNoteOrigin.capture(
-                                source.connector(), origin.artifactHash(), source.config())))
+                                source.connector(), origin.artifactHash(), io.tapstate.core.model.PipelineSourceConfig.settings(pipeline, source))))
             throw refused();
         if (io.tapstate.adapters.pdk.PdkSourceModelComparison.forVerifiedArtifact(
                         source.connector(), artifact)
@@ -494,7 +495,8 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
     private void attachSharedSource(Session session, Source source, boolean newHistory) {
         if (!newHistory) {
             var history = stores.configuration().inspectSharedHistory(
-                    source.prepared, source.id, session.inputs.sourceHashes().get(source.id));
+                    source.prepared, source.id, session.inputs.sourceHashes().get(source.id),
+                    session.original.pipelineId(), session.inputs.pipelineHash());
             if (!source.prepared.equals(history.preparation())) throw refused();
             source.positionEditsRestricted = history.positionEditsRestricted();
         }
@@ -1352,7 +1354,7 @@ final class ScopedPipelineCaptureCoordinator implements PipelineCaptureCoordinat
 
     private void startPreparedTail(Owner owner, SrsChainState opened, ConfiguredCaptureRun opening) {
         owner.require();if(owner.physical!=null || owner.configured==null || !opened.miningChainId().equals(owner.prepared.chainId()))throw refused();
-        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes());
+        var config=new CaptureConfig(owner.config.connectorId(),owner.config.settings(),opened.servingTables().stream().sorted().toList(),owner.config.node(),owner.config.sharedNotes(),owner.config.nodeConfig());
         var start=opened.resumeToken()==null?CaptureStart.present():CaptureStart.resume(new SourcePosition(opened.resumeToken()));
         var physical=new Physical(owner);owner.physical=physical;var notes=owner.configured;
         java.util.function.Function<io.tapstate.runtime.srs.SrsCaptureWriter, CapturePort> open = writer -> {

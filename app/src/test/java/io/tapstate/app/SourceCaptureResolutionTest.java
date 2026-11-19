@@ -217,6 +217,32 @@ class SourceCaptureResolutionTest {
                 .isEqualTo(physical.chainId());
     }
 
+    @org.junit.jupiter.params.ParameterizedTest
+    @org.junit.jupiter.params.provider.ValueSource(booleans = {true, false})
+    void pipelineOverridesReachCaptureAndPreparationWithIndependentKeyedIdentities(boolean shared) {
+        SourceResource source = cdcSource("orders_src", "orders", "shared-db");
+        PipelineResource inherited = pipeline("pipeline-a", SourceRef.spec(source.id(), shared));
+        PipelineResource changed = pipeline("pipeline-a", new SourceRef.Spec(source.id(), shared, Map.of("preImage", false)));
+        SourceCaptureResolution before = SourceCaptureResolution.forPipeline(inherited, source, null).orElseThrow();
+        SourceCaptureResolution after = SourceCaptureResolution.forPipeline(changed, source, null).orElseThrow();
+        assertThat(after.config().settings()).containsEntry("preImage", false).containsEntry("host", "h");
+        assertThat(source.config()).doesNotContainKey("preImage");
+        assertThat(after.chainId()).isNotEqualTo(before.chainId());
+        for (ReadMode mode : List.of(ReadMode.SNAPSHOT_ONLY, ReadMode.CDC_ONLY)) {
+            var originalRun = new CaptureRunSpec(before.config(), mode, before.srsKey(), shared,
+                    source.id(), inherited.id(), StartFrom.latest(), null, 0L);
+            var localRun = new CaptureRunSpec(after.config(), mode, after.srsKey(), shared,
+                    source.id(), changed.id(), StartFrom.latest(), null, 0L);
+            assertThat(io.tapstate.runtime.srs.CaptureId.of(localRun)).isNotEqualTo(io.tapstate.runtime.srs.CaptureId.of(originalRun));
+        }
+        if (!shared) {
+            var prepared = io.tapstate.spi.store.DirectChannelPreparation.of(
+                    new io.tapstate.spi.store.PipelineIntentScope("cluster", 1L, "cache", changed.id(), 1L),
+                    source, changed, ReadMode.CDC_ONLY, "latest", after.tables());
+            assertThat(prepared.context().channelId()).isEqualTo(after.chainId().value());
+        }
+    }
+
     private static PipelineResource pipeline(String id, SourceRef... refs) {
         return new PipelineResource(id, null, List.of(refs), null, null, null, null, null);
     }

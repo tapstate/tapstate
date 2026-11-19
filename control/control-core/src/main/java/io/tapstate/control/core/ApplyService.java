@@ -89,6 +89,7 @@ public final class ApplyService {
     }
 
     private final Supplier<TapstateCatalog> catalog;
+    private final java.util.function.Function<String, ConnectorDetail> connectorDetail;
     private final ArtifactStore store;
     private final AuditGate auditGate;
     private final SchemaStore schemas;
@@ -153,7 +154,17 @@ public final class ApplyService {
             PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
             ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
             DeploymentProfile deploymentProfile) {
+        this(catalog, store, auditGate, schemas, advisories, derivation, live, attribution,
+                stateDatabasePolicy, deploymentProfile, id -> null);
+    }
+
+    public ApplyService(
+            Supplier<TapstateCatalog> catalog, ArtifactStore store, AuditGate auditGate, SchemaStore schemas,
+            PlanAdvisories advisories, SchemaDerivation derivation, LivePipelines live,
+            ResourceAttributionPolicy attribution, StateDatabasePolicy stateDatabasePolicy,
+            DeploymentProfile deploymentProfile, java.util.function.Function<String, ConnectorDetail> connectorDetail) {
         this.live = live;
+        this.connectorDetail = Objects.requireNonNull(connectorDetail, "connectorDetail");
         this.deploymentProfile = Objects.requireNonNull(deploymentProfile, "deploymentProfile");
         this.catalog = Objects.requireNonNull(catalog, "catalog");
         this.store = Objects.requireNonNull(store, "store");
@@ -369,6 +380,24 @@ public final class ApplyService {
                 batchSources.put(source.id(), source);
             }
         }
+        Set<String> replacedConnectors = submitted.stream()
+                .filter(resource -> resource instanceof SourceResource source
+                        && connectorChanged(storedResources, source))
+                .map(Resource::id).collect(java.util.stream.Collectors.toSet());
+        for (Resource resource : candidate) {
+            if (!(resource instanceof PipelineResource pipeline)) {
+                continue;
+            }
+            boolean submittedPipeline = submittedIds.contains(pipeline.id());
+            for (SourceRef ref : pipeline.sources()) {
+                if (!ref.nodeConfig().isEmpty() && (submittedPipeline || replacedConnectors.contains(ref.id()))) {
+                    SourceNodeConfigRules.validate(batchSources.get(ref.id()), ref.nodeConfig(), connectorDetail);
+                    if (!submittedPipeline && !workspacePreconditions.containsKey(pipeline.id())) {
+                        workspacePreconditions.put(pipeline.id(), storedHash(pipeline));
+                    }
+                }
+            }
+        }
         List<PreparedArtifact> prepared = new ArrayList<>();
         for (Resource submittedResource : submitted) {
             Resource resource = validatedById.get(submittedResource.id());
@@ -384,6 +413,19 @@ public final class ApplyService {
         ApplyPlan plan = new ApplyPlan(
                 prepared, advisories.review(validated, discovered), preconditions, workspacePreconditions);
         return new CandidateWorkspacePlan(plan, List.copyOf(candidateById.values()));
+    }
+
+    private static boolean connectorChanged(List<Resource> stored, SourceResource replacement) {
+        SourceResource previous = storedSource(stored, replacement.id());
+        return previous != null && !previous.connector().equals(replacement.connector());
+    }
+
+    void validateDraftSourceNodeConfigs(Map<String, Map<String, Object>> configs) {
+        configs.forEach((id, config) -> {
+            SourceResource source = store.get(id).filter(SourceResource.class::isInstance)
+                    .map(SourceResource.class::cast).orElse(null);
+            SourceNodeConfigRules.validate(source, config, connectorDetail);
+        });
     }
 
     /**
@@ -417,7 +459,7 @@ public final class ApplyService {
         List<SourceRef> refs = new ArrayList<>();
         boolean anyRecorded = false;
         for (SourceRef ref : pipeline.sources()) {
-            if (ref instanceof SourceRef.Spec) {
+            if (ref instanceof SourceRef.Spec spec && spec.srs() != null) {
                 refs.add(ref);
                 anyRecorded = true;
                 continue;
@@ -431,7 +473,7 @@ public final class ApplyService {
                 SourceResource declaring = batchSources.get(ref.id());
                 own = declaring == null ? null : declaring.srsEnabled();
             }
-            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own));
+            refs.add(own == null ? ref : new SourceRef.Spec(ref.id(), own, ref.nodeConfig()));
             anyRecorded |= own != null;
         }
         return anyRecorded

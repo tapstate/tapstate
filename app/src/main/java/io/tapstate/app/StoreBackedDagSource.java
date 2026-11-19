@@ -518,7 +518,7 @@ final class StoreBackedDagSource implements DagSource {
             List<FieldSchema> fields = table.fields().stream()
                     .map(field -> new FieldSchema(field.name(), field.dataType())).toList();
             selected.add(new PreviewSourceTable(entry.getKey(), source.id(), source.connector(),
-                    source.config(), new TableSchema(table.name(), fields), table));
+                    io.tapstate.core.model.PipelineSourceConfig.settings(pipeline, source), new TableSchema(table.name(), fields), table));
         }
         return List.copyOf(selected);
     }

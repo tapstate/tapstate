@@ -102,18 +102,18 @@ final class PipelineRecoveryInspector {
                 modelHashes.put(source.id()+"."+table,PdkSinkPreparations.modelHash(target));
             }
             if(probeSources) {
-                active.run();var live=liveModels.apply(source,artifacts.get(source.connector()));active.run();
+                active.run();var live=liveModels.apply(PipelineSourceConfig.effective(pipeline, source),artifacts.get(source.connector()));active.run();
                 if(live==null || !selected.equals(Set.copyOf(PipelineTableSelection.resolve(pipeline,source,live))))throw staleModel(source);
                 var actual=new TargetModelResolver(store,snapshot,ignored -> live).resolveAll(source.id());
                 for(String table:selected)if(actual.get(table)==null || !PdkSinkPreparations.modelHash(actual.get(table)).equals(modelHashes.get(source.id()+"."+table)))
                     throw staleModel(source);
             }
-            originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source.id()),PipelineNode.Purpose.CAPTURE),source);
+            originalContexts.put(RequiredNoteOwner.namespace(new PipelineNode(id,source.id()),PipelineNode.Purpose.CAPTURE),PipelineSourceConfig.effective(pipeline, source));
             boolean shared=pipeline.sources().stream().anyMatch(reference -> reference.id().equals(source.id()) && reference instanceof SourceRef.Spec spec && spec.srs())
                     && (pipeline.settings()==null || pipeline.settings().readMode()!=ReadMode.SNAPSHOT_ONLY);
             if(shared) {
-                var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),source.id(),CanonicalHash.of(source));
-                var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),source.config());
+                var retained=configuration.capturePreparations().inspectSharedOrigin(new CacheBusinessScope(auth.clusterId(),auth.bindingVersion(),auth.cacheIncarnation()),source.id(),CanonicalHash.of(source),pipeline.id(),CanonicalHash.of(authored));
+                var expected=ConnectorNoteOrigin.capture(source.connector(),artifacts.get(source.connector()),PipelineSourceConfig.settings(pipeline, source));
                 if(retained.isPresent() && !retained.orElseThrow().equals(expected))throw new TapstateException(IoError.NOTE_ORIGIN_MISMATCH,Map.of(),null);
             }
         }

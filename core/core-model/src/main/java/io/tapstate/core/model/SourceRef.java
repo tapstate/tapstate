@@ -1,22 +1,12 @@
 package io.tapstate.core.model;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.Objects;
 
-/**
- * One element of a pipeline's {@code source} list: a bare source id, or an object carrying
- * this pipeline's own srs switch for that source.
- *
- * <p>The switch lives on the reference rather than on the source body so that changing a
- * source's srs configuration does not silently re-route every pipeline already reading it.
- * A pipeline records one value per source it reads, and the runtime reads only that value --
- * it never falls back to the source.
- *
- * <p>{@link Bare} means "no switch recorded on this reference yet"; the first apply
- * materializes the source's own value into a {@link Spec}. A Spec with no switch would be
- * the same state as Bare, so the object form requires one and parsing normalizes an object
- * written without it back to Bare.
- */
-@Doc("A source this pipeline reads from: a bare source id, or an object carrying its srs switch.")
+/** One use of a shared Source in a Pipeline. */
+@Doc("A source this pipeline reads from: a bare source id or a reference with local settings.")
 public sealed interface SourceRef {
 
     /** Id of the referenced source. */
@@ -24,6 +14,15 @@ public sealed interface SourceRef {
 
     static Bare bare(String id) {
         return new Bare(id);
+    }
+
+    default Map<String, Object> nodeConfig() {
+        return Map.of();
+    }
+
+    static SourceRef of(String id, Boolean srs, Map<String, Object> nodeConfig) {
+        return srs == null && (nodeConfig == null || nodeConfig.isEmpty())
+                ? bare(id) : new Spec(id, srs, nodeConfig);
     }
 
     static Spec spec(String id, Boolean srs) {
@@ -38,19 +37,29 @@ public sealed interface SourceRef {
         }
     }
 
-    /** Object form: source id plus this pipeline's own srs switch for that source. */
-    @Doc("A source reference carrying this pipeline's own srs switch for that source.")
+    /** A Source reference with settings owned by the Pipeline. */
+    @Doc("A source reference with optional Pipeline-owned settings.")
     record Spec(
             @Doc(value = "Id of the source this pipeline reads from.", required = true)
             String id,
             @Doc(value = "Whether this pipeline reads that source through the shared replay store. "
-                    + "Materialized from the source on first apply, and only follows this file after.",
-                    required = true)
-            Boolean srs)
+                    + "Materialized on apply when omitted.")
+            Boolean srs,
+            @Doc(value = "Connector node parameters for this Pipeline. Omitted fields inherit from the Source.",
+                    key = "nodeConfig")
+            Map<String, Object> nodeConfig)
             implements SourceRef {
+        public Spec(String id, Boolean srs) {
+            this(id, srs, Map.of());
+        }
+
         public Spec {
             Objects.requireNonNull(id, "id");
-            Objects.requireNonNull(srs, "srs");
+            nodeConfig = nodeConfig == null ? Map.of()
+                    : Collections.unmodifiableMap(new LinkedHashMap<>(nodeConfig));
+            if (srs == null && nodeConfig.isEmpty()) {
+                throw new IllegalArgumentException("a Source reference with no settings must use the bare form");
+            }
         }
     }
 }

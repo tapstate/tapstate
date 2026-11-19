@@ -50,11 +50,14 @@ final class SharedSrsRecoveryInspector {
         var token=configuration.requiredNotes().guardedBy(active).open(new RequiredNoteOwner(business.bindingVersion(),
                 "pdk.chain."+selection.canonicalChain(),RequiredNoteOwner.Kind.CHAIN,selection.canonicalChain(),0));
         var origin=configuration.requiredNotes().guardedBy(active).origin(token);ConnectorNoteOrigin.requireReadable(origin);
-        for(String sourceId:observed.consumers().stream().map(consumer -> consumer.context().key().sourceId()).collect(java.util.stream.Collectors.toSet())) {
-            var source=StoredArtifacts.requireSource(artifacts,sourceId);
-            String canonical=SourceCaptureIdentity.resolve(source.connector(),source.config(),source.srs()==null?null:source.srs().key());
-            if(!canonical.equals(selection.canonicalChain()) || !SourceCaptureIdentity.physical(source.connector(),source.config()).equals(observed.previous().sourceIdentityHash())
-                    || !origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),source.config())))throw fenced();
+        for(var consumer:observed.consumers()) {
+            var key=consumer.context().key();
+            var source=StoredArtifacts.requireSource(artifacts,key.sourceId());
+            var pipeline=StoredArtifacts.requirePipeline(artifacts,key.pipelineId());
+            var settings=io.tapstate.core.model.PipelineSourceConfig.settings(pipeline,source);
+            String canonical=io.tapstate.core.model.PipelineSourceConfig.chain(pipeline,source);
+            if(!canonical.equals(selection.canonicalChain()) || !SourceCaptureIdentity.physical(source.connector(),settings).equals(observed.previous().sourceIdentityHash())
+                    || !origin.equals(ConnectorNoteOrigin.capture(source.connector(),origin.artifactHash(),settings)))throw fenced();
         }
         for(var resource:artifacts.list())if(resource instanceof SourceResource source) {
             String canonical=SourceCaptureIdentity.resolve(source.connector(),source.config(),source.srs()==null?null:source.srs().key());

@@ -32,7 +32,7 @@ public record PipelinePreparationInputs(String pipelineHash,Map<String,String> s
             if (!(reference instanceof SourceRef.Spec spec)) throw new IllegalStateException("a prepared Pipeline requires materialized source switches");
             var tables = selections.get(reference.id());
             if (!spec.srs() && mode != ReadMode.SNAPSHOT_ONLY && !tables.isEmpty())
-                direct.add(DirectChannelPreparation.of(scope,sources.get(reference.id()),mode,start,tables));
+                direct.add(DirectChannelPreparation.of(scope,sources.get(reference.id()),pipeline,mode,start,tables));
         }
         return new PipelinePreparationInputs(CanonicalHash.of(pipeline),hashes,selections,direct);
     }

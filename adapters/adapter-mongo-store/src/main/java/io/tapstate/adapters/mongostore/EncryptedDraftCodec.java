@@ -179,7 +179,7 @@ final class EncryptedDraftCodec {
         Document value = body.get(field, Document.class);
         if (value == null) invalid();
         if (mode == PipelineDraft.Mode.DAG) {
-            keys(value, "nodes", "edges", "viewport");
+            payloadKeys(value, "nodes", "edges", "viewport");
             for (Document node : documents(value, "nodes")) {
                 keys(node, "id", "type", "sourceId", "table", "config", "metadata");
                 normalize(node, "config"); normalize(node, "metadata");
@@ -187,7 +187,7 @@ final class EncryptedDraftCodec {
             for (Document edge : documents(value, "edges")) keys(edge, "id", "source", "target");
             keys(value.get("viewport", Document.class), "x", "y", "zoom");
         } else {
-            keys(value, "root", "related", "transforms", "output");
+            payloadKeys(value, "root", "related", "transforms", "output");
             if (value.get("root") != null) {
                 Document root = value.get("root", Document.class);
                 keys(root, "id", "sourceId", "table", "key", "preTransforms"); strings(root, "key"); transforms(root, "preTransforms");
@@ -205,6 +205,20 @@ final class EncryptedDraftCodec {
             }
         }
     }
+    private static void payloadKeys(Document value, String... required) {
+        var keys = new java.util.HashSet<>(value.keySet());
+        if (keys.remove("sourceNodeConfigs")) {
+            if (!(value.get("sourceNodeConfigs") instanceof Document configs)) {
+                invalid();
+                return;
+            }
+            for (Object config : configs.values()) {
+                if (!(config instanceof Document)) invalid();
+            }
+        }
+        if (!keys.equals(Set.of(required))) invalid();
+    }
+
     private static void transforms(Document parent, String field) {
         for (Document transform : documents(parent, field)) { keys(transform, "id", "type", "fields"); normalize(transform, "fields"); }
     }
