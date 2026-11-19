@@ -359,7 +359,7 @@ class BenchmarkRunIT {
                                     boolean slowTarget = definition.getString("spec").getValue().equals("specs/copy-slow-target.json");
                                     try (var limit = limited ? new BenchmarkTargetLimit(admin, targetApplication,
                                             target.getNamespace().getFullName(), delay) : null;
-                                            var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(admin, target) : null) {
+                                            var window = slowTarget ? new BenchmarkTargetLimit.TargetWindow(targetDb, target) : null) {
                                         mongoCdc(entry, prepared, control, source, target, evidence, text(definition, "mode"),
                                                 limit, delay, window);
                                     }
@@ -543,15 +543,20 @@ class BenchmarkRunIT {
                         }
                         evidence.window("measurement");
                     }, () -> {
-                        evidence.window("drain");
+                        evidence.window(targetWindow == null ? "drain" : "target-frontier");
                         observedBeforeDrain[0] = settled(control) - observedWarm[0];
                         if (targetWindow != null) {
-                            evidence.result.put("target_majority_visible_before_drain", targetWindow.countThroughBoundary());
+                            evidence.result.put("target_frontier_requested_epoch_ms", System.currentTimeMillis());
+                            var observed = targetWindow.countThroughBoundary().orElseThrow(() ->
+                                    new Unverified("Target change stream did not reach its majority-visible frontier"));
+                            evidence.result.put("target_majority_visible_before_drain", observed);
                         }
                         if (limit != null) {
                             evidence.result.put("target_delay_millis", delay);
                             evidence.result.put("target_commands_delayed", limit.release());
+                            evidence.result.put("target_limit_released_epoch_ms", System.currentTimeMillis());
                         }
+                        evidence.window("drain");
                     });
             evidence.result.put("warmup", phase(result.warmup()));
             evidence.result.put("source_window", phase(result.measured()));

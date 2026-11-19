@@ -1,12 +1,17 @@
 package io.tapstate.e2e;
 
+import com.mongodb.WriteConcern;
 import com.mongodb.client.MongoCollection;
 import com.mongodb.client.MongoChangeStreamCursor;
 import com.mongodb.client.MongoDatabase;
+import com.mongodb.client.model.Aggregates;
+import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.changestream.ChangeStreamDocument;
 import java.util.List;
+import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
 import org.bson.BsonDocument;
+import org.bson.BsonInt32;
 import org.bson.Document;
 import org.testcontainers.containers.MongoDBContainer;
 import org.testcontainers.utility.DockerImageName;
@@ -58,32 +63,37 @@ final class BenchmarkTargetLimit implements AutoCloseable {
 
     /** Counts majority-visible target writes at a server-side boundary before the limit is released. */
     static final class TargetWindow implements AutoCloseable {
-        private final MongoDatabase admin;
-        private final MongoCollection<BsonDocument> target;
+        private static final String FRONTIER = "benchmark_target_frontier";
+        private final MongoDatabase database;
+        private final String target;
         private MongoChangeStreamCursor<ChangeStreamDocument<BsonDocument>> cursor;
 
-        TargetWindow(MongoDatabase admin, MongoCollection<BsonDocument> target) {
-            this.admin = admin;
-            this.target = target;
+        TargetWindow(MongoDatabase database, MongoCollection<BsonDocument> target) {
+            this.database = database;
+            this.target = target.getNamespace().getCollectionName();
         }
 
         void begin() {
-            cursor = target.watch().maxAwaitTime(200, TimeUnit.MILLISECONDS).batchSize(128).cursor();
+            database.createCollection(FRONTIER);
+            cursor = database.watch(List.of(Aggregates.match(Filters.in("ns.coll", target, FRONTIER))),
+                    BsonDocument.class).maxAwaitTime(200, TimeUnit.MILLISECONDS).batchSize(128).cursor();
         }
 
-        long countThroughBoundary() {
-            var clock = admin.runCommand(new BsonDocument("ping", new org.bson.BsonInt32(1)), BsonDocument.class)
-                    .getDocument("$clusterTime").getTimestamp("clusterTime");
+        OptionalLong countThroughBoundary() {
+            database.getCollection(FRONTIER, BsonDocument.class).withWriteConcern(WriteConcern.MAJORITY)
+                    .insertOne(new BsonDocument("_id", new BsonInt32(1)));
             long count = 0;
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
             while (System.nanoTime() < deadline) {
                 var event = cursor.tryNext();
-                if (event == null || event.getClusterTime().compareTo(clock) > 0) {
-                    return count;
+                if (event != null) {
+                    if (event.getNamespace().getCollectionName().equals(FRONTIER)) {
+                        return OptionalLong.of(count);
+                    }
+                    count++;
                 }
-                count++;
             }
-            throw new IllegalStateException("Target observation did not reach its boundary before timeout");
+            return OptionalLong.empty();
         }
 
         @Override
