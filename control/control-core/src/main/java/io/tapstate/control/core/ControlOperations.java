@@ -214,6 +214,16 @@ public final class ControlOperations {
             "connector-center.upload", Scope.ADMIN, true, null,
             "Upload an on-prem connector JAR for verified local installation.", REST_ONLY);
 
+    /** Cloud sessions use the workload write capability to fetch and install official releases. */
+    public static Scope requiredScope(Operation operation, CredentialType credential) {
+        if (credential == CredentialType.CLOUD_SESSION
+                && (operation.id().equals(CONNECTOR_CENTER_REFRESH.id())
+                    || operation.id().equals(CONNECTOR_CENTER_DOWNLOAD.id()))) {
+            return Scope.WRITE;
+        }
+        return operation.scope();
+    }
+
     // data-browser domain: the read face over a declared source's own database — list its collections,
     // read one collection's rows, report one collection's size. All three read through to the connector
     // and persist nothing, not even the result, so they are read-scoped and unaudited. That is what

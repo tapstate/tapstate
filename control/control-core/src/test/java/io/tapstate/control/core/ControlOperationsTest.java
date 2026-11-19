@@ -140,6 +140,18 @@ class ControlOperationsTest {
             assertThat(registry.resolve(id).scope()).isEqualTo(Scope.ADMIN);
             assertThat(registry.resolve(id).audited()).isTrue();
         }
+        for (Operation operation : registry.all()) {
+            Scope cloudScope = switch (operation.id()) {
+                case "connector-center.refresh", "connector-center.download" -> Scope.WRITE;
+                default -> operation.scope();
+            };
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.CLOUD_SESSION))
+                    .as(operation.id()).isEqualTo(cloudScope);
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.HUMAN_JWT))
+                    .as(operation.id()).isEqualTo(operation.scope());
+            assertThat(ControlOperations.requiredScope(operation, CredentialType.MACHINE_TOKEN))
+                    .as(operation.id()).isEqualTo(operation.scope());
+        }
         // the three data-browser verbs look at what a declared source's own database holds. They read
         // through to the connector and persist nothing at all — not even the result, unlike the two
         // connection probes — so they are read-scoped.
