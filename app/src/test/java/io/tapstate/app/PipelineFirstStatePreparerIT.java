@@ -119,6 +119,37 @@ class PipelineFirstStatePreparerIT {
         });
     }
 
+    @Test void writerObtainsFreshProofWhenItsMatchingMongoReadingIsSpentInFlight() {
+        withFixture(f -> {
+            f.preparer(f.configuration, f.cache).prepare(f.scope);
+            var claims = f.cache.workloadClaims(f.business());
+            var shortClaim = claims.acquirePipeline(f.scope, OWNER, 1, Duration.ofSeconds(8)).claim();
+            var original = claims.advanceExecution(shortClaim, 1, java.util.Set.of(OWNER.nodeId())).orElseThrow();
+            var fence = new ExecutionFence(f.scope, WorkloadClaimFence.from(original));
+            var clock = new java.util.concurrent.atomic.AtomicLong();
+            var reads = new java.util.concurrent.atomic.AtomicInteger();
+            var delayed = org.mockito.Mockito.mock(io.tapstate.spi.store.WorkloadClaimStore.class);
+            org.mockito.Mockito.when(delayed.readPipeline(f.scope)).thenAnswer(call -> {
+                var received = claims.readPipeline(f.scope).orElseThrow();
+                int attempt = reads.incrementAndGet();
+                assertThat(WorkloadClaimFence.from(received.claim())).isEqualTo(WorkloadClaimFence.from(original));
+                if (attempt == 1) {
+                    assertThat(received.leaseRemaining()).isPositive().isLessThanOrEqualTo(Duration.ofSeconds(8));
+                    var renewed = claims.renew(original, TTL).orElseThrow();
+                    assertThat(WorkloadClaimFence.from(renewed)).isEqualTo(WorkloadClaimFence.from(original));
+                    assertThat(renewed.leaseUntil()).isAfter(received.claim().leaseUntil());
+                    clock.addAndGet(received.leaseRemaining().toNanos() + 1);
+                }
+                return Optional.of(received);
+            });
+            try (var authorization = ExecutionAuthorization.scoped(f.business(), delayed,
+                    Duration.ofSeconds(10), clock::get, () -> true)) {
+                assertThat(authorization.require(fence)).isEqualTo(WorkloadClaimFence.from(original));
+                assertThat(reads).hasValue(2);
+            }
+        });
+    }
+
     @Test void unpreparedAuthoringModelsAreRetiredWithoutInventingExecutionHistory() {
         withFixture(f -> {
             var models = f.cache.unpreparedPipelineDerivedSchemas(f.scope, f.node, () -> {

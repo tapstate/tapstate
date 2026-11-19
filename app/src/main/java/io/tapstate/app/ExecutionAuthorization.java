@@ -547,8 +547,9 @@ final class ExecutionAuthorization implements AutoCloseable {
                 if (liveMatch(result, matches)) return entry;
                 if (entry != null && !precedes.test(entry)
                         && (result.denied() || !matches.test(entry))) return null;
-                // A completed read that cannot prove the requested fence is already an answer.
-                if (proof.revision != initialRevision) return null;
+                // A matching proof spent in flight still needs a fresh reading within this wait.
+                if (proof.revision != initialRevision
+                        && (entry == null || result.denied() || !matches.test(entry))) return null;
                 if (entry == null && result.denied() && proof.readFailure != null
                         && System.nanoTime() - proof.nextRead < 0) return null;
 
