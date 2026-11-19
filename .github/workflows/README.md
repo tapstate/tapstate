@@ -6,10 +6,13 @@ explains the placement; the reviewer assesses the cost. `catalog-scripts` runs
 `one-verify.sh` and its smoke cases against the actual workflows. Changes to the
 trigger policy or test ownership must retain those regressions.
 
-`ci.yml` owns one complete reactor test suite, distributed over its existing
-shards and admitted by the `build` aggregate. Automatic feature-branch testing
-runs on pull request creation and updates. `push` tests the integration branch
-`main` and release tags `v*`; it does not also run the suite for a feature branch.
+`ci.yml` owns the sharded reactor suite admitted by the `build` aggregate.
+Pull requests and pushes to `main` run all discovered unit and architecture
+tests plus the integration methods, examples, and classes in
+[`ci-fast-integration.json`](../ci-fast-integration.json). New integration
+tests join full regression automatically. Manual CI and `v*` tags run the
+full reactor. Automatic feature-branch testing runs on pull request creation
+and updates.
 This avoids a second suite both when a pull request already exists and when it
 is opened after a branch push. Before opening a pull request, explicitly run
 `gh workflow run ci.yml --ref <branch>` when CI validation is needed. Manual runs
@@ -48,10 +51,13 @@ admission.
 ## Nightly Test
 
 `nightly-test.yml` runs at 01:00 Asia/Shanghai and can be run manually from
-`main`. It checks real connectors, the full Join performance matrix, native
-CLI and MCP bundles for four platforms, the paired Cloud and OP image smoke,
-release-script self-tests, and distribution completeness. Release calls the
-same checks for its own selected source and Web revisions. Nightly only stores
+`main`. The full reactor regression runs in parallel with real connectors,
+the full Join performance matrix, native CLI and MCP bundles for four
+platforms, the paired Cloud and OP image smoke, release-script self-tests,
+and distribution completeness. A manual run with `reactor-only` validates
+only the full reactor on the selected branch. The release gate requires the
+shared full reactor regression on the pinned release commit; its existing
+required status checks include Sonar. Nightly only stores
 Actions artifacts. GitHub Release, GHCR pushes and Cloud registration belong
 to the separate release workflow.
 
@@ -209,8 +215,9 @@ per release attempt after the release gates pass.
 Choose a location for new work before adding a workflow:
 
 - Add ordinary unit, integration, or specification tests to the existing
-  reactor. Source discovery assigns them to the existing shards; do not copy a
-  full-reactor Maven test invocation into another automatic job or workflow.
+  reactor. Source discovery assigns them to the existing shards. Add an
+  integration test to the fast policy only when it provides a basic check
+  needed on every PR and main push.
 - Use a separate path- or label-gated lane for a distinct, expensive capability
   whose evidence cannot come from the ordinary suite. Run only that capability's
   selected tests, and explain its trigger and additional runner cost in review.
@@ -237,8 +244,10 @@ For a new lane, also state its selected scope and why its placement fits above.
 The timing delta is review evidence, never a fixed-duration pass/fail threshold.
 The structural gate checks executable Maven lifecycle and shard-driver calls in
 automatic push/PR workflows, rather than workflow comments or diagnostic text.
-The existing shard and aggregate gates prove that the one logical suite covers
-the entire discovered test set.
+Shard and aggregate admission independently rediscover the expected set for
+the selected mode and require a report from each planned class. Selected
+integration smoke cases must execute, including both tiers for each selected
+published example.
 
 The analysis job caches only `~/.sonar/cache`, separately from Maven packages.
 Every run reads the current server's plugin and scanner-engine indexes to key
