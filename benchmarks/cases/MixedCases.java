@@ -21,24 +21,6 @@ import io.tapstate.benchmarks.PerfCase;
         tags = {"node-timing"},
         spec = "specs/mixed-double-map.json"
 )
-@PerfCase(
-        id = "mixed.snapshot.map-nest.standard",
-        version = 1,
-        description = "Project the root key before building nested documents.",
-        group = "mixed",
-        operators = {"map", "nest"},
-        phase = "snapshot",
-        mode = "snapshot",
-        profile = "standard",
-        profileVersion = 1,
-        source = "mongodb",
-        target = "mongodb",
-        environments = {"single-node-op"},
-        purposes = {"throughput"},
-        workload = "finite-batch",
-        dataFeatures = {"multi-input", "stateful", "single-level", "fanout"},
-        spec = "specs/mixed-map-nest.json"
-)
 final class MixedCases {
     private MixedCases() {
     }

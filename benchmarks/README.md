@@ -126,7 +126,7 @@ memory case. The bounded overrides keep the walkthrough short. Run each command
 separately so a failure still leaves evidence and the other cases can run.
 
 ```sh
-for case_id in mixed.snapshot.map-nest.standard copy.live.basic.standard \
+for case_id in mixed.snapshot.double-map.standard copy.live.basic.standard \
   copy.backlog.fixed-iud.standard nest.snapshot.fanout.wide; do
   python3 -B benchmarks/runner.py describe "$case_id" --format json \
     > "$evidence/$case_id.definition.json"
@@ -138,8 +138,8 @@ done
 ```
 
 Record the operator, date, OS, architecture, JDK, Docker and MongoDB version, and
-retain the request and summary from each command. Check Map-to-Nest document
-contents and confirmed writes, live warm-up and window counts and final readback,
+retain the request and summary from each command. Check the keys and values produced by the two Map nodes, Filter and script.
+Check live warm-up and window counts and final readback,
 and backlog source history, zero snapshot rows on resume, confirmed writes and
 final readback. Review `measurement_status` independently from execution `status`.
 Live Copy may report `insufficient-event-correlation` and backlog Copy may

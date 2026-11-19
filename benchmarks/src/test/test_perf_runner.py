@@ -18,7 +18,10 @@ class PerfRunnerTest(unittest.TestCase):
         select = lambda filters: runner.select(self.cases, [], filters, "all")
         nest = {case["id"] for case in select(["group=nest"])}
         contains_nest = {case["id"] for case in select(["operators=nest"])}
-        self.assertEqual({"mixed.snapshot.map-nest.standard"}, contains_nest - nest)
+        self.assertEqual(nest, contains_nest)
+        filters = {case["id"] for case in select(["group=filter"])}
+        contains_filter = {case["id"] for case in select(["operators=filter"])}
+        self.assertEqual({"mixed.snapshot.double-map.standard"}, contains_filter - filters)
         result = select(["profile=wide", "profile=large", "tags=memory-regression"])
         self.assertEqual(len({case["id"] for case in result}), len(result))
         self.assertTrue(all(case["profile"] in {"wide", "large"} for case in result))
@@ -72,10 +75,11 @@ class PerfRunnerTest(unittest.TestCase):
     def test_operator_suite_lists_executable_definitions_and_preserves_scope(self):
         cases = runner.select(self.cases, [], [], "operators")
         ids = {case["id"] for case in cases}
-        self.assertEqual(50, len(ids))
+        self.assertEqual(49, len(ids))
         self.assertNotIn("join.live.hot-update.wide", ids)
         self.assertNotIn("copy.live.slow-target.large", ids)
         self.assertEqual({"qualification-ready"}, {runner.case_listing(case)["execution_status"] for case in cases})
         self.assertIn("js.live.basic.standard", ids)
         self.assertIn("mixed.snapshot.double-map.standard", ids)
         self.assertNotIn("mixed.snapshot.union-branches.standard", ids)
+        self.assertNotIn("mixed.snapshot.map-nest.standard", ids)

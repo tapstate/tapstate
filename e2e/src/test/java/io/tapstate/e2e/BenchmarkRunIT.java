@@ -320,6 +320,7 @@ class BenchmarkRunIT {
                 var server = RealProcessServer.startPreparedInJvm(storage.configurationUri(), jvmOptions,
                         ignored -> List.of("--tapstate.connectors.seed-dir=" + seeds));
                 try (server) {
+                    server.awaitReady();
                     var control = new ControlPlane(server.baseUrl());
                     storage.loginAndAwaitBusiness(control);
                     try (var peaks = memory ? new BenchmarkResources(server.pid(), folder.resolve("op-resource.jsonl"),

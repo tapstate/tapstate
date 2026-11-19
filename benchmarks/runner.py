@@ -24,7 +24,7 @@ BASE_CASES = {
 }
 OPERATOR_SPECS = {
     "map-basic", "filter-basic", "js-basic", "unwind-basic", "union-basic", "join-basic", "nest-basic",
-    "mixed-double-map", "mixed-map-nest", "join-hot-update", "nest-child-update",
+    "mixed-double-map", "join-hot-update", "nest-child-update",
 }
 DIMENSIONS = {
     "group", "operators", "phase", "mode", "profile", "source", "target",

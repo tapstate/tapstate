@@ -61,16 +61,13 @@ final class BenchmarkOperatorOracle {
                     }
                 }
             }
-            case "nest-basic", "nest-child-update", "nest-fanout", "mixed-map-nest" -> {
+            case "nest-basic", "nest-child-update", "nest-fanout" -> {
                 var children = new HashMap<Long, List<BsonValue>>();
                 for (var row : source.get("children")) {
                     children.computeIfAbsent(number(row, "root_id"), ignored -> new ArrayList<>()).add(row);
                 }
                 for (var root : source.get("roots")) {
                     var document = root.clone();
-                    if (scenario.equals("mixed-map-nest")) {
-                        document.put("root_key", document.remove("_id"));
-                    }
                     document.put("children", new BsonArray(children.getOrDefault(number(root, "_id"), List.of())));
                     put(result, key(root, "_id"), document);
                 }
@@ -108,10 +105,6 @@ final class BenchmarkOperatorOracle {
             case "unwind-basic" -> {
                 actual.remove("_id");
                 yield unwindKey(actual);
-            }
-            case "mixed-map-nest" -> {
-                actual.remove("_id");
-                yield key(actual, "root_key");
             }
             case "union-basic" -> table + "/" + key(actual, "_id");
             default -> key(actual, "_id");

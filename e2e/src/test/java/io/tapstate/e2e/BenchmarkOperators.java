@@ -44,7 +44,7 @@ final class BenchmarkOperators {
                 }
                 yield Map.of("roots", requestedRows / 4, "children", Math.multiplyExact(requestedRows / 4, fanout));
             }
-            case "nest-basic", "nest-child-update", "mixed-map-nest" -> {
+            case "nest-basic", "nest-child-update" -> {
                 int fanout = spec.getDocument("inputs").getDocument("roots").getInt32("children_per_root").getValue();
                 if (requestedRows < fanout || requestedRows % fanout != 0) {
                     throw new IllegalArgumentException("Child input count must be a positive multiple of " + fanout);
@@ -76,7 +76,6 @@ final class BenchmarkOperators {
             case "union-basic" -> List.of("left", "right");
             case "join-basic", "join-hot-update", "join-steady-state", "join-lifecycle-release" -> List.of("facts");
             case "nest-basic", "nest-child-update", "nest-fanout" -> List.of("roots");
-            case "mixed-map-nest" -> List.of(nodes.getFirst());
             default -> List.of("records");
         };
     }
@@ -104,8 +103,6 @@ final class BenchmarkOperators {
                     filter(nodes.get(1), first),
                     map(nodes.get(2), nodes.get(1), Map.of("value", "=int(after.value) * 2")),
                     script(nodes.get(3), nodes.get(2), false));
-            case "mixed-map-nest" -> List.of(map(first, List.of("roots"), Map.of("root_key", "$_id")),
-                    nest(nodes.get(1), first, "root_key"));
             default -> throw new AssertionError(scenario);
         };
         var sink = Map.of("id", "output", "source", "tgt_perf", "write_mode", "upsert", "on_full_load", "clear");

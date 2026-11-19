@@ -20,7 +20,6 @@ SPECIAL_CASES = {
     "copy.snapshot.dummy-baseline.standard",
     "copy.live.handoff.standard",
     "mixed.snapshot.double-map.standard",
-    "mixed.snapshot.map-nest.standard",
     "join.live.hot-update.standard",
     "nest.live.child-update.standard",
     "nest.snapshot.fanout.wide",
@@ -64,7 +63,10 @@ class PerfCatalogTest(unittest.TestCase):
     def test_combination_and_reused_memory_metadata(self):
         nest_only = {case["id"] for case in self.cases.values() if case["group"] == "nest"}
         nest_related = {case["id"] for case in self.cases.values() if "nest" in case["operators"]}
-        self.assertEqual(nest_related - nest_only, {"mixed.snapshot.map-nest.standard"})
+        self.assertEqual(nest_related, nest_only)
+        filter_only = {case["id"] for case in self.cases.values() if case["group"] == "filter"}
+        filter_related = {case["id"] for case in self.cases.values() if "filter" in case["operators"]}
+        self.assertEqual(filter_related - filter_only, {"mixed.snapshot.double-map.standard"})
         self.assertEqual(
             self.cases["mixed.snapshot.double-map.standard"]["operators"], ["map", "filter", "js"]
         )
@@ -99,13 +101,13 @@ class PerfCatalogTest(unittest.TestCase):
         self.assertNotIn("generation", dummy)
 
     def test_rejects_inconsistent_specs_and_binds_semantic_versions(self):
-        case = self.cases["mixed.snapshot.map-nest.standard"]
+        case = self.cases["mixed.snapshot.double-map.standard"]
         contracts = catalog_tool.read_json(catalog_tool.CASE_ROOT / "contracts.json")
         spec = catalog_tool.read_json(catalog_tool.CASE_ROOT / case["spec"])
         metadata = {key: value for key, value in case.items()
                     if key not in ("execution_status", "definition_sha256", "workload_spec")}
         with self.assertRaisesRegex(ValueError, "operators must match"):
-            catalog_tool.resolve_case(dict(metadata, operators=["nest"]), contracts, spec)
+            catalog_tool.resolve_case(dict(metadata, operators=["map", "js"]), contracts, spec)
         with self.assertRaisesRegex(ValueError, "profile version does not match"):
             catalog_tool.resolve_case(dict(metadata, profile_version=2), contracts, spec)
         moved = catalog_tool.resolve_case(dict(metadata, line=1000), contracts, spec)
@@ -125,7 +127,7 @@ class PerfCatalogTest(unittest.TestCase):
         self.assertIn("Group children independently", description)
         self.assertIn("Both all inputs are consumed", description)
         self.assertIn(self.cases[case_id]["definition_sha256"], description)
-        self.assertIn("59 registered cases", catalog_tool.render_markdown(self.catalog))
+        self.assertIn("58 registered cases", catalog_tool.render_markdown(self.catalog))
         invalid = subprocess.run(
             [sys.executable, str(CATALOG), "--case", "missing-case"],
             text=True, capture_output=True, check=False,
