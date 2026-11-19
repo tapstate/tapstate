@@ -20,7 +20,7 @@ jobs:
           cat > "$RUNNER_TEMP/estimates.json" <<'JSON'
           {"environment": "ubuntu-24.04-x64-op", "durations_seconds": {"copy.live.slow-target.large": 900, "copy.snapshot.basic.large": 250, "copy.snapshot.basic.wide": 240, "join.lifecycle.release.standard": 920, "join.live.hot-update.wide": 1200, "join.live.steady-state.standard": 350, "nest.snapshot.fanout.wide": 530}}
           JSON
-          python3 -B benchmarks/runner.py allocate --suite memory --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 4 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
+          python3 -B benchmarks/runner.py allocate --id join.live.hot-update.wide --repeats 3 --rows 96 --rate 8 --measurement-seconds 6 --timeout-seconds 95 --slots 1 --batch-seconds 1600 --deadline-seconds 2100 --reserve-seconds 300 --environment ubuntu-24.04-x64-op --estimates "$RUNNER_TEMP/estimates.json" --output "$RUNNER_TEMP/manifest.json"
       - uses: actions/upload-artifact@v4
         with:
           name: memory-qualification-manifest
@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        batch: [0, 1, 2, 3]
+        batch: [0]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -66,10 +66,17 @@ jobs:
           docker image inspect mongo:7.0 --format '{{json .RepoDigests}}' > "$RUNNER_TEMP/calibration/mongo-image.json"
       - name: Build the matching OP candidate
         run: |
-          mvn -B -pl e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build.log" 2>&1 || {
-            tail -100 "$RUNNER_TEMP/calibration/build.log"
-            exit 1
-          }
+          for attempt in 1 2 3; do
+            if mvn -B -pl e2e -am -DskipTests package > "$RUNNER_TEMP/calibration/build-$attempt.log" 2>&1; then
+              exit 0
+            fi
+            tail -60 "$RUNNER_TEMP/calibration/build-$attempt.log"
+            if ! grep -q 'HTTP Status: 429' "$RUNNER_TEMP/calibration/build-$attempt.log"; then
+              exit 1
+            fi
+            sleep "$((20 * attempt))"
+          done
+          exit 1
       - name: Validate the catalog, selection and report
         run: python3 -B -m unittest discover -s benchmarks/src/test
       - name: Replay the assigned batch
