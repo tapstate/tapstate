@@ -2,6 +2,7 @@ package io.tapstate.app;
 
 import io.tapstate.core.common.TapstateException;
 import io.tapstate.core.model.PipelineNode;
+import io.tapstate.core.model.SourceResource;
 import io.tapstate.spi.store.*;
 import java.util.*;
 import org.junit.jupiter.api.Test;
@@ -49,6 +50,36 @@ class PipelinePrivateNoteRetirementTest {
         var changed=new io.tapstate.core.model.SourceResource("source",null,"connector",Map.of("uri","database-y"),null,null,null,null);
         executor.reconcile(original,Map.of(token.owner().namespace(),changed),() -> {});
         assertThat(releases).containsExactly(token);verify(retirement).completeAfterVerifiedRelease();
+    }
+
+    @Test void recoveryFindsTheOriginalArtifactNamespaceWithoutCreatingItInTheTargetMapping() {
+        var notes = mock(RequiredNoteStore.class); when(notes.guardedBy(any())).thenReturn(notes);
+        var permission = mock(CacheRecoveryStore.FullPreparation.class);
+        var old = new PipelineIntentScope("cluster", 1, "old-cache", "flow", 1);
+        var target = new PipelineIntentScope("cluster", 1, "new-cache", "flow", 2);
+        when(permission.recovery()).thenReturn(new PipelineCacheRecovery(UUID.randomUUID().toString(), old, target));
+        String hash = "a".repeat(64);
+        var owner = RequiredNoteOwner.forArtifact(1, new PipelineNode("flow", "sink"), PipelineNode.Purpose.SYNC, 1, hash, 1);
+        var token = new RequiredNoteScope(owner, 1);
+        var origin = new RequiredNoteOrigin("connector", hash, new byte[]{1});
+        when(notes.privateContexts(permission)).thenReturn(List.of(new RequiredNoteContext(token, Optional.of(origin), false)));
+        var retirement = mock(RequiredNoteRetirement.class);
+        when(notes.retirement(token, permission)).thenReturn(retirement);
+        when(retirement.scope()).thenReturn(token); when(retirement.origin()).thenReturn(Optional.of(origin));
+        var released = new ArrayList<RequiredNoteScope>();
+        var executor = new PipelinePrivateNoteRetirement(notes, mock(PipelineStateRebuilds.class),
+                (id, settings) -> new RequiredNoteOrigin(id, "b".repeat(64), new byte[]{1}),
+                (item, config, purpose, cluster, guard) -> { released.add(item.scope()); return Optional.empty(); });
+        var binding = new ConnectorRunBindings.Binding("sink", PipelineNode.Purpose.SYNC, "connector", "1.0", hash, token, null, null);
+        var predecessor = new ConnectorRunBindings(old, 1, List.of(binding), null);
+        String canonical = RequiredNoteOwner.namespace(new PipelineNode("flow", "sink"), PipelineNode.Purpose.SYNC);
+        var source = new SourceResource("target", null, "connector", Map.of("uri", "changed"), null, null, null, null);
+        var desired = Map.of(canonical, source);
+        executor.reconcileRecovered(permission, desired, predecessor, () -> {});
+        assertThat(released).containsExactly(token);
+        verify(retirement).completeAfterVerifiedRelease();
+        assertThat(desired).containsOnlyKeys(canonical);
+        verify(notes, never()).open(any());
     }
 
     @Test void originalPurposesAreReleasedOnceAndFailureKeepsTheRemainingIdentity() {

@@ -240,7 +240,12 @@ final class MongoCaptureCachePreparations implements CaptureCachePreparations,Sh
             var identity=new MongoCacheBusinessIdentity(database,scope);identity.admitClaim(session);
             Date now=MongoCachePipelinePreparations.proveNode(session,database,scope,request.originalNode());
             var key=new WorkloadClaimKey(scope.clusterId(),WorkloadClaimType.CAPTURE,preparation.captureId());
-            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first()!=null)throw history(preparation);
+            if(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(database).find(session,new Document("_id",MongoWorkloadClaimStore.id(key))).first()!=null) {
+                var artifact = request.sharedArtifact();
+                if (artifact != null && artifact.handoffIntentRevision() != null)
+                    return loadInSession(session, preparation);
+                throw history(preparation);
+            }
             requireNoPriorFacts(session,preparation);
             var initial=new WorkloadClaimFence(key,request.originalNode().owner(),1,0,request.originalNode().topologyRevision());
             var row=new Document("_id",MongoWorkloadClaimStore.id(key)).append("clusterId",key.clusterId()).append("resourceType",key.type().name()).append("resourceId",key.resourceId())

@@ -127,14 +127,25 @@ final class MongoPipelineStateRebuilds implements PipelineStateRebuilds {
             ConfigurationVersion.advance(session, SystemCollections.CONFIGURATION_VERSION.on(database), client);
             long intentRevision = intents.completeRebuild(session, pending.request.intent(), target);
             var annex = encode(pending).append("result", new Document("phase", "COMPLETE").append("checkpointEpoch", receipt.checkpointEpoch()).append("intentRevision", intentRevision));
+            var removed = new Document("cacheRecovery", "").append("sharedRecovery", "");
+            var updated = new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
+                    .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex);
+            var desired = pending.request.intent().desired();
+            if (desired.purgeState()) {
+                if (desired.targetState() == io.tapstate.core.lifecycle.PipelineState.RUNNING) {
+                    var binding = new io.tapstate.spi.store.ConnectorRunBindings(target, 0L, java.util.List.of(),
+                            new io.tapstate.spi.store.ConnectorRunBindings.Handoff(intentRevision,
+                                    io.tapstate.spi.store.ConnectorRunBindings.Phase.REQUESTED, java.util.List.of(), java.util.List.of()));
+                    updated.append("connectorBindings", MongoPipelineStateMappings.connectorBindings(binding));
+                } else removed.append("connectorBindings", "");
+            } else if (mapping.containsKey("connectorBindings")) throw fenced();
             if (SystemCollections.OPERATOR_GENERATIONS.on(database).updateOne(session,
                     new Document("_id", target.pipelineId()).append("stateGeneration", pending.request.originalScope().stateGeneration())
                             .append("phase", "REBUILDING").append("operationId", pending.request.operationId()).append("stateRebuild", encode(pending))
                             .append("sharedRecovery",mapping.containsKey("sharedRecovery")?mapping.get("sharedRecovery"):new Document("$exists",false))
                             .append("noteWriteFence", writeFence),
-                    new Document("$set", new Document("stateGeneration", target.stateGeneration()).append("phase", "ACTIVE")
-                            .append("cachePreparation", MongoPipelinePreparationFacts.encode(result)).append("stateRebuild", annex))
-                            .append("$unset", new Document("cacheRecovery", "").append("sharedRecovery",""))
+                    new Document("$set", updated)
+                            .append("$unset", removed)
                             .append("$inc", new Document("noteWriteFence", 1L))).getMatchedCount() != 1)
                 throw new IllegalStateException("original rebuild changed within one CONFIG snapshot");
             return result;

@@ -3,6 +3,7 @@ package io.tapstate.control.restapi;
 import io.tapstate.control.core.AuditGate;
 import io.tapstate.control.core.ConnectorCenter;
 import io.tapstate.control.core.ConnectorCenterService;
+import io.tapstate.control.core.ConnectorUsageQuery;
 import io.tapstate.control.core.ControlError;
 import io.tapstate.control.core.CredentialType;
 import io.tapstate.control.core.Scope;
@@ -59,6 +60,15 @@ class ConnectorCenterControllerTest {
             mvc.perform(post("/api/connector-center:refresh")).andExpect(status().isOk());
             mvc.perform(post("/api/connector-center/mongodb:download")).andExpect(status().isOk());
             mvc.perform(get("/api/connector-center/operations/original-operation")).andExpect(status().isOk());
+            String hash = "a".repeat(64);
+            String usage = mvc.perform(get("/api/connector-center/mongodb/versions/" + hash + "/usages")
+                    .param("search", "Reader").param("page", "2").param("pageSize", "10"))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+            assertThat(usage).contains("reader_10", hash, "\"total\":11");
+            assertThatThrownBy(() -> mvc.perform(get("/api/connector-center/mongodb/versions/invalid/usages")))
+                    .hasCauseInstanceOf(TapstateException.class)
+                    .satisfies(failure -> assertThat(((TapstateException) failure.getCause()).code())
+                            .isEqualTo(ControlError.MALFORMED_REQUEST));
             byte[] artifact = new byte[]{1, 2, 3, 4};
             mvc.perform(post("/api/connector-center:upload").contentType("application/java-archive").content(artifact))
                     .andExpect(status().isOk());
@@ -83,6 +93,18 @@ class ConnectorCenterControllerTest {
     @Import({RestApiConfiguration.class, ConnectorCenterController.class})
     static class Fixture {
         @Bean CapturedCenter center() { return new CapturedCenter(); }
+        @Bean ConnectorUsageQuery usage() {
+            return new ConnectorUsageQuery() {
+                @Override public List<Version> forPipeline(String id) { return List.of(); }
+                @Override public Page usages(String id, String sha256, String search, int page, int pageSize) {
+                    assertThat(id).isEqualTo("mongodb"); assertThat(search).isEqualTo("Reader");
+                    assertThat(page).isEqualTo(2); assertThat(pageSize).isEqualTo(10);
+                    return new Page(page, pageSize, 11, List.of(new Pipeline("reader_10", "Reader", List.of(
+                            new Version("input", io.tapstate.core.model.PipelineNode.Purpose.CAPTURE,
+                                    id, "1.0", sha256, "capture", "chain")))));
+                }
+            };
+        }
         @Bean ConnectorCenterService connectorCenterService(CapturedCenter center) {
             return new ConnectorCenterService(center, new AuditGate(record -> { }, Clock.systemUTC()));
         }

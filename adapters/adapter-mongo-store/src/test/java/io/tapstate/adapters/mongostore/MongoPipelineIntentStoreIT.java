@@ -14,6 +14,10 @@ import io.tapstate.core.lifecycle.PipelineState;
 import io.tapstate.core.model.SourceResource;
 import io.tapstate.core.model.canonical.CanonicalHash;
 import io.tapstate.spi.store.IoError;
+import io.tapstate.spi.store.ConnectorRunBindings;
+import io.tapstate.spi.store.RequiredNoteOwner;
+import io.tapstate.spi.store.RequiredNoteScope;
+import io.tapstate.core.model.PipelineNode;
 import io.tapstate.spi.store.PipelineIntentScope;
 import io.tapstate.spi.store.PipelineIntentSnapshot;
 import io.tapstate.spi.store.StorageBinding;
@@ -44,6 +48,57 @@ class MongoPipelineIntentStoreIT {
     @Container private static final MongoDBContainer MONGO = new MongoDBContainer(DockerImageName.parse("mongo:7.0"))
             .withCommand("--replSet", "docker-rs", "--setParameter", "enableTestCommands=1");
     private static final String HASH = CanonicalHash.of(pipeline());
+
+    @Test
+    void aPreparedArtifactHandoffPreservesTheOriginalBindingWhenItsStartIsSuperseded() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            assertThat(store.compareAndSet(scope, 0, intent(PipelineState.STOPPED, false, false, null))).isTrue();
+            assertThat(store.compareAndSetExplicitStart(scope, 1, intent(PipelineState.RUNNING, false, true, 0L))).isTrue();
+            var original = store.load("flow").orElseThrow();
+            var bindings = store.connectorBindings();
+            var oldNote = new RequiredNoteScope(RequiredNoteOwner.forNode(scope.bindingVersion(),
+                    new PipelineNode("flow", "target"), PipelineNode.Purpose.SYNC, scope.stateGeneration()), 1);
+            var old = new ConnectorRunBindings.Binding("target", PipelineNode.Purpose.SYNC, "mongodb", "1.0", "a".repeat(64), oldNote, null, null);
+            var candidate = new ConnectorRunBindings.Binding("target", PipelineNode.Purpose.SYNC, "mongodb", "2.0", "b".repeat(64), oldNote, null, null);
+            bindings.seed(original, List.of(old));
+            assertThat(bindings.prepare(original, List.of(candidate)).handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PREPARED);
+            assertThat(bindings.prepare(original, List.of(candidate)).effective()).containsExactly(old);
+            assertThatThrownBy(() -> bindings.prepare(original, List.of(old))).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(store.compareAndSet(scope, 2, intent(PipelineState.PAUSED, false, false, null))).isTrue();
+            assertThatThrownBy(() -> bindings.publish(original)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThat(bindings.load(scope).orElseThrow().effective()).containsExactly(old);
+            assertThatThrownBy(() -> store.compareAndSetExplicitStart(scope, 3, intent(PipelineState.RUNNING, false, false, null)))
+                    .satisfies(MongoPipelineIntentStoreIT::fenced);
+            bindings.abort(scope, 2);
+            assertThat(bindings.load(scope).orElseThrow().effective()).containsExactly(old);
+            assertThat(bindings.load(scope).orElseThrow().handoff()).isNull();
+            try (var reopened = MongoConfigurationDomain.open(settings(database), "cluster-a")) {
+                assertThat(reopened.intents().connectorBindings().load(scope)).isEqualTo(bindings.load(scope));
+            }
+        });
+    }
+
+    @Test
+    void publishedBindingCleanupRetainsItsOriginalRevisionAcrossLaterIntents() {
+        withConfiguration((domain, database, scope) -> {
+            var store = domain.intents();
+            var bindings = store.connectorBindings();
+            assertThat(store.compareAndSetExplicitStart(scope, 0, intent(PipelineState.RUNNING, false, false, null))).isTrue();
+            var original = store.load("flow").orElseThrow();
+            bindings.prepare(original, List.of());
+            var published = bindings.publish(original);
+            assertThat(published.effectiveIntentRevision()).isEqualTo(1);
+            assertThat(published.handoff().phase()).isEqualTo(ConnectorRunBindings.Phase.PUBLISHED);
+            assertThat(store.compareAndSet(scope, 1, intent(PipelineState.PAUSED, false, false, null))).isTrue();
+            assertThatThrownBy(() -> bindings.abort(scope, 1)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            assertThatThrownBy(() -> bindings.complete(scope, 2)).satisfies(MongoPipelineIntentStoreIT::fenced);
+            bindings.complete(scope, 1);
+            bindings.complete(scope, 1);
+            assertThat(bindings.load(scope).orElseThrow().handoff()).isNull();
+            assertThat(bindings.load(scope).orElseThrow().effectiveIntentRevision()).isEqualTo(1);
+        });
+    }
 
     @Test
     void latestIntentAndCoordinatesSurviveReopenWithoutAnyCacheResource() {

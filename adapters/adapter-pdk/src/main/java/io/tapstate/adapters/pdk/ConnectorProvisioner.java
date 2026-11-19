@@ -37,6 +37,11 @@ public interface ConnectorProvisioner {
         return resolve(origin.connectorId(), origin.artifactHash());
     }
 
+    /** Reads metadata for an exact locally installed artifact without opening its classloader. */
+    default java.util.Optional<String> artifactVersion(String connectorId, String sha256) {
+        return java.util.Optional.empty();
+    }
+
     /** Keeps a persistent copy before publishing a new durable binding. */
     default void retain(ConnectorRef ref) {}
 

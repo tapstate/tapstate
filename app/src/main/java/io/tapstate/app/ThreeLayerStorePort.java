@@ -138,7 +138,12 @@ final class ThreeLayerStorePort implements StorePort {
                 && reference instanceof io.tapstate.core.model.SourceRef.Spec spec && !spec.srs())
                 || pipeline.settings()!=null && pipeline.settings().readMode()==io.tapstate.core.model.ReadMode.SNAPSHOT_ONLY)
             return Optional.of(canonical);
-        var original=scope(pipeline.id());String capture=io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value());
+        var original=scope(pipeline.id());
+        var binding = configuration.intents().connectorBindings().load(original)
+                .flatMap(value -> value.find(source.id(), io.tapstate.core.model.PipelineNode.Purpose.CAPTURE)).orElse(null);
+        String capture = binding == null ? io.tapstate.core.model.canonical.SourceCaptureIdentity.sharedCapture(canonical.chainId().value())
+                : binding.captureId();
+        if (capture == null) throw refused();
         var prepared=configuration.capturePreparations().read(business(),capture);
         if(prepared.isEmpty()) {
             // Start planning can leave the absent-history proof to the transaction that creates capture.
@@ -150,7 +155,8 @@ final class ThreeLayerStorePort implements StorePort {
         }
         var fixed=prepared.orElseThrow();
         if(fixed.mode()!=CapturePreparation.Mode.SHARED_SRS || !business().equals(fixed.scope()) || !capture.equals(fixed.captureId())
-                || !canonical.chainId().value().equals(fixed.canonicalChainId())
+                || binding == null && !canonical.chainId().value().equals(fixed.canonicalChainId())
+                || binding != null && !binding.chainId().equals(fixed.chainId())
                 || !fixed.sourceIdentityHash().equals(io.tapstate.core.model.canonical.SourceCaptureIdentity.physical(source.connector(),source.config())))throw refused();
         var topology=stores.get().consumers().attached(fixed.chainId());
         var reader=topology.consumers().stream().filter(member -> member.context().key().pipelineId().equals(pipeline.id())
@@ -158,7 +164,7 @@ final class ThreeLayerStorePort implements StorePort {
         active();if(!original.equals(scope(pipeline.id())))throw refused();
         if(reader.isEmpty() && requireAttachment)return Optional.empty();
         if(reader.isPresent() && reader.orElseThrow().context().stateGeneration()!=original.stateGeneration())throw refused();
-        return Optional.of(canonical.onPhysicalChain(fixed.canonicalChainId(),fixed.chainId()));
+        return Optional.of(canonical.onPhysicalChain(canonical.chainId().value(),fixed.chainId()));
     }
     PipelineIntentScope scope(String pipeline) {
         active();
@@ -254,7 +260,7 @@ final class ThreeLayerStorePort implements StorePort {
                 var previous = intents.load(desired.pipelineId());
                 if (previous.isPresent() && !previous.orElseThrow().scope().equals(original)) throw refused();
                 submit(desired, original, previous.map(PipelineIntentSnapshot::desired),
-                        previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), Optional.empty());
+                        previous.map(PipelineIntentSnapshot::intentRevision).orElse(0L), Optional.empty(), false);
             }
             @Override public Optional<StartEntry> startEntry(String pipeline) {
                 if (!deferFirstStart) return Optional.empty();
@@ -297,10 +303,10 @@ final class ThreeLayerStorePort implements StorePort {
                             .compareAndSetStart(scope, original.revision(), desired, inputs.inputs())) throw refused();
                     return;
                 }
-                submit(desired, scope, original.desired(), original.revision(), captured);
+                submit(desired, scope, original.desired(), original.revision(), captured, true);
             }
             private void submit(DesiredState desired, PipelineIntentScope original, Optional<DesiredState> previous,
-                    long revision, Optional<StartPreparation> captured) {
+                    long revision, Optional<StartPreparation> captured, boolean explicitStart) {
                 // An immediate start may supersede an explicitly clearing stop before convergence.
                 // That same fenced intent must finish replacement before preparing the new selection.
                 boolean clearsFirst = desired.purgeState() && desired.reassemble()
@@ -315,8 +321,11 @@ final class ThreeLayerStorePort implements StorePort {
                         prepareCaptured.accept(original, inputs.inputs());
                     }
                 }
-                if (!configuration.intents().guardedBy(ThreeLayerStorePort.this::active)
-                        .compareAndSet(original, revision, desired)) throw refused();
+                var intents = configuration.intents().guardedBy(ThreeLayerStorePort.this::active);
+                boolean committed = explicitStart && !clearsFirst
+                        ? intents.compareAndSetExplicitStart(original, revision, desired)
+                        : intents.compareAndSet(original, revision, desired);
+                if (!committed) throw refused();
             }
             @Override public Optional<DesiredState> read(String pipeline) {
                 active(); return configuration.intents().load(pipeline).filter(value -> !value.deleted()).map(PipelineIntentSnapshot::desired);

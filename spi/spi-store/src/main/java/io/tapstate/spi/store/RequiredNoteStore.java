@@ -43,6 +43,12 @@ public interface RequiredNoteStore {
     /** Reports an existing original binding without creating one. */
     default Optional<RequiredNoteOrigin> originIfPresent(RequiredNoteScope scope) { return Optional.empty(); }
 
+    /** Prepares isolated connector notes for a verified local artifact without changing the prior scope. */
+    default RequiredNoteScope prepareArtifactBinding(RequiredNoteOwner candidate, RequiredNoteOrigin expected,
+            RequiredNoteScope previous) {
+        throw new io.tapstate.core.common.TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, java.util.Map.of(), null);
+    }
+
     /** Verifies the captured original binding before allowing a legacy artifact migration. */
     default boolean localArtifactReady(RequiredNoteScope scope, RequiredNoteOrigin expected) { return false; }
 

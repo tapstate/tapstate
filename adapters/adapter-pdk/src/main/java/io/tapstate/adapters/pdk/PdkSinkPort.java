@@ -340,11 +340,8 @@ public final class PdkSinkPort implements SinkPort {
         requireActive();
         var identity = new SharedSinkConnectors.NoteIdentity(execution, primary, global, origin);
         if (writerOpening && preparations != null) preparations.rememberOpenedNotes(identity);
-        ConnectorNoteScopes fixed = ConnectorNoteScopes.of(noteScopes.store(), namespace -> {
-            if (namespace.equals(primary.owner().namespace())) return primary;
-            if (namespace.equals(global.owner().namespace())) return global;
-            throw new TapstateException(IoError.NOTE_SCOPE_UNAVAILABLE, Map.of(), null);
-        }, noteScopes::requireActive);
+        ConnectorNoteScopes fixed = ConnectorNoteScopes.forBoundRun(noteScopes.store(),
+                ConnectorStateNamespace.of(config.node(), purpose), primary, global, noteScopes::requireActive);
         return new ConfiguredDrive(identity, fixed);
     }
 

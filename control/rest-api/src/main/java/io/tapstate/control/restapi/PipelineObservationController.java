@@ -4,6 +4,8 @@ import io.tapstate.control.core.PipelineCatalogService;
 import io.tapstate.control.core.PipelineCatalogItem;
 import io.tapstate.control.core.PipelineObservationQueryService;
 import io.tapstate.control.core.PipelineSnapshot;
+import io.tapstate.control.core.ConnectorUsageQuery;
+import org.springframework.beans.factory.annotation.Autowired;
 import io.tapstate.messages.MessageCatalog;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -21,6 +23,10 @@ class PipelineObservationController {
     private final PipelineObservationQueryService observations;
     private final PipelineCatalogService pipelines;
     private final MessageCatalog catalog;
+    private ConnectorUsageQuery usage;
+
+    @Autowired(required = false)
+    void connectorUsage(ConnectorUsageQuery usage) { this.usage = usage; }
 
     PipelineObservationController(PipelineObservationQueryService observations,
             PipelineCatalogService pipelines, MessageCatalog catalog) {
@@ -35,11 +41,16 @@ class PipelineObservationController {
         Optional<PipelineCatalogItem> item = pipelines.find(id);
         if (item.isPresent()) {
             PipelineCatalogItem pipeline = item.orElseThrow();
-            return observations.findStatusWithPlan(pipeline)
+            var result = observations.findStatusWithPlan(pipeline)
                     .map(status -> PipelineStatusResponse.of(pipeline, catalog, status))
                     .orElseGet(() -> PipelineStatusResponse.of(pipeline, catalog));
+            return connectorVersions(result, id);
         }
-        return PipelineStatusResponse.of(observations.status(id), catalog);
+        return connectorVersions(PipelineStatusResponse.of(observations.status(id), catalog), id);
+    }
+
+    private PipelineStatusResponse connectorVersions(PipelineStatusResponse response, String id) {
+        return response.withConnectorVersions(usage == null ? java.util.List.of() : usage.forPipeline(id));
     }
 
     @Verb("pipeline.metrics")

@@ -386,6 +386,13 @@ public final class LocalConnectorArtifacts implements ConnectorProvisioner, Conn
         notes.markLocalArtifactReady(scope, origin);
     }
 
+    @Override
+    public Optional<String> artifactVersion(String connectorId, String sha256) {
+        return Optional.ofNullable(installed.get(sha256))
+                .filter(value -> value.metadata().catalog().id().equals(connectorId))
+                .map(value -> value.metadata().version());
+    }
+
     public List<ConnectorArtifactMetadata> catalog() {
         return list().stream().map(row -> installed.get(row.contentHash()).metadata()).toList();
     }

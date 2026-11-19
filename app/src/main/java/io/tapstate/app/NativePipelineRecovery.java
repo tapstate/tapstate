@@ -152,10 +152,11 @@ final class NativePipelineRecovery {
         var permission=configuration.cacheRecoveries().guardedBy(this::requireAvailable).authorizeFull(running,id);
         ConnectorProvisioner fixed=fixed(inspected.connectorHashes());
         var notes=new PipelinePrivateNoteRetirement(configuration.requiredNotes(),configuration.rebuilds(),fixed);
+        var predecessor = configuration.intents().connectorBindings().previousForRecovery(permission.recovery().targetScope()).orElse(null);
         preparer.prepareRecovered(permission,inspected.inputs(),() -> {
             requireAvailable();
             if(engine.captureRun(id).filter(Engine.Run::isCarryingAJob).isPresent())throw fenced();
-            notes.reconcileRecovered(permission,inspected.privateContexts(),this::requireAvailable);
+            notes.reconcileRecovered(permission,inspected.privateContexts(),predecessor,this::requireAvailable);
         });
         requireAvailable();permission.requireActive();
         if(!inspected.operatorDatabases().isEmpty()) {

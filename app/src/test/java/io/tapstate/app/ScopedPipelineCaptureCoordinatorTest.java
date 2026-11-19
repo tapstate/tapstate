@@ -877,6 +877,7 @@ class ScopedPipelineCaptureCoordinatorTest {
             when(f.configuration.read(BUSINESS,captureId)).thenReturn(Optional.of(prepared));
             var origin=ConnectorNoteOrigin.capture("mongodb","a".repeat(64),f.source.config());
             when(f.configuration.inspectSharedOrigin(eq(BUSINESS),eq("input"),anyString())).thenReturn(Optional.of(origin));
+            when(f.connectors.resolveRetained(any(),any(),eq(origin))).thenCallRealMethod();
             var key=f.streamingProgress.get().snapshot().models().get("orders");
             var pinned=new SourceTable("orders",List.of(new SourceField("old-sample","STRING(100)")),List.of(),List.of());
             var srs=f.sources.srs(BUSINESS,() -> {});

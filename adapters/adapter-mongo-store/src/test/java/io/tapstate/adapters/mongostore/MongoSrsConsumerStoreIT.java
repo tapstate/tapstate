@@ -54,6 +54,142 @@ class MongoSrsConsumerStoreIT {
     private static final String CHAIN = "chain-a";
     private static final SrsConsumerContext A = context("pipeline-a", "source-a", 1);
     private static final SrsConsumerContext B = context("pipeline-b", "source-b", 1);
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aConnectorHandoffSeedsOnlyItsOwnCandidateFromTheOriginalGlobalAck(boolean initialLoad) {
+        withBusiness(f -> {
+            var tables = initialLoad ? Set.of("orders", "items") : Set.of("orders");
+            var references = publishSnapshotModels(f, tables);
+            var member = f.consumers().attach(A, 0, tables, f.fenceA()).orElseThrow();
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            if (initialLoad) assertThat(f.consumers().pinSnapshot(A, member.revision(), 0,
+                    new SrsSnapshotPin(1, "initial-cut", references), f.fenceA())).isTrue();
+            var writers = new java.util.HashMap<String, List<String>>();
+            for (String table : tables) writers.put(table, List.of("sink"));
+            assertThat(f.consumers().beginWriterRun(A, member.revision(), "original", writers, f.fenceA())).isTrue();
+            assertThat(f.consumers().advanceWriter(A, member.revision(), "original", "orders", "sink", point(1, 9, "fast-cut"), f.fenceA())).isTrue();
+            if (initialLoad) assertThat(f.consumers().advanceWriter(A, member.revision(), "original", "items", "sink", point(1, 3, "safe-cut"), f.fenceA())).isTrue();
+            var original = f.consumers().progress(A).orElseThrow();
+            String resumeToken = initialLoad ? "initial-cut" : "fast-cut";
+            assertThat(original.cursor().sinkAcked().token()).isEqualTo(resumeToken);
+            var oldB = f.consumers().find(B.key()).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var capture = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "capture-candidate"),
+                    new WorkloadOwner("candidate-node", "candidate-boot"), 1, Duration.ofSeconds(30)).claim();
+            var captureFence = WorkloadClaimFence.from(capture);
+            String candidateChain = "candidate-chain";
+            CaptureHistoryFixture.shared(f.database(), SCOPE, captureFence, candidateChain, "retention");
+            var candidate = new SrsConsumerContext(new SrsConsumerKey(candidateChain, A.key().pipelineId(), A.key().sourceId()), A.stateGeneration());
+            assertThatThrownBy(() -> f.consumers().prepareConnectorHandoff(original, candidate, captureFence,
+                    f.fenceA(), java.time.Instant.EPOCH)).isInstanceOf(TapstateException.class);
+            assertThat(f.consumers().find(candidate.key())).isEmpty();
+            var next = WorkloadClaimFence.from(claims.advanceExecution(f.pipelineA(), 1,
+                    Set.of(f.pipelineA().owner().nodeId())).orElseThrow());
+            var staged = f.consumers().prepareConnectorHandoff(original, candidate, captureFence, next,
+                    java.time.Instant.EPOCH).orElseThrow();
+            assertThat(f.consumers().prepareConnectorHandoff(original, candidate, captureFence, next,
+                    java.time.Instant.EPOCH)).contains(staged);
+            assertThat(f.chains().load(candidateChain).orElseThrow().resumeToken()).isEqualTo(resumeToken);
+            assertThat(f.chains().load(candidateChain).orElseThrow().epoch()).isEqualTo(1);
+            var opened = f.chains().openServingEpoch(candidateChain, 1, tables, captureFence).orElseThrow();
+            assertThat(opened.epoch()).isEqualTo(2);
+            var candidateModels = new java.util.HashMap<String, SrsModelKey>();
+            for (String table : tables) {
+                var key = new SrsModelKey(candidateChain, table, SCOPE.cacheIncarnation(), opened.epoch(), 0);
+                models(f).publishInitial(key, "srs." + candidateChain + "." + table,
+                        models(f).require(references.get(table)).table(), captureFence);
+                candidateModels.put(table, key);
+            }
+            var pin = new SrsSnapshotPin(opened.epoch(), resumeToken, candidateModels);
+            assertThat(f.consumers().completeConnectorHandoff(original, candidate, staged.revision(), 0, pin, next)).isTrue();
+            assertThat(f.consumers().completeConnectorHandoff(original, candidate, staged.revision(), 0, pin, next)).isTrue();
+            var ready = f.consumers().progress(candidate).orElseThrow();
+            assertThat(ready.cursor().sinkAcked().order()).isEqualTo(SourceOrder.snapshotRow(2));
+            assertThat(ready.cursor().sinkAckedByTable().values()).allSatisfy(value -> assertThat(value.token()).isEqualTo(resumeToken));
+            assertThat(ready.cursor().perTableSeq().keySet()).isEqualTo(tables);
+            assertThat(ready.cursor().perTableSeq().values()).containsOnly(-1L);
+            assertThat(ready.ringDoneThrough()).isEqualTo(ready.cursor().perTableSeq());
+            assertThat(ready.cursor().snapshotCompletedTables()).containsExactlyInAnyOrderElementsOf(original.cursor().snapshotCompletedTables());
+            assertThat(f.consumers().progress(A)).contains(original);
+            assertThat(f.consumers().find(B.key())).contains(oldB);
+        });
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void aPreparedConnectorHandoffReattachesAfterThePipelineBootChanges(boolean modelsPrepared) {
+        withBusiness(f -> {
+            publishSnapshotModels(f, Set.of("orders"));
+            f.consumers().attach(A, 0, Set.of("orders"), f.fenceA()).orElseThrow();
+            f.consumers().attach(B, 0, Set.of("orders"), f.fenceB()).orElseThrow();
+            f.consumers().beginWriterRun(A, 1, "original", Map.of("orders", List.of("sink")), f.fenceA());
+            f.consumers().advanceWriter(A, 1, "original", "orders", "sink", point(1, 9, "original-cut"), f.fenceA());
+            var original = f.consumers().progress(A).orElseThrow();
+            var oldB = f.consumers().find(B.key()).orElseThrow();
+            var claims = new MongoWorkloadClaimStore(SystemCollections.CACHE_WORKLOAD_CLAIMS.on(f.database()));
+            var firstClaim = claims.advanceExecution(f.pipelineA(), 1, Set.of(f.pipelineA().owner().nodeId())).orElseThrow();
+            var first = WorkloadClaimFence.from(firstClaim);
+            var capture = claims.acquire(new WorkloadClaimKey(SCOPE.clusterId(), WorkloadClaimType.CAPTURE, "candidate-capture"),
+                    new WorkloadOwner("candidate-node", "candidate-boot"), 1, Duration.ofSeconds(30)).claim();
+            var captureFence = WorkloadClaimFence.from(capture);
+            String chain = "candidate-chain";
+            CaptureHistoryFixture.shared(f.database(), SCOPE, captureFence, chain, "retention");
+            var candidate = new SrsConsumerContext(new SrsConsumerKey(chain, A.key().pipelineId(), A.key().sourceId()), A.stateGeneration());
+            var member = f.consumers().prepareConnectorHandoff(original, candidate, captureFence, first,
+                    java.time.Instant.EPOCH).orElseThrow();
+            SrsSnapshotPin pin = null;
+            if (modelsPrepared) {
+                var opened = f.chains().openServingEpoch(chain, 1, Set.of("orders"), captureFence).orElseThrow();
+                var key = new SrsModelKey(chain, "orders", SCOPE.cacheIncarnation(), opened.epoch(), 0);
+                models(f).publishInitial(key, "srs." + chain + ".orders",
+                        new SourceTable("orders", List.of(new SourceField("id", "int")), List.of(), List.of()), captureFence);
+                pin = new SrsSnapshotPin(opened.epoch(), "original-cut", Map.of("orders", key));
+                assertThat(f.consumers().completeConnectorHandoff(original, candidate, member.revision(), 0, pin, first)).isTrue();
+            }
+            var before = f.consumers().progress(candidate).orElseThrow();
+            var beforeChain = f.chains().load(chain).orElseThrow();
+            assertThat(claims.release(firstClaim)).isTrue();
+            var recoveredClaim = claims.acquire(firstClaim.key(), new WorkloadOwner("replacement-node", "replacement-boot"),
+                    1, Duration.ofSeconds(30)).claim();
+            var second = WorkloadClaimFence.from(claims.advanceExecution(recoveredClaim, 1,
+                    Set.of(recoveredClaim.owner().nodeId())).orElseThrow());
+            var recovered = f.consumers().prepareConnectorHandoff(original, candidate, captureFence, second,
+                    java.time.Instant.EPOCH).orElseThrow();
+            assertThat(recovered.revision()).isEqualTo(member.revision() + 1);
+            assertThat(recovered.commandFence()).isEqualTo(second);
+            assertThat(f.consumers().prepareConnectorHandoff(original, candidate, captureFence, second,
+                    java.time.Instant.EPOCH)).contains(recovered);
+            var after = f.consumers().progress(candidate).orElseThrow();
+            assertThat(after.cursor()).isEqualTo(before.cursor());
+            assertThat(after.snapshot()).isEqualTo(before.snapshot());
+            assertThat(after.revision()).isEqualTo(before.revision());
+            assertThat(after.ringDoneThrough()).isEqualTo(before.ringDoneThrough());
+            var afterChain = f.chains().load(chain).orElseThrow();
+            assertThat(afterChain.epoch()).isEqualTo(beforeChain.epoch());
+            assertThat(afterChain.resumeOverride()).isEqualTo(beforeChain.resumeOverride());
+            assertThat(afterChain.checkpoint()).isEqualTo(beforeChain.checkpoint());
+            assertThat(afterChain.consumerCount()).isEqualTo(beforeChain.consumerCount());
+            assertThat(afterChain.consumerRevision()).isEqualTo(beforeChain.consumerRevision() + 1);
+            assertThat(f.consumers().progress(A)).contains(original);
+            assertThat(f.consumers().find(B.key())).contains(oldB);
+            assertThat(claims.release(capture)).isTrue();
+            var nextCapture = WorkloadClaimFence.from(claims.acquire(capture.key(),
+                    new WorkloadOwner("replacement-capture", "replacement-capture-boot"), 1, Duration.ofSeconds(30)).claim());
+            if (modelsPrepared) assertThatThrownBy(() -> f.chains().openServingEpoch(chain, beforeChain.epoch(),
+                    Set.of("orders"), nextCapture)).isInstanceOf(TapstateException.class);
+            var reopened = f.consumers().reopenConnectorHandoffEpoch(original, candidate, second, nextCapture,
+                    beforeChain.epoch(), Set.of("orders")).orElseThrow();
+            assertThat(reopened.epoch()).isEqualTo(beforeChain.epoch() + 1);
+            assertThat(reopened.resumeOverride()).isEqualTo(beforeChain.resumeOverride());
+            assertThat(f.consumers().reopenConnectorHandoffEpoch(original, candidate, second, nextCapture,
+                    beforeChain.epoch(), Set.of("orders"))).contains(reopened);
+            assertThat(f.consumers().progress(candidate)).contains(after);
+            assertThat(f.consumers().progress(A)).contains(original);
+            assertThat(f.consumers().find(B.key())).contains(oldB);
+            var originalCandidate = member;
+            assertThatThrownBy(() -> f.consumers().startReadingAfter(candidate, originalCandidate.revision(),
+                    before.revision(), "orders", -1, first)).isInstanceOf(TapstateException.class);
+        });
+    }
+
     @ParameterizedTest @ValueSource(strings={"revision","state","owner","detached","hash"})
     void validationMembershipRefusesChangedOriginalCoordinates(String changed){
         withBusiness(f->{

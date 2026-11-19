@@ -40,25 +40,21 @@ final class PipelinePrivateNoteRetirement {
         return new Release() {
             @Override public Optional<TapstateException> run(RequiredNoteRetirement retirement,CaptureConfig config,
                     PipelineNode.Purpose purpose,String clusterId,Runnable guard) {
-                return port(retirement,clusterId,guard).release(config,purpose);
+                return port(retirement,config,purpose,clusterId,guard).release(config,purpose);
             }
             @Override public boolean privatePostgres(RequiredNoteRetirement retirement,CaptureConfig config,String clusterId,Runnable guard) {
-                var port=port(retirement,clusterId,guard);
+                var port=port(retirement,config,PipelineNode.Purpose.CAPTURE,clusterId,guard);
                 var origin = retirement.origin().orElseThrow(PipelinePrivateNoteRetirement::unavailable);
                 connectors.resolveRetained(retirement.notes().guardedBy(guard), retirement.scope(), origin);
                 if(!port.automaticallyClearsPrivatePostgres(origin))return false;
                 port.releasePrivatePostgresSlot(config).ifPresent(failure -> {throw failure;});
                 return true;
             }
-            private PdkCapturePort port(RequiredNoteRetirement retirement,String clusterId,Runnable guard) {
+            private PdkCapturePort port(RequiredNoteRetirement retirement,CaptureConfig config,PipelineNode.Purpose purpose,String clusterId,Runnable guard) {
                 var fixed=retirement.scope();var store=retirement.notes();guard.run();
                 var global=store.open(new RequiredNoteOwner(fixed.owner().bindingVersion(),"pdk.global-state",
                         RequiredNoteOwner.Kind.GLOBAL,clusterId,0));guard.run();
-                var scopes=ConnectorNoteScopes.of(store,namespace -> {
-                    if(namespace.equals(fixed.owner().namespace()))return fixed;
-                    if(namespace.equals(global.owner().namespace()))return global;
-                    throw unavailable();
-                },guard);
+                var scopes=ConnectorNoteScopes.forBoundRun(store,RequiredNoteOwner.namespace(config.node(),purpose),fixed,global,guard);
                 return PdkCapturePort.withRequiredNotes(connectors,null,scopes);
             }
         };
@@ -112,15 +108,37 @@ final class PipelinePrivateNoteRetirement {
 
     /** Runs only for the winning first-preparation invocation after the original execution is isolated. */
     void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,Runnable requireRetiredExecution) {
+        reconcileRecovered(confirmation, desired, null, requireRetiredExecution);
+    }
+    void reconcileRecovered(CacheRecoveryStore.FullPreparation confirmation,Map<String,SourceResource> desired,
+            ConnectorRunBindings predecessor,Runnable requireRetiredExecution) {
+        var contexts = recoveryContexts(desired, predecessor);
         Runnable guard=() -> {requireRetiredExecution.run();confirmation.requireActive();};
         guard.run();
         for(var context:notes.guardedBy(requireRetiredExecution).privateContexts(confirmation)) {
             guard.run();if(context.completed() || context.origin().isEmpty())continue;
-            var source=desired.get(context.scope().owner().namespace());
+            var source=contexts.get(context.scope().owner().namespace());
             if(source==null || context.origin().orElseThrow().equals(origins.apply(source.connector(),source.config())))continue;
             releaseOne(confirmation.recovery().targetScope().clusterId(),notes.guardedBy(requireRetiredExecution).retirement(context.scope(),confirmation),guard);
         }
         guard.run();
+    }
+
+    static Map<String, SourceResource> recoveryContexts(Map<String, SourceResource> canonical, ConnectorRunBindings predecessor) {
+        if (predecessor == null) return canonical;
+        var result = new java.util.HashMap<>(canonical);
+        var bindings = new java.util.ArrayList<>(predecessor.effective());
+        if (predecessor.handoff() != null) {
+            bindings.addAll(predecessor.handoff().candidates());
+            bindings.addAll(predecessor.handoff().previous());
+        }
+        for (var binding : bindings) {
+            if (binding.notes().owner().kind() != RequiredNoteOwner.Kind.PIPELINE) continue;
+            String logical = RequiredNoteOwner.namespace(new PipelineNode(predecessor.scope().pipelineId(), binding.nodeId()), binding.purpose());
+            var desired = canonical.get(logical);
+            if (desired != null) result.put(binding.notes().owner().namespace(), desired);
+        }
+        return Map.copyOf(result);
     }
 
     /** The lifecycle caller has already terminated the original job, writers, capture and hot state. */

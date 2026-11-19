@@ -147,7 +147,9 @@ public final class MongoSrsChainStore implements SrsChainStore {
                 if (!held.servingTables().isEmpty()) return Optional.empty();
             } else {
                 if (held.epoch() != expectedEpoch) return Optional.empty();
-                if (held.epoch() > 0 && held.checkpoint() == null) throw unproven(chain);
+                if (held.epoch() > 0 && held.checkpoint() == null
+                        && (held.resumeOverride() == null || !held.servingTables().isEmpty()
+                            || !new MongoSrsModelContexts(database, scope).heads(row).isEmpty())) throw unproven(chain);
             }
             var replacement = new Document(row).append("epoch", epoch).append("captureFence", WorkloadClaimDocuments.stored(fence))
                     .append("requestedTables", sorted(requested)).append("servingTables", sorted(requested));

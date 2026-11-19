@@ -2,6 +2,9 @@ package io.tapstate.control.restapi;
 
 import io.tapstate.control.core.ConnectorCenterService;
 import io.tapstate.control.core.ControlError;
+import io.tapstate.control.core.ConnectorUsageQuery;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.RequestParam;
 import io.tapstate.core.common.TapstateException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.beans.factory.ObjectProvider;
@@ -17,6 +20,10 @@ import java.util.Map;
 @RestController
 final class ConnectorCenterController {
     private final ObjectProvider<ConnectorCenterService> services;
+    private ConnectorUsageQuery usage;
+
+    @Autowired(required = false)
+    void connectorUsage(ConnectorUsageQuery usage) { this.usage = usage; }
 
     ConnectorCenterController(ObjectProvider<ConnectorCenterService> services) {
         this.services = services;
@@ -26,6 +33,20 @@ final class ConnectorCenterController {
     @GetMapping("/connector-center")
     Map<String, Object> list() {
         return service().catalog();
+    }
+
+    @Verb("connector-center.list")
+    @GetMapping("/connector-center/{id}/versions/{sha256}/usages")
+    ConnectorUsageQuery.Page usages(@PathVariable("id") String id, @PathVariable("sha256") String sha256,
+            @RequestParam(value = "search", required = false) String search,
+            @RequestParam(value = "page", defaultValue = "1") int page,
+            @RequestParam(value = "pageSize", defaultValue = "10") int pageSize) {
+        MalformedRequest.requireText(id, "a connector id is required");
+        if (!sha256.matches("[a-f0-9]{64}") || page < 1 || pageSize < 1 || pageSize > 100)
+            throw MalformedRequest.rejecting("a lowercase SHA-256, positive page and pageSize between 1 and 100 are required", null);
+        service();
+        return usage == null ? new ConnectorUsageQuery.Page(page, pageSize, 0, java.util.List.of())
+                : usage.usages(id, sha256, search, page, pageSize);
     }
 
     @Verb("connector-center.refresh")

@@ -299,6 +299,62 @@ public final class MongoRequiredNoteStore implements RequiredNoteStore {
     }
 
     @Override
+    public RequiredNoteScope prepareArtifactBinding(RequiredNoteOwner candidate, RequiredNoteOrigin expected,
+            RequiredNoteScope previous) {
+        requireOrdinary();
+        if (candidate.kind() == RequiredNoteOwner.Kind.GLOBAL || previous != null
+                && (candidate.equals(previous.owner()) || candidate.kind() != previous.owner().kind()
+                    || candidate.bindingVersion() != previous.owner().bindingVersion()))
+            throw unavailable();
+        return withOriginIndexes(() -> transaction(session -> {
+            var cipher = cipherForWrite(session);
+            var scope = candidate.kind() == RequiredNoteOwner.Kind.CHAIN
+                    ? open(session, candidate) : initialize(session, candidate);
+            var metadata = verifyScope(session, scope, true);
+            var retained = retainedOrigin(session, scope, metadata);
+            if (retained != null) {
+                if (!retained.equals(expected) || !readyMarker(session, scope, retained)) throw originMismatch();
+                return scope;
+            }
+            if (previous != null) {
+                var oldMetadata = verifyScope(session, previous, false);
+                var oldOrigin = retainedOrigin(session, previous, oldMetadata);
+                if (oldOrigin == null || !oldOrigin.connectorId().equals(expected.connectorId())
+                        || !java.util.Arrays.equals(oldOrigin.settings(), expected.settings())
+                        || carryCount(oldMetadata, "outgoingCarries") != 0) throw unavailable();
+                var filters = new Document("_id.bindingVersion", previous.owner().bindingVersion())
+                        .append("_id.namespace", previous.owner().namespace()).append("_id.generation", previous.generation());
+                try (var values = notes.find(session, filters).iterator()) {
+                    while (values.hasNext()) {
+                        var row = values.next();
+                        var key = row.get("_id", Document.class).getString("key");
+                        var value = decode(previous, key, row);
+                        var copied = new Document("_id", noteId(scope, key)).append("revision", 1L)
+                                .append("deleted", !value.present());
+                        if (value.present()) copied.append("value", cipher.encrypt(context(scope, key, 1), "pdk-notes",
+                                Base64.getUrlEncoder().withoutPadding().encodeToString(value.bytes())));
+                        notes.insertOne(session, copied);
+                    }
+                }
+            }
+            origins.insertOne(session, originDocument(scope, expected, cipher).append("localArtifactReady", true));
+            if (scopes.updateOne(session, byScope(candidate).append("generation", scope.generation())
+                    .append("originGeneration", 0L), new Document("$set", new Document("originGeneration", scope.generation())))
+                    .getMatchedCount() != 1) throw unavailable();
+            return scope;
+        }));
+    }
+
+    void requireBinding(ClientSession session, io.tapstate.spi.store.ConnectorRunBindings.Binding binding) {
+        var scope = binding.notes();
+        checkOwner(session, scope.owner(), false);
+        var origin = retainedOrigin(session, scope, verifyPhysicalScope(session, scope, true));
+        if (origin == null || !origin.connectorId().equals(binding.connectorId())
+                || !origin.artifactHash().equals(binding.sha256()) || !readyMarker(session, scope, origin))
+            throw unavailable();
+    }
+
+    @Override
     public RequiredNoteOrigin prepareOrigin(RequiredNoteScope scope, RequiredNoteOrigin origin) {
         requireOrdinary();
         requireOriginScope(scope);

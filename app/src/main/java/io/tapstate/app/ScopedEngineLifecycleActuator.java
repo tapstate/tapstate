@@ -27,7 +27,13 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
     }
     record Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
             BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
-            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans,
+            PipelineConnectorExecutions connectorExecutions) {
+        Ports(Operators operators, Consumer<OperatorRunManifest> releaseHot,
+                BiConsumer<PipelineConvergencePass,Optional<OperatorRunManifest>> rebuild,
+                BiFunction<ExecutionFence,WorkloadClaimFence,ExecutionPlanRecorder> plans) {
+            this(operators,releaseHot,rebuild,plans,null);
+        }
         Ports {
             Objects.requireNonNull(operators,"operators"); Objects.requireNonNull(releaseHot,"releaseHot");
             Objects.requireNonNull(rebuild,"rebuild"); Objects.requireNonNull(plans,"plans");
@@ -144,6 +150,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
         run = null; capture = boundCapture(original);
         boolean submissionAttempted = false;
         try {
+            if (ports.connectorExecutions() != null)
+                ports.connectorExecutions().prepare(pass.intent(), prepared.connectorNodes(), command, this::require);
             pass.prepareOperatorDatabases(command,
                     prepared.operatorPlan().orElseThrow().nestDatabases().values(), this::require); require();
             var planned = prepared.plan(); require();
@@ -154,6 +162,8 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
             require(); pass.bindCapture(command,capture.captureBindings()); require();
             var built = planned.build(original); require();
             if (!members.equals(built.planned().members())) throw new IllegalStateException("topology changed its prepared members");
+            if (ports.connectorExecutions() != null)
+                ports.connectorExecutions().publish(pass.intent(), prepared.connectorNodes(), command, this::require);
             var recorder = Objects.requireNonNull(ports.plans().apply(original,command),"fixed plan recorder"); require();
             var previous = recorder.last(id()); require();
             recorder.record(EngineLifecycleActuator.planOf(id(),execution,built.planned(),clock.instant(),prepared.sinkConnectors(),shared).replacing(previous)); require();
@@ -166,7 +176,11 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
                 // The original writer may exist. A later pass must observe this exact manifest before proceeding.
                 invalidated = true;
             } else {
-                try { cleanupFailedStart(); } catch (RuntimeException | Error cleanup) { if (cleanup != failed) failed.addSuppressed(cleanup); }
+                try {
+                    cleanupFailedStart();
+                    if (ports.connectorExecutions() != null)
+                        ports.connectorExecutions().abandon(pass.intent(), command, this::require);
+                } catch (RuntimeException | Error cleanup) { if (cleanup != failed) failed.addSuppressed(cleanup); }
             }
             throw failed;
         }
@@ -205,7 +219,10 @@ final class ScopedEngineLifecycleActuator implements LifecycleActuator {
 
     @Override public synchronized void stop(String pipeline,boolean purge) {
         requireId(pipeline);
-        try { stopOriginal(); } finally { if (purge) invalidated = true; }
+        try {
+            stopOriginal();
+            if (ports.connectorExecutions() != null) ports.connectorExecutions().stopped(pass.intent(), command, this::require);
+        } finally { if (purge) invalidated = true; }
         if (purge) {
             ports.rebuild().accept(pass,Optional.ofNullable(manifest));
             // A changed physical generation must be loaded by a new pass, never adopted by this command.
